@@ -468,13 +468,11 @@ async function loadRooms() {
 
 async function loadSettings() {
   const s = await api("GET", "/admin/settings");
-  const tls = { "self-signed": "Autofirmado (solo desarrollo)", files: "Certificado del operador", acme: "ACME automático" }[s.tls_mode] || s.tls_mode;
+  const tls = { "self-signed": "Autofirmado (solo desarrollo)", files: "Certificado del operador" }[s.tls_mode] || s.tls_mode;
   const rows = [
     ["Servidor", `${s.public_host} (UDP ${s.public_udp_port}, TCP ${s.public_tcp_port})`],
     ["Versión", `coroom-server ${s.version} · protocolo ${s.protocol}`],
     ["Certificado", tls],
-    ["Directorio ACME", s.acme_directory],
-    ["Reto ACME", s.acme_challenge],
     ["Huella del certificado", s.certificate_fingerprint],
     ["Caduca", s.certificate_not_after ? dateFormat.format(new Date(s.certificate_not_after)) : null],
     ["Alta de usuarios", s.registration === "invite" ? "El administrador o con código de invitación" : "Solo el administrador"],

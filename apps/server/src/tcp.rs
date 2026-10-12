@@ -1,13 +1,9 @@
-//! Pila TCP: HTTP/2 y HTTP/1.1 sobre TLS (`tokio-rustls` + `hyper`) con `Alt-Svc` hacia HTTP/3,
-//! el reto ACME TLS-ALPN-01 en el mismo puerto y, aparte, el listener sin TLS del reto HTTP-01.
+//! Pila TCP: HTTP/2 y HTTP/1.1 sobre TLS (`tokio-rustls` + `hyper`) con `Alt-Svc` hacia HTTP/3.
 //!
 //! - Con TLS (por defecto), cada conexión hace el handshake con el [`CertResolver`] compartido
-//!   con QUIC; si se negocia `acme-tls/1` (la autoridad ACME validando el reto) se cierra tras el
-//!   handshake, y si no, se sirve HTTP/2 o HTTP/1.1 según el ALPN con las rutas comunes
+//!   con QUIC y se sirve HTTP/2 o HTTP/1.1 según el ALPN con las rutas comunes
 //!   ([`crate::routes::dispatch`]).
 //! - `COROOM_TCP_PLAIN=true` (solo desarrollo) sirve lo mismo sin TLS.
-//! - `COROOM_BIND_HTTP` (con `COROOM_ACME_CHALLENGE=http-01`) responde
-//!   `/.well-known/acme-challenge/<token>` y redirige todo lo demás a HTTPS.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -29,9 +25,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::debug;
 
 use crate::ServerState;
-use crate::acme::Http01Store;
 use crate::routes::{self, MAX_BODY, dispatch};
-use crate::tls::ACME_TLS_ALPN;
 
 /// Espera máxima del handshake TLS.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -200,11 +194,6 @@ pub(crate) async fn serve(
                 }
                 Err(_) => return,
             };
-            if tls.get_ref().1.alpn_protocol() == Some(ACME_TLS_ALPN) {
-                // Validación TLS-ALPN-01: basta con el handshake (RFC 8737 §3).
-                debug!(%remote, "reto TLS-ALPN-01 servido");
-                return;
-            }
             serve_connection(tls, state, remote, alt_svc).await;
         });
     }
@@ -215,82 +204,6 @@ pub(crate) async fn serve(
     .await;
     connections.abort_all();
     Ok(())
-}
-
-async fn handle_http01(
-    store: Arc<Http01Store>,
-    https_base: String,
-    request: Request<Incoming>,
-) -> Result<Response<Body>, Infallible> {
-    let path = request.uri().path().to_owned();
-    if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
-        return Ok(match store.get(token) {
-            Some(key_authorization) => simple(
-                StatusCode::OK,
-                "application/octet-stream",
-                key_authorization,
-            ),
-            None => simple(
-                StatusCode::NOT_FOUND,
-                "text/plain; charset=utf-8",
-                "no hay reto",
-            ),
-        });
-    }
-    let location = format!(
-        "{https_base}{}",
-        request
-            .uri()
-            .path_and_query()
-            .map_or("/", |path| path.as_str())
-    );
-    let mut response = simple(
-        StatusCode::PERMANENT_REDIRECT,
-        "text/plain; charset=utf-8",
-        location.clone(),
-    );
-    if let Ok(value) = HeaderValue::from_str(&location) {
-        response.headers_mut().insert(header::LOCATION, value);
-    }
-    Ok(response)
-}
-
-/// Listener sin TLS del reto HTTP-01 y de la redirección a `https_base`.
-pub(crate) async fn serve_http01(
-    listener: TcpListener,
-    store: Arc<Http01Store>,
-    https_base: String,
-    mut shutdown: watch::Receiver<bool>,
-) {
-    let mut connections = JoinSet::new();
-    loop {
-        let (stream, remote) = tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok(accepted) => accepted,
-                Err(_) => continue,
-            },
-            _ = shutdown.changed() => break,
-        };
-        while connections.try_join_next().is_some() {}
-        if connections.len() >= MAX_TCP_CONNECTIONS {
-            continue;
-        }
-        let store = Arc::clone(&store);
-        let base = https_base.clone();
-        connections.spawn(async move {
-            let service =
-                service_fn(move |request| handle_http01(Arc::clone(&store), base.clone(), request));
-            if let Err(err) = hyper::server::conn::http1::Builder::new()
-                .timer(TokioTimer::new())
-                .header_read_timeout(HEADER_TIMEOUT)
-                .serve_connection(TokioIo::new(stream), service)
-                .await
-            {
-                debug!(%remote, error = %err, "conexión HTTP-01 terminada");
-            }
-        });
-    }
-    connections.abort_all();
 }
 
 #[cfg(test)]

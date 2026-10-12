@@ -17,7 +17,7 @@ use crate::api::{
 };
 use crate::auth::{self, INVITATION_MAX_HOURS, INVITATION_TTL_HOURS};
 use crate::clock;
-use crate::config::{Registration, TlsMode};
+use crate::config::Registration;
 use crate::db::{InvitationRow, SessionRow};
 use crate::routes::{Request, Response, SERVER_VERSION};
 
@@ -381,7 +381,6 @@ fn rooms(state: &ServerState) -> Handled {
 fn settings(state: &ServerState) -> Handled {
     let config = &state.config;
     let (udp_reachable, udp_checked_at) = state.udp.get();
-    let acme = config.tls_mode == TlsMode::Acme;
     ok(&Settings {
         version: SERVER_VERSION.to_owned(),
         protocol: PROTOCOL_VERSION,
@@ -390,8 +389,6 @@ fn settings(state: &ServerState) -> Handled {
         public_udp_port: state.public_udp_port(),
         public_tcp_port: state.public_tcp_port(),
         tls_mode: config.tls_mode.to_string(),
-        acme_directory: acme.then(|| config.acme_directory.clone()),
-        acme_challenge: acme.then(|| config.acme_challenge.to_string()),
         certificate_fingerprint: state.certs.fingerprint(),
         certificate_not_after: state
             .certs

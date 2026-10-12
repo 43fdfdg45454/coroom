@@ -17,7 +17,6 @@ use coroom_transport::proto::PROTOCOL_VERSION;
 use coroom_transport::proto::codec;
 use coroom_transport::proto::signal::SignalMessage;
 
-use crate::acme::Http01Store;
 use crate::auth::AuthState;
 use crate::config::Config;
 use crate::probe::UdpStatus;
@@ -107,7 +106,6 @@ impl Harness {
                 quota,
                 certs,
                 udp: Arc::new(UdpStatus::default()),
-                http01: Arc::new(Http01Store::default()),
                 udp_addr: any,
                 tcp_addr: any,
                 relay_addr: Some(any),

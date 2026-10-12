@@ -3525,19 +3525,6 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/hyper-rustls/hyper-rustls-0.27.10.crate",
-        "sha256": "dfa8e654703247911e29c23fbeaa261834bd9bb74efba2f9acddc37bfb127f53",
-        "dest": "cargo/vendor/hyper-rustls-0.27.10"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"dfa8e654703247911e29c23fbeaa261834bd9bb74efba2f9acddc37bfb127f53\", \"files\": {}}",
-        "dest": "cargo/vendor/hyper-rustls-0.27.10",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/hyper-util/hyper-util-0.1.21.crate",
         "sha256": "ddc03d96684f9226b8a787cdb71488417b53ab5ea8fdb1dac946cb9431cc8bff",
         "dest": "cargo/vendor/hyper-util-0.1.21"
@@ -3923,19 +3910,6 @@
         "type": "inline",
         "contents": "{\"package\": \"4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7\", \"files\": {}}",
         "dest": "cargo/vendor/inout-0.2.2",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/instant-acme/instant-acme-0.8.5.crate",
-        "sha256": "9f05ad37c421b962354c358d347d4a6130151df9407978372d3ad7f0c8f71a64",
-        "dest": "cargo/vendor/instant-acme-0.8.5"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"9f05ad37c421b962354c358d347d4a6130151df9407978372d3ad7f0c8f71a64\", \"files\": {}}",
-        "dest": "cargo/vendor/instant-acme-0.8.5",
         "dest-filename": ".cargo-checksum.json"
     },
     {
@@ -7009,32 +6983,6 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/rustls-platform-verifier/rustls-platform-verifier-0.7.1.crate",
-        "sha256": "1167586491e2b18b8bfbb293e8180ec17c201c4f076d7cb3070ca964e7598f98",
-        "dest": "cargo/vendor/rustls-platform-verifier-0.7.1"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"1167586491e2b18b8bfbb293e8180ec17c201c4f076d7cb3070ca964e7598f98\", \"files\": {}}",
-        "dest": "cargo/vendor/rustls-platform-verifier-0.7.1",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/rustls-platform-verifier-android/rustls-platform-verifier-android-0.2.0.crate",
-        "sha256": "eec689c0bc40ff2458a5977b6619cb718087084a18e02a131c599b62d05e1a5f",
-        "dest": "cargo/vendor/rustls-platform-verifier-android-0.2.0"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"eec689c0bc40ff2458a5977b6619cb718087084a18e02a131c599b62d05e1a5f\", \"files\": {}}",
-        "dest": "cargo/vendor/rustls-platform-verifier-android-0.2.0",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/rustls-webpki/rustls-webpki-0.103.15.crate",
         "sha256": "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2",
         "dest": "cargo/vendor/rustls-webpki-0.103.15"
@@ -9266,19 +9214,6 @@
         "type": "inline",
         "contents": "{\"package\": \"5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb\", \"files\": {}}",
         "dest": "cargo/vendor/web-time-1.1.0",
-        "dest-filename": ".cargo-checksum.json"
-    },
-    {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/webpki-root-certs/webpki-root-certs-1.0.9.crate",
-        "sha256": "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b",
-        "dest": "cargo/vendor/webpki-root-certs-1.0.9"
-    },
-    {
-        "type": "inline",
-        "contents": "{\"package\": \"b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b\", \"files\": {}}",
-        "dest": "cargo/vendor/webpki-root-certs-1.0.9",
         "dest-filename": ".cargo-checksum.json"
     },
     {

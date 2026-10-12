@@ -333,7 +333,7 @@ pub enum ServerTrust {
     /// Huella SHA-256 (hex, 64 caracteres) del DER del certificado: fija el servidor de
     /// desarrollo con certificado autofirmado (`--trust-fingerprint`).
     Fingerprint(String),
-    /// Raíces de confianza (certificado del operador o ACME).
+    /// Raíces de confianza (el certificado del operador o su autoridad).
     Roots(Arc<RootCertStore>),
     /// Solo para comprobar un servidor antes de confiar en él ("Añadir servidor"):
     /// acepta cualquier certificado y apunta su huella y si lo validan las raíces del sistema

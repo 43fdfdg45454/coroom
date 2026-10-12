@@ -12,8 +12,7 @@ Esta guía es para quien usa la aplicación. Para montar un servidor, mira la
 
 1. Abre coroom. La primera vez pide la **dirección del servidor** (por ejemplo,
    `coroom.example.com`): te la da quien lo administra. coroom comprueba al momento que responde,
-   su versión y si el relay está activo. Si el servidor usa un certificado propio (sin dominio
-   público), te enseña su huella para que la compares con la que te dio el administrador y pulses
+   su versión y si el relay está activo. Si el servidor usa un certificado autofirmado, te enseña su huella para que la compares con la que te dio el administrador y pulses
    **Confiar**.
 2. **Entrar**: con tu usuario y contraseña. Si tienes un **código de invitación**, elige **Crear
    cuenta**: escribes el código, tu nombre de usuario, tu nombre visible y tu contraseña (al menos

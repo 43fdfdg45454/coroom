@@ -116,7 +116,7 @@ lo que ya estaba en vuelo cifrado con la anterior se sigue descifrando, nada nue
 Entre pares, QUIC usa **claves públicas crudas** (RFC 7250) que son la identidad Ed25519, y cada
 extremo exige la clave que anunció la señalización. El servidor se fija por la huella de su
 certificado (autofirmado, `ServerTrust::Fingerprint`, con «Confiar» la primera vez) o se valida con
-las raíces del sistema (ACME). El número de seguridad (60 dígitos, SHA-512 de las dos claves
+las raíces del sistema (certificado del operador emitido por una autoridad). El número de seguridad (60 dígitos, SHA-512 de las dos claves
 ordenadas) se ve en el overlay, en la sala y en Ajustes → Dispositivos, y se recuerda por par.
 
 **I-1 (sin corrección completa)**: el servidor es también el directorio de claves (manda la clave
@@ -305,7 +305,7 @@ otra sesión; por sesión en el modo de desarrollo); después, `RoomNotFound` co
 **Descripción.** Tras el handshake TLS, `hyper` servía sin temporizador: sin tiempo límite de
 cabeceras, de cuerpo ni de inactividad, y sin tope de conexiones; un cliente que mandara las
 cabeceras byte a byte ocupaba conexiones indefinidamente.
-**Corrección.** `HEADER_TIMEOUT` (10 s por petición, también en el listener de HTTP-01),
+**Corrección.** `HEADER_TIMEOUT` (10 s por petición),
 `BODY_TIMEOUT` (20 s, responde 408), `PING` de HTTP/2 cada 30 s y `MAX_TCP_CONNECTIONS` (1 024).
 HTTP/3 ya cerraba conexiones inactivas por el `idle_timeout` de QUIC.
 **Test.** `apps/server/tests/hardening.rs`: la conexión con cabeceras a medias se cierra a los

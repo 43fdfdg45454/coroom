@@ -2,38 +2,40 @@
 
 `coroom-server` es un único binario que termina TLS él mismo (`docs/ARQUITECTURA.md` §3 y §4):
 
-- por **UDP** (443), un solo socket QUIC que demultiplexa por ALPN entre HTTP/3 (`h3`: la API
-  `/api/v1`, la administración `/admin`, `/health`, `/version` y la señalización WebTransport en
-  `/signal`) y el relay de medios (`coroom-relay/1`);
-- por **TCP** (443), HTTP/2 y HTTP/1.1 **con TLS** como respaldo (navegadores y redes sin UDP), que
-  anuncia HTTP/3 con `Alt-Svc` y resuelve el reto ACME **TLS-ALPN-01**.
+- por **UDP**, un solo socket QUIC que demultiplexa por ALPN entre HTTP/3 (`h3`: la API `/api/v1`,
+  la administración `/admin`, `/health`, `/version` y la señalización WebTransport en `/signal`) y
+  el relay de medios (`coroom-relay/1`);
+- por **TCP**, HTTP/2 y HTTP/1.1 **con TLS** como respaldo (navegadores y redes sin UDP), que
+  anuncia HTTP/3 con `Alt-Svc`.
 
 Las cuentas, los dispositivos vinculados, las invitaciones, los amigos y el uso del relay viven
 en SQLite (`coroom.db`) dentro de `./data`; las salas, en memoria mientras el anfitrión
 está conectado. El servidor nunca ve claves privadas ni contenido: los medios, la entrada y la voz
 van cifrados de extremo a extremo.
 
+El servidor no necesita internet: sirve igual en una LAN, en una VPN o expuesto fuera. Tampoco
+gestiona certificados: usa el tuyo o uno autofirmado.
+
 ## Requisitos
 
-- Un **dominio** (o subdominio) que apunte a la IP pública del servidor, por ejemplo
-  `coroom.example.com`: el certificado ACME (Let's Encrypt) se emite para ese nombre y los clientes
-  se conectan con `https://coroom.example.com`.
+- Un **nombre** por el que los clientes lleguen al servidor, por ejemplo `coroom.example.com`: un
+  nombre de tu DNS, de la LAN o de la VPN. Es el del certificado y el de la URL de los clientes.
+- Un **certificado** para ese nombre (cadena completa y clave en PEM), de la autoridad que uses,
+  o el modo autofirmado, en el que los clientes confían por su huella.
 - Docker con Compose v2.
-- Abrir hacia el servidor **UDP 443** (HTTP/3, señalización y relay) y **TCP 443** (respaldo
-  HTTP/2 y reto TLS-ALPN-01). Son los puertos públicos por defecto; se cambian con
-  `COROOM_PUBLIC_UDP_PORT` y `COROOM_PUBLIC_TCP_PORT` en `.env`. Por ejemplo, con `ufw`:
+- Que los clientes lleguen a **un puerto UDP** (HTTP/3, señalización y relay) y, recomendado, **un
+  puerto TCP** (`/admin` desde el navegador y respaldo de la app si una red bloquea UDP). Por
+  defecto son el 443 de cada uno; se cambian con `COROOM_PUBLIC_UDP_PORT` y
+  `COROOM_PUBLIC_TCP_PORT` en `.env`. Usar el mismo número para los dos deja una sola URL. Por
+  ejemplo, con `ufw`:
 
   ```bash
   sudo ufw allow 443/udp
   sudo ufw allow 443/tcp
   ```
 
-  En un router doméstico, redirige los mismos puertos a la máquina del servidor. El reto ACME
-  HTTP-01 (`COROOM_ACME_CHALLENGE=http-01`) necesita además TCP 80, que el Compose no publica:
-  añade `"80:8080/tcp"` a sus `ports` si lo usas.
-- Sin reverse proxy por delante: WebTransport y el relay necesitan el UDP directo y el reto
-  TLS-ALPN-01 necesita el TCP 443 directo. Si se pone uno, debe hablar HTTP/3, pasar UDP y dejar
-  pasar el ALPN `acme-tls/1` (o usar HTTP-01); no es la configuración recomendada.
+- Sin reverse proxy por delante: WebTransport y el relay necesitan el UDP directo. Si se pone uno,
+  debe hablar HTTP/3 y pasar UDP; no es la configuración recomendada.
 
 ## Imagen
 
@@ -54,58 +56,42 @@ cruzada: `--platform linux/arm64` sirve también desde un equipo amd64).
 ## Primer arranque
 
 Solo hacen falta `docker-compose.yml` y `.env` en el mismo directorio. Todo lo persistente vive en
-`./data` junto a ellos, que la imagen usa con el usuario sin privilegios (uid 65532):
+`./data` junto a ellos, que la imagen usa con el usuario sin privilegios (uid 65532). Con el modo
+por defecto, `files`, el certificado va en `./data/certs`:
 
 ```bash
 cd deploy
 cp .env.sample .env        # edita .env: COROOM_PUBLIC_HOST, COROOM_RELAY_ADDR, cuotas…
-mkdir -p data/certs && sudo chown -R 65532:65532 data
+mkdir -p data/certs
+cp /ruta/a/fullchain.pem /ruta/a/privkey.pem data/certs/
+sudo chown -R 65532:65532 data
 docker compose pull
 docker compose up -d
 docker compose logs -f server
 ```
 
 Compose lee las variables de `.env` y se niega a arrancar si faltan `COROOM_PUBLIC_HOST` o
-`COROOM_RELAY_ADDR`.
+`COROOM_RELAY_ADDR`. En `./data` quedan `coroom.db` (cuentas, invitaciones, amigos, uso del relay),
+`certs/` (tu certificado) y, en modo autofirmado, `server.crt` y `server.key`.
 
-En `./data` quedan `coroom.db` (cuentas, invitaciones, amigos, uso del relay), `acme/` (cuenta y
-certificado de Let's Encrypt), `certs/` (certificado propio, modo `files`) y el certificado
-autofirmado si se usa ese modo.
+En el log verás los dos `bind`, el modo TLS y la huella del certificado. Abre
+**`https://coroom.example.com/admin`** (con `:PUERTO` si no es el 443): la primera vez pide crear
+el **administrador** (nombre y contraseña de al menos 12 caracteres). Después la página queda
+protegida por login.
 
-En el log verás los dos `bind`, el modo TLS y la línea `pidiendo certificado ACME`; mientras llega
-(unos segundos) el servidor sirve un certificado autofirmado temporal. Cuando aparezca
-`certificado ACME instalado`, abre **`https://coroom.example.com/admin`**: la primera vez pide
-crear el **administrador** (nombre y contraseña de al menos 12 caracteres). Después la página
-queda protegida por login.
+### Certificado
 
-Para probar sin dominio, pon `COROOM_TLS_MODE=self-signed` (solo desarrollo): los clientes fijan el
-certificado por la huella que imprime el log (`fingerprint=…`) con `--trust-fingerprint`, y el
-navegador mostrará un aviso.
+El servidor lee el certificado al arrancar. Cuando lo renueves, copia los ficheros nuevos a
+`./data/certs` y reinicia con `docker compose restart server` (las salas abiertas se cortan; los
+clientes reconectan solos). El certificado debe ser para `COROOM_PUBLIC_HOST`.
 
-Para no gastar el límite de Let's Encrypt mientras pruebas, usa su entorno de pruebas
-(`COROOM_ACME_DIRECTORY=https://acme-staging-v02.api.letsencrypt.org/directory`); sus
-certificados no son de confianza, así que los clientes necesitarán `--trust-fingerprint` con la
-huella que muestra `/admin` → Ajustes.
-
-### Certificado propio
-
-Si ya tienes un certificado (por ejemplo, de tu propio certbot), pon `COROOM_TLS_MODE=files` en
-`.env` y copia la cadena completa y la clave a `./data/certs`:
-
-```bash
-sudo cp -L /etc/letsencrypt/live/coroom.example.com/fullchain.pem data/certs/
-sudo cp -L /etc/letsencrypt/live/coroom.example.com/privkey.pem data/certs/
-sudo chown 65532:65532 data/certs/*.pem
-docker compose restart server
-```
-
-El servidor lee esos ficheros al arrancar: tras cada renovación hay que copiarlos de nuevo y
-reiniciar (un gancho en `/etc/letsencrypt/renewal-hooks/deploy/` lo hace solo). El certificado
-debe ser para `COROOM_PUBLIC_HOST`.
+Sin certificado, `COROOM_TLS_MODE=self-signed`: el servidor genera uno la primera vez y lo guarda
+en `./data`. Los clientes lo aceptan comparando la huella que muestran con la del log
+(`fingerprint=…`) o la de `/admin` → Ajustes, y el navegador avisa al abrir `/admin`.
 
 ## Usuarios e invitaciones
 
-Sin registro público. Desde `/admin`:
+Sin registro abierto. Desde `/admin`:
 
 - **Usuarios**: crear (nombre, nombre visible, contraseña inicial), hacer o quitar administrador,
   restablecer la contraseña (cierra sus sesiones) y deshabilitar (no puede entrar y sus sesiones
@@ -132,15 +118,12 @@ dispositivos vinculados abren la señalización y el relay.
 | Variable | Por defecto | Uso |
 |---|---|---|
 | `COROOM_VERSION` | `1.0.0` | Versión de la imagen; la misma que la de los clientes |
-| `COROOM_PUBLIC_HOST` | **obligatoria** | Nombre público: el del certificado y el de la URL de los clientes |
-| `COROOM_PUBLIC_UDP_PORT` | `443` | Puerto UDP público: HTTP/3, señalización y relay |
-| `COROOM_PUBLIC_TCP_PORT` | `443` | Puerto TCP público: HTTP/2 de respaldo y reto TLS-ALPN-01 |
-| `COROOM_RELAY_ADDR` | **obligatoria** | Dirección UDP pública del relay: `<IP pública>:<COROOM_PUBLIC_UDP_PORT>` |
-| `COROOM_TLS_MODE` | `acme` | `acme`, `files` o `self-signed` (solo pruebas) |
+| `COROOM_PUBLIC_HOST` | **obligatoria** | Nombre por el que llegan los clientes: el del certificado y el de su URL |
+| `COROOM_PUBLIC_UDP_PORT` | `443` | Puerto UDP del host al que llegan los clientes: HTTP/3, señalización y relay |
+| `COROOM_PUBLIC_TCP_PORT` | `443` | Puerto TCP del host al que llegan los clientes: `/admin` y HTTP/2 de respaldo |
+| `COROOM_RELAY_ADDR` | **obligatoria** | Dirección UDP del relay que alcanzan los clientes: `<IP del servidor>:<COROOM_PUBLIC_UDP_PORT>` |
+| `COROOM_TLS_MODE` | `files` | `files` (tu certificado) o `self-signed` (generado por el servidor) |
 | `COROOM_TLS_CERT`, `COROOM_TLS_KEY` | `/data/certs/fullchain.pem`, `/data/certs/privkey.pem` | PEM del modo `files` (`./data/certs` en el host) |
-| `COROOM_ACME_DIRECTORY` | Let's Encrypt producción | Directorio ACME |
-| `COROOM_ACME_CONTACT` | — | Correo de contacto para la autoridad ACME (opcional) |
-| `COROOM_ACME_CHALLENGE` | `tls-alpn-01` | `tls-alpn-01` (TCP público) o `http-01` (TCP 80) |
 | `COROOM_REGISTRATION` | `invite` | `invite` (administrador e invitaciones) o `admin` (solo administrador) |
 | `COROOM_MAX_GUESTS_PER_ROOM` | `8` | Invitados como mucho por sala |
 | `COROOM_RELAY_ENABLED` | `true` | Relay de medios; sin él, las salas solo funcionan en directo |
@@ -149,8 +132,8 @@ dispositivos vinculados abren la señalización y el relay.
 | `COROOM_SOURCE_URL` | el repositorio de coroom | Repositorio que enlazan `GET /version` y `/admin` (AGPL-3.0); con un servidor modificado, el de tu fork |
 | `RUST_LOG` | `info` | Nivel de logs (nunca incluyen tokens ni contraseñas) |
 
-Las direcciones internas (`COROOM_BIND_UDP` `[::]:4433`, `COROOM_BIND_TCP` `[::]:8443`,
-`COROOM_BIND_HTTP`) y `COROOM_DATA_DIR` (`/data`) las fija la imagen. `COROOM_DEV_TOKEN` y
+Las direcciones internas (`COROOM_BIND_UDP` `[::]:4433`, `COROOM_BIND_TCP` `[::]:8443`) y
+`COROOM_DATA_DIR` (`/data`) las fija la imagen. `COROOM_DEV_TOKEN` y
 `COROOM_TCP_PLAIN` son solo para desarrollo y no se pasan en el Compose. Si el sistema no tiene
 IPv6, el servidor sustituye `[::]` por `0.0.0.0` y lo avisa en el log.
 
@@ -161,14 +144,6 @@ cuota mensual, al agotarla el relay corta las salas de ese anfitrión (los miemb
 `QuotaExceeded`) y las salas nuevas se crean sin relay: los clientes lo dicen y conectan solo en
 directo. El uso es visible en `/admin` → Uso del relay y para cada usuario con `coroom whoami`.
 
-### Certificados ACME
-
-La cuenta ACME (`acme/account.json`, permisos `0600`), el certificado (`acme/cert.pem`) y su clave
-(`acme/key.pem`, `0600`) viven en `./data/acme`. La renovación es automática: 30 días antes de
-caducar (en certificados de vida corta, al pasar dos tercios de su vida), con reintentos con espera
-exponencial (de 1 minuto a 6 horas) si falla, y el cambio de certificado es en caliente para QUIC y
-TCP. Si cambias `COROOM_ACME_DIRECTORY`, se crea una cuenta nueva en ese directorio.
-
 ## Copias de seguridad
 
 ```bash
@@ -177,9 +152,7 @@ docker compose exec server coroom-server backup /data/copia-$(date +%F).db
 
 Es una copia en línea y consistente de SQLite (`VACUUM INTO`), válida con el servidor en marcha;
 queda en `./data` del host. Para restaurarla: para el servidor, pon la copia como
-`./data/coroom.db` (borrando
-`coroom.db-wal` y `coroom.db-shm` si existen) y arráncalo. Guarda también `acme/` si no quieres
-volver a pedir el certificado.
+`./data/coroom.db` (borrando `coroom.db-wal` y `coroom.db-shm` si existen) y arráncalo.
 
 Recuperar el acceso si se olvida la contraseña del administrador:
 
@@ -220,7 +193,8 @@ como operador:
   12 horas y vive en la pestaña (sin cookies).
 - **Registro**: `RUST_LOG` (por defecto `info`). Ni en `trace` aparecen contraseñas ni tokens (lo
   comprueba un test), pero `debug` y `trace` registran IP y rutas: úsalos solo para diagnosticar.
-- **Modo desarrollo**: no definas `COROOM_DEV_TOKEN` ni `COROOM_TCP_PLAIN` en un servidor público.
+- **Modo desarrollo**: no definas `COROOM_DEV_TOKEN` ni `COROOM_TCP_PLAIN` en un servidor que usen
+  otras personas.
 - **Actualizaciones**: sigue las publicaciones (`CHANGELOG.md`); el servidor y los clientes deben
   hablar la misma versión del protocolo.
 
@@ -235,15 +209,15 @@ cada 10 minutos el servidor hace un handshake QUIC consigo mismo en
 `COROOM_PUBLIC_HOST:COROOM_PUBLIC_UDP_PORT`), `users`, `rooms`, `relay_bytes` (desde el arranque),
 `relay_bytes_today` y `relay_rooms` (bytes por sala, sin identificarlas).
 
-- **`udp_reachable: false`**: el UDP 443 no llega. Revisa el cortafuegos, la redirección de puertos
-  del router y que Compose publique `443:4433/udp`. Ojo: una NAT **sin hairpin** (el router no
-  devuelve a la red local el tráfico a su propia IP pública) da `false` aunque desde fuera
-  funcione; compruébalo desde otra red (`curl --http3 https://coroom.example.com/health`).
-- **No llega el certificado ACME**: el log dice por qué. Comprueba que el dominio apunta a este
-  servidor, que el TCP 443 (o el 80 con HTTP-01) llega al contenedor y que nada delante (un proxy,
-  un CDN) intercepta TLS. Mientras tanto se sirve un certificado autofirmado temporal.
-- **El relay no conecta desde fuera**: falta `COROOM_RELAY_ADDR=<IP pública>:443`; dentro de
-  Docker el servidor no conoce su IP pública ni el puerto publicado.
+- **`udp_reachable: false`**: el puerto UDP no llega. Revisa el cortafuegos, la redirección de
+  puertos si la hay y que `COROOM_PUBLIC_HOST` resuelva a este servidor desde él mismo. Ojo: detrás
+  de una NAT **sin hairpin** (el router no devuelve a la red local el tráfico a su propia IP
+  externa) da `false` aunque desde fuera funcione; compruébalo desde un cliente
+  (`curl --http3 https://coroom.example.com/health`).
+- **El servidor no arranca con `files`**: el log nombra el fichero que no pudo leer. Comprueba que
+  están en `./data/certs`, que el usuario 65532 puede leerlos y que la cadena es la completa.
+- **El relay no conecta**: `COROOM_RELAY_ADDR` no es la dirección que alcanzan los clientes;
+  dentro de Docker el servidor no la conoce.
 - **«la sesión no es válida o ha caducado»** en un cliente: el token caduca a los 30 días o se
   revocó (contraseña cambiada, cuenta deshabilitada, `coroom logout`); `coroom login` otra vez.
 - **Demasiados intentos**: tras 5 fallos de login en un minuto (por cuenta y por IP) el servidor
@@ -262,7 +236,7 @@ a la base); también con Ctrl+C.
 COROOM_TLS_MODE=self-signed COROOM_PUBLIC_HOST=localhost cargo run -p coroom-server
 # HTTP/3 en UDP 4433, HTTP/2 con TLS en TCP 8443; abre https://localhost:8443/admin
 curl -sk https://localhost:8443/health
-cargo test -p coroom-server     # cuentas, ACME con un directorio falso, señalización, relay
+cargo test -p coroom-server     # cuentas, señalización, relay, TLS
 ```
 
 Con `COROOM_DEV_TOKEN=change-me` la señalización acepta además ese token sin cuenta (modo

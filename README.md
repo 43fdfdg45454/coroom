@@ -30,7 +30,8 @@ dos NAT distintas, pantallas HDR y de 120 Hz), en [`docs/ARQUITECTURA.md`](docs/
 - **Cifrado de extremo a extremo** con MLS, SFrame y HPKE (X-Wing, poscuántico): el servidor no
   puede ver ni oír nada. Revisión de seguridad en [`docs/seguridad.md`](docs/seguridad.md).
 - **Servidor autoalojado** en un binario y un puerto UDP (más TCP de respaldo): cuentas, amigos,
-  invitaciones, relay con cuotas, ACME y administración web. [Guía del operador](deploy/README.md).
+  invitaciones, relay con cuotas y administración web; con tu certificado o uno autofirmado, en
+  una LAN, una VPN o fuera. [Guía del operador](deploy/README.md).
 - **Aplicación de escritorio** con el tema, el acento y la fuente del sistema, navegable con el
   teclado y con los textos en catálogos Fluent listos para traducir. [Guía de uso](docs/guia.md).
 
@@ -58,7 +59,7 @@ dos NAT distintas, pantallas HDR y de 120 Hz), en [`docs/ARQUITECTURA.md`](docs/
 | `crates/input` | Captura en el invitado (`InputCapture`, mandos con `gilrs`, `InputSender`, guiones JSON), trait `InputSink` con libei + uinput (Linux), `SendInput` y el cliente del driver de mando virtual (Windows) y `RecordingSink`; tabla de teclas evdev ↔ *scancode* |
 | `crates/audio` | Traits `AudioSource` y `AudioSink`; PipeWire (Linux), WASAPI (Windows) y sintéticos; Opus (`codec`), buffer de jitter, mezcla, procesado de voz y VAD, sincronía A/V |
 | `apps/desktop` | Binario `coroom`: la aplicación (`ui`, sin argumentos) y `doctor`, `probe`, `host`, `join`, `login`, `logout`, `whoami`, `friends` e `invite` |
-| `apps/server` | Binario `coroom-server`: HTTP/3, señalización WebTransport y relay en un puerto UDP; HTTP/2 con TLS por TCP; cuentas en SQLite, `/admin`, ACME; `backup`, `admin reset-password`, `migrate` |
+| `apps/server` | Binario `coroom-server`: HTTP/3, señalización WebTransport y relay en un puerto UDP; HTTP/2 con TLS por TCP; cuentas en SQLite, `/admin`; `backup`, `admin reset-password`, `migrate` |
 | `deploy/` | Dockerfile (multi-arquitectura), `docker-compose.yml`, `.env.sample` y [guía de despliegue](deploy/README.md) |
 | `packaging/` | Flatpak (`flatpak/`: manifiesto, `cargo-sources.json`, AppStream y `.desktop`), MSIX (`msix/`: `AppxManifest.xml`, iconos y `build.ps1`) e icono propio (`icons/coroom.svg`) |
 | `vendor/` | `iced_wgpu` y `cryoglyph` adaptados a `wgpu` 30 hasta que `iced` publique esa versión ([por qué](vendor/README.md)) |
@@ -312,7 +313,7 @@ anfitrión y el invitado, cada uno con su cuenta y la sesión iniciada (`coroom 
    llavero del sistema, o `~/.local/share/coroom` sin llavero o con `--headless`); si se prueban
    anfitrión e invitado en la misma máquina, cada uno necesita su `--data-dir` y su cuenta.
 
-**Servidor de desarrollo** (sin dominio): `COROOM_TLS_MODE=self-signed cargo run --release -p
+**Servidor de desarrollo** (sin certificado): `COROOM_TLS_MODE=self-signed cargo run --release -p
 coroom-server` imprime `fingerprint=<64 caracteres hex>`, la huella del certificado autofirmado;
 los clientes la fijan con `--trust-fingerprint <huella>` en `coroom login` (se guarda con la
 sesión) y, como el TCP de desarrollo escucha en el 8443, `--tcp-port 8443` para el respaldo
@@ -320,7 +321,7 @@ HTTP/2. Con `COROOM_DEV_TOKEN=change-me` en el servidor, `host` y `join` aceptan
 `--dev-token change-me` sin cuenta (solo para desarrollo).
 
 Sin `--trust-fingerprint`, el cliente valida el servidor con las raíces de confianza del sistema
-(certificado ACME o del operador). Si el servidor dice que la sala no tiene relay (cuota agotada o
+(el certificado del operador emitido por una autoridad en la que confía el equipo). Si el servidor dice que la sala no tiene relay (cuota agotada o
 relay deshabilitado), los clientes lo avisan y conectan solo en directo. `coroom host --help` y
 `coroom join --help` listan el resto de opciones (`--width`, `--height`, `--fps`,
 `--bitrate-kbps`, `--invite`…).

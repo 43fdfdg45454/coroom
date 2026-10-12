@@ -9,17 +9,14 @@
 //!   - `coroom-relay/1`: el **relay** de medios con abanico, caché de `Nack`, cuotas y límite por
 //!     sala ([`relay`], [`quota`]).
 //! - **HTTP/2 y HTTP/1.1 sobre TLS** en el puerto TCP (`COROOM_BIND_TCP`, [`tcp`]), con la cabecera
-//!   `Alt-Svc` que anuncia HTTP/3 y el reto ACME TLS-ALPN-01; sin TLS solo con
-//!   `COROOM_TCP_PLAIN=true` (desarrollo). Con `COROOM_ACME_CHALLENGE=http-01`, además, un listener
-//!   sin TLS para `/.well-known/acme-challenge/`.
+//!   `Alt-Svc` que anuncia HTTP/3; sin TLS solo con `COROOM_TCP_PLAIN=true` (desarrollo).
 //!
 //! Cuentas en SQLite ([`db`]) con Argon2id, tokens de sesión y desafío de dispositivo
 //! ([`auth`]), la API ([`api`]) y la administración web ([`admin`]), amigos y presencia, cuotas
-//! del relay ([`quota`]), certificados ACME con renovación en caliente ([`acme`], [`tls`]) y la
+//! del relay ([`quota`]), el certificado del operador o autofirmado ([`tls`]) y la
 //! autocomprobación de UDP ([`probe`]). Las salas siguen en memoria mientras el anfitrión está
 //! conectado. El token de desarrollo `COROOM_DEV_TOKEN` queda como modo explícito de desarrollo.
 
-pub mod acme;
 pub mod admin;
 pub mod api;
 pub mod auth;
@@ -48,9 +45,8 @@ use quinn::crypto::rustls::QuicServerConfig;
 
 use coroom_transport::rate::{Congestion, CongestionShared};
 
-use acme::{AcmeHttp, AcmeSettings, Http01Store};
 use auth::AuthState;
-use config::{AcmeChallenge, Registration};
+use config::Registration;
 use db::Db;
 use probe::UdpStatus;
 use quota::Quota;
@@ -166,7 +162,6 @@ pub(crate) struct ServerState {
     pub(crate) quota: Arc<Quota>,
     pub(crate) certs: Arc<CertResolver>,
     pub(crate) udp: Arc<UdpStatus>,
-    pub(crate) http01: Arc<Http01Store>,
     pub(crate) udp_addr: SocketAddr,
     pub(crate) tcp_addr: SocketAddr,
     pub(crate) relay_addr: Option<SocketAddr>,
@@ -262,12 +257,9 @@ pub struct Server {
     endpoint: quinn::Endpoint,
     listener: TcpListener,
     acceptor: Option<tokio_rustls::TlsAcceptor>,
-    http_listener: Option<TcpListener>,
     udp_addr: SocketAddr,
     tcp_addr: SocketAddr,
-    http_addr: Option<SocketAddr>,
     state: Arc<ServerState>,
-    acme_http: AcmeHttp,
     quota_cuts: tokio::sync::mpsc::UnboundedReceiver<u64>,
 }
 
@@ -277,15 +269,6 @@ impl Server {
     /// Con puerto `0` el sistema elige uno libre; [`Server::udp_addr`] y [`Server::tcp_addr`]
     /// devuelven los reales.
     pub async fn bind(config: &Config) -> Result<Self, ServerError> {
-        if config.tls_mode == config::TlsMode::Acme
-            && config.tcp_plain
-            && config.acme_challenge == AcmeChallenge::TlsAlpn01
-        {
-            return Err(ServerError::Config(
-                "el reto TLS-ALPN-01 necesita TLS por TCP: quita COROOM_TCP_PLAIN o usa                  COROOM_ACME_CHALLENGE=http-01"
-                    .to_owned(),
-            ));
-        }
         if !(config.relay_quota_gb_per_month >= 0.0 && config.relay_quota_gb_per_month.is_finite())
         {
             return Err(ServerError::Config(
@@ -334,18 +317,6 @@ impl Server {
                 tls::tcp_server_config(Arc::clone(&certs))?,
             )))
         };
-        let http_listener = match config.http_listener() {
-            Some(addr) => Some(bind_tcp(addr, "abrir el socket HTTP").await?),
-            None => None,
-        };
-        let http_addr = match &http_listener {
-            Some(listener) => Some(
-                listener
-                    .local_addr()
-                    .map_err(|err| ServerError::io("leer la dirección HTTP", tcp_addr, err))?,
-            ),
-            None => None,
-        };
 
         if config.dev_token.is_some() {
             warn!(
@@ -375,7 +346,6 @@ impl Server {
             quota,
             certs,
             udp: Arc::new(UdpStatus::default()),
-            http01: Arc::new(Http01Store::default()),
             udp_addr,
             tcp_addr,
             relay_addr: config.relay_addr,
@@ -385,20 +355,11 @@ impl Server {
             endpoint,
             listener,
             acceptor,
-            http_listener,
             udp_addr,
             tcp_addr,
-            http_addr,
             state,
-            acme_http: AcmeHttp::Default,
             quota_cuts,
         })
-    }
-
-    /// Usa otro cliente HTTP para la autoridad ACME (tests con un directorio falso).
-    pub fn with_acme_http(mut self, http: AcmeHttp) -> Self {
-        self.acme_http = http;
-        self
     }
 
     /// Dirección UDP real de HTTP/3.
@@ -409,11 +370,6 @@ impl Server {
     /// Dirección TCP real de HTTP/2 y HTTP/1.1.
     pub fn tcp_addr(&self) -> SocketAddr {
         self.tcp_addr
-    }
-
-    /// Dirección del listener sin TLS del reto HTTP-01, si lo hay.
-    pub fn http_addr(&self) -> Option<SocketAddr> {
-        self.http_addr
     }
 
     /// Huella SHA-256 (hex) del certificado del servidor en uso.
@@ -498,30 +454,6 @@ impl Server {
             Arc::clone(&state.certs),
             stop_rx.clone(),
         )));
-        if config.tls_mode == config::TlsMode::Acme {
-            let mut settings = AcmeSettings::from_config(config);
-            settings.http = self.acme_http.clone();
-            background.push(tokio::spawn(acme::run(
-                settings,
-                Arc::clone(&state.certs),
-                Arc::clone(&state.http01),
-                stop_rx.clone(),
-            )));
-        }
-        if let Some(listener) = self.http_listener {
-            let port = state.public_tcp_port();
-            let base = if port == 443 {
-                format!("https://{}", config.public_host)
-            } else {
-                format!("https://{}:{port}", config.public_host)
-            };
-            background.push(tokio::spawn(tcp::serve_http01(
-                listener,
-                Arc::clone(&state.http01),
-                base,
-                stop_rx.clone(),
-            )));
-        }
 
         let tcp_addr = self.tcp_addr;
         let (_, tcp_result) = tokio::join!(

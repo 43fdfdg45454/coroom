@@ -12,6 +12,12 @@ proyecto activo, con respaldo declarado cuando dependa de drivers (tabla en
 `docs/ARQUITECTURA.md` §3). Antes de añadir una dependencia: comprobar que está mantenida, fijar
 versión y pasar `cargo deny`.
 
+**Nunca suponer internet pública.** El servidor y la aplicación tienen que funcionar igual en una
+LAN, en una VPN o expuestos fuera, sin salida a internet. Nada de gestión automática de
+certificados (ACME) ni de otra función que complique el despliegue o dependa de internet: se
+pregunta al propietario antes de añadirla, y nunca va activada por defecto. El certificado lo pone
+el operador.
+
 ## Interfaz de usuario
 
 Las interfaces deben sentirse **de Linux** (convenciones de GNOME y KDE: tema claro y oscuro del
@@ -47,7 +53,7 @@ crates/ui         sistema de diseño para iced (coroom-ui): tokens, tema, fuente
 apps/desktop      binario `coroom` (anfitrión + invitado), aplicación iced en src/ui
 apps/desktop/locales/  catálogos Fluent de los textos de la aplicación
 vendor/           iced_wgpu y cryoglyph parcheados a wgpu 30 (ver vendor/README.md)
-apps/server       binario `coroom-server` (h3 + hyper/TLS + relay + sqlite + ACME + /admin)
+apps/server       binario `coroom-server` (h3 + hyper/TLS + relay + sqlite + /admin)
 drivers/windows-vhid  driver KMDF de mandos virtuales (Virtual HID Framework)
 deploy/           Dockerfile, docker-compose.yml, .env.sample, README
 packaging/        flatpak/, msix/

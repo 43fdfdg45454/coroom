@@ -33,7 +33,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 sqlx.workspace = true
 argon2.workspace = true
-instant-acme.workspace = true
 subtle.workspace = true
 tokio-rustls.workspace = true
 rpassword.workspace = true
@@ -42,9 +41,7 @@ sha2.workspace = true
 [dev-dependencies]
 coroom-transport = { workspace = true, features = ["test-util"] }
 hyper = { workspace = true, features = ["client", "http1", "http2"] }
-hyper-util = { workspace = true, features = ["tokio", "client", "client-legacy", "http1"] }
-instant-acme = { workspace = true, features = ["hyper-rustls"] }
-base64.workspace = true
+hyper-util = { workspace = true, features = ["tokio", "client", "http1"] }
 tempfile.workspace = true
 
 [lints]

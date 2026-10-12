@@ -8,12 +8,6 @@ use std::path::PathBuf;
 use clap::builder::BoolishValueParser;
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
-/// Directorio ACME de Let's Encrypt (producción).
-pub const LETS_ENCRYPT_PRODUCTION: &str = "https://acme-v02.api.letsencrypt.org/directory";
-
-/// Directorio ACME de Let's Encrypt (pruebas, certificados no fiables).
-pub const LETS_ENCRYPT_STAGING: &str = "https://acme-staging-v02.api.letsencrypt.org/directory";
-
 /// Cómo obtiene el servidor su certificado TLS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum TlsMode {
@@ -22,8 +16,6 @@ pub enum TlsMode {
     SelfSigned,
     /// Usa el certificado y la clave PEM de `COROOM_TLS_CERT` y `COROOM_TLS_KEY`.
     Files,
-    /// Certificado automático por ACME (Let's Encrypt por defecto), con renovación.
-    Acme,
 }
 
 impl fmt::Display for TlsMode {
@@ -31,27 +23,6 @@ impl fmt::Display for TlsMode {
         f.write_str(match self {
             TlsMode::SelfSigned => "self-signed",
             TlsMode::Files => "files",
-            TlsMode::Acme => "acme",
-        })
-    }
-}
-
-/// Reto ACME con el que se demuestra el control del dominio.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum AcmeChallenge {
-    /// TLS-ALPN-01 (RFC 8737) en el puerto TCP 443 con TLS: sin puertos extra.
-    #[value(name = "tls-alpn-01")]
-    TlsAlpn01,
-    /// HTTP-01 en el puerto TCP 80 (`COROOM_BIND_HTTP`), sin TLS.
-    #[value(name = "http-01")]
-    Http01,
-}
-
-impl fmt::Display for AcmeChallenge {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            AcmeChallenge::TlsAlpn01 => "tls-alpn-01",
-            AcmeChallenge::Http01 => "http-01",
         })
     }
 }
@@ -162,7 +133,7 @@ pub struct Config {
     )]
     pub bind_udp: SocketAddr,
 
-    /// Dirección TCP de HTTP/2 y HTTP/1.1 con TLS (y del reto TLS-ALPN-01).
+    /// Dirección TCP de HTTP/2 y HTTP/1.1 con TLS.
     #[arg(
         long,
         env = "COROOM_BIND_TCP",
@@ -173,17 +144,6 @@ pub struct Config {
         help = "Dirección TCP de HTTP/2 y HTTP/1.1 con TLS [COROOM_BIND_TCP; por defecto [::]:8443]"
     )]
     pub bind_tcp: SocketAddr,
-
-    /// Dirección TCP sin TLS del reto ACME HTTP-01 (y de la redirección a HTTPS).
-    #[arg(
-        long,
-        env = "COROOM_BIND_HTTP",
-        value_name = "DIRECCIÓN",
-        hide_env = true,
-        help = "Dirección TCP sin TLS del reto HTTP-01 y la redirección a HTTPS; con \
-                COROOM_ACME_CHALLENGE=http-01, por defecto [::]:8080 [COROOM_BIND_HTTP]"
-    )]
-    pub bind_http: Option<SocketAddr>,
 
     /// Solo desarrollo: TCP sin TLS (HTTP/1.1 y HTTP/2 en claro).
     #[arg(
@@ -249,7 +209,7 @@ pub struct Config {
         value_name = "PUERTO",
         hide_env = true,
         hide_default_value = true,
-        help = "Puerto TCP público (redirección de HTTP-01 y ajustes); 0 = el local \
+        help = "Puerto TCP público (ajustes de la administración); 0 = el local \
                 [COROOM_PUBLIC_TCP_PORT; por defecto 443]"
     )]
     pub public_tcp_port: u16,
@@ -264,7 +224,7 @@ pub struct Config {
         hide_env = true,
         hide_default_value = true,
         hide_possible_values = true,
-        help = "Certificado TLS: self-signed (solo desarrollo), files o acme \
+        help = "Certificado TLS: files (certificado del operador) o self-signed \
                 [COROOM_TLS_MODE; por defecto self-signed]"
     )]
     pub tls_mode: TlsMode,
@@ -289,45 +249,7 @@ pub struct Config {
     )]
     pub tls_key: Option<PathBuf>,
 
-    /// Directorio ACME.
-    #[arg(
-        long,
-        env = "COROOM_ACME_DIRECTORY",
-        default_value = LETS_ENCRYPT_PRODUCTION,
-        value_name = "URL",
-        hide_env = true,
-        hide_default_value = true,
-        help = "Directorio ACME del modo acme [COROOM_ACME_DIRECTORY; por defecto Let's Encrypt \
-                producción]"
-    )]
-    pub acme_directory: String,
-
-    /// Contacto ACME (`mailto:`), opcional.
-    #[arg(
-        long,
-        env = "COROOM_ACME_CONTACT",
-        value_name = "CORREO",
-        hide_env = true,
-        help = "Correo de contacto para la autoridad ACME, opcional [COROOM_ACME_CONTACT]"
-    )]
-    pub acme_contact: Option<String>,
-
-    /// Reto ACME.
-    #[arg(
-        long,
-        env = "COROOM_ACME_CHALLENGE",
-        value_enum,
-        default_value_t = AcmeChallenge::TlsAlpn01,
-        value_name = "RETO",
-        hide_env = true,
-        hide_default_value = true,
-        hide_possible_values = true,
-        help = "Reto ACME: tls-alpn-01 (TCP 443) o http-01 (TCP 80) \
-                [COROOM_ACME_CHALLENGE; por defecto tls-alpn-01]"
-    )]
-    pub acme_challenge: AcmeChallenge,
-
-    /// Directorio de datos persistentes: base de datos, certificados y cuenta ACME.
+    /// Directorio de datos persistentes: base de datos y certificado autofirmado.
     #[arg(
         long,
         env = "COROOM_DATA_DIR",
@@ -335,7 +257,7 @@ pub struct Config {
         value_name = "DIRECTORIO",
         hide_env = true,
         hide_default_value = true,
-        help = "Directorio de datos (coroom.db, acme/, certificado autofirmado) \
+        help = "Directorio de datos (coroom.db, certificado autofirmado) \
                 [COROOM_DATA_DIR; por defecto ./data]"
     )]
     pub data_dir: PathBuf,
@@ -419,13 +341,14 @@ pub struct Config {
     )]
     pub relay_max_kbps: u32,
 
-    /// Dirección UDP pública del relay que se anuncia en `RelayToken`.
+    /// Dirección UDP del relay que se anuncia en `RelayToken`: la que alcanzan los clientes.
     #[arg(
         long,
         env = "COROOM_RELAY_ADDR",
         value_name = "DIRECCIÓN",
         hide_env = true,
-        help = "Dirección UDP pública del relay que se anuncia a los clientes; por defecto, la \
+        help = "Dirección UDP del relay que se anuncia a los clientes (la que alcanzan: de la LAN, \
+                de una VPN o pública); por defecto, la \
                 dirección local de cada conexión con el puerto UDP [COROOM_RELAY_ADDR]"
     )]
     pub relay_addr: Option<SocketAddr>,
@@ -453,7 +376,6 @@ impl Config {
             command: None,
             bind_udp,
             bind_tcp,
-            bind_http: None,
             tcp_plain: false,
             public_host: "localhost".to_owned(),
             source_url: SOURCE_URL.to_owned(),
@@ -462,9 +384,6 @@ impl Config {
             tls_mode: TlsMode::SelfSigned,
             tls_cert: None,
             tls_key: None,
-            acme_directory: LETS_ENCRYPT_PRODUCTION.to_owned(),
-            acme_contact: None,
-            acme_challenge: AcmeChallenge::TlsAlpn01,
             data_dir,
             dev_token: None,
             registration: Registration::Invite,
@@ -488,17 +407,6 @@ impl Config {
     pub fn database_path(&self) -> PathBuf {
         self.data_dir.join(crate::db::DATABASE_FILE)
     }
-
-    /// Dirección del listener HTTP sin TLS, si hace falta.
-    pub fn http_listener(&self) -> Option<SocketAddr> {
-        match (self.bind_http, self.tls_mode, self.acme_challenge) {
-            (Some(addr), _, _) => Some(addr),
-            (None, TlsMode::Acme, AcmeChallenge::Http01) => {
-                Some(SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 8080)))
-            }
-            _ => None,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -521,13 +429,10 @@ mod tests {
         assert_eq!(config.command, None);
         assert_eq!(config.bind_udp, "[::]:4433".parse().expect("dirección"));
         assert_eq!(config.bind_tcp, "[::]:8443".parse().expect("dirección"));
-        assert_eq!(config.bind_http, None);
         assert!(!config.tcp_plain);
         assert_eq!(config.public_host, "localhost");
         assert_eq!((config.public_udp_port, config.public_tcp_port), (443, 443));
         assert_eq!(config.tls_mode, TlsMode::SelfSigned);
-        assert_eq!(config.acme_directory, LETS_ENCRYPT_PRODUCTION);
-        assert_eq!(config.acme_challenge, AcmeChallenge::TlsAlpn01);
         assert_eq!(config.data_dir, PathBuf::from("./data"));
         assert_eq!(config.dev_token, None);
         assert_eq!(config.registration, Registration::Invite);
@@ -536,11 +441,10 @@ mod tests {
         assert_eq!(config.quota_bytes(), None);
         assert_eq!(config.relay_max_kbps, 0);
         assert_eq!(config.relay_addr, None);
-        assert_eq!(config.http_listener(), None);
     }
 
     #[test]
-    fn phase_6_settings_parse() {
+    fn optional_settings_parse() {
         let config = Config::try_parse_from([
             "coroom-server",
             "--dev-token",
@@ -560,11 +464,7 @@ mod tests {
             "--tcp-plain",
             "yes",
             "--tls-mode",
-            "acme",
-            "--acme-challenge",
-            "http-01",
-            "--acme-directory",
-            LETS_ENCRYPT_STAGING,
+            "files",
         ])
         .expect("configuración");
         assert_eq!(config.dev_token.as_deref(), Some("change-me"));
@@ -578,11 +478,7 @@ mod tests {
         assert_eq!(config.quota_bytes(), Some(500_000_000));
         assert_eq!(config.relay_max_kbps, 20_000);
         assert!(config.tcp_plain);
-        assert_eq!(config.acme_challenge, AcmeChallenge::Http01);
-        assert_eq!(
-            config.http_listener(),
-            Some("[::]:8080".parse().expect("dirección"))
-        );
+        assert_eq!(config.tls_mode, TlsMode::Files);
     }
 
     #[test]
@@ -622,7 +518,7 @@ mod tests {
             Config::try_parse_from(["coroom-server", "--tls-mode", "files"]).expect("files");
         assert_eq!(config.tls_mode, TlsMode::Files);
         assert_eq!(TlsMode::SelfSigned.to_string(), "self-signed");
-        assert_eq!(AcmeChallenge::TlsAlpn01.to_string(), "tls-alpn-01");
+        assert_eq!(TlsMode::Files.to_string(), "files");
     }
 
     #[test]

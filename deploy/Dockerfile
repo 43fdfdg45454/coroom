@@ -2,7 +2,7 @@
 # Imagen de coroom-server. Se construye desde la raíz del repositorio:
 #   docker build -f deploy/Dockerfile -t coroom-server .
 #
-# Multi-arquitectura (`release.yml`): la etapa de compilación corre siempre en la
+# Multi-arquitectura (la CI publica amd64 y arm64): la etapa de compilación corre siempre en la
 # plataforma de quien construye y compila de forma cruzada para la de destino (amd64 o arm64), así
 # arm64 no pasa por QEMU:
 #   docker buildx build --platform linux/amd64,linux/arm64 -f deploy/Dockerfile .
@@ -51,15 +51,14 @@ RUN --mount=type=cache,id=coroom-registry-${TARGETARCH},target=/usr/local/cargo/
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /out/coroom-server /usr/local/bin/coroom-server
 # El volumen hereda el propietario del directorio de la imagen: el usuario sin privilegios
-# (nonroot, uid 65532) puede escribir la base de datos, la cuenta ACME y los certificados.
+# (nonroot, uid 65532) puede escribir la base de datos y el certificado autofirmado.
 COPY --from=build --chown=65532:65532 /out/data /data
 ENV COROOM_DATA_DIR=/data \
     COROOM_BIND_UDP=[::]:4433 \
     COROOM_BIND_TCP=[::]:8443 \
     RUST_LOG=info
 VOLUME ["/data"]
-# 4433/udp: HTTP/3, señalización y relay; 8443/tcp: HTTP/2 con TLS y TLS-ALPN-01;
-# 8080/tcp: solo con COROOM_ACME_CHALLENGE=http-01.
-EXPOSE 4433/udp 8443/tcp 8080/tcp
+# 4433/udp: HTTP/3, señalización y relay; 8443/tcp: HTTP/2 y HTTP/1.1 con TLS.
+EXPOSE 4433/udp 8443/tcp
 USER nonroot:nonroot
 ENTRYPOINT ["/usr/local/bin/coroom-server"]

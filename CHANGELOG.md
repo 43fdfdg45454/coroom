@@ -5,6 +5,20 @@ Registro de las versiones de coroom. Formato de
 [versionado semántico](https://semver.org/lang/es/). La versión del **protocolo** (la que tienen que
 compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /version`.
 
+## [Sin publicar]
+
+### Cambiado
+
+- El Compose del servidor usa solo la imagen publicada, pasa cada variable de `.env` con su valor
+  por defecto y guarda todo en `./data`, también el certificado (`./data/certs`).
+- El modo TLS por defecto del Compose es `files`: el certificado lo pone el operador.
+
+### Eliminado
+
+- La gestión automática de certificados por ACME (`COROOM_TLS_MODE=acme`, los retos TLS-ALPN-01 y
+  HTTP-01, `COROOM_ACME_*` y `COROOM_BIND_HTTP`). El servidor usa el certificado del operador o uno
+  autofirmado, y no necesita salida a internet.
+
 ## [1.0.0] — 2026-10-12
 
 Primera versión pública, con el protocolo 7. Licencia Apache-2.0 para todo salvo el servidor

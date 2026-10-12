@@ -101,7 +101,7 @@ y un respaldo declarado cuando dependa de drivers o de borradores.
 | Entrada | Linux: **libei** por el portal `RemoteDesktop` (`reis`) y mandos por **uinput**. Windows: `SendInput` y driver KMDF propio sobre **Virtual HID Framework** (`drivers/windows-vhid/`, hasta 8 mandos HID genéricos, visibles por DirectInput, SDL y Steam Input) | Aviso si falta libei (uinput no depende de él); mando a teclas (`--gamepad-to-keys`) sin driver |
 | Render | `wgpu` con backend Vulkan para importar las texturas decodificadas, `winit` con Wayland nativo; BT.709 y HDR10 (BT.2020 PQ) con superficie `Rgba16Float`; 4:4:4 y 120 fps cuando todos lo admiten | D3D12 en Windows si la importación lo exige; *tone mapping* a SDR sin superficie HDR |
 | UI | `iced` 0.14 a bajo nivel (`iced_winit`, `iced_wgpu`) sobre el mismo `wgpu::Device` que el vídeo; sistema de diseño `coroom-ui` de estilo Adwaita con tema, acento y fuente del sistema; textos en Fluent | Fuente Inter embebida si no hay la del sistema |
-| Servidor | `coroom-server`: `h3` y relay en el mismo socket (ALPN), `hyper` + `tokio-rustls` para TCP, **SQLite** (`sqlx`), ACME con `instant-acme` (TLS-ALPN-01 o HTTP-01), imagen distroless | Certificado y clave del operador montados en lugar de ACME |
+| Servidor | `coroom-server`: `h3` y relay en el mismo socket (ALPN), `hyper` + `tokio-rustls` para TCP, **SQLite** (`sqlx`), certificado del operador en PEM (o autofirmado), imagen distroless; sin gestión de certificados ni dependencia de internet | — |
 | Empaquetado | **Flatpak** (runtime freedesktop 26.08, portales declarados), **MSIX** firmado y `.zip` portátil, imagen multiarquitectura en GHCR; publicación automática en cada push a `main` con la versión que calcula GitVersion (etiqueta `vX.Y.Z` y release con los paquetes) | — |
 | Observabilidad | `tracing` y overlay de estadísticas con marcas por etapa; sin telemetría externa | — |
 
@@ -117,7 +117,8 @@ Invitado ── HTTP/3 + WebTransport ──▶ Servidor (UDP) ◀── HTTP/3 
 - **Un solo puerto UDP**: el socket QUIC del servidor demultiplexa por ALPN entre `h3` (API REST,
   interfaz de administración y sesiones WebTransport de señalización en `/signal`) y
   `coroom-relay/1` (medios). TCP con HTTP/2 y TLS queda para clientes sin HTTP/3 y para anunciar
-  `Alt-Svc`. En producción se publican UDP 443 y TCP 443; en desarrollo, UDP 4433 y TCP 8443.
+  `Alt-Svc`. Con Docker, los puertos del host son los de `COROOM_PUBLIC_UDP_PORT` y
+  `COROOM_PUBLIC_TCP_PORT` (443 por defecto); en desarrollo, UDP 4433 y TCP 8443.
 - **Señalización**: sesión WebTransport autenticada que transporta candidatos de red, claves
   públicas y mensajes MLS/HPKE cifrados para sus destinatarios; el servidor solo enruta y nunca
   interpreta MLS ni medios.
@@ -159,7 +160,7 @@ Invitado ── HTTP/3 + WebTransport ──▶ Servidor (UDP) ◀── HTTP/3 
 | `crates/session` | Máquinas de estado anfitrión e invitado, permisos, reloj, marcas por etapa |
 | `crates/ui` | Sistema de diseño `coroom-ui` para `iced`: tokens, tema, fuentes, iconos, componentes |
 | `apps/desktop` | Binario `coroom` (aplicación, `doctor`, `probe`, `host`, `join`, `login`…); `locales/` |
-| `apps/server` | Binario `coroom-server` (HTTP/3, WebTransport, relay, SQLite, ACME, `/admin`) |
+| `apps/server` | Binario `coroom-server` (HTTP/3, WebTransport, relay, SQLite, `/admin`) |
 | `drivers/windows-vhid` | Driver KMDF de mandos virtuales sobre Virtual HID Framework |
 | `vendor/` | `iced_wgpu` y `cryoglyph` adaptados a `wgpu` 30 |
 | `deploy/`, `packaging/` | Docker Compose, `.env.sample` ficticio; Flatpak y MSIX |
@@ -204,7 +205,7 @@ hardware real:
 |---|---|
 | GPU | Matriz NVIDIA, AMD e Intel con Vulkan Video y NVENC/AMF/QSV/VA-API; cero copias a CPU y < 8 ms de codificación + decodificación a 1080p60; 4:4:4 y 10 bits por hardware; `coroom probe` a 1080p60 con p95 < 25 ms en el equipo de referencia |
 | Windows real | Compilación con MSVC, la aplicación, WGC con D3D11, WASAPI con loopback por proceso, `SendInput`, el driver de mando con Driver Verifier, el MSIX instalado y el `.zip` portátil |
-| Dos NAT distintas | Dos equipos en redes distintas en directo y con `--force-relay`, `docker compose up` con dominio y certificado ACME (primero *staging*), migración de ruta al cambiar de red |
+| Dos NAT distintas | Dos equipos en redes distintas en directo y con `--force-relay`, `docker compose up` con el certificado del operador, migración de ruta al cambiar de red |
 | Dispositivos de audio y entrada | PipeWire y WASAPI con altavoces (AEC), |A−V| y boca-oído en la LAN; libei y uinput con un cooperativo local de 4 mandos |
 | Pantalla real | Superficie HDR (Windows con HDR, Linux con compositor con gestión de color), captura HDR de WGC y PipeWire, 120 fps en pantalla de 120 Hz, HiDPI fraccionario, tema y acento del portal, decoraciones y modo inmersivo en GNOME y KDE |
 | Red y duración | Matriz `netem_matrix` y `soak` de 8 h en el equipo de referencia; en los runners de la CI los pasos con `tc netem` son todavía informativos: en el primer intento la matriz perdió la conexión de señalización al pasar al perfil «media» (2 % de pérdida, 30 ± 10 ms) y queda por diagnosticar |

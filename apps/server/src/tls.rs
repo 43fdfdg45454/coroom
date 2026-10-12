@@ -1,18 +1,13 @@
-//! Certificado TLS del servidor: autofirmado persistido, ficheros PEM o ACME, servido por un
+//! Certificado TLS del servidor: autofirmado persistido o ficheros PEM del operador, servido por un
 //! resolutor propio ([`CertResolver`]) que comparten QUIC y TCP.
 //!
-//! El resolutor guarda el certificado en uso tras un `RwLock` (se cambia en caliente al renovar
-//! por ACME) y los certificados temporales del reto **TLS-ALPN-01** (RFC 8737): si el
-//! `ClientHello` ofrece el ALPN `acme-tls/1`, entrega el certificado del reto del SNI pedido (con
-//! la extensión crítica `acmeIdentifier`, OID 1.3.6.1.5.5.7.1.31, con el SHA-256 de la
-//! autorización) o nada; el resto del tráfico recibe el certificado normal. Solo la configuración
-//! TCP anuncia `acme-tls/1`.
+//! El servidor no gestiona la emisión ni la renovación de certificados: en modo `files` lee los PEM
+//! al arrancar y el operador los renueva por su cuenta y reinicia.
 
-use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use rustls::crypto::aws_lc_rs;
 use rustls::pki_types::pem::PemObject;
@@ -32,18 +27,6 @@ pub const SELF_SIGNED_CERT_FILE: &str = "server.crt";
 /// Nombre de la clave del certificado autofirmado dentro de `COROOM_DATA_DIR`.
 pub const SELF_SIGNED_KEY_FILE: &str = "server.key";
 
-/// Subdirectorio de `COROOM_DATA_DIR` con la cuenta y los certificados ACME.
-pub const ACME_DIR: &str = "acme";
-
-/// Certificado ACME (cadena completa) dentro de [`ACME_DIR`].
-pub const ACME_CERT_FILE: &str = "cert.pem";
-
-/// Clave del certificado ACME dentro de [`ACME_DIR`].
-pub const ACME_KEY_FILE: &str = "key.pem";
-
-/// ALPN del reto TLS-ALPN-01 (RFC 8737).
-pub const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
-
 /// Certificado y clave listos para TLS.
 #[derive(Debug)]
 pub struct TlsMaterial {
@@ -56,8 +39,7 @@ pub struct TlsMaterial {
 }
 
 impl TlsMaterial {
-    /// Obtiene el certificado según `config.tls_mode`. En modo `acme` es el último emitido o,
-    /// si todavía no hay ninguno, uno autofirmado temporal (en memoria) hasta que llegue.
+    /// Obtiene el certificado según `config.tls_mode`.
     pub fn load(config: &Config) -> Result<Self, ServerError> {
         match config.tls_mode {
             TlsMode::SelfSigned => {
@@ -74,15 +56,6 @@ impl TlsMaterial {
                     .ok_or(ServerError::MissingSetting("COROOM_TLS_KEY"))?;
                 read_pem(cert, key)
             }
-            TlsMode::Acme => {
-                let dir = config.data_dir.join(ACME_DIR);
-                let (cert, key) = (dir.join(ACME_CERT_FILE), dir.join(ACME_KEY_FILE));
-                if cert.is_file() && key.is_file() {
-                    read_pem(&cert, &key)
-                } else {
-                    generate_self_signed(&config.public_host)
-                }
-            }
         }
     }
 
@@ -98,106 +71,45 @@ impl TlsMaterial {
         certificate_validity(self.certs.first()?.as_ref())
     }
 
-    /// Configuración `rustls` para QUIC con un resolutor fijo (tests y herramientas).
+    /// Configuración `rustls` para QUIC (tests y herramientas).
     pub fn quic_server_config(&self) -> Result<rustls::ServerConfig, ServerError> {
         quic_server_config(Arc::new(CertResolver::new(self)?))
     }
 }
 
-/// Certificado en uso y certificados del reto TLS-ALPN-01.
+/// Certificado del servidor, con su huella y su validez para la administración.
 #[derive(Debug)]
 pub struct CertResolver {
-    current: RwLock<Arc<CertifiedKey>>,
-    fingerprint: RwLock<String>,
-    validity: RwLock<Option<(i64, i64)>>,
-    challenges: RwLock<HashMap<String, Arc<CertifiedKey>>>,
+    key: Arc<CertifiedKey>,
+    fingerprint: String,
+    validity: Option<(i64, i64)>,
 }
 
 impl CertResolver {
-    /// Resolutor que empieza con `material`.
+    /// Resolutor que sirve `material`.
     pub fn new(material: &TlsMaterial) -> Result<Self, ServerError> {
         Ok(Self {
-            current: RwLock::new(material.certified_key()?),
-            fingerprint: RwLock::new(material.fingerprint.clone()),
-            validity: RwLock::new(material.validity()),
-            challenges: RwLock::new(HashMap::new()),
+            key: material.certified_key()?,
+            fingerprint: material.fingerprint.clone(),
+            validity: material.validity(),
         })
     }
 
-    /// Cambia el certificado en caliente (las conexiones nuevas reciben el nuevo).
-    pub fn replace(&self, material: &TlsMaterial) -> Result<(), ServerError> {
-        let key = material.certified_key()?;
-        if let Ok(mut current) = self.current.write() {
-            *current = key;
-        }
-        if let Ok(mut fingerprint) = self.fingerprint.write() {
-            fingerprint.clone_from(&material.fingerprint);
-        }
-        if let Ok(mut validity) = self.validity.write() {
-            *validity = material.validity();
-        }
-        Ok(())
-    }
-
-    /// Huella SHA-256 del certificado en uso.
+    /// Huella SHA-256 del certificado.
     pub fn fingerprint(&self) -> String {
-        self.fingerprint
-            .read()
-            .map(|fingerprint| fingerprint.clone())
-            .unwrap_or_default()
+        self.fingerprint.clone()
     }
 
-    /// Validez del certificado en uso.
+    /// Validez del certificado.
     pub fn validity(&self) -> Option<(i64, i64)> {
-        self.validity.read().ok().and_then(|validity| *validity)
-    }
-
-    /// Instala el certificado del reto TLS-ALPN-01 de `domain`.
-    pub fn set_challenge(&self, domain: &str, key: Arc<CertifiedKey>) {
-        if let Ok(mut challenges) = self.challenges.write() {
-            challenges.insert(domain.to_ascii_lowercase(), key);
-        }
-    }
-
-    /// Retira el certificado del reto de `domain`.
-    pub fn clear_challenge(&self, domain: &str) {
-        if let Ok(mut challenges) = self.challenges.write() {
-            challenges.remove(&domain.to_ascii_lowercase());
-        }
+        self.validity
     }
 }
 
 impl ResolvesServerCert for CertResolver {
-    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let acme = client_hello
-            .alpn()
-            .is_some_and(|mut protocols| protocols.any(|protocol| protocol == ACME_TLS_ALPN));
-        if acme {
-            let name = client_hello.server_name()?.to_ascii_lowercase();
-            return self.challenges.read().ok()?.get(&name).cloned();
-        }
-        self.current.read().ok().map(|key| Arc::clone(&key))
+    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(Arc::clone(&self.key))
     }
-}
-
-/// Certificado temporal del reto TLS-ALPN-01 para `domain` con el SHA-256 de la autorización.
-pub fn challenge_certificate(
-    domain: &str,
-    digest: &[u8],
-) -> Result<Arc<CertifiedKey>, ServerError> {
-    let tls = |err: rcgen::Error| ServerError::Tls(format!("certificado del reto ACME: {err}"));
-    let mut params = rcgen::CertificateParams::new(vec![domain.to_owned()]).map_err(tls)?;
-    params.distinguished_name = rcgen::DistinguishedName::new();
-    params.custom_extensions = vec![rcgen::CustomExtension::new_acme_identifier(digest)];
-    let key = rcgen::KeyPair::generate().map_err(tls)?;
-    let cert = params.self_signed(&key).map_err(tls)?;
-    let material = TlsMaterial {
-        fingerprint: sha256_fingerprint(cert.der()),
-        certs: vec![cert.der().clone()],
-        key: PrivateKeyDer::try_from(key.serialize_der())
-            .map_err(|err| ServerError::Tls(err.to_owned()))?,
-    };
-    material.certified_key()
 }
 
 /// Configuración `rustls` para QUIC: solo TLS 1.3, ALPN `h3` y `coroom-relay/1` (el socket
@@ -219,7 +131,7 @@ pub fn quic_server_config(
     Ok(config)
 }
 
-/// Configuración `rustls` para TCP: TLS 1.3 y 1.2, ALPN `h2`, `http/1.1` y `acme-tls/1`.
+/// Configuración `rustls` para TCP: TLS 1.3 y 1.2, ALPN `h2` y `http/1.1`.
 pub fn tcp_server_config(resolver: Arc<CertResolver>) -> Result<rustls::ServerConfig, ServerError> {
     let provider = Arc::new(aws_lc_rs::default_provider());
     let mut config = rustls::ServerConfig::builder_with_provider(provider)
@@ -227,7 +139,7 @@ pub fn tcp_server_config(resolver: Arc<CertResolver>) -> Result<rustls::ServerCo
         .map_err(|err| ServerError::Tls(err.to_string()))?
         .with_no_client_auth()
         .with_cert_resolver(resolver);
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), ACME_TLS_ALPN.to_vec()];
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(config)
 }
 
@@ -254,10 +166,6 @@ fn generate_self_signed_pem(
         generated.cert.pem(),
         generated.signing_key.serialize_pem(),
     ))
-}
-
-fn generate_self_signed(public_host: &str) -> Result<TlsMaterial, ServerError> {
-    generate_self_signed_pem(public_host).map(|(material, _, _)| material)
 }
 
 /// Lee el certificado autofirmado de `data_dir` o lo genera si no existe.
@@ -317,19 +225,6 @@ fn write_file(path: &Path, contents: &[u8], secret: bool) -> Result<(), ServerEr
     file.write_all(contents)
         .and_then(|()| file.sync_all())
         .map_err(|err| ServerError::io("escribir", path, err))
-}
-
-/// Sustituye un fichero de forma atómica (temporal y renombrado); `0600` si es secreto.
-pub fn replace_file(path: &Path, contents: &[u8], secret: bool) -> Result<(), ServerError> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|err| ServerError::io("crear", dir, err))?;
-    }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    let _ = fs::remove_file(&tmp);
-    write_file(&tmp, contents, secret)?;
-    fs::rename(&tmp, path).map_err(|err| ServerError::io("renombrar", path, err))
 }
 
 /// Ruta del certificado autofirmado dentro de `data_dir` (la usan los clientes de prueba).
@@ -435,16 +330,6 @@ mod tests {
     }
 
     #[test]
-    fn acme_starts_with_a_temporary_certificate() {
-        let dir = tempfile::tempdir().expect("directorio temporal");
-        let mut config = config(dir.path());
-        config.tls_mode = TlsMode::Acme;
-        let material = TlsMaterial::load(&config).expect("temporal");
-        assert!(!dir.path().join(SELF_SIGNED_CERT_FILE).exists());
-        assert!(material.certified_key().is_ok());
-    }
-
-    #[test]
     fn files_mode_requires_both_paths() {
         let dir = tempfile::tempdir().expect("directorio temporal");
         let mut config = config(dir.path());
@@ -470,15 +355,21 @@ mod tests {
     }
 
     #[test]
-    fn replaced_pem_files_read_back() {
+    fn files_mode_reads_the_operator_pem() {
         let dir = tempfile::tempdir().expect("directorio temporal");
         let (material, cert_pem, key_pem) =
             generate_self_signed_pem("coroom.example.com").expect("certificado");
-        let (cert, key) = (dir.path().join("c.pem"), dir.path().join("k.pem"));
-        replace_file(&cert, cert_pem.as_bytes(), false).expect("cert");
-        replace_file(&key, key_pem.as_bytes(), true).expect("clave");
-        replace_file(&key, key_pem.as_bytes(), true).expect("sustituir");
-        let read = read_pem(&cert, &key).expect("lectura");
+        let (cert, key) = (
+            dir.path().join("fullchain.pem"),
+            dir.path().join("privkey.pem"),
+        );
+        fs::write(&cert, cert_pem).expect("cert");
+        fs::write(&key, key_pem).expect("clave");
+        let mut config = config(dir.path());
+        config.tls_mode = TlsMode::Files;
+        config.tls_cert = Some(cert);
+        config.tls_key = Some(key);
+        let read = TlsMaterial::load(&config).expect("lectura");
         assert_eq!(read.fingerprint, material.fingerprint);
         assert_eq!(read.key.secret_der(), material.key.secret_der());
     }
@@ -559,44 +450,14 @@ mod tests {
     }
 
     #[test]
-    fn the_tls_alpn_01_certificate_is_served_only_for_its_alpn_and_name() {
-        let domain = "coroom.example.com";
-        let material = generate_self_signed(domain).expect("certificado");
+    fn tcp_serves_the_certificate_with_h2_and_http11() {
+        let (material, _, _) = generate_self_signed_pem("coroom.example.com").expect("certificado");
         let resolver = Arc::new(CertResolver::new(&material).expect("resolutor"));
-        let config = Arc::new(tcp_server_config(Arc::clone(&resolver)).expect("TCP"));
-        let digest = [7u8; 32];
-        resolver.set_challenge(
-            "Coroom.Example.COM",
-            challenge_certificate(domain, &digest).expect("reto"),
-        );
-
-        // Con `acme-tls/1` y el nombre del reto: el certificado temporal con la extensión
-        // `acmeIdentifier` crítica (OID 1.3.6.1.5.5.7.1.31) y el SHA-256 de la autorización.
-        let cert = handshake(&config, domain, ACME_TLS_ALPN).expect("reto servido");
-        let mut extension = vec![
-            0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x1f, 0x01, 0x01, 0xff, 0x04,
-            0x22, 0x04, 0x20,
-        ];
-        extension.extend_from_slice(&digest);
-        assert!(
-            cert.windows(extension.len())
-                .any(|w| w == extension.as_slice())
-        );
-        assert_ne!(sha256_fingerprint(&cert), material.fingerprint);
-
-        // Sin ese ALPN, el certificado normal; con otro nombre o sin reto, nada.
-        let normal = handshake(&config, domain, b"h2").expect("normal");
-        assert_eq!(sha256_fingerprint(&normal), material.fingerprint);
-        assert!(handshake(&config, "otro.example.com", ACME_TLS_ALPN).is_none());
-        resolver.clear_challenge(domain);
-        assert!(handshake(&config, domain, ACME_TLS_ALPN).is_none());
-
-        // Cambio en caliente.
-        let other = generate_self_signed(domain).expect("otro");
-        resolver.replace(&other).expect("sustituir");
-        let swapped = handshake(&config, domain, b"http/1.1").expect("nuevo");
-        assert_eq!(sha256_fingerprint(&swapped), other.fingerprint);
-        assert_eq!(resolver.fingerprint(), other.fingerprint);
+        let config = Arc::new(tcp_server_config(resolver).expect("TCP"));
+        for alpn in [&b"h2"[..], b"http/1.1"] {
+            let cert = handshake(&config, "coroom.example.com", alpn).expect("handshake");
+            assert_eq!(sha256_fingerprint(&cert), material.fingerprint);
+        }
     }
 
     #[test]

@@ -405,12 +405,8 @@ pub struct Settings {
     pub public_udp_port: u16,
     /// Puerto TCP público.
     pub public_tcp_port: u16,
-    /// Modo TLS (`self-signed`, `files`, `acme`).
+    /// Modo TLS (`self-signed` o `files`).
     pub tls_mode: String,
-    /// Directorio ACME (modo `acme`).
-    pub acme_directory: Option<String>,
-    /// Reto ACME (`tls-alpn-01` o `http-01`).
-    pub acme_challenge: Option<String>,
     /// Huella SHA-256 del certificado en uso.
     pub certificate_fingerprint: String,
     /// Caducidad del certificado en uso (RFC 3339), si se conoce.
