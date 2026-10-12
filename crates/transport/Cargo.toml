@@ -1,0 +1,49 @@
+[package]
+name = "coroom-transport"
+description = "Transporte QUIC de coroom: datagramas, FEC, NACK, control de tasa, NAT y cliente relay."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+# Proxy UDP con pérdida y retardo (`lossy::UdpLossy`) para los tests de esta crate y de las demás.
+test-util = []
+
+[dependencies]
+bytes.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1", "http2"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio-rustls.workspace = true
+coroom-crypto.workspace = true
+coroom-proto.workspace = true
+if-addrs.workspace = true
+quinn.workspace = true
+quinn-proto.workspace = true
+raptorq.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+socket2.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "time", "sync", "macros", "io-util"] }
+tracing.workspace = true
+wtransport-proto.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# `timeBeginPeriod`: resolución de 1 ms para el pacer de QUIC y los temporizadores (ver quic.rs).
+windows = { workspace = true, features = ["Win32_Media"] }
+
+[dev-dependencies]
+bytes.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+coroom-transport = { path = ".", features = ["test-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
+
+[lints]
+workspace = true

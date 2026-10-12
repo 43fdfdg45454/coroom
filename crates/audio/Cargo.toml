@@ -1,0 +1,35 @@
+[package]
+name = "coroom-audio"
+description = "Audio de coroom: captura, Opus, jitter, mezcla y supresión de ruido."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+# Cada backend solo se compila en su sistema; activarlos todos por defecto es inocuo en el otro.
+default = ["pipewire", "wasapi", "bundled-opus", "webrtc-apm"]
+# libopus incluida en la crate y compilada con CMake (sin ella, la del sistema).
+bundled-opus = ["opusic-c/bundled", "opusic-sys/bundled"]
+pipewire = ["dep:pipewire"]
+wasapi = ["dep:wasapi"]
+# Procesado de voz de WebRTC (solo Linux: su compilación usa meson, ninja, `nm` y `objcopy`).
+webrtc-apm = ["dep:webrtc-audio-processing"]
+
+[dependencies]
+bytemuck.workspace = true
+opusic-c.workspace = true
+opusic-sys.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# DRED (redundancia profunda de Opus 1.5+) solo en Linux (en Windows, la FEC en banda).
+opusic-c = { workspace = true, features = ["dred"] }
+opusic-sys = { workspace = true, features = ["dred"] }
+pipewire = { workspace = true, optional = true }
+webrtc-audio-processing = { workspace = true, optional = true, features = ["bundled"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wasapi = { workspace = true, optional = true }
+
+[lints]
+workspace = true

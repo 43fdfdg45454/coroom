@@ -1,0 +1,3 @@
+# Los tests pueden usar `unwrap()`; el código de producción no (lint `clippy::unwrap_used` del
+# workspace).
+allow-unwrap-in-tests = true

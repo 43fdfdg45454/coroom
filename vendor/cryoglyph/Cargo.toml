@@ -1,0 +1,21 @@
+# Copia de `cryoglyph` 0.1.0 (crates.io) adaptada a `wgpu` 30; ver `vendor/README.md`.
+[package]
+edition = "2021"
+name = "cryoglyph"
+version = "0.1.0"
+description = "Fast, simple 2D text rendering for wgpu. A fork of glyphon for iced."
+readme = "README.md"
+license = "MIT OR Apache-2.0 OR Zlib"
+repository = "https://github.com/iced-rs/cryoglyph"
+publish = false
+
+[lib]
+name = "cryoglyph"
+path = "src/lib.rs"
+
+[dependencies]
+cosmic-text = "0.15"
+etagere = "0.2"
+lru = { version = "0.18.5", default-features = false }
+rustc-hash = "2"
+wgpu = { version = "30.0.1", default-features = false, features = ["wgsl"] }

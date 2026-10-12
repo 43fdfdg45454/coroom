@@ -1,0 +1,709 @@
+//! Entrada del invitado: eventos, paquetes y su formato en el cable.
+//!
+//! Los eventos ([`InputEvent`]) viajan en dos canales:
+//!
+//! - **Estado** (teclas, botones, rueda, conexión de mando, [`InputEvent::ReleaseAll`]) por el
+//!   *stream* de entrada fiable de QUIC, en [`InputMessage`].
+//! - **Continuo** (movimiento del ratón relativo y absoluto, ejes de mando) por **datagramas** de la
+//!   pista [`Track::Input`], en [`InputPacket`]; el anfitrión descarta los que lleguen más antiguos
+//!   que el último aplicado.
+//!
+//! Los dos se serializan con `postcard` y se cifran con la clave pareja a pareja
+//! (`coroom_crypto::input`). Esta crate solo fija el formato en claro que los rodea:
+//!
+//! | Canal | Bytes en claro | Resto |
+//! |---|---|---|
+//! | Datagrama | `2` (versión de cabecera de medios), `3` ([`Track::Input`]), `0`, `0`, `key_id` (u32 BE) | sellado de `coroom_crypto::input` |
+//! | Stream | al abrirlo, [`STREAM_VERSION`] y `key_id` (u32 BE); después, tramas `longitud (u16 BE) ‖ sellado` | — |
+//!
+//! Los dos primeros bytes del datagrama son los de [`ObjectHeader`]: así una conexión separa los
+//! datagramas de entrada de los de medios mirando solo la pista. `key_id` identifica la clave
+//! pareja a pareja (y con ella al invitado) cuando varios invitados llegan por el relay en una sola
+//! conexión; no es secreto ni hace falta autenticarlo aparte: con otra clave el sellado no abre.
+//!
+//! **Teclas**: códigos **evdev** de Linux (`KEY_*`). **Ratón**: botones por nombre, movimiento
+//! relativo en unidades del ratón, posición absoluta en `0..=65535` del fotograma del anfitrión y
+//! rueda en 1/120 de muesca (positivo = hacia arriba y a la derecha, como `WHEEL_DELTA`).
+//! **Mandos**: vocabulario de un mando Xbox; ejes de los sticks en `i16` con positivo = derecha y
+//! arriba, gatillos en `0..=i16::MAX`. Las ranuras se numeran desde 1.
+
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+use crate::media::{ObjectHeader, Track};
+
+/// Bytes en claro delante del sellado de un datagrama de entrada.
+pub const DATAGRAM_HEADER_LEN: usize = 8;
+
+/// Bytes del preámbulo del stream de entrada ([`STREAM_VERSION`] y `key_id`).
+pub const STREAM_PREAMBLE_LEN: usize = 5;
+
+/// Versión del formato del stream de entrada.
+pub const STREAM_VERSION: u8 = 1;
+
+/// Longitud máxima de una trama sellada del stream.
+pub const MAX_STREAM_FRAME: usize = 16 * 1024;
+
+/// Eventos como mucho por paquete o mensaje (el emisor agrupa o suma por encima).
+pub const MAX_EVENTS: usize = 64;
+
+/// Ranuras de mando por defecto.
+pub const DEFAULT_GAMEPAD_SLOTS: u8 = 4;
+
+/// Ranuras de mando como mucho (`COROOM_MAX_GAMEPADS`).
+pub const MAX_GAMEPAD_SLOTS: u8 = 8;
+
+/// Una muesca de la rueda, en las unidades de [`InputEvent::Wheel`].
+pub const WHEEL_NOTCH: i32 = 120;
+
+/// Botón del ratón.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum MouseButton {
+    /// Izquierdo.
+    Left,
+    /// Derecho.
+    Right,
+    /// Central.
+    Middle,
+    /// Lateral trasero.
+    Back,
+    /// Lateral delantero.
+    Forward,
+}
+
+impl MouseButton {
+    /// Todos los botones.
+    pub const ALL: [MouseButton; 5] = [
+        MouseButton::Left,
+        MouseButton::Right,
+        MouseButton::Middle,
+        MouseButton::Back,
+        MouseButton::Forward,
+    ];
+}
+
+/// Tipo de mando que emula el anfitrión.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GamepadKind {
+    /// Mando compatible con el de Xbox 360.
+    Xbox,
+}
+
+/// Botón de mando (vocabulario de Xbox; los gatillos son ejes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum GamepadButton {
+    /// A (abajo).
+    A,
+    /// B (derecha).
+    B,
+    /// X (izquierda).
+    X,
+    /// Y (arriba).
+    Y,
+    /// Botón superior izquierdo (LB).
+    LeftBumper,
+    /// Botón superior derecho (RB).
+    RightBumper,
+    /// Back / View.
+    Back,
+    /// Start / Menu.
+    Start,
+    /// Guide / botón central.
+    Guide,
+    /// Pulsar el stick izquierdo (LS).
+    LeftStick,
+    /// Pulsar el stick derecho (RS).
+    RightStick,
+    /// Cruceta arriba.
+    DPadUp,
+    /// Cruceta abajo.
+    DPadDown,
+    /// Cruceta izquierda.
+    DPadLeft,
+    /// Cruceta derecha.
+    DPadRight,
+}
+
+impl GamepadButton {
+    /// Todos los botones.
+    pub const ALL: [GamepadButton; 15] = [
+        GamepadButton::A,
+        GamepadButton::B,
+        GamepadButton::X,
+        GamepadButton::Y,
+        GamepadButton::LeftBumper,
+        GamepadButton::RightBumper,
+        GamepadButton::Back,
+        GamepadButton::Start,
+        GamepadButton::Guide,
+        GamepadButton::LeftStick,
+        GamepadButton::RightStick,
+        GamepadButton::DPadUp,
+        GamepadButton::DPadDown,
+        GamepadButton::DPadLeft,
+        GamepadButton::DPadRight,
+    ];
+}
+
+/// Eje de mando.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum GamepadAxis {
+    /// Stick izquierdo, horizontal (positivo = derecha).
+    LeftX,
+    /// Stick izquierdo, vertical (positivo = arriba).
+    LeftY,
+    /// Stick derecho, horizontal.
+    RightX,
+    /// Stick derecho, vertical.
+    RightY,
+    /// Gatillo izquierdo (LT), `0..=i16::MAX`.
+    LeftTrigger,
+    /// Gatillo derecho (RT), `0..=i16::MAX`.
+    RightTrigger,
+}
+
+impl GamepadAxis {
+    /// Todos los ejes.
+    pub const ALL: [GamepadAxis; 6] = [
+        GamepadAxis::LeftX,
+        GamepadAxis::LeftY,
+        GamepadAxis::RightX,
+        GamepadAxis::RightY,
+        GamepadAxis::LeftTrigger,
+        GamepadAxis::RightTrigger,
+    ];
+
+    /// Indica si es un gatillo (solo valores no negativos).
+    pub const fn is_trigger(self) -> bool {
+        matches!(self, GamepadAxis::LeftTrigger | GamepadAxis::RightTrigger)
+    }
+}
+
+/// Evento de entrada independiente de la plataforma.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum InputEvent {
+    /// Tecla física pulsada o soltada, por código evdev (`KEY_*`).
+    Key {
+        /// Código evdev.
+        code: u16,
+        /// `true` al pulsar.
+        pressed: bool,
+    },
+    /// Botón del ratón.
+    MouseButton {
+        /// Botón.
+        button: MouseButton,
+        /// `true` al pulsar.
+        pressed: bool,
+    },
+    /// Movimiento relativo (modo inmersivo), en unidades del ratón.
+    MouseMove {
+        /// Horizontal (positivo = derecha).
+        dx: i32,
+        /// Vertical (positivo = abajo).
+        dy: i32,
+    },
+    /// Posición absoluta (modo escritorio) en `0..=65535` del fotograma del anfitrión.
+    MouseMoveAbsolute {
+        /// Horizontal (0 = borde izquierdo).
+        x: u16,
+        /// Vertical (0 = borde superior).
+        y: u16,
+    },
+    /// Rueda, en 1/120 de muesca ([`WHEEL_NOTCH`]); positivo = arriba y derecha.
+    Wheel {
+        /// Horizontal.
+        dx: i32,
+        /// Vertical.
+        dy: i32,
+    },
+    /// El invitado conectó un mando para su ranura.
+    GamepadConnected {
+        /// Ranura (desde 1).
+        slot: u8,
+        /// Tipo.
+        kind: GamepadKind,
+    },
+    /// El invitado desconectó el mando de su ranura.
+    GamepadDisconnected {
+        /// Ranura.
+        slot: u8,
+    },
+    /// Botón de mando.
+    GamepadButton {
+        /// Ranura.
+        slot: u8,
+        /// Botón.
+        button: GamepadButton,
+        /// `true` al pulsar.
+        pressed: bool,
+    },
+    /// Eje de mando.
+    GamepadAxis {
+        /// Ranura.
+        slot: u8,
+        /// Eje.
+        axis: GamepadAxis,
+        /// Valor ([`GamepadAxis`]).
+        value: i16,
+    },
+    /// Soltar todo lo pulsado (al perder el foco, al pausar o al expulsar).
+    ReleaseAll,
+}
+
+/// Qué permiso necesita un evento.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EventClass {
+    /// Teclado y ratón.
+    KeyboardMouse,
+    /// El mando de esa ranura.
+    Gamepad(u8),
+    /// Ninguno ([`InputEvent::ReleaseAll`]).
+    Control,
+}
+
+impl InputEvent {
+    /// Indica si es movimiento continuo (va por datagramas): ratón y ejes de mando.
+    pub const fn is_continuous(&self) -> bool {
+        matches!(
+            self,
+            InputEvent::MouseMove { .. }
+                | InputEvent::MouseMoveAbsolute { .. }
+                | InputEvent::GamepadAxis { .. }
+        )
+    }
+
+    /// Permiso que necesita.
+    pub const fn class(&self) -> EventClass {
+        match self {
+            InputEvent::Key { .. }
+            | InputEvent::MouseButton { .. }
+            | InputEvent::MouseMove { .. }
+            | InputEvent::MouseMoveAbsolute { .. }
+            | InputEvent::Wheel { .. } => EventClass::KeyboardMouse,
+            InputEvent::GamepadConnected { slot, .. }
+            | InputEvent::GamepadDisconnected { slot }
+            | InputEvent::GamepadButton { slot, .. }
+            | InputEvent::GamepadAxis { slot, .. } => EventClass::Gamepad(*slot),
+            InputEvent::ReleaseAll => EventClass::Control,
+        }
+    }
+}
+
+/// Error del formato de entrada.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputWireError {
+    /// Faltan bytes.
+    Truncated,
+    /// No es un datagrama de entrada (otra versión o pista).
+    NotInput,
+    /// Versión de stream desconocida.
+    UnsupportedVersion(u8),
+    /// Una trama del stream anuncia más de [`MAX_STREAM_FRAME`] bytes o está vacía.
+    BadFrameLength(usize),
+    /// Más de [`MAX_EVENTS`] eventos.
+    TooManyEvents(usize),
+    /// El cuerpo no es un `postcard` válido.
+    Postcard(String),
+}
+
+impl fmt::Display for InputWireError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InputWireError::Truncated => f.write_str("mensaje de entrada truncado"),
+            InputWireError::NotInput => f.write_str("no es un datagrama de entrada"),
+            InputWireError::UnsupportedVersion(version) => {
+                write!(f, "versión del stream de entrada no admitida: {version}")
+            }
+            InputWireError::BadFrameLength(len) => {
+                write!(f, "trama de entrada de {len} bytes no válida")
+            }
+            InputWireError::TooManyEvents(count) => write!(
+                f,
+                "{count} eventos en un mensaje de entrada (como mucho {MAX_EVENTS})"
+            ),
+            InputWireError::Postcard(err) => write!(f, "mensaje de entrada no válido: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for InputWireError {}
+
+fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, InputWireError> {
+    postcard::to_stdvec(value).map_err(|err| InputWireError::Postcard(err.to_string()))
+}
+
+fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, InputWireError> {
+    let (value, rest) = postcard::take_from_bytes(bytes)
+        .map_err(|err| InputWireError::Postcard(err.to_string()))?;
+    if !rest.is_empty() {
+        return Err(InputWireError::Postcard(format!(
+            "sobran {} bytes tras el mensaje",
+            rest.len()
+        )));
+    }
+    Ok(value)
+}
+
+/// Paquete de movimiento continuo (datagrama).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputPacket {
+    /// Secuencia del canal de datagramas (la misma que autentica el sellado).
+    pub seq: u32,
+    /// Hora del primer evento en µs del reloj del anfitrión (estimado por `Ping`/`Pong`, truncado
+    /// a 32 bits); `0` si aún no se conoce el desfase.
+    pub sent_us: u32,
+    /// Eventos, en orden.
+    pub events: Vec<InputEvent>,
+}
+
+/// Mensaje de cambios de estado (stream fiable).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputMessage {
+    /// Secuencia del canal del stream.
+    pub seq: u32,
+    /// Como [`InputPacket::sent_us`].
+    pub sent_us: u32,
+    /// Eventos, en orden.
+    pub events: Vec<InputEvent>,
+}
+
+macro_rules! impl_bytes {
+    ($ty:ty) => {
+        impl $ty {
+            /// Serializa con `postcard`.
+            pub fn to_bytes(&self) -> Result<Vec<u8>, InputWireError> {
+                if self.events.len() > MAX_EVENTS {
+                    return Err(InputWireError::TooManyEvents(self.events.len()));
+                }
+                encode(self)
+            }
+
+            /// Inverso de `to_bytes`; rechaza bytes sobrantes y más de [`MAX_EVENTS`] eventos.
+            pub fn from_bytes(bytes: &[u8]) -> Result<Self, InputWireError> {
+                let value: Self = decode(bytes)?;
+                if value.events.len() > MAX_EVENTS {
+                    return Err(InputWireError::TooManyEvents(value.events.len()));
+                }
+                Ok(value)
+            }
+        }
+    };
+}
+
+impl_bytes!(InputPacket);
+impl_bytes!(InputMessage);
+
+/// Cabecera en claro de un datagrama de entrada con la clave `key_id`.
+pub fn datagram_header(key_id: u32) -> [u8; DATAGRAM_HEADER_LEN] {
+    let mut out = [0u8; DATAGRAM_HEADER_LEN];
+    out[0] = ObjectHeader::VERSION;
+    out[1] = Track::Input.id();
+    out[4..].copy_from_slice(&key_id.to_be_bytes());
+    out
+}
+
+/// Indica si un datagrama es de entrada (sin validar el resto).
+pub fn is_input_datagram(bytes: &[u8]) -> bool {
+    bytes.len() >= 2 && bytes[0] == ObjectHeader::VERSION && bytes[1] == Track::Input.id()
+}
+
+/// Separa la clave y el sellado de un datagrama de entrada.
+pub fn parse_datagram(bytes: &[u8]) -> Result<(u32, &[u8]), InputWireError> {
+    if !is_input_datagram(bytes) {
+        return Err(if bytes.len() < 2 {
+            InputWireError::Truncated
+        } else {
+            InputWireError::NotInput
+        });
+    }
+    let Some(header) = bytes.first_chunk::<DATAGRAM_HEADER_LEN>() else {
+        return Err(InputWireError::Truncated);
+    };
+    let key_id = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+    Ok((key_id, &bytes[DATAGRAM_HEADER_LEN..]))
+}
+
+/// Preámbulo del stream de entrada con la clave `key_id`.
+pub fn stream_preamble(key_id: u32) -> [u8; STREAM_PREAMBLE_LEN] {
+    let mut out = [0u8; STREAM_PREAMBLE_LEN];
+    out[0] = STREAM_VERSION;
+    out[1..].copy_from_slice(&key_id.to_be_bytes());
+    out
+}
+
+/// Lee el preámbulo del stream: la clave.
+pub fn parse_stream_preamble(bytes: [u8; STREAM_PREAMBLE_LEN]) -> Result<u32, InputWireError> {
+    if bytes[0] != STREAM_VERSION {
+        return Err(InputWireError::UnsupportedVersion(bytes[0]));
+    }
+    Ok(u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]))
+}
+
+/// Trama del stream: `longitud (u16 BE) ‖ sellado`.
+pub fn stream_frame(sealed: &[u8]) -> Result<Vec<u8>, InputWireError> {
+    if sealed.is_empty() || sealed.len() > MAX_STREAM_FRAME {
+        return Err(InputWireError::BadFrameLength(sealed.len()));
+    }
+    let mut out = Vec::with_capacity(2 + sealed.len());
+    // Cabe: `MAX_STREAM_FRAME < u16::MAX`.
+    out.extend_from_slice(&(sealed.len() as u16).to_be_bytes());
+    out.extend_from_slice(sealed);
+    Ok(out)
+}
+
+/// Recompone las tramas del stream a partir de trozos arbitrarios.
+#[derive(Debug, Default)]
+pub struct StreamFrames {
+    buffer: Vec<u8>,
+}
+
+impl StreamFrames {
+    /// Búfer vacío.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Añade bytes leídos.
+    pub fn extend(&mut self, bytes: &[u8]) {
+        self.buffer.extend_from_slice(bytes);
+    }
+
+    /// Bytes pendientes.
+    pub fn pending(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Siguiente sellado completo, si ya llegó.
+    pub fn next_frame(&mut self) -> Result<Option<Vec<u8>>, InputWireError> {
+        let Some(prefix) = self.buffer.first_chunk::<2>() else {
+            return Ok(None);
+        };
+        let len = usize::from(u16::from_be_bytes(*prefix));
+        if len == 0 || len > MAX_STREAM_FRAME {
+            return Err(InputWireError::BadFrameLength(len));
+        }
+        if self.buffer.len() < 2 + len {
+            return Ok(None);
+        }
+        let frame = self.buffer[2..2 + len].to_vec();
+        self.buffer.drain(..2 + len);
+        Ok(Some(frame))
+    }
+}
+
+/// `true` si la secuencia `a` es posterior a `b` con aritmética circular de 32 bits.
+pub const fn seq_after(a: u32, b: u32) -> bool {
+    a != b && a.wrapping_sub(b) < 1 << 31
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn slot() -> impl Strategy<Value = u8> {
+        1..=MAX_GAMEPAD_SLOTS
+    }
+
+    fn event() -> impl Strategy<Value = InputEvent> {
+        prop_oneof![
+            (any::<u16>(), any::<bool>())
+                .prop_map(|(code, pressed)| InputEvent::Key { code, pressed }),
+            (
+                prop::sample::select(MouseButton::ALL.to_vec()),
+                any::<bool>()
+            )
+                .prop_map(|(button, pressed)| InputEvent::MouseButton { button, pressed }),
+            (any::<i32>(), any::<i32>()).prop_map(|(dx, dy)| InputEvent::MouseMove { dx, dy }),
+            (any::<u16>(), any::<u16>()).prop_map(|(x, y)| InputEvent::MouseMoveAbsolute { x, y }),
+            (any::<i32>(), any::<i32>()).prop_map(|(dx, dy)| InputEvent::Wheel { dx, dy }),
+            slot().prop_map(|slot| InputEvent::GamepadConnected {
+                slot,
+                kind: GamepadKind::Xbox
+            }),
+            slot().prop_map(|slot| InputEvent::GamepadDisconnected { slot }),
+            (
+                slot(),
+                prop::sample::select(GamepadButton::ALL.to_vec()),
+                any::<bool>()
+            )
+                .prop_map(|(slot, button, pressed)| InputEvent::GamepadButton {
+                    slot,
+                    button,
+                    pressed
+                }),
+            (
+                slot(),
+                prop::sample::select(GamepadAxis::ALL.to_vec()),
+                any::<i16>()
+            )
+                .prop_map(|(slot, axis, value)| InputEvent::GamepadAxis {
+                    slot,
+                    axis,
+                    value
+                }),
+            Just(InputEvent::ReleaseAll),
+        ]
+    }
+
+    fn events() -> impl Strategy<Value = Vec<InputEvent>> {
+        prop::collection::vec(event(), 0..=MAX_EVENTS)
+    }
+
+    proptest! {
+        #[test]
+        fn packets_round_trip(seq in any::<u32>(), sent_us in any::<u32>(), events in events()) {
+            let packet = InputPacket { seq, sent_us, events };
+            let bytes = packet.to_bytes().expect("serializar");
+            prop_assert_eq!(InputPacket::from_bytes(&bytes), Ok(packet));
+        }
+
+        #[test]
+        fn messages_round_trip(seq in any::<u32>(), sent_us in any::<u32>(), events in events()) {
+            let message = InputMessage { seq, sent_us, events };
+            let bytes = message.to_bytes().expect("serializar");
+            prop_assert_eq!(InputMessage::from_bytes(&bytes), Ok(message.clone()));
+            if bytes.len() > 1 {
+                prop_assert!(InputMessage::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+            }
+        }
+
+        #[test]
+        fn events_round_trip_alone(event in event()) {
+            let bytes = postcard::to_stdvec(&event).expect("serializar");
+            prop_assert_eq!(decode::<InputEvent>(&bytes), Ok(event));
+        }
+
+        #[test]
+        fn garbage_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..128)) {
+            let _ = InputPacket::from_bytes(&bytes);
+            let _ = InputMessage::from_bytes(&bytes);
+            let _ = parse_datagram(&bytes);
+            let mut frames = StreamFrames::new();
+            frames.extend(&bytes);
+            let _ = frames.next_frame();
+        }
+
+        #[test]
+        fn datagram_headers_round_trip(key_id in any::<u32>(), body in prop::collection::vec(any::<u8>(), 0..64)) {
+            let mut datagram = datagram_header(key_id).to_vec();
+            datagram.extend_from_slice(&body);
+            prop_assert!(is_input_datagram(&datagram));
+            prop_assert_eq!(parse_datagram(&datagram), Ok((key_id, &body[..])));
+        }
+
+        #[test]
+        fn stream_frames_survive_chunking(
+            frames in prop::collection::vec(prop::collection::vec(any::<u8>(), 1..200), 1..10),
+            chunk in 1usize..50,
+        ) {
+            let mut stream = Vec::new();
+            for frame in &frames {
+                stream.extend(stream_frame(frame).expect("trama"));
+            }
+            let mut buffer = StreamFrames::new();
+            let mut out = Vec::new();
+            for part in stream.chunks(chunk) {
+                buffer.extend(part);
+                while let Some(frame) = buffer.next_frame().expect("trama") {
+                    out.push(frame);
+                }
+            }
+            prop_assert_eq!(out, frames);
+            prop_assert_eq!(buffer.pending(), 0);
+        }
+    }
+
+    #[test]
+    fn too_many_events_are_rejected() {
+        let packet = InputPacket {
+            seq: 1,
+            sent_us: 0,
+            events: vec![InputEvent::ReleaseAll; MAX_EVENTS + 1],
+        };
+        assert_eq!(
+            packet.to_bytes(),
+            Err(InputWireError::TooManyEvents(MAX_EVENTS + 1))
+        );
+        let raw = postcard::to_stdvec(&packet).expect("serializar");
+        assert!(matches!(
+            InputPacket::from_bytes(&raw),
+            Err(InputWireError::TooManyEvents(_))
+        ));
+    }
+
+    #[test]
+    fn input_datagrams_are_told_apart_from_media() {
+        let media = ObjectHeader {
+            track: Track::Video,
+            flags: ObjectHeader::LAST_OBJECT,
+            group: 1,
+            object: 0,
+            object_count: 1,
+            payload_len: 0,
+            epoch_hint: 0,
+        };
+        assert!(!is_input_datagram(&media.to_bytes()));
+        assert_eq!(
+            parse_datagram(&media.to_bytes()),
+            Err(InputWireError::NotInput)
+        );
+        assert!(is_input_datagram(&datagram_header(7)));
+        assert_eq!(
+            parse_datagram(&datagram_header(7)[..5]),
+            Err(InputWireError::Truncated)
+        );
+    }
+
+    #[test]
+    fn stream_preamble_and_frames_are_checked() {
+        assert_eq!(
+            parse_stream_preamble(stream_preamble(0xdead_beef)),
+            Ok(0xdead_beef)
+        );
+        assert_eq!(
+            parse_stream_preamble([9, 0, 0, 0, 0]),
+            Err(InputWireError::UnsupportedVersion(9))
+        );
+        assert!(stream_frame(&[]).is_err());
+        assert!(stream_frame(&vec![0; MAX_STREAM_FRAME + 1]).is_err());
+        let mut frames = StreamFrames::new();
+        frames.extend(&[0, 0]);
+        assert_eq!(frames.next_frame(), Err(InputWireError::BadFrameLength(0)));
+    }
+
+    #[test]
+    fn classes_follow_the_permissions() {
+        assert_eq!(
+            InputEvent::Key {
+                code: 30,
+                pressed: true
+            }
+            .class(),
+            EventClass::KeyboardMouse
+        );
+        assert_eq!(
+            InputEvent::GamepadAxis {
+                slot: 2,
+                axis: GamepadAxis::LeftX,
+                value: 5
+            }
+            .class(),
+            EventClass::Gamepad(2)
+        );
+        assert_eq!(InputEvent::ReleaseAll.class(), EventClass::Control);
+        assert!(InputEvent::MouseMove { dx: 1, dy: 1 }.is_continuous());
+        assert!(!InputEvent::Wheel { dx: 0, dy: 120 }.is_continuous());
+    }
+
+    #[test]
+    fn sequences_wrap_around() {
+        assert!(seq_after(1, 0));
+        assert!(!seq_after(0, 1));
+        assert!(!seq_after(5, 5));
+        assert!(seq_after(0, u32::MAX));
+        assert!(seq_after(10, u32::MAX - 10));
+    }
+}

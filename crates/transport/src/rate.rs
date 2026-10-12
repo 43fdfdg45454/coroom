@@ -1,0 +1,728 @@
+//! Control de tasa de los medios y controlador de congestión de `quinn`.
+//!
+//! [`RateController`] está inspirado en **SCReAM** (RFC 8298): el receptor envía un `Feedback`
+//! cada 50 ms con sus marcas de llegada, los objetos perdidos y las marcas ECN-CE; el emisor estima
+//! la cola del camino como el retardo de ida (OWD) por encima de su mínimo de los últimos 10 s y
+//! ajusta el bitrate objetivo:
+//!
+//! - **por retardo**: sin cola, crecimiento multiplicativo suave, +5 % cada 100 ms, hasta
+//!   `max_kbps`; cola por encima de [`QUEUE_THRESHOLD`] y creciendo: reducción proporcional al
+//!   exceso; marcas ECN-CE sin cola: reducción del 10 % (reacción tipo L4S);
+//! - **por pérdida**, una segunda estimación como la del controlador GCC
+//!   (`draft-ietf-rmcat-gcc`, §6): con la pérdida de los informes del último segundo
+//!   ([`LOSS_WINDOW`]) por debajo del 2 % crece, entre el 2 y el 10 % se mantiene y por encima del
+//!   10 % se recorta en `pérdida / 2` cada 300 ms;
+//! - el objetivo es el **mínimo** de las dos. La pérdida aleatoria de un enlace malo (sin cola) la
+//!   cubren la FEC y el `Nack`: con una sola estimación, recortar con cada 2 % la hundía hasta el
+//!   mínimo, y con el 5 % de pérdida del perfil `mala` ya no se recuperaba de ningún recorte por
+//!   cola (lo destapó la matriz de red).
+//!
+//! La **cola** es el mínimo del OWD de los informes de los últimos 500 ms ([`QUEUE_WINDOW`]) por
+//! encima del mínimo de los últimos 10 s: una cola de verdad sube también el mínimo, el jitter no
+//! (con 60 ± 20 ms y ~15 muestras en la ventana, el mínimo pasa de los 10 ms del umbral con una
+//! probabilidad del 1 %; una cola que crece se detecta con 500 ms de retraso como mucho).
+//! (Antes era la mediana de cada informe, y con 30 ± 10 ms de jitter la «cola» rondaba
+//! los 10 ms del umbral sin que hubiera ninguna: el bitrate caía al mínimo.)
+//!
+//! La salida [`RateController::target_kbps`] lleva histéresis: si la variación es < 10 % no cambia
+//! más de una vez por segundo, para no reconfigurar el codificador a cada informe.
+//!
+//! [`MediaControllerFactory`] construye el controlador de congestión propio para `quinn`: fija
+//! la ventana a `target_kbps × RTT × 2` (nunca por debajo de 64 KB) para que QUIC no frene los
+//! datagramas por su cuenta, y cuenta los eventos de congestión por ECN que `quinn` le notifica
+//! (`on_congestion_event` con `lost_bytes == 0`). Se compara con el BBR
+//! de `quinn` ([`Congestion::Bbr`]) en el spike `tests/spike.rs`.
+//!
+//! ECN: `quinn` 0.11 marca ECT(0) y procesa los contadores ECN de los ACK, pero no expone al
+//! receptor cuántos paquetes llegaron con CE. Por eso `Feedback::ecn_ce` va a 0 desde el receptor y
+//! el emisor usa en su lugar los eventos ECN que ve su controlador de congestión
+//! ([`CongestionShared::ecn_events`]).
+
+use std::any::Any;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use quinn::congestion::{BbrConfig, Controller, ControllerFactory};
+// `quinn` no reexporta el estimador de RTT que recibe `Controller::on_ack`.
+use quinn_proto::RttEstimator;
+
+/// Ventana mínima del controlador de congestión de medios.
+pub const MIN_WINDOW: u64 = 64 * 1024;
+
+/// Factor de la ventana sobre el producto bitrate × RTT.
+pub const WINDOW_RTT_FACTOR: u64 = 2;
+
+/// Cola a partir de la cual el emisor reduce el bitrate.
+pub const QUEUE_THRESHOLD: Duration = Duration::from_millis(10);
+
+/// Ventana del mínimo de OWD (retardo base del camino).
+const BASE_WINDOW: Duration = Duration::from_secs(10);
+
+/// Ventana corta del mínimo de OWD con la que se estima la cola (filtra el jitter).
+pub const QUEUE_WINDOW: Duration = Duration::from_millis(500);
+
+/// Pérdida por debajo de la cual se puede crecer (GCC).
+pub const LOSS_GROW: f64 = 0.02;
+
+/// Pérdida por encima de la cual se reduce (GCC).
+pub const LOSS_CUT: f64 = 0.10;
+
+/// Periodo de los incrementos y de las reducciones por cola o ECN.
+const ADJUST_PERIOD: Duration = Duration::from_millis(100);
+
+/// Periodo mínimo entre reducciones por pérdida.
+const LOSS_PERIOD: Duration = Duration::from_millis(300);
+
+/// Ventana de la pérdida: la fracción es la de los objetos de los informes del último segundo (como
+/// el intervalo de RTCP de GCC). Un informe de 50 ms lleva ~10 objetos a 30 fps: con un 5 % de
+/// pérdida, uno perdido ya es un 10 %, y decidir con eso recortaba al azar.
+pub const LOSS_WINDOW: Duration = Duration::from_secs(1);
+
+/// Informes en [`LOSS_WINDOW`] como mucho.
+const MAX_LOSS_REPORTS: usize = 256;
+
+/// Histéresis de la salida.
+const OUTPUT_PERIOD: Duration = Duration::from_secs(1);
+const OUTPUT_STEP: f64 = 0.10;
+
+/// Límites del bitrate objetivo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateConfig {
+    /// Mínimo, en kbit/s.
+    pub min_kbps: u32,
+    /// Máximo, en kbit/s (el del usuario).
+    pub max_kbps: u32,
+    /// Valor inicial, en kbit/s.
+    pub start_kbps: u32,
+}
+
+impl Default for RateConfig {
+    /// 1080p60 AV1/HEVC "buena" de `docs/ARQUITECTURA.md` §2.1: arranca en 8 Mbit/s, entre 1 y 50.
+    fn default() -> Self {
+        Self {
+            min_kbps: 1_000,
+            max_kbps: 50_000,
+            start_kbps: 8_000,
+        }
+    }
+}
+
+/// Datos de un `Feedback` ya traducidos por el emisor.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RateInput<'a> {
+    /// Retardos de ida en µs (con un desfase constante desconocido: solo importa su variación).
+    pub owd_us: &'a [i64],
+    /// Fracción de objetos de origen perdidos en la red desde el último informe (0..1).
+    pub loss_fraction: f64,
+    /// Objetos de origen que cubre `loss_fraction` (su peso en [`LOSS_WINDOW`]); con 0, el
+    /// informe no dice nada de la pérdida.
+    pub sent_objects: u64,
+    /// Marcas ECN-CE nuevas desde el último informe.
+    pub ecn_ce: u32,
+}
+
+/// Control de tasa tipo SCReAM del emisor.
+#[derive(Debug, Clone)]
+pub struct RateController {
+    config: RateConfig,
+    /// Estimación por retardo (cola y ECN), la de SCReAM.
+    estimate: f64,
+    /// Estimación por pérdida, la de GCC: el objetivo es el mínimo de las dos.
+    loss_estimate: f64,
+    /// Informes de [`LOSS_WINDOW`]: instante, objetos perdidos y objetos enviados.
+    loss_window: VecDeque<(Instant, f64, u64)>,
+    output: u32,
+    last_output_change: Option<Instant>,
+    base: VecDeque<(Instant, i64)>,
+    recent: VecDeque<(Instant, i64)>,
+    queue_ms: f64,
+    previous_queue_ms: f64,
+    loss: f64,
+    last_adjust: Option<Instant>,
+    last_loss_cut: Option<Instant>,
+    last_loss_grow: Option<Instant>,
+}
+
+impl RateController {
+    /// Controlador que arranca en `config.start_kbps` (acotado a `[min, max]`).
+    pub fn new(config: RateConfig) -> Self {
+        let max = config.max_kbps.max(config.min_kbps);
+        let config = RateConfig {
+            max_kbps: max,
+            start_kbps: config.start_kbps.clamp(config.min_kbps, max),
+            ..config
+        };
+        Self {
+            config,
+            estimate: f64::from(config.start_kbps),
+            loss_estimate: f64::from(config.start_kbps),
+            loss_window: VecDeque::new(),
+            output: config.start_kbps,
+            last_output_change: None,
+            base: VecDeque::new(),
+            recent: VecDeque::new(),
+            queue_ms: 0.0,
+            previous_queue_ms: 0.0,
+            loss: 0.0,
+            last_adjust: None,
+            last_loss_cut: None,
+            last_loss_grow: None,
+        }
+    }
+
+    /// Límites en uso.
+    pub fn config(&self) -> RateConfig {
+        self.config
+    }
+
+    /// Bitrate objetivo para el codificador, con histéresis.
+    pub fn target_kbps(&self) -> u32 {
+        self.output
+    }
+
+    /// Estimación interna sin histéresis, en kbit/s.
+    pub fn estimate_kbps(&self) -> f64 {
+        self.estimate.min(self.loss_estimate)
+    }
+
+    /// Cola estimada (suavizada).
+    pub fn queue_delay(&self) -> Duration {
+        Duration::from_secs_f64(self.queue_ms.max(0.0) / 1000.0)
+    }
+
+    /// Pérdida de [`LOSS_WINDOW`] (0..1).
+    pub fn loss(&self) -> f64 {
+        self.loss
+    }
+
+    /// Procesa un informe y devuelve el bitrate objetivo resultante.
+    pub fn update(&mut self, now: Instant, input: RateInput<'_>) -> u32 {
+        self.update_queue(now, input.owd_us);
+        self.update_loss(now, input.loss_fraction, input.sent_objects);
+
+        let threshold = QUEUE_THRESHOLD.as_secs_f64() * 1000.0;
+        let growing = self.queue_ms > self.previous_queue_ms;
+        let queue = self.queue_ms > threshold && (growing || self.queue_ms > 2.0 * threshold);
+        let due = |last: Option<Instant>, period: Duration| {
+            last.is_none_or(|at| now.saturating_duration_since(at) >= period)
+        };
+
+        // Retardo: la cola y ECN recortan; sin cola, crece.
+        if queue {
+            if due(self.last_adjust, ADJUST_PERIOD) {
+                let excess = (self.queue_ms - threshold) / threshold;
+                let cut = (0.05 + 0.10 * excess).clamp(0.05, 0.40);
+                self.estimate *= 1.0 - cut;
+                self.last_adjust = Some(now);
+            }
+        } else if input.ecn_ce > 0 {
+            if due(self.last_adjust, ADJUST_PERIOD) {
+                self.estimate *= 0.90;
+                self.last_adjust = Some(now);
+            }
+        } else if self.queue_ms < threshold / 2.0 && due(self.last_adjust, ADJUST_PERIOD) {
+            self.estimate *= 1.05;
+            self.last_adjust = Some(now);
+        }
+        // Pérdida (GCC): por encima del 10 %, recorte desde el objetivo actual; por debajo del
+        // 2 %, crece; entre medias se mantiene (y manda la estimación por retardo).
+        if self.loss > LOSS_CUT {
+            if due(self.last_loss_cut, LOSS_PERIOD) {
+                let current = self.estimate.min(self.loss_estimate);
+                self.loss_estimate = current * (1.0 - 0.5 * self.loss);
+                self.last_loss_cut = Some(now);
+            }
+        } else if self.loss < LOSS_GROW && due(self.last_loss_grow, ADJUST_PERIOD) {
+            self.loss_estimate *= 1.05;
+            self.last_loss_grow = Some(now);
+        }
+        let (min, max) = (
+            f64::from(self.config.min_kbps),
+            f64::from(self.config.max_kbps),
+        );
+        self.estimate = self.estimate.clamp(min, max);
+        self.loss_estimate = self.loss_estimate.clamp(min, max);
+        self.previous_queue_ms = self.queue_ms;
+        self.update_output(now);
+        self.output
+    }
+
+    fn update_loss(&mut self, now: Instant, fraction: f64, sent: u64) {
+        if sent > 0 {
+            let lost = fraction.clamp(0.0, 1.0) * sent as f64;
+            self.loss_window.push_back((now, lost, sent));
+        }
+        // Un informe cada 50 ms son 20 en la ventana; la cota es solo contra un par que inunde.
+        while self.loss_window.len() > MAX_LOSS_REPORTS {
+            self.loss_window.pop_front();
+        }
+        while self
+            .loss_window
+            .front()
+            .is_some_and(|&(at, _, _)| now.saturating_duration_since(at) > LOSS_WINDOW)
+        {
+            self.loss_window.pop_front();
+        }
+        let (lost, sent) = self
+            .loss_window
+            .iter()
+            .fold((0.0, 0u64), |(lost, sent), &(_, l, s)| (lost + l, sent + s));
+        if sent > 0 {
+            self.loss = lost / sent as f64;
+        }
+    }
+
+    fn update_queue(&mut self, now: Instant, owd_us: &[i64]) {
+        let Some(minimum) = owd_us.iter().copied().min() else {
+            return;
+        };
+        for (window, keep) in [
+            (&mut self.base, BASE_WINDOW),
+            (&mut self.recent, QUEUE_WINDOW),
+        ] {
+            window.push_back((now, minimum));
+            while window
+                .front()
+                .is_some_and(|(at, _)| now.saturating_duration_since(*at) > keep)
+            {
+                window.pop_front();
+            }
+        }
+        let floor = |window: &VecDeque<(Instant, i64)>| {
+            window.iter().map(|(_, owd)| *owd).min().unwrap_or(minimum)
+        };
+        let queue_ms = (floor(&self.recent) - floor(&self.base)).max(0) as f64 / 1000.0;
+        self.queue_ms = 0.7 * self.queue_ms + 0.3 * queue_ms;
+    }
+
+    fn update_output(&mut self, now: Instant) {
+        let candidate = self.estimate_kbps().round() as u32;
+        if candidate == self.output {
+            return;
+        }
+        let change =
+            (f64::from(candidate) - f64::from(self.output)).abs() / f64::from(self.output.max(1));
+        let elapsed = self
+            .last_output_change
+            .is_none_or(|at| now.saturating_duration_since(at) >= OUTPUT_PERIOD);
+        if change >= OUTPUT_STEP || elapsed {
+            self.output = candidate;
+            self.last_output_change = Some(now);
+        }
+    }
+}
+
+/// Estado compartido entre una conexión y su controlador de congestión.
+#[derive(Debug)]
+pub struct CongestionShared {
+    target_kbps: AtomicU32,
+    ecn_events: AtomicU64,
+    loss_events: AtomicU64,
+    window: AtomicU64,
+}
+
+impl CongestionShared {
+    /// Estado con un bitrate objetivo inicial.
+    pub fn new(target_kbps: u32) -> Arc<Self> {
+        Arc::new(Self {
+            target_kbps: AtomicU32::new(target_kbps),
+            ecn_events: AtomicU64::new(0),
+            loss_events: AtomicU64::new(0),
+            window: AtomicU64::new(MIN_WINDOW),
+        })
+    }
+
+    /// Fija el bitrate objetivo del que depende la ventana.
+    pub fn set_target_kbps(&self, kbps: u32) {
+        self.target_kbps.store(kbps, Ordering::Relaxed);
+    }
+
+    /// Bitrate objetivo actual.
+    pub fn target_kbps(&self) -> u32 {
+        self.target_kbps.load(Ordering::Relaxed)
+    }
+
+    /// Eventos de congestión por ECN-CE notificados por `quinn` (acumulado).
+    pub fn ecn_events(&self) -> u64 {
+        self.ecn_events.load(Ordering::Relaxed)
+    }
+
+    /// Eventos de congestión por pérdida notificados por `quinn` (acumulado).
+    pub fn loss_events(&self) -> u64 {
+        self.loss_events.load(Ordering::Relaxed)
+    }
+
+    /// Última ventana calculada, en bytes.
+    pub fn window(&self) -> u64 {
+        self.window.load(Ordering::Relaxed)
+    }
+}
+
+/// Ventana del controlador de medios para un bitrate y un RTT.
+pub fn media_window(target_kbps: u32, rtt: Duration) -> u64 {
+    let bytes_per_second = u64::from(target_kbps) * 1000 / 8;
+    let bdp = (bytes_per_second as f64 * rtt.as_secs_f64()) as u64;
+    (bdp * WINDOW_RTT_FACTOR).max(MIN_WINDOW)
+}
+
+/// Controlador de congestión de `quinn` que no frena los medios por debajo de su bitrate objetivo.
+#[derive(Debug, Clone)]
+pub struct MediaController {
+    shared: Arc<CongestionShared>,
+    rtt: Duration,
+}
+
+impl MediaController {
+    /// Estado compartido de este controlador.
+    pub fn shared(&self) -> &Arc<CongestionShared> {
+        &self.shared
+    }
+}
+
+impl Controller for MediaController {
+    fn on_ack(
+        &mut self,
+        _now: Instant,
+        _sent: Instant,
+        _bytes: u64,
+        _app_limited: bool,
+        rtt: &RttEstimator,
+    ) {
+        self.rtt = rtt.get();
+    }
+
+    fn on_congestion_event(
+        &mut self,
+        _now: Instant,
+        _sent: Instant,
+        _is_persistent_congestion: bool,
+        lost_bytes: u64,
+    ) {
+        // `quinn` notifica las marcas CE de los ACK como congestión sin bytes perdidos.
+        if lost_bytes == 0 {
+            self.shared.ecn_events.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.shared.loss_events.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn on_mtu_update(&mut self, _new_mtu: u16) {}
+
+    fn window(&self) -> u64 {
+        let window = media_window(self.shared.target_kbps(), self.rtt);
+        self.shared.window.store(window, Ordering::Relaxed);
+        window
+    }
+
+    fn clone_box(&self) -> Box<dyn Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        media_window(self.shared.target_kbps(), self.rtt)
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+}
+
+/// Construye un [`MediaController`] por camino de la conexión, todos con el mismo estado
+/// compartido (también tras una migración de ruta).
+#[derive(Debug)]
+pub struct MediaControllerFactory {
+    shared: Arc<CongestionShared>,
+}
+
+impl MediaControllerFactory {
+    /// Fábrica atada a `shared`.
+    pub fn new(shared: Arc<CongestionShared>) -> Arc<Self> {
+        Arc::new(Self { shared })
+    }
+}
+
+impl ControllerFactory for MediaControllerFactory {
+    fn build(self: Arc<Self>, _now: Instant, _current_mtu: u16) -> Box<dyn Controller> {
+        Box::new(MediaController {
+            shared: Arc::clone(&self.shared),
+            // RTT inicial de RFC 9002 hasta el primer ACK.
+            rtt: Duration::from_millis(333),
+        })
+    }
+}
+
+/// Controlador de congestión de las conexiones de medios.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Congestion {
+    /// [`MediaController`]: ventana `target × RTT × 2`, nunca < 64 KB (por defecto).
+    #[default]
+    Media,
+    /// BBR de `quinn` (referencia del spike).
+    Bbr,
+}
+
+impl Congestion {
+    /// Fábrica de `quinn` para esta elección.
+    pub(crate) fn factory(
+        self,
+        shared: &Arc<CongestionShared>,
+    ) -> Arc<dyn ControllerFactory + Send + Sync> {
+        match self {
+            Congestion::Media => MediaControllerFactory::new(Arc::clone(shared)),
+            Congestion::Bbr => Arc::new(BbrConfig::default()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TICK: Duration = Duration::from_millis(50);
+
+    fn run(
+        controller: &mut RateController,
+        start: Instant,
+        ticks: std::ops::Range<u32>,
+        owd_ms: impl Fn(u32) -> i64,
+        loss: f64,
+    ) -> Vec<u32> {
+        ticks
+            .map(|tick| {
+                let owd = owd_ms(tick) * 1000;
+                controller.update(
+                    start + TICK * tick,
+                    RateInput {
+                        owd_us: &[owd, owd + 300, owd - 200],
+                        loss_fraction: loss,
+                        sent_objects: 10,
+                        ecn_ce: 0,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rising_owd_lowers_the_bitrate_and_it_recovers_afterwards() {
+        let start = Instant::now();
+        let mut controller = RateController::new(RateConfig {
+            min_kbps: 500,
+            max_kbps: 20_000,
+            start_kbps: 6_000,
+        });
+        // 2 s sin cola: crece.
+        let calm = run(&mut controller, start, 0..40, |_| 20, 0.0);
+        let peak = *calm.last().expect("muestras");
+        assert!(peak > 6_000, "debe crecer sin cola: {peak}");
+        // 1,5 s con OWD creciendo 2 ms por informe (60 ms de cola al final): baja.
+        let congested = run(
+            &mut controller,
+            start,
+            40..70,
+            |t| 20 + 2 * i64::from(t - 39),
+            0.0,
+        );
+        let bottom = *congested.last().expect("muestras");
+        assert!(
+            f64::from(bottom) < f64::from(peak) * 0.6,
+            "debe bajar con la cola: {peak} → {bottom}"
+        );
+        // 5 s con la cola vaciada: se recupera.
+        let recovered = run(&mut controller, start, 70..170, |_| 20, 0.0);
+        let end = *recovered.last().expect("muestras");
+        assert!(
+            f64::from(end) > f64::from(bottom) * 1.5,
+            "debe recuperarse: {bottom} → {end}"
+        );
+        assert!(end <= 20_000);
+    }
+
+    #[test]
+    fn heavy_loss_without_queue_cuts_like_gcc() {
+        let start = Instant::now();
+        let mut controller = RateController::new(RateConfig {
+            min_kbps: 500,
+            max_kbps: 20_000,
+            start_kbps: 10_000,
+        });
+        // 20 % de pérdida: −10 % cada 300 ms (la pérdida suavizada tarda unos informes en
+        // pasar del 10 %).
+        let rates = run(&mut controller, start, 0..40, |_| 15, 0.20);
+        assert!(*rates.last().expect("muestras") < 7_000, "{rates:?}");
+        assert!(rates.iter().all(|&rate| rate >= 500));
+    }
+
+    /// Matriz de red: con la pérdida aleatoria y el jitter de los perfiles `media`
+    /// (2 %, 30 ± 10 ms) y `mala` (5 %, 60 ± 20 ms) y sin cola, el bitrate no se hunde: la pérdida de
+    /// cada informe es ruidosa (10 objetos, cada uno perdido con probabilidad `p`), y una cola
+    /// pasajera (1 s con 40 ms más, como un intra grande) recorta pero se recupera aunque la pérdida
+    /// esté entre el 2 y el 10 % (ahí la pérdida mantiene y manda la estimación por retardo).
+    #[test]
+    fn random_loss_and_jitter_without_queue_hold_the_bitrate() {
+        for (loss, jitter_ms) in [(0.02, 10i64), (0.05, 20)] {
+            let start = Instant::now();
+            let mut controller = RateController::new(RateConfig {
+                min_kbps: 150,
+                max_kbps: 1_500,
+                start_kbps: 1_500,
+            });
+            // Generador determinista (xorshift).
+            let mut seed = 0x5EED_u64;
+            let mut next = move || {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed
+            };
+            let mut lowest = u32::MAX;
+            let mut last = 0;
+            for tick in 0..600u32 {
+                let queue = if (200..220).contains(&tick) {
+                    40_000
+                } else {
+                    0
+                };
+                let mut jitter =
+                    || (next() % (2 * jitter_ms as u64 * 1000 + 1)) as i64 - jitter_ms * 1000;
+                let owd = [30_000 + queue + jitter(), 30_000 + queue + jitter()];
+                let samples = if tick % 2 == 0 { &owd[..1] } else { &owd[..] };
+                let lost = (0..10)
+                    .filter(|_| (next() % 10_000) < (loss * 10_000.0) as u64)
+                    .count();
+                last = controller.update(
+                    start + TICK * tick,
+                    RateInput {
+                        owd_us: samples,
+                        loss_fraction: lost as f64 / 10.0,
+                        sent_objects: 10,
+                        ecn_ce: 0,
+                    },
+                );
+                if tick == 199 {
+                    assert!(
+                        last >= 1_200,
+                        "{loss} de pérdida y ±{jitter_ms} ms: {last} kbit/s antes de la cola, \
+                         pérdida medida {:.3}",
+                        controller.loss()
+                    );
+                }
+                lowest = lowest.min(last);
+            }
+            assert!(lowest < 1_200, "la cola recorta: {lowest}");
+            assert!(
+                last >= 1_200,
+                "{loss} de pérdida y ±{jitter_ms} ms: {last} kbit/s al final, cola {:?}",
+                controller.queue_delay()
+            );
+        }
+    }
+
+    /// Un informe suelto con mucha pérdida es ruido; la ventana de 1 s lo diluye.
+    #[test]
+    fn the_loss_is_measured_over_a_window_of_reports() {
+        let start = Instant::now();
+        let mut controller = RateController::new(RateConfig::default());
+        for tick in 0..20u32 {
+            let lost = if tick == 10 { 0.3 } else { 0.0 };
+            controller.update(
+                start + TICK * tick,
+                RateInput {
+                    owd_us: &[20_000],
+                    loss_fraction: lost,
+                    sent_objects: 10,
+                    ecn_ce: 0,
+                },
+            );
+        }
+        // 3 objetos de 200 en la ventana.
+        assert!(
+            (controller.loss() - 0.015).abs() < 1e-9,
+            "{}",
+            controller.loss()
+        );
+        // Pasado 1 s sin pérdida, la ventana se vacía de ella.
+        controller.update(
+            start + TICK * 40,
+            RateInput {
+                owd_us: &[20_000],
+                loss_fraction: 0.0,
+                sent_objects: 10,
+                ecn_ce: 0,
+            },
+        );
+        assert_eq!(controller.loss(), 0.0);
+    }
+
+    #[test]
+    fn output_hysteresis_limits_small_changes_to_once_per_second() {
+        let start = Instant::now();
+        let mut controller = RateController::new(RateConfig {
+            min_kbps: 500,
+            max_kbps: 100_000,
+            start_kbps: 10_000,
+        });
+        let rates = run(&mut controller, start, 0..60, |_| 20, 0.0);
+        let mut changes = Vec::new();
+        for (tick, pair) in rates.windows(2).enumerate() {
+            if pair[0] != pair[1] {
+                changes.push((tick as u32 + 1, pair[0], pair[1]));
+            }
+        }
+        for window in changes.windows(2) {
+            let (t0, _, _) = window[0];
+            let (t1, from, to) = window[1];
+            let step = (f64::from(to) - f64::from(from)).abs() / f64::from(from);
+            assert!(
+                step >= OUTPUT_STEP || TICK * (t1 - t0) >= OUTPUT_PERIOD,
+                "cambio pequeño antes de 1 s: {changes:?}"
+            );
+        }
+        assert!(!changes.is_empty());
+    }
+
+    #[test]
+    fn bitrate_stays_within_limits() {
+        let start = Instant::now();
+        let mut controller = RateController::new(RateConfig {
+            min_kbps: 1_000,
+            max_kbps: 4_000,
+            start_kbps: 50_000,
+        });
+        assert_eq!(controller.target_kbps(), 4_000);
+        let rates = run(
+            &mut controller,
+            start,
+            0..400,
+            |t| i64::from(t % 50) * 4,
+            0.3,
+        );
+        assert!(rates.iter().all(|&rate| (1_000..=4_000).contains(&rate)));
+    }
+
+    #[test]
+    fn media_window_follows_the_contract() {
+        assert_eq!(media_window(8_000, Duration::from_millis(1)), MIN_WINDOW);
+        // 8 Mbit/s = 1 MB/s; × 100 ms × 2 = 200 KB.
+        assert_eq!(media_window(8_000, Duration::from_millis(100)), 200_000);
+    }
+
+    #[test]
+    fn controller_counts_ecn_and_loss_events_separately() {
+        let shared = CongestionShared::new(8_000);
+        let factory = MediaControllerFactory::new(Arc::clone(&shared));
+        let now = Instant::now();
+        let mut controller = factory.build(now, 1200);
+        controller.on_congestion_event(now, now, false, 0);
+        controller.on_congestion_event(now, now, false, 1200);
+        controller.on_congestion_event(now, now, false, 0);
+        assert_eq!(shared.ecn_events(), 2);
+        assert_eq!(shared.loss_events(), 1);
+        // La ventana no se reduce por la congestión: la fija el bitrate objetivo.
+        let before = controller.window();
+        shared.set_target_kbps(80_000);
+        assert!(controller.window() > before);
+    }
+}

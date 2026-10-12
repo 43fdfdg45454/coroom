@@ -1,0 +1,141 @@
+name: Fuzzing y larga duración
+
+# Semanal y a mano: cada objetivo de fuzz/ dos minutos con
+# libFuzzer (nightly) y la prueba de larga duración (`soak`) de 20 minutos. Los fallos del fuzzer
+# se suben como artefacto; se corrigen con su test de regresión.
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Segundos por objetivo"
+        required: false
+        default: "120"
+      soak_minutes:
+        description: "Minutos de la prueba de larga duración"
+        required: false
+        default: "20"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - proto_media
+          - proto_audio
+          - proto_input
+          - proto_control
+          - proto_signal
+          - proto_api
+          - transport_media
+          - transport_loopback
+          - crypto_sframe
+          - crypto_input
+          - crypto_mls
+          - server_api
+          - server_signal
+          - codec_slices
+          - audio_jitter
+    steps:
+      - uses: actions/checkout@v7
+
+      # `rust-toolchain.toml` fija la versión stable del repositorio: el fuzzer se llama con `+nightly`.
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> ../target/fuzz
+          key: ${{ matrix.target }}
+
+      # libopus (cmake) para `coroom-audio`; nada de PipeWire, FFmpeg ni WebRTC: los objetivos
+      # usan las crates sin sus backends de plataforma.
+      - name: Dependencias de sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake pkg-config
+
+      - name: cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzzing
+        env:
+          SECONDS_PER_TARGET: ${{ inputs.seconds || '120' }}
+        run: |
+          mkdir -p "fuzz/corpus/${{ matrix.target }}"
+          cargo +nightly fuzz run --target-dir target/fuzz "${{ matrix.target }}" \
+            "fuzz/corpus/${{ matrix.target }}" "fuzz/seeds/${{ matrix.target }}" \
+            -- -max_total_time="$SECONDS_PER_TARGET" -rss_limit_mb=2048 -timeout=20
+
+      - name: Fallos encontrados
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+
+  soak:
+    name: larga duración
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Versión de Rust (rust-toolchain.toml)
+        id: rust
+        shell: bash
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Las mismas dependencias que la CI de Linux (ci.yml).
+      - name: Dependencias de sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libclang-dev pkg-config mesa-vulkan-drivers libxkbcommon-dev libwayland-dev libva2 libva-drm2 libvpl2 libudev-dev cmake meson ninja-build
+
+      - name: Caché de meson
+        uses: actions/cache@v4
+        with:
+          path: third_party/meson-packagecache
+          key: meson-wraps-${{ hashFiles('tools/fetch-meson-wraps.sh') }}
+
+      - name: Paquetes de meson
+        run: tools/fetch-meson-wraps.sh
+
+      - name: Etiqueta de FFmpeg
+        id: ffmpeg
+        run: echo "tag=$(sed -n 's/^BTBN_TAG=//p' tools/ffmpeg.lock | tr -d '\r')" >> "$GITHUB_OUTPUT"
+
+      - name: Caché de FFmpeg
+        uses: actions/cache@v4
+        with:
+          path: third_party/ffmpeg
+          key: ffmpeg-${{ runner.os }}-${{ steps.ffmpeg.outputs.tag }}
+
+      - name: FFmpeg
+        run: tools/fetch-ffmpeg.sh
+
+      - name: Larga duración
+        env:
+          COROOM_SOAK_MINUTES: ${{ inputs.soak_minutes || '20' }}
+          # Umbrales del asignador fijos: mide lo que retiene coroom y no los escalones del umbral
+          # dinámico de glibc (ver apps/desktop/tests/soak.rs).
+          GLIBC_TUNABLES: glibc.malloc.mmap_threshold=131072:glibc.malloc.trim_threshold=131072:glibc.malloc.arena_max=2
+        run: cargo test --release -p coroom --test soak --locked -- --ignored --nocapture

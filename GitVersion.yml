@@ -1,0 +1,21 @@
+# Versionado semántico calculado por GitVersion a partir del historial de git (ci.yml, job
+# «Versión»). Nadie edita la versión a mano:
+# - main: cada push que pasa la CI publica una versión y sube el parche (1.0.0 → 1.0.1). La CI
+#   crea la release vX.Y.Z, cuya etiqueta es la base del cálculo siguiente.
+# - Para subir menor o mayor, incluye en el mensaje de un commit «+semver: minor» (o «feature»)
+#   o «+semver: major» (o «breaking»). «+semver: none» no incrementa.
+# - Otras ramas y pull requests: versión de pre-release con el nombre de la rama (no se publican).
+workflow: GitHubFlow/v1
+# Primera versión gestionada por GitVersion.
+next-version: 1.0.0
+tag-prefix: '[vV]?'
+major-version-bump-message: '\+semver:\s?(breaking|major)'
+minor-version-bump-message: '\+semver:\s?(feature|minor)'
+patch-version-bump-message: '\+semver:\s?(fix|patch)'
+no-bump-message: '\+semver:\s?(none|skip)'
+branches:
+  main:
+    regex: ^main$
+    mode: ContinuousDeployment
+    label: ''
+    increment: Patch

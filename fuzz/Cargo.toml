@@ -1,0 +1,160 @@
+[package]
+name = "coroom-fuzz"
+description = "Objetivos de fuzzing de coroom (cargo-fuzz con libFuzzer)."
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Workspace propio (el raíz lo excluye): `cargo fuzz` necesita nightly y sus propias banderas.
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+serde = { version = "=1.0.229", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }
+coroom-proto = { path = "../crates/proto" }
+coroom-crypto = { path = "../crates/crypto" }
+coroom-transport = { path = "../crates/transport" }
+# Sin FFmpeg ni backends de plataforma: solo la lógica que parsea.
+coroom-codec = { path = "../crates/codec", default-features = false }
+coroom-audio = { path = "../crates/audio", default-features = false, features = ["bundled-opus"] }
+coroom-server = { path = "../apps/server", features = ["fuzzing"] }
+
+# Las mismas opciones de desarrollo que el workspace raíz, para que `cargo check` aquí reutilice lo
+# que ya compiló el raíz (`--target-dir ../target`).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package.openh264-sys2]
+opt-level = 3
+
+[profile.dev.package.yuv]
+opt-level = 3
+
+[profile.dev.package.raptorq]
+opt-level = 3
+
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+# `cargo fuzz` compila en release con aserciones de depuración; trazas legibles en los fallos.
+[profile.release]
+debug = "line-tables-only"
+
+[lib]
+path = "src/lib.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "proto_media"
+path = "fuzz_targets/proto_media.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_audio"
+path = "fuzz_targets/proto_audio.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_input"
+path = "fuzz_targets/proto_input.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_control"
+path = "fuzz_targets/proto_control.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_signal"
+path = "fuzz_targets/proto_signal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proto_api"
+path = "fuzz_targets/proto_api.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transport_media"
+path = "fuzz_targets/transport_media.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transport_loopback"
+path = "fuzz_targets/transport_loopback.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crypto_sframe"
+path = "fuzz_targets/crypto_sframe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crypto_input"
+path = "fuzz_targets/crypto_input.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crypto_mls"
+path = "fuzz_targets/crypto_mls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_api"
+path = "fuzz_targets/server_api.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_signal"
+path = "fuzz_targets/server_signal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_slices"
+path = "fuzz_targets/codec_slices.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "audio_jitter"
+path = "fuzz_targets/audio_jitter.rs"
+test = false
+doc = false
+bench = false

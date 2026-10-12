@@ -1,0 +1,15 @@
+# FFmpeg (ver README.md, «FFmpeg»). `rusty_ffmpeg` (el binding de bajo nivel
+# de `rsmpeg`) lee estas variables al compilar: cabeceras para `bindgen` y bibliotecas compartidas
+# con las que enlazar. Apuntan a la build fijada en `tools/ffmpeg.lock`, que descargan
+# `tools/fetch-ffmpeg.sh` (Linux) y `tools/fetch-ffmpeg.ps1` (Windows) en `third_party/ffmpeg/`.
+#
+# Para usar otra build de FFmpeg ≥ 8.0 basta con exportar las mismas variables, que tienen prioridad
+# sobre este fichero (ver README.md, «FFmpeg»).
+[env]
+FFMPEG_INCLUDE_DIR = { value = "third_party/ffmpeg/include", relative = true }
+FFMPEG_LIBS_DIR = { value = "third_party/ffmpeg/lib", relative = true }
+FFMPEG_LINK_MODE = "dynamic"
+
+# Procesado de voz (`webrtc-audio-processing`, Linux): meson toma abseil-cpp de aquí en
+# lugar de descargarlo al compilar. Lo llena `tools/fetch-meson-wraps.sh` (ver README.md, «Audio»).
+MESON_PACKAGE_CACHE_DIR = { value = "third_party/meson-packagecache", relative = true }

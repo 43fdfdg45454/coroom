@@ -1,0 +1,337 @@
+name: CI
+
+# Integración y entrega continuas:
+#
+# 1. «Versión»: GitVersion calcula X.Y.Z del historial (GitVersion.yml). En main, la última
+#    etiqueta vX.Y.Z más un parche (o menor/mayor con «+semver: minor|major» en un commit).
+# 2. «Comprobaciones» (Linux y Windows) y «Paquetes» (Flatpak, MSIX y zip, imagen del servidor,
+#    driver; packages.yml) en paralelo, con esa versión escrita en el workspace.
+# 3. «Publicación», solo en main y solo si todo lo anterior pasó: sube la imagen a GHCR, crea la
+#    etiqueta vX.Y.Z y la release de GitHub con los paquetes y las notas. Nadie crea etiquetas ni
+#    toca la versión a mano.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+# Las ejecuciones de main van en fila: cada una publica su versión y la siguiente parte de ella.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Versión
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.gitversion.outputs.majorMinorPatch }}
+      semver: ${{ steps.gitversion.outputs.semVer }}
+      publish: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # GitVersion necesita el historial entero y las etiquetas
+
+      - uses: gittools/actions/gitversion/setup@v3
+        with:
+          versionSpec: "6.x"
+
+      - id: gitversion
+        uses: gittools/actions/gitversion/execute@v3
+
+      - run: echo "Versión ${{ steps.gitversion.outputs.semVer }} (publicar ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }})" >> "$GITHUB_STEP_SUMMARY"
+
+  check:
+    name: Comprobaciones (${{ matrix.os }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Versión de Rust (rust-toolchain.toml)
+        id: rust
+        shell: bash
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: ./.github/actions/version
+        with:
+          version: ${{ needs.version.outputs.version }}
+
+      # aws-lc-sys compila ensamblador con NASM en Windows y el runner no lo trae.
+      - name: NASM
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
+      # Captura por PipeWire (libpipewire + bindgen/libclang), ventana Wayland/X11, lavapipe para
+      # los tests de render sin GPU, los cargadores de VA-API y oneVPL que abre FFmpeg (si la build
+      # los trae estáticos, sobran), libudev para los mandos (`gilrs`), cmake (libopus de
+      # `opusic-sys`) y meson + ninja (el procesado de voz de `webrtc-audio-processing`).
+      - name: Dependencias de sistema
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpipewire-0.3-dev libclang-dev pkg-config mesa-vulkan-drivers libxkbcommon-dev libwayland-dev libva2 libva-drm2 libvpl2 libudev-dev cmake meson ninja-build
+
+      # abseil-cpp para la compilación de `webrtc-audio-processing`: los ficheros y SHA-256 de su
+      # wrap, en el directorio que lee meson (`MESON_PACKAGE_CACHE_DIR`, .cargo/config.toml).
+      - name: Caché de meson
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: third_party/meson-packagecache
+          key: meson-wraps-${{ hashFiles('tools/fetch-meson-wraps.sh') }}
+
+      - name: Paquetes de meson
+        if: runner.os == 'Linux'
+        run: tools/fetch-meson-wraps.sh
+
+      # FFmpeg 8 LGPL compartido de BtbN fijado en tools/ffmpeg.lock. La caché va por etiqueta del
+      # release: solo se descarga otra vez al fijar uno nuevo.
+      - name: Etiqueta de FFmpeg
+        id: ffmpeg
+        shell: bash
+        run: echo "tag=$(sed -n 's/^BTBN_TAG=//p' tools/ffmpeg.lock | tr -d '\r')" >> "$GITHUB_OUTPUT"
+
+      - name: Caché de FFmpeg
+        uses: actions/cache@v4
+        with:
+          path: third_party/ffmpeg
+          key: ffmpeg-${{ runner.os }}-${{ steps.ffmpeg.outputs.tag }}
+
+      - name: FFmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: tools/fetch-ffmpeg.sh
+
+      # En Windows las DLL se buscan en el PATH (los tests corren desde target\debug\deps) y
+      # `bindgen` (rusty_ffmpeg) necesita libclang, que el runner trae con LLVM.
+      - name: FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./tools/fetch-ffmpeg.ps1
+          "$env:GITHUB_WORKSPACE\third_party\ffmpeg\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          if (-not $env:LIBCLANG_PATH) {
+            "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+      - name: Formato
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+      # Firma híbrida Ed25519 + ML-DSA-65, tras su `feature` desactivada por defecto.
+      - name: Firma híbrida (pq-sign)
+        if: runner.os == 'Linux'
+        run: cargo test -p coroom-crypto --features pq-sign --locked
+
+      # Los objetivos de fuzzing compilan en stable; se ejecutan con nightly en fuzz.yml.
+      - name: Fuzzing (compila)
+        if: runner.os == 'Linux'
+        run: |
+          cargo check --manifest-path fuzz/Cargo.toml --target-dir target --bins --locked
+          cargo test -p coroom-server --features fuzzing --lib --locked fuzzing
+
+      # Puertas de coste del E2EE (docs/ARQUITECTURA.md §2.3): SFrame, MLS y HPKE optimizados.
+      - name: Puertas E2EE (release)
+        if: runner.os == 'Linux'
+        run: cargo test --release -p coroom-crypto --locked -- --ignored --nocapture
+
+      # Medios con pérdida y jitter reales (tc netem en lo: 2 %, 10 ms ± 5 ms). Los tests `netem_*`
+      # se saltan solos si no hay netem; aquí se aplica antes y se quita siempre después. Los dos
+      # pasos netem son informativos (`continue-on-error`) hasta validar su comportamiento en los
+      # runners: en el primer intento la matriz perdió la conexión de señalización al pasar al
+      # perfil «media» (docs/ARQUITECTURA.md §7).
+      - name: netem
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          sudo modprobe sch_netem || true
+          if ! sudo tools/netem.sh apply; then
+            echo "::warning::el kernel del runner no tiene sch_netem; los tests netem_* no se ejecutan"
+            exit 0
+          fi
+          status=0
+          cargo test -p coroom-transport --locked -- netem --nocapture || status=$?
+          # La sesión remota completa (servidor, anfitrión e invitado en proceso) con netem.
+          cargo test -p coroom --test remote --locked -- netem --nocapture || status=$?
+          sudo tools/netem.sh clear
+          exit $status
+
+      # Matriz de red: el test aplica cada perfil de tools/netem.sh (lan, buena, media, mala,
+      # cuello) con `sudo -n` durante 30 s y lo quita al terminar; sin sch_netem se salta.
+      - name: Matriz de red (netem)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          sudo modprobe sch_netem || true
+          cargo test -p coroom --test matrix --locked -- --ignored netem_matrix --nocapture
+
+      - name: cargo deny
+        if: runner.os == 'Linux'
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  packages:
+    name: Paquetes
+    needs: version
+    if: needs.version.outputs.publish == 'true'
+    uses: ./.github/workflows/packages.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+
+  publish:
+    name: Publicación ${{ needs.version.outputs.version }}
+    needs: [version, check, packages]
+    if: needs.version.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # etiqueta y release
+      packages: write # imagen en GHCR
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/version
+        with:
+          version: ${{ env.VERSION }}
+
+      # La etiqueta vX.Y.Z la crea la release (abajo) sobre este commit. Si ya existe en otro
+      # commit, es el resto de una publicación anterior que no terminó: se retira, junto con su
+      # release si quedó vacía (sin paquetes). Una release con paquetes es una versión publicada y
+      # esta ejecución no la sustituye.
+      - name: Etiqueta v${{ env.VERSION }}
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v$VERSION"
+          existing="$(git ls-remote --tags origin "refs/tags/$tag" | cut -f1)"
+          if [ -n "$existing" ] && [ "$existing" != "$GITHUB_SHA" ]; then
+            release="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq '"\(.id) \(.assets | length)"' 2>/dev/null || true)"
+            if [ -n "$release" ]; then
+              id="${release% *}"; assets="${release#* }"
+              if [ "$assets" != 0 ]; then
+                echo "::error::$tag ya está publicada sobre $existing con $assets paquetes; esta ejecución no la sustituye"
+                exit 1
+              fi
+              echo "::warning::$tag tenía una release vacía sobre $existing; se retira"
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
+            fi
+            echo "::warning::$tag apuntaba a $existing; se mueve a $GITHUB_SHA"
+            git push origin ":refs/tags/$tag"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: Paquetes
+        run: |
+          mkdir -p upload
+          cp artifacts/flatpak/*.flatpak upload/
+          cp artifacts/windows/* upload/
+          for platform in x64 ARM64; do
+            (cd "artifacts/coroomvhid-$platform-desarrollo" && zip -qr "../../upload/coroomvhid-$VERSION-$platform-desarrollo.zip" .)
+          done
+          (cd upload && sha256sum -- * > SHA256SUMS)
+          ls -l upload
+
+      # La imagen ya se construyó en «Paquetes» (sin subirla): con la caché de BuildKit de esa
+      # ejecución, aquí solo se vuelve a ensamblar y se sube a GHCR.
+      - name: Nombre de la imagen
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/coroom-server" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=${{ env.VERSION }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=coroom-server
+            org.opencontainers.image.description=Servidor autoalojado de coroom: API, señalización y relay
+            org.opencontainers.image.version=${{ env.VERSION }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+
+      # Notas: los commits desde la etiqueta anterior (o desde el principio, en la primera).
+      - name: Notas de la versión
+        run: |
+          previous="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
+          range="${previous:+$previous..}HEAD"
+          image="${{ steps.image.outputs.name }}:$VERSION"
+          {
+            echo "## coroom $VERSION"
+            echo
+            echo "### Paquetes"
+            echo
+            echo "- **Linux**: \`coroom-$VERSION-x86_64.flatpak\` (\`flatpak install --user coroom-$VERSION-x86_64.flatpak\`)."
+            echo "- **Windows**: \`coroom-$VERSION-x64.msix\` (firmado con el certificado de prueba \`coroom-dev.cer\`, que hay que instalar antes) o el portátil \`coroom-$VERSION-windows-x64.zip\`."
+            echo "- **Servidor**: \`docker pull $image\`."
+            echo "- **Driver de mando virtual** (Windows): \`coroomvhid-$VERSION-*-desarrollo.zip\`. Es una build de **desarrollo**: sin firmar (se instala con \`bcdedit /set testsigning on\` y la firma de prueba, ver su README) y con VID/PID 0, para equipos propios; no está pensada para distribuirla."
+            echo
+            if [ -n "$previous" ]; then
+              echo "### Cambios desde $previous"
+            else
+              echo "### Cambios"
+            fi
+            echo
+            git log --no-merges --pretty='format:- %s (%h)' "$range"
+            echo
+          } > notes.md
+          cat notes.md
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: coroom ${{ env.VERSION }}
+          body_path: notes.md
+          files: upload/*
+          fail_on_unmatched_files: true

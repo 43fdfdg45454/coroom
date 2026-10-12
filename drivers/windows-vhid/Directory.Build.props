@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Hooks the WDK and Windows SDK NuGet packages (packages.config, restored into packages\) into the
+  project, the same way the official driver samples do. Every import is conditional on the
+  package being present, so a build without packages\ falls back to the installed WDK or the EWDK.
+  The version must match packages.config.
+-->
+<Project>
+  <PropertyGroup>
+    <CoroomWdkNuGetVersion>10.0.28000.2526</CoroomWdkNuGetVersion>
+    <CoroomWdkPackages>$(MSBuildThisFileDirectory)packages\</CoroomWdkPackages>
+  </PropertyGroup>
+  <Import Project="$(CoroomWdkPackages)Microsoft.Windows.WDK.x64.$(CoroomWdkNuGetVersion)\build\native\Microsoft.Windows.WDK.x64.props" Condition="Exists('$(CoroomWdkPackages)Microsoft.Windows.WDK.x64.$(CoroomWdkNuGetVersion)\build\native\Microsoft.Windows.WDK.x64.props') and '$(Platform)' == 'x64'" />
+  <Import Project="$(CoroomWdkPackages)Microsoft.Windows.WDK.arm64.$(CoroomWdkNuGetVersion)\build\native\Microsoft.Windows.WDK.arm64.props" Condition="Exists('$(CoroomWdkPackages)Microsoft.Windows.WDK.arm64.$(CoroomWdkNuGetVersion)\build\native\Microsoft.Windows.WDK.arm64.props') and '$(Platform)' == 'ARM64'" />
+  <Import Project="$(CoroomWdkPackages)Microsoft.Windows.SDK.CPP.x64.$(CoroomWdkNuGetVersion)\build\native\Microsoft.Windows.SDK.cpp.x64.props" Condition="Exists('$(CoroomWdkPackages)Microsoft.Windows.SDK.CPP.x64.$(CoroomWdkNuGetVersion)\build\native\Microsoft.Windows.SDK.cpp.x64.props') and '$(Platform)' == 'x64'" />
+  <Import Project="$(CoroomWdkPackages)Microsoft.Windows.SDK.CPP.arm64.$(CoroomWdkNuGetVersion)\build\native\Microsoft.Windows.SDK.cpp.arm64.props" Condition="Exists('$(CoroomWdkPackages)Microsoft.Windows.SDK.CPP.arm64.$(CoroomWdkNuGetVersion)\build\native\Microsoft.Windows.SDK.cpp.arm64.props') and '$(Platform)' == 'ARM64'" />
+  <Import Project="$(CoroomWdkPackages)Microsoft.Windows.SDK.CPP.$(CoroomWdkNuGetVersion)\build\native\Microsoft.Windows.SDK.cpp.props" Condition="Exists('$(CoroomWdkPackages)Microsoft.Windows.SDK.CPP.$(CoroomWdkNuGetVersion)\build\native\Microsoft.Windows.SDK.cpp.props')" />
+</Project>

@@ -1,0 +1,31 @@
+[package]
+name = "coroom-codec"
+description = "Codificación y decodificación de vídeo de coroom tras los traits Encoder y Decoder."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+# FFmpeg (SVT-AV1, dav1d, Vulkan Video, NVENC/NVDEC, AMF, QSV, VAAPI). Sin ella solo queda OpenH264.
+default = ["ffmpeg"]
+ffmpeg = ["dep:rsmpeg", "dep:ash"]
+
+[dependencies]
+ash = { workspace = true, optional = true }
+openh264.workspace = true
+rsmpeg = { workspace = true, optional = true }
+yuv.workspace = true
+
+# Texturas D3D11 de la captura y su importación en los *hw frames* de FFmpeg.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
+[lints]
+workspace = true

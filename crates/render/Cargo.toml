@@ -1,0 +1,17 @@
+[package]
+name = "coroom-render"
+description = "Presentación de vídeo de coroom con wgpu: dispositivo de la ventana, capa de vídeo y cursor local."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Importación sin copias de las imágenes Vulkan del decodificador.
+ash.workspace = true
+bytemuck.workspace = true
+pollster.workspace = true
+wgpu.workspace = true
+
+[lints]
+workspace = true

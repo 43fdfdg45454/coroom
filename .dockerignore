@@ -1,0 +1,13 @@
+# Contexto mínimo para deploy/Dockerfile (rust-toolchain.toml sí entra: la imagen compila con la
+# versión de Rust fijada ahí, como la CI).
+.git
+.github
+target
+data
+deploy/.env
+deploy/data
+docs
+packaging
+**/*.pem
+**/*.key
+**/*.crt

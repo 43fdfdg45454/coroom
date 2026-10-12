@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Manifiesto MSIX de coroom. `build.ps1` pone la versión del workspace (X.Y.Z.0) en
+  `Identity/@Version` y empaqueta coroom.exe, las DLL de FFmpeg (LGPL, enlazadas de forma
+  dinámica), sus licencias y Assets\ con `makeappx`.
+
+  `Publisher` tiene que coincidir con el sujeto del certificado que firma el paquete: `CN=coroom-dev`
+  es el del certificado de prueba que crea `build.ps1 -TestCertificate`. Para una firma real,
+  `build.ps1 -Publisher "CN=…"` con el sujeto exacto del certificado de firma de código.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap rescap">
+
+  <Identity
+    Name="coroom"
+    Publisher="CN=coroom-dev"
+    Version="1.0.0.0"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>coroom</DisplayName>
+    <PublisherDisplayName>Proyecto coroom</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <Description>Juega en remoto con tus amigos: comparte tu pantalla con baja latencia y cifrado de extremo a extremo.</Description>
+  </Properties>
+
+  <!-- Windows 10 2004 o posterior (Windows.Graphics.Capture sin borde y WASAPI con loopback). -->
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="es-ES" />
+    <Resource Language="en-US" />
+  </Resources>
+
+  <Applications>
+    <Application Id="coroom" Executable="coroom.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="coroom"
+        Description="Juego remoto con amigos"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" ShortName="coroom" />
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- Servidor de coroom, conexión directa entre pares y relay. -->
+    <Capability Name="internetClient" />
+    <!-- Aplicación de escritorio completa (Win32): captura, entrada y audio como fuera del paquete. -->
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>

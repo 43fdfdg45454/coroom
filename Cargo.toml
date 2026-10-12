@@ -1,0 +1,198 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*"]
+# Copias adaptadas de crates de terceros (ver `vendor/README.md`) y el workspace de fuzzing
+# (`fuzz/`, con nightly): no son miembros del workspace.
+exclude = ["vendor", "fuzz"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+publish = false
+# Apache-2.0 para las crates y la aplicación; el servidor (apps/server) es AGPL-3.0-or-later.
+license = "Apache-2.0"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+
+[workspace.dependencies]
+# Crates del workspace.
+coroom-proto = { path = "crates/proto", version = "1.0.0" }
+coroom-crypto = { path = "crates/crypto", version = "1.0.0" }
+coroom-transport = { path = "crates/transport", version = "1.0.0" }
+coroom-capture = { path = "crates/capture", version = "1.0.0" }
+coroom-codec = { path = "crates/codec", version = "1.0.0" }
+coroom-audio = { path = "crates/audio", version = "1.0.0" }
+coroom-input = { path = "crates/input", version = "1.0.0" }
+coroom-render = { path = "crates/render", version = "1.0.0" }
+coroom-session = { path = "crates/session", version = "1.0.0" }
+coroom-ui = { path = "crates/ui", version = "1.0.0" }
+
+# Criptografía de identidad.
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["fast", "zeroize", "alloc", "pkcs8"] }
+sha2 = { version = "=0.11.0", default-features = false }
+getrandom = { version = "=0.4.3", default-features = false, features = ["std"] }
+
+# E2EE: MLS, SFrame, HPKE y almacenamiento de la identidad.
+openmls = { version = "=0.9.1", default-features = false }
+openmls_rust_crypto = { version = "=0.6.0", default-features = false }
+openmls_traits = { version = "=0.6.0", default-features = false }
+sframe = { version = "=2.0.0", default-features = false }
+# AES-256-GCM rápido para SFrame: el mismo proveedor (y las mismas features) que usa `rustls`.
+aws-lc-rs = { version = "=1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+hpke = { version = "=0.14.1", default-features = false, features = ["alloc", "getrandom", "x25519", "aes", "hkdfsha2"] }
+keyring = { version = "=4.2.0", default-features = false, features = ["v1"] }
+zeroize = { version = "=1.9.1", default-features = false, features = ["std"] }
+hkdf = { version = "=0.13.0", default-features = false }
+# Firma poscuántica ML-DSA-65 (FIPS 204, RustCrypto) para la identidad híbrida tras la `feature`
+# `pq-sign` de `coroom-crypto` (desactivada por defecto).
+ml-dsa = { version = "=0.1.1", default-features = false, features = ["alloc", "zeroize"] }
+base64 = { version = "=0.23.1", default-features = false, features = ["std"] }
+criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+# Servidor y red.
+tokio = { version = "=1.53.2", default-features = false }
+quinn = { version = "=0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+# Solo para nombrar `RttEstimator` en el controlador de congestión propio (misma versión que quinn).
+quinn-proto = { version = "=0.11.19", default-features = false }
+h3 = { version = "=0.0.8", default-features = false }
+h3-quinn = { version = "=0.0.10", default-features = false }
+rustls = { version = "=0.23.45", default-features = false, features = ["aws_lc_rs", "std", "prefer-post-quantum"] }
+# Raíces de confianza del sistema para el servidor de coroom en producción (`ServerTrust::system_roots`).
+rustls-native-certs = { version = "=0.8.4", default-features = false }
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
+hyper = { version = "=1.12.0", default-features = false }
+hyper-util = { version = "=0.1.21", default-features = false }
+http-body-util = { version = "=0.1.5", default-features = false }
+http = { version = "=1.5.0", default-features = false, features = ["std"] }
+bytes = { version = "=1.12.1", default-features = false, features = ["std"] }
+serde = { version = "=1.0.229", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }
+tracing = { version = "=0.1.44", default-features = false, features = ["std", "attributes"] }
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["std", "fmt", "ansi", "env-filter"] }
+postcard = { version = "=1.1.3", default-features = false, features = ["use-std"] }
+raptorq = { version = "=2.0.1", default-features = false, features = ["std"] }
+if-addrs = { version = "=0.15.0", default-features = false }
+socket2 = { version = "=0.6.5", default-features = false }
+# WebTransport (borrador IETF, docs/ARQUITECTURA.md §3): servidor con la extensión de `h3`; el cliente
+# usa el códec QPACK de `wtransport-proto` sobre el mismo `quinn::Endpoint` de los medios.
+h3-webtransport = { version = "=0.1.2", default-features = false }
+wtransport-proto = { version = "=0.7.2", default-features = false }
+clap = { version = "=4.6.7", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context", "suggestions"] }
+
+# Servidor: cuentas en SQLite (consultas en tiempo de ejecución, sin macros con
+# `DATABASE_URL`; migraciones propias embebidas), Argon2id, ACME (TLS-ALPN-01 y HTTP-01), TLS por
+# TCP y contraseñas por consola sin eco.
+sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "migrate"] }
+argon2 = { version = "=0.6.0", default-features = false, features = ["alloc", "password-hash", "getrandom"] }
+instant-acme = { version = "=0.8.5", default-features = false, features = ["aws-lc-rs", "hyper-rustls"] }
+subtle = { version = "=2.6.1", default-features = false, features = ["std"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
+rpassword = { version = "=7.5.4", default-features = false }
+
+# Vídeo y presentación: `wgpu` 30 y `winit` 0.30.
+openh264 = { version = "=0.9.8", default-features = false, features = ["source"] }
+# FFmpeg 8: binding activo con soporte de FFmpeg 8 (`ffmpeg-next` está en mantenimiento).
+# FFmpeg no es dependencia de Cargo: lo localiza `crates/codec/build.rs` (ver `tools/ffmpeg.lock`).
+rsmpeg = { version = "=0.18.0", default-features = false, features = ["ffmpeg8"] }
+yuv = { version = "=0.8.19", default-features = false, features = ["avx", "sse", "rdm"] }
+# Tipos y funciones de Vulkan para la ruta sin copias: la misma versión que usa `wgpu-hal`.
+# Sin `loaded`: las funciones se cargan con el `vkGetInstanceProcAddr` de `wgpu` o de FFmpeg.
+ash = { version = "=0.38.0", default-features = false, features = ["std"] }
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "dx12", "metal", "wgsl"] }
+winit = { version = "=0.30.13", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen", "wayland-csd-adwaita-notitle", "x11"] }
+bytemuck = { version = "=1.25.2", default-features = false, features = ["derive"] }
+pollster = { version = "=1.0.1", default-features = false }
+crossbeam-channel = { version = "=0.5.17", default-features = false, features = ["std"] }
+
+# Interfaz: `iced` 0.14 a bajo nivel, con `iced_winit` (eventos de `winit` 0.30) e
+# `iced_wgpu` sobre el mismo `wgpu::Device` que el presentador del vídeo. `iced_wgpu` y su
+# `cryoglyph` dependen de `wgpu` 27 en crates.io; las copias de `vendor/` los adaptan a `wgpu` 30
+# (`[patch.crates-io]` al final) hasta que salga `iced` 0.15.
+iced_core = { version = "=0.14.0", default-features = false, features = ["advanced"] }
+iced_widget = { version = "=0.14.0", default-features = false, features = ["wgpu", "svg", "advanced"] }
+iced_wgpu = { version = "=0.14.0", default-features = false, features = ["svg", "web-colors"] }
+iced_winit = { version = "=0.14.0", default-features = false, features = ["x11", "wayland"] }
+iced_runtime = { version = "=0.14.0", default-features = false }
+# Apariencia del sistema: el portal `Settings` en Linux (con `ashpd`, más abajo) y el
+# registro en Windows.
+winreg = { version = "=0.56.0", default-features = false }
+futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
+
+# Captura de plataforma.
+pipewire = { version = "=0.10.1", default-features = false }
+ashpd = { version = "=0.13.13", default-features = false, features = ["tokio", "screencast", "remote_desktop"] }
+windows = { version = "=0.62.2", default-features = false }
+
+# Entrada. `reis` (libei en Rust, de ids1024) habla el protocolo EI con el socket que da
+# el portal `RemoteDesktop` (`connect_to_eis`); `evdev` crea los mandos virtuales por uinput;
+# `gilrs` lee los mandos del invitado.
+reis = { version = "=0.7.1", default-features = false }
+evdev = { version = "=0.13.2", default-features = false }
+gilrs = { version = "=0.11.2", default-features = false, features = ["wgi"] }
+# `CLOCK_MONOTONIC` para las marcas de tiempo de EI (la misma versión que usa `reis`).
+rustix = { version = "=1.1.5", default-features = false, features = ["std", "time"] }
+
+# Audio. `opusic-c` (libopus 1.6.1 incluida y compilada con CMake, sin bindgen; DRED con
+# sus pesos dentro del código fuente, sin descargas), `webrtc-audio-processing` (tonarino, módulo de
+# procesado de WebRTC 2.1 compilado con meson y ninja; solo Linux) y `wasapi` (HEnquist, con
+# loopback por proceso).
+opusic-c = { version = "=1.6.1", default-features = false }
+opusic-sys = { version = "=0.7.5", default-features = false }
+webrtc-audio-processing = { version = "=2.1.0", default-features = false }
+wasapi = { version = "=0.26.0", default-features = false }
+
+# Catálogos de textos de la interfaz: Fluent de Project Fluent (Mozilla), el formato de
+# Firefox y Thunderbird; `fluent-bundle` formatea, `fluent-syntax` lee los identificadores en los
+# tests y `unic-langid` nombra el idioma.
+fluent-bundle = { version = "=0.16.0", default-features = false }
+fluent-syntax = { version = "=0.12.0", default-features = false }
+unic-langid = { version = "=0.9.6", default-features = false }
+
+# Ajustes persistentes de la aplicación (`settings.toml`) y tests de capas.
+toml = { version = "=1.1.8", default-features = false, features = ["parse", "display", "serde", "std"] }
+
+# Solo para tests.
+proptest = { version = "=1.12.0", default-features = false, features = ["std"] }
+tempfile = "=3.27.0"
+# Capturas de pantalla de la interfaz, en PNG.
+png = { version = "=0.18.1", default-features = false }
+
+# Los tests en debug codifican y convierten vídeo: optimizar siempre esas crates.
+[profile.dev.package.openh264-sys2]
+opt-level = 3
+
+[profile.dev.package.yuv]
+opt-level = 3
+
+# La FEC RaptorQ sin optimizar tarda milisegundos por fotograma y falsea los tests de medios.
+[profile.dev.package.raptorq]
+opt-level = 3
+
+# Argon2id sin optimizar tarda segundos por contraseña y ralentiza los tests de cuentas.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
+# Información de depuración solo con tablas de líneas: trazas legibles con una fracción del tamaño
+# en disco (el perfil completo supera los 20 GB con wgpu, openh264 y aws-lc).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# `iced_wgpu` 0.14 y `cryoglyph` 0.1 adaptados a `wgpu` 30 (ver `vendor/README.md`).
+[patch.crates-io]
+iced_wgpu = { path = "vendor/iced_wgpu" }
+cryoglyph = { path = "vendor/cryoglyph" }

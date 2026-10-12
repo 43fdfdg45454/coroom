@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=coroom
+GenericName=Juego remoto
+GenericName[en]=Remote play
+Comment=Juega en remoto con tus amigos: comparte tu pantalla con baja latencia y cifrado de extremo a extremo
+Comment[en]=Play remotely with friends: share your screen with low latency and end-to-end encryption
+Icon=io.github._43fdfdg45454.coroom
+Exec=coroom
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=juego;remoto;pantalla;compartir;mando;game;remote;screen;share;gamepad;
+StartupNotify=true
+StartupWMClass=io.github._43fdfdg45454.coroom
+SingleMainWindow=true

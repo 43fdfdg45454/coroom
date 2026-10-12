@@ -1,0 +1,48 @@
+[package]
+name = "coroom-input"
+description = "Entrada de coroom: captura en el invitado e inyección en el anfitrión."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+# Cada backend solo se compila en su sistema; activar los dos por defecto es inocuo en el otro.
+default = ["linux-portal", "windows-sendinput", "windows-vhid"]
+# Linux: teclado y ratón por libei (portal `RemoteDesktop`) y mandos por uinput.
+linux-portal = ["dep:reis", "dep:evdev", "dep:ashpd", "dep:tokio", "dep:rustix"]
+# Windows: teclado y ratón por `SendInput`.
+windows-sendinput = []
+# Windows: mandos virtuales por el driver propio `coroomvhid.sys` (drivers/windows-vhid). El
+# formato de sus informes se compila (y se prueba) en todas las plataformas.
+windows-vhid = ["windows-sendinput"]
+
+[dependencies]
+coroom-crypto.workspace = true
+coroom-proto.workspace = true
+crossbeam-channel.workspace = true
+gilrs.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+winit.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { workspace = true, optional = true }
+evdev = { workspace = true, optional = true }
+reis = { workspace = true, optional = true }
+rustix = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["rt", "sync", "time"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[lints]
+workspace = true

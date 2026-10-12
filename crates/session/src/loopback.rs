@@ -1,0 +1,1244 @@
+//! Pipeline de vídeo completo en una sola máquina: captura → codificación → UDP local →
+//! reensamblado → decodificación → presentación, con una marca de tiempo por etapa.
+//!
+//! Cada etapa vive en su hilo (`capture`, `encode`, `send`, `recv`, `decode`, `present`) y se
+//! comunica con la siguiente por un canal acotado de capacidad [`CHANNEL_CAPACITY`] con política
+//! **gana el último**: si el canal está lleno se saca el fotograma más antiguo, se anota como
+//! descarte en el [`LatencyLedger`] y se mete el nuevo. Entre `send` y `recv` van datagramas reales
+//! por `127.0.0.1` ([`coroom_transport::loopback`]).
+//!
+//! En los dos canales de imagen sin comprimir (`capture → encode` y `decode → present`) el
+//! consumidor también aplica la política al leer: si hay varios fotogramas esperando, toma el más
+//! reciente y descarta los demás. Así un codificador al límite trabaja siempre sobre el último
+//! fotograma capturado en lugar de arrastrar dos periodos de cola. En los canales de vídeo
+//! comprimido no se hace, porque saltarse un fotograma rompe las referencias.
+//!
+//! Un descarte es un fotograma que no llega a una etapa, y se anota en esa etapa: el canal
+//! `capture → encode` descarta en [`Stage::Encoded`], el reensamblador en [`Stage::Received`], etc.
+//! Como perder un fotograma comprimido rompe la cadena de referencias, cualquier descarte o error a
+//! partir de la codificación pide un intra al codificador (lo que en la sesión remota hace el NACK/PLI por
+//! la red).
+//!
+//! La presentación es un [`FrameSink`]: `session` no depende de `coroom-render` (`docs/ARQUITECTURA.md`
+//! §5), así que la aplicación adapta su `Presenter` a este trait.
+//!
+//! Cero copias: al arrancar, la captura recibe las imágenes de GPU que acepta el
+//! codificador ([`capture_gpu_frames`]); `encode` le pasa la imagen tal cual (DMA-BUF o textura
+//! D3D11, sin tocarla) y el decodificador puede devolver una imagen de GPU que va así hasta la
+//! presentación. Cada etapa anota en el [`LatencyLedger`] cuántas copias a CPU hizo
+//! ([`LatencyLedger::record_cpu_copies`]). El codificador se configura con
+//! [`coroom_codec::DEFAULT_SLICES`] slices.
+
+use std::collections::VecDeque;
+use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use coroom_capture::{
+    CaptureError, CaptureOptions, CapturedFrame, Capturer, CursorShape, CursorState, FramePixels,
+    GpuFrames,
+};
+use coroom_codec::{
+    Codec, CodecError, DEFAULT_SLICES, Decoder, DecoderSet, EncodedSlice, Encoder, EncoderConfig,
+    GpuInput, PixelFormat, RawFrame, VideoFormat, decoder_label, encoder_label,
+};
+use coroom_transport::loopback::{UdpLoopback, UdpReceiver, UdpSender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
+
+use crate::latency::{LatencyLedger, LatencySummary, Stage};
+
+/// Capacidad de cada canal entre etapas.
+pub const CHANNEL_CAPACITY: usize = 2;
+
+/// Cada cuánto miran los hilos si hay que parar mientras esperan.
+const POLL: Duration = Duration::from_millis(50);
+
+/// Parámetros del pipeline local.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopbackConfig {
+    /// Ancho pedido al codificador (la captura de pantalla puede traer su propio tamaño).
+    pub width: u32,
+    /// Alto pedido al codificador.
+    pub height: u32,
+    /// Fotogramas por segundo objetivo.
+    pub fps: u32,
+    /// Bitrate objetivo en kbit/s.
+    pub bitrate_kbps: u32,
+    /// Si está definido, el pipeline termina solo tras presentar este número de fotogramas.
+    pub frames: Option<u64>,
+    /// Pedir croma 4:4:4 cuando el codificador y los decodificadores lo admitan.
+    pub yuv444: bool,
+    /// Pedir HDR10 (10 bits, BT.2020 PQ) cuando el codificador y los decodificadores lo admitan;
+    /// la captura se pide en HDR. Si se piden los dos, gana HDR.
+    pub hdr: bool,
+}
+
+impl Default for LoopbackConfig {
+    fn default() -> Self {
+        Self {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_kbps: 10_000,
+            frames: None,
+            yuv444: false,
+            hdr: false,
+        }
+    }
+}
+
+impl LoopbackConfig {
+    /// Formatos a intentar, del preferido al de siempre: HDR10, 4:4:4 y 4:2:0 SDR.
+    pub fn format_candidates(&self) -> Vec<VideoFormat> {
+        let mut out = Vec::with_capacity(3);
+        if self.hdr {
+            out.push(VideoFormat::HDR10_420);
+        }
+        if self.yuv444 {
+            out.push(VideoFormat::SDR_444);
+        }
+        out.push(VideoFormat::SDR_420);
+        out
+    }
+
+    /// El formato preferido de [`LoopbackConfig::format_candidates`].
+    pub fn wanted_format(&self) -> VideoFormat {
+        self.format_candidates()
+            .first()
+            .copied()
+            .unwrap_or(VideoFormat::SDR_420)
+    }
+
+    /// Lo que se le pide a la captura: los fps y, con HDR, imágenes en coma flotante.
+    pub fn capture_options(&self) -> CaptureOptions {
+        CaptureOptions {
+            max_fps: self.fps,
+            hdr: self.hdr,
+        }
+    }
+
+    /// Imágenes de GPU que se le piden a la captura para `input`: solo con el formato de siempre
+    /// (4:4:4 y HDR se convierten en CPU).
+    pub fn gpu_frames(&self, input: &GpuInput) -> GpuFrames {
+        if self.yuv444 || self.hdr {
+            GpuFrames::Off
+        } else {
+            capture_gpu_frames(input)
+        }
+    }
+}
+
+/// Formas de cursor que se recuerdan (las más antiguas se olvidan).
+const CURSOR_SHAPES: usize = 16;
+
+/// Fotograma decodificado que llega a la presentación.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedFrame {
+    /// Imagen I420 o NV12 con planos compactados (NV12 es lo que dan los decodificadores por
+    /// hardware y se pasa sin convertir).
+    pub frame: RawFrame,
+    /// Último cursor conocido del anfitrión (viaja aparte del vídeo, como en la sesión remota).
+    pub cursor: Option<CursorState>,
+    /// Forma de ese cursor, si ya llegó.
+    pub cursor_shape: Option<Arc<CursorShape>>,
+}
+
+/// Texto del códec en uso para el resumen y el overlay: `AV1 · SVT-AV1 → dav1d`.
+pub fn video_label(encoder: Option<&dyn Encoder>, decoder: Option<&dyn Decoder>) -> String {
+    let codec = encoder
+        .map(|e| e.codec())
+        .or_else(|| decoder.map(|d| d.codec()));
+    let Some(codec) = codec else {
+        return String::new();
+    };
+    let encoder = encoder.map_or_else(|| "?".to_owned(), |e| encoder_label(codec, e.backend()));
+    let decoder = decoder.map_or_else(|| "?".to_owned(), |d| decoder_label(codec, d.backend()));
+    format!("{codec} · {encoder} → {decoder}")
+}
+
+/// Imágenes de GPU que hay que pedirle a la captura para un codificador que acepta `input`.
+pub fn capture_gpu_frames(input: &GpuInput) -> GpuFrames {
+    match input {
+        GpuInput::None => GpuFrames::Off,
+        GpuInput::DmaBuf { modifiers } => GpuFrames::DmaBuf {
+            modifiers: modifiers.clone(),
+        },
+        GpuInput::D3D11 => GpuFrames::D3D11,
+    }
+}
+
+/// Convierte un fotograma de la captura en la entrada del codificador moviendo la imagen (sin
+/// copiarla). El tamaño se recorta a par: H.264 y HEVC 4:2:0 lo necesitan.
+pub fn to_raw_frame(frame: CapturedFrame) -> RawFrame {
+    let size = (frame.width & !1, frame.height & !1);
+    match frame.pixels {
+        FramePixels::Bgra { data, stride } => {
+            RawFrame::cpu(frame.frame_id, size, PixelFormat::Bgra, stride, data)
+        }
+        FramePixels::Rgba16F { data, stride } => {
+            RawFrame::cpu(frame.frame_id, size, PixelFormat::Rgba16F, stride, data)
+        }
+        #[cfg(unix)]
+        FramePixels::DmaBuf(dmabuf) => {
+            use coroom_codec::gpu::{DmaBufImage, DmaBufPlane};
+            // Normalmente el `Arc` es único y los descriptores se mueven; si no, se duplican.
+            let (planes, modifier, fourcc, release) = match Arc::try_unwrap(dmabuf) {
+                Ok(owned) => (
+                    owned
+                        .planes
+                        .into_iter()
+                        .map(|plane| DmaBufPlane {
+                            fd: plane.fd,
+                            offset: plane.offset,
+                            stride: plane.stride,
+                        })
+                        .collect::<Vec<_>>(),
+                    owned.modifier,
+                    owned.fourcc,
+                    owned.release,
+                ),
+                Err(shared) => (
+                    shared
+                        .planes
+                        .iter()
+                        .filter_map(|plane| {
+                            Some(DmaBufPlane {
+                                fd: plane.fd.try_clone().ok()?,
+                                offset: plane.offset,
+                                stride: plane.stride,
+                            })
+                        })
+                        .collect(),
+                    shared.modifier,
+                    shared.fourcc,
+                    shared.release.clone(),
+                ),
+            };
+            let image = DmaBufImage {
+                planes,
+                modifier,
+                fourcc,
+                width: size.0,
+                height: size.1,
+                keepalive: release,
+            };
+            RawFrame::gpu(
+                frame.frame_id,
+                size,
+                coroom_codec::GpuImage::DmaBuf(Arc::new(image)),
+            )
+        }
+        #[cfg(windows)]
+        FramePixels::D3D11(texture) => {
+            let image = coroom_codec::gpu::D3D11Image {
+                texture: texture.texture.clone(),
+                subresource: texture.subresource,
+                device: texture.device.clone(),
+                width: size.0,
+                height: size.1,
+                keepalive: texture.release.clone(),
+            };
+            RawFrame::gpu(
+                frame.frame_id,
+                size,
+                coroom_codec::GpuImage::D3D11(Arc::new(image)),
+            )
+        }
+    }
+}
+
+/// Error de la etapa de presentación.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkError(pub String);
+
+impl fmt::Display for SinkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SinkError {}
+
+/// Última etapa del pipeline: presenta un fotograma decodificado.
+///
+/// El hilo `present` marca [`Stage::Presented`] justo después de que vuelva
+/// [`FrameSink::present`].
+pub trait FrameSink: Send {
+    /// Presenta el fotograma.
+    fn present(&mut self, frame: DecodedFrame) -> Result<(), SinkError>;
+
+    /// Copias de la imagen en memoria de CPU que hizo el último `present` (subir los planos a la
+    /// GPU cuenta una; importar una imagen de GPU, ninguna). Por defecto, ninguna.
+    fn cpu_copies(&self) -> u32 {
+        0
+    }
+}
+
+/// Presentación que no dibuja nada; para tests y pruebas sin ventana.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NullSink;
+
+impl FrameSink for NullSink {
+    fn present(&mut self, _frame: DecodedFrame) -> Result<(), SinkError> {
+        Ok(())
+    }
+}
+
+/// Error que detuvo el pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipelineError {
+    /// Falló la captura.
+    Capture(CaptureError),
+    /// Falló el códec.
+    Codec(CodecError),
+    /// Falló el bucle UDP local.
+    Transport(String),
+    /// Falló la presentación.
+    Sink(SinkError),
+    /// Un hilo no se pudo crear o terminó con un pánico.
+    Thread(String),
+}
+
+impl fmt::Display for PipelineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PipelineError::Capture(err) => write!(f, "captura: {err}"),
+            PipelineError::Codec(err) => write!(f, "códec: {err}"),
+            PipelineError::Transport(err) => write!(f, "transporte: {err}"),
+            PipelineError::Sink(err) => write!(f, "presentación: {err}"),
+            PipelineError::Thread(err) => write!(f, "hilo del pipeline: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for PipelineError {}
+
+/// Estado compartido entre los hilos (también los de la sesión remota).
+#[derive(Debug, Default)]
+pub(crate) struct Shared {
+    pub(crate) stop: AtomicBool,
+    pub(crate) keyframe_requested: AtomicBool,
+    pub(crate) cursor: Mutex<Option<CursorState>>,
+    /// Últimas formas de cursor, de la más antigua a la más nueva.
+    cursor_shapes: Mutex<VecDeque<Arc<CursorShape>>>,
+    finished: Mutex<bool>,
+    finished_changed: Condvar,
+    failure: Mutex<Option<PipelineError>>,
+    /// Vista previa de la captura, si alguien la pidió.
+    pub(crate) preview: Mutex<Option<Arc<crate::preview::PreviewTap>>>,
+}
+
+impl Shared {
+    pub(crate) fn stopping(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
+    }
+
+    /// Termina el pipeline; guarda el primer error, si lo hay.
+    pub(crate) fn finish(&self, error: Option<PipelineError>) {
+        if let Some(error) = error {
+            let mut failure = self.failure.lock().unwrap_or_else(PoisonError::into_inner);
+            failure.get_or_insert(error);
+        }
+        self.stop.store(true, Ordering::Release);
+        *self.finished.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.finished_changed.notify_all();
+    }
+
+    /// Guarda una forma de cursor (sustituye la del mismo id). Devuelve si era nueva.
+    pub(crate) fn remember_shape(&self, shape: Arc<CursorShape>) -> bool {
+        let mut shapes = self
+            .cursor_shapes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(at) = shapes.iter().position(|s| s.shape_id == shape.shape_id) {
+            if Arc::ptr_eq(&shapes[at], &shape) || *shapes[at] == *shape {
+                return false;
+            }
+            shapes.remove(at);
+        }
+        shapes.push_back(shape);
+        while shapes.len() > CURSOR_SHAPES {
+            shapes.pop_front();
+        }
+        true
+    }
+
+    /// Forma del cursor `shape_id`, si se conoce.
+    pub(crate) fn cursor_shape(&self, shape_id: u64) -> Option<Arc<CursorShape>> {
+        self.cursor_shapes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .rev()
+            .find(|shape| shape.shape_id == shape_id)
+            .cloned()
+    }
+
+    pub(crate) fn request_keyframe(&self) {
+        self.keyframe_requested.store(true, Ordering::Release);
+    }
+
+    /// Consume una petición de intra pendiente.
+    pub(crate) fn take_keyframe_request(&self) -> bool {
+        self.keyframe_requested.swap(false, Ordering::AcqRel)
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        *self.finished.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn wait(&self, timeout: Duration) -> bool {
+        let finished = self.finished.lock().unwrap_or_else(PoisonError::into_inner);
+        let (finished, _) = self
+            .finished_changed
+            .wait_timeout_while(finished, timeout, |finished| !*finished)
+            .unwrap_or_else(PoisonError::into_inner);
+        *finished
+    }
+
+    pub(crate) fn failure(&self) -> Option<PipelineError> {
+        self.failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// Lanza un hilo con nombre de una etapa; su error termina el pipeline.
+pub(crate) fn spawn_stage(
+    shared: &Arc<Shared>,
+    name: &'static str,
+    body: impl FnOnce() -> Result<(), PipelineError> + Send + 'static,
+) -> Result<JoinHandle<()>, PipelineError> {
+    let thread_shared = Arc::clone(shared);
+    thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            if let Err(err) = body() {
+                thread_shared.finish(Some(err));
+            }
+        })
+        .map_err(|err| {
+            let err = PipelineError::Thread(format!("no se pudo crear `{name}`: {err}"));
+            shared.finish(Some(err.clone()));
+            err
+        })
+}
+
+/// Mete `item` en el canal; si está lleno, saca el más antiguo, lo anota como descarte en `stage`
+/// y reintenta. Devuelve si hubo descarte, o `Err` si el consumidor ya no existe.
+pub(crate) fn send_latest<T>(
+    tx: &Sender<T>,
+    evict: &Receiver<T>,
+    mut item: T,
+    ledger: &LatencyLedger,
+    stage: Stage,
+) -> Result<bool, ()> {
+    let mut dropped = false;
+    loop {
+        match tx.try_send(item) {
+            Ok(()) => return Ok(dropped),
+            Err(TrySendError::Full(back)) => {
+                item = back;
+                if evict.try_recv().is_ok() {
+                    ledger.record_drop(stage);
+                    dropped = true;
+                }
+            }
+            Err(TrySendError::Disconnected(_)) => return Err(()),
+        }
+    }
+}
+
+/// Espera el siguiente elemento; `None` si hay que parar o el productor terminó.
+pub(crate) fn recv_or_stop<T>(rx: &Receiver<T>, shared: &Shared) -> Option<T> {
+    loop {
+        if shared.stopping() {
+            return None;
+        }
+        match rx.recv_timeout(POLL) {
+            Ok(item) => return Some(item),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+}
+
+/// Como [`recv_or_stop`], pero si hay más elementos esperando devuelve el más reciente y anota los
+/// demás como descartes en `stage`.
+pub(crate) fn recv_latest<T>(
+    rx: &Receiver<T>,
+    shared: &Shared,
+    ledger: &LatencyLedger,
+    stage: Stage,
+) -> Option<T> {
+    let mut item = recv_or_stop(rx, shared)?;
+    while let Ok(newer) = rx.try_recv() {
+        ledger.record_drop(stage);
+        item = newer;
+    }
+    Some(item)
+}
+
+/// Reconstruye un id de 64 bits a partir de los 32 bits de la cabecera, eligiendo el más cercano
+/// al último recibido (los ids crecen de uno en uno, así que la vuelta de los 32 bits se detecta).
+pub fn extend_frame_id(last: Option<u64>, low: u32) -> u64 {
+    let Some(last) = last else {
+        return u64::from(low);
+    };
+    let base = (last & !0xFFFF_FFFF) | u64::from(low);
+    let span = 1u64 << 32;
+    [base.checked_sub(span), Some(base), base.checked_add(span)]
+        .into_iter()
+        .flatten()
+        .min_by_key(|candidate| candidate.abs_diff(last))
+        .unwrap_or(base)
+}
+
+/// Fotograma comprimido en tránsito.
+#[derive(Debug)]
+pub(crate) struct Compressed {
+    pub(crate) frame_id: u64,
+    pub(crate) keyframe: bool,
+    pub(crate) data: Vec<u8>,
+}
+
+/// Control del codificador desde fuera del pipeline (sesión remota): bitrate objetivo, si hay a
+/// quién enviar y el codificador nuevo cuando se negocia otro códec.
+pub(crate) struct EncodeControl {
+    /// Bitrate objetivo en kbit/s; el hilo `encode` lo aplica cuando cambia.
+    pub(crate) bitrate_kbps: AtomicU32,
+    /// Sin destinatarios no se codifica (ni se cuenta como descarte).
+    pub(crate) active: AtomicBool,
+    /// Codificador ya configurado que el hilo `encode` adopta antes del siguiente fotograma (su
+    /// primer fotograma es intra).
+    pub(crate) next: Mutex<Option<Box<dyn Encoder>>>,
+}
+
+impl EncodeControl {
+    pub(crate) fn new(bitrate_kbps: u32) -> Self {
+        Self {
+            bitrate_kbps: AtomicU32::new(bitrate_kbps),
+            active: AtomicBool::new(false),
+            next: Mutex::new(None),
+        }
+    }
+
+    /// Entrega un codificador nuevo al hilo `encode`.
+    pub(crate) fn replace(&self, encoder: Box<dyn Encoder>) {
+        *self.next.lock().unwrap_or_else(PoisonError::into_inner) = Some(encoder);
+    }
+
+    fn take_next(&self) -> Option<Box<dyn Encoder>> {
+        self.next
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+}
+
+/// Control del decodificador desde fuera del pipeline (invitado de la sesión remota): el códec que
+/// anunció el anfitrión; el hilo `decode` abre el decodificador de ese códec con lo mejor de
+/// `set` antes del siguiente fotograma (y lo vuelve a abrir si cambia).
+#[derive(Debug)]
+pub(crate) struct DecodeControl {
+    pub(crate) set: DecoderSet,
+    wanted: Mutex<Option<(Codec, VideoFormat)>>,
+    /// Lo que el invitado acepta además de 4:2:0 SDR: `(4:4:4, HDR10)`.
+    pub(crate) accept: (bool, bool),
+}
+
+impl DecodeControl {
+    pub(crate) fn new(set: DecoderSet) -> Self {
+        Self {
+            set,
+            wanted: Mutex::new(None),
+            accept: (false, false),
+        }
+    }
+
+    /// Con lo que acepta el invitado: 4:4:4 y HDR10.
+    pub(crate) fn accepting(mut self, yuv444: bool, hdr: bool) -> Self {
+        self.accept = (yuv444, hdr);
+        self
+    }
+
+    /// Pide decodificar `codec` en `format` a partir de ahora.
+    pub(crate) fn request(&self, codec: Codec, format: VideoFormat) {
+        *self.wanted.lock().unwrap_or_else(PoisonError::into_inner) = Some((codec, format));
+    }
+
+    fn wanted(&self) -> Option<(Codec, VideoFormat)> {
+        *self.wanted.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl fmt::Debug for EncodeControl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EncodeControl")
+            .field("bitrate_kbps", &self.bitrate_kbps)
+            .field("active", &self.active)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Pipeline local en marcha.
+#[derive(Debug)]
+pub struct LoopbackPipeline {
+    shared: Arc<Shared>,
+    ledger: Arc<LatencyLedger>,
+    threads: Vec<(&'static str, JoinHandle<()>)>,
+}
+
+impl LoopbackPipeline {
+    /// Configura el codificador, arranca la captura del primer objetivo disponible y lanza los seis
+    /// hilos. Los errores de configuración se devuelven aquí; los posteriores, en
+    /// [`LoopbackPipeline::failure`].
+    pub fn start(
+        mut capturer: Box<dyn Capturer>,
+        mut encoder: Box<dyn Encoder>,
+        decoder: Box<dyn Decoder>,
+        sink: Box<dyn FrameSink>,
+        ledger: Arc<LatencyLedger>,
+        config: LoopbackConfig,
+    ) -> Result<Self, PipelineError> {
+        encoder
+            .configure(&EncoderConfig {
+                codec: encoder.codec(),
+                width: config.width,
+                height: config.height,
+                fps: config.fps,
+                bitrate_kbps: config.bitrate_kbps,
+                slices: DEFAULT_SLICES,
+                format: config.wanted_format(),
+            })
+            .map_err(PipelineError::Codec)?;
+        if decoder.codec() != encoder.codec() {
+            return Err(PipelineError::Codec(CodecError::Unsupported(format!(
+                "el codificador produce {} y el decodificador acepta {}",
+                encoder.codec(),
+                decoder.codec()
+            ))));
+        }
+        ledger.set_video(video_label(Some(encoder.as_ref()), Some(decoder.as_ref())));
+        let target = capturer
+            .targets()
+            .map_err(PipelineError::Capture)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                PipelineError::Capture(CaptureError::Unsupported("no hay nada que capturar".into()))
+            })?;
+        capturer.set_gpu_frames(config.gpu_frames(&encoder.gpu_input()));
+        capturer.set_options(config.capture_options());
+        capturer.start(&target).map_err(PipelineError::Capture)?;
+        let (sender, receiver) = UdpLoopback::new().map_err(|err| {
+            capturer.stop();
+            PipelineError::Transport(err.to_string())
+        })?;
+
+        let shared = Arc::new(Shared::default());
+        let (raw_tx, raw_rx) = bounded::<CapturedFrame>(CHANNEL_CAPACITY);
+        let (enc_tx, enc_rx) = bounded::<Compressed>(CHANNEL_CAPACITY);
+        let (rcv_tx, rcv_rx) = bounded::<Compressed>(CHANNEL_CAPACITY);
+        let (dec_tx, dec_rx) = bounded::<RawFrame>(CHANNEL_CAPACITY);
+
+        let mut pipeline = Self {
+            shared: Arc::clone(&shared),
+            ledger: Arc::clone(&ledger),
+            threads: Vec::with_capacity(6),
+        };
+        let spawn =
+            |pipeline: &mut Self,
+             name: &'static str,
+             body: Box<dyn FnOnce() -> Result<(), PipelineError> + Send>| {
+                let handle = spawn_stage(&pipeline.shared, name, body)?;
+                pipeline.threads.push((name, handle));
+                Ok::<(), PipelineError>(())
+            };
+
+        {
+            let (shared, ledger, evict) =
+                (Arc::clone(&shared), Arc::clone(&ledger), raw_rx.clone());
+            spawn(
+                &mut pipeline,
+                "capture",
+                Box::new(move || capture_loop(capturer, raw_tx, evict, &shared, &ledger)),
+            )?;
+        }
+        {
+            let (shared, ledger, evict) =
+                (Arc::clone(&shared), Arc::clone(&ledger), enc_rx.clone());
+            spawn(
+                &mut pipeline,
+                "encode",
+                Box::new(move || {
+                    encode_loop(Some(encoder), raw_rx, enc_tx, evict, &shared, &ledger, None)
+                }),
+            )?;
+        }
+        {
+            let (shared, ledger) = (Arc::clone(&shared), Arc::clone(&ledger));
+            spawn(
+                &mut pipeline,
+                "send",
+                Box::new(move || send_loop(sender, enc_rx, &shared, &ledger)),
+            )?;
+        }
+        {
+            let (shared, ledger, evict) =
+                (Arc::clone(&shared), Arc::clone(&ledger), rcv_rx.clone());
+            spawn(
+                &mut pipeline,
+                "recv",
+                Box::new(move || recv_loop(receiver, rcv_tx, evict, &shared, &ledger)),
+            )?;
+        }
+        {
+            let (shared, ledger, evict) =
+                (Arc::clone(&shared), Arc::clone(&ledger), dec_rx.clone());
+            spawn(
+                &mut pipeline,
+                "decode",
+                Box::new(move || {
+                    decode_loop(Some(decoder), rcv_rx, dec_tx, evict, &shared, &ledger, None)
+                }),
+            )?;
+        }
+        {
+            let (shared, ledger) = (Arc::clone(&shared), Arc::clone(&ledger));
+            let frames = config.frames;
+            spawn(
+                &mut pipeline,
+                "present",
+                Box::new(move || present_loop(sink, dec_rx, frames, &shared, &ledger)),
+            )?;
+        }
+        Ok(pipeline)
+    }
+
+    /// Registro de marcas de tiempo del pipeline.
+    pub fn ledger(&self) -> &Arc<LatencyLedger> {
+        &self.ledger
+    }
+
+    /// Indica si el pipeline terminó (llegó al número de fotogramas o falló).
+    pub fn is_finished(&self) -> bool {
+        self.shared.is_finished()
+    }
+
+    /// Espera hasta que el pipeline termine o pase `timeout`. Devuelve si terminó.
+    pub fn wait(&self, timeout: Duration) -> bool {
+        self.shared.wait(timeout)
+    }
+
+    /// Primer error que detuvo el pipeline, si lo hubo.
+    pub fn failure(&self) -> Option<PipelineError> {
+        self.shared.failure()
+    }
+
+    /// Detiene los hilos en orden (de la captura a la presentación) y devuelve el resumen final.
+    pub fn stop(mut self) -> LatencySummary {
+        self.join_all();
+        self.ledger.summary()
+    }
+
+    fn join_all(&mut self) {
+        self.shared.stop.store(true, Ordering::Release);
+        for (name, handle) in self.threads.drain(..) {
+            if handle.join().is_err() {
+                self.shared.finish(Some(PipelineError::Thread(format!(
+                    "`{name}` terminó con un pánico"
+                ))));
+            }
+        }
+        self.shared.finish(None);
+    }
+}
+
+impl Drop for LoopbackPipeline {
+    fn drop(&mut self) {
+        if !self.threads.is_empty() {
+            self.join_all();
+        }
+    }
+}
+
+pub(crate) fn capture_loop(
+    mut capturer: Box<dyn Capturer>,
+    tx: Sender<CapturedFrame>,
+    evict: Receiver<CapturedFrame>,
+    shared: &Shared,
+    ledger: &LatencyLedger,
+) -> Result<(), PipelineError> {
+    let result = (|| {
+        while !shared.stopping() {
+            let Some(frame) = capturer
+                .next_frame_timeout(POLL)
+                .map_err(PipelineError::Capture)?
+            else {
+                continue;
+            };
+            ledger.mark(frame.frame_id, Stage::Captured, frame.captured_at);
+            ledger.record_cpu_copies(Stage::Captured, frame.cpu_copies);
+            if let Some(cursor) = frame.cursor {
+                *shared.cursor.lock().unwrap_or_else(PoisonError::into_inner) = Some(cursor);
+            }
+            if let Some(shape) = &frame.cursor_shape {
+                shared.remember_shape(Arc::clone(shape));
+            }
+            let preview = shared
+                .preview
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(preview) = preview {
+                preview.offer(&frame);
+            }
+            if send_latest(&tx, &evict, frame, ledger, Stage::Encoded).is_err() {
+                break;
+            }
+        }
+        Ok(())
+    })();
+    capturer.stop();
+    result
+}
+
+pub(crate) fn encode_loop(
+    mut encoder: Option<Box<dyn Encoder>>,
+    rx: Receiver<CapturedFrame>,
+    tx: Sender<Compressed>,
+    evict: Receiver<Compressed>,
+    shared: &Shared,
+    ledger: &LatencyLedger,
+    control: Option<&EncodeControl>,
+) -> Result<(), PipelineError> {
+    let mut bitrate = control.map(|control| control.bitrate_kbps.load(Ordering::Acquire));
+    while let Some(frame) = recv_latest(&rx, shared, ledger, Stage::Encoded) {
+        if let Some(control) = control {
+            if let Some(next) = control.take_next() {
+                // Códec nuevo (negociación): sale ya configurado y su primer fotograma es intra.
+                encoder = Some(next);
+                bitrate = None;
+            }
+            if !control.active.load(Ordering::Acquire) {
+                continue;
+            }
+        }
+        let Some(encoder) = encoder.as_mut() else {
+            // Todavía no hay códec (el anfitrión espera las capacidades del invitado).
+            continue;
+        };
+        if let Some(control) = control {
+            let target = control.bitrate_kbps.load(Ordering::Acquire);
+            if bitrate != Some(target) {
+                encoder.set_bitrate(target).map_err(PipelineError::Codec)?;
+                bitrate = Some(target);
+            }
+        }
+        let frame_id = frame.frame_id;
+        // H.264 4:2:0 necesita un tamaño par: se recorta la última fila o columna si sobra.
+        let raw = to_raw_frame(frame);
+        if raw.width == 0 || raw.height == 0 {
+            ledger.record_drop(Stage::Encoded);
+            continue;
+        }
+        if shared.keyframe_requested.swap(false, Ordering::AcqRel) {
+            encoder.request_keyframe();
+        }
+        let slices = encoder.encode(&raw).map_err(PipelineError::Codec)?;
+        let encoded_at = Instant::now();
+        // La imagen (y el búfer de la captura que retiene) se suelta en cuanto se codifica.
+        drop(raw);
+        ledger.record_cpu_copies(Stage::Encoded, encoder.cpu_copies());
+        if slices.is_empty() {
+            // El codificador se saltó el fotograma.
+            ledger.record_drop(Stage::Encoded);
+            continue;
+        }
+        let keyframe = slices.iter().any(|slice| slice.keyframe);
+        let data = if slices.len() == 1 {
+            slices
+                .into_iter()
+                .next()
+                .map(|slice| slice.data)
+                .unwrap_or_default()
+        } else {
+            slices.into_iter().flat_map(|slice| slice.data).collect()
+        };
+        ledger.mark(frame_id, Stage::Encoded, encoded_at);
+        if control.is_none() {
+            // En el bucle local no se cifra: la etapa dura 0.
+            ledger.mark(frame_id, Stage::Encrypted, encoded_at);
+        }
+        ledger.record_encoded_bytes_at(data.len() as u64, encoded_at);
+        let compressed = Compressed {
+            frame_id,
+            keyframe,
+            data,
+        };
+        match send_latest(&tx, &evict, compressed, ledger, Stage::Sent) {
+            Ok(true) => shared.request_keyframe(),
+            Ok(false) => {}
+            Err(()) => break,
+        }
+    }
+    Ok(())
+}
+
+fn send_loop(
+    sender: UdpSender,
+    rx: Receiver<Compressed>,
+    shared: &Shared,
+    ledger: &LatencyLedger,
+) -> Result<(), PipelineError> {
+    while let Some(frame) = recv_or_stop(&rx, shared) {
+        // Los ids de la cabecera son de 32 bits; el receptor reconstruye los altos.
+        let wire_id = frame.frame_id as u32;
+        sender
+            .send_frame(wire_id, frame.keyframe, &frame.data)
+            .map_err(|err| PipelineError::Transport(err.to_string()))?;
+        ledger.mark(frame.frame_id, Stage::Sent, Instant::now());
+    }
+    Ok(())
+}
+
+fn recv_loop(
+    mut receiver: UdpReceiver,
+    tx: Sender<Compressed>,
+    evict: Receiver<Compressed>,
+    shared: &Shared,
+    ledger: &LatencyLedger,
+) -> Result<(), PipelineError> {
+    let mut last_id = None;
+    let mut dropped = 0;
+    while !shared.stopping() {
+        let frame = receiver
+            .recv_frame(POLL)
+            .map_err(|err| PipelineError::Transport(err.to_string()))?;
+        let now = Instant::now();
+        let lost = receiver.dropped() - dropped;
+        if lost > 0 {
+            dropped = receiver.dropped();
+            for _ in 0..lost {
+                ledger.record_drop(Stage::Received);
+            }
+            shared.request_keyframe();
+        }
+        let Some(frame) = frame else {
+            continue;
+        };
+        let frame_id = extend_frame_id(last_id, frame.frame_id);
+        last_id = Some(frame_id);
+        ledger.mark(frame_id, Stage::Received, now);
+        // En el bucle local no se descifra: la etapa dura 0.
+        ledger.mark(frame_id, Stage::Decrypted, now);
+        let compressed = Compressed {
+            frame_id,
+            keyframe: frame.keyframe,
+            data: frame.data,
+        };
+        match send_latest(&tx, &evict, compressed, ledger, Stage::Decoded) {
+            Ok(true) => shared.request_keyframe(),
+            Ok(false) => {}
+            Err(()) => break,
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn decode_loop(
+    mut decoder: Option<Box<dyn Decoder>>,
+    rx: Receiver<Compressed>,
+    tx: Sender<RawFrame>,
+    evict: Receiver<RawFrame>,
+    shared: &Shared,
+    ledger: &LatencyLedger,
+    control: Option<&DecodeControl>,
+) -> Result<(), PipelineError> {
+    // Formato del decodificador que pidió `control` (el de la sesión remota; en local, el del
+    // decodificador que se dio).
+    let mut opened_format: Option<VideoFormat> = None;
+    while let Some(frame) = recv_or_stop(&rx, shared) {
+        if let Some(control) = control
+            && let Some((codec, format)) = control.wanted()
+            && (decoder
+                .as_ref()
+                .is_none_or(|current| current.codec() != codec)
+                || opened_format != Some(format))
+        {
+            let opened = control
+                .set
+                .open_format(codec, format)
+                .map_err(PipelineError::Codec)?;
+            let suffix = if format.is_default() {
+                String::new()
+            } else {
+                format!(" · {format}")
+            };
+            ledger.set_video(format!(
+                "{codec} · decodifica {}{suffix}",
+                decoder_label(codec, opened.backend())
+            ));
+            decoder = Some(opened);
+            opened_format = Some(format);
+            // Lo anterior era de otro códec o formato: hace falta un intra del nuevo.
+            shared.request_keyframe();
+        }
+        let Some(decoder) = decoder.as_mut() else {
+            // Aún no se sabe el códec (no ha llegado `CodecSelected`).
+            ledger.record_drop(Stage::Decoded);
+            shared.request_keyframe();
+            continue;
+        };
+        let slice = EncodedSlice {
+            frame_id: frame.frame_id,
+            index: 0,
+            count: 1,
+            keyframe: frame.keyframe,
+            data: frame.data,
+        };
+        match decoder.decode(std::slice::from_ref(&slice)) {
+            Ok(Some(mut image)) => {
+                ledger.mark(frame.frame_id, Stage::Decoded, Instant::now());
+                ledger.record_cpu_copies(Stage::Decoded, decoder.cpu_copies());
+                image.frame_id = frame.frame_id;
+                // El espacio de color negociado manda (`CodecSelected`).
+                if let Some(format) = opened_format {
+                    image.color = format.color;
+                }
+                if send_latest(&tx, &evict, image, ledger, Stage::Presented).is_err() {
+                    break;
+                }
+            }
+            Ok(None) => ledger.record_drop(Stage::Decoded),
+            Err(_) => {
+                // Fotograma corrupto o sin referencias: se descarta y se pide un intra.
+                ledger.record_drop(Stage::Decoded);
+                decoder.reset();
+                shared.request_keyframe();
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn present_loop(
+    mut sink: Box<dyn FrameSink>,
+    rx: Receiver<RawFrame>,
+    frames: Option<u64>,
+    shared: &Shared,
+    ledger: &LatencyLedger,
+) -> Result<(), PipelineError> {
+    let mut presented = 0u64;
+    while let Some(frame) = recv_latest(&rx, shared, ledger, Stage::Presented) {
+        let frame_id = frame.frame_id;
+        let cursor = *shared.cursor.lock().unwrap_or_else(PoisonError::into_inner);
+        let cursor_shape = cursor.and_then(|cursor| shared.cursor_shape(cursor.shape_id));
+        sink.present(DecodedFrame {
+            frame,
+            cursor,
+            cursor_shape,
+        })
+        .map_err(PipelineError::Sink)?;
+        ledger.mark(frame_id, Stage::Presented, Instant::now());
+        ledger.record_cpu_copies(Stage::Presented, sink.cpu_copies());
+        presented += 1;
+        if frames.is_some_and(|limit| presented >= limit) {
+            shared.finish(None);
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coroom_capture::synthetic::SyntheticCapturer;
+    use coroom_codec::openh264::{OpenH264Decoder, OpenH264Encoder};
+
+    #[test]
+    fn frame_ids_survive_the_32_bit_wrap() {
+        assert_eq!(extend_frame_id(None, 7), 7);
+        assert_eq!(extend_frame_id(Some(7), 8), 8);
+        assert_eq!(extend_frame_id(Some(u64::from(u32::MAX)), 0), 1 << 32);
+        assert_eq!(
+            extend_frame_id(Some((1 << 32) + 1), u32::MAX),
+            u64::from(u32::MAX)
+        );
+        assert_eq!(extend_frame_id(Some((5 << 32) + 10), 12), (5 << 32) + 12);
+    }
+
+    #[test]
+    fn latest_wins_drops_the_oldest() {
+        let ledger = LatencyLedger::new();
+        let (tx, rx) = bounded::<u32>(CHANNEL_CAPACITY);
+        for i in 0..5 {
+            send_latest(&tx, &rx, i, &ledger, Stage::Encoded).unwrap();
+        }
+        assert_eq!(rx.try_recv(), Ok(3));
+        assert_eq!(rx.try_recv(), Ok(4));
+        assert_eq!(ledger.summary().drops[Stage::Encoded.index()].count, 3);
+    }
+
+    #[test]
+    fn the_consumer_takes_the_newest_frame() {
+        let ledger = LatencyLedger::new();
+        let shared = Shared::default();
+        let (tx, rx) = bounded::<u32>(CHANNEL_CAPACITY);
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        assert_eq!(recv_latest(&rx, &shared, &ledger, Stage::Encoded), Some(2));
+        assert_eq!(ledger.summary().drops[Stage::Encoded.index()].count, 1);
+        drop(tx);
+        assert_eq!(recv_latest(&rx, &shared, &ledger, Stage::Encoded), None);
+    }
+
+    #[test]
+    fn a_small_pipeline_presents_every_stage() {
+        let ledger = Arc::new(LatencyLedger::new());
+        let config = LoopbackConfig {
+            width: 320,
+            height: 180,
+            fps: 60,
+            bitrate_kbps: 1_000,
+            frames: Some(30),
+            yuv444: false,
+            hdr: false,
+        };
+        let pipeline = LoopbackPipeline::start(
+            Box::new(SyntheticCapturer::new(320, 180, 60)),
+            Box::new(OpenH264Encoder::new()),
+            Box::new(OpenH264Decoder::new().unwrap()),
+            Box::new(NullSink),
+            Arc::clone(&ledger),
+            config,
+        )
+        .unwrap();
+        assert!(pipeline.wait(Duration::from_secs(20)), "terminó a tiempo");
+        assert_eq!(pipeline.failure(), None);
+        let summary = pipeline.stop();
+        assert!(summary.frames_presented >= 30, "{summary}");
+        let complete = ledger
+            .timelines()
+            .iter()
+            .filter(|timeline| timeline.is_complete())
+            .count();
+        assert!(complete >= 30, "{summary}");
+        for span in &summary.spans {
+            assert!(span.samples >= 30, "{summary}");
+        }
+        // Software: captura sintética (0), conversión de OpenH264 (1), salida de OpenH264 (1) y
+        // presentación nula (0).
+        let per_stage: Vec<(Stage, f64)> = summary
+            .cpu_copies
+            .iter()
+            .map(|copies| (copies.stage, copies.per_frame))
+            .collect();
+        assert_eq!(
+            per_stage,
+            vec![
+                (Stage::Captured, 0.0),
+                (Stage::Encoded, 1.0),
+                (Stage::Decoded, 1.0),
+                (Stage::Presented, 0.0)
+            ],
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn gpu_inputs_become_capture_requests() {
+        assert_eq!(capture_gpu_frames(&GpuInput::None), GpuFrames::Off);
+        assert_eq!(capture_gpu_frames(&GpuInput::D3D11), GpuFrames::D3D11);
+        assert_eq!(
+            capture_gpu_frames(&GpuInput::DmaBuf {
+                modifiers: vec![0, 7]
+            }),
+            GpuFrames::DmaBuf {
+                modifiers: vec![0, 7]
+            }
+        );
+    }
+
+    /// Un DMA-BUF de la captura llega al codificador sin copiar la imagen: se mueven sus
+    /// descriptores y su `release` (el búfer de PipeWire) viaja con él.
+    #[cfg(unix)]
+    #[test]
+    fn dmabuf_frames_move_into_the_encoder_input() {
+        use std::os::fd::AsRawFd;
+
+        let fd: std::os::fd::OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        let raw_fd = fd.as_raw_fd();
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct Release(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let frame = CapturedFrame {
+            frame_id: 9,
+            width: 101,
+            height: 50,
+            captured_at: Instant::now(),
+            cursor: None,
+            cursor_shape: None,
+            pixels: FramePixels::DmaBuf(Arc::new(coroom_capture::DmaBufFrame {
+                planes: vec![coroom_capture::DmaBufPlane {
+                    fd,
+                    offset: 0,
+                    stride: 512,
+                }],
+                modifier: 3,
+                fourcc: 0x3432_5258,
+                width: 101,
+                height: 50,
+                release: Some(Arc::new(Release(Arc::clone(&released)))),
+            })),
+            cpu_copies: 0,
+        };
+        let raw = to_raw_frame(frame);
+        assert_eq!(
+            (raw.width, raw.height, raw.format),
+            (100, 50, PixelFormat::Gpu)
+        );
+        assert!(raw.data.is_empty());
+        let Some(coroom_codec::GpuImage::DmaBuf(image)) = &raw.gpu else {
+            panic!("se esperaba un DMA-BUF");
+        };
+        assert_eq!(
+            image.planes[0].fd.as_raw_fd(),
+            raw_fd,
+            "el descriptor se mueve"
+        );
+        assert_eq!((image.modifier, image.width), (3, 100));
+        assert!(!released.load(Ordering::SeqCst));
+        drop(raw);
+        assert!(
+            released.load(Ordering::SeqCst),
+            "el búfer vuelve al soltar la imagen"
+        );
+    }
+
+    #[test]
+    fn start_reports_configuration_errors() {
+        let err = LoopbackPipeline::start(
+            Box::new(SyntheticCapturer::new(321, 180, 60)),
+            Box::new(OpenH264Encoder::new()),
+            Box::new(OpenH264Decoder::new().unwrap()),
+            Box::new(NullSink),
+            Arc::new(LatencyLedger::new()),
+            LoopbackConfig {
+                width: 321,
+                ..LoopbackConfig::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, PipelineError::Codec(_)), "{err}");
+    }
+}

@@ -1,0 +1,79 @@
+name: Driver de mando virtual (Windows)
+
+# Compila drivers/windows-vhid (coroomvhid.sys, KMDF + Virtual HID Framework) con el WDK. Es la
+# única verificación automática del driver: no lo firma ni lo carga (eso necesita la firma por
+# atestación y un Windows real, ver drivers/windows-vhid/README.md). `packages.yml` lo llama en cada
+# push a main y «Publicación» adjunta los paquetes a la release como «desarrollo»: sin firmar y con
+# VID/PID 0, para instalar a mano en equipos propios.
+on:
+  pull_request:
+    paths:
+      - "drivers/windows-vhid/**"
+      - ".github/workflows/driver.yml"
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: coroomvhid.sys (${{ matrix.platform }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [x64, ARM64]
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: drivers/windows-vhid
+    steps:
+      - uses: actions/checkout@v7
+
+      # El WDK y el SDK vienen como paquetes NuGet fijados en packages.config (la distribución
+      # oficial desde el WDK 10.0.26100; es lo que hace la CI de los ejemplos de Microsoft). Así no
+      # dependen de la versión que traiga la imagen. El conjunto de herramientas de MSBuild para
+      # drivers (WindowsKernelModeDriver10.0) lo da el componente «Windows Driver Kit» de Visual
+      # Studio, que las imágenes windows-2025 y windows-2025-vs2026 incluyen.
+      - name: WDK y SDK (NuGet)
+        run: |
+          nuget restore packages.config -PackagesDirectory packages -NonInteractive
+          $vhf = Get-ChildItem packages -Recurse -Filter vhf.h -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $vhf) { throw 'Los paquetes NuGet del WDK no traen vhf.h' }
+          Write-Host "WDK (vhf.h): $($vhf.FullName)"
+          Write-Host "Paquetes: $((Get-ChildItem packages -Directory).Name -join ', ')"
+
+      - name: Compilar
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          if (-not $vs) { throw 'No hay Visual Studio con MSBuild' }
+          $wdk = & $vswhere -latest -products * -requires Component.Microsoft.Windows.DriverKit -property installationPath
+          if (-not $wdk) {
+            & $vswhere -all -products * -format json | Out-Host
+            throw "La instalación de Visual Studio en $vs no tiene el componente «Windows Driver Kit»"
+          }
+          Write-Host "Visual Studio: $vs"
+          Import-Module (Join-Path $vs 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
+          Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=amd64 -host_arch=amd64'
+          msbuild coroomvhid.sln /m /nologo /v:minimal /p:Configuration=Release /p:Platform=${{ matrix.platform }}
+          if ($LASTEXITCODE -ne 0) { throw "msbuild terminó con código $LASTEXITCODE" }
+
+      - name: Paquete
+        run: |
+          $cat = Get-ChildItem "build\${{ matrix.platform }}\Release" -Recurse -Filter coroomvhid.cat | Select-Object -First 1
+          if (-not $cat) { throw 'Falta coroomvhid.cat (Inf2Cat)' }
+          $out = New-Item -ItemType Directory -Force -Path "package\${{ matrix.platform }}"
+          foreach ($file in 'coroomvhid.sys', 'coroomvhid.inf', 'coroomvhid.cat') {
+            Copy-Item (Join-Path $cat.DirectoryName $file) $out
+          }
+          Copy-Item "build\${{ matrix.platform }}\Release\coroomvhid.pdb" $out -ErrorAction SilentlyContinue
+          Copy-Item install.ps1, uninstall.ps1, devices.ps1, README.md, coroom_vhid.h $out
+          Get-ChildItem $out | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coroomvhid-${{ matrix.platform }}-desarrollo
+          path: drivers/windows-vhid/package/${{ matrix.platform }}
+          if-no-files-found: error

@@ -1,0 +1,5 @@
+[toolchain]
+# Versión fijada: la CI, el Dockerfile y el desarrollo usan la misma. Subirla cuando salga una
+# stable nueva y pase `cargo clippy -D warnings`.
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]

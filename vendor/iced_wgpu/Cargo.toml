@@ -1,0 +1,40 @@
+# Copia de `iced_wgpu` 0.14.0 (crates.io) adaptada a `wgpu` 30; ver `vendor/README.md`.
+[package]
+edition = "2024"
+name = "iced_wgpu"
+version = "0.14.0"
+description = "A renderer for iced on top of wgpu"
+homepage = "https://iced.rs"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/iced-rs/iced"
+publish = false
+
+[lib]
+name = "iced_wgpu"
+path = "src/lib.rs"
+
+[features]
+default = ["wgpu/default"]
+geometry = ["iced_graphics/geometry", "lyon"]
+image = ["iced_graphics/image"]
+strict-assertions = []
+svg = ["iced_graphics/svg", "resvg"]
+web-colors = ["iced_graphics/web-colors"]
+webgl = ["wgpu/webgl"]
+
+[dependencies]
+bitflags = "2.0"
+bytemuck = { version = "1.0", features = ["derive"] }
+cryoglyph = "0.1"
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+glam = "0.25"
+guillotiere = "0.6"
+iced_debug = "0.14.0"
+iced_graphics = "0.14.0"
+log = "0.4"
+lyon = { version = "1.0", optional = true }
+resvg = { version = "0.48.1", optional = true, default-features = false }
+rustc-hash = "2.0"
+thiserror = "2"
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "wgsl"] }

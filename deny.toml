@@ -1,0 +1,75 @@
+# Configuración de cargo-deny: licencias, avisos de seguridad, duplicados y orígenes.
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Solo las plataformas de coroom: así Windows queda cubierto desde Linux y no cuentan las
+# dependencias exclusivas de otros destinos (por ejemplo, `ring` en wasm32 vía quinn-proto).
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+]
+all-features = false
+
+[advisories]
+# Las vulnerabilidades siempre son error; además, crates sin mantenimiento, inseguras o retiradas.
+unmaintained = "all"
+unsound = "all"
+yanked = "deny"
+ignore = [
+    # `paste` (macro procedimental, solo en compilación) está archivada por su autor. Llega con
+    # `rsmpeg` 0.18, el binding de FFmpeg 8 elegido (`ffmpeg-next` está en
+    # mantenimiento); no hay versión de `rsmpeg` sin ella. Revisar cuando `rsmpeg` pase a `pastey`.
+    { id = "RUSTSEC-2024-0436", reason = "proc-macro de compilación de rsmpeg; sin alternativa en el binding de FFmpeg 8" },
+    # `ttf-parser` (lectura de fuentes) está sin mantenimiento desde 2026; llega con `fontdb` 0.23
+    # por `cosmic-text` 0.15, el motor de texto de `iced` 0.14, y con `ab_glyph` por las
+    # decoraciones Adwaita de `winit` 0.30 en Wayland. Las versiones nuevas (`fontdb` 0.24,
+    # `skrifa`) llegan con `iced` 0.15; los SVG de los iconos ya no lo usan (`resvg` 0.48 sin texto).
+    { id = "RUSTSEC-2026-0192", reason = "fontdb 0.23 de cosmic-text 0.15 (iced 0.14) y ab_glyph de winit 0.30; se retira con iced 0.15" },
+]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    # `target-lexicon` (dependencia de compilación de `libspa-sys`). La OFL es la de las fuentes
+    # (la Inter embebida en `coroom-ui`). Ninguna es copyleft fuerte.
+    "Apache-2.0 WITH LLVM-exception",
+    "OFL-1.1",
+]
+confidence-threshold = 0.93
+# La lista es la política del proyecto, no el inventario actual: no avisar si alguna no aparece.
+unused-allowed-license = "allow"
+exceptions = [
+    # Portapapeles de Windows de `iced_winit` (`window_clipboard`): Boost 1.0, permisiva.
+    { allow = ["BSL-1.0"], crate = "clipboard-win" },
+    { allow = ["BSL-1.0"], crate = "error-code" },
+]
+
+# `webrtc-audio-processing` (procesado de voz en Linux) declara su licencia con
+# `license-file` (`COPYING`, la BSD-3-Clause de WebRTC): cargo-deny la reconoce al escanear el
+# fichero (el aviso `no-license-field` es solo informativo). libopus (`opusic-sys`) es BSD-3-Clause.
+
+[licenses.private]
+# Las crates del workspace no se publican en crates.io (`publish = false`); sus licencias
+# (Apache-2.0, y AGPL-3.0-or-later en `coroom-server`) no se comprueban como dependencias.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

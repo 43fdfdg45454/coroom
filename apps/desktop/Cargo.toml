@@ -1,0 +1,60 @@
+[package]
+name = "coroom"
+description = "Cliente de escritorio de coroom (anfitrión e invitado)."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "coroom_desktop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "coroom"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+coroom-render.workspace = true
+coroom-session.workspace = true
+coroom-transport.workspace = true
+coroom-ui.workspace = true
+crossbeam-channel.workspace = true
+fluent-bundle.workspace = true
+fluent-syntax.workspace = true
+iced_core.workspace = true
+iced_runtime.workspace = true
+iced_wgpu.workspace = true
+iced_widget.workspace = true
+iced_winit.workspace = true
+rpassword.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "time", "macros"] }
+toml.workspace = true
+tracing.workspace = true
+unic-langid.workspace = true
+winit.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# `settings`: tema y acento del sistema; `open_uri`: abrir la página de una versión nueva
+# y `secret`: la clave del llavero dentro de Flatpak.
+ashpd = { workspace = true, features = ["settings", "open_uri", "secret"] }
+futures-util.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winreg.workspace = true
+
+[dev-dependencies]
+# Tests de extremo a extremo (`tests/remote.rs`): servidor real en proceso y proxy con pérdida.
+coroom-server = { path = "../server" }
+coroom-transport = { workspace = true, features = ["test-util"] }
+# Capturas de las pantallas (`ui::shots`), en PNG.
+png.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "time"] }
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

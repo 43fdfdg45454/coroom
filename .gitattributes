@@ -1,0 +1,11 @@
+# Finales de línea LF en todos los checkouts (también en Windows): los tests leen el código y los
+# catálogos tal cual, y los scripts de PowerShell y MSBuild los aceptan.
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.jpg binary
+*.woff2 binary
+*.ttf binary
+*.otf binary
+*.sys binary
+*.cat binary

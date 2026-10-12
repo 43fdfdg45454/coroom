@@ -1,0 +1,71 @@
+;
+; coroomvhid.inf - coroom virtual gamepad driver (KMDF + Virtual HID Framework).
+;
+; Installs the root device Root\coroomvhid with vhf.sys as lower filter. The virtual gamepads
+; are children that vhf.sys enumerates on demand ("HID-compliant game controller").
+; DriverVer and $KMDFVERSION$ are filled in by stampinf when MSBuild builds the package.
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+CatalogFile = coroomvhid.cat
+DriverVer   =
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+coroomvhid.sys = 1,,
+
+[Manufacturer]
+%ManufacturerName% = Coroom,NT$ARCH$.10.0...17763
+
+; Windows 10 1809 (build 17763) or later.
+[Coroom.NT$ARCH$.10.0...17763]
+%DeviceDesc% = CoroomVhid_Device, Root\coroomvhid
+
+[CoroomVhid_Device.NT]
+CopyFiles = CoroomVhid_CopyFiles
+
+[CoroomVhid_CopyFiles]
+coroomvhid.sys
+
+[CoroomVhid_Device.NT.HW]
+AddReg = CoroomVhid_Device_AddReg
+
+[CoroomVhid_Device_AddReg]
+; Virtual HID Framework below the driver (required by VhfCreate).
+HKR,,"LowerFilters",0x00010000,"vhf"
+; The root device itself serves no I/O: only SYSTEM and administrators may open it. The control
+; device \\.\coroomvhid has its own SDDL (coroom_vhid.h).
+HKR,,"Security",,"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+[CoroomVhid_Device.NT.Services]
+AddService = coroomvhid,0x00000002,CoroomVhid_Service
+
+[CoroomVhid_Service]
+DisplayName   = %ServiceDesc%
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START
+ErrorControl  = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary = %13%\coroomvhid.sys
+
+[CoroomVhid_Device.NT.Wdf]
+KmdfService = coroomvhid,CoroomVhid_WdfSection
+
+[CoroomVhid_WdfSection]
+KmdfLibraryVersion = $KMDFVERSION$
+
+[Strings]
+ProviderName     = "coroom"
+ManufacturerName = "coroom"
+DiskName         = "coroom virtual gamepad driver"
+DeviceDesc       = "coroom virtual gamepad bus"
+ServiceDesc      = "coroom virtual gamepad"

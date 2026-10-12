@@ -1,0 +1,65 @@
+name: Fijar la versión del workspace
+description: >-
+  Escribe la versión calculada por GitVersion en Cargo.toml (todas las crates la heredan), en
+  Cargo.lock y en los metadatos de AppStream, antes de compilar o empaquetar. Nada de esto se
+  confirma en el repositorio: la versión vive en las etiquetas de git. Solo necesita python3 (el
+  contenedor de flatpak-builder no tiene cargo).
+inputs:
+  version:
+    description: Versión X.Y.Z (majorMinorPatch de GitVersion)
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Versión ${{ inputs.version }}
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        python3 - <<'EOF'
+        import datetime, os, re, sys
+        version = os.environ["VERSION"]
+        if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+            sys.exit(f"::error::versión no válida: {version}")
+
+        # [workspace.package] es la primera sección con `version` de Cargo.toml.
+        text = open("Cargo.toml", encoding="utf-8").read()
+        new, n = re.subn(r'^version = "\d[^"]*"', f'version = "{version}"', text, count=1, flags=re.M)
+        if n != 1:
+            sys.exit("::error::Cargo.toml sin version en [workspace.package]")
+        open("Cargo.toml", "w", encoding="utf-8").write(new)
+
+        # Cargo.lock (y el del workspace de fuzzing, que apunta a las mismas crates por ruta) lleva
+        # la versión de cada crate del workspace (sin `source`, nombre coroom*); es lo mismo que
+        # haría `cargo update --workspace`, y los builds van con --locked.
+        changed = 0
+        for lock_path in ("Cargo.lock", "fuzz/Cargo.lock"):
+            if not os.path.exists(lock_path):
+                continue
+            lock = open(lock_path, encoding="utf-8").read()
+            blocks = lock.split("[[package]]")
+            for i, block in enumerate(blocks[1:], start=1):
+                name = re.search(r'^name = "([^"]+)"', block, re.M)
+                if not name or "source = " in block:
+                    continue
+                # El propio paquete de fuzzing (coroom-fuzz, 0.0.0) no lleva la versión del producto.
+                if name.group(1) == "coroom" or (name.group(1).startswith("coroom-") and name.group(1) != "coroom-fuzz"):
+                    blocks[i], k = re.subn(r'^version = "[^"]+"', f'version = "{version}"', block, count=1, flags=re.M)
+                    changed += k
+            open(lock_path, "w", encoding="utf-8").write("[[package]]".join(blocks))
+        if changed == 0:
+            sys.exit("::error::Cargo.lock sin crates del workspace")
+
+        # Entrada de AppStream de esta versión (fecha de hoy y enlace a la release).
+        path = "packaging/flatpak/io.github._43fdfdg45454.coroom.metainfo.xml"
+        meta = open(path, encoding="utf-8").read()
+        today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+        meta, a = re.subn(r'<release version="[^"]+" date="[^"]+">', f'<release version="{version}" date="{today}">', meta, count=1)
+        meta, b = re.subn(r'releases/tag/v[0-9][^"<]*', f'releases/tag/v{version}', meta, count=1)
+        if a != 1 or b != 1:
+            sys.exit("::error::metainfo sin la entrada <release> esperada")
+        open(path, "w", encoding="utf-8").write(meta)
+        print(f"coroom {version}: Cargo.toml, {changed} crates en Cargo.lock y AppStream")
+        EOF
+        echo "coroom $VERSION" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Metadatos AppStream de coroom. Se validan con `appstreamcli validate`. -->
+<component type="desktop-application">
+  <id>io.github._43fdfdg45454.coroom</id>
+  <name>coroom</name>
+  <name xml:lang="en">coroom</name>
+  <summary>Juega en remoto con tus amigos</summary>
+  <summary xml:lang="en">Play remotely with your friends</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <developer id="io.github._43fdfdg45454">
+    <name>Proyecto coroom</name>
+    <name xml:lang="en">The coroom project</name>
+  </developer>
+  <description>
+    <p>
+      coroom comparte la pantalla de un juego con tus amigos para que jueguen contigo como si
+      estuvieran en el mismo sofá: el vídeo, el audio del juego y la voz van con muy poca latencia
+      y cifrados de extremo a extremo, y los invitados controlan el juego con su teclado, su ratón
+      o su mando.
+    </p>
+    <p>
+      Funciona con tu propio servidor de coroom, que solo ve texto cifrado. Lo que puedes hacer:
+    </p>
+    <ul>
+      <li>Compartir un monitor o una ventana por el portal del escritorio, con el audio del juego</li>
+      <li>Entrar en la sala de un amigo con un código o con su invitación</li>
+      <li>Ver la calidad de la conexión antes de entrar y reconectar sola si se cae la red</li>
+      <li>Dar a cada invitado teclado y ratón o un mando virtual, y hablar por la sala</li>
+      <li>Vídeo AV1, HEVC o H.264 por hardware, con 4:4:4, 120 fps y HDR cuando el equipo lo admite</li>
+    </ul>
+    <p xml:lang="en">
+      coroom shares a game's screen with your friends so they can play with you as if they were on
+      the same couch: video, game audio and voice travel with very low latency and end-to-end
+      encryption, and guests control the game with their own keyboard, mouse or gamepad.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github._43fdfdg45454.coroom.desktop</launchable>
+  <provides>
+    <binary>coroom</binary>
+  </provides>
+  <url type="homepage">https://github.com/43fdfdg45454/coroom</url>
+  <url type="bugtracker">https://github.com/43fdfdg45454/coroom/issues</url>
+  <url type="vcs-browser">https://github.com/43fdfdg45454/coroom</url>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Inicio: compartir la pantalla o unirse a una sala</caption>
+      <image>https://raw.githubusercontent.com/43fdfdg45454/coroom/main/docs/screenshots/inicio.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Sala abierta con sus invitados y permisos</caption>
+      <image>https://raw.githubusercontent.com/43fdfdg45454/coroom/main/docs/screenshots/sala.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Invitado jugando, con las estadísticas de la conexión</caption>
+      <image>https://raw.githubusercontent.com/43fdfdg45454/coroom/main/docs/screenshots/invitado.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Ajustes de vídeo en el tema oscuro</caption>
+      <image>https://raw.githubusercontent.com/43fdfdg45454/coroom/main/docs/screenshots/ajustes.png</image>
+    </screenshot>
+  </screenshots>
+  <branding>
+    <color type="primary" scheme_preference="light">#99c1f1</color>
+    <color type="primary" scheme_preference="dark">#1a5fb4</color>
+  </branding>
+  <categories>
+    <category>Network</category>
+    <category>RemoteAccess</category>
+  </categories>
+  <keywords>
+    <keyword>juego remoto</keyword>
+    <keyword>compartir pantalla</keyword>
+    <keyword>mando</keyword>
+    <keyword xml:lang="en">remote play</keyword>
+    <keyword xml:lang="en">screen sharing</keyword>
+  </keywords>
+  <requires>
+    <display_length compare="ge">760</display_length>
+    <internet>always</internet>
+  </requires>
+  <recommends>
+    <control>keyboard</control>
+    <control>pointing</control>
+    <control>gamepad</control>
+  </recommends>
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-audio">intense</content_attribute>
+  </content_rating>
+  <releases>
+    <!-- La CI (.github/actions/version) escribe aquí la versión y la fecha de cada publicación. -->
+    <release version="1.0.0" date="2026-10-12">
+      <url type="details">https://github.com/43fdfdg45454/coroom/releases/tag/v1.0.0</url>
+      <description>
+        <p>Versión 1.0: revisión de seguridad con sus correcciones, fuzzing, control de tasa estable con pérdida y jitter, textos en catálogos traducibles y navegación con el teclado que da la vuelta.</p>
+      </description>
+    </release>
+  </releases>
+</component>

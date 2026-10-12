@@ -1,0 +1,34 @@
+# Compilación
+/target/
+# Paquetes de Windows de packaging/msix/build.ps1 y el directorio de flatpak-builder
+/dist/
+/build-dir/
+/.flatpak-builder/
+
+# Datos locales del servidor (certificado autofirmado, base de datos)
+/data/
+/apps/server/data/
+/deploy/data/
+
+# Secretos y valores reales del despliegue
+deploy/.env
+*.pem
+*.key
+*.crt
+
+# FFmpeg de desarrollo descargado por tools/fetch-ffmpeg.sh (tools/ffmpeg.lock)
+/third_party/
+
+# Driver de mando virtual de Windows: compilación, paquetes y certificados de prueba (build.ps1)
+/drivers/windows-vhid/build/
+/drivers/windows-vhid/out/
+/drivers/windows-vhid/packages/
+*.cer
+*.pfx
+
+# Fuzzing (fuzz/): corpus que crece al ejecutar, fallos y cobertura. Las semillas de
+# fuzz/seeds/ sí van en el repositorio.
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+/fuzz/target/

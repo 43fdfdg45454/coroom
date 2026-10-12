@@ -1,0 +1,114 @@
+name: Paquetes
+
+# Construye todo lo que se adjunta a una publicación, con la versión que calcula ci.yml: el
+# Flatpak (flatpak.yml), el MSIX firmado con el certificado de prueba y el .zip portátil de Windows,
+# la imagen multiarquitectura de coroom-server (solo se construye; «Publicación» la sube a GHCR
+# desde la caché) y el driver de mando virtual en su build de desarrollo (driver.yml). Lo llama
+# ci.yml en cada push a main; a mano, desde la pestaña Actions.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Versión X.Y.Z
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Versión X.Y.Z
+        required: true
+        type: string
+        default: 0.0.0
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  flatpak:
+    name: Flatpak
+    uses: ./.github/workflows/flatpak.yml
+    with:
+      version: ${{ inputs.version }}
+
+  driver:
+    name: Driver de mando virtual
+    uses: ./.github/workflows/driver.yml
+
+  windows:
+    name: Windows (MSIX y zip)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Versión de Rust (rust-toolchain.toml)
+        id: rust
+        shell: bash
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: ./.github/actions/version
+        with:
+          version: ${{ inputs.version }}
+
+      # aws-lc-sys compila ensamblador con NASM en Windows y el runner no lo trae.
+      - uses: ilammy/setup-nasm@v1
+
+      # FFmpeg LGPL de tools/ffmpeg.lock (sus DLL van en el paquete) y libclang para `bindgen`.
+      - name: FFmpeg
+        run: |
+          ./tools/fetch-ffmpeg.ps1
+          if (-not $env:LIBCLANG_PATH) {
+            "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+
+      # Firma con un certificado de prueba creado en el runner (CN=coroom-dev, el del manifiesto):
+      # para instalarlo hay que confiar antes en coroom-dev.cer (README, «Windows»). La firma real
+      # se hace aparte con build.ps1 -CertificatePath.
+      - name: MSIX y zip
+        run: ./packaging/msix/build.ps1 -TestCertificate
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: |
+            dist/coroom-${{ inputs.version }}-x64.msix
+            dist/coroom-${{ inputs.version }}-windows-x64.zip
+            dist/coroom-dev.cer
+          if-no-files-found: error
+
+  docker:
+    name: Imagen del servidor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/version
+        with:
+          version: ${{ inputs.version }}
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+
+      # amd64 y arm64; deploy/Dockerfile compila de forma cruzada en la plataforma del runner. No se
+      # sube: queda en la caché de BuildKit de GitHub, de donde la toma «Publicación» una vez que
+      # las comprobaciones han pasado.
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

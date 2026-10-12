@@ -1,0 +1,147 @@
+# Flatpak de coroom. Se construye con:
+#
+#   flatpak-builder --user --install-deps-from=flathub --force-clean build-dir \
+#       packaging/flatpak/io.github._43fdfdg45454.coroom.yml
+#   flatpak build-bundle ~/.local/share/flatpak/repo coroom.flatpak io.github._43fdfdg45454.coroom
+#
+# (o con `.github/workflows/flatpak.yml`, que hace lo mismo en la CI y lo adjunta a cada release).
+#
+# Identificador: la convención de Flathub para proyectos de GitHub, `io.github.<usuario>.<repo>`,
+# con `_` delante del usuario porque ningún componente puede empezar por un dígito.
+#
+# Runtime 26.08 (el más reciente de freedesktop-sdk). Ya trae, en la Platform, lo que coroom usa del
+# sistema: SVT-AV1 4.2, dav1d 1.5, libva 2.24, el cargador de Vulkan, PipeWire, Wayland, libopus
+# 1.6.1 y WebRTC Audio Processing 2.1; libei no hace falta (`reis` habla el protocolo EI en Rust).
+# Se compilan aparte:
+#
+# - FFmpeg 8.1.3 en LGPL (sin GPL ni nonfree), con Vulkan Video, VA-API, NVENC/NVDEC (cabeceras
+#   ffnvcodec del SDK, la biblioteca la carga el driver), AMF, SVT-AV1 y dav1d del runtime. Sin
+#   QSV: el SDK no trae libvpl. El de la Platform no sirve: no tiene los codificadores de Vulkan ni
+#   el decodificador `hevc`.
+# - coroom con cargo sin red: `cargo-sources.json` (generado con `flatpak-cargo-generator.py` de
+#   flatpak-builder-tools desde `Cargo.lock`) vendoriza las crates de crates.io; las copias
+#   parcheadas de `vendor/` vienen con el propio código. libopus (`opusic-sys`) y el procesado de
+#   voz de WebRTC (`webrtc-audio-processing`, con meson) se compilan desde las crates; abseil-cpp
+#   llega como paquete de meson (los mismos ficheros que `tools/fetch-meson-wraps.sh`).
+id: io.github._43fdfdg45454.coroom
+runtime: org.freedesktop.Platform
+runtime-version: '26.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  # Rust estable (1.98 en la rama 26.08) y libclang para `bindgen` (`rusty_ffmpeg`, `pipewire-sys`).
+  - org.freedesktop.Sdk.Extension.rust-stable
+  - org.freedesktop.Sdk.Extension.llvm22
+command: coroom
+finish-args:
+  # Ventana: Wayland nativo, X11 solo de respaldo; IPC compartida para X11 (MIT-SHM).
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  # GPU: Vulkan, Vulkan Video, VA-API y NVENC/NVDEC.
+  - --device=dri
+  # Servidor de coroom, conexión directa entre pares (QUIC por UDP) y relay.
+  - --share=network
+  # Audio del juego, micrófono y salida por PipeWire nativo. La pantalla se captura por el portal
+  # ScreenCast (sin permiso aquí: lo da el usuario en el diálogo del portal) y la entrada del
+  # anfitrión por el portal RemoteDesktop (libei).
+  - --filesystem=xdg-run/pipewire-0
+  # Mandos: el invitado lee los suyos en /dev/input y el anfitrión crea mandos virtuales en
+  # /dev/uinput (necesita Flatpak 1.15.6 o posterior y que el usuario pueda abrir /dev/uinput, ver
+  # el README). Ningún portal da todavía mandos virtuales; cuando exista, se quitará.
+  - --device=input
+  # El llavero va por el portal Secret (sin `--talk-name=org.freedesktop.secrets`): la identidad y
+  # las credenciales se sellan con su clave en el directorio de datos del sandbox.
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm22/bin
+  prepend-ld-library-path: /usr/lib/sdk/llvm22/lib
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /share/ffmpeg
+  - /share/doc
+  - /share/man
+  - '*.a'
+modules:
+  - name: ffmpeg
+    # LGPL 2.1 o posterior: --disable-gpl y --disable-nonfree (también son los valores por defecto,
+    # pero se dicen para que nadie los cambie sin verlo).
+    config-opts:
+      - --disable-static
+      - --enable-shared
+      - --disable-programs
+      - --disable-doc
+      - --disable-debug
+      - --disable-gpl
+      - --disable-nonfree
+      - --disable-indevs
+      - --disable-outdevs
+      - --enable-vulkan
+      - --enable-libshaderc
+      - --enable-libdrm
+      - --enable-vaapi
+      - --enable-ffnvcodec
+      - --enable-nvenc
+      - --enable-nvdec
+      - --enable-amf
+      - --enable-libsvtav1
+      - --enable-libdav1d
+    sources:
+      # Repositorio git oficial con la etiqueta fijada a su commit (flatpak-builder lo comprueba).
+      # Mismo código que el tarball oficial ffmpeg-8.1.3.tar.xz y que la build de desarrollo de
+      # `tools/ffmpeg.lock`.
+      - type: git
+        url: https://git.ffmpeg.org/ffmpeg.git
+        tag: n8.1.3
+        commit: 1041abdc962f4cc4f394aa8de9dc5236c0c3b9e7
+
+  - name: coroom
+    buildsystem: simple
+    build-options:
+      # Sin los CFLAGS/CXXFLAGS del SDK (-O2 …): la crate `cc` los añade al final de cada orden y
+      # pisan el -O0 que aws-lc-sys exige para jitterentropy (`#error` si se compila con
+      # optimizaciones). Cada crate pone sus propias banderas.
+      cflags-override: true
+      cxxflags-override: true
+      env:
+        CARGO_HOME: /run/build/coroom/cargo
+        CARGO_NET_OFFLINE: 'true'
+        # El FFmpeg de arriba (tienen prioridad sobre `.cargo/config.toml`).
+        FFMPEG_INCLUDE_DIR: /app/include
+        FFMPEG_LIBS_DIR: /app/lib
+        FFMPEG_LINK_MODE: dynamic
+        # Bindings de FFmpeg pregenerados (misma versión n8.1.3): con el libclang 22 del SDK,
+        # bindgen deja opacas las estructuras y rsmpeg no compila (ver la cabecera del fichero).
+        FFMPEG_BINDING_PATH: /run/build/coroom/packaging/flatpak/ffmpeg-binding.rs
+        LIBCLANG_PATH: /usr/lib/sdk/llvm22/lib
+        # abseil-cpp para meson, sin red (ver las fuentes `file` de abajo). El abseil del SDK está
+        # compilado como C++20 y `webrtc-audio-processing` (C++17) no puede incluirlo: este
+        # pkg-config lo oculta y meson y `bindgen` usan el subproyecto, como en la CI de Linux.
+        MESON_PACKAGE_CACHE_DIR: /run/build/coroom/meson-packagecache
+        PKG_CONFIG: /run/build/coroom/packaging/flatpak/pkg-config-sin-abseil
+    build-commands:
+      - cargo --offline build --release --locked -p coroom
+      - install -Dm755 target/release/coroom /app/bin/coroom
+      - install -Dm644 packaging/flatpak/io.github._43fdfdg45454.coroom.desktop
+        /app/share/applications/io.github._43fdfdg45454.coroom.desktop
+      - install -Dm644 packaging/flatpak/io.github._43fdfdg45454.coroom.metainfo.xml
+        /app/share/metainfo/io.github._43fdfdg45454.coroom.metainfo.xml
+      - install -Dm644 packaging/icons/coroom.svg
+        /app/share/icons/hicolor/scalable/apps/io.github._43fdfdg45454.coroom.svg
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - .git
+          - target
+          - third_party
+          - packaging/msix
+          - deploy
+      - cargo-sources.json
+      - type: file
+        url: https://github.com/abseil/abseil-cpp/releases/download/20240722.0/abseil-cpp-20240722.0.tar.gz
+        sha256: f50e5ac311a81382da7fa75b97310e4b9006474f9560ac46f54a9967f07d4ae3
+        dest: meson-packagecache
+      - type: file
+        url: https://github.com/mesonbuild/wrapdb/releases/download/abseil-cpp_20240722.0-3/abseil-cpp_20240722.0-3_patch.zip
+        sha256: 12dd8df1488a314c53e3751abd2750cf233b830651d168b6a9f15e7d0cf71f7b
+        dest: meson-packagecache

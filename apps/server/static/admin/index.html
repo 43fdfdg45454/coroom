@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>coroom · Administración</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/admin/admin.css">
+  <script src="/admin/admin.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#principal">Saltar al contenido</a>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"></span>
+      <div>
+        <strong>coroom</strong>
+        <span class="host" id="server-host">servidor</span>
+      </div>
+      <span class="badge" id="server-version" title="Versión del servidor">—</span>
+    </div>
+    <div class="session" id="session" hidden>
+      <span id="session-user"></span>
+      <button type="button" class="ghost" id="logout">Cerrar sesión</button>
+    </div>
+  </header>
+
+  <div class="status" id="status" role="status" aria-live="polite" hidden></div>
+
+  <!-- Primer arranque: crear el administrador. -->
+  <main class="card narrow" id="view-setup" hidden>
+    <h1>Bienvenido a tu servidor de coroom</h1>
+    <p class="lead">Todavía no hay administrador. Crea la cuenta con la que gestionarás usuarios,
+      invitaciones y el relay. Solo se puede hacer una vez.</p>
+    <form id="setup-form" novalidate>
+      <label>Nombre de usuario
+        <input name="username" autocomplete="username" required minlength="3" maxlength="32"
+               pattern="[A-Za-z0-9._\-]{3,32}" placeholder="admin">
+        <small>De 3 a 32 caracteres: letras, dígitos, «.», «-» y «_».</small>
+      </label>
+      <label><span>Nombre visible <span class="optional">(opcional)</span></span>
+        <input name="display_name" autocomplete="name" maxlength="64">
+      </label>
+      <label>Contraseña
+        <input name="password" type="password" autocomplete="new-password" required minlength="12">
+        <small>Al menos 12 caracteres.</small>
+      </label>
+      <label>Repite la contraseña
+        <input name="password2" type="password" autocomplete="new-password" required minlength="12">
+      </label>
+      <p class="error" role="alert" hidden></p>
+      <button type="submit" class="primary">Crear administrador</button>
+    </form>
+  </main>
+
+  <!-- Inicio de sesión. -->
+  <main class="card narrow" id="view-login" hidden>
+    <h1>Administración</h1>
+    <p class="lead">Inicia sesión con una cuenta de administrador.</p>
+    <form id="login-form" novalidate>
+      <label>Usuario
+        <input name="username" autocomplete="username" required>
+      </label>
+      <label>Contraseña
+        <input name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <p class="error" role="alert" hidden></p>
+      <button type="submit" class="primary">Entrar</button>
+    </form>
+    <p class="hint">Los jugadores no entran aquí: inician sesión desde la app con
+      <code>coroom login</code>.</p>
+  </main>
+
+  <!-- Panel. -->
+  <div class="layout" id="view-app" hidden>
+    <nav class="sidebar" aria-label="Secciones">
+      <button type="button" data-section="users" aria-current="page">
+        <span class="icon users" aria-hidden="true"></span>Usuarios</button>
+      <button type="button" data-section="invitations">
+        <span class="icon ticket" aria-hidden="true"></span>Invitaciones</button>
+      <button type="button" data-section="usage">
+        <span class="icon chart" aria-hidden="true"></span>Uso del relay</button>
+      <button type="button" data-section="rooms">
+        <span class="icon rooms" aria-hidden="true"></span>Salas activas</button>
+      <button type="button" data-section="settings">
+        <span class="icon gear" aria-hidden="true"></span>Ajustes</button>
+    </nav>
+
+    <main id="principal" class="content" tabindex="-1">
+      <section id="section-users" data-title="Usuarios">
+        <div class="section-head">
+          <h1>Usuarios</h1>
+          <p>Cuentas del servidor. Deshabilitar una cuenta cierra sus sesiones al momento.</p>
+        </div>
+        <details class="card form-card" id="new-user">
+          <summary>Nuevo usuario</summary>
+          <form id="user-form" class="grid-form" novalidate>
+            <label>Nombre de usuario
+              <input name="username" required minlength="3" maxlength="32"
+                     pattern="[A-Za-z0-9._\-]{3,32}" autocomplete="off">
+            </label>
+            <label><span>Nombre visible <span class="optional">(opcional)</span></span>
+              <input name="display_name" maxlength="64" autocomplete="off">
+            </label>
+            <label>Contraseña inicial
+              <input name="password" type="password" required minlength="12" autocomplete="new-password">
+            </label>
+            <label class="check"><input name="is_admin" type="checkbox"> Administrador</label>
+            <p class="error" role="alert" hidden></p>
+            <div class="actions"><button type="submit" class="primary">Crear usuario</button></div>
+          </form>
+        </details>
+        <div class="card table-card">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Usuario</th>
+                <th scope="col">Papel</th>
+                <th scope="col">Estado</th>
+                <th scope="col" class="num">Dispositivos</th>
+                <th scope="col">Último uso</th>
+                <th scope="col"><span class="sr">Acciones</span></th>
+              </tr>
+            </thead>
+            <tbody id="users-body"></tbody>
+          </table>
+          <p class="empty" id="users-empty" hidden>No hay usuarios.</p>
+        </div>
+      </section>
+
+      <section id="section-invitations" data-title="Invitaciones" hidden>
+        <div class="section-head">
+          <h1>Códigos de invitación</h1>
+          <p>Cada código sirve una sola vez: quien lo canjea elige su nombre y contraseña con
+            <code>coroom login --invitation CÓDIGO</code>.</p>
+        </div>
+        <div class="card form-card">
+          <form id="invitation-form" class="grid-form inline" novalidate>
+            <label><span>Para quién <span class="optional">(nota)</span></span>
+              <input name="note" maxlength="120" placeholder="Ana, del grupo de los jueves" autocomplete="off">
+            </label>
+            <label>Validez
+              <select name="hours">
+                <option value="24">24 horas</option>
+                <option value="72" selected>3 días</option>
+                <option value="168">7 días</option>
+                <option value="720">30 días</option>
+              </select>
+            </label>
+            <div class="actions"><button type="submit" class="primary">Crear código</button></div>
+            <p class="error" role="alert" hidden></p>
+          </form>
+          <div class="created" id="created-code" hidden>
+            <p>Código nuevo; cópialo ahora, no se vuelve a mostrar:</p>
+            <div class="code-row">
+              <code id="created-value"></code>
+              <button type="button" id="copy-code">Copiar</button>
+            </div>
+          </div>
+        </div>
+        <div class="card table-card">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Código</th>
+                <th scope="col">Nota</th>
+                <th scope="col">Estado</th>
+                <th scope="col">Caduca</th>
+                <th scope="col">Canjeado por</th>
+                <th scope="col"><span class="sr">Acciones</span></th>
+              </tr>
+            </thead>
+            <tbody id="invitations-body"></tbody>
+          </table>
+          <p class="empty" id="invitations-empty" hidden>Todavía no has creado códigos.</p>
+        </div>
+      </section>
+
+      <section id="section-usage" data-title="Uso del relay" hidden>
+        <div class="section-head">
+          <h1>Uso del relay</h1>
+          <p>Bytes que el relay reenvió en las salas de cada anfitrión. Solo cantidades: el
+            contenido va cifrado de extremo a extremo.</p>
+        </div>
+        <div class="toolbar">
+          <label>Mes <select id="usage-month"></select></label>
+          <div class="stat"><span>Total</span><strong id="usage-total">—</strong></div>
+          <div class="stat"><span>Cuota por usuario</span><strong id="usage-quota">—</strong></div>
+        </div>
+        <div class="card table-card">
+          <table>
+            <thead>
+              <tr><th scope="col">Usuario</th><th scope="col">Uso</th><th scope="col" class="num">Bytes</th></tr>
+            </thead>
+            <tbody id="usage-body"></tbody>
+          </table>
+          <p class="empty" id="usage-empty" hidden>Nadie ha usado el relay este mes.</p>
+        </div>
+      </section>
+
+      <section id="section-rooms" data-title="Salas activas" hidden>
+        <div class="section-head">
+          <h1>Salas activas</h1>
+          <p>Solo recuentos: el servidor no sabe qué se juega ni quién habla. Se actualiza cada
+            5 segundos.</p>
+        </div>
+        <div class="toolbar">
+          <div class="stat"><span>Salas</span><strong id="rooms-count">0</strong></div>
+          <div class="stat"><span>Por el relay</span><strong id="rooms-relayed">0</strong></div>
+          <div class="stat"><span>Invitados</span><strong id="rooms-guests">0</strong></div>
+        </div>
+        <div class="card table-card">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Sala</th>
+                <th scope="col" class="num">Invitados</th>
+                <th scope="col">Relay</th>
+                <th scope="col" class="num">Bytes reenviados</th>
+                <th scope="col" class="num">Descartados por el límite</th>
+              </tr>
+            </thead>
+            <tbody id="rooms-body"></tbody>
+          </table>
+          <p class="empty" id="rooms-empty" hidden>Ahora mismo no hay ninguna sala abierta.</p>
+        </div>
+      </section>
+
+      <section id="section-settings" data-title="Ajustes" hidden>
+        <div class="section-head">
+          <h1>Ajustes</h1>
+          <p>Solo lectura: se cambian con las variables <code>COROOM_*</code> del fichero
+            <code>.env</code> y reiniciando el servidor.</p>
+        </div>
+        <div class="card"><dl class="settings" id="settings-list"></dl></div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="password-dialog" aria-labelledby="password-title">
+    <form id="password-form" method="dialog" novalidate>
+      <h2 id="password-title">Restablecer contraseña</h2>
+      <input type="text" name="username" autocomplete="username" hidden>
+      <p>La cuenta <strong id="password-user"></strong> tendrá esta contraseña y se cerrarán
+        todas sus sesiones.</p>
+      <label>Contraseña nueva
+        <input name="password" type="password" required minlength="12" autocomplete="new-password">
+      </label>
+      <p class="error" role="alert" hidden></p>
+      <div class="actions">
+        <button type="button" class="ghost" id="password-cancel">Cancelar</button>
+        <button type="submit" class="primary">Cambiar</button>
+      </div>
+    </form>
+  </dialog>
+
+  <noscript><p class="card narrow">La administración necesita JavaScript.</p></noscript>
+</body>
+</html>

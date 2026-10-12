@@ -1,0 +1,25 @@
+[package]
+name = "coroom-session"
+description = "Máquinas de estado de sesión de coroom (anfitrión e invitado), permisos y reloj."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+coroom-audio.workspace = true
+coroom-capture.workspace = true
+coroom-codec.workspace = true
+coroom-input.workspace = true
+coroom-transport.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "sync", "macros"] }
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

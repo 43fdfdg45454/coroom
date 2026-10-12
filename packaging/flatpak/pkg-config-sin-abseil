@@ -1,0 +1,12 @@
+#!/bin/sh
+# pkg-config que no encuentra abseil. El SDK de freedesktop trae un abseil compilado como C++20 que
+# el procesado de voz de WebRTC (`webrtc-audio-processing`, C++17) no puede incluir; sin él, meson
+# recurre a su subproyecto abseil-cpp 20240722 (de `MESON_PACKAGE_CACHE_DIR`, como en la CI de
+# Linux) y `bindgen` toma las cabeceras de ese mismo subproyecto. Lo usan meson y la crate
+# `pkg-config` a través de la variable PKG_CONFIG (manifiesto del Flatpak).
+for arg in "$@"; do
+    case "$arg" in
+        absl_*) exit 1 ;;
+    esac
+done
+exec /usr/bin/pkg-config "$@"
