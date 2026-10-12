@@ -1,28 +1,27 @@
-# coroom-server con Docker Compose. Uso: cp .env.sample .env && docker compose up -d
-#
-# La imagen sale de GHCR con la versión de COROOM_VERSION (.env; cada publicación vX.Y.Z sube
-# ghcr.io/43fdfdg45454/coroom-server:X.Y.Z y :latest, amd64 y arm64). `docker compose up -d --build`
-# la compila desde este repositorio en su lugar.
 services:
   server:
-    image: ${COROOM_IMAGE:-ghcr.io/43fdfdg45454/coroom-server}:${COROOM_VERSION:-1.0.0}
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-    env_file: .env
+    image: ghcr.io/43fdfdg45454/coroom-server:${COROOM_VERSION:-1.0.0}
     restart: unless-stopped
+    environment:
+      COROOM_PUBLIC_HOST: ${COROOM_PUBLIC_HOST:?falta COROOM_PUBLIC_HOST en .env}
+      COROOM_PUBLIC_UDP_PORT: ${COROOM_PUBLIC_UDP_PORT:-443}
+      COROOM_PUBLIC_TCP_PORT: ${COROOM_PUBLIC_TCP_PORT:-443}
+      COROOM_TLS_MODE: ${COROOM_TLS_MODE:-acme}
+      COROOM_TLS_CERT: ${COROOM_TLS_CERT:-/data/certs/fullchain.pem}
+      COROOM_TLS_KEY: ${COROOM_TLS_KEY:-/data/certs/privkey.pem}
+      COROOM_ACME_DIRECTORY: ${COROOM_ACME_DIRECTORY:-https://acme-v02.api.letsencrypt.org/directory}
+      COROOM_ACME_CONTACT: ${COROOM_ACME_CONTACT:-}
+      COROOM_ACME_CHALLENGE: ${COROOM_ACME_CHALLENGE:-tls-alpn-01}
+      COROOM_REGISTRATION: ${COROOM_REGISTRATION:-invite}
+      COROOM_MAX_GUESTS_PER_ROOM: ${COROOM_MAX_GUESTS_PER_ROOM:-8}
+      COROOM_RELAY_ENABLED: ${COROOM_RELAY_ENABLED:-true}
+      COROOM_RELAY_ADDR: ${COROOM_RELAY_ADDR:?falta COROOM_RELAY_ADDR en .env}
+      COROOM_RELAY_QUOTA_GB_PER_MONTH: ${COROOM_RELAY_QUOTA_GB_PER_MONTH:-0}
+      COROOM_RELAY_MAX_KBPS: ${COROOM_RELAY_MAX_KBPS:-0}
+      COROOM_SOURCE_URL: ${COROOM_SOURCE_URL:-https://github.com/43fdfdg45454/coroom}
+      RUST_LOG: ${RUST_LOG:-info}
     ports:
-      # HTTP/3 (API, administración), señalización WebTransport y relay de medios.
-      - "443:4433/udp"
-      # HTTP/2 y HTTP/1.1 con TLS (respaldo con Alt-Svc) y reto ACME TLS-ALPN-01.
-      - "443:8443/tcp"
-      # Solo con COROOM_ACME_CHALLENGE=http-01 (y COROOM_BIND_HTTP=[::]:8080).
-      # - "80:8080/tcp"
+      - "${COROOM_PUBLIC_UDP_PORT:-443}:4433/udp"
+      - "${COROOM_PUBLIC_TCP_PORT:-443}:8443/tcp"
     volumes:
-      # coroom.db (cuentas, invitaciones, amigos, uso del relay) y acme/ (cuenta y certificados).
-      - data:/data
-      # Modo COROOM_TLS_MODE=files: monta el certificado y la clave en solo lectura.
-      # - ./certs:/certs:ro
-
-volumes:
-  data:
+      - ./data:/data

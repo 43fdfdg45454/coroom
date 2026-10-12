@@ -116,7 +116,11 @@ impl AcmeSettings {
     pub fn from_config(config: &crate::Config) -> Self {
         Self {
             directory: config.acme_directory.clone(),
-            contact: config.acme_contact.clone(),
+            // Vacío equivale a sin contacto (Compose pasa la variable aunque no se defina).
+            contact: config
+                .acme_contact
+                .clone()
+                .filter(|contact| !contact.trim().is_empty()),
             challenge: config.acme_challenge,
             domain: config.public_host.to_ascii_lowercase(),
             dir: config.data_dir.join(ACME_DIR),
