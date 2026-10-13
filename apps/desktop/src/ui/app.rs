@@ -1066,7 +1066,10 @@ impl App {
     }
 
     fn account_footer(&self) -> Element<'_, Message> {
-        use coroom_ui::icon::Icon;
+        use coroom_ui::icon::{Icon, icon_with};
+        use coroom_ui::style::{ButtonClass, ContainerClass, SvgClass};
+        use iced_core::text::Wrapping;
+        use iced_widget::button;
         let Some(account) = &self.account else {
             return ui::gap(0.0);
         };
@@ -1089,25 +1092,46 @@ impl App {
         if !self.account_menu {
             return container(who).padding(Padding::from([4.0, 4.0])).into();
         }
-        let menu = ui::card(
+        // Filas de menú: una sola línea, sin el alto fijo de los botones (no cabe en la barra).
+        let item = |label: &'static str, icon: Icon, destructive: bool, message: Message| {
+            let (class, tint) = if destructive {
+                (ButtonClass::DestructiveFlat, SvgClass::Tone(Tone::Error))
+            } else {
+                (ButtonClass::Flat, SvgClass::Text)
+            };
+            button(
+                row![
+                    icon_with(icon, 18.0, tint),
+                    ui::strong(label).wrapping(Wrapping::None)
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .padding(Padding::from([8.0, 10.0]))
+            .width(Length::Fill)
+            .class(class)
+            .on_press(message)
+        };
+        let menu = container(
             column![
-                ui::button_with(
-                    ui::Kind::Flat,
+                item(
                     t!("app-cambiar-de-servidor"),
-                    Some(Icon::Server),
-                    Some(Message::SwitchServer)
-                )
-                .width(Length::Fill),
-                ui::button_with(
-                    ui::Kind::DestructiveFlat,
+                    Icon::Server,
+                    false,
+                    Message::SwitchServer
+                ),
+                item(
                     t!("app-cerrar-sesion"),
-                    Some(Icon::LogOut),
-                    Some(Message::SignOut)
-                )
-                .width(Length::Fill),
+                    Icon::LogOut,
+                    true,
+                    Message::SignOut
+                ),
             ]
             .spacing(2),
-        );
+        )
+        .padding(4)
+        .width(Length::Fill)
+        .class(ContainerClass::Card);
         column![menu, container(who).padding(Padding::from([4.0, 4.0]))]
             .spacing(8)
             .into()

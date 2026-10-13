@@ -851,6 +851,76 @@ pub fn card<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Element<'a, M> {
         .into()
 }
 
+/// Fila de tarjetas igual de altas: la de la más alta. Una fila de iced no iguala alturas (una
+/// tarjeta con `Length::Fill` en una fila que se encoge se queda en cero), así que va en una pila:
+/// debajo, `cards(false)` dentro de [`Measure`], que solo da la altura (con `Length::Shrink`; ni se
+/// dibuja ni recibe eventos ni foco); encima, `cards(true)`, las de verdad con `Length::Fill`.
+pub fn equal_height_row<'a, M: 'a>(
+    cards: impl Fn(bool) -> Vec<Element<'a, M>>,
+    spacing: f32,
+) -> Element<'a, M> {
+    stack![
+        Measure {
+            content: Row::with_children(cards(false))
+                .spacing(spacing)
+                .height(Length::Shrink)
+                .into(),
+        },
+        Row::with_children(cards(true))
+            .spacing(spacing)
+            .height(Length::Fill),
+    ]
+    .into()
+}
+
+/// Ocupa lo que ocuparía su contenido sin dibujarlo, sin eventos y sin operaciones (foco, `id`).
+struct Measure<'a, M> {
+    content: Element<'a, M>,
+}
+
+impl<'a, M: 'a> iced_core::Widget<M, Theme, Renderer> for Measure<'a, M> {
+    fn size(&self) -> iced_core::Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut iced_core::widget::Tree,
+        renderer: &Renderer,
+        limits: &iced_core::layout::Limits,
+    ) -> iced_core::layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn draw(
+        &self,
+        _tree: &iced_core::widget::Tree,
+        _renderer: &mut Renderer,
+        _theme: &Theme,
+        _style: &iced_core::renderer::Style,
+        _layout: iced_core::Layout<'_>,
+        _cursor: iced_core::mouse::Cursor,
+        _viewport: &iced_core::Rectangle,
+    ) {
+    }
+
+    fn children(&self) -> Vec<iced_core::widget::Tree> {
+        vec![iced_core::widget::Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut iced_core::widget::Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+}
+
+impl<'a, M: 'a> From<Measure<'a, M>> for Element<'a, M> {
+    fn from(measure: Measure<'a, M>) -> Self {
+        Element::new(measure)
+    }
+}
+
 /// Tarjeta entera pulsable.
 pub fn card_button<'a, M: Clone + 'a>(
     content: impl Into<Element<'a, M>>,

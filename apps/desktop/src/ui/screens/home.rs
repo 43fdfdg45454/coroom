@@ -124,7 +124,10 @@ pub fn view(app: &App) -> Element<'_, Message> {
     for notice in notices(app) {
         page = page.push(notice);
     }
-    page = page.push(row![share_card(app), join_card(app)].spacing(space::M));
+    page = page.push(ui::equal_height_row(
+        |real| vec![share_card(app, real), join_card(app, real)],
+        space::M,
+    ));
     page = page.push(online_friends(app));
     ui::page(page)
 }
@@ -195,9 +198,16 @@ fn big_card_header<'a>(icon: Icon, title: &'a str, text: &'a str) -> Element<'a,
     .into()
 }
 
-fn share_card(app: &App) -> Element<'_, Message> {
+/// Altura de una tarjeta de [`ui::equal_height_row`]: la de verdad llena la fila; la copia de
+/// debajo, que solo mide, se encoge.
+fn card_height(real: bool) -> Length {
+    if real { Length::Fill } else { Length::Shrink }
+}
+
+/// Tarjeta de compartir (`real`: ver [`ui::equal_height_row`]).
+fn share_card(app: &App, real: bool) -> Element<'_, Message> {
     let open = app.host.is_open();
-    ui::card(
+    iced_widget::container(
         column![
             big_card_header(
                 Icon::ShareScreen,
@@ -213,24 +223,34 @@ fn share_card(app: &App) -> Element<'_, Message> {
                     t!("pantalla-home-compartir")
                 },
                 Some(Icon::ShareScreen),
-                Some(on(Msg::Share))
+                real.then(|| on(Msg::Share))
             )
         ]
         .spacing(space::XS),
     )
+    .padding(space::M)
+    .width(Length::Fill)
+    .height(card_height(real))
+    .class(coroom_ui::style::ContainerClass::Card)
+    .into()
 }
 
-fn join_card(app: &App) -> Element<'_, Message> {
+/// Tarjeta de unirse (`real`: ver [`ui::equal_height_row`]; la copia no lleva el `id` del campo
+/// ni mensajes).
+fn join_card(app: &App, real: bool) -> Element<'_, Message> {
     let state = &app.home;
-    let code_field = Element::from(
-        ui::field(t!("pantalla-home-codigo-de-la-sala"), &state.code)
-            .placeholder("K7Q2MZ")
-            .monospace()
+    let field = ui::field(t!("pantalla-home-codigo-de-la-sala"), &state.code)
+        .placeholder("K7Q2MZ")
+        .monospace()
+        .error(state.code_error.as_deref());
+    let code_field = Element::from(if real {
+        field
             .on_input(|value| on(Msg::Code(value)))
             .on_submit(Some(on(Msg::Join)))
-            .error(state.code_error.as_deref())
-            .id("room-code"),
-    );
+            .id("room-code")
+    } else {
+        field
+    });
     let mut content = column![
         big_card_header(
             Icon::LogIn,
@@ -239,7 +259,7 @@ fn join_card(app: &App) -> Element<'_, Message> {
         ),
         row![
             iced_widget::container(code_field).width(Length::Fill),
-            ui::primary(t!("pantalla-home-entrar"), Some(on(Msg::Join)))
+            ui::primary(t!("pantalla-home-entrar"), real.then(|| on(Msg::Join)))
         ]
         .spacing(space::XS)
         .align_y(Alignment::End)
@@ -260,7 +280,7 @@ fn join_card(app: &App) -> Element<'_, Message> {
                             Kind::Primary,
                             t!("pantalla-home-entrar"),
                             None,
-                            Some(on(Msg::Accept(invitation.code.clone()))),
+                            real.then(|| on(Msg::Accept(invitation.code.clone()))),
                         )
                         .into(),
                     ],
@@ -272,7 +292,12 @@ fn join_card(app: &App) -> Element<'_, Message> {
             .push(ui::caption(t!("pantalla-home-invitaciones")))
             .push(ui::boxed_list(rows));
     }
-    ui::card(content)
+    iced_widget::container(content)
+        .padding(space::M)
+        .width(Length::Fill)
+        .height(card_height(real))
+        .class(coroom_ui::style::ContainerClass::Card)
+        .into()
 }
 
 fn online_friends(app: &App) -> Element<'_, Message> {

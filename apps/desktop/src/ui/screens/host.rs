@@ -716,13 +716,14 @@ pub fn view(app: &App) -> Element<'_, Message> {
     }
 }
 
-/// Tarjeta de una de las dos fuentes, con su icono y el borde de acento si es la elegida.
+/// Tarjeta de una de las dos fuentes, con su icono y el borde de acento si es la elegida. Sin
+/// mensaje es la copia que solo da la altura en [`source_cards`].
 fn choice<'a>(
     icon: Icon,
     title: &'a str,
     subtitle: &'a str,
     selected: bool,
-    message: Message,
+    message: Option<Message>,
 ) -> Element<'a, Message> {
     let class = if selected {
         SvgClass::Accent
@@ -743,9 +744,40 @@ fn choice<'a>(
     button(content)
         .padding(space::M)
         .width(Length::Fill)
+        .height(if message.is_some() {
+            Length::Fill
+        } else {
+            Length::Shrink
+        })
         .class(ButtonClass::Choice { selected })
-        .on_press(message)
+        .on_press_maybe(message)
         .into()
+}
+
+/// Las dos tarjetas de fuente, igual de altas.
+fn source_cards(state: &State) -> Element<'_, Message> {
+    ui::equal_height_row(
+        |real| {
+            let message = |source| real.then(|| on(Msg::Source(source)));
+            vec![
+                choice(
+                    Icon::Monitor,
+                    t!("pantalla-host-transmitir-pantalla"),
+                    t!("pantalla-host-un-monitor-entero-con-el-audio"),
+                    state.source == SourceChoice::Screen,
+                    message(SourceChoice::Screen),
+                ),
+                choice(
+                    Icon::AppWindow,
+                    t!("pantalla-host-transmitir-una-app"),
+                    t!("pantalla-host-una-sola-ventana-con-el-audio"),
+                    state.source == SourceChoice::App,
+                    message(SourceChoice::App),
+                ),
+            ]
+        },
+        space::S,
+    )
 }
 
 fn setup(app: &App) -> Element<'_, Message> {
@@ -758,23 +790,7 @@ fn setup(app: &App) -> Element<'_, Message> {
         CodecChoice::Hevc => "HEVC",
         CodecChoice::H264 => "H.264",
     };
-    let cards = row![
-        choice(
-            Icon::Monitor,
-            t!("pantalla-host-transmitir-pantalla"),
-            t!("pantalla-host-un-monitor-entero-con-el-audio"),
-            state.source == SourceChoice::Screen,
-            on(Msg::Source(SourceChoice::Screen)),
-        ),
-        choice(
-            Icon::AppWindow,
-            t!("pantalla-host-transmitir-una-app"),
-            t!("pantalla-host-una-sola-ventana-con-el-audio"),
-            state.source == SourceChoice::App,
-            on(Msg::Source(SourceChoice::App)),
-        ),
-    ]
-    .spacing(space::S);
+    let cards = source_cards(state);
     let test_source: Element<'_, Message> = if state.source == SourceChoice::Synthetic {
         ui::banner(
             Tone::Info,
