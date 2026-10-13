@@ -9,36 +9,29 @@
        clave privada se borró al terminar la compilación que lo creó: nadie puede firmar nada más
        con él.
     2. Quita los paquetes coroomvhid.inf anteriores del almacén de drivers (también el KMDF de
-       versiones antiguas) y los dispositivos que sobran o no tienen ranura.
-    3. Crea un dispositivo raíz Root\coroomvhid por ranura (0 a -Pads - 1), cada uno con su ranura
-       en el valor CoroomSlot de su clave de hardware.
+       versiones antiguas) y los dispositivos de coroom que hubiera (los mandos raíz de las
+       versiones anteriores incluidos).
+    3. Crea el dispositivo de control Root\coroomvhid (los mandos se crean y se quitan desde él
+       mientras coroom comparte) y cuatro Root\coroomxusb, mandos de Xbox 360 para XInput, cada uno
+       con su ranura en el valor CoroomSlot de su clave de hardware. Los juegos solo ven los mandos
+       que coroom está usando.
     4. Añade el paquete al almacén de drivers y lo instala: pnputil /add-driver coroomvhid.inf /install.
-    5. Limita la colección de control de cada mando a SYSTEM, administradores y el usuario con la
-       sesión iniciada.
+       Los permisos de cada dispositivo vienen en el INF.
 
     No toca la firma de prueba, el arranque seguro ni la integridad de memoria (HVCI): el driver
-    corre en modo usuario (UMDF2) bajo mshidumdf.sys y WUDFRd.sys, que son de Windows y están
-    firmados por Microsoft.
+    corre en modo usuario (UMDF2) sobre WUDFRd.sys y vhf.sys, que son de Windows y están firmados
+    por Microsoft.
 
     Hay que ejecutarlo en una consola de PowerShell abierta como administrador, desde la carpeta
     del paquete (la que tiene coroomvhid.inf) o con -PackageDir.
 
-.PARAMETER Pads
-    Mandos que se crean (1 a 8; 4 por defecto). Cada uno ocupa una ranura de invitado y los juegos
-    lo ven siempre, aunque nadie lo use (en reposo). Para cambiar el número, vuelve a ejecutar
-    install.ps1 con otro valor.
-
 .EXAMPLE
     .\install.ps1
-    .\install.ps1 -Pads 8
     .\install.ps1 -PackageDir .\out\x64
 #>
 [CmdletBinding()]
 param(
-    [string] $PackageDir,
-
-    [ValidateRange(1, 8)]
-    [int] $Pads = 4
+    [string] $PackageDir
 )
 
 $ErrorActionPreference = 'Stop'
@@ -80,28 +73,21 @@ foreach ($package in @(Get-CoroomDriverPackage)) {
     Invoke-PnpUtil -Arguments @('/delete-driver', $package.Driver, '/uninstall', '/force') | Out-Null
 }
 
-$bySlot = @{}
 foreach ($device in @(Get-CoroomDevice)) {
-    $slot = Get-CoroomDeviceSlot -Device $device
-    if ($null -eq $slot -or $slot -ge $Pads -or $bySlot.ContainsKey($slot)) {
-        $why = if ($null -eq $slot) { 'sin ranura (versión anterior del driver)' } elseif ($slot -ge $Pads) { "ranura $($slot + 1) de más" } else { "ranura $($slot + 1) repetida" }
-        Write-Host "Quitando el dispositivo $($device.InstanceId): $why"
-        [CoroomVhid.SetupApi]::RemoveDevice($device.InstanceId)
-    } else {
-        $bySlot[$slot] = $device.InstanceId
-    }
+    Write-Host "Quitando el dispositivo $($device.InstanceId)"
+    [CoroomVhid.SetupApi]::RemoveDevice($device.InstanceId)
 }
 
-# 3. Un dispositivo raíz por ranura.
-for ($slot = 0; $slot -lt $Pads; $slot++) {
-    if ($bySlot.ContainsKey($slot)) {
-        Write-Host "Ranura $($slot + 1): $($bySlot[$slot]) (ya existía)"
-        continue
-    }
-    $id = [CoroomVhid.SetupApi]::CreateRootDevice($CoroomClassGuid, 'coroomvhid', $CoroomHardwareId,
-        "Mando virtual de coroom $($slot + 1)", $CoroomSlotValue, [uint32]$slot)
-    $bySlot[$slot] = $id
-    Write-Host "Ranura $($slot + 1): $id (nuevo)"
+# 3. El dispositivo de control y los de Xbox 360.
+$created = @()
+$created += [CoroomVhid.SetupApi]::CreateRootDevice($CoroomClassGuid, 'coroomvhid', $CoroomHardwareId,
+    'Mandos virtuales de coroom', $CoroomSlotValue, [uint32]0)
+for ($slot = 0; $slot -lt $CoroomXusbSlots; $slot++) {
+    $created += [CoroomVhid.SetupApi]::CreateRootDevice($CoroomClassGuid, 'coroomxusb', $CoroomXusbHardwareId,
+        "Mando de Xbox 360 de coroom $($slot + 1)", $CoroomSlotValue, [uint32]$slot)
+}
+foreach ($id in $created) {
+    Write-Host "Creado $id"
 }
 
 # 4. Driver.
@@ -113,44 +99,25 @@ if ($code -eq 259) {
     Write-Warning 'pnputil no actualizó ningún dispositivo: ¿ya estaba instalada esta versión del driver (o una más nueva)?'
 }
 
-# 5. Permisos de la colección de control (cuando hidclass ya la ha creado).
 $failed = $false
-foreach ($slot in ($bySlot.Keys | Sort-Object)) {
-    $device = Get-PnpDevice -InstanceId $bySlot[$slot] -ErrorAction SilentlyContinue
-    if (-not $device) {
-        Write-Warning "No encuentro el dispositivo de la ranura $($slot + 1) ($($bySlot[$slot]))."
-        $failed = $true
-        continue
-    }
-    $controls = @()
-    for ($try = 0; $try -lt 20 -and $controls.Count -eq 0; $try++) {
-        $controls = @(Get-CoroomControlCollection -Device $device)
-        if ($controls.Count -eq 0) {
+foreach ($id in $created) {
+    $status = $null
+    for ($try = 0; $try -lt 20 -and $status -ne 'OK'; $try++) {
+        $status = (Get-PnpDevice -InstanceId $id -ErrorAction SilentlyContinue).Status
+        if ($status -ne 'OK') {
             Start-Sleep -Milliseconds 500
         }
     }
-    $status = (Get-PnpDevice -InstanceId $bySlot[$slot] -ErrorAction SilentlyContinue).Status
-    Write-Host "Ranura $($slot + 1): $($bySlot[$slot]), estado $status"
+    Write-Host "$id, estado $status"
     if ($status -ne 'OK') {
         $failed = $true
-    }
-    if ($controls.Count -eq 0) {
-        Write-Warning "La ranura $($slot + 1) no tiene todavía su colección de control: no se han podido limitar sus permisos (vuelve a ejecutar install.ps1 cuando el dispositivo esté en marcha)."
-        continue
-    }
-    foreach ($control in $controls) {
-        try {
-            [CoroomVhid.SetupApi]::SetSecurityAndRestart($control, $CoroomControlSddl)
-        } catch {
-            Write-Warning "No se pudieron limitar los permisos de $control ($($_.Exception.Message)); el mando funciona igual."
-        }
     }
 }
 
 if ($failed) {
-    Write-Warning 'Algún dispositivo no arrancó: mira su estado en el Administrador de dispositivos (Dispositivos de interfaz humana, «Mando virtual de coroom») y README.md, "Solución de problemas".'
+    Write-Warning 'Algún dispositivo no arrancó: mira su estado en el Administrador de dispositivos (Dispositivos del sistema, «Mandos virtuales de coroom» y «Mando de Xbox 360 de coroom») y README.md, "Solución de problemas".'
 }
 if ($code -eq 3010) {
     Write-Warning 'Windows pide reiniciar para terminar la instalación.'
 }
-Write-Host "Listo: $Pads mandos. Comprueba con: coroom doctor (debe decir ""mandos: driver coroomvhid"")."
+Write-Host 'Listo. Comprueba con: coroom doctor (debe decir "mandos: driver coroomvhid").'

@@ -103,7 +103,7 @@ y un respaldo declarado cuando dependa de drivers o de borradores.
 | Códecs y negociación | **Vulkan Video** por FFmpeg 8 (`h264_vulkan`, `hevc_vulkan`, `av1_vulkan`); orden **AV1 → HEVC → H.264** por capacidades reales de ambos extremos, sondeadas al arrancar (`coroom doctor`); baja latencia (IPPP, una referencia, CBR, intra-refresh, 4 slices) | NVENC/NVDEC, AMF, QSV, VA-API en el mismo FFmpeg; software SVT-AV1, dav1d, OpenH264. FFmpeg LGPL dinámico, sin GPL |
 | Sin copias | DMA-BUF → `VkImage` en Linux; textura D3D11 de WGC al pool D3D11 del codificador en Windows; decodificación en el `VkDevice` de `wgpu` | Respaldo a CPU en cada paso, contado en el resumen y el overlay |
 | Audio | Linux: **PipeWire** nativo. Windows: **WASAPI** con loopback por proceso. **Opus** (libopus 1.6.1) a 48 kHz, tramas 10 ms, DRED en Linux y FEC en banda; voz con `webrtc-audio-processing` (NS, AGC2, AEC3) y VAD propio | Loopback de la salida (`--audio system`); FEC en banda y PLC sin DRED; puerta de ruido sin AEC (auriculares) en Windows |
-| Entrada | Linux: **libei** por el portal `RemoteDesktop` (`reis`), mandos convertidos por **uinput** y **tal cual** por **UHID** (el mando del invitado con su VID/PID y su descriptor HID, leído en el invitado por `hidraw`; protocolo 8: `PadData`, `GamepadMode`, `GamepadOutput`). Windows: `SendInput` y driver propio de mandos en modo usuario, **UMDF2** bajo el `mshidumdf.sys` de Windows (`drivers/windows-vhid/`, hasta 8 mandos HID genéricos, visibles por DirectInput, SDL y Steam Input; sin firma de prueba ni tocar el arranque seguro o HVCI) | Aviso si falta libei (uinput no depende de él); mando a teclas (`--gamepad-to-keys`) sin driver |
+| Entrada | Linux: **libei** por el portal `RemoteDesktop` (`reis`), mandos convertidos por **uinput** y **tal cual** por **UHID** (el mando del invitado con su VID/PID y su descriptor HID, leído en el invitado por `hidraw` en Linux o `hidapi` en Windows; protocolo 8: `PadData`, `GamepadMode`, `GamepadOutput`). Windows: `SendInput` y driver propio de mandos en modo usuario, **UMDF2** (`drivers/windows-vhid/`): mandos tal cual como fuente de la **Virtual HID Framework** (`vhf.sys`) y convertidos a cuatro **Xbox 360** de XInput (la interfaz XUSB de `xusb22`); sin firma de prueba ni tocar el arranque seguro o HVCI | Aviso si falta libei (uinput no depende de él); mando a teclas (`--gamepad-to-keys`) sin driver |
 | Render | `wgpu` con backend Vulkan para importar las texturas decodificadas, `winit` con Wayland nativo; BT.709 y HDR10 (BT.2020 PQ) con superficie `Rgba16Float`; 4:4:4 y 120 fps cuando todos lo admiten | D3D12 en Windows si la importación lo exige; *tone mapping* a SDR sin superficie HDR |
 | UI | `iced` 0.14 a bajo nivel (`iced_winit`, `iced_wgpu`) sobre el mismo `wgpu::Device` que el vídeo; sistema de diseño `coroom-ui` de estilo Adwaita con tema, acento y fuente del sistema; textos en Fluent | Fuente Inter embebida si no hay la del sistema |
 | Servidor | `coroom-server`: `h3` y relay en el mismo socket (ALPN), `hyper` + `tokio-rustls` para TCP, **SQLite** (`sqlx`), certificado del operador en PEM (o autofirmado), imagen distroless; sin gestión de certificados ni dependencia de internet | — |
@@ -166,7 +166,7 @@ Invitado ── HTTP/3 + WebTransport ──▶ Servidor (UDP) ◀── HTTP/3 
 | `crates/ui` | Sistema de diseño `coroom-ui` para `iced`: tokens, tema, fuentes, iconos, componentes |
 | `apps/desktop` | Binario `coroom` (aplicación, `doctor`, `probe`, `host`, `join`, `login`…); `locales/` |
 | `apps/server` | Binario `coroom-server` (HTTP/3, WebTransport, relay, SQLite, `/admin`) |
-| `drivers/windows-vhid` | Driver de mandos virtuales: minidriver HID de UMDF2 (modo usuario) bajo `mshidumdf.sys` |
+| `drivers/windows-vhid` | Driver de mandos virtuales de UMDF2 (modo usuario): mandos VHF tal cual y Xbox 360 para XInput |
 | `vendor/` | `iced_wgpu` y `cryoglyph` adaptados a `wgpu` 30 |
 | `deploy/`, `packaging/` | Docker Compose, `.env.sample` ficticio; Flatpak y MSIX |
 | `fuzz/`, `tools/` | Objetivos de `cargo-fuzz` (workspace aparte); perfiles `netem` y FFmpeg |
@@ -230,16 +230,15 @@ Deuda técnica conocida:
   Microsoft que exige el código de kernel: la CI firma cada paquete con un certificado autofirmado
   de un solo uso cuya clave borra al terminar, e `install.ps1` confía en él en el equipo
   (`drivers/windows-vhid/README.md`, «Firma»). Sin probar todavía en un Windows real (Steam, Smart
-  App Control). Los mandos existen desde la instalación (`install.ps1 -Pads`, 4 por defecto), no
-  bajo demanda: UMDF no crea dispositivos hijos. Los juegos que solo usan XInput no ven el mando
-  salvo a través de Steam Input; el paso siguiente sería un dispositivo compañero que registre la
-  interfaz XUSB, como HIDMaestro.
-- **Identificadores USB del driver**: los mandos virtuales de Windows se presentan con VID 0 y
-  PID 0 (Steam y SDL los reconocen por su uso HID e identifican por nombre y versión, sin
-  colisiones). Lo correcto a medio plazo es un PID propio de pid.codes, que lo concede gratis a
-  proyectos con licencia publicada, y aportar su mapeo a SDL. En Linux el mando convertido (uinput) emula un
-  mando de Xbox 360 para que `xpad`, SDL y los juegos lo reconozcan sin mapear; el mando **tal
-  cual** (UHID) lleva el VID/PID y el descriptor del físico, así que el kernel, SDL y Steam lo
-  tratan como ese mando. En un anfitrión Windows el mando va siempre convertido por ahora.
+  App Control). Los mandos HID se crean al momento con la Virtual HID Framework desde un
+  dispositivo de control; los cuatro Xbox 360 existen desde la instalación, pero los juegos solo
+  los ven mientras coroom los usa. Los IOCTL de `xusb22` no están documentados: se siguen los
+  valores de HIDMaestro.
+- **Identificadores de los mandos virtuales**: el mando convertido es un Xbox 360 (`045E:028E`)
+  en Linux (uinput) y en Windows (XUSB), para que `xpad`, XInput, SDL y los juegos lo reconozcan
+  sin mapear; el mando **tal cual** (UHID en Linux, VHF en Windows) lleva el VID/PID y el
+  descriptor del físico, así que el sistema, SDL y Steam lo tratan como ese mando. Solo el mando
+  HID genérico de Windows (cuando no quedan Xbox 360 libres) va con VID/PID 0; lo correcto a medio
+  plazo es un PID propio de pid.codes.
 - **Desafío de dispositivo**: no lleva etiqueta de dominio propia (separado por formato y longitud,
   probado); se añadirá en el próximo cambio de protocolo.

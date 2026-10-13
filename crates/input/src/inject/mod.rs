@@ -63,7 +63,7 @@ pub trait InputSink: Send {
     fn connect_raw(&mut self, slot: u8, device: &GamepadDevice) -> Result<(), InputError> {
         let _ = (slot, device);
         Err(InputError::Unsupported(
-            "este anfitrión todavía no recrea mandos tal cual".to_owned(),
+            "este anfitrión no recrea mandos tal cual".to_owned(),
         ))
     }
 
@@ -737,6 +737,12 @@ impl<S: InputSink> InputSink for GamepadToKeys<S> {
 
     fn describe(&self) -> String {
         format!("{} con mandos como teclas", self.inner.describe())
+    }
+
+    fn connect_raw(&mut self, _slot: u8, _device: &GamepadDevice) -> Result<(), InputError> {
+        Err(InputError::Unsupported(
+            "el anfitrión convierte los mandos en teclas (--gamepad-to-keys)".to_owned(),
+        ))
     }
 }
 

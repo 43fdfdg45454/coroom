@@ -24,7 +24,9 @@ dos NAT distintas, pantallas HDR y de 120 Hz), en [`docs/ARQUITECTURA.md`](docs/
   y HDR10 cuando todos lo admiten) con AV1, HEVC o H.264 por hardware y sin copias a CPU (Vulkan
   Video, NVENC, AMF, QSV, VA-API), audio del juego sincronizado con el vídeo y voz opcional.
 - **Entrada del invitado**: teclado, ratón (escritorio o inmersivo) y hasta 8 mandos, con permisos
-  por invitado; libei y uinput en Linux, `SendInput` y un driver de mando propio en Windows.
+  por invitado y cada mando **tal cual** (su VID/PID y su descriptor HID: Steam y los juegos lo
+  ven como ese mando) o convertido a Xbox 360; libei, uinput y UHID en Linux, `SendInput` y un
+  driver de mandos propio en Windows.
 - **Conexión** QUIC directa entre los equipos cuando la NAT lo permite y, si no, por el relay del
   servidor; control de tasa propio que aguanta pérdida y jitter, FEC y reenvíos.
 - **Cifrado de extremo a extremo** con MLS, SFrame y HPKE (X-Wing, poscuántico): el servidor no
@@ -379,12 +381,14 @@ anfitrión decide por invitado si su mando llega **tal cual** (por defecto) o **
 crea un mando con el mismo VID/PID, nombre y descriptor HID que el físico, y le pasan sus informes
 sin traducir: Steam, SDL y el juego lo reconocen como ese mando, con sus botones extra, giroscopio
 o lo que declare, y la vibración y las luces vuelven al mando del invitado. Un mando de Xbox por
-cable (XInput, sin HID en crudo) llega con su identidad. Si no se puede (anfitrión Windows por
-ahora, sin acceso a `/dev/hidraw*` o `/dev/uhid`, o un descriptor que también declara teclado o
-ratón sin ese permiso), va convertido y la tarjeta del invitado dice por qué. En el invitado
-Linux, leer el mando en crudo necesita acceso a su `/dev/hidraw*`: las reglas de Steam
-(`steam-devices`) cubren la mayoría; si no, una para tu mando
-(`KERNEL=="hidraw*", ATTRS{idVendor}=="2dc8", TAG+="uaccess"`).
+cable (XInput, sin HID en crudo) llega con su identidad. Funciona con anfitrión e invitado en
+Linux o Windows. Si no se puede (sin acceso a `/dev/hidraw*` o `/dev/uhid` en Linux, sin el
+driver de coroom en un anfitrión Windows, o un descriptor que también declara teclado o ratón sin
+ese permiso), va convertido y la tarjeta del invitado dice por qué. En el invitado Linux, leer el
+mando en crudo necesita acceso a su `/dev/hidraw*`: las reglas de Steam (`steam-devices`) cubren la
+mayoría; si no, una para tu mando (`KERNEL=="hidraw*", ATTRS{idVendor}=="2dc8", TAG+="uaccess"`).
+En el invitado Windows no hace falta nada (si Steam está abierto, puede cambiar el modo de algunos
+mandos: mejor cerrarlo).
 
 **Anfitrión en Linux**:
 
@@ -424,9 +428,10 @@ de [`drivers/windows-vhid/`](drivers/windows-vhid/README.md): un driver de modo 
 que se instala con `install.ps1` desde el paquete de cada versión, sin firma de prueba y con el
 arranque seguro y la integridad de memoria activados (ahí están la compilación, la firma, la
 instalación, la desinstalación y la solución de problemas). Con él, cada ranura
-(`allow N pad RANURA`) es un «Dispositivo de juego compatible con HID» que ven DirectInput, SDL y
-Steam Input (los juegos que solo usan XInput, a través de Steam Input); `coroom doctor` dice si
-está instalado. Sin el driver, o con
+(`allow N pad RANURA`) es un mando de Xbox 360 (los cuatro primeros; que ven todos los juegos,
+también los que solo usan XInput) o, tal cual, el mando del invitado con su VID/PID y su
+descriptor, que Steam y SDL reconocen como ese mando; `coroom doctor` dice si está instalado. Sin
+el driver, o con
 `coroom host --gamepad-to-keys`, los mandos se convierten en teclas con un perfil fijo: stick
 izquierdo → W A S D, cruceta → flechas, A → Espacio, B → E, X → R, Y → F, LB → Q, RB → Tab,
 LT → Mayús, RT → Ctrl, Back → Esc, Start → Intro (todos los mandos escriben en el mismo teclado).

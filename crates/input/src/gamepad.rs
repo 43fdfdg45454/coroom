@@ -2,9 +2,9 @@
 //!
 //! Un solo mando va a la ranura que el anfitrión haya asignado a este invitado
 //! ([`GamepadCapture::set_slot`]): el que elija el invitado ([`PadChoice::Pad`]) o, en automático,
-//! el primero conectado. Los mandos se pueden conectar y desconectar en cualquier momento: si el
+//! el último conectado. Los mandos se pueden conectar y desconectar en cualquier momento: si el
 //! elegido se desconecta, la ranura se queda sin mando hasta que vuelva (o, en automático, pasa
-//! al siguiente); la lista para la interfaz está en [`GamepadCapture::pads`]. Conexión y
+//! al anterior que siga conectado); la lista para la interfaz está en [`GamepadCapture::pads`]. Conexión y
 //! desconexión, y cambio de ranura, se anuncian con `GamepadConnected`/`GamepadDisconnected`.
 //!
 //! **Convertido**: botones por evento (al momento), ejes a 250 Hz y solo si cambian más de
@@ -12,9 +12,10 @@
 //! `gilrs`, en el vocabulario de Xbox. Los mandos que la base de SDL no trae para Linux se
 //! añaden en [`MAPPINGS`].
 //!
-//! **Tal cual**: al conectar el mando a la ranura se declara (`PadData::Device`): en Linux, si es
-//! HID y se puede leer en crudo ([`crate::hidraw`]), con su descriptor y sus informes de
-//! característica; si es un Xbox por cable (`xpad`), como XInput; si no, convertido y por qué.
+//! **Tal cual**: al conectar el mando a la ranura se declara (`PadData::Device`): si es HID y se
+//! puede leer en crudo (`hidraw` en Linux, [`crate::hidraw`]; `hidapi` en Windows,
+//! [`crate::hidwin`]), con su descriptor y sus informes de característica; si es un Xbox por cable
+//! (`xpad` o `xusb22`), como XInput; si no, convertido y por qué.
 //! Si el anfitrión lo acepta (`GamepadMode`, [`PadLink::raw`]), el hilo `mando-crudo` manda cada
 //! informe tal cual (y el último otra vez cada [`RESEND`] si no hay nuevos, por si se perdió el
 //! datagrama que soltaba un botón) y deja de salir lo convertido; los informes de salida del
@@ -291,12 +292,67 @@ fn pick(choice: &PadChoice, connected: &[(GamepadId, PadKey)]) -> Option<Gamepad
     pick_index(choice, &keys).map(|index| connected[index].0)
 }
 
+/// El mando en crudo de cada sistema, con la misma forma.
+#[cfg(all(target_os = "linux", feature = "linux-portal"))]
+mod platform {
+    use std::path::Path;
+
+    use crate::InputError;
+    use crate::hidraw;
+    pub use crate::hidraw::{HIDRAW_HELP as HELP, HidrawInfo as Info};
+
+    /// Por qué no se puede abrir, para la lista de mandos.
+    pub const NO_ACCESS: &str = "sin permiso para leerlo en crudo (reglas udev)";
+
+    pub fn find(vendor: u16, product: u16) -> Option<Info> {
+        hidraw::find(
+            Path::new(hidraw::SYS_HIDRAW),
+            Path::new("/dev"),
+            vendor,
+            product,
+            &[],
+        )
+    }
+
+    pub fn is_xinput(vendor: u16, product: u16) -> bool {
+        hidraw::is_xpad(Path::new(hidraw::SYS_INPUT), vendor, product)
+    }
+
+    /// El nodo `hidraw` abierto.
+    pub type Device = hidraw::HidrawDevice;
+
+    pub fn open(info: &Info) -> Result<Device, InputError> {
+        Device::open(&info.node)
+    }
+}
+
+/// El mando en crudo de cada sistema, con la misma forma.
+#[cfg(target_os = "windows")]
+mod platform {
+    use crate::InputError;
+    use crate::hidwin;
+    pub use crate::hidwin::{HIDWIN_HELP as HELP, HidwinInfo as Info, find, is_xinput};
+
+    /// Por qué no se puede abrir, para la lista de mandos.
+    pub const NO_ACCESS: &str = "no se puede abrir en crudo (¿Steam lo tiene en exclusiva?)";
+
+    /// La colección HID abierta.
+    pub type Device = hidwin::HidwinDevice;
+
+    pub fn open(info: &Info) -> Result<Device, InputError> {
+        Device::open(info)
+    }
+}
+
 /// El mando de la ranura mandado tal cual en crudo (hilo `mando-crudo`).
 struct RawPad {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    #[cfg(all(target_os = "linux", feature = "linux-portal"))]
-    writer: Option<crate::hidraw::HidrawDevice>,
+    #[cfg(any(
+        all(target_os = "linux", feature = "linux-portal"),
+        target_os = "windows"
+    ))]
+    writer: Option<platform::Device>,
     /// Si es HID (lo convertido se calla cuando el anfitrión lo tiene tal cual).
     hid: bool,
 }
@@ -312,13 +368,19 @@ impl Drop for RawPad {
 
 impl RawPad {
     fn write(&mut self, data: &[u8]) {
-        #[cfg(all(target_os = "linux", feature = "linux-portal"))]
+        #[cfg(any(
+            all(target_os = "linux", feature = "linux-portal"),
+            target_os = "windows"
+        ))]
         if let Some(writer) = &mut self.writer
             && let Err(err) = writer.write_output(data)
         {
             debug!(error = %err, "informe de salida al mando");
         }
-        #[cfg(not(all(target_os = "linux", feature = "linux-portal")))]
+        #[cfg(not(any(
+            all(target_os = "linux", feature = "linux-portal"),
+            target_os = "windows"
+        )))]
         let _ = data;
     }
 }
@@ -339,43 +401,38 @@ fn declare(link: &Arc<dyn PadLink>, slot: u8, key: &PadKey) -> RawPad {
     let idle = |hid| RawPad {
         stop: Arc::new(AtomicBool::new(false)),
         thread: None,
-        #[cfg(all(target_os = "linux", feature = "linux-portal"))]
+        #[cfg(any(
+            all(target_os = "linux", feature = "linux-portal"),
+            target_os = "windows"
+        ))]
         writer: None,
         hid,
     };
-    #[cfg(all(target_os = "linux", feature = "linux-portal"))]
+    #[cfg(any(
+        all(target_os = "linux", feature = "linux-portal"),
+        target_os = "windows"
+    ))]
     {
-        use std::path::Path;
-
-        use crate::hidraw::{self, HidrawDevice};
-        let found = hidraw::find(
-            Path::new(hidraw::SYS_HIDRAW),
-            Path::new("/dev"),
-            key.vendor,
-            key.product,
-            &[],
-        );
-        let Some(info) = found else {
-            let transport =
-                if hidraw::is_xpad(Path::new(hidraw::SYS_INPUT), key.vendor, key.product) {
-                    GamepadTransport::XInput
-                } else {
-                    GamepadTransport::Converted {
-                        reason: "el mando no tiene interfaz HID en crudo en el equipo del invitado"
-                            .into(),
-                    }
-                };
+        let Some(info) = platform::find(key.vendor, key.product) else {
+            let transport = if platform::is_xinput(key.vendor, key.product) {
+                GamepadTransport::XInput
+            } else {
+                GamepadTransport::Converted {
+                    reason: "el mando no tiene interfaz HID en crudo en el equipo del invitado"
+                        .into(),
+                }
+            };
             link.pad(device(transport));
             return idle(false);
         };
-        let opened = HidrawDevice::open(&info.node).and_then(|reader| {
+        let opened = platform::open(&info).and_then(|reader| {
             let writer = reader.try_clone()?;
             Ok((reader, writer))
         });
         let (reader, writer) = match opened {
             Ok(pair) => pair,
             Err(err) => {
-                warn!(error = %err, "{}", hidraw::HIDRAW_HELP);
+                warn!(error = %err, "{}", platform::HELP);
                 link.pad(device(GamepadTransport::Converted {
                     reason: "el invitado no tiene permiso para leer el mando en crudo".into(),
                 }));
@@ -397,7 +454,10 @@ fn declare(link: &Arc<dyn PadLink>, slot: u8, key: &PadKey) -> RawPad {
             hid: true,
         }
     }
-    #[cfg(not(all(target_os = "linux", feature = "linux-portal")))]
+    #[cfg(not(any(
+        all(target_os = "linux", feature = "linux-portal"),
+        target_os = "windows"
+    )))]
     {
         link.pad(device(GamepadTransport::Converted {
             reason: "el invitado todavía no manda mandos tal cual desde este sistema".into(),
@@ -408,10 +468,13 @@ fn declare(link: &Arc<dyn PadLink>, slot: u8, key: &PadKey) -> RawPad {
 
 /// Hilo `mando-crudo`: lee los informes de característica, declara el mando y pasa cada informe
 /// de entrada tal cual mientras el anfitrión lo tenga así.
-#[cfg(all(target_os = "linux", feature = "linux-portal"))]
+#[cfg(any(
+    all(target_os = "linux", feature = "linux-portal"),
+    target_os = "windows"
+))]
 fn raw_loop(
-    mut reader: crate::hidraw::HidrawDevice,
-    info: crate::hidraw::HidrawInfo,
+    mut reader: platform::Device,
+    info: platform::Info,
     slot: u8,
     link: &Arc<dyn PadLink>,
     stop: &AtomicBool,
@@ -469,29 +532,22 @@ fn raw_loop(
 
 /// Clasifica un mando conectado para la interfaz.
 fn kind_of(key: &PadKey) -> PadKind {
-    #[cfg(all(target_os = "linux", feature = "linux-portal"))]
+    #[cfg(any(
+        all(target_os = "linux", feature = "linux-portal"),
+        target_os = "windows"
+    ))]
     {
-        use std::path::Path;
-
-        use crate::hidraw;
-        match hidraw::find(
-            Path::new(hidraw::SYS_HIDRAW),
-            Path::new("/dev"),
-            key.vendor,
-            key.product,
-            &[],
-        ) {
-            Some(info) if std::fs::File::open(&info.node).is_ok() => PadKind::Hid,
-            Some(_) => {
-                PadKind::Converted("sin permiso para leerlo en crudo (reglas udev)".to_owned())
-            }
-            None if hidraw::is_xpad(Path::new(hidraw::SYS_INPUT), key.vendor, key.product) => {
-                PadKind::XInput
-            }
+        match platform::find(key.vendor, key.product) {
+            Some(info) if platform::open(&info).is_ok() => PadKind::Hid,
+            Some(_) => PadKind::Converted(platform::NO_ACCESS.to_owned()),
+            None if platform::is_xinput(key.vendor, key.product) => PadKind::XInput,
             None => PadKind::Converted("sin interfaz HID en crudo".to_owned()),
         }
     }
-    #[cfg(not(all(target_os = "linux", feature = "linux-portal")))]
+    #[cfg(not(any(
+        all(target_os = "linux", feature = "linux-portal"),
+        target_os = "windows"
+    )))]
     {
         let _ = key;
         PadKind::Converted("todavía no desde este sistema".to_owned())

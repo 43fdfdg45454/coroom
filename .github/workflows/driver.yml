@@ -1,6 +1,6 @@
 name: Driver de mando virtual (Windows)
 
-# Compila drivers/windows-vhid (coroomvhid.dll, UMDF2 bajo mshidumdf.sys) con el WDK y lo firma con
+# Compila drivers/windows-vhid (coroomvhid.dll, UMDF2, mandos VHF y Xbox 360) con el WDK y lo firma con
 # un certificado autofirmado de un solo uso: build.ps1 -Sign lo crea al empezar (solo firma de
 # código, SHA-256, clave no exportable), firma la DLL y el catálogo con sello de tiempo RFC 3161,
 # deja en el paquete solo la parte pública (coroomvhid.cer) y borra el certificado y su clave al

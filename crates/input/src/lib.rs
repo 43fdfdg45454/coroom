@@ -21,6 +21,8 @@ pub mod capture;
 pub mod gamepad;
 #[cfg(all(target_os = "linux", feature = "linux-portal"))]
 pub mod hidraw;
+#[cfg(target_os = "windows")]
+pub mod hidwin;
 pub mod inject;
 pub mod keymap;
 pub mod script;

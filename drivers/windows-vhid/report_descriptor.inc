@@ -1,9 +1,9 @@
-// HID report descriptor of the coroom virtual gamepad (one per slot): the first top-level
-// collection (Col01) of each device, followed by control_descriptor.inc (Col02).
+// HID report descriptor of the generic coroom gamepad: the one the client creates (through the
+// control device, COROOM_VHID_IOCTL_CREATE) for a converted controller when every Xbox 360 slot
+// is taken.
 //
-// Single source of truth: the driver includes this file inside a C array initializer
-// (coroomvhid.c) and the Rust client parses it in its tests (crates/input/src/inject/
-// windows_vhid.rs), which check that the report layout in coroom_vhid.h matches it.
+// Single source of truth: the Rust client (crates/input/src/inject/windows_vhid.rs) sends these
+// bytes and its tests parse this file to check that its copy and its report layout match it.
 // Only hexadecimal bytes, commas and comments are allowed here.
 //
 // Input report 1 (16 bytes including the report ID):

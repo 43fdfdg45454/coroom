@@ -219,7 +219,7 @@ sin avisos en las crates que lo usan:
 | `coroom-codec` | 63 | FFmpeg (`rsmpeg`) y Vulkan (`ash`) en la importación sin copias |
 | `coroom-capture` | 30 | PipeWire (DMA-BUF) y Windows.Graphics.Capture |
 | `coroom-render` | 14 | Importación de imágenes Vulkan en `wgpu` (`as_hal`, `texture_from_raw`) |
-| `coroom-input` | 16 | `SendInput` y el cliente del driver de mando de Windows (cfgmgr32, `hid.dll` y `WriteFile`); en Linux, `HIDIOCGFEATURE` sobre `hidraw` (informes de característica del mando tal cual) |
+| `coroom-input` | 10 | `SendInput` y el cliente del driver de mandos de Windows (cfgmgr32, `CreateFileW` y `DeviceIoControl`); en Linux, `HIDIOCGFEATURE` sobre `hidraw` (informes de característica del mando tal cual). El invitado Windows lee el mando con `hidapi`, sin `unsafe` propio |
 | `coroom-audio` | 10 | Sesiones de audio de WASAPI (COM) y prioridad de tiempo real (`sched_setscheduler`, `RLIMIT_RTTIME`, `gettid`; MMCSS en Windows) |
 | `proto`, `crypto`, `transport`, `session`, `ui`, `coroom`, `coroom-server` | 0 | `unsafe_code = "deny"` en el workspace |
 
@@ -228,8 +228,9 @@ Todo lo que parsea datos de la red está en crates sin `unsafe`.
 ### 2.12 Mandos tal cual (HID en crudo)
 
 Con el mando **tal cual**, el invitado manda el descriptor HID de su mando, sus informes de
-característica y cada informe de entrada, y el anfitrión crea con UHID un dispositivo idéntico
-(mismo VID/PID y descriptor). Eso deja al invitado definir **cualquier** dispositivo HID en el
+característica y cada informe de entrada, y el anfitrión crea un dispositivo idéntico (mismo
+VID/PID y descriptor): con UHID en Linux, con la Virtual HID Framework en Windows (driver de
+coroom, §2.11). Eso deja al invitado definir **cualquier** dispositivo HID en el
 equipo del anfitrión, así que:
 
 - **Lo decide el anfitrión, por invitado.** Solo hay mando tal cual con una ranura concedida y el
@@ -249,8 +250,16 @@ equipo del anfitrión, así que:
   informes de característica que mandó el invitado al conectar, sin ida y vuelta por la red.
 - El objetivo de fuzzing `proto_hid` cubre el parser (§3).
 
+- **En Windows**, el dispositivo de control del driver es exclusivo (un programa a la vez) y solo
+  lo abren SYSTEM, los administradores y el usuario con la sesión iniciada; al cerrarse el handle
+  de coroom (o morir), el driver quita sus mandos. El driver vuelve a comprobar los límites de
+  cada petición (tamaños del descriptor, de los informes y de las características) antes de tocar
+  nada. Los Xbox 360 los abre cualquiera (los juegos), pero sus órdenes privadas solo valen para el
+  handle que los activó.
+
 Lo que no cubre: un mando tal cual con un descriptor válido puede llevar al kernel por caminos de
-drivers HID específicos (`hid-playstation`, `hid-nintendo`…) según el VID/PID que declare. Es la
+drivers HID específicos (`hid-playstation`, `hid-nintendo`… en Linux; los de clase HID de Windows)
+según el VID/PID que declare. Es la
 misma superficie que enchufar ese mando por USB; el anfitrión que no confíe en un invitado lo deja
 en «Convertido» o sin mando.
 
@@ -259,7 +268,8 @@ en «Convertido» o sin mando.
 `cargo deny check` (avisos de RustSec, licencias, crates prohibidas y duplicadas) en la CI; todas
 las versiones fijadas con `=`. Las revisadas expresamente: `ml-dsa` (opcional), `fluent-bundle`,
 `fluent-syntax` y `unic-langid` (Project Fluent, Apache-2.0 o MIT), `libfuzzer-sys` (solo en
-`fuzz/`).
+`fuzz/`), `hidapi` (MIT, solo en Windows y con su backend en Rust, sin C: el mando del invitado en
+crudo).
 
 ## 3. Fuzzing
 

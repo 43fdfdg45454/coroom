@@ -3304,6 +3304,19 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/hidapi/hidapi-2.6.7.crate",
+        "sha256": "818c0e1d27887aaf76fe737042e27a66b796a7b099e6d2e1a72d106c2dff3fa6",
+        "dest": "cargo/vendor/hidapi-2.6.7"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"818c0e1d27887aaf76fe737042e27a66b796a7b099e6d2e1a72d106c2dff3fa6\", \"files\": {}}",
+        "dest": "cargo/vendor/hidapi-2.6.7",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/hkdf/hkdf-0.12.4.crate",
         "sha256": "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7",
         "dest": "cargo/vendor/hkdf-0.12.4"

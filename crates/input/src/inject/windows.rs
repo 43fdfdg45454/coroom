@@ -9,9 +9,11 @@
 //!   de [`set_pointer_area_source`]) o, sin ella, sobre el monitor principal, expresada en
 //!   coordenadas del escritorio virtual; rueda con `MOUSEEVENTF_WHEEL`/`HWHEEL`
 //!   (`WHEEL_DELTA` = 120, como el cable).
-//! - **Mandos** (feature `windows-vhid`): un mando HID genérico por ranura con el
-//!   driver propio de UMDF2 ([`super::windows_vhid::VhidGamepads`]), que se abre al asignar la
-//!   primera ranura. Sin el driver, [`InputSink::assign_gamepad`] devuelve
+//! - **Mandos** (feature `windows-vhid`): con el driver propio de UMDF2
+//!   ([`super::windows_vhid::VhidGamepads`]), que se abre al asignar la primera ranura: un Xbox
+//!   360 por ranura (el genérico cuando no quedan) y, tal cual
+//!   ([`InputSink::connect_raw`]), el mando HID del invitado con su VID/PID y su descriptor o un
+//!   Xbox por cable con su identidad. Sin el driver, [`InputSink::assign_gamepad`] devuelve
 //!   [`InputError::GamepadUnavailable`] con la guía de instalación; el mapeo a teclas
 //!   (`--gamepad-to-keys`, [`super::GamepadToKeys`]) sigue disponible.
 //!
@@ -40,6 +42,8 @@ use super::windows_vhid::{self, DriverHandle, VhidGamepads};
 use super::{InputSink, PressedKeys};
 use crate::keymap::scancode_from_evdev;
 use crate::{GuestId, InputError, InputEvent, MouseButton};
+#[cfg(feature = "windows-vhid")]
+use coroom_proto::input::GamepadDevice;
 
 /// Por qué no hay mando virtual en Windows sin el driver.
 pub const GAMEPAD_HELP: &str = "Windows no tiene API de usuario para crear un mando virtual: hace \
@@ -325,6 +329,38 @@ impl InputSink for SendInputSink {
             return "SendInput y mandos virtuales (driver coroomvhid)".to_owned();
         }
         "SendInput".to_owned()
+    }
+
+    #[cfg(feature = "windows-vhid")]
+    fn connect_raw(&mut self, slot: u8, device: &GamepadDevice) -> Result<(), InputError> {
+        match &mut self.pads {
+            Some(pads) => pads.connect_raw(slot, device),
+            None => Err(InputError::NoSuchSlot(slot)),
+        }
+    }
+
+    #[cfg(feature = "windows-vhid")]
+    fn raw_report(&mut self, slot: u8, data: &[u8]) -> Result<(), InputError> {
+        match &mut self.pads {
+            Some(pads) => pads.raw_report(slot, data),
+            None => Err(InputError::NoSuchSlot(slot)),
+        }
+    }
+
+    #[cfg(feature = "windows-vhid")]
+    fn disconnect_raw(&mut self, slot: u8) -> Result<(), InputError> {
+        match &mut self.pads {
+            Some(pads) => pads.disconnect_raw(slot),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(feature = "windows-vhid")]
+    fn take_outputs(&mut self) -> Vec<(u8, Vec<u8>)> {
+        self.pads
+            .as_mut()
+            .map(VhidGamepads::take_outputs)
+            .unwrap_or_default()
     }
 }
 

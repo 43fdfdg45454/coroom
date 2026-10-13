@@ -1,26 +1,26 @@
 ﻿# devices.ps1: funciones comunes de install.ps1 y uninstall.ps1 (se cargan con ". .\devices.ps1").
 #
-# Crean y quitan los dispositivos raíz Root\coroomvhid (uno por ranura) con SetupAPI, como hace
+# Crean y quitan los dispositivos raíz (Root\coroomvhid, el de control, y Root\coroomxusb, los de
+# Xbox 360) con SetupAPI, como hace
 # "devcon install" / "devcon remove", para no depender de devcon.exe ni devgen.exe (vienen con el
 # WDK, no con Windows), y comprueban el certificado con el que está firmado el paquete.
 
 Set-StrictMode -Version Latest
 
-# Los mismos valores que COROOM_VHID_HARDWARE_ID y COROOM_VHID_SLOT_VALUE de coroom_vhid.h.
+# Los mismos valores que COROOM_VHID_HARDWARE_ID, COROOM_VHID_XUSB_HARDWARE_ID,
+# COROOM_VHID_SLOT_VALUE y COROOM_VHID_XUSB_SLOTS de coroom_vhid.h.
 $CoroomHardwareId = 'Root\coroomvhid'
+$CoroomXusbHardwareId = 'Root\coroomxusb'
 $CoroomSlotValue = 'CoroomSlot'
-$CoroomMaxSlots = 8
-# Clase HIDClass (la del INF).
-$CoroomClassGuid = [Guid]'745a17a0-74d3-11d0-b6fe-00a0c90f57da'
+$CoroomXusbSlots = 4
+# Clase System (la del INF desde el protocolo 3; antes, HIDClass).
+$CoroomClassGuid = [Guid]'4d36e97d-e325-11ce-bfc1-08002be10318'
 # Certificado autofirmado con el que la CI (o build.ps1 -Sign) firma cada paquete; su clave privada
 # se borra al terminar esa compilación.
 $CoroomCertificateSubject = 'CN=coroom (driver local)'
 # Certificado de prueba de las versiones anteriores (KMDF): uninstall.ps1 también lo quita.
 $CoroomLegacyCertificateSubject = 'CN=coroom test driver signing (NO DISTRIBUIR)'
 $CodeSigningOid = '1.3.6.1.5.5.7.3.3'
-# Colección de control (Col02) de cada mando: solo SYSTEM, administradores y el usuario con la
-# sesión iniciada en el equipo pueden mandar el estado del mando.
-$CoroomControlSddl = 'D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)'
 
 if (-not ('CoroomVhid.SetupApi' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -186,30 +186,6 @@ namespace CoroomVhid {
             });
         }
 
-        // Fija el descriptor de seguridad (SDDL) de un dispositivo y lo reinicia para aplicarlo.
-        public static void SetSecurityAndRestart(string instanceId, string sddl) {
-            WithDevice(instanceId, delegate(IntPtr set, ref SP_DEVINFO_DATA data) {
-                byte[] text = Encoding.Unicode.GetBytes(sddl + "\0");
-                if (!SetupDiSetDeviceRegistryPropertyW(set, ref data, SPDRP_SECURITY_SDS, text,
-                                                       (uint)text.Length)) {
-                    throw LastError("SetupDiSetDeviceRegistryProperty(SPDRP_SECURITY_SDS)");
-                }
-                SP_PROPCHANGE_PARAMS change = new SP_PROPCHANGE_PARAMS();
-                change.cbSize = 8; // sizeof(SP_CLASSINSTALL_HEADER)
-                change.InstallFunction = DIF_PROPERTYCHANGE;
-                change.StateChange = DICS_PROPCHANGE;
-                change.Scope = DICS_FLAG_GLOBAL;
-                change.HwProfile = 0;
-                if (!SetupDiSetClassInstallParamsW(set, ref data, ref change,
-                                                   Marshal.SizeOf(typeof(SP_PROPCHANGE_PARAMS)))) {
-                    throw LastError("SetupDiSetClassInstallParams");
-                }
-                if (!SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, set, ref data)) {
-                    throw LastError("SetupDiCallClassInstaller(DIF_PROPERTYCHANGE)");
-                }
-            });
-        }
-
         delegate void DeviceAction(IntPtr set, ref SP_DEVINFO_DATA data);
 
         static void WithDevice(string instanceId, DeviceAction action) {
@@ -239,40 +215,11 @@ function Assert-Administrator {
     }
 }
 
-# Dispositivos con el identificador de hardware del driver (presentes o no).
+# Dispositivos de coroom (presentes o no): el de control, los de Xbox 360 y los mandos raíz de las
+# versiones anteriores (también Root\coroomvhid, de clase HIDClass).
 function Get-CoroomDevice {
     Get-PnpDevice -ErrorAction SilentlyContinue |
-        Where-Object { $_.HardwareID -contains $CoroomHardwareId }
-}
-
-# Ranura (0 a 7) de un dispositivo según su clave de hardware, o $null si no la tiene (por ejemplo,
-# el dispositivo raíz único de las versiones KMDF del driver).
-function Get-CoroomDeviceSlot {
-    param([Parameter(Mandatory)] $Device)
-    $key = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($Device.InstanceId)\Device Parameters"
-    $properties = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
-    if (-not $properties -or $properties.PSObject.Properties.Name -notcontains $CoroomSlotValue) {
-        return $null
-    }
-    $value = $properties.$CoroomSlotValue
-    if ($value -isnot [int] -or $value -lt 0 -or $value -ge $CoroomMaxSlots) {
-        return $null
-    }
-    return [int]$value
-}
-
-# Colecciones HID de control (Col02) de un dispositivo raíz, cuando ya están enumeradas.
-function Get-CoroomControlCollection {
-    param([Parameter(Mandatory)] $Device)
-    $property = Get-PnpDeviceProperty -InstanceId $Device.InstanceId -KeyName 'DEVPKEY_Device_Children' -ErrorAction SilentlyContinue
-    if (-not $property) {
-        return
-    }
-    foreach ($child in @($property.Data)) {
-        if ($child -and $child -match '&COL02\\') {
-            $child
-        }
-    }
+        Where-Object { $_.HardwareID -contains $CoroomHardwareId -or $_.HardwareID -contains $CoroomXusbHardwareId }
 }
 
 # Paquetes del driver en el almacén de drivers (oemNN.inf).

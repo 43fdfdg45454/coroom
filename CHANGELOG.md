@@ -15,6 +15,13 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
   invitado. Un mando de Xbox por cable llega con su identidad. El anfitrión elige por invitado
   «Tal cual» (por defecto) o «Convertido a Xbox 360» y ve qué mando tiene cada uno; si no se puede
   tal cual, va convertido y se dice por qué. Consola: `allow N raw` / `deny N raw`.
+- **Mandos tal cual con anfitrión e invitado Windows** (driver de mandos, protocolo 3; hay que
+  volver a ejecutar `install.ps1`). El driver crea al momento, con la Virtual HID Framework, el
+  mando del invitado con su VID/PID y su descriptor, y tiene cuatro mandos de **Xbox 360** para
+  XInput: los convertidos van a ellos (ahora los ven también los juegos que solo usan XInput, sin
+  Steam Input) y un Xbox por cable tal cual llega con su identidad. Ya no hay mandos fantasma: los
+  juegos solo ven los que coroom está usando. El invitado Windows lee su mando en crudo con
+  `hidapi`.
 - El invitado elige qué mando envía (panel de mandos, `Ctrl+Alt+J`): automático (el último que
   conecte) o uno concreto, que se recuerda. Conectar y desconectar mandos en plena sesión se
   avisa y se sigue al momento.

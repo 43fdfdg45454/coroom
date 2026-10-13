@@ -1,24 +1,26 @@
 ;
-; coroomvhid.inf - coroom virtual gamepad driver (UMDF2 HID minidriver under mshidumdf.sys).
+; coroomvhid.inf - coroom virtual gamepad driver (UMDF2, protocol 3).
 ;
-; Installs coroomvhid.dll on the root devices Root\coroomvhid that install.ps1 creates, one per
-; slot. Each one is a HID device (class HIDClass) with two top-level collections: the gamepad
-; ("HID-compliant game controller") and coroom's control collection.
+; Installs coroomvhid.dll on the root devices that install.ps1 creates:
+;   - Root\coroomvhid (one): the control device, a HID source driver of the Virtual HID Framework.
+;     vhf.sys (inbox) is its lower filter; the gamepads it creates with VhfCreate appear as its
+;     children ("HID-compliant game controller") with the identity the client gives.
+;   - Root\coroomxusb (COROOM_VHID_XUSB_SLOTS of them): Xbox 360 controllers for XInput, through
+;     the xusb22 device interface. "xinputhid" in UpperFilters is only the mark that
+;     Windows.Gaming.Input looks for on XUSB devices; xinputhid.sys does not attach to a device of
+;     class System.
 ;
-; Two variants of the same installation, as Microsoft's vhidmini2 UMDF2 sample:
-;   - Windows 11 (build 22000 or later): the inbox MsHidUmdf.inf and WUDFRD.inf through
-;     Include/Needs, as the current sample;
-;   - Windows 10 22H2 (VB, build 19041 and later): MsHidUmdf.inf does not exist there, so the
-;     mshidumdf and WUDFRd services are added explicitly, as the sample did before build 22000.
-; Both are inbox drivers signed by Microsoft; the only file of this package is the user-mode DLL.
+; WUDFRd.sys (inbox) is the function driver of both and loads the DLL in WUDFHost.exe; the same
+; sections serve Windows 10 22H2 and Windows 11. Both are inbox drivers signed by Microsoft; the
+; only file of this package is the user-mode DLL.
 ;
 ; build.ps1 fills in DriverVer and $UMDFVERSION$ (stampinf) and creates the catalog (Inf2Cat).
 ;
 
 [Version]
 Signature   = "$WINDOWS NT$"
-Class       = HIDClass
-ClassGuid   = {745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Class       = System
+ClassGuid   = {4d36e97d-e325-11ce-bfc1-08002be10318}
 Provider    = %ProviderName%
 CatalogFile = coroomvhid.cat
 DriverVer   =
@@ -34,87 +36,69 @@ DefaultDestDir = 13
 coroomvhid.dll = 1,,
 
 [Manufacturer]
-%ManufacturerName% = Coroom,NT$ARCH$.10.0...19041,NT$ARCH$.10.0...22000
-
-[Coroom.NT$ARCH$.10.0...22000]
-%DeviceDesc% = CoroomVhid, Root\coroomvhid
+%ManufacturerName% = Coroom,NT$ARCH$.10.0...19041
 
 [Coroom.NT$ARCH$.10.0...19041]
-%DeviceDesc% = CoroomVhid_Win10, Root\coroomvhid
+%ControlDesc% = CoroomControl, Root\coroomvhid
+%XusbDesc%    = CoroomXusb, Root\coroomxusb
 
 [CoroomVhid_CopyFiles]
 coroomvhid.dll
 
 ; ---------------------------------------------------------------------------------------------
-; Windows 11: MsHidUmdf.inf (build 22000 and later) and WUDFRD.inf
+; Control device: HID source driver over vhf.sys
 ; ---------------------------------------------------------------------------------------------
 
-[CoroomVhid.NT]
-CopyFiles = CoroomVhid_CopyFiles
-Include = MsHidUmdf.inf
-Needs = MsHidUmdf.NT
-Include = WUDFRD.inf
-Needs = WUDFRD_LowerFilter.NT
-
-[CoroomVhid.NT.HW]
-Include = MsHidUmdf.inf
-Needs = MsHidUmdf.NT.hw
-Include = WUDFRD.inf
-Needs = WUDFRD_LowerFilter.NT.hw
-
-[CoroomVhid.NT.Services]
-Include = MsHidUmdf.inf
-Needs = MsHidUmdf.NT.Services
-Include = WUDFRD.inf
-Needs = WUDFRD_LowerFilter.NT.Services
-
-[CoroomVhid.NT.Filters]
-Include = WUDFRD.inf
-Needs = WUDFRD_LowerFilter.NT.Filters
-
-[CoroomVhid.NT.Wdf]
-UmdfService                = coroomvhid, CoroomVhid_UmdfService
-UmdfServiceOrder           = coroomvhid
-UmdfKernelModeClientPolicy = AllowKernelModeClients
-UmdfFileObjectPolicy       = AllowNullAndUnknownFileObjects
-UmdfMethodNeitherAction    = Copy
-UmdfFsContextUsePolicy     = CanUseFsContext2
-
-; ---------------------------------------------------------------------------------------------
-; Windows 10 22H2: the same services, added explicitly
-; ---------------------------------------------------------------------------------------------
-
-[CoroomVhid_Win10.NT]
+[CoroomControl.NT]
 CopyFiles = CoroomVhid_CopyFiles
 
-[CoroomVhid_Win10.NT.HW]
-AddReg = CoroomVhid_Win10_AddReg
+[CoroomControl.NT.HW]
+AddReg = CoroomControl_AddReg
 
-[CoroomVhid_Win10_AddReg]
-; The UMDF reflector below mshidumdf.sys (FLG_ADDREG_TYPE_MULTI_SZ | FLG_ADDREG_APPEND).
-HKR,,"LowerFilters",0x00010008,"WUDFRd"
+[CoroomControl_AddReg]
+; vhf.sys below the reflector (FLG_ADDREG_TYPE_MULTI_SZ | FLG_ADDREG_APPEND), in its user-mode
+; mode.
+HKR,,"LowerFilters",0x00010008,"vhf"
+HKR,,"VhfMode",0x00010001,1
+HKR,,"CoroomKind",0x00010001,0
+; One handle at a time (the client's): closing it removes its gamepads.
+HKR,,"Exclusive",0x00010001,1
+; Only SYSTEM, administrators and the user signed in at the computer can open it.
+HKR,,"Security",,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)"
 
-[CoroomVhid_Win10.NT.Services]
-AddService = WUDFRd,0x000001f8,CoroomVhid_WudfRd_Service
-; 0x2 (SPSVCINST_ASSOCSERVICE): mshidumdf.sys is the function driver of the device.
-AddService = mshidumdf,0x000001fa,CoroomVhid_MsHidUmdf_Service
+[CoroomControl.NT.Services]
+; 0x2 (SPSVCINST_ASSOCSERVICE): WUDFRd.sys is the function driver of the device.
+AddService = WUDFRd,0x000001fa,CoroomVhid_WudfRd_Service
 
-[CoroomVhid_WudfRd_Service]
-DisplayName   = %WudfRdDisplayName%
-ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
-StartType     = 3               ; SERVICE_DEMAND_START
-ErrorControl  = 1               ; SERVICE_ERROR_NORMAL
-ServiceBinary = %12%\WUDFRd.sys
+[CoroomControl.NT.Wdf]
+UmdfService              = coroomvhid, CoroomVhid_UmdfService
+UmdfServiceOrder         = coroomvhid
+UmdfHostProcessSharing   = ProcessSharingDisabled
 
-[CoroomVhid_MsHidUmdf_Service]
-ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
-StartType     = 3               ; SERVICE_DEMAND_START
-ErrorControl  = 1               ; SERVICE_ERROR_NORMAL
-ServiceBinary = %12%\mshidumdf.sys
+; ---------------------------------------------------------------------------------------------
+; Xbox 360 devices (XUSB)
+; ---------------------------------------------------------------------------------------------
 
-[CoroomVhid_Win10.NT.Wdf]
+[CoroomXusb.NT]
+CopyFiles = CoroomVhid_CopyFiles
+
+[CoroomXusb.NT.HW]
+AddReg = CoroomXusb_AddReg
+
+[CoroomXusb_AddReg]
+HKR,,"UpperFilters",0x00010008,"xinputhid"
+HKR,,"CoroomKind",0x00010001,1
+; Games open it as any user (XInput); the private IOCTLs only work for the client that activated
+; the slot.
+HKR,,"Security",,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;WD)"
+
+[CoroomXusb.NT.Services]
+AddService = WUDFRd,0x000001fa,CoroomVhid_WudfRd_Service
+
+[CoroomXusb.NT.Wdf]
 UmdfService                = coroomvhid, CoroomVhid_UmdfService
 UmdfServiceOrder           = coroomvhid
+UmdfHostProcessSharing     = ProcessSharingDisabled
 UmdfKernelModeClientPolicy = AllowKernelModeClients
 UmdfFileObjectPolicy       = AllowNullAndUnknownFileObjects
 UmdfMethodNeitherAction    = Copy
@@ -124,6 +108,13 @@ UmdfFsContextUsePolicy     = CanUseFsContext2
 ; Common
 ; ---------------------------------------------------------------------------------------------
 
+[CoroomVhid_WudfRd_Service]
+DisplayName   = %WudfRdDisplayName%
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START
+ErrorControl  = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary = %12%\WUDFRd.sys
+
 [CoroomVhid_UmdfService]
 UmdfLibraryVersion = $UMDFVERSION$
 ServiceBinary      = %13%\coroomvhid.dll
@@ -132,5 +123,6 @@ ServiceBinary      = %13%\coroomvhid.dll
 ProviderName      = "coroom"
 ManufacturerName  = "coroom"
 DiskName          = "Driver de mando virtual de coroom"
-DeviceDesc        = "Mando virtual de coroom"
+ControlDesc       = "Mandos virtuales de coroom"
+XusbDesc          = "Mando de Xbox 360 de coroom"
 WudfRdDisplayName = "Windows Driver Foundation - User-mode Driver Framework Reflector"

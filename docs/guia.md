@@ -63,7 +63,10 @@ Si se corta la conexión, coroom **reconecta solo** (hasta 5 intentos, de medio 
 El anfitrión da y quita, a cada invitado y en cualquier momento:
 
 - **Teclado y ratón**: el invitado escribe y mueve el ratón en el equipo del anfitrión.
-- **Mando**: una **ranura** (1 a 8) para un mando; cada ranura es de un solo invitado.
+- **Mando**: una **ranura** (1 a 8) para un mando; cada ranura es de un solo invitado. Tu mando
+  llega **tal cual** (el juego y Steam lo ven como ese mando, con sus botones) o **convertido a
+  Xbox 360**, como decida el anfitrión. Si tienes varios mandos, eliges cuál envías en el panel de
+  mandos de la barra (`Ctrl+Alt+J`).
 - **Voz**: el invitado habla y oye a la sala.
 
 Además puede **pausar la entrada de todos** (se suelta todo lo pulsado) y **expulsar** a un
@@ -122,7 +125,7 @@ Las letras de `Ctrl+Alt` se cambian en Ajustes → Entrada (no pueden coincidir 
 | «El anfitrión agotó su cuota del relay» | Este mes solo funciona la conexión directa; el administrador puede subir la cuota. |
 | El vídeo va a saltos o con poca calidad | Abre las estadísticas (`Ctrl+Alt+O`): pérdida, RTT y bitrate. coroom baja el bitrate solo si hay cola en la red; con wifi, prueba con cable. Por encima de 50 ms de RTT la experiencia ya no es buena para juegos rápidos. |
 | No se oye el juego | Mira el audio elegido al abrir la sala y, en Linux, el nombre de la aplicación en Ajustes → Diagnóstico. El invitado puede haber silenciado el juego (`Ctrl+Alt+V`). |
-| El juego no recibe mi teclado o mando | El anfitrión tiene que darte el permiso; mira también si la entrada está en pausa. En Linux, el anfitrión debe aceptar el diálogo de «Control remoto» del sistema; en Windows, el mando necesita el driver de coroom, que se instala con `install.ps1` sin tocar la seguridad de Windows (sin él, `coroom host --gamepad-to-keys` convierte el mando en teclas); si el juego solo usa XInput, lánzalo desde Steam con Steam Input. Algunos juegos con anti-trampas no aceptan dispositivos virtuales. |
+| El juego no recibe mi teclado o mando | El anfitrión tiene que darte el permiso; mira también si la entrada está en pausa. En Linux, el anfitrión debe aceptar el diálogo de «Control remoto» del sistema; en Windows, el mando necesita el driver de coroom, que se instala con `install.ps1` sin tocar la seguridad de Windows (sin él, `coroom host --gamepad-to-keys` convierte el mando en teclas); si el juego solo usa XInput y el mando va «Tal cual», ponlo en «Convertido a Xbox 360» o lanza el juego desde Steam con Steam Input. Algunos juegos con anti-trampas no aceptan dispositivos virtuales. |
 | Aviso «la clave X-Wing del anfitrión no verifica» | Alguien manipuló el intercambio de claves en el servidor: la entrada se desactiva en esa sala. Avisa al administrador. |
 | «Este equipo no puede decodificar…» | Mira Ajustes → Diagnóstico: los códecs que tu equipo decodifica. coroom elige el mejor que tengáis todos. |
 | «Demasiados códigos de sala que no existen» | Has probado 10 códigos que no existen en un minuto: espera un minuto y comprueba el código con el anfitrión. |

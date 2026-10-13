@@ -182,7 +182,18 @@ try {
 
     foreach ($arch in $Platform) {
         Write-Host "== Compilando $Configuration|$arch"
-        & $msbuild $solution /m /nologo /v:minimal "/p:Configuration=$Configuration" "/p:Platform=$arch" $msbuildVersion
+        # VhfUm.lib (Virtual HID Framework en modo usuario) está en Lib\<versión>\um\<arquitectura>
+        # del WDK, que no siempre está entre las rutas del proyecto (el WDK de NuGet va aparte del
+        # SDK): se busca y se pasa su carpeta.
+        $vhf = foreach ($root in Get-KitRoots) {
+            Get-ChildItem (Join-Path $root "Lib\*\um\$arch\VhfUm.lib") -ErrorAction SilentlyContinue
+        }
+        $vhf = $vhf | Sort-Object { $_.Directory.Parent.Parent.Name } -Descending | Select-Object -First 1
+        if (-not $vhf) {
+            throw "No encuentro VhfUm.lib ($arch) en el WDK ($((Get-KitRoots) -join ', '))."
+        }
+        Write-Host "VHF: $($vhf.FullName)"
+        & $msbuild $solution /m /nologo /v:minimal "/p:Configuration=$Configuration" "/p:Platform=$arch" $msbuildVersion "/p:CoroomVhfLibDir=$($vhf.DirectoryName)"
         if ($LASTEXITCODE -ne 0) {
             throw "MSBuild falló para $arch (código $LASTEXITCODE)."
         }
@@ -209,9 +220,8 @@ try {
         Write-Host "INF: $((Select-String -Path $packageInf -Pattern '^\s*DriverVer').Line.Trim())"
 
         # InfVerif: la validación básica tiene que pasar. La de "Windows Driver" (/w, aislamiento
-        # del paquete) se muestra solo como aviso: la sección de Windows 10 añade los servicios
-        # del sistema mshidumdf y WUDFRd a mano, como el ejemplo de Microsoft anterior a
-        # Windows 11, porque MsHidUmdf.inf no existe allí.
+        # del paquete) se muestra solo como aviso: el INF añade el servicio del sistema WUDFRd a
+        # mano (la misma sección sirve para Windows 10 y 11).
         & $infverif /v $packageInf
         if ($LASTEXITCODE -ne 0) {
             throw "InfVerif encontró errores en coroomvhid.inf (código $LASTEXITCODE)."

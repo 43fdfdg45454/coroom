@@ -3,7 +3,8 @@
     Desinstala el driver de mando virtual de coroom.
 
 .DESCRIPTION
-    Quita los dispositivos Root\coroomvhid (con ellos desaparecen los mandos virtuales), borra el
+    Quita los dispositivos Root\coroomvhid y Root\coroomxusb (con ellos desaparecen los mandos
+    virtuales), borra el
     paquete del almacén de drivers (pnputil /delete-driver oemNN.inf /uninstall /force) y quita de
     "Entidades de certificación raíz de confianza" y "Editores de confianza" del equipo los
     certificados de los paquetes de coroom: los de sujeto "CN=coroom (driver local)" (y el de prueba
@@ -38,7 +39,7 @@ foreach ($device in $devices) {
     [CoroomVhid.SetupApi]::RemoveDevice($device.InstanceId)
 }
 if ($devices.Count -eq 0) {
-    Write-Host "No hay dispositivos $CoroomHardwareId."
+    Write-Host "No hay dispositivos $CoroomHardwareId ni $CoroomXusbHardwareId."
 }
 
 $packages = @(Get-CoroomDriverPackage)

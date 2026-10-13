@@ -54,7 +54,7 @@ apps/desktop      binario `coroom` (anfitrión + invitado), aplicación iced en 
 apps/desktop/locales/  catálogos Fluent de los textos de la aplicación
 vendor/           iced_wgpu y cryoglyph parcheados a wgpu 30 (ver vendor/README.md)
 apps/server       binario `coroom-server` (h3 + hyper/TLS + relay + sqlite + /admin)
-drivers/windows-vhid  driver de mandos virtuales: minidriver HID de UMDF2 (modo usuario) bajo mshidumdf
+drivers/windows-vhid  driver de mandos virtuales de UMDF2 (modo usuario): mandos VHF tal cual y Xbox 360
 deploy/           Dockerfile, docker-compose.yml, .env.sample, README
 packaging/        flatpak/, msix/
 docs/             ARQUITECTURA.md, seguridad.md, guia.md, screenshots/

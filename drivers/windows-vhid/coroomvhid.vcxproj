@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  coroomvhid.dll: UMDF2 HID minidriver under mshidumdf.sys, with the project settings of
-  Microsoft's vhidmini2 UMDF2 sample (hid/vhidmini2/driver/umdf2/VhidminiUm.vcxproj). Needs
+  coroomvhid.dll: UMDF2 driver (HID source driver of the Virtual HID Framework and Xbox 360
+  devices), with the project settings of Microsoft's vhidmini2 UMDF2 sample
+  (hid/vhidmini2/driver/umdf2/VhidminiUm.vcxproj) plus VhfUm.lib. Needs
   Visual Studio 2022 or 2026 (or its Build Tools) with the Windows SDK and the WDK of the same
   version (10.0.26100 or later) and its Visual Studio extension, or the EWDK. See README.md.
 
@@ -83,7 +84,9 @@
     </ClCompile>
     <Link>
       <TreatLinkerWarningAsErrors>true</TreatLinkerWarningAsErrors>
-      <AdditionalDependencies>%(AdditionalDependencies);mincore.lib</AdditionalDependencies>
+      <AdditionalDependencies>%(AdditionalDependencies);mincore.lib;VhfUm.lib</AdditionalDependencies>
+      <!-- build.ps1 passes the folder of VhfUm.lib (Lib\<version>\um\<arch> of the WDK). -->
+      <AdditionalLibraryDirectories>%(AdditionalLibraryDirectories);$(CoroomVhfLibDir)</AdditionalLibraryDirectories>
     </Link>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
@@ -100,7 +103,6 @@
     <ClInclude Include="coroom_vhid.h" />
     <ClInclude Include="driver.h" />
     <None Include="report_descriptor.inc" />
-    <None Include="control_descriptor.inc" />
   </ItemGroup>
   <ItemGroup>
     <Inf Include="coroomvhid.inf" />
