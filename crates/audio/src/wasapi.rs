@@ -135,6 +135,11 @@ fn run(
     stop: Arc<AtomicBool>,
     ready: std::sync::mpsc::Sender<Result<(), AudioError>>,
 ) {
+    // El hilo que mueve el dispositivo, con MMCSS «Pro Audio» como el motor de audio de Windows.
+    match crate::realtime::promote_current_thread() {
+        Ok(via) => tracing::debug!(via, "wasapi-audio en tiempo real"),
+        Err(reason) => tracing::debug!(%reason, "wasapi-audio sin tiempo real"),
+    }
     let _ = wasapi::initialize_mta();
     let (client, handle, io) = match open(&endpoint, format) {
         Ok(opened) => opened,

@@ -1221,6 +1221,7 @@ name = "coroom-audio"
 version = "1.0.0"
 dependencies = [
  "bytemuck",
+ "libc",
  "opusic-c",
  "opusic-sys",
  "pipewire",
@@ -1228,6 +1229,7 @@ dependencies = [
  "wasapi",
  "webrtc-audio-processing",
  "windows",
+ "zbus",
 ]
 
 [[package]]

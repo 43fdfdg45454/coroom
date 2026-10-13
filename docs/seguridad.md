@@ -220,7 +220,8 @@ sin avisos en las crates que lo usan:
 | `coroom-capture` | 30 | PipeWire (DMA-BUF) y Windows.Graphics.Capture |
 | `coroom-render` | 14 | Importación de imágenes Vulkan en `wgpu` (`as_hal`, `texture_from_raw`) |
 | `coroom-input` | 13 | `SendInput` y el cliente del driver de mando de Windows (cfgmgr32, `hid.dll` y `WriteFile`) |
-| `proto`, `crypto`, `transport`, `session`, `audio`, `ui`, `coroom`, `coroom-server` | 0 | `unsafe_code = "deny"` en el workspace |
+| `coroom-audio` | 10 | Sesiones de audio de WASAPI (COM) y prioridad de tiempo real (`sched_setscheduler`, `RLIMIT_RTTIME`, `gettid`; MMCSS en Windows) |
+| `proto`, `crypto`, `transport`, `session`, `ui`, `coroom`, `coroom-server` | 0 | `unsafe_code = "deny"` en el workspace |
 
 Todo lo que parsea datos de la red está en crates sin `unsafe`.
 

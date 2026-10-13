@@ -23,6 +23,9 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- Audio: en la 1.1.3, tras un parón de la red, el audio podía sonar 30-70 ms tarde durante
+  varios segundos (la cola solo se recortaba una trama por segundo). Ahora, si sobran dos tramas o
+  más, se recorta una cada 100 ms; la que sobra sola sigue esperando un segundo.
 - «Cambiar de servidor» ya no cierra la sesión: la lista de servidores tiene «Volver» a la
   cuenta abierta, y elegir un servidor con la sesión guardada entra sin pedir la contraseña (solo
   la pide si no la hay o ya no vale).
@@ -58,6 +61,12 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
   de tomarla de una cola llenada una trama antes. Además, el buffer de jitter ya no se queda una
   trama por encima de su objetivo: se ceba en el objetivo y recorta cuando durante un segundo le
   sobra una trama. WASAPI sigue con la cola.
+- El audio se recibe y se descifra en un hilo propio (`audio-net`) en vez de en el runtime de la
+  red, que comparte sus hilos con el vídeo, QUIC y el control: un fotograma grande ya no retrasa
+  el audio. Los hilos de audio piden prioridad de tiempo real: en Linux `SCHED_FIFO` si el límite
+  lo permite o, si no, RealtimeKit (o el portal Realtime en Flatpak), como PipeWire; en Windows,
+  MMCSS «Pro Audio», como el motor de audio del sistema. Si no se concede, siguen con prioridad
+  normal.
 - Windows: el driver de mando virtual pasa de KMDF sobre Virtual HID Framework a un minidriver HID
   de UMDF2 en modo usuario bajo el `mshidumdf.sys` de Windows. Se instala sin firma de prueba y
   con el arranque seguro y la integridad de memoria activados: la CI firma cada paquete con un

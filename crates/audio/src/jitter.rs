@@ -165,6 +165,10 @@ pub struct JitterBuffer {
     min_queued: i32,
     /// Tramas de la ventana actual de `min_queued`.
     window: u32,
+    /// Menor cola vista en las últimas [`ADJUST_PERIOD_FRAMES`] tramas.
+    min_recent: i32,
+    /// Tramas de la ventana actual de `min_recent`.
+    recent: u32,
     since_adjust: u32,
     run: u32,
     underrun_run: u32,
@@ -219,6 +223,8 @@ impl JitterBuffer {
             level: 0.0,
             min_queued: i32::MAX,
             window: 0,
+            min_recent: i32::MAX,
+            recent: 0,
             since_adjust: 0,
             run: 0,
             underrun_run: 0,
@@ -433,6 +439,8 @@ impl JitterBuffer {
             self.level = f64::from(queued);
             self.min_queued = i32::MAX;
             self.window = 0;
+            self.min_recent = i32::MAX;
+            self.recent = 0;
             self.since_adjust = 0;
         }
         self.level = self.level * 0.9 + f64::from(queued) * 0.1;
@@ -444,26 +452,34 @@ impl JitterBuffer {
         }
         self.window += 1;
         self.min_queued = self.min_queued.min(queued);
+        if self.recent >= ADJUST_PERIOD_FRAMES {
+            self.recent = 0;
+            self.min_recent = i32::MAX;
+        }
+        self.recent += 1;
+        self.min_recent = self.min_recent.min(queued);
         self.since_adjust = self.since_adjust.saturating_add(1);
         let desired = f64::from(self.desired_frames());
         let adjust = self.since_adjust >= ADJUST_PERIOD_FRAMES;
 
-        // Sobra cola: se recorta la trama que toca si está (y hay más detrás). Sobra cuando en todo
-        // el periodo la cola no bajó nunca del objetivo: así no se recorta por una llegada que cae
-        // justo antes o después de la trama (la media no lo distingue) y la cola no se queda una
-        // trama por encima del objetivo, que es lo que pasaba con `nivel > objetivo + 1`.
-        if adjust
-            && self.window >= TRIM_WINDOW_FRAMES
-            && self.min_queued > self.desired_frames()
-            && queued > 1
-            && self.slot(next).is_some()
-        {
+        // Sobra cola: se recorta la trama que toca si está (y hay más detrás). Sobran dos o más si
+        // en las últimas [`ADJUST_PERIOD_FRAMES`] tramas la cola no bajó de objetivo + 2 (una ráfaga
+        // tras un parón): se recorta una cada periodo hasta quedar en objetivo + 1. Sobra una sola
+        // si en todo un [`TRIM_WINDOW_FRAMES`] la cola no bajó nunca del objetivo: así no se
+        // recorta la que hace falta cuando las llegadas caen a un lado u otro de la reproducción, y
+        // la cola no se queda una trama por encima (lo que pasaba con `nivel > objetivo + 1`).
+        let desired_frames = self.desired_frames();
+        let burst = self.recent >= ADJUST_PERIOD_FRAMES && self.min_recent > desired_frames + 1;
+        let one_extra = self.window >= TRIM_WINDOW_FRAMES && self.min_queued > desired_frames;
+        if adjust && (burst || one_extra) && queued > 1 && self.slot(next).is_some() {
             self.take(next);
             self.next = Some(next.wrapping_add(1));
             self.stats.trimmed += 1;
             self.level -= 1.0;
             self.min_queued = i32::MAX;
             self.window = 0;
+            self.min_recent = i32::MAX;
+            self.recent = 0;
             self.since_adjust = 0;
             return self.pop_inner();
         }
@@ -473,6 +489,8 @@ impl JitterBuffer {
             self.level += 1.0;
             self.min_queued = i32::MAX;
             self.window = 0;
+            self.min_recent = i32::MAX;
+            self.recent = 0;
             self.since_adjust = 0;
             return Pop::Plc(Lost {
                 seq: next,
@@ -785,6 +803,25 @@ mod tests {
         let (wait, stats) = hold(3 * MS, |_| Duration::ZERO, -10);
         assert!((wait - 5.0).abs() < 0.5, "{wait} ms {stats:?}");
         assert_eq!((stats.trimmed, stats.stretched), (1, 0), "{stats:?}");
+    }
+
+    #[test]
+    fn a_burst_after_a_stall_drains_in_well_under_a_second() {
+        // Un parón de 60 ms: las tramas 100 a 106 llegan juntas con la 106. La cola crece 6
+        // tramas y tiene que volver al objetivo enseguida (con una por segundo tardaba 6 s, y el
+        // audio sonaba 60 ms tarde todo ese tiempo).
+        let stall = |seq: u32| {
+            if (100..106).contains(&seq) {
+                FRAME_DURATION * (106 - seq)
+            } else {
+                Duration::ZERO
+            }
+        };
+        let (wait, stats) = hold(3 * MS, stall, 0);
+        assert!((wait - 15.0).abs() < 0.5, "{wait} ms {stats:?}");
+        assert!(stats.trimmed >= 5, "{stats:?}");
+        // El propio parón vacía la cola una vez; los recortes no añaden ninguna.
+        assert!(stats.underruns <= 1, "{stats:?}");
     }
 
     #[test]

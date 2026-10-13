@@ -6,7 +6,8 @@
 //! `capture_us` va en el **reloj del anfitrión**: el del propio anfitrión (el origen común de todos
 //! sus `MediaSender`) o, en el invitado, su hora convertida con el desfase de `Ping`/`Pong`.
 //!
-//! **Recepción** (tareas de red): `read_audio_datagram` → SFrame (que dice el emisor y la pista) →
+//! **Recepción** (hilo `audio-net`, propio y en tiempo real, fuera del runtime de la red):
+//! `read_audio_datagram_blocking` → SFrame (que dice el emisor y la pista) →
 //! cabecera de audio → canal hacia el hilo `audio-play`. En el anfitrión, la voz de un invitado con
 //! permiso se **reenvía tal cual** (el mismo datagrama cifrado, sin descifrarlo de nuevo ni
 //! recifrarlo) a los demás invitados con permiso; el anfitrión la descifra solo para oírla y para
@@ -28,12 +29,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use coroom_audio::codec::{OpusDecoder, OpusEncoder, Profile, Recovery, is_silk_or_hybrid};
 use coroom_audio::jitter::{JitterBuffer, Pop};
 use coroom_audio::mix::Mixer;
 use coroom_audio::processing::{ProcessingOptions, RenderFeed, VoiceProcessor};
 use coroom_audio::sync::AvSync;
 use coroom_audio::{AudioConfig, AudioSink, AudioSource, MAX_FRAME_SAMPLES, Render};
+use coroom_transport::PeerConnection;
 use coroom_transport::crypto::sframe::FrameEncryptor;
 use coroom_transport::proto::audio::{AUDIO_HEADER_LEN, AudioHeader};
 use coroom_transport::proto::media::Track;
@@ -456,6 +459,7 @@ pub(crate) fn game_capture_loop(
     frame_ms: u8,
     out: &dyn AudioOut,
 ) {
+    realtime("audio-cap");
     let shared = &core.shared;
     if let Err(err) = source.start(&AudioConfig::game()) {
         core.warn(format!("sin audio del juego: {err}"));
@@ -511,6 +515,7 @@ pub(crate) fn voice_capture_loop(
     control: &AudioControl,
     out: &dyn AudioOut,
 ) {
+    realtime("voice-cap");
     let shared = &core.shared;
     if let Err(err) = input.mic.start(&AudioConfig::voice()) {
         core.warn(format!("sin micrófono: {err}"));
@@ -1003,6 +1008,8 @@ fn play_push(
     mut playout: Playout,
     frame_len: usize,
 ) {
+    // Con la cola, este hilo marca el ritmo del sumidero (a demanda lo marca el dispositivo).
+    realtime("audio-play");
     if let Err(err) = sink.start(config) {
         core.warn(format!("sin salida de audio: {err}"));
         return;
@@ -1029,6 +1036,57 @@ fn play_push(
     }
     playout.publish();
     sink.stop();
+}
+
+/// Sube el hilo de audio que llama a tiempo real ([`coroom_audio::realtime`]); si no se concede,
+/// sigue con prioridad normal.
+fn realtime(thread: &str) {
+    match coroom_audio::realtime::promote_current_thread() {
+        Ok(via) => debug!(hilo = thread, via, "hilo de audio en tiempo real"),
+        Err(reason) => debug!(hilo = thread, %reason, "hilo de audio sin tiempo real"),
+    }
+}
+
+/// Espera máxima de `audio-net` antes de mirar si la sesión terminó.
+const READER_POLL: Duration = Duration::from_millis(100);
+
+/// Hilo `audio-net`: lee los datagramas de audio de una conexión y los pasa a `handle` (SFrame,
+/// cabecera y canal hacia `audio-play`) en un hilo propio con prioridad de tiempo real, fuera del
+/// runtime de la red, que comparte sus hilos con el vídeo, QUIC y el control: así un fotograma
+/// clave grande no retrasa el audio. Termina al cerrarse la conexión o la sesión, o con
+/// [`AudioReader::stop`].
+pub(crate) struct AudioReader {
+    stop: Arc<AtomicBool>,
+}
+
+impl AudioReader {
+    pub(crate) fn spawn(
+        core: &Arc<Core>,
+        connection: PeerConnection,
+        mut handle: impl FnMut(Bytes) + Send + 'static,
+    ) -> Result<Self, String> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (thread_stop, shared) = (Arc::clone(&stop), Arc::clone(&core.shared));
+        std::thread::Builder::new()
+            .name("audio-net".into())
+            .spawn(move || {
+                realtime("audio-net");
+                while !thread_stop.load(Ordering::Acquire) && !shared.stopping() {
+                    match connection.read_audio_datagram_blocking(READER_POLL) {
+                        Ok(Some(datagram)) => handle(datagram),
+                        Ok(None) => {}
+                        Err(_) => break,
+                    }
+                }
+            })
+            .map_err(|err| format!("no se pudo crear `audio-net`: {err}"))?;
+        Ok(Self { stop })
+    }
+
+    /// Lo para (sin esperarlo: sale en menos de [`READER_POLL`]).
+    pub(crate) fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+    }
 }
 
 /// Suma los contadores de los buffers por pista y los deja en el registro.

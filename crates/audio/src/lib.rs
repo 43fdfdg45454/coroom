@@ -26,6 +26,7 @@ pub mod codec;
 pub mod jitter;
 pub mod mix;
 pub mod processing;
+pub mod realtime;
 pub mod sync;
 pub mod synthetic;
 

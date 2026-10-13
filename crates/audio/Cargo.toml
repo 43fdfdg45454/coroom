@@ -27,6 +27,8 @@ opusic-sys.workspace = true
 opusic-c = { workspace = true, features = ["dred"] }
 opusic-sys = { workspace = true, features = ["dred"] }
 pipewire = { workspace = true, optional = true }
+zbus.workspace = true
+libc.workspace = true
 webrtc-audio-processing = { workspace = true, optional = true, features = ["bundled"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]

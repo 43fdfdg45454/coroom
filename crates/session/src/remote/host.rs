@@ -36,8 +36,8 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use super::audio::{
-    AudioOut, HostAudio, Packet, Player, TalkMode, extend_us, game_capture_loop, packet_channel,
-    play_loop, voice_capture_loop,
+    AudioOut, AudioReader, HostAudio, Packet, Player, TalkMode, extend_us, game_capture_loop,
+    packet_channel, play_loop, voice_capture_loop,
 };
 use super::input::{HostInput, Job};
 use super::negotiate::{
@@ -504,19 +504,20 @@ impl AudioOut for HostAudioOut {
 /// Lee la voz de los invitados que llega por `conn` (la directa de `only` o la del relay): la
 /// descifra para saber quién habla y oírla, comprueba su permiso y la reenvía tal cual a los
 /// demás invitados con permiso.
-async fn voice_reader(ctx: Arc<HostCtx>, conn: PeerConnection, only: Option<GuestId>) {
+fn voice_reader(ctx: &Arc<HostCtx>, conn: PeerConnection, only: Option<GuestId>) {
     let core = Arc::clone(&ctx.core);
+    let thread_ctx = Arc::clone(ctx);
     let mut decryptor = core.ring.decryptor();
     let mut plain = Vec::with_capacity(2048);
     let mut permitted = Vec::with_capacity(16);
-    let mut rejected = 0u64;
-    while let Ok(datagram) = conn.read_audio_datagram().await {
+    let reader = AudioReader::spawn(&core, conn, move |datagram| {
+        let (ctx, core) = (&thread_ctx, &thread_ctx.core);
         let arrived = Instant::now();
         let Ok((header, payload)) = ObjectHeader::parse_datagram(&datagram) else {
-            continue;
+            return;
         };
         if header.track != Track::Voice {
-            continue;
+            return;
         }
         let guest = if core.sframe {
             match decryptor.decrypt_into(payload, &mut plain) {
@@ -535,14 +536,12 @@ async fn voice_reader(ctx: Arc<HostCtx>, conn: PeerConnection, only: Option<Gues
             only
         };
         let Some(guest) = guest.filter(|guest| only.is_none_or(|only| only == *guest)) else {
-            rejected += 1;
-            continue;
+            return;
         };
-        voice_permitted(&core, &mut permitted);
+        voice_permitted(core, &mut permitted);
         if !permitted.contains(&guest) {
             // Sin permiso de voz: ni se oye ni se reenvía.
-            rejected += 1;
-            continue;
+            return;
         }
         {
             let links = lock(&ctx.links);
@@ -553,8 +552,11 @@ async fn voice_reader(ctx: Arc<HostCtx>, conn: PeerConnection, only: Option<Gues
         {
             let _ = tx.try_send(packet);
         }
+    });
+    // Termina sola al cerrarse la conexión o la sesión.
+    if let Err(err) = reader {
+        core.warn(err);
     }
-    debug!(rejected, "lector de voz terminado");
 }
 
 /// Espera a que terminen todos los futuros (sin `futures`: un `poll_fn` que los sondea a todos).
@@ -977,11 +979,7 @@ fn attach_direct(
     ));
     ctx.input
         .spawn_readers(&ctx.core, &connection, Some(guest), &sender);
-    tokio::spawn(voice_reader(
-        Arc::clone(ctx),
-        connection.clone(),
-        Some(guest),
-    ));
+    voice_reader(ctx, connection.clone(), Some(guest));
     ctx.install_pending();
     sender.set_epoch_hint(ctx.core.epoch.load(Ordering::Acquire) as u16);
     lock(&ctx.links).direct.insert(
@@ -1029,7 +1027,7 @@ async fn ensure_relay(ctx: &Arc<HostCtx>) {
     // Por el relay llegan todos los invitados: los lectores separan por la clave de cada uno.
     ctx.input
         .spawn_readers(&ctx.core, &connection, None, &sender);
-    tokio::spawn(voice_reader(Arc::clone(ctx), connection.clone(), None));
+    voice_reader(ctx, connection.clone(), None);
     lock(&ctx.links).relay = Some(RelayLink {
         sender: Arc::clone(&sender),
         guests: BTreeMap::new(),

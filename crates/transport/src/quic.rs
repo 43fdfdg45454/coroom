@@ -27,8 +27,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -514,6 +514,8 @@ pub type BiStream = (quinn::SendStream, quinn::RecvStream);
 struct DatagramQueue {
     queue: Mutex<VecDeque<Bytes>>,
     notify: Notify,
+    /// Para el lector que espera bloqueado ([`DatagramQueue::pop_blocking`]).
+    cond: Condvar,
     closed: std::sync::atomic::AtomicBool,
     dropped: std::sync::atomic::AtomicU64,
 }
@@ -529,12 +531,38 @@ impl DatagramQueue {
             }
         }
         self.notify.notify_one();
+        self.cond.notify_one();
     }
 
     fn close(&self) {
         self.closed
             .store(true, std::sync::atomic::Ordering::Release);
         self.notify.notify_one();
+        self.cond.notify_all();
+    }
+
+    /// Como [`DatagramQueue::pop`], bloqueando el hilo hasta `timeout`: `Ok(None)` si no llegó
+    /// nada, `Err(())` si la conexión se cerró y no queda ninguno.
+    fn pop_blocking(&self, timeout: Duration) -> Result<Option<Bytes>, ()> {
+        let deadline = Instant::now() + timeout;
+        let mut queue = self.queue.lock().map_err(|_| ())?;
+        loop {
+            if let Some(datagram) = queue.pop_front() {
+                return Ok(Some(datagram));
+            }
+            if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            queue = self
+                .cond
+                .wait_timeout(queue, deadline - now)
+                .map_err(|_| ())?
+                .0;
+        }
     }
 
     /// Siguiente datagrama; `None` si la conexión se cerró y no queda ninguno. Pensada para un
@@ -714,6 +742,18 @@ impl PeerConnection {
             Some(datagram) => Ok(datagram),
             None => Err(self.closed_error()),
         }
+    }
+
+    /// Como [`PeerConnection::read_audio_datagram`], bloqueando el hilo hasta `timeout` (para un
+    /// hilo de audio propio, fuera del runtime): `Ok(None)` si no llegó nada en ese tiempo.
+    pub fn read_audio_datagram_blocking(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<Bytes>, TransportError> {
+        self.inner
+            .audio_datagrams
+            .pop_blocking(timeout)
+            .map_err(|()| self.closed_error())
     }
 
     /// Datagramas de audio descartados por llenarse su cola.
@@ -975,5 +1015,35 @@ impl ControlReceiver {
                 None => return Err(TransportError::Closed),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_blocking_reader_waits_times_out_and_sees_the_close() {
+        let queue = Arc::new(DatagramQueue::default());
+        assert_eq!(queue.pop_blocking(Duration::from_millis(5)), Ok(None));
+        let writer = Arc::clone(&queue);
+        let sent = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            writer.push(Bytes::from_static(b"audio"));
+        });
+        // Se despierta al llegar, sin esperar al plazo.
+        let started = Instant::now();
+        let got = queue.pop_blocking(Duration::from_secs(5));
+        assert_eq!(got, Ok(Some(Bytes::from_static(b"audio"))));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        sent.join().unwrap();
+        queue.push(Bytes::from_static(b"queda"));
+        queue.close();
+        // Lo que quedaba se entrega antes del cierre.
+        assert_eq!(
+            queue.pop_blocking(Duration::from_millis(5)),
+            Ok(Some(Bytes::from_static(b"queda")))
+        );
+        assert_eq!(queue.pop_blocking(Duration::from_millis(5)), Err(()));
     }
 }

@@ -131,6 +131,11 @@ pipewire = { version = "=0.10.1", default-features = false }
 # runtimes de un solo uso) las llamadas siguientes esperaban para siempre. Con `async-io`, zbus la
 # lleva en un hilo propio.
 ashpd = { version = "=0.13.13", default-features = false, features = ["async-io", "screencast", "remote_desktop"] }
+# Prioridad de tiempo real de los hilos de audio: RealtimeKit (bus del sistema) o el portal
+# Realtime (en Flatpak), con la misma zbus que ashpd y su API bloqueante; `libc` para
+# `sched_setscheduler`, `gettid` y `RLIMIT_RTTIME`.
+zbus = { version = "=5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
+libc = "=0.2.190"
 windows = { version = "=0.62.2", default-features = false }
 
 # Entrada. `reis` (libei en Rust, de ids1024) habla el protocolo EI con el socket que da

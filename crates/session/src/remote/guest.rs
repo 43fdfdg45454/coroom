@@ -29,8 +29,8 @@ use tokio::sync::mpsc;
 use tracing::debug;
 
 use super::audio::{
-    AudioOut, GuestAudio, Packet, Player, TalkMode, extend_us, packet_channel, play_loop,
-    voice_capture_loop,
+    AudioOut, AudioReader, GuestAudio, Packet, Player, TalkMode, extend_us, packet_channel,
+    play_loop, voice_capture_loop,
 };
 use super::host::signal_error;
 use super::negotiate::{GuestCapabilities, codec_from_wire, format_from_wire, shape_from_message};
@@ -227,29 +227,35 @@ impl AudioOut for GuestAudioOut {
 }
 
 /// Recibe el audio del juego (solo del anfitrión) y las voces (de cualquiera menos de uno mismo)
-/// y los pasa a `audio-play`.
-async fn audio_receiver(core: Arc<Core>, connection: PeerConnection, playing: Arc<AtomicBool>) {
+/// y los pasa a `audio-play`, en el hilo `audio-net` ([`AudioReader`]).
+fn audio_receiver(
+    core: &Arc<Core>,
+    connection: PeerConnection,
+    playing: Arc<AtomicBool>,
+) -> Result<AudioReader, String> {
     let mut decryptor = core.ring.decryptor();
     let mut plain = Vec::with_capacity(2048);
-    while let Ok(datagram) = connection.read_audio_datagram().await {
+    let thread_core = Arc::clone(core);
+    AudioReader::spawn(core, connection, move |datagram| {
+        let core = &thread_core;
         // Durante la estimación de calidad se descarta (sin acumular: el audio arranca con el
         // vídeo, y la sincronía A/V no tiene que recortar nada).
         if !playing.load(Ordering::Acquire) {
-            continue;
+            return;
         }
         let arrived = Instant::now();
         let Ok((header, payload)) = ObjectHeader::parse_datagram(&datagram) else {
-            continue;
+            return;
         };
         let track = match header.track {
             Track::Audio => AudioTrack::Game,
             Track::Voice => AudioTrack::Voice,
-            _ => continue,
+            _ => return,
         };
         let source = if core.sframe {
             match decryptor.decrypt_into(payload, &mut plain) {
                 Ok((info, _)) if info.track == header.track as u8 => info.sender_leaf,
-                _ => continue,
+                _ => return,
             }
         } else {
             plain.clear();
@@ -264,14 +270,14 @@ async fn audio_receiver(core: Arc<Core>, connection: PeerConnection, playing: Ar
             AudioTrack::Voice => (source != own || !core.sframe) && core.audio.voice_allowed(),
         };
         if !accept {
-            continue;
+            return;
         }
         if let Some(tx) = lock(&core.audio_tx).as_ref()
             && let Some(packet) = Packet::parse(track, source, &plain, arrived)
         {
             let _ = tx.try_send(packet);
         }
-    }
+    })
 }
 
 /// Cómo terminó una entrada en la sala.
@@ -847,13 +853,17 @@ async fn receive(
         link.control = Some(reply.clone());
     }
     let playing = Arc::new(AtomicBool::new(false));
-    let audio_task = lock(&core.audio_tx).is_some().then(|| {
-        tokio::spawn(audio_receiver(
-            Arc::clone(core),
-            connection.clone(),
-            Arc::clone(&playing),
-        ))
-    });
+    let audio_task = if lock(&core.audio_tx).is_some() {
+        match audio_receiver(core, connection.clone(), Arc::clone(&playing)) {
+            Ok(reader) => Some(reader),
+            Err(err) => {
+                core.warn(err);
+                None
+            }
+        }
+    } else {
+        None
+    };
     core.set_state(SessionState::Active);
     core.emit(SessionEvent::Connected {
         path: established.path,
@@ -881,8 +891,8 @@ async fn receive(
     });
     if let Err(err) = reply.send(&caps.to_message()) {
         control_task.abort();
-        if let Some(task) = audio_task {
-            task.abort();
+        if let Some(task) = &audio_task {
+            task.stop();
         }
         connection.close("capacidades");
         return Err(network("capacidades")(err));
@@ -900,8 +910,8 @@ async fn receive(
     };
     let result = media_loop(core, &receiver, &reply, frames).await;
     input_task.abort();
-    if let Some(task) = audio_task {
-        task.abort();
+    if let Some(task) = &audio_task {
+        task.stop();
     }
     lock(&core.link).control = None;
     core.guest_input.set_sender(None);
