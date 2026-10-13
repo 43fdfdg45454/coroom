@@ -26,7 +26,7 @@ Wayland nativo, HiDPI, diálogos y notificaciones por los portales), con **buena
 a un clic, estados vacíos y errores explicados en español, nada que bloquee sin decir por qué,
 indicadores de latencia y conexión siempre visibles) y **UI bonita** (jerarquía visual clara,
 animaciones breves, nada de widgets por defecto sin estilo). En Windows, la misma interfaz con el
-tema del sistema. Toda pantalla nueva se diseña antes de implementarse (boceto en su issue) y se
+tema del sistema. Toda pantalla nueva se diseña antes de implementarse (boceto aprobado por el propietario) y se
 revisa con captura de pantalla.
 
 ## Regla de privacidad (obligatoria)
