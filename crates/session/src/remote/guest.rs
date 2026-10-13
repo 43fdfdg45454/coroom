@@ -742,7 +742,13 @@ async fn run_guest(
                 command = commands.recv() => match command {
                     Some(Command::Close) | None => break Ok(Exit::Closed),
                     Some(Command::Reconnect) => break Ok(Exit::Reconnect),
-                    Some(Command::Kick(_) | Command::PermissionsChanged(_) | Command::Invite(_)) => {}
+                    Some(
+                        Command::Kick(_)
+                        | Command::PermissionsChanged(_)
+                        | Command::Invite(_)
+                        | Command::GamepadMode { .. }
+                        | Command::GamepadOutput { .. },
+                    ) => {}
                 },
                 Some(end) = disconnected.recv() => match end {
                     Ok(()) => break Ok(Exit::Closed),
@@ -1091,6 +1097,12 @@ async fn control_loop(
             }
             Some(ControlMessage::VoiceState { guest, speaking }) => {
                 core.audio.set_talker(guest, speaking);
+            }
+            Some(ControlMessage::GamepadMode { slot, raw }) => {
+                core.guest_input.set_pad_mode(slot, raw);
+            }
+            Some(ControlMessage::GamepadOutput { slot, data }) => {
+                core.guest_input.push_pad_output(slot, data);
             }
             Some(ControlMessage::Bye) => break,
             _ => {}

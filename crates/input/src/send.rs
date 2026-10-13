@@ -12,6 +12,11 @@
 //!   las posiciones absolutas y los ejes se quedan con el último valor. Por encima de
 //!   [`MAX_EVENTS`] eventos, los movimientos relativos se suman al último.
 //!
+//! - **Mandos tal cual** ([`PadData`]): la declaración del mando ([`PadData::Device`]) sale por el
+//!   stream como lo de estado; los informes HID ([`PadData::Report`]) van con el movimiento, todos
+//!   en orden (un informe puede ser la única pulsación de un botón), hasta [`MAX_PADS`] o
+//!   [`MAX_PAD_DATAGRAM_BYTES`] por datagrama.
+//!
 //! Cada paquete lleva `sent_us`, la hora de su primer evento en el reloj del anfitrión
 //! ([`InputLink::remote_clock_us`]), para medir la latencia de entrada en el anfitrión. Se cifra con
 //! [`InputCipher`] (canal y secuencia propios de cada canal) y sale por el [`InputLink`] que da la
@@ -23,7 +28,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use coroom_crypto::input::{Channel, InputCipher};
-use coroom_proto::input::{InputMessage, InputPacket, MAX_EVENTS, datagram_header, stream_frame};
+use coroom_proto::input::{
+    InputMessage, InputPacket, MAX_EVENTS, MAX_PADS, PadData, datagram_header, stream_frame,
+};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use tracing::debug;
 
@@ -31,6 +38,16 @@ use crate::{InputError, InputEvent};
 
 /// Intervalo mínimo entre dos datagramas de movimiento.
 pub const BATCH_INTERVAL: Duration = Duration::from_millis(2);
+
+/// Bytes de informes de mando por datagrama, como mucho (con lo demás, por debajo del MTU).
+pub const MAX_PAD_DATAGRAM_BYTES: usize = 900;
+
+/// Lo que llega al hilo `entrada`.
+#[derive(Debug)]
+enum Item {
+    Event(InputEvent),
+    Pad(PadData),
+}
 
 /// Por dónde sale la entrada (lo implementa la sesión sobre su conexión).
 pub trait InputLink: Send + Sync {
@@ -89,10 +106,29 @@ impl SenderStats {
 #[derive(Debug, Default)]
 struct Batch {
     events: Vec<InputEvent>,
+    pads: Vec<PadData>,
+    pad_bytes: usize,
     first: Option<Instant>,
 }
 
 impl Batch {
+    fn is_empty(&self) -> bool {
+        self.events.is_empty() && self.pads.is_empty()
+    }
+
+    /// Si un informe más de `len` bytes ya no cabe en este datagrama.
+    fn pads_full(&self, len: usize) -> bool {
+        self.pads.len() >= MAX_PADS || self.pad_bytes + len > MAX_PAD_DATAGRAM_BYTES
+    }
+
+    fn push_pad(&mut self, pad: PadData, at: Instant) {
+        self.first.get_or_insert(at);
+        if let PadData::Report { data, .. } = &pad {
+            self.pad_bytes += data.len();
+        }
+        self.pads.push(pad);
+    }
+
     fn push(&mut self, event: InputEvent, at: Instant, stats: &SenderStats) {
         self.first.get_or_insert(at);
         match event {
@@ -151,12 +187,14 @@ impl Worker {
     }
 
     fn send_batch(&mut self, batch: &mut Batch) {
-        if batch.events.is_empty() {
+        if batch.is_empty() {
             return;
         }
         let events = std::mem::take(&mut batch.events);
+        let pads = std::mem::take(&mut batch.pads);
+        batch.pad_bytes = 0;
         let sent_us = self.sent_us(batch.first.take());
-        let count = events.len() as u64;
+        let count = (events.len() + pads.len()) as u64;
         let mut cipher = self.cipher.lock().unwrap_or_else(PoisonError::into_inner);
         let seq = cipher.next_seq(Channel::Datagram);
         let Ok(seq32) = u32::try_from(seq) else {
@@ -167,6 +205,7 @@ impl Worker {
             seq: seq32,
             sent_us,
             events,
+            pads,
         };
         let result = packet
             .to_bytes()
@@ -196,9 +235,9 @@ impl Worker {
         }
     }
 
-    fn send_message(&mut self, events: Vec<InputEvent>, at: Instant) {
+    fn send_message(&mut self, events: Vec<InputEvent>, pads: Vec<PadData>, at: Instant) {
         let sent_us = self.sent_us(Some(at));
-        let count = events.len() as u64;
+        let count = (events.len() + pads.len()) as u64;
         let mut cipher = self.cipher.lock().unwrap_or_else(PoisonError::into_inner);
         let seq = cipher.next_seq(Channel::Stream);
         let Ok(seq32) = u32::try_from(seq) else {
@@ -209,6 +248,7 @@ impl Worker {
             seq: seq32,
             sent_us,
             events,
+            pads,
         };
         let result = message
             .to_bytes()
@@ -237,13 +277,13 @@ impl Worker {
         }
     }
 
-    fn run(mut self, rx: &Receiver<(Instant, InputEvent)>) {
+    fn run(mut self, rx: &Receiver<(Instant, Item)>) {
         let mut batch = Batch::default();
         // Hace tiempo que no sale nada: el primer movimiento sale al momento.
         let mut last_batch: Option<Instant> = None;
         loop {
             let due = last_batch.map(|at| at + BATCH_INTERVAL);
-            let wait = if batch.events.is_empty() {
+            let wait = if batch.is_empty() {
                 Duration::from_millis(250)
             } else {
                 due.map_or(Duration::ZERO, |due| {
@@ -251,25 +291,46 @@ impl Worker {
                 })
             };
             match rx.recv_timeout(wait) {
-                Ok((at, event)) if event.is_continuous() => batch.push(event, at, &self.stats),
-                Ok((at, event)) => {
-                    // Lo de estado sale ya, con el movimiento anterior por delante.
-                    if !batch.events.is_empty() {
+                Ok((at, Item::Event(event))) if event.is_continuous() => {
+                    batch.push(event, at, &self.stats);
+                }
+                Ok((at, Item::Pad(pad @ PadData::Report { .. }))) => {
+                    let len = match &pad {
+                        PadData::Report { data, .. } => data.len(),
+                        PadData::Device { .. } => 0,
+                    };
+                    if batch.pads_full(len) {
                         last_batch = Some(Instant::now());
                         self.send_batch(&mut batch);
                     }
-                    let mut events = vec![event];
-                    while events.len() < MAX_EVENTS {
+                    batch.push_pad(pad, at);
+                }
+                Ok((at, item)) => {
+                    // Lo de estado sale ya, con el movimiento anterior por delante.
+                    if !batch.is_empty() {
+                        last_batch = Some(Instant::now());
+                        self.send_batch(&mut batch);
+                    }
+                    let (mut events, mut pads) = (Vec::new(), Vec::new());
+                    match item {
+                        Item::Event(event) => events.push(event),
+                        Item::Pad(pad) => pads.push(pad),
+                    }
+                    while events.len() < MAX_EVENTS && pads.len() < MAX_PADS {
                         match rx.try_recv() {
-                            Ok((at, event)) if event.is_continuous() => {
+                            Ok((at, Item::Event(event))) if event.is_continuous() => {
                                 batch.push(event, at, &self.stats);
                             }
-                            Ok((_, event)) => events.push(event),
+                            Ok((at, Item::Pad(pad @ PadData::Report { .. }))) => {
+                                batch.push_pad(pad, at);
+                            }
+                            Ok((_, Item::Event(event))) => events.push(event),
+                            Ok((_, Item::Pad(pad))) => pads.push(pad),
                             Err(_) => break,
                         }
                     }
-                    self.send_message(events, at);
-                    if !batch.events.is_empty() {
+                    self.send_message(events, pads, at);
+                    if !batch.is_empty() {
                         last_batch = Some(Instant::now());
                         self.send_batch(&mut batch);
                     }
@@ -282,7 +343,7 @@ impl Worker {
                 }
             }
             let now = Instant::now();
-            if !batch.events.is_empty() && due.is_none_or(|due| now >= due) {
+            if !batch.is_empty() && due.is_none_or(|due| now >= due) {
                 last_batch = Some(now);
                 self.send_batch(&mut batch);
             }
@@ -292,7 +353,7 @@ impl Worker {
 
 /// Emisor de la entrada de un invitado.
 pub struct InputSender {
-    tx: Option<Sender<(Instant, InputEvent)>>,
+    tx: Option<Sender<(Instant, Item)>>,
     stats: Arc<SenderStats>,
     thread: Option<JoinHandle<()>>,
 }
@@ -338,7 +399,15 @@ impl InputSender {
     /// Envía un evento que ocurrió en `at`.
     pub fn send_at(&self, event: InputEvent, at: Instant) {
         if let Some(tx) = &self.tx {
-            let _ = tx.send((at, event));
+            let _ = tx.send((at, Item::Event(event)));
+        }
+    }
+
+    /// Envía datos de un mando tal cual (la declaración por el stream, los informes por
+    /// datagrama).
+    pub fn send_pad(&self, pad: PadData) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send((Instant::now(), Item::Pad(pad)));
         }
     }
 

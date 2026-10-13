@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use coroom_session::input::gamepad::PadChoice;
 use serde::{Deserialize, Serialize};
 
 /// Nombre del fichero dentro del directorio de datos.
@@ -250,6 +251,8 @@ pub struct Shortcuts {
     pub mic: char,
     /// Silenciar el juego.
     pub game: char,
+    /// Panel de mandos.
+    pub pads: char,
 }
 
 impl Default for Shortcuts {
@@ -260,14 +263,22 @@ impl Default for Shortcuts {
             leave: 'Q',
             mic: 'M',
             game: 'V',
+            pads: 'J',
         }
     }
 }
 
 impl Shortcuts {
-    /// Las cinco letras, en orden.
-    pub fn letters(&self) -> [char; 5] {
-        [self.immersive, self.stats, self.leave, self.mic, self.game]
+    /// Las seis letras, en orden.
+    pub fn letters(&self) -> [char; 6] {
+        [
+            self.immersive,
+            self.stats,
+            self.leave,
+            self.mic,
+            self.game,
+            self.pads,
+        ]
     }
 
     /// Si no hay letras repetidas y todas son letras ASCII.
@@ -289,6 +300,8 @@ pub struct Input {
     pub shortcuts: Shortcuts,
     /// Ranura de mando que se ofrece primero al dar mando a un invitado (`0`: la primera libre).
     pub preferred_slot: u8,
+    /// Qué mando envía este equipo como invitado.
+    pub pad: PadChoice,
 }
 
 /// Red.

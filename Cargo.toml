@@ -145,7 +145,7 @@ reis = { version = "=0.7.1", default-features = false }
 evdev = { version = "=0.13.2", default-features = false }
 gilrs = { version = "=0.11.2", default-features = false, features = ["wgi"] }
 # `CLOCK_MONOTONIC` para las marcas de tiempo de EI (la misma versión que usa `reis`).
-rustix = { version = "=1.1.5", default-features = false, features = ["std", "time"] }
+rustix = { version = "=1.1.5", default-features = false, features = ["std", "time", "event"] }
 
 # Audio. `opusic-c` (libopus 1.6.1 incluida y compilada con CMake, sin bindgen; DRED con
 # sus pesos dentro del código fuente, sin descargas), `webrtc-audio-processing` (tonarino, módulo de

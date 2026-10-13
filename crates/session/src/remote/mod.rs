@@ -519,6 +519,36 @@ pub struct GuestStatus {
     pub input_key: bool,
     /// Latencia de su entrada y eventos aplicados y descartados.
     pub input: InputLatency,
+    /// El mando físico que declaró para su ranura, si lo hay.
+    pub gamepad: Option<GuestPad>,
+}
+
+/// Cómo puede llegar el mando físico de un invitado.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PadTransport {
+    /// HID: tal cual, con su descriptor.
+    Hid,
+    /// XInput (Xbox por cable): con su identidad.
+    XInput,
+    /// Solo convertido, por lo que dijo el invitado.
+    Converted,
+}
+
+/// El mando físico de un invitado y cómo va.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestPad {
+    /// Nombre que da el mando.
+    pub name: String,
+    /// Fabricante.
+    pub vendor: u16,
+    /// Producto.
+    pub product: u16,
+    /// Cómo puede llegar.
+    pub transport: PadTransport,
+    /// Si va tal cual ahora (si no, convertido a Xbox 360).
+    pub raw: bool,
+    /// Por qué no va tal cual, si se pidió y no se pudo.
+    pub note: Option<String>,
 }
 
 /// Órdenes de la interfaz a la tarea de red.
@@ -529,6 +559,18 @@ pub(crate) enum Command {
     Invite(u64),
     /// Avisar al invitado de sus permisos nuevos (`InputPermissions`).
     PermissionsChanged(GuestId),
+    /// Avisar al invitado de si su mando va tal cual (`GamepadMode`).
+    GamepadMode {
+        guest: GuestId,
+        slot: u8,
+        raw: bool,
+    },
+    /// Informe de salida para el mando tal cual del invitado (`GamepadOutput`).
+    GamepadOutput {
+        guest: GuestId,
+        slot: u8,
+        data: Vec<u8>,
+    },
     /// Invitado: volver a entrar en la sala ya.
     Reconnect,
     Close,
@@ -588,6 +630,8 @@ pub(crate) struct Core {
     pub(crate) reconnect_attempts: AtomicU32,
     /// Paquetes de audio hacia `audio-play`, si hay reproducción.
     pub(crate) audio_tx: Mutex<Option<channel::Sender<audio::Packet>>>,
+    /// Órdenes a la tarea de red (para el hilo `inject`: modo y salida de los mandos tal cual).
+    pub(crate) commands: Mutex<Option<mpsc::UnboundedSender<Command>>>,
 }
 
 /// Cerrojo que sobrevive a un pánico de otro hilo (el estado se sustituye entero).
@@ -622,6 +666,7 @@ impl Core {
             clock_origin: Instant::now(),
             audio: AudioControl::default(),
             audio_tx: Mutex::new(None),
+            commands: Mutex::new(None),
             joined_once: AtomicBool::new(false),
             reconnect_attempts: AtomicU32::new(0),
         }
@@ -1161,6 +1206,7 @@ impl Session for RemoteSession {
             Ok(started) => {
                 self.main = Some(started.main);
                 self.threads = started.threads;
+                *lock(&self.core.commands) = Some(commands.clone());
                 self.commands = Some(commands);
                 self.runtime = Some(runtime);
                 Ok(())

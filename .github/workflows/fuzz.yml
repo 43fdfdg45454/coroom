@@ -36,6 +36,7 @@ jobs:
           - proto_media
           - proto_audio
           - proto_input
+          - proto_hid
           - proto_control
           - proto_signal
           - proto_api

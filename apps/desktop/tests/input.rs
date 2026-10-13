@@ -21,11 +21,13 @@ use common::TestServer;
 use coroom_desktop::remote::play_script;
 use coroom_session::capture::synthetic::SyntheticCapturer;
 use coroom_session::codec::{DecoderSet, EncoderSet};
+use coroom_session::input::gamepad::PadLink;
 use coroom_session::input::script::{InputScript, Step};
 use coroom_session::input::{GamepadAxis, GamepadButton, InputEvent, Recorded, RecordingSink};
 use coroom_session::latency::{InputLatency, LatencyLedger};
 use coroom_session::loopback::{LoopbackConfig, NullSink};
-use coroom_session::remote::{GuestStatus, RemoteSession};
+use coroom_session::remote::{GuestStatus, PadTransport, RemoteSession};
+use coroom_session::transport::proto::input::{GamepadDevice, GamepadTransport, PadData};
 use coroom_session::{GuestId, Permissions, Session, SessionError, SessionState};
 
 const LIMIT: Duration = Duration::from_secs(30);
@@ -526,6 +528,7 @@ fn e_kicking_releases_everything_and_frees_the_slot() {
             keyboard_mouse: true,
             gamepad_slot: Some(2),
             voice: false,
+            gamepad_raw: true,
         },
     );
     guest.input().send(InputEvent::GamepadButton {
@@ -698,6 +701,106 @@ fn g_input_through_the_relay_arrives_complete() {
         .collect();
     assert_eq!(moves, (1..=1000).collect::<Vec<_>>());
     print_latency("(g) relay", &status(&host, id).input);
+    guest.close();
+    host.close();
+    drop(server);
+}
+
+/// Un mando HID sencillo: 8 botones y dos ejes, informe 1.
+const PAD_DESCRIPTOR: &[u8] = &[
+    0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x85, 0x01, 0x05, 0x09, 0x19, 0x01, 0x29, 0x08, 0x15, 0x00,
+    0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x00,
+    0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02, 0xc0,
+];
+
+/// El mismo mando con un teclado de arranque en el mismo descriptor.
+fn pad_with_keyboard() -> Vec<u8> {
+    let mut descriptor = PAD_DESCRIPTOR.to_vec();
+    descriptor.extend_from_slice(&[
+        0x05, 0x01, 0x09, 0x06, 0xa1, 0x01, 0x85, 0x02, 0x05, 0x07, 0x19, 0xe0, 0x29, 0xe7, 0x15,
+        0x00, 0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0xc0,
+    ]);
+    descriptor
+}
+
+fn hid_pad(slot: u8, descriptor: Vec<u8>) -> PadData {
+    PadData::Device {
+        slot,
+        device: GamepadDevice {
+            name: "Mando de prueba".to_owned(),
+            vendor: 0x1234,
+            product: 0x5678,
+            version: 0x0100,
+            bus: 3,
+            transport: GamepadTransport::Hid {
+                descriptor,
+                features: Vec::new(),
+            },
+        },
+    }
+}
+
+#[test]
+fn h_a_raw_gamepad_follows_the_host_choice() {
+    let _serial = serial();
+    let server = TestServer::start();
+    let sink = RecordingSink::new();
+    let mut host = host(&server, &sink);
+    let code = room_code(&host);
+    let mut guest = guest(&server, &code);
+    let id = connected(&host, &guest, 0);
+    let pad = Permissions {
+        gamepad_slot: Some(2),
+        ..Permissions::VIEW_ONLY
+    };
+    allow(&mut host, &guest, id, pad);
+    wait_until("la ranura 2", LIMIT, || sink.assigned_slots() == vec![2]);
+
+    // Tal cual: el anfitrión recrea el mando y se lo dice al invitado.
+    let input = guest.input();
+    input.send_pad(hid_pad(2, PAD_DESCRIPTOR.to_vec()));
+    wait_until("el mando tal cual", LIMIT, || {
+        sink.raw_slots() == vec![2] && input.raw(2)
+    });
+    let shown = status(&host, id).gamepad.expect("el mando del invitado");
+    assert_eq!((shown.vendor, shown.product), (0x1234, 0x5678));
+    assert_eq!(shown.transport, PadTransport::Hid);
+    assert!(shown.raw && shown.note.is_none(), "{shown:?}");
+    input.send_pad(PadData::Report {
+        slot: 2,
+        data: vec![1, 0x05, 0x80, 0x7f],
+    });
+    wait_until("el informe", LIMIT, || {
+        sink.log()
+            .contains(&Recorded::RawReport { slot: 2, len: 4 })
+    });
+
+    // Convertido: se quita el mando tal cual y vuelve el de Xbox 360.
+    allow(
+        &mut host,
+        &guest,
+        id,
+        Permissions {
+            gamepad_raw: false,
+            ..pad
+        },
+    );
+    wait_until("el convertido", LIMIT, || {
+        sink.raw_slots().is_empty() && !input.raw(2)
+    });
+    assert!(sink.log().contains(&Recorded::RawDisconnected { slot: 2 }));
+
+    // Un descriptor que también declara teclado no va tal cual sin permiso de teclado.
+    input.send_pad(hid_pad(2, pad_with_keyboard()));
+    allow(&mut host, &guest, id, pad);
+    wait_until("el motivo", LIMIT, || {
+        status(&host, id)
+            .gamepad
+            .and_then(|shown| shown.note)
+            .is_some_and(|note| note.contains("teclado"))
+    });
+    assert!(sink.raw_slots().is_empty());
+    assert!(!input.raw(2));
     guest.close();
     host.close();
     drop(server);

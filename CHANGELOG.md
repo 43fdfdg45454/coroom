@@ -9,6 +9,17 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Añadido
 
+- **Mandos tal cual** (protocolo 8). Con anfitrión Linux, el mando del invitado llega con su
+  VID/PID, su nombre y su descriptor HID (UHID), y sus informes sin traducir: Steam, SDL y los
+  juegos lo ven como ese mando, con sus botones extra, y la vibración y las luces vuelven al
+  invitado. Un mando de Xbox por cable llega con su identidad. El anfitrión elige por invitado
+  «Tal cual» (por defecto) o «Convertido a Xbox 360» y ve qué mando tiene cada uno; si no se puede
+  tal cual, va convertido y se dice por qué. Consola: `allow N raw` / `deny N raw`.
+- El invitado elige qué mando envía (panel de mandos, `Ctrl+Alt+J`): automático (el último que
+  conecte) o uno concreto, que se recuerda. Conectar y desconectar mandos en plena sesión se
+  avisa y se sigue al momento.
+- Objetivo de fuzzing `proto_hid` para el parser de descriptores HID.
+
 - Compartir tiene dos modos. **Transmitir pantalla**: un monitor, con el audio de todas las
   aplicaciones salvo las que quites (se recuerdan). **Transmitir una app**: una ventana, con el
   audio solo de esa aplicación. La lista de audio es igual en Linux y en Windows y coroom nunca se
@@ -22,6 +33,9 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
   pantalla muestra lo elegido y al empezar se repite sin volver a preguntar.
 
 ### Corregido
+
+- 8BitDo Ultimate 2 en Linux: el stick derecho se leía como gatillos (faltaba su mapeo de SDL).
+- Flatpak: `--device=all` en lugar de `--device=input`, que no daba `/dev/hidraw*` ni `/dev/uhid`.
 
 - Audio: en la 1.1.3, tras un parón de la red, el audio podía sonar 30-70 ms tarde durante
   varios segundos (la cola solo se recortaba una trama por segundo). Ahora, si sobran dos tramas o

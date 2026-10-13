@@ -27,7 +27,7 @@
 //! Steam Input y los juegos lo reconocen. Sin *force feedback*. Si `/dev/uinput` no es accesible,
 //! el error explica la regla udev ([`UINPUT_HELP`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
@@ -40,9 +40,11 @@ use reis::ei;
 use reis::event::{DeviceCapability, EiEvent};
 use tracing::{debug, warn};
 
+use super::uhid::UhidPad;
 use super::{EisConnection, EisProvider, InputSink, PadTracker, PointerArea, PressedKeys};
 use crate::keymap::evdev as codes;
 use crate::{GamepadAxis, GamepadButton, GuestId, InputError, InputEvent, MouseButton};
+use coroom_proto::input::{GamepadDevice, GamepadTransport};
 
 /// Qué hacer si `/dev/uinput` no es accesible.
 pub const UINPUT_HELP: &str = "no se puede abrir /dev/uinput para crear el mando virtual. Instala \
@@ -580,8 +582,39 @@ fn uinput_error(err: std::io::Error) -> InputError {
     }
 }
 
+/// Identidad de un mando uinput: nombre, VID, PID y versión.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PadIdentity {
+    /// Nombre.
+    pub name: String,
+    /// Fabricante.
+    pub vendor: u16,
+    /// Producto.
+    pub product: u16,
+    /// Versión.
+    pub version: u16,
+}
+
+impl PadIdentity {
+    /// La de siempre: «coroom Gamepad N» con el VID/PID del mando de Xbox 360.
+    pub fn converted(slot: u8) -> Self {
+        Self {
+            name: format!("coroom Gamepad {slot}"),
+            vendor: GAMEPAD_VENDOR,
+            product: GAMEPAD_PRODUCT,
+            version: 0x0110,
+        }
+    }
+}
+
 /// Crea el dispositivo uinput de la ranura `slot`.
 pub fn create_gamepad(slot: u8) -> Result<VirtualDevice, InputError> {
+    create_gamepad_as(&PadIdentity::converted(slot))
+}
+
+/// Crea un dispositivo uinput con la disposición de `xpad` y la identidad `identity` (la del
+/// mando XInput de un invitado, tal cual).
+pub fn create_gamepad_as(identity: &PadIdentity) -> Result<VirtualDevice, InputError> {
     let mut keys = AttributeSet::<KeyCode>::new();
     for key in [
         KeyCode::BTN_SOUTH,
@@ -601,15 +634,14 @@ pub fn create_gamepad(slot: u8) -> Result<VirtualDevice, InputError> {
     let stick = AbsInfo::new(0, -32768, 32767, 16, 128, 0);
     let trigger = AbsInfo::new(0, 0, 255, 0, 0, 0);
     let hat = AbsInfo::new(0, -1, 1, 0, 0, 0);
-    let name = format!("coroom Gamepad {slot}");
     let mut builder = VirtualDevice::builder()
         .map_err(uinput_error)?
-        .name(&name)
+        .name(&identity.name)
         .input_id(InputId::new(
             BusType::BUS_USB,
-            GAMEPAD_VENDOR,
-            GAMEPAD_PRODUCT,
-            0x0110,
+            identity.vendor,
+            identity.product,
+            identity.version,
         ))
         .with_keys(&keys)
         .map_err(uinput_error)?;
@@ -728,10 +760,15 @@ impl VirtualPad {
 
 // --- Sumidero ---------------------------------------------------------------------------------
 
-/// Sumidero de Linux: libei para teclado y ratón, uinput para los mandos.
+/// Sumidero de Linux: libei para teclado y ratón, uinput para los mandos y UHID para los mandos
+/// HID tal cual.
 pub struct LinuxSink {
     ei: EiBackend,
     pads: BTreeMap<u8, VirtualPad>,
+    /// Mandos HID tal cual (en su ranura no hay `VirtualPad`).
+    raw: BTreeMap<u8, UhidPad>,
+    /// Ranuras con un `VirtualPad` que lleva la identidad del mando XInput del invitado.
+    xinput: BTreeSet<u8>,
     pressed: PressedKeys,
     pad_state: PadTracker,
 }
@@ -742,6 +779,8 @@ impl LinuxSink {
         Self {
             ei: EiBackend::Idle(eis),
             pads: BTreeMap::new(),
+            raw: BTreeMap::new(),
+            xinput: BTreeSet::new(),
             pressed: PressedKeys::default(),
             pad_state: PadTracker::default(),
         }
@@ -777,9 +816,21 @@ impl InputSink for LinuxSink {
             InputEvent::MouseMove { dx, dy } => self.ei.ready()?.motion(dx, dy),
             InputEvent::MouseMoveAbsolute { x, y } => self.ei.ready()?.absolute(x, y),
             InputEvent::Wheel { dx, dy } => self.ei.ready()?.wheel(dx, dy),
+            // Con el mando tal cual, lo convertido que quede en vuelo no tiene adónde ir.
+            InputEvent::GamepadButton { slot, .. } | InputEvent::GamepadAxis { slot, .. }
+                if self.raw.contains_key(&slot) =>
+            {
+                Ok(())
+            }
             InputEvent::GamepadButton { slot, .. } | InputEvent::GamepadAxis { slot, .. } => {
                 self.pad(slot)?.emit(event)?;
                 self.pad_state.note(guest, event);
+                Ok(())
+            }
+            InputEvent::GamepadConnected { slot, .. }
+            | InputEvent::GamepadDisconnected { slot }
+                if self.raw.contains_key(&slot) =>
+            {
                 Ok(())
             }
             InputEvent::GamepadConnected { slot, .. } => self.pad(slot).map(|_| ()),
@@ -834,10 +885,82 @@ impl InputSink for LinuxSink {
 
     fn release_gamepad(&mut self, slot: u8) -> Result<(), InputError> {
         self.pad_state.forget(slot);
-        self.pads
-            .remove(&slot)
-            .map(|_| ())
-            .ok_or(InputError::NoSuchSlot(slot))
+        self.xinput.remove(&slot);
+        let raw = self.raw.remove(&slot).is_some();
+        match self.pads.remove(&slot) {
+            Some(_) => Ok(()),
+            None if raw => Ok(()),
+            None => Err(InputError::NoSuchSlot(slot)),
+        }
+    }
+
+    fn connect_raw(&mut self, slot: u8, device: &GamepadDevice) -> Result<(), InputError> {
+        if !self.pads.contains_key(&slot) && !self.raw.contains_key(&slot) {
+            return Err(InputError::NoSuchSlot(slot));
+        }
+        match &device.transport {
+            GamepadTransport::Hid { .. } => {
+                let pad = UhidPad::create(slot, device)?;
+                // El convertido se quita solo cuando el tal cual ya existe.
+                self.pad_state.forget(slot);
+                self.pads.remove(&slot);
+                self.xinput.remove(&slot);
+                self.raw.insert(slot, pad);
+                Ok(())
+            }
+            GamepadTransport::XInput => {
+                let identity = PadIdentity {
+                    name: device.name.clone(),
+                    vendor: device.vendor,
+                    product: device.product,
+                    version: device.version,
+                };
+                let created = create_gamepad_as(&identity)?;
+                self.pad_state.forget(slot);
+                self.raw.remove(&slot);
+                self.pads.insert(
+                    slot,
+                    VirtualPad {
+                        device: created,
+                        dpad: [false; 4],
+                    },
+                );
+                self.xinput.insert(slot);
+                Ok(())
+            }
+            GamepadTransport::Converted { reason } => Err(InputError::Unsupported(reason.clone())),
+        }
+    }
+
+    fn raw_report(&mut self, slot: u8, data: &[u8]) -> Result<(), InputError> {
+        self.raw
+            .get_mut(&slot)
+            .ok_or(InputError::NoSuchSlot(slot))?
+            .input(data)
+    }
+
+    fn disconnect_raw(&mut self, slot: u8) -> Result<(), InputError> {
+        let was_raw = self.raw.remove(&slot).is_some();
+        let was_xinput = self.xinput.remove(&slot);
+        if was_raw || was_xinput {
+            self.pad_state.forget(slot);
+            let device = create_gamepad(slot)?;
+            self.pads.insert(
+                slot,
+                VirtualPad {
+                    device,
+                    dpad: [false; 4],
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn take_outputs(&mut self) -> Vec<(u8, Vec<u8>)> {
+        self.raw
+            .iter()
+            .flat_map(|(slot, pad)| pad.take_outputs().into_iter().map(|data| (*slot, data)))
+            .collect()
     }
 
     fn prepare(&mut self) {
@@ -845,7 +968,7 @@ impl InputSink for LinuxSink {
     }
 
     fn describe(&self) -> String {
-        "libei (portal RemoteDesktop) y uinput".to_owned()
+        "libei (portal RemoteDesktop), uinput y UHID".to_owned()
     }
 }
 

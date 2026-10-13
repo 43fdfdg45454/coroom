@@ -261,6 +261,8 @@ pub enum Grant {
     KeyboardMouse,
     /// Mando en esa ranura.
     Pad(u8),
+    /// El mando tal cual (si no, convertido a Xbox 360).
+    Raw,
     /// Voz.
     Voice,
 }
@@ -272,6 +274,8 @@ pub enum Revoke {
     KeyboardMouse,
     /// El mando.
     Pad,
+    /// El mando tal cual: pasa a convertido.
+    Raw,
     /// Voz.
     Voice,
 }
@@ -304,8 +308,10 @@ pub const CONSOLE_HELP: &str = "Órdenes (escribe una y pulsa Intro):
   list                     invitados, permisos y latencia de su entrada
   allow N kbm              teclado y ratón para el invitado N
   allow N pad RANURA       mando en esa ranura (de 1 a COROOM_MAX_GAMEPADS, 4 por defecto)
+  allow N raw              su mando tal cual, con su VID/PID y su descriptor (por defecto)
   allow N voice            voz: habla y oye a la sala (sin ella no recibe ninguna voz)
   deny N kbm|pad|voice     quitar ese permiso
+  deny N raw               su mando, convertido a Xbox 360
   pause / resume           pausar o reanudar la entrada de todos (en pausa se suelta todo)
   kick N                   expulsar al invitado N (rota las claves de la sala)
   invite NOMBRE            invitar a un amigo conectado a la sala
@@ -342,6 +348,7 @@ pub fn parse_console(line: &str) -> Result<Option<ConsoleCommand>, String> {
             let grant = match words.next() {
                 Some("kbm") => Grant::KeyboardMouse,
                 Some("voice") => Grant::Voice,
+                Some("raw") => Grant::Raw,
                 Some("pad") => {
                     let slot = words
                         .next()
@@ -351,8 +358,10 @@ pub fn parse_console(line: &str) -> Result<Option<ConsoleCommand>, String> {
                             .map_err(|_| format!("«{slot}» no es una ranura de mando"))?,
                     )
                 }
-                Some(other) => return Err(format!("no sé conceder «{other}» (kbm, pad o voice)")),
-                None => return Err("falta qué conceder: kbm, pad RANURA o voice".to_owned()),
+                Some(other) => {
+                    return Err(format!("no sé conceder «{other}» (kbm, pad, raw o voice)"));
+                }
+                None => return Err("falta qué conceder: kbm, pad RANURA, raw o voice".to_owned()),
             };
             ConsoleCommand::Allow(guest, grant)
         }
@@ -362,8 +371,11 @@ pub fn parse_console(line: &str) -> Result<Option<ConsoleCommand>, String> {
                 Some("kbm") => Revoke::KeyboardMouse,
                 Some("pad") => Revoke::Pad,
                 Some("voice") => Revoke::Voice,
-                Some(other) => return Err(format!("no sé quitar «{other}» (kbm, pad o voice)")),
-                None => return Err("falta qué quitar: kbm, pad o voice".to_owned()),
+                Some("raw") => Revoke::Raw,
+                Some(other) => {
+                    return Err(format!("no sé quitar «{other}» (kbm, pad, raw o voice)"));
+                }
+                None => return Err("falta qué quitar: kbm, pad, raw o voice".to_owned()),
             };
             ConsoleCommand::Deny(guest, revoke)
         }
@@ -397,8 +409,19 @@ pub fn describe_guest(status: &GuestStatus) -> String {
     } else {
         String::new()
     };
+    let pad = status.gamepad.as_ref().map_or_else(String::new, |pad| {
+        let mode = match (&pad.note, pad.raw) {
+            (_, true) => "tal cual".to_owned(),
+            (Some(note), false) => format!("convertido: {note}"),
+            (None, false) => "convertido".to_owned(),
+        };
+        format!(
+            " · mando {} ({:04x}:{:04x}, {mode})",
+            pad.name, pad.vendor, pad.product
+        )
+    });
     format!(
-        "Invitado {} ({}) · {path}{rtt} · {} · {} eventos aplicados, {} descartados{latency}{}",
+        "Invitado {} ({}) · {path}{rtt} · {}{pad} · {} eventos aplicados, {} descartados{latency}{}",
         status.guest.0,
         status.name,
         permissions_label(&status.permissions),
@@ -479,6 +502,7 @@ pub fn apply_console(
             match grant {
                 Grant::KeyboardMouse => permissions.keyboard_mouse = true,
                 Grant::Pad(slot) => permissions.gamepad_slot = Some(slot),
+                Grant::Raw => permissions.gamepad_raw = true,
                 Grant::Voice => permissions.voice = true,
             }
             set(session, guest, permissions)
@@ -488,6 +512,7 @@ pub fn apply_console(
             match revoke {
                 Revoke::KeyboardMouse => permissions.keyboard_mouse = false,
                 Revoke::Pad => permissions.gamepad_slot = None,
+                Revoke::Raw => permissions.gamepad_raw = false,
                 Revoke::Voice => permissions.voice = false,
             }
             set(session, guest, permissions)
@@ -1235,6 +1260,14 @@ mod tests {
             Ok(Some(ConsoleCommand::Deny(3, Revoke::Pad)))
         );
         assert_eq!(
+            parse_console("deny 3 raw"),
+            Ok(Some(ConsoleCommand::Deny(3, Revoke::Raw)))
+        );
+        assert_eq!(
+            parse_console("allow 3 raw"),
+            Ok(Some(ConsoleCommand::Allow(3, Grant::Raw)))
+        );
+        assert_eq!(
             parse_console("  kick 7 "),
             Ok(Some(ConsoleCommand::Kick(7)))
         );
@@ -1244,7 +1277,7 @@ mod tests {
         let err = |line: &str| parse_console(line).expect_err(line);
         assert!(err("allow tres kbm").contains("no es un número"));
         assert!(err("allow 3 pad").contains("ranura"));
-        assert!(err("allow 3 volar").contains("kbm, pad o voice"));
+        assert!(err("allow 3 volar").contains("kbm, pad, raw o voice"));
         assert!(err("bailar").contains("help"));
         assert!(err("kick 1 2").contains("sobra"));
         assert!(err("kick").contains("falta"));

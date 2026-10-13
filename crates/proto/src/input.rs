@@ -26,6 +26,11 @@
 //! rueda en 1/120 de muesca (positivo = hacia arriba y a la derecha, como `WHEEL_DELTA`).
 //! **Mandos**: vocabulario de un mando Xbox; ejes de los sticks en `i16` con positivo = derecha y
 //! arriba, gatillos en `0..=i16::MAX`. Las ranuras se numeran desde 1.
+//!
+//! **Mandos tal cual** ([`PadData`]): el invitado declara su mando físico ([`GamepadDevice`]: nombre,
+//! VID/PID y, si es HID, su descriptor y sus informes de característica) por el stream, y manda
+//! cada informe de entrada HID sin tocar ([`PadData::Report`]) por datagrama. Van en el campo
+//! `pads` de los paquetes y mensajes, aparte de los eventos.
 
 use std::fmt;
 
@@ -56,6 +61,18 @@ pub const MAX_GAMEPAD_SLOTS: u8 = 8;
 
 /// Una muesca de la rueda, en las unidades de [`InputEvent::Wheel`].
 pub const WHEEL_NOTCH: i32 = 120;
+
+/// Datos de mandos tal cual por paquete o mensaje, como mucho.
+pub const MAX_PADS: usize = 16;
+
+/// Caracteres del nombre de un mando, como mucho.
+pub const MAX_PAD_NAME: usize = 128;
+
+/// Informes de característica de un mando, como mucho.
+pub const MAX_FEATURES: usize = 32;
+
+/// Bytes de todos los informes de característica de un mando, como mucho.
+pub const MAX_FEATURE_BYTES: usize = 8 * 1024;
 
 /// Botón del ratón.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -252,6 +269,121 @@ pub enum InputEvent {
     ReleaseAll,
 }
 
+/// Cómo llega el mando físico de un invitado.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GamepadTransport {
+    /// HID: el anfitrión crea un dispositivo con este descriptor y le pasa los informes tal cual
+    /// ([`PadData::Report`]). `features` son los informes de característica que el invitado leyó
+    /// del mando al conectarlo (identificador y bytes, el identificador incluido si lo hay), para
+    /// contestar al driver del anfitrión cuando los pida.
+    Hid {
+        /// Descriptor de informes ([`crate::hid`]).
+        descriptor: Vec<u8>,
+        /// Informes de característica.
+        features: Vec<(u8, Vec<u8>)>,
+    },
+    /// XInput (un Xbox por cable): los eventos de siempre, del vocabulario de Xbox, con la
+    /// identidad (nombre y VID/PID) del mando.
+    XInput,
+    /// No se puede mandar tal cual (el invitado no puede leerlo en crudo, por ejemplo): va
+    /// convertido. El motivo es para el anfitrión.
+    Converted {
+        /// Por qué, en español.
+        reason: String,
+    },
+}
+
+/// El mando físico de un invitado.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GamepadDevice {
+    /// Nombre que da el mando.
+    pub name: String,
+    /// Fabricante (VID).
+    pub vendor: u16,
+    /// Producto (PID).
+    pub product: u16,
+    /// Versión.
+    pub version: u16,
+    /// Bus por el que va (`BUS_USB` = 3, `BUS_BLUETOOTH` = 5, como en Linux): algunos drivers
+    /// esperan informes distintos por USB y por Bluetooth.
+    pub bus: u16,
+    /// Cómo llega.
+    pub transport: GamepadTransport,
+}
+
+/// Datos de un mando tal cual.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PadData {
+    /// Stream: el mando físico de la ranura (al conectarlo o al cambiar de ranura).
+    Device {
+        /// Ranura.
+        slot: u8,
+        /// El mando.
+        device: GamepadDevice,
+    },
+    /// Datagrama: un informe de entrada HID tal cual, con su identificador si el descriptor los
+    /// usa.
+    Report {
+        /// Ranura.
+        slot: u8,
+        /// Bytes del informe.
+        data: Vec<u8>,
+    },
+}
+
+impl PadData {
+    /// Ranura.
+    pub const fn slot(&self) -> u8 {
+        match self {
+            PadData::Device { slot, .. } | PadData::Report { slot, .. } => *slot,
+        }
+    }
+
+    /// Comprueba los límites ([`MAX_PAD_NAME`], [`crate::hid::MAX_DESCRIPTOR`],
+    /// [`MAX_FEATURES`], [`MAX_FEATURE_BYTES`], [`crate::hid::MAX_REPORT_BYTES`]).
+    pub fn check(&self) -> Result<(), InputWireError> {
+        let bad = |what: &str| Err(InputWireError::Pad(what.to_owned()));
+        match self {
+            PadData::Report { data, .. } => {
+                if data.is_empty() || data.len() > crate::hid::MAX_REPORT_BYTES {
+                    return bad("informe de mando vacío o demasiado grande");
+                }
+            }
+            PadData::Device { device, .. } => {
+                if device.name.chars().count() > MAX_PAD_NAME {
+                    return bad("nombre de mando demasiado largo");
+                }
+                match &device.transport {
+                    GamepadTransport::Hid {
+                        descriptor,
+                        features,
+                    } => {
+                        if descriptor.is_empty() || descriptor.len() > crate::hid::MAX_DESCRIPTOR {
+                            return bad("descriptor de mando vacío o demasiado grande");
+                        }
+                        let total: usize = features.iter().map(|(_, data)| data.len()).sum();
+                        if features.len() > MAX_FEATURES
+                            || total > MAX_FEATURE_BYTES
+                            || features
+                                .iter()
+                                .any(|(_, data)| data.len() > crate::hid::MAX_REPORT_BYTES)
+                        {
+                            return bad("demasiados informes de característica");
+                        }
+                    }
+                    GamepadTransport::Converted { reason } => {
+                        if reason.chars().count() > 256 {
+                            return bad("motivo demasiado largo");
+                        }
+                    }
+                    GamepadTransport::XInput => {}
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Qué permiso necesita un evento.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventClass {
@@ -304,6 +436,8 @@ pub enum InputWireError {
     BadFrameLength(usize),
     /// Más de [`MAX_EVENTS`] eventos.
     TooManyEvents(usize),
+    /// Datos de mando tal cual fuera de sus límites ([`PadData::check`]) o más de [`MAX_PADS`].
+    Pad(String),
     /// El cuerpo no es un `postcard` válido.
     Postcard(String),
 }
@@ -323,6 +457,7 @@ impl fmt::Display for InputWireError {
                 f,
                 "{count} eventos en un mensaje de entrada (como mucho {MAX_EVENTS})"
             ),
+            InputWireError::Pad(what) => write!(f, "mando tal cual: {what}"),
             InputWireError::Postcard(err) => write!(f, "mensaje de entrada no válido: {err}"),
         }
     }
@@ -356,6 +491,8 @@ pub struct InputPacket {
     pub sent_us: u32,
     /// Eventos, en orden.
     pub events: Vec<InputEvent>,
+    /// Informes de mandos tal cual ([`PadData::Report`]).
+    pub pads: Vec<PadData>,
 }
 
 /// Mensaje de cambios de estado (stream fiable).
@@ -367,6 +504,18 @@ pub struct InputMessage {
     pub sent_us: u32,
     /// Eventos, en orden.
     pub events: Vec<InputEvent>,
+    /// Mandos tal cual que se conectan ([`PadData::Device`]).
+    pub pads: Vec<PadData>,
+}
+
+fn check_pads(pads: &[PadData]) -> Result<(), InputWireError> {
+    if pads.len() > MAX_PADS {
+        return Err(InputWireError::Pad(format!(
+            "{} datos de mando en un mensaje (como mucho {MAX_PADS})",
+            pads.len()
+        )));
+    }
+    pads.iter().try_for_each(PadData::check)
 }
 
 macro_rules! impl_bytes {
@@ -377,6 +526,7 @@ macro_rules! impl_bytes {
                 if self.events.len() > MAX_EVENTS {
                     return Err(InputWireError::TooManyEvents(self.events.len()));
                 }
+                check_pads(&self.pads)?;
                 encode(self)
             }
 
@@ -386,6 +536,7 @@ macro_rules! impl_bytes {
                 if value.events.len() > MAX_EVENTS {
                     return Err(InputWireError::TooManyEvents(value.events.len()));
                 }
+                check_pads(&value.pads)?;
                 Ok(value)
             }
         }
@@ -552,17 +703,55 @@ mod tests {
         prop::collection::vec(event(), 0..=MAX_EVENTS)
     }
 
+    fn pad() -> impl Strategy<Value = PadData> {
+        let bytes = |max: usize| prop::collection::vec(any::<u8>(), 1..max);
+        let transport = prop_oneof![
+            (
+                bytes(300),
+                prop::collection::vec((any::<u8>(), bytes(80)), 0..4)
+            )
+                .prop_map(|(descriptor, features)| GamepadTransport::Hid {
+                    descriptor,
+                    features
+                }),
+            Just(GamepadTransport::XInput),
+            "[a-z ]{0,40}".prop_map(|reason| GamepadTransport::Converted { reason }),
+        ];
+        prop_oneof![
+            (slot(), bytes(80)).prop_map(|(slot, data)| PadData::Report { slot, data }),
+            (slot(), "[A-Za-z0-9 ]{0,60}", any::<[u16; 4]>(), transport).prop_map(
+                |(slot, name, [vendor, product, version, bus], transport)| {
+                    PadData::Device {
+                        slot,
+                        device: GamepadDevice {
+                            name,
+                            vendor,
+                            product,
+                            version,
+                            bus,
+                            transport,
+                        },
+                    }
+                }
+            ),
+        ]
+    }
+
+    fn pads() -> impl Strategy<Value = Vec<PadData>> {
+        prop::collection::vec(pad(), 0..4)
+    }
+
     proptest! {
         #[test]
-        fn packets_round_trip(seq in any::<u32>(), sent_us in any::<u32>(), events in events()) {
-            let packet = InputPacket { seq, sent_us, events };
+        fn packets_round_trip(seq in any::<u32>(), sent_us in any::<u32>(), events in events(), pads in pads()) {
+            let packet = InputPacket { seq, sent_us, events, pads };
             let bytes = packet.to_bytes().expect("serializar");
             prop_assert_eq!(InputPacket::from_bytes(&bytes), Ok(packet));
         }
 
         #[test]
-        fn messages_round_trip(seq in any::<u32>(), sent_us in any::<u32>(), events in events()) {
-            let message = InputMessage { seq, sent_us, events };
+        fn messages_round_trip(seq in any::<u32>(), sent_us in any::<u32>(), events in events(), pads in pads()) {
+            let message = InputMessage { seq, sent_us, events, pads };
             let bytes = message.to_bytes().expect("serializar");
             prop_assert_eq!(InputMessage::from_bytes(&bytes), Ok(message.clone()));
             if bytes.len() > 1 {
@@ -622,6 +811,7 @@ mod tests {
             seq: 1,
             sent_us: 0,
             events: vec![InputEvent::ReleaseAll; MAX_EVENTS + 1],
+            pads: Vec::new(),
         };
         assert_eq!(
             packet.to_bytes(),
@@ -632,6 +822,71 @@ mod tests {
             InputPacket::from_bytes(&raw),
             Err(InputWireError::TooManyEvents(_))
         ));
+    }
+
+    #[test]
+    fn pad_data_out_of_bounds_is_rejected() {
+        let report = |len: usize| PadData::Report {
+            slot: 1,
+            data: vec![0; len],
+        };
+        assert!(report(64).check().is_ok());
+        assert!(report(0).check().is_err());
+        assert!(report(crate::hid::MAX_REPORT_BYTES + 1).check().is_err());
+        let device = |transport| PadData::Device {
+            slot: 1,
+            device: GamepadDevice {
+                name: "8BitDo Ultimate 2".into(),
+                vendor: 0x2dc8,
+                product: 0x6012,
+                version: 0x0111,
+                bus: 3,
+                transport,
+            },
+        };
+        assert!(
+            device(GamepadTransport::Hid {
+                descriptor: vec![0; 200],
+                features: vec![(5, vec![0; 41])]
+            })
+            .check()
+            .is_ok()
+        );
+        assert!(
+            device(GamepadTransport::Hid {
+                descriptor: vec![0; crate::hid::MAX_DESCRIPTOR + 1],
+                features: Vec::new()
+            })
+            .check()
+            .is_err()
+        );
+        assert!(
+            device(GamepadTransport::Hid {
+                descriptor: vec![0; 10],
+                features: vec![(1, vec![0; 400]); MAX_FEATURES + 1]
+            })
+            .check()
+            .is_err()
+        );
+        // Con la trama de stream más grande posible, cabe.
+        let big = InputMessage {
+            seq: 1,
+            sent_us: 1,
+            events: Vec::new(),
+            pads: vec![device(GamepadTransport::Hid {
+                descriptor: vec![0xAB; crate::hid::MAX_DESCRIPTOR],
+                features: vec![(1, vec![0xCD; 256]); MAX_FEATURE_BYTES / 256],
+            })],
+        };
+        let bytes = big.to_bytes().expect("cabe");
+        assert!(bytes.len() + 64 <= MAX_STREAM_FRAME, "{}", bytes.len());
+        let too_many = InputPacket {
+            seq: 1,
+            sent_us: 0,
+            events: Vec::new(),
+            pads: vec![report(8); MAX_PADS + 1],
+        };
+        assert!(matches!(too_many.to_bytes(), Err(InputWireError::Pad(_))));
     }
 
     #[test]

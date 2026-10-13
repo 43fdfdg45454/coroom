@@ -45,10 +45,11 @@ finish-args:
   # ScreenCast (sin permiso aquí: lo da el usuario en el diálogo del portal) y la entrada del
   # anfitrión por el portal RemoteDesktop (libei).
   - --filesystem=xdg-run/pipewire-0
-  # Mandos: el invitado lee los suyos en /dev/input y el anfitrión crea mandos virtuales en
-  # /dev/uinput (necesita Flatpak 1.15.6 o posterior y que el usuario pueda abrir /dev/uinput, ver
-  # el README). Ningún portal da todavía mandos virtuales; cuando exista, se quitará.
-  - --device=input
+  # Mandos: el invitado lee los suyos en /dev/input y, tal cual, en /dev/hidraw*; el anfitrión
+  # crea mandos virtuales en /dev/uinput y los tal cual en /dev/uhid (cada nodo necesita además que
+  # el usuario pueda abrirlo, ver el README). `--device=input` no cubre hidraw ni uhid, por eso
+  # `all`. Ningún portal da todavía mandos virtuales ni HID en crudo; cuando exista, se quitará.
+  - --device=all
   # El llavero va por el portal Secret (sin `--talk-name=org.freedesktop.secrets`): la identidad y
   # las credenciales se sellan con su clave en el directorio de datos del sandbox.
 build-options:

@@ -27,8 +27,16 @@ use coroom_session::transport::proto::audio::AudioHeader;
 use coroom_session::transport::proto::codec;
 use coroom_session::transport::proto::control::ControlMessage;
 use coroom_session::transport::proto::input::{
-    InputEvent, InputMessage, InputPacket, MouseButton, datagram_header, stream_frame,
+    GamepadDevice, GamepadTransport, InputEvent, InputMessage, InputPacket, MouseButton, PadData,
+    datagram_header, stream_frame,
 };
+
+/// Descriptor HID de un mando sencillo: 8 botones y dos ejes, con informe 1.
+const PAD_DESCRIPTOR: &[u8] = &[
+    0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x85, 0x01, 0x05, 0x09, 0x19, 0x01, 0x29, 0x08, 0x15, 0x00,
+    0x25, 0x01, 0x75, 0x01, 0x95, 0x08, 0x81, 0x02, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x00,
+    0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02, 0xc0,
+];
 use coroom_session::transport::proto::media::{ObjectHeader, Track};
 use coroom_session::transport::proto::signal::SignalMessage;
 
@@ -233,11 +241,29 @@ fn fuzz_seeds() {
         seq: 4,
         sent_us: 1_000,
         events: events(),
+        pads: vec![PadData::Report {
+            slot: 1,
+            data: vec![0x01, 0x80, 0x80, 0x80, 0x80, 0x08, 0x00, 0x00],
+        }],
     };
     let message = InputMessage {
         seq: 2,
         sent_us: 900,
         events: events(),
+        pads: vec![PadData::Device {
+            slot: 1,
+            device: GamepadDevice {
+                name: "Mando de prueba".to_owned(),
+                vendor: 0x1234,
+                product: 0x5678,
+                version: 0x0100,
+                bus: 3,
+                transport: GamepadTransport::Hid {
+                    descriptor: PAD_DESCRIPTOR.to_vec(),
+                    features: vec![(2, vec![2, 0, 0, 0])],
+                },
+            },
+        }],
     };
     let packet_bytes = packet.to_bytes().expect("paquete");
     let message_bytes = message.to_bytes().expect("mensaje");
@@ -254,6 +280,7 @@ fn fuzz_seeds() {
         "stream",
         &prefixed(&[3], &chunks([&stream[..3], &stream[3..]])),
     );
+    seeds.write("proto_hid", "mando", PAD_DESCRIPTOR);
     let mut guest = input_cipher(Role::Guest);
     let mut sealed = Vec::new();
     let mut opens = Vec::new();

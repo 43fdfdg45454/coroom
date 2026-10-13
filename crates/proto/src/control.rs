@@ -336,6 +336,24 @@ pub enum ControlMessage {
         /// Si habla ahora.
         speaking: bool,
     },
+    /// Anfitrión → invitado: si el mando de su ranura va tal cual (el invitado manda los informes
+    /// HID, `PadData::Report`) o convertido (los eventos de Xbox). Se manda al recibir su
+    /// `PadData::Device` y cada vez que cambia.
+    GamepadMode {
+        /// Ranura.
+        slot: u8,
+        /// Tal cual.
+        raw: bool,
+    },
+    /// Anfitrión → invitado: informe de salida para su mando tal cual (vibración, luces), como lo
+    /// pidió el driver del anfitrión, con su identificador si lo hay. Como mucho
+    /// `hid::MAX_REPORT_BYTES` bytes.
+    GamepadOutput {
+        /// Ranura.
+        slot: u8,
+        /// Bytes del informe.
+        data: Vec<u8>,
+    },
 }
 
 #[cfg(test)]
@@ -520,6 +538,10 @@ mod tests {
             any::<bool>().prop_map(|allowed| ControlMessage::VoicePermission { allowed }),
             (any::<u32>(), any::<bool>())
                 .prop_map(|(guest, speaking)| ControlMessage::VoiceState { guest, speaking }),
+            (1u8..=8, any::<bool>())
+                .prop_map(|(slot, raw)| ControlMessage::GamepadMode { slot, raw }),
+            (1u8..=8, prop::collection::vec(any::<u8>(), 1..64))
+                .prop_map(|(slot, data)| ControlMessage::GamepadOutput { slot, data }),
         ]
     }
 

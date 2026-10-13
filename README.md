@@ -16,7 +16,7 @@ de la ficha de AppStream del Flatpak.
 
 ## Estado
 
-**Versión 1.0.0** (protocolo 7). Lo que incluye está en el [`CHANGELOG.md`](CHANGELOG.md); lo que
+**Versión 1.0.0** (protocolo 8). Lo que incluye está en el [`CHANGELOG.md`](CHANGELOG.md); lo que
 está implementado y probado en la CI pero falta validar en hardware real (GPU reales, Windows real,
 dos NAT distintas, pantallas HDR y de 120 Hz), en [`docs/ARQUITECTURA.md`](docs/ARQUITECTURA.md) §7.
 
@@ -85,12 +85,14 @@ flatpak run io.github._43fdfdg45454.coroom
 
 Permisos del paquete (`packaging/flatpak/io.github._43fdfdg45454.coroom.yml`): Wayland (X11 solo de
 respaldo), la GPU (`--device=dri`), la red, PipeWire para el audio
-(`--filesystem=xdg-run/pipewire-0`) y `--device=input` para los mandos. La pantalla se comparte
+(`--filesystem=xdg-run/pipewire-0`) y `--device=all` para los mandos (`/dev/input` y
+`/dev/uinput`, y para los mandos tal cual `/dev/hidraw*` en el invitado y `/dev/uhid` en el
+anfitrión, que `--device=input` no cubre). La pantalla se comparte
 por el portal `ScreenCast` y la entrada del anfitrión por el portal `RemoteDesktop` (los permisos
 los da el diálogo del portal); la identidad y las credenciales se guardan selladas con la clave
-del portal `Secret`, sin acceso al llavero entero. `--device=input` necesita Flatpak 1.15.6 o
-posterior; los **mandos virtuales** del anfitrión necesitan además que tu usuario pueda abrir
-`/dev/uinput` (la regla de udev de «Entrada»), y sin ella el resto funciona igual. El HDR de la
+del portal `Secret`, sin acceso al llavero entero. Los **mandos virtuales** del anfitrión
+necesitan además que tu usuario pueda abrir `/dev/uinput` y `/dev/uhid` (las reglas de udev de
+«Entrada»), y sin ellas el resto funciona igual. El HDR de la
 ventana necesita un compositor con gestión de color de Wayland y Mesa reciente; si no, el vídeo
 HDR se ve con *tone mapping*.
 
@@ -343,6 +345,7 @@ corre escribiendo órdenes en la consola de `coroom host` (`help` las lista):
 | `list` | invitados, ruta, permisos, eventos aplicados y descartados y latencia de su entrada |
 | `allow N kbm` | teclado y ratón para el invitado N |
 | `allow N pad RANURA` | mando virtual en esa ranura (1 a `COROOM_MAX_GAMEPADS`, 4 por defecto, hasta 8) |
+| `allow N raw` / `deny N raw` | su mando **tal cual** (por defecto) o convertido a Xbox 360 |
 | `deny N kbm\|pad\|voice` | quitar ese permiso (lo pulsado se suelta y el mando se destruye) |
 | `pause` / `resume` | pausar o reanudar la entrada de todos (en pausa se suelta todo y se descarta lo que llegue) |
 | `kick N` | expulsar (se suelta lo suyo, se libera su ranura y rotan las claves) |
@@ -359,12 +362,29 @@ derivada del secreto HPKE): ni el relay ni otro invitado pueden leerla ni falsif
 |---|---|
 | `Ctrl+Alt+G` | alterna el **modo escritorio** (cursor libre, posición absoluta) y el **modo inmersivo** (cursor capturado y oculto, movimiento relativo, para juegos en primera persona) |
 | `Ctrl+Alt+O` | muestra u oculta el panel de estadísticas (el antiguo overlay) |
+| `Ctrl+Alt+M` / `Ctrl+Alt+V` | silencia o reactiva el micrófono / el audio del juego |
+| `Ctrl+Alt+J` | panel de mandos: cuál envías (automático o uno concreto) |
 | `Ctrl+Alt+Q` | sale (con teclado y ratón permitidos, `Esc` va al juego) |
 
 Al perder el foco se suelta todo lo pulsado y el cursor. En modo inmersivo, si el cursor se
 suelta, un clic en la ventana lo vuelve a capturar. El overlay dice qué permite el anfitrión
 ("solo mirar", "teclado y ratón", "mando en ranura 2") y la latencia de entrada que mide el
-anfitrión. El primer mando conectado al invitado es el de su ranura.
+anfitrión. Las letras se cambian en Ajustes → Entrada.
+
+**Mandos tal cual.** Con varios mandos conectados, el invitado elige en el panel de mandos cuál
+envía: **Automático** (el último que conectes; si lo desconectas, el siguiente) o uno concreto,
+que se recuerda entre sesiones. Conectarlos y desconectarlos en plena sesión funciona sin más. El
+anfitrión decide por invitado si su mando llega **tal cual** (por defecto) o **convertido a Xbox
+360**, y ve cuál es («Su mando: 8BitDo Ultimate 2 · 2dc8:6012 · HID»). Tal cual, el anfitrión
+crea un mando con el mismo VID/PID, nombre y descriptor HID que el físico, y le pasan sus informes
+sin traducir: Steam, SDL y el juego lo reconocen como ese mando, con sus botones extra, giroscopio
+o lo que declare, y la vibración y las luces vuelven al mando del invitado. Un mando de Xbox por
+cable (XInput, sin HID en crudo) llega con su identidad. Si no se puede (anfitrión Windows por
+ahora, sin acceso a `/dev/hidraw*` o `/dev/uhid`, o un descriptor que también declara teclado o
+ratón sin ese permiso), va convertido y la tarjeta del invitado dice por qué. En el invitado
+Linux, leer el mando en crudo necesita acceso a su `/dev/hidraw*`: las reglas de Steam
+(`steam-devices`) cubren la mayoría; si no, una para tu mando
+(`KERNEL=="hidraw*", ATTRS{idVendor}=="2dc8", TAG+="uaccess"`).
 
 **Anfitrión en Linux**:
 
@@ -384,7 +404,18 @@ anfitrión. El primer mando conectado al invitado es el de su ranura.
   ```
 
   y volver a entrar en la sesión. En Flatpak hace falta la misma regla (el paquete ya pide
-  `--device=input`). Sin acceso, `allow N pad` avisa con esta misma regla.
+  `--device=all`). Sin acceso, `allow N pad` avisa con esta misma regla.
+- Mandos **tal cual** por **UHID** (`/dev/uhid`): el mando del invitado con su VID/PID y su
+  descriptor, que el kernel trata como si estuviera enchufado (`hid-generic`, `hid-playstation`,
+  `hid-nintendo`… según el VID/PID). La regla udev (una vez):
+
+  ```bash
+  echo 'KERNEL=="uhid", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uhid"' \
+      | sudo tee /etc/udev/rules.d/60-coroom-uhid.rules
+  sudo udevadm control --reload && sudo udevadm trigger
+  ```
+
+  Sin ella, el mando va convertido y la tarjeta del invitado lo explica.
 
 **Anfitrión en Windows**: teclado y ratón por `SendInput` (tecla física por *scancode*; ratón
 relativo sin agrupar y absoluto sobre el monitor principal). **Mandos con el driver de coroom**:

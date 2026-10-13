@@ -219,13 +219,42 @@ sin avisos en las crates que lo usan:
 | `coroom-codec` | 63 | FFmpeg (`rsmpeg`) y Vulkan (`ash`) en la importación sin copias |
 | `coroom-capture` | 30 | PipeWire (DMA-BUF) y Windows.Graphics.Capture |
 | `coroom-render` | 14 | Importación de imágenes Vulkan en `wgpu` (`as_hal`, `texture_from_raw`) |
-| `coroom-input` | 13 | `SendInput` y el cliente del driver de mando de Windows (cfgmgr32, `hid.dll` y `WriteFile`) |
+| `coroom-input` | 16 | `SendInput` y el cliente del driver de mando de Windows (cfgmgr32, `hid.dll` y `WriteFile`); en Linux, `HIDIOCGFEATURE` sobre `hidraw` (informes de característica del mando tal cual) |
 | `coroom-audio` | 10 | Sesiones de audio de WASAPI (COM) y prioridad de tiempo real (`sched_setscheduler`, `RLIMIT_RTTIME`, `gettid`; MMCSS en Windows) |
 | `proto`, `crypto`, `transport`, `session`, `ui`, `coroom`, `coroom-server` | 0 | `unsafe_code = "deny"` en el workspace |
 
 Todo lo que parsea datos de la red está en crates sin `unsafe`.
 
-### 2.12 Dependencias
+### 2.12 Mandos tal cual (HID en crudo)
+
+Con el mando **tal cual**, el invitado manda el descriptor HID de su mando, sus informes de
+característica y cada informe de entrada, y el anfitrión crea con UHID un dispositivo idéntico
+(mismo VID/PID y descriptor). Eso deja al invitado definir **cualquier** dispositivo HID en el
+equipo del anfitrión, así que:
+
+- **Lo decide el anfitrión, por invitado.** Solo hay mando tal cual con una ranura concedida y el
+  modo «Tal cual» (`Permissions::gamepad_raw`, por defecto sí al conceder la ranura; «Convertido a
+  Xbox 360» lo quita al momento). Sin ranura no se crea nada, igual que antes.
+- **El descriptor se valida antes de crear nada** (`proto::hid::parse`): como mucho 4 KiB, Push y
+  Pop y colecciones emparejados, informes de 512 bytes como máximo; tiene que declarar un mando
+  (Game Pad, Joystick o Multi-axis), y si además declara teclado, ratón, *system control* o
+  *consumer control* hace falta el permiso de teclado y ratón (si no, va convertido y la tarjeta
+  dice por qué). Así un «mando» no puede escribir en el anfitrión sin el permiso de teclado.
+- **Límites**: nombre de 128 caracteres, 32 informes de característica de hasta 8 KiB en total,
+  informes de entrada de 512 bytes como máximo y solo para la ranura del propio invitado (lo de
+  otra ranura se descarta y se cuenta); en pausa se quita el dispositivo, y al expulsar, quitar la
+  ranura o desconectar el mando, también.
+- **Hacia el invitado** solo vuelven los informes de salida (vibración, luces) de su propio mando,
+  cifrados como el resto del control. Las peticiones `GET_REPORT` del sistema se contestan con los
+  informes de característica que mandó el invitado al conectar, sin ida y vuelta por la red.
+- El objetivo de fuzzing `proto_hid` cubre el parser (§3).
+
+Lo que no cubre: un mando tal cual con un descriptor válido puede llevar al kernel por caminos de
+drivers HID específicos (`hid-playstation`, `hid-nintendo`…) según el VID/PID que declare. Es la
+misma superficie que enchufar ese mando por USB; el anfitrión que no confíe en un invitado lo deja
+en «Convertido» o sin mando.
+
+### 2.13 Dependencias
 
 `cargo deny check` (avisos de RustSec, licencias, crates prohibidas y duplicadas) en la CI; todas
 las versiones fijadas con `=`. Las revisadas expresamente: `ml-dsa` (opcional), `fluent-bundle`,
@@ -248,6 +277,7 @@ señalización no deja salas abiertas al cerrarse la sesión.
 | `proto_media` | Cabecera de objetos v2 | 63,4 M | 42 |
 | `proto_audio` | Cabecera de audio | 76,7 M | 18 |
 | `proto_input` | `InputPacket`, `InputMessage`, datagramas y stream de entrada | 24,6 M | 523 |
+| `proto_hid` | Descriptores HID del mando tal cual | 2,4 M | — |
 | `proto_control` | Mensajes de control enmarcados, en trozos | 11,0 M | 1 197 |
 | `proto_signal` | Mensajes de señalización con el máximo del servidor | 8,2 M | 759 |
 | `proto_api` | Cuerpos JSON de la API y hexadecimal | 8,8 M | 3 647 |

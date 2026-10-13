@@ -5,7 +5,10 @@
 //! y el ratón del sistema, así que las pulsaciones se cuentan por invitado ([`PressedKeys`]): una
 //! tecla se suelta en el sistema cuando la suelta el último que la tenía pulsada, y
 //! [`InputSink::release_all`] suelta solo lo de ese invitado. Los mandos son un dispositivo por
-//! ranura ([`InputSink::assign_gamepad`] / [`InputSink::release_gamepad`]).
+//! ranura ([`InputSink::assign_gamepad`] / [`InputSink::release_gamepad`]). Un mando **tal cual**
+//! ([`InputSink::connect_raw`]) sustituye al de la ranura por uno idéntico al del invitado (UHID o
+//! uinput con su identidad en Linux); el sumidero que no sepa, lo rechaza y la sesión sigue con el
+//! convertido.
 //!
 //! Backends: [`linux`] (feature `linux-portal`: libei por el portal `RemoteDesktop` y uinput),
 //! [`windows`] (feature `windows-sendinput`: `SendInput`; los mandos por el driver propio de
@@ -18,9 +21,12 @@ use std::time::{Duration, Instant};
 
 use crate::keymap::evdev as codes;
 use crate::{GamepadAxis, GamepadButton, GuestId, InputError, InputEvent, MouseButton};
+use coroom_proto::input::{GamepadDevice, GamepadTransport};
 
 #[cfg(all(target_os = "linux", feature = "linux-portal"))]
 pub mod linux;
+#[cfg(all(target_os = "linux", feature = "linux-portal"))]
+pub mod uhid;
 #[cfg(all(target_os = "windows", feature = "windows-sendinput"))]
 pub mod windows;
 // El formato del driver es independiente de la plataforma (y se prueba en todas); solo el acceso
@@ -50,6 +56,35 @@ pub trait InputSink: Send {
 
     /// Nombre del backend para los avisos (`libei + uinput`, `SendInput`…).
     fn describe(&self) -> String;
+
+    /// Sustituye el mando de `slot` por uno idéntico al físico del invitado (`device`, ya
+    /// validado por la sesión): con su descriptor si es HID, con su identidad si es XInput. Por
+    /// defecto no se puede, y la ranura sigue con su mando convertido.
+    fn connect_raw(&mut self, slot: u8, device: &GamepadDevice) -> Result<(), InputError> {
+        let _ = (slot, device);
+        Err(InputError::Unsupported(
+            "este anfitrión todavía no recrea mandos tal cual".to_owned(),
+        ))
+    }
+
+    /// Un informe de entrada HID tal cual para el mando de `slot`.
+    fn raw_report(&mut self, slot: u8, data: &[u8]) -> Result<(), InputError> {
+        let _ = data;
+        Err(InputError::NoSuchSlot(slot))
+    }
+
+    /// Quita el mando tal cual de `slot` y vuelve a poner el convertido si la ranura sigue
+    /// asignada.
+    fn disconnect_raw(&mut self, slot: u8) -> Result<(), InputError> {
+        let _ = slot;
+        Ok(())
+    }
+
+    /// Informes de salida (vibración, luces) que el driver del anfitrión mandó a los mandos tal
+    /// cual desde la última llamada: ranura y bytes.
+    fn take_outputs(&mut self) -> Vec<(u8, Vec<u8>)> {
+        Vec::new()
+    }
 }
 
 /// Conexión EIS (libei) ya abierta por quien tenga la sesión del portal `RemoteDesktop` (la
@@ -365,12 +400,38 @@ pub enum Recorded {
         /// Ranura.
         slot: u8,
     },
+    /// [`InputSink::connect_raw`].
+    RawConnected {
+        /// Ranura.
+        slot: u8,
+        /// VID.
+        vendor: u16,
+        /// PID.
+        product: u16,
+        /// HID (si no, XInput).
+        hid: bool,
+    },
+    /// [`InputSink::raw_report`].
+    RawReport {
+        /// Ranura.
+        slot: u8,
+        /// Bytes.
+        len: usize,
+    },
+    /// [`InputSink::disconnect_raw`].
+    RawDisconnected {
+        /// Ranura.
+        slot: u8,
+    },
 }
 
 #[derive(Debug, Default)]
 struct RecordingState {
     log: Vec<Recorded>,
     slots: BTreeSet<u8>,
+    raw: BTreeSet<u8>,
+    raw_unsupported: bool,
+    outputs: Vec<(u8, Vec<u8>)>,
 }
 
 /// Sumidero de prueba (público para los tests de las demás crates): guarda todo lo que recibe con
@@ -422,6 +483,22 @@ impl RecordingSink {
         self.lock().slots.iter().copied().collect()
     }
 
+    /// Ranuras con mando tal cual ahora.
+    pub fn raw_slots(&self) -> Vec<u8> {
+        self.lock().raw.iter().copied().collect()
+    }
+
+    /// Como un anfitrión que no recrea mandos tal cual.
+    pub fn without_raw(self) -> Self {
+        self.lock().raw_unsupported = true;
+        self
+    }
+
+    /// Simula un informe de salida del driver del anfitrión para el mando tal cual de `slot`.
+    pub fn push_output(&self, slot: u8, data: Vec<u8>) {
+        self.lock().outputs.push((slot, data));
+    }
+
     /// Espera hasta que `condition` se cumpla sobre el registro o pase `timeout`; devuelve si se
     /// cumplió.
     pub fn wait_for(&self, timeout: Duration, condition: impl Fn(&[Recorded]) -> bool) -> bool {
@@ -470,12 +547,57 @@ impl InputSink for RecordingSink {
         if !state.slots.remove(&slot) {
             return Err(InputError::NoSuchSlot(slot));
         }
+        state.raw.remove(&slot);
         state.log.push(Recorded::GamepadReleased { slot });
         Ok(())
     }
 
     fn describe(&self) -> String {
         "registro de prueba".to_owned()
+    }
+
+    fn connect_raw(&mut self, slot: u8, device: &GamepadDevice) -> Result<(), InputError> {
+        let mut state = self.lock();
+        if state.raw_unsupported {
+            return Err(InputError::Unsupported(
+                "sumidero de prueba sin tal cual".into(),
+            ));
+        }
+        if !state.slots.contains(&slot) {
+            return Err(InputError::NoSuchSlot(slot));
+        }
+        state.raw.insert(slot);
+        state.log.push(Recorded::RawConnected {
+            slot,
+            vendor: device.vendor,
+            product: device.product,
+            hid: matches!(device.transport, GamepadTransport::Hid { .. }),
+        });
+        Ok(())
+    }
+
+    fn raw_report(&mut self, slot: u8, data: &[u8]) -> Result<(), InputError> {
+        let mut state = self.lock();
+        if !state.raw.contains(&slot) {
+            return Err(InputError::NoSuchSlot(slot));
+        }
+        state.log.push(Recorded::RawReport {
+            slot,
+            len: data.len(),
+        });
+        Ok(())
+    }
+
+    fn disconnect_raw(&mut self, slot: u8) -> Result<(), InputError> {
+        let mut state = self.lock();
+        if state.raw.remove(&slot) {
+            state.log.push(Recorded::RawDisconnected { slot });
+        }
+        Ok(())
+    }
+
+    fn take_outputs(&mut self) -> Vec<(u8, Vec<u8>)> {
+        std::mem::take(&mut self.lock().outputs)
     }
 }
 

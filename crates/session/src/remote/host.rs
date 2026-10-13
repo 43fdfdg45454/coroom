@@ -852,6 +852,16 @@ impl HostCtx {
     }
 
     /// Envía a `guest` sus permisos de entrada y de voz actuales.
+    /// Un mensaje de control solo para `guest`.
+    fn send_to_guest(&self, guest: GuestId, message: &ControlMessage) {
+        let controls = lock(&self.links).guest_controls();
+        for (id, control) in controls {
+            if id == guest {
+                let _ = control.send(message);
+            }
+        }
+    }
+
     fn send_permissions(&self, guest: GuestId) {
         let Some(permissions) = lock(&self.core.guests)
             .get(&guest)
@@ -1579,6 +1589,7 @@ impl Room {
                 target_kbps: None,
                 input_key: false,
                 input: Default::default(),
+                gamepad: None,
             },
         );
         self.ctx.core.emit(SessionEvent::GuestJoined {
@@ -1892,6 +1903,12 @@ async fn run_host(
                     }
                 }
                 Some(Command::PermissionsChanged(guest)) => ctx.send_permissions(guest),
+                Some(Command::GamepadMode { guest, slot, raw }) => {
+                    ctx.send_to_guest(guest, &ControlMessage::GamepadMode { slot, raw });
+                }
+                Some(Command::GamepadOutput { guest, slot, data }) => {
+                    ctx.send_to_guest(guest, &ControlMessage::GamepadOutput { slot, data });
+                }
                 Some(Command::Reconnect) => {}
                 Some(Command::Invite(user)) => {
                     let invite = SignalMessage::Invite { to_user: user, code: room.code.clone() };

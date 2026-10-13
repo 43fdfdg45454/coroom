@@ -10,6 +10,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use coroom_session::input::gamepad::PadChoice;
 use coroom_session::remote::{GuestStatus, QualityLevel, SessionEvent};
 use coroom_session::{GuestId, Permissions};
 use coroom_transport::api::ServerProbe;
@@ -390,6 +391,8 @@ pub enum Effect {
     ToggleGameAudio,
     /// Pasar el ratón a modo inmersivo (`true`) o escritorio.
     SetImmersive(bool),
+    /// Qué mando envía el invitado.
+    SetPadChoice(PadChoice),
     /// Guardar los ajustes.
     SaveSettings,
     /// Copiar al portapapeles.

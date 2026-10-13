@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use coroom_input::capture::Allowed;
+use coroom_input::gamepad::PadLink;
 use coroom_input::inject::{EisConnection, EisProvider, PointerArea};
 use coroom_input::script::ScriptTarget;
 use coroom_input::send::{InputLink, InputSender, SenderSnapshot};
@@ -33,14 +34,15 @@ use coroom_transport::PeerConnection;
 use coroom_transport::crypto::hpke::PairwiseSecret;
 use coroom_transport::crypto::input::{Channel, InputCipher, Role};
 use coroom_transport::media::{MediaReceiver, MediaSender};
+use coroom_transport::proto::hid;
 use coroom_transport::proto::input::{
-    InputMessage, InputPacket, STREAM_PREAMBLE_LEN, StreamFrames, parse_datagram,
-    parse_stream_preamble, seq_after, stream_preamble,
+    GamepadDevice, GamepadTransport, InputMessage, InputPacket, PadData, STREAM_PREAMBLE_LEN,
+    StreamFrames, parse_datagram, parse_stream_preamble, seq_after, stream_preamble,
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use tracing::debug;
 
-use super::{Core, lock};
+use super::{Command, Core, GuestPad, PadTransport, lock};
 use crate::latency::InputLatency;
 use crate::{GuestId, Permissions, SessionError};
 
@@ -88,6 +90,7 @@ pub(crate) enum Job {
         datagram: bool,
         seq: u32,
         events: Vec<InputEvent>,
+        pads: Vec<PadData>,
         latency_us: Option<u64>,
     },
     /// Permisos nuevos.
@@ -247,6 +250,7 @@ async fn datagram_reader(
             seq: packet.seq,
             latency_us: latency_us(&clock, received, packet.sent_us),
             events: packet.events,
+            pads: packet.pads,
         });
     }
 }
@@ -345,8 +349,63 @@ async fn stream_reader(
                 seq: message.seq,
                 latency_us: latency_us(&clock, received, message.sent_us),
                 events: message.events,
+                pads: message.pads,
             });
         }
+    }
+}
+
+/// El mando físico que declaró un invitado para su ranura.
+struct PadState {
+    slot: u8,
+    device: GamepadDevice,
+    /// Si el sumidero lo tiene tal cual ahora.
+    active: bool,
+    /// Por qué no va tal cual, si se pidió.
+    note: Option<String>,
+}
+
+impl PadState {
+    fn status(&self) -> GuestPad {
+        GuestPad {
+            name: self.device.name.clone(),
+            vendor: self.device.vendor,
+            product: self.device.product,
+            transport: match self.device.transport {
+                GamepadTransport::Hid { .. } => PadTransport::Hid,
+                GamepadTransport::XInput => PadTransport::XInput,
+                GamepadTransport::Converted { .. } => PadTransport::Converted,
+            },
+            raw: self.active,
+            note: self.note.clone(),
+        }
+    }
+
+    /// Si el invitado tiene que mandar los informes en crudo (si no, sus eventos convertidos).
+    fn guest_sends_raw(&self) -> bool {
+        self.active && matches!(self.device.transport, GamepadTransport::Hid { .. })
+    }
+}
+
+/// Si el mando declarado se puede crear tal cual con estos permisos.
+fn check_device(device: &GamepadDevice, permissions: &Permissions) -> Result<(), String> {
+    match &device.transport {
+        GamepadTransport::Hid { descriptor, .. } => {
+            let summary = hid::parse(descriptor).map_err(|err| err.to_string())?;
+            if !summary.has_controller() {
+                return Err("su descriptor no declara un mando".to_owned());
+            }
+            if summary.has_keyboard_or_mouse() && !permissions.keyboard_mouse {
+                return Err(
+                    "también se declara teclado o ratón y el invitado no tiene permiso de \
+                     teclado y ratón"
+                        .to_owned(),
+                );
+            }
+            Ok(())
+        }
+        GamepadTransport::XInput => Ok(()),
+        GamepadTransport::Converted { reason } => Err(reason.clone()),
     }
 }
 
@@ -354,6 +413,7 @@ async fn stream_reader(
 #[derive(Default)]
 struct GuestState {
     permissions: Permissions,
+    pad: Option<PadState>,
     last_datagram: Option<u32>,
     applied: u64,
     dropped: u64,
@@ -395,7 +455,15 @@ impl Worker {
     fn run(mut self, rx: &Receiver<Job>) {
         debug!(backend = self.sink.describe(), "hilo inject");
         loop {
-            match rx.recv_timeout(Duration::from_millis(100)) {
+            // Con un mando tal cual, su vibración sale enseguida aunque no llegue nada.
+            let wait = if self.any_raw() {
+                Duration::from_millis(5)
+            } else {
+                Duration::from_millis(100)
+            };
+            let received = rx.recv_timeout(wait);
+            self.forward_outputs();
+            match received {
                 Ok(job) => {
                     self.handle(job);
                     for _ in 0..256 {
@@ -433,19 +501,31 @@ impl Worker {
                 datagram,
                 seq,
                 events,
+                pads,
                 latency_us,
-            } => self.packet(guest, datagram, seq, &events, latency_us),
+            } => {
+                self.packet(guest, datagram, seq, &events, latency_us);
+                self.pads(guest, pads);
+            }
             Job::Permissions { guest, permissions } => self.permissions(guest, permissions),
             Job::Paused(paused) => {
-                if paused && !self.paused {
-                    let guests: Vec<GuestId> = self.guests.keys().copied().collect();
-                    for guest in guests {
-                        if let Err(err) = self.sink.release_all(guest) {
+                let was = self.paused;
+                self.paused = paused;
+                let guests: Vec<GuestId> = self.guests.keys().copied().collect();
+                if paused && !was {
+                    for guest in &guests {
+                        if let Err(err) = self.sink.release_all(*guest) {
                             self.warn(&err);
                         }
                     }
                 }
-                self.paused = paused;
+                // Un mando tal cual no tiene un informe «en reposo» que inyectar: en pausa se
+                // quita (el sistema suelta lo que tuviera pulsado) y vuelve al reanudar.
+                if paused != was {
+                    for guest in guests {
+                        self.apply_pad_mode(guest);
+                    }
+                }
             }
             Job::GuestGone(guest) => self.gone(guest),
         }
@@ -499,6 +579,9 @@ impl Worker {
             if !allowed {
                 dropped += 1;
                 continue;
+            }
+            if let InputEvent::GamepadDisconnected { slot } = event {
+                self.forget_pad(guest, *slot);
             }
             let result = match event {
                 InputEvent::ReleaseAll => self.sink.release_all(guest),
@@ -558,6 +641,154 @@ impl Worker {
         for err in errors {
             self.warn(&err);
         }
+        if slot_changed {
+            // El invitado vuelve a declarar su mando para la ranura nueva.
+            if let Some(state) = self.guests.get_mut(&guest) {
+                state.pad = None;
+            }
+        } else if old.gamepad_raw != permissions.gamepad_raw
+            || old.keyboard_mouse != permissions.keyboard_mouse
+        {
+            self.apply_pad_mode(guest);
+        }
+    }
+
+    /// Datos de mandos tal cual de `guest` (ya autenticados).
+    fn pads(&mut self, guest: GuestId, pads: Vec<PadData>) {
+        for pad in pads {
+            let Some(state) = self.guests.get_mut(&guest) else {
+                return;
+            };
+            if state.permissions.gamepad_slot != Some(pad.slot()) {
+                state.dropped += 1;
+                self.totals.1 += 1;
+                continue;
+            }
+            match pad {
+                PadData::Device { slot, device } => {
+                    if state.pad.as_ref().is_some_and(|pad| pad.active)
+                        && let Err(err) = self.sink.disconnect_raw(slot)
+                    {
+                        self.warn(&err);
+                    }
+                    let state = self.guests.get_mut(&guest).expect("invitado");
+                    state.pad = Some(PadState {
+                        slot,
+                        device,
+                        active: false,
+                        note: None,
+                    });
+                    state.dirty = true;
+                    self.apply_pad_mode(guest);
+                }
+                PadData::Report { slot, data } => {
+                    if self.paused || !state.pad.as_ref().is_some_and(PadState::guest_sends_raw) {
+                        state.dropped += 1;
+                        self.totals.1 += 1;
+                        continue;
+                    }
+                    state.applied += 1;
+                    self.totals.0 += 1;
+                    if let Err(err) = self.sink.raw_report(slot, &data) {
+                        self.warn(&err);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pone el mando de `guest` tal cual o convertido según su permiso, su declaración y la
+    /// pausa, y le avisa del modo.
+    fn apply_pad_mode(&mut self, guest: GuestId) {
+        let paused = self.paused;
+        let Some(state) = self.guests.get_mut(&guest) else {
+            return;
+        };
+        let permissions = state.permissions;
+        let Some(pad) = state.pad.as_mut() else {
+            return;
+        };
+        let check = if permissions.gamepad_raw {
+            check_device(&pad.device, &permissions)
+        } else {
+            Err(String::new())
+        };
+        let mut error = None;
+        match (check, pad.active) {
+            (Ok(()), false) if !paused => match self.sink.connect_raw(pad.slot, &pad.device) {
+                Ok(()) => {
+                    pad.active = true;
+                    pad.note = None;
+                }
+                Err(err) => {
+                    pad.note = Some(err.to_string());
+                    error = Some(err);
+                }
+            },
+            (Ok(()), true) if !paused => {}
+            (check, active) => {
+                if active {
+                    if let Err(err) = self.sink.disconnect_raw(pad.slot) {
+                        error = Some(err);
+                    }
+                    pad.active = false;
+                }
+                pad.note = match check {
+                    Err(reason) if !reason.is_empty() => Some(reason),
+                    _ => None,
+                };
+            }
+        }
+        let (slot, raw) = (pad.slot, pad.guest_sends_raw());
+        state.dirty = true;
+        if let Some(err) = error {
+            self.warn(&err);
+        }
+        self.command(Command::GamepadMode { guest, slot, raw });
+    }
+
+    /// El invitado desconectó el mando de `slot`: vuelve el convertido.
+    fn forget_pad(&mut self, guest: GuestId, slot: u8) {
+        let Some(state) = self.guests.get_mut(&guest) else {
+            return;
+        };
+        let Some(pad) = state.pad.take_if(|pad| pad.slot == slot) else {
+            return;
+        };
+        state.dirty = true;
+        if pad.active
+            && let Err(err) = self.sink.disconnect_raw(slot)
+        {
+            self.warn(&err);
+        }
+    }
+
+    fn any_raw(&self) -> bool {
+        self.guests
+            .values()
+            .any(|state| state.pad.as_ref().is_some_and(|pad| pad.active))
+    }
+
+    /// Vibración y luces que el sistema mandó a los mandos tal cual, a su invitado.
+    fn forward_outputs(&mut self) {
+        for (slot, data) in self.sink.take_outputs() {
+            let owner = self.guests.iter().find_map(|(guest, state)| {
+                state
+                    .pad
+                    .as_ref()
+                    .filter(|pad| pad.active && pad.slot == slot)
+                    .map(|_| *guest)
+            });
+            if let Some(guest) = owner {
+                self.command(Command::GamepadOutput { guest, slot, data });
+            }
+        }
+    }
+
+    fn command(&self, command: Command) {
+        if let Some(commands) = lock(&self.core.commands).as_ref() {
+            let _ = commands.send(command);
+        }
     }
 
     fn gone(&mut self, guest: GuestId) {
@@ -576,7 +807,7 @@ impl Worker {
 
     /// Pasa los contadores y la latencia de los invitados que cambiaron a su `GuestStatus`.
     fn publish(&mut self) {
-        let dirty: Vec<(GuestId, InputLatency)> = self
+        let dirty: Vec<(GuestId, InputLatency, Option<GuestPad>)> = self
             .guests
             .iter_mut()
             .filter(|(_, state)| state.dirty)
@@ -589,6 +820,7 @@ impl Worker {
                         state.applied,
                         state.dropped,
                     ),
+                    state.pad.as_ref().map(PadState::status),
                 )
             })
             .collect();
@@ -599,9 +831,10 @@ impl Worker {
             return;
         }
         let mut guests = lock(&self.core.guests);
-        for (guest, latency) in dirty {
+        for (guest, latency, pad) in dirty {
             if let Some(status) = guests.get_mut(&guest) {
                 status.input = latency;
+                status.gamepad = pad;
             }
         }
     }
@@ -616,7 +849,15 @@ struct GuestInputInner {
     report: Mutex<Option<InputLatency>>,
     sender: Mutex<Option<InputSender>>,
     stopped: AtomicBool,
+    /// Ranuras cuyo mando el anfitrión tiene tal cual (`GamepadMode`).
+    pad_modes: Mutex<BTreeMap<u8, bool>>,
+    /// Informes de salida del anfitrión para el mando (`GamepadOutput`), los más recientes.
+    pad_outputs: Mutex<VecDeque<(u8, Vec<u8>)>>,
 }
+
+/// Informes de salida del anfitrión que se guardan como mucho hasta que el hilo de mandos los
+/// recoge.
+const MAX_PAD_OUTPUTS: usize = 64;
 
 /// Entrada del invitado: lo que la ventana (o el guion) necesita de la sesión.
 #[derive(Clone, Default)]
@@ -681,11 +922,57 @@ impl GuestInput {
     pub(crate) fn set_sender(&self, sender: Option<InputSender>) {
         let old = std::mem::replace(&mut *lock(&self.inner.sender), sender);
         drop(old);
+        // Conexión nueva: el anfitrión vuelve a decir el modo de cada mando.
+        lock(&self.inner.pad_modes).clear();
+        lock(&self.inner.pad_outputs).clear();
+    }
+
+    /// Envía datos del mando tal cual al anfitrión (si la entrada ya está lista).
+    pub fn send_pad(&self, data: PadData) {
+        if let Some(sender) = lock(&self.inner.sender).as_ref() {
+            sender.send_pad(data);
+        }
+    }
+
+    pub(crate) fn set_pad_mode(&self, slot: u8, raw: bool) {
+        lock(&self.inner.pad_modes).insert(slot, raw);
+    }
+
+    pub(crate) fn push_pad_output(&self, slot: u8, data: Vec<u8>) {
+        if data.is_empty() || data.len() > hid::MAX_REPORT_BYTES {
+            return;
+        }
+        let mut outputs = lock(&self.inner.pad_outputs);
+        if outputs.len() >= MAX_PAD_OUTPUTS {
+            outputs.pop_front();
+        }
+        outputs.push_back((slot, data));
     }
 
     pub(crate) fn stop(&self) {
         self.inner.stopped.store(true, Ordering::Release);
         self.set_sender(None);
+    }
+}
+
+impl PadLink for GuestInput {
+    fn event(&self, event: InputEvent) {
+        GuestInput::send(self, event);
+    }
+
+    fn pad(&self, data: PadData) {
+        self.send_pad(data);
+    }
+
+    fn raw(&self, slot: u8) -> bool {
+        lock(&self.inner.pad_modes)
+            .get(&slot)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn outputs(&self) -> Vec<(u8, Vec<u8>)> {
+        lock(&self.inner.pad_outputs).drain(..).collect()
     }
 }
 

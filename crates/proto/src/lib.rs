@@ -13,6 +13,7 @@ pub mod audio;
 pub mod codec;
 pub mod control;
 pub mod hex;
+pub mod hid;
 pub mod input;
 pub mod media;
 pub mod signal;
@@ -27,8 +28,9 @@ pub mod signal;
 /// la 6, las cuentas en la señalización (`Auth` con token de sesión y clave del dispositivo,
 /// usuario y nombre en `Joined` y `PeerJoined`, `Invite`, `Invited`, `Presence`, `QuotaExceeded`
 /// y `RelayDisabled`); la 7, el formato del vídeo (espacio de color, croma y profundidad en
-/// `CodecSelected`, 4:4:4 y HDR10 en `Capabilities`).
-pub const PROTOCOL_VERSION: u16 = 7;
+/// `CodecSelected`, 4:4:4 y HDR10 en `Capabilities`); la 8, los mandos tal cual (`pads` en los
+/// paquetes y mensajes de entrada, `GamepadMode` y `GamepadOutput`).
+pub const PROTOCOL_VERSION: u16 = 8;
 
 /// Identificadores ALPN (RFC 7301) que el socket QUIC usa para demultiplexar conexiones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

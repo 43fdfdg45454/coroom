@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 
 use coroom_render::wgpu::{GpuContext, create_instance};
 use coroom_render::{CursorImage, CursorOverlay, PresentFrame, PresentImage};
+use coroom_session::input::gamepad::{ConnectedPad, PadChoice, PadKey, PadKind};
 use coroom_session::latency::{InputLatency, LatencyLedger, LinkSummary, Stage};
-use coroom_session::remote::{GuestStatus, QualityLevel, SessionEvent};
+use coroom_session::remote::{GuestPad, GuestStatus, PadTransport, QualityLevel, SessionEvent};
 use coroom_session::{GuestId, Permissions};
 use coroom_transport::api::ServerProbe;
 use coroom_transport::crypto::SafetyNumber;
@@ -200,7 +201,7 @@ pub fn scenes() -> Vec<Scene> {
 
 type Builder = fn(&mut App);
 
-const BUILDERS: [(&str, Builder); 28] = [
+const BUILDERS: [(&str, Builder); 29] = [
     ("01-servidores", servers),
     ("01-servidores-cambiar", |app| {
         home(app);
@@ -226,6 +227,7 @@ const BUILDERS: [(&str, Builder); 28] = [
     ("12-estimacion", guest_estimate),
     ("13-video", guest_video),
     ("14-estadisticas", guest_stats),
+    ("14-mandos", guest_pads),
     ("15-reconectando", guest_reconnecting),
     ("16-ajustes-video", |app| {
         settings_page(app, SettingsPage::Video)
@@ -533,6 +535,14 @@ fn guest_status(id: u32, name: &str, permissions: Permissions, rtt: f64) -> Gues
         target_kbps: Some(if id == 1 { 24_000 } else { 9_500 }),
         input_key: true,
         input: InputLatency::default(),
+        gamepad: None,
+    }
+}
+
+fn with_pad(status: GuestStatus, pad: GuestPad) -> GuestStatus {
+    GuestStatus {
+        gamepad: Some(pad),
+        ..status
     }
 }
 
@@ -558,18 +568,30 @@ fn host_room(app: &mut App) {
                 keyboard_mouse: true,
                 gamepad_slot: None,
                 voice: true,
+                gamepad_raw: true,
             },
             14.2,
         ),
-        guest_status(
-            2,
-            "Carla",
-            Permissions {
-                keyboard_mouse: false,
-                gamepad_slot: Some(1),
-                voice: false,
+        with_pad(
+            guest_status(
+                2,
+                "Carla",
+                Permissions {
+                    keyboard_mouse: false,
+                    gamepad_slot: Some(1),
+                    voice: false,
+                    gamepad_raw: true,
+                },
+                38.6,
+            ),
+            GuestPad {
+                name: "8BitDo Ultimate 2 Wireless Controller".to_owned(),
+                vendor: 0x2dc8,
+                product: 0x6012,
+                transport: PadTransport::Hid,
+                raw: true,
+                note: None,
             },
-            38.6,
         ),
     ])));
     app.toasts.clear();
@@ -654,6 +676,49 @@ fn guest_video(app: &mut App) {
 fn guest_stats(app: &mut App) {
     video(app);
     app.update(Message::Guest(guest::Msg::ToggleStats));
+}
+
+fn sample_pad(vendor: u16, product: u16, name: &str, kind: PadKind, active: bool) -> ConnectedPad {
+    ConnectedPad {
+        key: PadKey {
+            vendor,
+            product,
+            name: name.to_owned(),
+        },
+        kind,
+        active,
+    }
+}
+
+fn guest_pads(app: &mut App) {
+    video(app);
+    if let Some(stats) = app.guest.as_mut().and_then(|state| state.stats.as_mut()) {
+        stats.allowed.gamepad_slot = Some(2);
+    }
+    let eightbitdo = sample_pad(
+        0x2dc8,
+        0x6012,
+        "8BitDo Ultimate 2 Wireless Controller",
+        PadKind::Hid,
+        true,
+    );
+    let xbox = sample_pad(
+        0x045e,
+        0x0b12,
+        "Xbox Wireless Controller",
+        PadKind::XInput,
+        false,
+    );
+    app.settings.input.pad = PadChoice::Pad(eightbitdo.key.clone());
+    app.update(Message::Guest(guest::Msg::Pads(
+        vec![eightbitdo.clone()],
+        true,
+    )));
+    app.update(Message::Guest(guest::Msg::Pads(
+        vec![eightbitdo, xbox],
+        true,
+    )));
+    app.update(Message::Guest(guest::Msg::TogglePads));
 }
 
 fn guest_reconnecting(app: &mut App) {

@@ -32,6 +32,7 @@ ejecuta cada objetivo 120 s con AddressSanitizer cada semana y a mano.
 | `proto_media` | `ObjectHeader::parse` y `parse_datagram`; ida y vuelta | El datagrama |
 | `proto_audio` | `AudioHeader::parse`; ida y vuelta | El paquete |
 | `proto_input` | `InputPacket`, `InputMessage`, datagramas, preámbulo y `StreamFrames` | Byte de modo (`% 4`) y el resto (en modo 3, trozos) |
+| `proto_hid` | Descriptores de informes HID (`hid::parse`): límites de tamaño de los informes | Todo el descriptor |
 | `proto_control` | `FrameBuffer` + `ControlMessage`; ida y vuelta | Trozos del stream |
 | `proto_signal` | `FrameBuffer::with_max(MAX_SIGNAL_MESSAGE)` + `SignalMessage` | Trozos del stream |
 | `proto_api` | Tipos JSON de la API (24 tipos) y hexadecimal | Byte de tipo y el cuerpo |

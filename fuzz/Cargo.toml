@@ -62,6 +62,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "proto_hid"
+path = "fuzz_targets/proto_hid.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "proto_audio"
 path = "fuzz_targets/proto_audio.rs"
 test = false

@@ -18,7 +18,7 @@ use std::time::Duration;
 use coroom_session::audio::GameCapture;
 use coroom_session::audio::apps::{AppFilter, PlayingApp, normalize};
 use coroom_session::capture::{CaptureTarget, PickedShare, ShareChoice, ShareKind};
-use coroom_session::remote::{GuestStatus, SessionEvent, permissions_label};
+use coroom_session::remote::{GuestStatus, PadTransport, SessionEvent, permissions_label};
 use coroom_session::{GuestId, Permissions};
 use coroom_ui::Element;
 use coroom_ui::icon::{Icon, icon_with};
@@ -114,6 +114,20 @@ impl std::fmt::Display for PadSlot {
             None => f.write_str(t!("pantalla-host-sin-mando")),
             Some(slot) => write!(f, "{}", t!("pantalla-host-ranura-slot", slot = slot)),
         }
+    }
+}
+
+/// Cómo llega el mando de un invitado: tal cual (`true`) o convertido a Xbox 360.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PadMode(pub bool);
+
+impl std::fmt::Display for PadMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0 {
+            t!("pantalla-host-tal-cual")
+        } else {
+            t!("pantalla-host-convertido-a-xbox-360")
+        })
     }
 }
 
@@ -336,6 +350,8 @@ pub enum Msg {
     Keyboard(GuestId, bool),
     /// Mando de un invitado.
     Pad(GuestId, PadSlot),
+    /// Si el mando de un invitado va tal cual o convertido.
+    PadMode(GuestId, PadMode),
     /// Voz de un invitado.
     GuestVoice(GuestId, bool),
     /// Expulsar (pide confirmación).
@@ -476,6 +492,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
             return set_permissions(app, id, |p| p.gamepad_slot = slot.0);
         }
+        Msg::PadMode(id, mode) => return set_permissions(app, id, |p| p.gamepad_raw = mode.0),
         Msg::GuestVoice(id, on) => return set_permissions(app, id, |p| p.voice = on),
         Msg::Kick(id) => {
             if let Some(status) = guest(app, id) {
@@ -1218,12 +1235,22 @@ fn guest_card<'a>(app: &'a App, status: &'a GuestStatus) -> Element<'a, Message>
         ]
         .spacing(space::XS)
         .align_y(Alignment::Center),
-        row![
-            icon_with(Icon::Gamepad, 18.0, SvgClass::Secondary),
-            ui::select(slots, Some(current), move |slot| on(Msg::Pad(id, slot)))
-        ]
-        .spacing(space::XS)
-        .align_y(Alignment::Center),
+        {
+            let mut pad = row![
+                icon_with(Icon::Gamepad, 18.0, SvgClass::Secondary),
+                ui::select(slots, Some(current), move |slot| on(Msg::Pad(id, slot)))
+            ]
+            .spacing(space::XS)
+            .align_y(Alignment::Center);
+            if status.permissions.gamepad_slot.is_some() {
+                pad = pad.push(ui::select(
+                    vec![PadMode(true), PadMode(false)],
+                    Some(PadMode(status.permissions.gamepad_raw)),
+                    move |mode| on(Msg::PadMode(id, mode)),
+                ));
+            }
+            pad
+        },
         row![
             icon_with(Icon::Mic, 18.0, SvgClass::Secondary),
             ui::body(t!("pantalla-host-voz")),
@@ -1238,6 +1265,9 @@ fn guest_card<'a>(app: &'a App, status: &'a GuestStatus) -> Element<'a, Message>
     .spacing(space::L)
     .align_y(Alignment::Center);
     let mut card = column![header, permissions].spacing(space::S);
+    if status.permissions.gamepad_slot.is_some() {
+        card = card.push(pad_line(status));
+    }
     if !status.input_key
         && (status.permissions.keyboard_mouse || status.permissions.gamepad_slot.is_some())
     {
@@ -1246,6 +1276,38 @@ fn guest_card<'a>(app: &'a App, status: &'a GuestStatus) -> Element<'a, Message>
         )));
     }
     ui::card(card)
+}
+
+/// El mando que declara el invitado (nombre, VID:PID y cómo llega) y, si no va tal cual
+/// pudiendo, por qué.
+fn pad_line(status: &GuestStatus) -> Element<'_, Message> {
+    let Some(pad) = &status.gamepad else {
+        return ui::caption(t!("pantalla-host-todavia-no-ha-conectado-ningun-mando")).into();
+    };
+    let transport = match pad.transport {
+        PadTransport::Hid => "HID",
+        PadTransport::XInput => "XInput",
+        PadTransport::Converted => t!("pantalla-host-solo-convertido"),
+    };
+    let mut line = column![
+        row![
+            ui::caption(t!("pantalla-host-su-mando-name", name = pad.name.as_str())),
+            ui::status_badge(
+                Tone::Neutral,
+                format!("{:04x}:{:04x} · {transport}", pad.vendor, pad.product)
+            ),
+        ]
+        .spacing(space::XS)
+        .align_y(Alignment::Center)
+    ]
+    .spacing(2);
+    if let Some(note) = &pad.note {
+        line = line.push(ui::caption(t!(
+            "pantalla-host-va-convertido-note",
+            note = note.as_str()
+        )));
+    }
+    line.into()
 }
 
 fn room_view<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
@@ -1393,6 +1455,7 @@ mod tests {
             target_kbps: None,
             input_key: true,
             input: Default::default(),
+            gamepad: None,
         }
     }
 

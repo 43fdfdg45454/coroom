@@ -16,7 +16,8 @@
 //!   píxeles por muesca, guardando los restos.
 //! - **Atajos** (no se envían al anfitrión): `Ctrl+Alt+G` alterna inmersivo y escritorio y suelta
 //!   la captura; `Ctrl+Alt+O` muestra u oculta el overlay; `Ctrl+Alt+Q` sale;
-//!   `Ctrl+Alt+M` silencia o reactiva el micrófono y `Ctrl+Alt+V` el audio del juego. Sin permiso
+//!   `Ctrl+Alt+M` silencia o reactiva el micrófono, `Ctrl+Alt+V` el audio del juego y
+//!   `Ctrl+Alt+J` muestra u oculta el panel de mandos. Sin permiso
 //!   de teclado, `Esc` también sale.
 //! - **Pulsar para hablar** ([`InputCapture::set_push_to_talk`]): la tecla elegida
 //!   (`--ptt TECLA`) no va al anfitrión; pulsarla y soltarla dan [`Action::PushToTalk`].
@@ -89,6 +90,8 @@ pub struct ShortcutKeys {
     pub mic: KeyCode,
     /// Audio del juego (`V`).
     pub game: KeyCode,
+    /// Panel de mandos (`J`).
+    pub pads: KeyCode,
 }
 
 impl Default for ShortcutKeys {
@@ -99,6 +102,7 @@ impl Default for ShortcutKeys {
             quit: KeyCode::KeyQ,
             mic: KeyCode::KeyM,
             game: KeyCode::KeyV,
+            pads: KeyCode::KeyJ,
         }
     }
 }
@@ -118,6 +122,8 @@ pub enum Action {
     ToggleMicMute,
     /// Silenciar o reactivar el audio del juego (`Ctrl+Alt+V`).
     ToggleGameMute,
+    /// Mostrar u ocultar el panel de mandos (`Ctrl+Alt+J`).
+    TogglePads,
     /// La tecla de pulsar para hablar se pulsó (`true`) o se soltó.
     PushToTalk(bool),
 }
@@ -288,6 +294,8 @@ impl InputCapture {
             Some(vec![Action::ToggleMicMute])
         } else if code == keys.game {
             Some(vec![Action::ToggleGameMute])
+        } else if code == keys.pads {
+            Some(vec![Action::TogglePads])
         } else if code == keys.quit {
             let mut out = self.release();
             out.push(Action::Quit);

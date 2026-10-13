@@ -299,7 +299,8 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                         1 => shortcuts.stats = letter,
                         2 => shortcuts.leave = letter,
                         3 => shortcuts.mic = letter,
-                        _ => shortcuts.game = letter,
+                        4 => shortcuts.game = letter,
+                        _ => shortcuts.pads = letter,
                     }
                     if !shortcuts.is_valid() {
                         app.toast(
@@ -812,6 +813,7 @@ fn input(app: &App) -> Element<'_, Message> {
         t!("pantalla-settings-salir-de-la-sala"),
         t!("pantalla-settings-silenciar-el-microfono"),
         t!("pantalla-settings-silenciar-el-audio-del-juego"),
+        t!("pantalla-settings-panel-de-mandos"),
     ];
     let letters = shortcuts.letters();
     let mut rows: Vec<Element<'_, Message>> = names

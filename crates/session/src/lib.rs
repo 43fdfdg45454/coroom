@@ -74,7 +74,7 @@ impl SessionState {
 pub use coroom_input::GuestId;
 
 /// Permisos de un invitado (el anfitrión los aplica antes de inyectar su entrada).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Permissions {
     /// Puede usar teclado y ratón.
     pub keyboard_mouse: bool,
@@ -82,14 +82,25 @@ pub struct Permissions {
     pub gamepad_slot: Option<u8>,
     /// Puede hablar por voz.
     pub voice: bool,
+    /// Su mando va tal cual (con su identidad y sus botones) si se puede; si no, convertido a
+    /// Xbox 360.
+    pub gamepad_raw: bool,
+}
+
+impl Default for Permissions {
+    fn default() -> Self {
+        Self::VIEW_ONLY
+    }
 }
 
 impl Permissions {
-    /// Solo mirar: sin entrada ni voz. Es el permiso con el que entra un invitado.
+    /// Solo mirar: sin entrada ni voz. Es el permiso con el que entra un invitado (con el mando
+    /// tal cual para cuando se le dé ranura).
     pub const VIEW_ONLY: Permissions = Permissions {
         keyboard_mouse: false,
         gamepad_slot: None,
         voice: false,
+        gamepad_raw: true,
     };
 }
 

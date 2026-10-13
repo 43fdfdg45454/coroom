@@ -391,8 +391,11 @@ impl Backend {
                     ))));
                 });
             }
-            Effect::Copy(_) | Effect::SetFullscreen(_) | Effect::Quit | Effect::SetImmersive(_) => {
-            }
+            Effect::Copy(_)
+            | Effect::SetFullscreen(_)
+            | Effect::Quit
+            | Effect::SetImmersive(_)
+            | Effect::SetPadChoice(_) => {}
         }
     }
 

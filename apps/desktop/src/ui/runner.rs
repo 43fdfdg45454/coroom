@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use coroom_render::hdr::HdrOutput;
 use coroom_render::wgpu::{Acquired, GpuContext, HdrSurface, acquire, create_instance};
 use coroom_session::input::capture::{Action, CaptureMode, InputCapture, ShortcutKeys};
-use coroom_session::input::gamepad::GamepadCapture;
+use coroom_session::input::gamepad::{ConnectedPad, GamepadCapture, PadLink};
 use coroom_session::input::keymap::keycode_from_name;
 use coroom_session::latency::LatencySummary;
 use coroom_transport::crypto::Identity;
@@ -93,6 +93,8 @@ struct WindowInput {
     controls: GuestControls,
     capture: InputCapture,
     gamepads: Option<GamepadCapture>,
+    /// Último estado de los mandos que vio la interfaz.
+    pads: Option<(Vec<ConnectedPad>, bool)>,
     confined: bool,
     mode: CaptureMode,
 }
@@ -185,6 +187,7 @@ fn shortcut_keys(shortcuts: &Shortcuts) -> ShortcutKeys {
         quit: letter_key(shortcuts.leave).unwrap_or(default.quit),
         mic: letter_key(shortcuts.mic).unwrap_or(default.mic),
         game: letter_key(shortcuts.game).unwrap_or(default.game),
+        pads: letter_key(shortcuts.pads).unwrap_or(default.pads),
     }
 }
 
@@ -427,6 +430,11 @@ impl Ready {
                         self.apply(actions);
                     }
                 }
+                Effect::SetPadChoice(choice) => {
+                    if let Some(gamepads) = self.input.as_ref().and_then(|i| i.gamepads.as_ref()) {
+                        gamepads.set_choice(choice);
+                    }
+                }
                 Effect::SaveSettings => {
                     if let Some(input) = self.input.as_mut() {
                         input
@@ -451,12 +459,13 @@ impl Ready {
         if let Some(name) = &controls.push_to_talk {
             capture.set_push_to_talk(keycode_from_name(name));
         }
-        let sender = controls.input.clone();
-        let gamepads = GamepadCapture::spawn(Box::new(move |event| sender.send(event))).ok();
+        let link: Arc<dyn PadLink> = Arc::new(controls.input.clone());
+        let gamepads = GamepadCapture::spawn(link, self.app.settings.input.pad.clone()).ok();
         self.input = Some(WindowInput {
             controls,
             capture,
             gamepads,
+            pads: None,
             confined: false,
             mode: CaptureMode::Desktop,
         });
@@ -482,6 +491,9 @@ impl Ready {
                 Action::Grab(grab) => self.grab(grab),
                 Action::ToggleOverlay => {
                     self.dispatch(Message::Guest(guest::Msg::ToggleStats));
+                }
+                Action::TogglePads => {
+                    self.dispatch(Message::Guest(guest::Msg::TogglePads));
                 }
                 Action::Quit => {
                     let effects = guest::leave(&mut self.app);
@@ -552,12 +564,28 @@ impl Ready {
             input.capture.set_host_frame(width, height);
         }
         let allowed = input.controls.input.allowed();
+        let mut pads = None;
+        if let Some(gamepads) = &input.gamepads {
+            let now = (
+                gamepads.pads(),
+                allowed
+                    .gamepad_slot
+                    .is_some_and(|slot| input.controls.input.raw(slot)),
+            );
+            if input.pads.as_ref() != Some(&now) {
+                input.pads = Some(now.clone());
+                pads = Some(now);
+            }
+        }
         if allowed != input.capture.allowed() {
             if let Some(gamepads) = &input.gamepads {
                 gamepads.set_slot(allowed.gamepad_slot);
             }
             let actions = input.capture.set_allowed(allowed);
             self.apply(actions);
+        }
+        if let Some((pads, raw)) = pads {
+            self.dispatch(Message::Guest(guest::Msg::Pads(pads, raw)));
         }
     }
 

@@ -19,6 +19,8 @@ use std::fmt;
 
 pub mod capture;
 pub mod gamepad;
+#[cfg(all(target_os = "linux", feature = "linux-portal"))]
+pub mod hidraw;
 pub mod inject;
 pub mod keymap;
 pub mod script;

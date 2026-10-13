@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use coroom_session::input::capture::Allowed;
+use coroom_session::input::gamepad::{ConnectedPad, PadChoice, PadKey, PadKind};
 use coroom_session::latency::LatencySummary;
 use coroom_session::remote::{QualityLevel, SessionEvent};
 use coroom_transport::Path;
@@ -113,6 +114,12 @@ pub struct State {
     pub stats: Option<Stats>,
     /// Panel de estadísticas abierto.
     pub stats_open: bool,
+    /// Panel de mandos abierto.
+    pub pads_open: bool,
+    /// Mandos conectados a este equipo (`None`: aún no se sabe).
+    pub pads: Option<Vec<ConnectedPad>>,
+    /// Si el mando que se envía va tal cual.
+    pub pads_raw: bool,
     /// Hasta cuándo se ve la barra.
     pub bar_until: Instant,
     /// Modo inmersivo.
@@ -178,6 +185,9 @@ impl State {
             codec: None,
             stats: None,
             stats_open: false,
+            pads_open: false,
+            pads: None,
+            pads_raw: false,
             bar_until: now,
             immersive: false,
             reconnecting: None,
@@ -231,6 +241,12 @@ impl State {
 pub enum Msg {
     /// Panel de estadísticas.
     ToggleStats,
+    /// Panel de mandos.
+    TogglePads,
+    /// Mandos conectados y si el que se envía va tal cual.
+    Pads(Vec<ConnectedPad>, bool),
+    /// Elegir qué mando enviar.
+    ChoosePad(PadChoice),
     /// Inmersivo.
     ToggleImmersive,
     /// Micrófono.
@@ -304,7 +320,30 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         return Vec::new();
     };
     match msg {
-        Msg::ToggleStats => state.stats_open = !state.stats_open,
+        Msg::ToggleStats => {
+            state.stats_open = !state.stats_open;
+            state.pads_open &= !state.stats_open;
+        }
+        Msg::TogglePads => {
+            state.pads_open = !state.pads_open;
+            state.stats_open &= !state.pads_open;
+        }
+        Msg::Pads(pads, raw) => {
+            let slot = state.stats.as_ref().and_then(|s| s.allowed.gamepad_slot);
+            let notice = state
+                .pads
+                .as_ref()
+                .and_then(|before| pads_notice(before, &pads, slot.is_some()));
+            state.pads = Some(pads);
+            state.pads_raw = raw;
+            if let Some(notice) = notice {
+                app.toast(Tone::Info, notice);
+            }
+        }
+        Msg::ChoosePad(choice) => {
+            app.settings.input.pad = choice.clone();
+            return vec![Effect::SetPadChoice(choice), Effect::SaveSettings];
+        }
         Msg::ToggleImmersive => {
             state.immersive = !state.immersive;
             if state.immersive {
@@ -346,6 +385,48 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         }
     }
     Vec::new()
+}
+
+/// Aviso de un mando que se conectó o se desconectó, con el que se envía ahora si hay ranura.
+fn pads_notice(before: &[ConnectedPad], after: &[ConnectedPad], slot: bool) -> Option<String> {
+    let has = |list: &[ConnectedPad], key: &PadKey| list.iter().any(|pad| &pad.key == key);
+    let active = after
+        .iter()
+        .find(|pad| pad.active)
+        .map(|pad| pad.key.name.as_str());
+    let (mut text, connected) = if let Some(pad) = after.iter().find(|p| !has(before, &p.key)) {
+        (
+            t!(
+                "pantalla-guest-mando-conectado",
+                name = pad.key.name.as_str()
+            ),
+            Some(&pad.key),
+        )
+    } else {
+        let pad = before.iter().find(|p| !has(after, &p.key))?;
+        (
+            t!(
+                "pantalla-guest-mando-desconectado",
+                name = pad.key.name.as_str()
+            ),
+            None,
+        )
+    };
+    if slot {
+        let more = match (active, connected) {
+            (Some(name), Some(key)) if name != key.name => {
+                t!("pantalla-guest-sigues-enviando", name = name)
+            }
+            (Some(name), None) => t!("pantalla-guest-ahora-envias", name = name),
+            (None, None) => t!("pantalla-guest-no-envias-ningun-mando").to_owned(),
+            _ => String::new(),
+        };
+        if !more.is_empty() {
+            text.push(' ');
+            text.push_str(&more);
+        }
+    }
+    Some(text)
 }
 
 /// Texto del cambio de permisos, si cambió algo que contar.
@@ -843,6 +924,12 @@ fn top_bar<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         ));
     }
     buttons = buttons.push(bar_button(
+        Icon::Gamepad,
+        t!("pantalla-guest-mandos", key = keys.pads),
+        state.pads_open,
+        on(Msg::TogglePads),
+    ));
+    buttons = buttons.push(bar_button(
         Icon::Activity,
         t!("pantalla-guest-estadisticas", key = keys.stats),
         state.stats_open,
@@ -910,6 +997,120 @@ fn stat_section<'a>(title: &'a str, rows: Vec<Element<'a, Message>>) -> Element<
         content = content.push(row);
     }
     content.into()
+}
+
+/// Una opción del panel de mandos.
+fn pad_option<'a>(
+    selected: bool,
+    name: String,
+    detail: Option<String>,
+    badges: Vec<String>,
+    choice: PadChoice,
+) -> Element<'a, Message> {
+    let mark: Element<'a, Message> = if selected {
+        icon_with(Icon::Check, 16.0, SvgClass::Overlay)
+    } else {
+        Space::new().width(Length::Fixed(16.0)).into()
+    };
+    let mut texts = column![
+        text(name)
+            .size(type_size::BODY)
+            .font(coroom_ui::font::SEMIBOLD)
+            .class(TextClass::Overlay)
+            .wrapping(Wrapping::WordOrGlyph)
+    ]
+    .spacing(1);
+    if let Some(detail) = detail {
+        texts = texts.push(overlay_text(detail));
+    }
+    if !badges.is_empty() {
+        let mut chips = row![].spacing(space::XXS);
+        for badge in badges {
+            chips = chips.push(ui::status_badge(Tone::Neutral, badge));
+        }
+        texts = texts.push(chips);
+    }
+    button(
+        row![mark, texts.width(Length::Fill)]
+            .spacing(space::XS)
+            .align_y(Alignment::Center),
+    )
+    .padding(Padding::from([6.0, 8.0]))
+    .width(Length::Fill)
+    .class(ButtonClass::Overlay { active: selected })
+    .on_press(on(Msg::ChoosePad(choice)))
+    .into()
+}
+
+/// Panel de mandos: cuál se envía (automático o uno concreto) entre los conectados.
+fn pads_panel<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
+    let choice = &app.settings.input.pad;
+    let slot = state.stats.as_ref().and_then(|s| s.allowed.gamepad_slot);
+    let pads = state.pads.as_deref().unwrap_or_default();
+    let mut options = vec![pad_option(
+        *choice == PadChoice::Auto,
+        t!("pantalla-guest-automatico").to_owned(),
+        Some(t!("pantalla-guest-el-ultimo-que-conectes").to_owned()),
+        Vec::new(),
+        PadChoice::Auto,
+    )];
+    for pad in pads {
+        let detail = if pad.active {
+            match slot {
+                Some(slot) => t!("pantalla-guest-enviando-ranura", slot = slot),
+                None => t!("pantalla-guest-sin-ranura").to_owned(),
+            }
+        } else {
+            t!("pantalla-guest-conectado").to_owned()
+        };
+        let transport = match &pad.kind {
+            PadKind::Hid => "HID",
+            PadKind::XInput => "XInput",
+            PadKind::Converted(_) => t!("pantalla-guest-solo-convertido"),
+        };
+        let mut badges = vec![format!(
+            "{:04x}:{:04x} · {transport}",
+            pad.key.vendor, pad.key.product
+        )];
+        if pad.active && slot.is_some() {
+            badges.push(if state.pads_raw {
+                t!("pantalla-guest-tal-cual").to_owned()
+            } else {
+                t!("pantalla-guest-convertido").to_owned()
+            });
+        }
+        options.push(pad_option(
+            *choice == PadChoice::Pad(pad.key.clone()),
+            pad.key.name.clone(),
+            Some(detail),
+            badges,
+            PadChoice::Pad(pad.key.clone()),
+        ));
+    }
+    // El elegido, aunque ahora no esté conectado.
+    if let PadChoice::Pad(key) = choice
+        && !pads.iter().any(|pad| &pad.key == key)
+    {
+        options.push(pad_option(
+            true,
+            key.name.clone(),
+            Some(t!("pantalla-guest-desconectado").to_owned()),
+            vec![format!("{:04x}:{:04x}", key.vendor, key.product)],
+            choice.clone(),
+        ));
+    }
+    let mut content = Column::new()
+        .spacing(space::S)
+        .push(stat_section(t!("pantalla-guest-mando-que-envias"), options));
+    if pads.is_empty() {
+        content = content.push(overlay_text(t!("pantalla-guest-no-hay-mandos-conectados")));
+    }
+    content = content.push(overlay_text(t!("pantalla-guest-se-recuerda-la-eleccion")));
+    container(content)
+        .padding(space::M)
+        .width(Length::Fixed(size::STATS_PANEL))
+        .class(ContainerClass::Overlay)
+        .into()
 }
 
 fn stats_panel<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
@@ -1071,6 +1272,7 @@ fn shortcuts_line(shortcuts: &crate::ui::settings::Shortcuts) -> String {
         stats = shortcuts.stats,
         mic = shortcuts.mic,
         game = shortcuts.game,
+        pads = shortcuts.pads,
         leave = shortcuts.leave
     )
 }
@@ -1096,6 +1298,13 @@ fn video<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     if state.stats_open {
         overlay = overlay.push(
             container(stats_panel(app, state))
+                .width(Length::Fill)
+                .align_x(Horizontal::Right),
+        );
+    }
+    if state.pads_open {
+        overlay = overlay.push(
+            container(pads_panel(app, state))
                 .width(Length::Fill)
                 .align_x(Horizontal::Right),
         );
