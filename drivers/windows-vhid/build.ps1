@@ -218,6 +218,14 @@ try {
         Copy-Item (Join-Path $built 'coroomvhid.pdb') $package -ErrorAction SilentlyContinue
         $packageInf = Join-Path $package 'coroomvhid.inf'
         Write-Host "INF: $((Select-String -Path $packageInf -Pattern '^\s*DriverVer').Line.Trim())"
+        # La versión de UMDF que pide el INF: con una más nueva que la del sistema, Windows no
+        # arranca el dispositivo (2.31 es la de Windows 10 2004-22H2; ver coroomvhid.vcxproj).
+        $umdf = @(Select-String -Path $packageInf -Pattern '^\s*UmdfLibraryVersion\s*=\s*(\S+)' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value })
+        Write-Host "INF: UmdfLibraryVersion = $($umdf -join ', ')"
+        if ($umdf.Count -eq 0 -or ($umdf | Where-Object { $_ -ne '2.31.0' })) {
+            throw "El INF pide UMDF $($umdf -join ', ') y tiene que ser 2.31.0: ¿UMDF_VERSION_MINOR en coroomvhid.vcxproj?"
+        }
 
         # InfVerif: la validación básica tiene que pasar. La de "Windows Driver" (/w, aislamiento
         # del paquete) se muestra solo como aviso: el INF añade el servicio del sistema WUDFRd a

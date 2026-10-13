@@ -47,5 +47,9 @@ windows = { workspace = true, features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+# tests/windows_driver.rs: el driver instalado visto por XInput (job de prueba de driver.yml).
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+windows = { workspace = true, features = ["Win32_UI_Input_XboxController"] }
+
 [lints]
 workspace = true

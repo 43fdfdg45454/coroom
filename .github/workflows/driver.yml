@@ -6,12 +6,14 @@ name: Driver de mando virtual (Windows)
 # deja en el paquete solo la parte pública (coroomvhid.cer) y borra el certificado y su clave al
 # terminar. La clave nunca sale del runner ni se sube: nadie puede firmar después otra cosa con el
 # certificado en el que confía quien instala el paquete. `packages.yml` lo llama en cada push a
-# main con la versión de la release, y «Publicación» adjunta los paquetes. No se carga en ningún
-# Windows aquí: la prueba en un equipo real está en drivers/windows-vhid/README.md.
+# main con la versión de la release, y «Publicación» adjunta los paquetes. El job «Prueba del driver
+# instalado» lo instala en el runner y lo usa con el cliente de coroom-input antes de publicarlo.
 on:
   pull_request:
     paths:
       - "drivers/windows-vhid/**"
+      - "crates/input/src/inject/windows_vhid.rs"
+      - "crates/input/tests/windows_driver.rs"
       - ".github/workflows/driver.yml"
   workflow_dispatch:
     inputs:
@@ -44,7 +46,8 @@ jobs:
         shell: pwsh
         working-directory: drivers/windows-vhid
     env:
-      VERSION: ${{ inputs.version || '0.0.0' }}
+      # InfVerif no acepta DriverVer 0.0.0.0: sin versión (pull request, a mano), 0.0.1.
+      VERSION: ${{ (inputs.version && inputs.version != '0.0.0') && inputs.version || '0.0.1' }}
     steps:
       - uses: actions/checkout@v7
 
@@ -101,3 +104,90 @@ jobs:
           name: coroomvhid-${{ matrix.platform }}
           path: drivers/windows-vhid/package/${{ matrix.platform }}
           if-no-files-found: error
+
+  # El paquete x64 instalado de verdad en el runner (administrador, sin firma de prueba): install.ps1,
+  # los dispositivos arrancados, el cliente de coroom-input contra ellos (tests/windows_driver.rs:
+  # mando tal cual con su VID/PID, informes, salidas y características; Xbox 360 en XInput;
+  # genérico) y uninstall.ps1 sin dejar nada. Si falla, no se publica.
+  smoke:
+    name: Prueba del driver instalado (x64)
+    needs: build
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Versión de Rust (rust-toolchain.toml)
+        id: rust
+        shell: bash
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # aws-lc-sys (por coroom-crypto) compila ensamblador con NASM.
+      - name: NASM
+        uses: ilammy/setup-nasm@v1
+
+      # Antes de instalar, para que el tiempo de instalación no cuente en los límites del test.
+      - name: Compilar el test
+        run: cargo test -p coroom-input --test windows_driver --no-run
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: coroomvhid-x64
+          path: ${{ runner.temp }}/coroomvhid
+
+      - name: Instalar
+        run: ./drivers/windows-vhid/install.ps1 -PackageDir "$env:RUNNER_TEMP\coroomvhid"
+
+      - name: Dispositivos arrancados
+        run: |
+          $devices = @(Get-PnpDevice -PresentOnly | Where-Object { $_.HardwareID -match '^Root\\coroom(vhid|xusb)$' })
+          $devices | Format-Table Status, Class, FriendlyName, InstanceId -AutoSize | Out-String -Width 200 | Write-Host
+          $control = @($devices | Where-Object { $_.HardwareID -contains 'Root\coroomvhid' })
+          $xusb = @($devices | Where-Object { $_.HardwareID -contains 'Root\coroomxusb' })
+          if ($control.Count -ne 1) { throw "Dispositivos de control: $($control.Count) (se espera 1)" }
+          if ($xusb.Count -ne 4) { throw "Xbox 360: $($xusb.Count) (se esperan 4)" }
+          $bad = @($devices | Where-Object { $_.Status -ne 'OK' })
+          if ($bad.Count -ne 0) {
+            $bad | ForEach-Object { Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName DEVPKEY_Device_ProblemCode, DEVPKEY_Device_ProblemStatus } |
+              Format-Table InstanceId, KeyName, Data -AutoSize | Out-String -Width 200 | Write-Host
+            throw "Dispositivos sin arrancar: $($bad.InstanceId -join ', ')"
+          }
+
+      - name: Cliente contra el driver
+        run: cargo test -p coroom-input --test windows_driver -- --ignored --test-threads=1 --nocapture
+
+      - name: Desinstalar
+        run: |
+          ./drivers/windows-vhid/uninstall.ps1
+          $left = @(Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object { $_.HardwareID -match '^Root\\coroom(vhid|xusb)$' })
+          if ($left.Count -ne 0) { throw "Quedan dispositivos: $($left.InstanceId -join ', ')" }
+          $packages = @(Get-WindowsDriver -Online | Where-Object { (Split-Path -Leaf $_.OriginalFileName) -ieq 'coroomvhid.inf' })
+          if ($packages.Count -ne 0) { throw "Quedan paquetes en el almacén: $($packages.Driver -join ', ')" }
+          $certs = @(Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\TrustedPublisher | Where-Object { $_.Subject -eq 'CN=coroom (driver local)' })
+          if ($certs.Count -ne 0) { throw "Quedan certificados: $($certs.Thumbprint -join ', ')" }
+          Write-Host 'No queda nada del driver.'
+
+      - name: Diagnóstico
+        if: failure()
+        run: |
+          Get-PnpDevice | Where-Object { $_.HardwareID -match 'coroom' -or $_.InstanceId -match 'coroom|^HID\\' } |
+            Format-Table Status, Class, FriendlyName, InstanceId -AutoSize | Out-String -Width 250 | Write-Host
+          foreach ($log in 'Microsoft-Windows-DriverFrameworks-UserMode/Operational', 'Microsoft-Windows-Kernel-PnP/Configuration') {
+            Write-Host "== $log"
+            Get-WinEvent -LogName $log -MaxEvents 80 -ErrorAction SilentlyContinue |
+              Format-Table TimeCreated, Id, LevelDisplayName, Message -Wrap | Out-String -Width 250 | Write-Host
+          }
+          Write-Host '== System (UMDF, PnP)'
+          Get-WinEvent -FilterHashtable @{ LogName = 'System'; StartTime = (Get-Date).AddHours(-1) } -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProviderName -match 'UserPnp|DriverFrameworks|Kernel-PnP|WUDF' } |
+            Format-Table TimeCreated, ProviderName, Id, Message -Wrap | Out-String -Width 250 | Write-Host
+          $setupapi = "$env:windir\INF\setupapi.dev.log"
+          if (Test-Path $setupapi) { Write-Host '== setupapi.dev.log'; Get-Content $setupapi -Tail 200 }

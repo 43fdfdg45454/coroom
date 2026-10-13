@@ -209,7 +209,7 @@ hardware real:
 | Área | Qué falta comprobar |
 |---|---|
 | GPU | Matriz NVIDIA, AMD e Intel con Vulkan Video y NVENC/AMF/QSV/VA-API; cero copias a CPU y < 8 ms de codificación + decodificación a 1080p60; 4:4:4 y 10 bits por hardware; `coroom probe` a 1080p60 con p95 < 25 ms en el equipo de referencia |
-| Windows real | Compilación con MSVC, la aplicación, WGC con D3D11, WASAPI con loopback por proceso, `SendInput`, el driver de mando con Driver Verifier, el MSIX instalado y el `.zip` portátil |
+| Windows real | Compilación con MSVC, la aplicación, WGC con D3D11, WASAPI con loopback por proceso, `SendInput`, el driver de mando con juegos, Steam y Driver Verifier (la CI ya lo instala y lo usa con el cliente), el MSIX instalado y el `.zip` portátil |
 | Dos NAT distintas | Dos equipos en redes distintas en directo y con `--force-relay`, `docker compose up` con el certificado del operador, migración de ruta al cambiar de red |
 | Dispositivos de audio y entrada | PipeWire y WASAPI con altavoces (AEC), |A−V| y boca-oído en la LAN; libei y uinput con un cooperativo local de 4 mandos |
 | Pantalla real | Superficie HDR (Windows con HDR, Linux con compositor con gestión de color), captura HDR de WGC y PipeWire, 120 fps en pantalla de 120 Hz, HiDPI fraccionario, tema y acento del portal, decoraciones y modo inmersivo en GNOME y KDE |

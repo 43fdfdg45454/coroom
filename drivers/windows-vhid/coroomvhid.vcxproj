@@ -33,9 +33,6 @@
     <ProjectGuid>{AF6DF77A-E68E-4474-B5EF-FCDB75B996C2}</ProjectGuid>
     <RootNamespace>coroomvhid</RootNamespace>
     <ProjectName>coroomvhid</ProjectName>
-    <!-- UMDF 2.31 is the version inbox in Windows 10 2004-22H2, the oldest system supported. -->
-    <UMDF_VERSION_MAJOR>2</UMDF_VERSION_MAJOR>
-    <UMDF_VERSION_MINOR>31</UMDF_VERSION_MINOR>
     <Configuration Condition="'$(Configuration)' == ''">Release</Configuration>
     <Platform Condition="'$(Platform)' == ''">x64</Platform>
   </PropertyGroup>
@@ -44,6 +41,12 @@
     <TargetVersion>Windows10</TargetVersion>
     <DriverTargetPlatform>Windows Driver</DriverTargetPlatform>
     <DriverType>UMDF</DriverType>
+    <!-- UMDF 2.31 is the version inbox in Windows 10 2004-22H2, the oldest system supported. It
+         goes after Microsoft.Cpp.Default.props: set before, the WDK props replace it with the
+         latest of the kit (2.35 in 10.0.28000), stamped as UmdfLibraryVersion, and older
+         Windows refuse to start the device. build.ps1 checks the stamped INF. -->
+    <UMDF_VERSION_MAJOR>2</UMDF_VERSION_MAJOR>
+    <UMDF_VERSION_MINOR>31</UMDF_VERSION_MINOR>
     <PlatformToolset>WindowsUserModeDriver10.0</PlatformToolset>
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <SpectreMitigation>Spectre</SpectreMitigation>

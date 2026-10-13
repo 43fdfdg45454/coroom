@@ -41,6 +41,16 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **Driver de mandos de Windows** (el de la v1.3.0 puede no arrancar: hay que volver a ejecutar
+  `install.ps1` con el paquete nuevo). El INF pedía UMDF 2.35, la última del WDK con el que se
+  compila, en lugar de 2.31 (Windows 10 22H2), y Windows no arrancaba el dispositivo de control
+  en los sistemas sin esa versión; `build.ps1` comprueba ahora la versión del INF. Los Xbox 360
+  llevaban `xinputhid` como filtro: donde no existe, no arrancaban (código 19), y donde existe se
+  cargaba sobre un dispositivo que no es HID. Ahora no llevan filtros, como uno por cable.
+- La CI instala el driver en un Windows (job «Prueba del driver instalado» de `driver.yml`) y lo
+  usa con el cliente de coroom antes de publicarlo: mando tal cual con su VID/PID, informes,
+  salidas y características; Xbox 360 en XInput; mando genérico; un solo cliente; desinstalación
+  sin restos (`crates/input/tests/windows_driver.rs`).
 - 8BitDo Ultimate 2 en Linux: el stick derecho se leía como gatillos (faltaba su mapeo de SDL).
 - Flatpak: `--device=all` en lugar de `--device=input`, que no daba `/dev/hidraw*` ni `/dev/uhid`.
 

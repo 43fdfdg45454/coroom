@@ -179,9 +179,19 @@ versiones antiguas). No hay nada más que deshacer.
 
 ## Probar en Windows real
 
-Nada de esto se ha probado todavía en un Windows real: la CI solo compila y firma. Para darlo por
-bueno, en Windows 11 y en Windows 10 22H2, con el arranque seguro y la integridad de memoria
-activados:
+La CI (job «Prueba del driver instalado» de
+[`driver.yml`](../../.github/workflows/driver.yml), antes de cada publicación) instala el paquete
+x64 en un runner de Windows Server 2025 con `install.ps1`, comprueba que el dispositivo de control
+y los cuatro Xbox 360 arrancan y ejecuta
+[`crates/input/tests/windows_driver.rs`](../../crates/input/tests/windows_driver.rs) con el
+cliente de coroom: un segundo cliente no puede abrir el driver; un convertido es un Xbox 360 que
+XInput ve con los botones que se mandan; un tal cual aparece como HID con su VID/PID, contesta sus
+características con las del invitado, entrega sus informes y devuelve las salidas que le escribe
+Windows; sin Xbox 360 libres sale el genérico; al cerrar no queda ningún mando. Después,
+`uninstall.ps1` y comprueba que no quedan dispositivos, paquete ni certificados.
+
+Lo que la CI no ve (sin juegos, sin Steam, sin mandos físicos, sin Windows de escritorio), en
+Windows 11 y en Windows 10 22H2, con el arranque seguro y la integridad de memoria activados:
 
 1. `install.ps1` sin errores ni avisos y `coroom doctor`.
 2. **Convertido**: `coroom host --auto-allow pad` y un invitado con mando, con «Convertido a Xbox
@@ -204,11 +214,10 @@ Anota los resultados (versión de Windows, arquitectura, mandos, juegos) en un i
 
 ## Lo que falta por verificar
 
-- **Todo en un equipo real** (ver la lista de arriba): la CI no carga el driver.
-- **VHF desde UMDF2**: Microsoft lo documenta (`VHF_CONFIG.FileHandle`, `VhfUm.lib`) y lo usa al
-  menos otro proyecto, pero no se ha probado con este driver.
-- **Los IOCTL de `xusb22`**: no están documentados; se siguen los valores de HIDMaestro,
-  comprobados por ellos con un mando de Xbox 360 por cable.
+- **En un equipo de escritorio** (la lista de arriba): la CI lo prueba en Windows Server 2025 x64,
+  sin juegos ni Steam; ARM64 solo se compila.
+- **Los IOCTL de `xusb22`**: no están documentados; se siguen los valores de HIDMaestro. XInput los
+  acepta en la CI (estado y botones); vibración y Windows.Gaming.Input, sin probar.
 - **Mandos que preguntan al PC**: un Switch Pro manda subcomandos y espera respuesta por informes
   de entrada; hoy esas preguntas llegan al mando del invitado como salidas y su respuesta vuelve
   como un informe más, con la latencia de la red. Si algún mando no lo tolera, irá convertido.

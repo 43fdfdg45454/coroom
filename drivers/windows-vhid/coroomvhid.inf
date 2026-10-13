@@ -6,9 +6,8 @@
 ;     vhf.sys (inbox) is its lower filter; the gamepads it creates with VhfCreate appear as its
 ;     children ("HID-compliant game controller") with the identity the client gives.
 ;   - Root\coroomxusb (COROOM_VHID_XUSB_SLOTS of them): Xbox 360 controllers for XInput, through
-;     the xusb22 device interface. "xinputhid" in UpperFilters is only the mark that
-;     Windows.Gaming.Input looks for on XUSB devices; xinputhid.sys does not attach to a device of
-;     class System.
+;     the xusb22 device interface, like a wired one: no filters (Windows loads every service in
+;     UpperFilters, and a missing one stops the device with code 19).
 ;
 ; WUDFRd.sys (inbox) is the function driver of both and loads the DLL in WUDFHost.exe; the same
 ; sections serve Windows 10 22H2 and Windows 11. Both are inbox drivers signed by Microsoft; the
@@ -86,7 +85,6 @@ CopyFiles = CoroomVhid_CopyFiles
 AddReg = CoroomXusb_AddReg
 
 [CoroomXusb_AddReg]
-HKR,,"UpperFilters",0x00010008,"xinputhid"
 HKR,,"CoroomKind",0x00010001,1
 ; Games open it as any user (XInput); the private IOCTLs only work for the client that activated
 ; the slot.

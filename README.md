@@ -585,9 +585,11 @@ simulada, expulsión, A/B del cifrado, negociación de códec y cursor). `apps/d
 prueba la entrada igual, con un `RecordingSink` en el anfitrión: permisos, ratón a 1000 Hz sin
 pérdida, ranuras de mando, pausa, expulsión, latencia de entrada y el relay. El mando uinput real
 se prueba a mano con acceso a `/dev/uinput`: `cargo test -p coroom-input -- --ignored`. El
-driver de mando virtual de Windows solo lo compila y firma su propia CI
-(`.github/workflows/driver.yml`, con el WDK); su formato (descriptores HID, informes, INF y scripts)
-lo prueban los tests de `coroom-input` en cualquier sistema, y su prueba en Windows real está en
+driver de mando virtual de Windows lo compila, lo firma y lo instala en un runner de Windows su
+propia CI (`.github/workflows/driver.yml`, con el WDK), que lo usa con el cliente de coroom
+(`crates/input/tests/windows_driver.rs`: tal cual, Xbox 360 en XInput, genérico) antes de
+publicarlo; su formato (descriptores HID, informes, INF y scripts) lo prueban los tests de
+`coroom-input` en cualquier sistema, y lo que falta probar en un Windows de escritorio está en
 `drivers/windows-vhid/README.md`.
 `crates/codec/tests/ffmpeg.rs`
 prueba los códecs de FFmpeg por software (AV1 SVT-AV1 → dav1d, también en HDR10 a 10 bits, H.264
