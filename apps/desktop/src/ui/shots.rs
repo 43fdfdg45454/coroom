@@ -200,8 +200,12 @@ pub fn scenes() -> Vec<Scene> {
 
 type Builder = fn(&mut App);
 
-const BUILDERS: [(&str, Builder); 27] = [
+const BUILDERS: [(&str, Builder); 28] = [
     ("01-servidores", servers),
+    ("01-servidores-cambiar", |app| {
+        home(app);
+        app.update(Message::SwitchServer);
+    }),
     ("02-servidor-nuevo", new_server),
     ("03-entrar", sign_in),
     ("04-crear-cuenta", create_account),

@@ -23,6 +23,9 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- «Cambiar de servidor» ya no cierra la sesión: la lista de servidores tiene «Volver» a la
+  cuenta abierta, y elegir un servidor con la sesión guardada entra sin pedir la contraseña (solo
+  la pide si no la hay o ya no vale).
 - KDE Plasma: compartir solo ofrecía «control remoto» sobre todos los monitores, sin dejar elegir
   uno ni una ventana. La captura y el control remoto van ahora en dos sesiones del portal: primero
   el selector de pantallas y ventanas del escritorio, después el permiso de teclado y ratón. Con un

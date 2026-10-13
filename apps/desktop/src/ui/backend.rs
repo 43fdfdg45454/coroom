@@ -209,6 +209,11 @@ impl Backend {
                     notify(Message::Event(restore(&servers)));
                 });
             }
+            Effect::Resume(server) => {
+                self.spawn("recuperar", move |notify| {
+                    notify(Message::Event(resume_server(server)));
+                });
+            }
             Effect::SignOut => {
                 if let Some(options) = account {
                     self.spawn("cerrar", move |notify| {
@@ -803,6 +808,20 @@ fn restore(servers: &[ServerEntry]) -> Event {
             tcp_port: None,
             username: None,
         });
+    resume_from(&store, server)
+}
+
+/// Recupera la sesión guardada de `server` y lo deja como el último (el que se recupera al abrir).
+fn resume_server(server: ServerEntry) -> Event {
+    let store = AccountStore::new(None, false);
+    let event = resume_from(&store, server.clone());
+    if matches!(event, Event::SignedIn(Ok(_))) {
+        store.set_last_server(&server.url);
+    }
+    event
+}
+
+fn resume_from(store: &AccountStore, server: ServerEntry) -> Event {
     let mut options = account_options(&server);
     match store.load(&server.url) {
         Ok(Some(credentials)) => {

@@ -342,6 +342,8 @@ pub enum Effect {
     },
     /// Recuperar la sesión guardada del último servidor.
     Restore,
+    /// Recuperar la sesión guardada de un servidor elegido (al cambiar de servidor).
+    Resume(ServerEntry),
     /// Cerrar sesión.
     SignOut,
     /// Cargar los amigos.
@@ -723,8 +725,11 @@ impl App {
                 if self.host.is_open() {
                     effects.push(Effect::StopHost);
                 }
+                // La cuenta sigue abierta: «Volver» lleva de nuevo a ella y elegir un servidor con
+                // la sesión guardada entra sin pedir la contraseña.
                 self.screen = Screen::Login;
                 self.login.step = login::Step::Servers;
+                self.login.error = None;
                 effects
             }
             Message::ToggleAccountMenu => {

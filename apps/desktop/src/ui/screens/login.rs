@@ -161,6 +161,8 @@ pub enum Msg {
     AddServer,
     /// Elegir un servidor conocido.
     Choose(String),
+    /// Volver a la cuenta abierta sin cambiar de servidor.
+    StayHere,
     /// Olvidar un servidor conocido.
     Forget(String),
     /// URL.
@@ -268,13 +270,24 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         }
         Msg::Choose(url) => {
             if let Some(entry) = app.settings.servers.iter().find(|s| s.url == url) {
+                // El de la cuenta abierta: se vuelve a ella.
+                if app
+                    .account
+                    .as_ref()
+                    .is_some_and(|account| account.server.url == url)
+                {
+                    return stay_here(app);
+                }
                 state.username = entry.username.clone().unwrap_or_default();
                 state.server = Some(entry.clone());
-                state.step = Step::SignIn;
                 state.error = None;
                 state.errors = FieldErrors::default();
+                // Con la sesión guardada se entra sin la contraseña; si no hay, se pide.
+                state.restoring = true;
+                return vec![Effect::Resume(entry.clone())];
             }
         }
+        Msg::StayHere => return stay_here(app),
         Msg::Forget(url) => {
             app.settings.forget_server(&url);
             if app.settings.servers.is_empty() {
@@ -368,6 +381,14 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
     Vec::new()
 }
 
+/// Vuelve a la cuenta abierta (después de «Cambiar de servidor»).
+fn stay_here(app: &mut App) -> Vec<Effect> {
+    app.login.restoring = false;
+    app.login.error = None;
+    app.screen = Screen::Main;
+    vec![Effect::StartLobby]
+}
+
 /// Resultados de la red para esta pantalla.
 pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
     match event {
@@ -382,7 +403,12 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
             Vec::new()
         }
         Event::NoSavedSession => {
-            app.login.restoring = false;
+            let state = &mut app.login;
+            state.restoring = false;
+            // Al elegir un servidor sin sesión guardada: a iniciarla.
+            if state.server.is_some() && state.step == Step::Servers {
+                state.step = Step::SignIn;
+            }
             Vec::new()
         }
         Event::SignedIn(Ok(account)) => {
@@ -411,7 +437,15 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
         Event::SignedIn(Err(err)) => {
             let state = &mut app.login;
             state.busy = false;
-            if state.restoring {
+            if state.restoring && state.server.is_some() {
+                // La sesión guardada del servidor elegido ya no vale: se pide la contraseña.
+                state.restoring = false;
+                state.step = Step::SignIn;
+                state.error = Some(t!(
+                    "pantalla-login-no-se-pudo-recuperar-la-sesion",
+                    err = err
+                ));
+            } else if state.restoring {
                 state.restoring = false;
                 state.step = if app.settings.servers.is_empty() {
                     Step::AddServer
@@ -518,17 +552,25 @@ fn servers(app: &App) -> Element<'_, Message> {
                 .into()
         })
         .collect();
+    let mut actions = row![];
+    if app.account.is_some() {
+        // Se llegó desde «Cambiar de servidor»: la cuenta sigue abierta.
+        actions = actions.push(ui::button_with(
+            Kind::Normal,
+            t!("pantalla-login-volver"),
+            Some(Icon::ChevronLeft),
+            Some(on(Msg::StayHere)),
+        ));
+    }
+    let actions = actions.push(ui::fill()).push(ui::button_with(
+        Kind::Normal,
+        t!("pantalla-login-anadir-servidor"),
+        Some(Icon::Plus),
+        Some(on(Msg::AddServer)),
+    ));
     column![
         ui::section(t!("pantalla-login-elige-un-servidor"), None, rows),
-        row![
-            ui::fill(),
-            ui::button_with(
-                Kind::Normal,
-                t!("pantalla-login-anadir-servidor"),
-                Some(Icon::Plus),
-                Some(on(Msg::AddServer))
-            )
-        ]
+        actions
     ]
     .spacing(space::M)
     .into()
@@ -1006,5 +1048,62 @@ mod tests {
             app.login.password.is_empty(),
             "la contraseña no se queda en memoria"
         );
+    }
+
+    fn signed_in(app: &mut App, url: &str) {
+        app.update(Message::Event(Event::SignedIn(Ok(
+            crate::ui::app::AccountInfo {
+                server: ServerEntry {
+                    url: url.into(),
+                    fingerprint: None,
+                    tcp_port: None,
+                    username: None,
+                },
+                username: "ana".into(),
+                display_name: "Ana".into(),
+                user_id: 2,
+                device: "Portátil".into(),
+                fingerprint: "ab".repeat(32),
+            },
+        ))));
+    }
+
+    #[test]
+    fn switching_server_keeps_the_account_and_back_returns_to_it() {
+        let mut app = app();
+        signed_in(&mut app, "https://coroom.example.com");
+        app.update(Message::SwitchServer);
+        assert_eq!((app.screen, app.login.step), (Screen::Login, Step::Servers));
+        assert!(
+            app.account.is_some(),
+            "cambiar de servidor no cierra la sesión"
+        );
+        let effects = update(&mut app, Msg::StayHere);
+        assert_eq!(app.screen, Screen::Main);
+        assert_eq!(effects, [Effect::StartLobby]);
+        // Elegir el servidor de la cuenta abierta también vuelve a ella.
+        app.update(Message::SwitchServer);
+        let effects = update(&mut app, Msg::Choose("https://coroom.example.com".into()));
+        assert_eq!(app.screen, Screen::Main);
+        assert_eq!(effects, [Effect::StartLobby]);
+    }
+
+    #[test]
+    fn choosing_another_server_resumes_its_saved_session_first() {
+        let mut app = app();
+        signed_in(&mut app, "https://otro.example.com");
+        signed_in(&mut app, "https://coroom.example.com");
+        app.update(Message::SwitchServer);
+        let effects = update(&mut app, Msg::Choose("https://otro.example.com".into()));
+        assert!(
+            matches!(&effects[..], [Effect::Resume(server)] if server.url == "https://otro.example.com"),
+            "{effects:?}"
+        );
+        assert!(app.login.restoring, "se ve que está recuperando la sesión");
+        // Sin sesión guardada en ese servidor: se pide la contraseña.
+        on_event(&mut app, Event::NoSavedSession);
+        assert_eq!(app.login.step, Step::SignIn);
+        assert!(!app.login.restoring);
+        assert_eq!(app.login.username, "ana");
     }
 }

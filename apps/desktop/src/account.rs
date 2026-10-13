@@ -142,7 +142,8 @@ impl AccountStore {
             .filter(|text| !text.is_empty())
     }
 
-    fn set_last_server(&self, url: &str) {
+    /// Apunta `url` como el último servidor (el que se recupera al abrir la aplicación).
+    pub fn set_last_server(&self, url: &str) {
         let path = self.last_path();
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
