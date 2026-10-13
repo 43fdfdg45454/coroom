@@ -23,6 +23,7 @@ deploy/.env
 /drivers/windows-vhid/build/
 /drivers/windows-vhid/out/
 /drivers/windows-vhid/packages/
+/drivers/windows-vhid/package/
 *.cer
 *.pfx
 

@@ -10,8 +10,8 @@
 //!   coordenadas del escritorio virtual; rueda con `MOUSEEVENTF_WHEEL`/`HWHEEL`
 //!   (`WHEEL_DELTA` = 120, como el cable).
 //! - **Mandos** (feature `windows-vhid`): un mando HID genérico por ranura con el
-//!   driver propio sobre Virtual HID Framework ([`super::windows_vhid::VhidGamepads`]), que se
-//!   abre al asignar la primera ranura. Sin el driver, [`InputSink::assign_gamepad`] devuelve
+//!   driver propio de UMDF2 ([`super::windows_vhid::VhidGamepads`]), que se abre al asignar la
+//!   primera ranura. Sin el driver, [`InputSink::assign_gamepad`] devuelve
 //!   [`InputError::GamepadUnavailable`] con la guía de instalación; el mapeo a teclas
 //!   (`--gamepad-to-keys`, [`super::GamepadToKeys`]) sigue disponible.
 //!

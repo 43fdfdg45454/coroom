@@ -11,7 +11,7 @@
 //! - **Anfitrión**: el trait [`InputSink`] ([`inject`]) con los backends de cada plataforma tras su
 //!   `feature`: **libei** por el portal `RemoteDesktop` y **uinput** para los mandos en Linux
 //!   (`linux-portal`), `SendInput` en Windows (`windows-sendinput`) con los mandos por el driver
-//!   propio sobre Virtual HID Framework (`windows-vhid`); y [`RecordingSink`] para los
+//!   propio de UMDF2 (`windows-vhid`); y [`RecordingSink`] para los
 //!   tests. La sesión aplica permisos y pausa **antes** de llamar al sumidero.
 //! - [`keymap`]: tecla física de `winit` → evdev → *scancode* set 1 de Windows.
 

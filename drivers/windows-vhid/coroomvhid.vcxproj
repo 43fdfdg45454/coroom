@@ -1,8 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  coroomvhid.sys: KMDF driver over Virtual HID Framework. Needs Visual Studio 2022 (or its Build
-  Tools) with the Windows SDK and the WDK of the same version (10.0.26100 or later) and its
-  Visual Studio extension, or the EWDK. See README.md.
+  coroomvhid.dll: UMDF2 HID minidriver under mshidumdf.sys, with the project settings of
+  Microsoft's vhidmini2 UMDF2 sample (hid/vhidmini2/driver/umdf2/VhidminiUm.vcxproj). Needs
+  Visual Studio 2022 or 2026 (or its Build Tools) with the Windows SDK and the WDK of the same
+  version (10.0.26100 or later) and its Visual Studio extension, or the EWDK. See README.md.
+
+  MSBuild compiles the DLL and stamps the INF (DriverVer, $UMDFVERSION$); build.ps1 then verifies
+  the INF, signs the DLL, creates the catalog with Inf2Cat and signs it, so Inf2Cat, InfVerif and
+  signing are off here.
 -->
 <Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
@@ -25,27 +30,26 @@
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>{AF6DF77A-E68E-4474-B5EF-FCDB75B996C2}</ProjectGuid>
-    <TemplateGuid>{1bc93793-694f-48fe-9372-81e2b05556fd}</TemplateGuid>
-    <TargetFrameworkVersion>v4.5</TargetFrameworkVersion>
-    <MinimumVisualStudioVersion>12.0</MinimumVisualStudioVersion>
-    <Configuration>Release</Configuration>
-    <Platform Condition="'$(Platform)' == ''">x64</Platform>
     <RootNamespace>coroomvhid</RootNamespace>
     <ProjectName>coroomvhid</ProjectName>
+    <!-- UMDF 2.31 is the version inbox in Windows 10 2004-22H2, the oldest system supported. -->
+    <UMDF_VERSION_MAJOR>2</UMDF_VERSION_MAJOR>
+    <UMDF_VERSION_MINOR>31</UMDF_VERSION_MINOR>
+    <Configuration Condition="'$(Configuration)' == ''">Release</Configuration>
+    <Platform Condition="'$(Platform)' == ''">x64</Platform>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Label="Configuration">
     <TargetVersion>Windows10</TargetVersion>
-    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
-    <ConfigurationType>Driver</ConfigurationType>
-    <DriverType>KMDF</DriverType>
     <DriverTargetPlatform>Windows Driver</DriverTargetPlatform>
-    <!-- KMDF 1.27 is the version inbox in Windows 10 1809, the oldest system supported. -->
-    <KMDF_VERSION_MAJOR>1</KMDF_VERSION_MAJOR>
-    <KMDF_VERSION_MINOR>27</KMDF_VERSION_MINOR>
-    <!-- build.ps1 signs (test certificate) when asked; the CI builds an unsigned package. -->
-    <SignMode>Off</SignMode>
+    <DriverType>UMDF</DriverType>
+    <PlatformToolset>WindowsUserModeDriver10.0</PlatformToolset>
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
     <SpectreMitigation>Spectre</SpectreMitigation>
+    <!-- build.ps1 does these after compiling (see the comment at the top). -->
+    <SignMode>Off</SignMode>
+    <EnableInf2cat>false</EnableInf2cat>
+    <SkipPackageVerification>true</SkipPackageVerification>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
     <UseDebugLibraries>true</UseDebugLibraries>
@@ -61,24 +65,33 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup>
-    <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
+    <TargetName>coroomvhid</TargetName>
     <OutDir>$(SolutionDir)build\$(Platform)\$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)build\obj\$(Platform)\$(Configuration)\</IntDir>
-    <EnableInf2cat>true</EnableInf2cat>
   </PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
       <TreatWarningAsError>true</TreatWarningAsError>
-      <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);_UNICODE;UNICODE</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);$(DDK_INC_PATH);$(DDK_INC_PATH)\wdm;$(ProjectDir)</AdditionalIncludeDirectories>
+      <ExceptionHandling>
+      </ExceptionHandling>
+      <!-- Static CRT: the DLL must not depend on the Visual C++ redistributable. -->
+      <RuntimeLibrary Condition="'$(Configuration)'=='Release'">MultiThreaded</RuntimeLibrary>
+      <RuntimeLibrary Condition="'$(Configuration)'=='Debug'">MultiThreadedDebug</RuntimeLibrary>
     </ClCompile>
     <Link>
       <TreatLinkerWarningAsErrors>true</TreatLinkerWarningAsErrors>
-      <AdditionalDependencies>$(DDK_LIB_PATH)vhfkm.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>%(AdditionalDependencies);mincore.lib</AdditionalDependencies>
     </Link>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
+    <!-- DriverVer = the coroom version when build.ps1 passes it (otherwise stampinf makes one). -->
+    <Inf Condition="'$(CoroomDriverVersion)' != ''">
+      <TimeStamp>$(CoroomDriverVersion)</TimeStamp>
+    </Inf>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="coroomvhid.c" />
@@ -87,6 +100,7 @@
     <ClInclude Include="coroom_vhid.h" />
     <ClInclude Include="driver.h" />
     <None Include="report_descriptor.inc" />
+    <None Include="control_descriptor.inc" />
   </ItemGroup>
   <ItemGroup>
     <Inf Include="coroomvhid.inf" />

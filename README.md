@@ -69,8 +69,9 @@ dos NAT distintas, pantallas HDR y de 120 Hz), en [`docs/ARQUITECTURA.md`](docs/
 ## Instalar
 
 Las publicaciones están en <https://github.com/43fdfdg45454/coroom/releases>; cada una trae el
-Flatpak, el MSIX y el `.zip` de Windows, el driver de mando virtual (build de desarrollo: sin firmar y con VID/PID 0) y `SHA256SUMS`, y
-sube la imagen del servidor a GHCR. La aplicación avisa en Inicio cuando hay una versión nueva
+Flatpak, el MSIX y el `.zip` de Windows, el driver de mando virtual de Windows
+(`coroomvhid-*-x64.zip` y `-ARM64.zip`, firmado en la CI; se instala con su `install.ps1`) y
+`SHA256SUMS`, y sube la imagen del servidor a GHCR. La aplicación avisa en Inicio cuando hay una versión nueva
 (una consulta al día a la API pública de GitHub, sin token ni datos tuyos; se desactiva en Ajustes
 → Acerca de o con `COROOM_NO_UPDATE_CHECK=1`).
 
@@ -388,11 +389,13 @@ anfitrión. El primer mando conectado al invitado es el de su ranura.
 **Anfitrión en Windows**: teclado y ratón por `SendInput` (tecla física por *scancode*; ratón
 relativo sin agrupar y absoluto sobre el monitor principal). **Mandos con el driver de coroom**:
 Windows no tiene API de usuario para crear un mando, así que hace falta instalar una vez el driver
-de [`drivers/windows-vhid/`](drivers/windows-vhid/README.md) (KMDF sobre Virtual HID Framework;
-ahí están la compilación, la instalación con firma de prueba o por atestación, la desinstalación y
-la solución de problemas). Con él, cada ranura (`allow N pad RANURA`) es un «Dispositivo de juego
-compatible con HID» que ven DirectInput, SDL y Steam Input (los juegos que solo usan XInput, a
-través de Steam Input); `coroom doctor` dice si está instalado. Sin el driver, o con
+de [`drivers/windows-vhid/`](drivers/windows-vhid/README.md): un driver de modo usuario (UMDF2)
+que se instala con `install.ps1` desde el paquete de cada versión, sin firma de prueba y con el
+arranque seguro y la integridad de memoria activados (ahí están la compilación, la firma, la
+instalación, la desinstalación y la solución de problemas). Con él, cada ranura
+(`allow N pad RANURA`) es un «Dispositivo de juego compatible con HID» que ven DirectInput, SDL y
+Steam Input (los juegos que solo usan XInput, a través de Steam Input); `coroom doctor` dice si
+está instalado. Sin el driver, o con
 `coroom host --gamepad-to-keys`, los mandos se convierten en teclas con un perfil fijo: stick
 izquierdo → W A S D, cruceta → flechas, A → Espacio, B → E, X → R, Y → F, LB → Q, RB → Tab,
 LT → Mayús, RT → Ctrl, Back → Esc, Start → Intro (todos los mandos escriben en el mismo teclado).
@@ -546,9 +549,10 @@ simulada, expulsión, A/B del cifrado, negociación de códec y cursor). `apps/d
 prueba la entrada igual, con un `RecordingSink` en el anfitrión: permisos, ratón a 1000 Hz sin
 pérdida, ranuras de mando, pausa, expulsión, latencia de entrada y el relay. El mando uinput real
 se prueba a mano con acceso a `/dev/uinput`: `cargo test -p coroom-input -- --ignored`. El
-driver de mando virtual de Windows solo lo compila su propia CI (`.github/workflows/driver.yml`,
-con el WDK); su formato (descriptor HID, informe, IOCTL) lo prueban los tests de `coroom-input` en
-cualquier sistema, y su prueba en Windows real está en `drivers/windows-vhid/README.md`.
+driver de mando virtual de Windows solo lo compila y firma su propia CI
+(`.github/workflows/driver.yml`, con el WDK); su formato (descriptores HID, informes, INF y scripts)
+lo prueban los tests de `coroom-input` en cualquier sistema, y su prueba en Windows real está en
+`drivers/windows-vhid/README.md`.
 `crates/codec/tests/ffmpeg.rs`
 prueba los códecs de FFmpeg por software (AV1 SVT-AV1 → dav1d, también en HDR10 a 10 bits, H.264
 de FFmpeg frente a OpenH264). Los tests `netem` usan `tc netem` real en `lo` y se saltan

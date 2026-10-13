@@ -49,6 +49,15 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Cambiado
 
+- Windows: el driver de mando virtual pasa de KMDF sobre Virtual HID Framework a un minidriver HID
+  de UMDF2 en modo usuario bajo el `mshidumdf.sys` de Windows. Se instala sin firma de prueba y
+  con el arranque seguro y la integridad de memoria activados: la CI firma cada paquete con un
+  certificado autofirmado de un solo uso (solo firma de código, clave borrada al terminar) que
+  `install.ps1` instala en el equipo y `uninstall.ps1` quita. Los mandos existen desde la
+  instalación (`install.ps1 -Pads`, 4 por defecto) y `coroom` les manda el estado por una colección
+  HID de control (protocolo 2 del driver); si coroom se cierra, vuelven al reposo en menos de un
+  segundo. Los paquetes de la release se llaman `coroomvhid-X.Y.Z-x64.zip` y `-ARM64.zip`. Sin
+  probar todavía en un Windows real.
 - La pantalla de compartir ya no pide el nombre de la aplicación ni el PID del proceso.
 - El Compose del servidor usa solo la imagen publicada, pasa cada variable de `.env` con su valor
   por defecto y guarda todo en `./data`, también el certificado (`./data/certs`).
@@ -56,6 +65,8 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Eliminado
 
+- `build.ps1 -TestSign` y las instrucciones de firma de prueba y por atestación del driver de
+  mando.
 - La gestión automática de certificados por ACME (`COROOM_TLS_MODE=acme`, los retos TLS-ALPN-01 y
   HTTP-01, `COROOM_ACME_*` y `COROOM_BIND_HTTP`). El servidor usa el certificado del operador o uno
   autofirmado, y no necesita salida a internet.

@@ -1,4 +1,5 @@
-// HID report descriptor of the coroom virtual gamepad (one per slot).
+// HID report descriptor of the coroom virtual gamepad (one per slot): the first top-level
+// collection (Col01) of each device, followed by control_descriptor.inc (Col02).
 //
 // Single source of truth: the driver includes this file inside a C array initializer
 // (coroomvhid.c) and the Rust client parses it in its tests (crates/input/src/inject/

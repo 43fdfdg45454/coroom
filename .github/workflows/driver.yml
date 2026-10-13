@@ -1,24 +1,39 @@
 name: Driver de mando virtual (Windows)
 
-# Compila drivers/windows-vhid (coroomvhid.sys, KMDF + Virtual HID Framework) con el WDK. Es la
-# única verificación automática del driver: no lo firma ni lo carga (eso necesita la firma por
-# atestación y un Windows real, ver drivers/windows-vhid/README.md). `packages.yml` lo llama en cada
-# push a main y «Publicación» adjunta los paquetes a la release como «desarrollo»: sin firmar y con
-# VID/PID 0, para instalar a mano en equipos propios.
+# Compila drivers/windows-vhid (coroomvhid.dll, UMDF2 bajo mshidumdf.sys) con el WDK y lo firma con
+# un certificado autofirmado de un solo uso: build.ps1 -Sign lo crea al empezar (solo firma de
+# código, SHA-256, clave no exportable), firma la DLL y el catálogo con sello de tiempo RFC 3161,
+# deja en el paquete solo la parte pública (coroomvhid.cer) y borra el certificado y su clave al
+# terminar. La clave nunca sale del runner ni se sube: nadie puede firmar después otra cosa con el
+# certificado en el que confía quien instala el paquete. `packages.yml` lo llama en cada push a
+# main con la versión de la release, y «Publicación» adjunta los paquetes. No se carga en ningún
+# Windows aquí: la prueba en un equipo real está en drivers/windows-vhid/README.md.
 on:
   pull_request:
     paths:
       - "drivers/windows-vhid/**"
       - ".github/workflows/driver.yml"
   workflow_dispatch:
+    inputs:
+      version:
+        description: Versión X.Y.Z (DriverVer del INF)
+        required: false
+        type: string
+        default: 0.0.0
   workflow_call:
+    inputs:
+      version:
+        description: Versión X.Y.Z (DriverVer del INF)
+        required: false
+        type: string
+        default: 0.0.0
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: coroomvhid.sys (${{ matrix.platform }})
+    name: coroomvhid.dll (${{ matrix.platform }})
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -28,23 +43,26 @@ jobs:
       run:
         shell: pwsh
         working-directory: drivers/windows-vhid
+    env:
+      VERSION: ${{ inputs.version || '0.0.0' }}
     steps:
       - uses: actions/checkout@v7
 
       # El WDK y el SDK vienen como paquetes NuGet fijados en packages.config (la distribución
       # oficial desde el WDK 10.0.26100; es lo que hace la CI de los ejemplos de Microsoft). Así no
       # dependen de la versión que traiga la imagen. El conjunto de herramientas de MSBuild para
-      # drivers (WindowsKernelModeDriver10.0) lo da el componente «Windows Driver Kit» de Visual
+      # drivers (WindowsUserModeDriver10.0) lo da el componente «Windows Driver Kit» de Visual
       # Studio, que las imágenes windows-2025 y windows-2025-vs2026 incluyen.
       - name: WDK y SDK (NuGet)
         run: |
           nuget restore packages.config -PackagesDirectory packages -NonInteractive
-          $vhf = Get-ChildItem packages -Recurse -Filter vhf.h -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $vhf) { throw 'Los paquetes NuGet del WDK no traen vhf.h' }
-          Write-Host "WDK (vhf.h): $($vhf.FullName)"
+          $wdf = Get-ChildItem packages -Recurse -Filter wdf.h -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\umdf\\2\.31\\' } | Select-Object -First 1
+          if (-not $wdf) { throw 'Los paquetes NuGet del WDK no traen UMDF 2.31 (wdf.h)' }
+          Write-Host "WDK (UMDF 2.31): $($wdf.FullName)"
           Write-Host "Paquetes: $((Get-ChildItem packages -Directory).Name -join ', ')"
 
-      - name: Compilar
+      - name: Compilar y firmar
         run: |
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
           $vs = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
@@ -57,23 +75,29 @@ jobs:
           Write-Host "Visual Studio: $vs"
           Import-Module (Join-Path $vs 'Common7\Tools\Microsoft.VisualStudio.DevShell.dll')
           Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=amd64 -host_arch=amd64'
-          msbuild coroomvhid.sln /m /nologo /v:minimal /p:Configuration=Release /p:Platform=${{ matrix.platform }}
-          if ($LASTEXITCODE -ne 0) { throw "msbuild terminó con código $LASTEXITCODE" }
+          ./build.ps1 -Platform ${{ matrix.platform }} -Configuration Release -Version $env:VERSION -Sign -OutputDir package
 
-      - name: Paquete
+      # Comprobaciones de que la clave privada no sale de aquí: el certificado ya no está en el
+      # almacén del runner y el paquete solo lleva la parte pública.
+      - name: Comprobar el paquete
         run: |
-          $cat = Get-ChildItem "build\${{ matrix.platform }}\Release" -Recurse -Filter coroomvhid.cat | Select-Object -First 1
-          if (-not $cat) { throw 'Falta coroomvhid.cat (Inf2Cat)' }
-          $out = New-Item -ItemType Directory -Force -Path "package\${{ matrix.platform }}"
-          foreach ($file in 'coroomvhid.sys', 'coroomvhid.inf', 'coroomvhid.cat') {
-            Copy-Item (Join-Path $cat.DirectoryName $file) $out
+          $leftover = @(Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq 'CN=coroom (driver local)' })
+          if ($leftover.Count -ne 0) { throw "Queda el certificado de firma en el runner: $($leftover.Thumbprint -join ', ')" }
+          $out = "package\${{ matrix.platform }}"
+          $private = @(Get-ChildItem $out -Recurse -Include *.pfx, *.p12, *.pvk, *.key)
+          if ($private.Count -ne 0) { throw "El paquete lleva claves: $($private.Name -join ', ')" }
+          $cer = [Security.Cryptography.X509Certificates.X509Certificate2]::new((Join-Path $out 'coroomvhid.cer'))
+          if ($cer.HasPrivateKey) { throw 'coroomvhid.cer lleva la clave privada' }
+          foreach ($file in 'coroomvhid.dll', 'coroomvhid.cat') {
+            $signature = Get-AuthenticodeSignature (Join-Path $out $file)
+            if ($signature.SignerCertificate.Thumbprint -ne $cer.Thumbprint) { throw "$file no está firmado con coroomvhid.cer" }
+            if (-not $signature.TimeStamperCertificate) { throw "$file no tiene sello de tiempo" }
+            Write-Host "$file firmado por $($cer.Subject) ($($cer.Thumbprint)), sello de $($signature.TimeStamperCertificate.Subject)"
           }
-          Copy-Item "build\${{ matrix.platform }}\Release\coroomvhid.pdb" $out -ErrorAction SilentlyContinue
-          Copy-Item install.ps1, uninstall.ps1, devices.ps1, README.md, coroom_vhid.h $out
           Get-ChildItem $out | Format-Table Name, Length
 
       - uses: actions/upload-artifact@v7
         with:
-          name: coroomvhid-${{ matrix.platform }}-desarrollo
+          name: coroomvhid-${{ matrix.platform }}
           path: drivers/windows-vhid/package/${{ matrix.platform }}
           if-no-files-found: error

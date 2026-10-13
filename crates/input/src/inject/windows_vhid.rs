@@ -1,22 +1,27 @@
 //! Mando virtual en Windows (feature `windows-vhid`): cliente del driver
-//! `coroomvhid.sys` (`drivers/windows-vhid/`).
+//! `coroomvhid.dll` (`drivers/windows-vhid/`), un minidriver HID de UMDF2 bajo el `mshidumdf.sys`
+//! de Windows.
 //!
-//! Windows no tiene API de usuario para crear un dispositivo HID: el driver, sobre Virtual HID
-//! Framework, crea hasta [`DRIVER_SLOTS`] mandos HID genéricos bajo demanda y los alimenta con
-//! los informes que le manda este módulo por el dispositivo de control [`DEVICE_PATH`]
-//! (`IOCTL_COROOM_VHID_*` de `coroom_vhid.h`).
+//! Windows no tiene API de usuario para crear un dispositivo HID: el driver presenta hasta
+//! [`DRIVER_SLOTS`] mandos HID genéricos, uno por dispositivo raíz (los crea `install.ps1`), y
+//! cada uno tiene dos colecciones: el mando que ven los juegos y una colección de control
+//! ([`CONTROL_USAGE_PAGE`]) por la que este módulo le manda su estado con informes HID
+//! (`coroom_vhid.h`).
 //!
 //! - **Formato** (independiente de la plataforma y probado en Linux): el informe de 16 bytes del
-//!   descriptor `report_descriptor.inc` ([`PadReport::to_bytes`]), las cargas de cada IOCTL y los
-//!   códigos `CTL_CODE`. Los tests leen el descriptor y la cabecera del driver y comprueban que
-//!   este módulo dice lo mismo que ellos.
+//!   descriptor `report_descriptor.inc` ([`PadReport::to_bytes`]), el informe de estado y el de
+//!   información de `control_descriptor.inc`. Los tests leen los descriptores, la cabecera y el
+//!   INF del driver y comprueban que este módulo dice lo mismo que ellos.
 //! - **Ranuras**: las del cable van de 1 a 8 y las del driver de 0 a 7 ([`driver_slot`]).
 //! - **Ritmo**: un informe en cada cambio, con tope de 250 Hz ([`REPORT_INTERVAL`]) para los ejes;
 //!   los botones y la cruceta salen siempre al momento (una pulsación corta no se pierde). Un hilo
-//!   (`coroom-vhid`) manda el último estado de los ejes que esperaba su turno.
-//! - [`VhidGamepads`] funciona sobre cualquier [`VhidDevice`]; en Windows, `DriverHandle` abre
-//!   el driver (`CreateFileW`), comprueba la versión del protocolo y habla por `DeviceIoControl`.
-//!   Al cerrarse el handle (también si `coroom` muere) el driver destruye sus mandos.
+//!   (`coroom-vhid`) manda el último estado de los ejes que esperaba su turno y repite el estado
+//!   cada [`KEEPALIVE_INTERVAL`]: si el driver pasa [`WATCHDOG`] sin noticias (coroom se cerró o
+//!   murió), deja el mando en reposo.
+//! - [`VhidGamepads`] funciona sobre cualquier [`VhidDevice`]; en Windows, `DriverHandle` busca las
+//!   colecciones de control (`CM_Get_Device_Interface_List`, `HidP_GetCaps`), lee su ranura y la
+//!   versión del protocolo (`HidD_GetFeature`), abre la de cada ranura que se asigna sin compartir
+//!   la escritura (otro programa no puede usarla a la vez) y escribe el estado con `WriteFile`.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -27,28 +32,45 @@ use std::time::{Duration, Instant};
 use crate::{GamepadAxis, GamepadButton, GuestId, InputError, InputEvent};
 
 /// Versión del protocolo del driver que habla este cliente (`COROOM_VHID_PROTOCOL_VERSION`).
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
-/// Mandos que puede crear el driver (`COROOM_VHID_MAX_SLOTS`).
+/// Mandos que puede tener el driver (`COROOM_VHID_MAX_SLOTS`).
 pub const DRIVER_SLOTS: u8 = 8;
 
-/// Dispositivo de control del driver (`COROOM_VHID_USER_PATH`).
-pub const DEVICE_PATH: &str = r"\\.\coroomvhid";
+/// Mandos que crea `install.ps1` si no se le dice otra cosa (`-Pads`).
+pub const DEFAULT_PADS: u8 = 4;
 
-/// Identificador del informe de entrada (`COROOM_VHID_REPORT_ID`).
+/// Identificador de hardware de los dispositivos raíz (`COROOM_VHID_HARDWARE_ID`).
+pub const HARDWARE_ID: &str = r"Root\coroomvhid";
+
+/// Identificador del informe de entrada del mando (`COROOM_VHID_REPORT_ID`).
 pub const REPORT_ID: u8 = 1;
 
-/// Bytes del informe, con el identificador (`COROOM_VHID_REPORT_SIZE`).
+/// Bytes del informe del mando, con el identificador (`COROOM_VHID_REPORT_SIZE`).
 pub const REPORT_LEN: usize = 16;
 
-/// Bytes de la respuesta de `IOCTL_COROOM_VHID_VERSION` (`COROOM_VHID_VERSION_INFO_SIZE`).
-pub const VERSION_INFO_LEN: usize = 8;
+/// Página de uso de la colección de control (`COROOM_VHID_CONTROL_USAGE_PAGE`, de fabricante).
+pub const CONTROL_USAGE_PAGE: u16 = 0xFFC0;
 
-/// Bytes de la carga de CREATE y DESTROY (`COROOM_VHID_SLOT_SIZE`).
-pub const SLOT_LEN: usize = 1;
+/// Uso de la colección de control (`COROOM_VHID_CONTROL_USAGE`).
+pub const CONTROL_USAGE: u16 = 0x0001;
 
-/// Bytes de la carga de REPORT (`COROOM_VHID_REPORT_PACKET_SIZE`).
-pub const REPORT_PACKET_LEN: usize = 1 + REPORT_LEN;
+/// Identificador del informe de salida con el estado del mando (`COROOM_VHID_STATE_REPORT_ID`).
+pub const STATE_REPORT_ID: u8 = 2;
+
+/// Bytes del informe de estado: su identificador y un informe del mando entero
+/// (`COROOM_VHID_STATE_REPORT_SIZE`).
+pub const STATE_REPORT_LEN: usize = 1 + REPORT_LEN;
+
+/// Identificador del informe de característica con la información del driver
+/// (`COROOM_VHID_INFO_REPORT_ID`).
+pub const INFO_REPORT_ID: u8 = 3;
+
+/// Bytes de la información del driver, sin el identificador (`COROOM_VHID_INFO_SIZE`).
+pub const INFO_LEN: usize = 8;
+
+/// Bytes del informe de información, con el identificador (`COROOM_VHID_INFO_REPORT_SIZE`).
+pub const INFO_REPORT_LEN: usize = 1 + INFO_LEN;
 
 /// Máximo de los ejes del informe (`COROOM_VHID_AXIS_MAX`); los sticks van de `-AXIS_MAX` a
 /// `AXIS_MAX` y los gatillos de 0 a `AXIS_MAX`.
@@ -59,6 +81,14 @@ pub const HAT_NULL: u8 = 8;
 
 /// Tope de ritmo de los informes de ejes por mando: 250 Hz.
 pub const REPORT_INTERVAL: Duration = Duration::from_millis(4);
+
+/// Sin un informe de estado durante este tiempo, el driver deja el mando en reposo
+/// (`COROOM_VHID_WATCHDOG_MS`).
+pub const WATCHDOG: Duration = Duration::from_millis(1000);
+
+/// Cada cuánto se repite el último estado de un mando sin cambios, para que el driver sepa que
+/// coroom sigue ahí (bastante menos que [`WATCHDOG`]).
+pub const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Posición de cada campo en el informe (`COROOM_VHID_REPORT_OFFSET_*`); los ejes son `i16`
 /// little endian.
@@ -80,34 +110,6 @@ pub mod offset {
     /// Hat (bits 0 a 3) y relleno.
     pub const HAT: usize = 15;
 }
-
-const FILE_DEVICE_UNKNOWN: u32 = 0x22;
-const METHOD_BUFFERED: u32 = 0;
-const FILE_ANY_ACCESS: u32 = 0;
-
-/// `CTL_CODE` de `winioctl.h`.
-pub const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> u32 {
-    (device_type << 16) | (access << 14) | (function << 2) | method
-}
-
-/// `COROOM_VHID_IOCTL(n)`.
-pub const fn coroom_ioctl(n: u32) -> u32 {
-    ctl_code(
-        FILE_DEVICE_UNKNOWN,
-        0x800 + n,
-        METHOD_BUFFERED,
-        FILE_ANY_ACCESS,
-    )
-}
-
-/// Versión del protocolo del driver.
-pub const IOCTL_VERSION: u32 = coroom_ioctl(0);
-/// Crea el mando de una ranura.
-pub const IOCTL_CREATE: u32 = coroom_ioctl(1);
-/// Destruye el mando de una ranura.
-pub const IOCTL_DESTROY: u32 = coroom_ioctl(2);
-/// Manda un informe a una ranura.
-pub const IOCTL_REPORT: u32 = coroom_ioctl(3);
 
 /// Qué hacer si el driver no está.
 pub const DRIVER_HELP: &str = "instala el driver de mando virtual de coroom (guía en \
@@ -249,44 +251,41 @@ impl PadReport {
     }
 }
 
-/// Carga de `IOCTL_COROOM_VHID_CREATE` y `IOCTL_COROOM_VHID_DESTROY`.
-pub fn slot_payload(driver_slot: u8) -> [u8; SLOT_LEN] {
-    [driver_slot]
-}
-
-/// Carga de `IOCTL_COROOM_VHID_REPORT`.
-pub fn report_payload(driver_slot: u8, report: &[u8; REPORT_LEN]) -> [u8; REPORT_PACKET_LEN] {
-    let mut out = [0u8; REPORT_PACKET_LEN];
-    out[0] = driver_slot;
+/// Informe de estado de la colección de control: [`STATE_REPORT_ID`] y el informe del mando.
+pub fn state_report(report: &[u8; REPORT_LEN]) -> [u8; STATE_REPORT_LEN] {
+    let mut out = [0u8; STATE_REPORT_LEN];
+    out[0] = STATE_REPORT_ID;
     out[1..].copy_from_slice(report);
     out
 }
 
-/// Respuesta de `IOCTL_COROOM_VHID_VERSION`.
+/// Informe de información de una colección de control (`COROOM_VHID_INFO`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VersionInfo {
+pub struct DriverInfo {
     /// Versión del protocolo del driver.
     pub protocol: u32,
-    /// Ranuras del driver.
-    pub max_slots: u8,
-    /// Bytes del informe.
+    /// Ranura del driver (0 a 7) de ese mando.
+    pub slot: u8,
+    /// Bytes del informe del mando.
     pub report_len: u8,
 }
 
-impl VersionInfo {
-    /// Lee la respuesta (`COROOM_VHID_VERSION_INFO`, little endian y sin relleno).
-    pub fn parse(bytes: &[u8]) -> Result<Self, InputError> {
-        if bytes.len() < VERSION_INFO_LEN {
+impl DriverInfo {
+    /// Lee el informe de característica entero (el identificador y `COROOM_VHID_INFO`, little
+    /// endian y sin relleno).
+    pub fn parse(report: &[u8]) -> Result<Self, InputError> {
+        if report.len() < INFO_REPORT_LEN || report[0] != INFO_REPORT_ID {
             return Err(InputError::GamepadUnavailable(format!(
-                "el driver coroomvhid respondió a la consulta de versión con {} bytes en vez de \
-                 {VERSION_INFO_LEN}",
-                bytes.len()
+                "el driver coroomvhid respondió a la consulta de versión con {} bytes que no son \
+                 su informe de información: instala el driver que acompaña a esta versión de \
+                 coroom (drivers/windows-vhid/README.md)",
+                report.len()
             )));
         }
         Ok(Self {
-            protocol: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-            max_slots: bytes[4],
-            report_len: bytes[5],
+            protocol: u32::from_le_bytes([report[1], report[2], report[3], report[4]]),
+            slot: report[5],
+            report_len: report[6],
         })
     }
 
@@ -300,32 +299,32 @@ impl VersionInfo {
                 self.protocol
             )));
         }
-        if self.max_slots < DRIVER_SLOTS || usize::from(self.report_len) != REPORT_LEN {
+        if self.slot >= DRIVER_SLOTS || usize::from(self.report_len) != REPORT_LEN {
             return Err(InputError::GamepadUnavailable(format!(
-                "el driver coroomvhid dice tener {} ranuras e informes de {} bytes (se esperaban \
-                 {DRIVER_SLOTS} y {REPORT_LEN}): reinstala el driver",
-                self.max_slots, self.report_len
+                "el driver coroomvhid dice tener la ranura {} e informes de {} bytes (se esperaban \
+                 0 a {} y {REPORT_LEN}): reinstala el driver",
+                self.slot,
+                self.report_len,
+                DRIVER_SLOTS - 1
             )));
         }
         Ok(())
     }
 }
 
-/// Operación del driver, para los mensajes de error.
+/// Operación con el driver, para los mensajes de error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverOp {
-    /// `IOCTL_COROOM_VHID_VERSION`.
-    Version,
-    /// `IOCTL_COROOM_VHID_CREATE`.
-    Create,
-    /// `IOCTL_COROOM_VHID_DESTROY`.
-    Destroy,
-    /// `IOCTL_COROOM_VHID_REPORT`.
+    /// Abrir la colección de control de una ranura.
+    Open,
+    /// Leer el informe de información.
+    Info,
+    /// Mandar el informe de estado.
     Report,
 }
 
-/// Error en español de un IOCTL fallido, a partir del código de Win32 en que Windows convierte
-/// el `NTSTATUS` del driver (`slot`: ranura del cable).
+/// Error en español de una operación fallida, a partir del código de Win32 en que Windows
+/// convierte el `NTSTATUS` del driver o de `hidclass.sys` (`slot`: ranura del cable).
 pub fn driver_error(
     op: DriverOp,
     slot: Option<u8>,
@@ -333,29 +332,32 @@ pub fn driver_error(
     detail: &str,
 ) -> InputError {
     let what = match (op, slot) {
-        (DriverOp::Version, _) => "consultar la versión del driver".to_owned(),
-        (DriverOp::Create, Some(slot)) => format!("crear el mando de la ranura {slot}"),
-        (DriverOp::Destroy, Some(slot)) => format!("destruir el mando de la ranura {slot}"),
+        (DriverOp::Open, Some(slot)) => format!("abrir el mando de la ranura {slot}"),
+        (DriverOp::Info, _) => "consultar la versión del driver".to_owned(),
         (DriverOp::Report, Some(slot)) => format!("mandar el estado del mando de la ranura {slot}"),
         (_, None) => "hablar con el driver".to_owned(),
     };
     let why = match win32 {
-        // STATUS_DEVICE_BUSY
-        Some(170) => "la ranura la usa otro programa (¿otro coroom abierto como anfitrión?)",
-        // STATUS_ACCESS_DENIED
-        Some(5) => "la ranura es de otro programa",
-        // STATUS_INVALID_DEVICE_STATE
-        Some(22) => "el driver no tiene creado ese mando",
+        // ERROR_SHARING_VIOLATION: otro handle la tiene abierta para escribir.
+        Some(32) => "la ranura la usa otro programa (¿otro coroom abierto como anfitrión?)",
+        // ERROR_ACCESS_DENIED: el SDDL que pone install.ps1 a la colección de control.
+        Some(5) => {
+            "Windows no deja usar el mando: solo pueden SYSTEM, los administradores y el usuario \
+             con la sesión iniciada en este equipo"
+        }
+        // ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_DEVICE_NOT_CONNECTED,
+        // ERROR_DEVICE_REMOVED
+        Some(2 | 3 | 1167 | 1617) => {
+            "el mando virtual ya no está (¿se ha desactivado o desinstalado su dispositivo?)"
+        }
         // STATUS_INVALID_PARAMETER
-        Some(87) => "el driver rechazó la ranura o el informe (fuera de rango)",
-        // STATUS_INVALID_BUFFER_SIZE
+        Some(87) => "el driver rechazó el informe (fuera de rango)",
+        // STATUS_INVALID_BUFFER_SIZE, ERROR_INVALID_USER_BUFFER
         Some(1784) => "tamaño de datos inesperado: el driver y coroom no son de la misma versión",
-        // STATUS_DEVICE_REMOVED
-        Some(1617) => "el dispositivo raíz del driver se está desinstalando o desactivando",
-        // STATUS_FILE_CLOSED
-        Some(6) => "el handle del driver se está cerrando",
-        // STATUS_INVALID_DEVICE_REQUEST
-        Some(1) => "el driver no conoce esa orden: el driver y coroom no son de la misma versión",
+        // STATUS_NOT_IMPLEMENTED, STATUS_INVALID_DEVICE_REQUEST
+        Some(1 | 120) => {
+            "el driver no conoce esa orden: el driver y coroom no son de la misma versión"
+        }
         _ => "",
     };
     let why = if why.is_empty() {
@@ -366,37 +368,38 @@ pub fn driver_error(
     InputError::Backend(format!("mando virtual: no se pudo {what}: {why}"))
 }
 
-/// Error en español al abrir [`DEVICE_PATH`] (`win32`: el código de `CreateFileW`).
-pub fn open_error(win32: Option<u32>, detail: &str) -> InputError {
-    InputError::GamepadUnavailable(match win32 {
-        // ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
-        Some(2 | 3) => format!(
-            "el driver coroomvhid no está instalado o su dispositivo raíz está desactivado: \
-             {DRIVER_HELP}"
-        ),
-        // ERROR_ACCESS_DENIED
-        Some(5) => format!(
-            "Windows no deja abrir {DEVICE_PATH}: solo pueden usar el mando virtual los \
-             administradores y el usuario con la sesión iniciada en este equipo ({detail})"
-        ),
-        _ => format!("no se pudo abrir {DEVICE_PATH} ({detail}): {DRIVER_HELP}"),
-    })
+/// El driver no está: no hay ninguna colección de control de coroom.
+pub fn not_installed_error() -> InputError {
+    InputError::GamepadUnavailable(format!(
+        "el driver coroomvhid no está instalado o sus mandos están desactivados: {DRIVER_HELP}"
+    ))
+}
+
+/// La ranura `slot` del cable no tiene mando instalado (`installed`: las que sí).
+pub fn missing_slot_error(slot: u8, installed: &[u8]) -> InputError {
+    let list: Vec<String> = installed.iter().map(u8::to_string).collect();
+    InputError::GamepadUnavailable(format!(
+        "la ranura {slot} no tiene mando virtual instalado (hay {}: ranuras {}); para tener más, \
+         vuelve a ejecutar install.ps1 con -Pads {DRIVER_SLOTS} (drivers/windows-vhid/README.md)",
+        installed.len(),
+        list.join(", ")
+    ))
 }
 
 /// Lo que [`VhidGamepads`] necesita del driver (ranuras del driver, de 0 a 7). En Windows es
 /// `DriverHandle`; los tests usan uno falso.
 pub trait VhidDevice: Send + 'static {
-    /// `IOCTL_COROOM_VHID_CREATE`.
+    /// Toma el mando de la ranura (abre su colección de control sin compartir la escritura).
     fn create(&mut self, driver_slot: u8) -> Result<(), InputError>;
-    /// `IOCTL_COROOM_VHID_DESTROY`.
+    /// Lo deja en reposo y lo suelta.
     fn destroy(&mut self, driver_slot: u8) -> Result<(), InputError>;
-    /// `IOCTL_COROOM_VHID_REPORT`.
+    /// Manda un informe del mando (dentro del informe de estado).
     fn report(&mut self, driver_slot: u8, report: &[u8; REPORT_LEN]) -> Result<(), InputError>;
 }
 
 /// Cuándo mandar los informes de un mando: en cada cambio, los ejes como mucho cada
 /// [`REPORT_INTERVAL`] (lo que llega antes espera y se sustituye por lo más nuevo), los botones y
-/// la cruceta al momento.
+/// la cruceta al momento; sin cambios, el último otra vez cada [`KEEPALIVE_INTERVAL`].
 #[derive(Debug, Clone, Default)]
 pub struct ReportPacer {
     sent: Option<[u8; REPORT_LEN]>,
@@ -454,6 +457,28 @@ impl ReportPacer {
             None
         }
     }
+
+    /// Cuándo toca repetir el último informe (sin nada pendiente), con `keepalive` de intervalo.
+    pub fn keepalive_deadline(&self, keepalive: Duration) -> Option<Instant> {
+        if self.pending.is_some() {
+            return None;
+        }
+        self.sent?;
+        self.sent_at.map(|at| at + keepalive)
+    }
+
+    /// El último informe, si ya toca repetirlo a las `now` (y hay que llamar a
+    /// [`ReportPacer::sent`] si se mandó).
+    pub fn take_keepalive(&self, now: Instant, keepalive: Duration) -> Option<[u8; REPORT_LEN]> {
+        if self
+            .keepalive_deadline(keepalive)
+            .is_some_and(|deadline| deadline <= now)
+        {
+            self.sent
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -467,6 +492,8 @@ struct State<D> {
     device: D,
     /// Por ranura del cable (1 a 8).
     pads: BTreeMap<u8, Pad>,
+    /// Cada cuánto se repite el estado ([`KEEPALIVE_INTERVAL`]; los tests lo alargan).
+    keepalive: Duration,
     stop: bool,
 }
 
@@ -492,23 +519,39 @@ impl<D: VhidDevice> State<D> {
         Ok(())
     }
 
-    /// Manda lo pendiente que ya toca; devuelve cuándo vence lo siguiente.
+    /// Manda lo pendiente que ya toca y repite los estados que llevan [`State::keepalive`] sin
+    /// salir; devuelve cuándo vence lo siguiente.
     fn flush_due(&mut self, now: Instant) -> Option<Instant> {
-        let State { device, pads, .. } = self;
+        let State {
+            device,
+            pads,
+            keepalive,
+            ..
+        } = self;
         for (slot, pad) in pads.iter_mut() {
-            if let Some(report) = pad.pacer.take_due(now) {
+            let due = pad
+                .pacer
+                .take_due(now)
+                .or_else(|| pad.pacer.take_keepalive(now, *keepalive));
+            if let Some(report) = due {
                 match driver_slot(*slot).and_then(|index| device.report(index, &report)) {
                     Ok(()) => pad.pacer.sent(report, now),
                     Err(err) => tracing::warn!("mando virtual de la ranura {slot}: {err}"),
                 }
             }
         }
-        pads.values().filter_map(|pad| pad.pacer.deadline()).min()
+        pads.values()
+            .filter_map(|pad| {
+                pad.pacer
+                    .deadline()
+                    .or_else(|| pad.pacer.keepalive_deadline(*keepalive))
+            })
+            .min()
     }
 }
 
-/// Mandos virtuales por el driver `coroomvhid.sys`: un mando HID por ranura, creado al asignarla y
-/// destruido al liberarla.
+/// Mandos virtuales por el driver `coroomvhid`: el mando HID de cada ranura se toma al asignarla y
+/// se suelta, en reposo, al liberarla.
 pub struct VhidGamepads<D: VhidDevice> {
     shared: Arc<Shared<D>>,
     flusher: Option<JoinHandle<()>>,
@@ -523,12 +566,18 @@ impl<D: VhidDevice> fmt::Debug for VhidGamepads<D> {
 }
 
 impl<D: VhidDevice> VhidGamepads<D> {
-    /// Mandos sobre `device`, con el hilo que manda los informes de ejes pendientes.
+    /// Mandos sobre `device`, con el hilo que manda los informes de ejes pendientes y repite el
+    /// estado cada [`KEEPALIVE_INTERVAL`].
     pub fn with_device(device: D) -> Result<Self, InputError> {
+        Self::with_keepalive(device, KEEPALIVE_INTERVAL)
+    }
+
+    fn with_keepalive(device: D, keepalive: Duration) -> Result<Self, InputError> {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 device,
                 pads: BTreeMap::new(),
+                keepalive,
                 stop: false,
             }),
             wake: Condvar::new(),
@@ -548,7 +597,7 @@ impl<D: VhidDevice> VhidGamepads<D> {
         })
     }
 
-    /// Crea el mando de `slot` (1 a 8) en reposo; si ya existe, no hace nada.
+    /// Toma el mando de `slot` (1 a 8) y lo deja en reposo; si ya es suyo, no hace nada.
     pub fn assign(&mut self, slot: u8) -> Result<(), InputError> {
         let index = driver_slot(slot)?;
         let mut state = lock(&self.shared);
@@ -563,10 +612,12 @@ impl<D: VhidDevice> VhidGamepads<D> {
             state.pads.remove(&slot);
             let _ = state.device.destroy(index);
         }
+        // El hilo de informes empieza a repetir el estado de este mando.
+        self.shared.wake.notify_one();
         result
     }
 
-    /// Destruye el mando de `slot`.
+    /// Deja en reposo el mando de `slot` y lo suelta.
     pub fn release(&mut self, slot: u8) -> Result<(), InputError> {
         let index = driver_slot(slot)?;
         let mut state = lock(&self.shared);
@@ -632,7 +683,7 @@ impl<D: VhidDevice> VhidGamepads<D> {
         }
     }
 
-    /// Ranuras con mando creado.
+    /// Ranuras con mando tomado.
     pub fn assigned_slots(&self) -> Vec<u8> {
         lock(&self.shared).pads.keys().copied().collect()
     }
@@ -645,7 +696,7 @@ impl<D: VhidDevice> Drop for VhidGamepads<D> {
         if let Some(flusher) = self.flusher.take() {
             let _ = flusher.join();
         }
-        // Al soltar el dispositivo se cierra el handle y el driver destruye los mandos.
+        // Al soltar el dispositivo, sus mandos vuelven al reposo y se cierran sus handles.
     }
 }
 
@@ -675,22 +726,32 @@ fn flush_loop<D: VhidDevice>(shared: &Shared<D>) {
 #[cfg(target_os = "windows")]
 pub use driver::{DriverHandle, open, status};
 
-/// Acceso al driver real (solo Windows). El `unsafe` es el de `CreateFileW`, `DeviceIoControl` y
-/// `CloseHandle` (`// SAFETY:` en cada uno).
+/// Acceso al driver real (solo Windows). El `unsafe` es el de las llamadas a cfgmgr32, `hid.dll` y
+/// los handles de fichero (`// SAFETY:` en cada una).
 #[cfg(target_os = "windows")]
 #[allow(unsafe_code)]
 mod driver {
+    use std::collections::BTreeMap;
+
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_Get_Device_Interface_List_SizeW,
+        CM_Get_Device_Interface_ListW, CR_BUFFER_SMALL, CR_SUCCESS,
+    };
+    use windows::Win32::Devices::HumanInterfaceDevice::{
+        HIDP_CAPS, HIDP_STATUS_SUCCESS, HidD_FreePreparsedData, HidD_GetFeature, HidD_GetHidGuid,
+        HidD_GetPreparsedData, HidP_GetCaps, PHIDP_PREPARSED_DATA,
+    };
     use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE};
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING, WriteFile,
     };
-    use windows::Win32::System::IO::DeviceIoControl;
     use windows::core::PCWSTR;
 
     use super::{
-        DEVICE_PATH, DriverOp, IOCTL_CREATE, IOCTL_DESTROY, IOCTL_REPORT, IOCTL_VERSION,
-        REPORT_LEN, VERSION_INFO_LEN, VersionInfo, VhidDevice, VhidGamepads, driver_error,
-        open_error, report_payload, slot_payload,
+        CONTROL_USAGE, CONTROL_USAGE_PAGE, DriverInfo, DriverOp, INFO_REPORT_ID, INFO_REPORT_LEN,
+        PROTOCOL_VERSION, PadReport, REPORT_LEN, STATE_REPORT_LEN, VhidDevice, VhidGamepads,
+        driver_error, missing_slot_error, not_installed_error, state_report,
     };
     use crate::InputError;
 
@@ -700,126 +761,291 @@ mod driver {
         (code & 0xFFFF_0000 == 0x8007_0000).then_some(code & 0xFFFF)
     }
 
-    /// Handle abierto de `\\.\coroomvhid`.
+    /// Handle de fichero que se cierra al soltarlo.
     #[derive(Debug)]
-    pub struct DriverHandle {
-        handle: HANDLE,
-    }
+    struct OwnedHandle(HANDLE);
 
     // SAFETY: un HANDLE de fichero de Windows se puede usar desde cualquier hilo; aquí solo lo
     // usa quien tenga el `Mutex` de `VhidGamepads`, y se cierra una vez en `Drop`.
-    unsafe impl Send for DriverHandle {}
+    unsafe impl Send for OwnedHandle {}
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            // SAFETY: el handle lo abrió `open_path` y solo se cierra aquí, una vez.
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    /// Abre una interfaz HID (`path` acaba en NUL).
+    fn open_path(
+        path: &[u16],
+        access: u32,
+        share: FILE_SHARE_MODE,
+    ) -> Result<OwnedHandle, windows::core::Error> {
+        // SAFETY: `path` acaba en NUL y vive durante la llamada; los demás argumentos son valores
+        // o `None` (sin atributos de seguridad ni plantilla).
+        unsafe {
+            CreateFileW(
+                PCWSTR(path.as_ptr()),
+                access,
+                share,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        }
+        .map(OwnedHandle)
+    }
+
+    /// Rutas (con su NUL) de las interfaces HID presentes.
+    fn hid_interfaces() -> Result<Vec<Vec<u16>>, InputError> {
+        // SAFETY: solo devuelve un GUID constante.
+        let guid = unsafe { HidD_GetHidGuid() };
+        // La lista puede crecer entre las dos llamadas (CR_BUFFER_SMALL): se reintenta.
+        for _ in 0..4 {
+            let mut len = 0u32;
+            // SAFETY: `len` y `guid` son locales y viven durante la llamada; sin identificador de
+            // dispositivo (todas las interfaces de la clase).
+            let result = unsafe {
+                CM_Get_Device_Interface_List_SizeW(
+                    &mut len,
+                    &guid,
+                    PCWSTR::null(),
+                    CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+                )
+            };
+            if result != CR_SUCCESS {
+                return Err(InputError::Backend(format!(
+                    "mando virtual: no se pudo listar los dispositivos HID (CONFIGRET {})",
+                    result.0
+                )));
+            }
+            let mut buffer = vec![0u16; len as usize];
+            // SAFETY: `buffer` tiene los `len` caracteres que pide la API y vive durante la
+            // llamada; `guid` también.
+            let result = unsafe {
+                CM_Get_Device_Interface_ListW(
+                    &guid,
+                    PCWSTR::null(),
+                    &mut buffer,
+                    CM_GET_DEVICE_INTERFACE_LIST_PRESENT,
+                )
+            };
+            if result == CR_BUFFER_SMALL {
+                continue;
+            }
+            if result != CR_SUCCESS {
+                return Err(InputError::Backend(format!(
+                    "mando virtual: no se pudo listar los dispositivos HID (CONFIGRET {})",
+                    result.0
+                )));
+            }
+            // REG_MULTI_SZ: rutas separadas por NUL y acabadas en dos.
+            return Ok(buffer
+                .split(|&unit| unit == 0)
+                .filter(|path| !path.is_empty())
+                .map(|path| path.iter().copied().chain(Some(0)).collect())
+                .collect());
+        }
+        Err(InputError::Backend(
+            "mando virtual: la lista de dispositivos HID cambiaba sin parar".to_owned(),
+        ))
+    }
+
+    /// Capacidades de la colección HID abierta (`HidP_GetCaps`).
+    fn caps(handle: &OwnedHandle) -> Option<HIDP_CAPS> {
+        let mut data = PHIDP_PREPARSED_DATA(0);
+        // SAFETY: el handle está abierto y `data` es local; la función la rellena.
+        if !unsafe { HidD_GetPreparsedData(handle.0, &mut data) } {
+            return None;
+        }
+        let mut caps = HIDP_CAPS::default();
+        // SAFETY: `data` la acaba de dar `HidD_GetPreparsedData` y `caps` es local.
+        let status = unsafe { HidP_GetCaps(data, &mut caps) };
+        // SAFETY: `data` es de `HidD_GetPreparsedData` y se libera aquí, una vez.
+        let _ = unsafe { HidD_FreePreparsedData(data) };
+        (status == HIDP_STATUS_SUCCESS).then_some(caps)
+    }
+
+    /// Lee el informe de información de una colección de control.
+    fn read_info(handle: &OwnedHandle) -> Result<DriverInfo, InputError> {
+        let mut report = [0u8; INFO_REPORT_LEN];
+        report[0] = INFO_REPORT_ID;
+        // SAFETY: `report` es local, tiene los INFO_REPORT_LEN bytes del informe
+        // (FeatureReportByteLength) con su identificador delante y vive durante la llamada.
+        let ok = unsafe {
+            HidD_GetFeature(handle.0, report.as_mut_ptr().cast(), INFO_REPORT_LEN as u32)
+        };
+        if !ok {
+            let err = windows::core::Error::from_thread();
+            return Err(driver_error(
+                DriverOp::Info,
+                None,
+                win32_code(&err),
+                &err.message(),
+            ));
+        }
+        DriverInfo::parse(&report)
+    }
+
+    /// Las colecciones de control de coroom, por ranura del driver.
+    fn discover() -> Result<BTreeMap<u8, Vec<u16>>, InputError> {
+        let mut found = BTreeMap::new();
+        let mut problem = None;
+        for path in hid_interfaces()? {
+            // Sin acceso de lectura ni escritura: basta para las capacidades y no molesta a nadie.
+            let Ok(probe) = open_path(&path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE) else {
+                continue;
+            };
+            let Some(caps) = caps(&probe) else {
+                continue;
+            };
+            if caps.UsagePage != CONTROL_USAGE_PAGE || caps.Usage != CONTROL_USAGE {
+                continue;
+            }
+            if usize::from(caps.FeatureReportByteLength) != INFO_REPORT_LEN
+                || usize::from(caps.OutputReportByteLength) != STATE_REPORT_LEN
+            {
+                problem = Some(InputError::GamepadUnavailable(
+                    "el driver coroomvhid instalado tiene otros informes: instala el driver que \
+                     acompaña a esta versión de coroom (drivers/windows-vhid/README.md)"
+                        .to_owned(),
+                ));
+                continue;
+            }
+            let reader = match open_path(&path, GENERIC_READ.0, FILE_SHARE_READ | FILE_SHARE_WRITE)
+            {
+                Ok(reader) => reader,
+                Err(err) => {
+                    problem = Some(driver_error(
+                        DriverOp::Info,
+                        None,
+                        win32_code(&err),
+                        &err.message(),
+                    ));
+                    continue;
+                }
+            };
+            match read_info(&reader).and_then(|info| info.check().map(|()| info)) {
+                Ok(info) => {
+                    found.insert(info.slot, path);
+                }
+                Err(err) => problem = Some(err),
+            }
+        }
+        if found.is_empty() {
+            return Err(problem.unwrap_or_else(not_installed_error));
+        }
+        Ok(found)
+    }
+
+    /// Escribe el informe de estado (`WriteFile`, síncrono).
+    fn write_state(
+        handle: &OwnedHandle,
+        report: &[u8; REPORT_LEN],
+    ) -> Result<(), windows::core::Error> {
+        let packet = state_report(report);
+        let mut written = 0u32;
+        // SAFETY: el handle está abierto (se cierra solo al soltar `OwnedHandle`) y sin
+        // `OVERLAPPED`, así que la llamada es síncrona; `packet` y `written` son locales y viven
+        // durante ella.
+        unsafe { WriteFile(handle.0, Some(&packet), Some(&mut written), None) }
+    }
+
+    /// Los mandos del driver: las colecciones de control encontradas y las que tiene abiertas
+    /// este programa.
+    #[derive(Debug)]
+    pub struct DriverHandle {
+        /// Ruta de la colección de control de cada ranura del driver instalada.
+        paths: BTreeMap<u8, Vec<u16>>,
+        /// Ranuras tomadas, con su handle de escritura.
+        open: BTreeMap<u8, OwnedHandle>,
+    }
 
     impl DriverHandle {
-        /// Abre el driver y comprueba la versión de su protocolo.
-        pub fn open() -> Result<(Self, VersionInfo), InputError> {
-            let path: Vec<u16> = DEVICE_PATH.encode_utf16().chain(Some(0)).collect();
-            // SAFETY: `path` acaba en NUL y vive durante la llamada; los demás argumentos son
-            // valores o `None` (sin atributos de seguridad ni plantilla).
-            let handle = unsafe {
-                CreateFileW(
-                    PCWSTR(path.as_ptr()),
-                    (GENERIC_READ | GENERIC_WRITE).0,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE,
-                    None,
-                    OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL,
-                    None,
-                )
-            }
-            .map_err(|err| open_error(win32_code(&err), &err.message()))?;
-            let device = Self { handle };
-            let mut out = [0u8; VERSION_INFO_LEN];
-            let returned = device.ioctl(IOCTL_VERSION, &[], &mut out).map_err(|err| {
-                driver_error(DriverOp::Version, None, win32_code(&err), &err.message())
-            })?;
-            let info = VersionInfo::parse(&out[..returned.min(out.len())])?;
-            info.check()?;
-            Ok((device, info))
-        }
-
-        /// `DeviceIoControl` síncrono; devuelve los bytes escritos en `output`.
-        fn ioctl(
-            &self,
-            code: u32,
-            input: &[u8],
-            output: &mut [u8],
-        ) -> Result<usize, windows::core::Error> {
-            let mut returned = 0u32;
-            // SAFETY: el handle está abierto (se cierra solo en `Drop`) y sin `OVERLAPPED`, así
-            // que la llamada es síncrona; los punteros y longitudes son los de `input` y `output`,
-            // que viven durante la llamada, y `returned` es un `u32` local.
-            unsafe {
-                DeviceIoControl(
-                    self.handle,
-                    code,
-                    (!input.is_empty()).then(|| input.as_ptr().cast()),
-                    input.len() as u32,
-                    (!output.is_empty()).then(|| output.as_mut_ptr().cast()),
-                    output.len() as u32,
-                    Some(&mut returned),
-                    None,
-                )
-            }?;
-            Ok(returned as usize)
-        }
-
-        fn command(
-            &self,
-            op: DriverOp,
-            code: u32,
-            driver_slot: u8,
-            input: &[u8],
-        ) -> Result<(), InputError> {
-            self.ioctl(code, input, &mut []).map(|_| ()).map_err(|err| {
-                driver_error(op, Some(driver_slot + 1), win32_code(&err), &err.message())
+        /// Busca los mandos del driver y comprueba la versión de su protocolo.
+        pub fn open() -> Result<Self, InputError> {
+            Ok(Self {
+                paths: discover()?,
+                open: BTreeMap::new(),
             })
+        }
+
+        /// Ranuras del cable (1 a 8) con mando instalado.
+        pub fn installed_slots(&self) -> Vec<u8> {
+            self.paths.keys().map(|slot| slot + 1).collect()
         }
     }
 
     impl Drop for DriverHandle {
         fn drop(&mut self) {
-            // SAFETY: el handle lo abrió `open` y solo se cierra aquí, una vez.
-            let _ = unsafe { CloseHandle(self.handle) };
+            // Al reposo antes de cerrar; si no llegara, el driver lo hace solo tras WATCHDOG.
+            let neutral = PadReport::neutral().to_bytes();
+            for handle in self.open.values() {
+                let _ = write_state(handle, &neutral);
+            }
         }
     }
 
     impl VhidDevice for DriverHandle {
         fn create(&mut self, driver_slot: u8) -> Result<(), InputError> {
-            self.command(
-                DriverOp::Create,
-                IOCTL_CREATE,
-                driver_slot,
-                &slot_payload(driver_slot),
-            )
+            if self.open.contains_key(&driver_slot) {
+                return Ok(());
+            }
+            let Some(path) = self.paths.get(&driver_slot) else {
+                return Err(missing_slot_error(driver_slot + 1, &self.installed_slots()));
+            };
+            // Escritura sin compartir: otro programa no puede mandar estados a la vez.
+            let handle = open_path(path, (GENERIC_READ | GENERIC_WRITE).0, FILE_SHARE_READ)
+                .map_err(|err| {
+                    driver_error(
+                        DriverOp::Open,
+                        Some(driver_slot + 1),
+                        win32_code(&err),
+                        &err.message(),
+                    )
+                })?;
+            self.open.insert(driver_slot, handle);
+            Ok(())
         }
 
         fn destroy(&mut self, driver_slot: u8) -> Result<(), InputError> {
-            self.command(
-                DriverOp::Destroy,
-                IOCTL_DESTROY,
-                driver_slot,
-                &slot_payload(driver_slot),
-            )
+            let Some(handle) = self.open.remove(&driver_slot) else {
+                return Err(InputError::NoSuchSlot(driver_slot + 1));
+            };
+            // Al reposo y se cierra el handle (al soltarlo).
+            write_state(&handle, &PadReport::neutral().to_bytes()).map_err(|err| {
+                driver_error(
+                    DriverOp::Report,
+                    Some(driver_slot + 1),
+                    win32_code(&err),
+                    &err.message(),
+                )
+            })
         }
 
         fn report(&mut self, driver_slot: u8, report: &[u8; REPORT_LEN]) -> Result<(), InputError> {
-            self.command(
-                DriverOp::Report,
-                IOCTL_REPORT,
-                driver_slot,
-                &report_payload(driver_slot, report),
-            )
+            let Some(handle) = self.open.get(&driver_slot) else {
+                return Err(InputError::NoSuchSlot(driver_slot + 1));
+            };
+            write_state(handle, report).map_err(|err| {
+                driver_error(
+                    DriverOp::Report,
+                    Some(driver_slot + 1),
+                    win32_code(&err),
+                    &err.message(),
+                )
+            })
         }
     }
 
     /// Abre el driver para [`VhidGamepads`].
     pub fn open() -> Result<VhidGamepads<DriverHandle>, InputError> {
-        let (device, info) = DriverHandle::open()?;
+        let device = DriverHandle::open()?;
         tracing::info!(
-            "mando virtual: driver coroomvhid, protocolo {}, {} ranuras",
-            info.protocol,
-            info.max_slots
+            "mando virtual: driver coroomvhid, protocolo {PROTOCOL_VERSION}, ranuras {:?}",
+            device.installed_slots()
         );
         VhidGamepads::with_device(device)
     }
@@ -827,10 +1053,16 @@ mod driver {
     /// Estado del driver para `coroom doctor`.
     pub fn status() -> String {
         match DriverHandle::open() {
-            Ok((_, info)) => format!(
-                "mandos: driver coroomvhid (protocolo {}, hasta {} mandos HID genéricos)",
-                info.protocol, info.max_slots
-            ),
+            Ok(device) => {
+                let slots = device.installed_slots();
+                let list: Vec<String> = slots.iter().map(u8::to_string).collect();
+                format!(
+                    "mandos: driver coroomvhid (protocolo {PROTOCOL_VERSION}, {} mandos HID \
+                     genéricos: ranuras {})",
+                    slots.len(),
+                    list.join(", ")
+                )
+            }
             Err(err) => format!("mandos: {err}"),
         }
     }
@@ -842,10 +1074,16 @@ mod tests {
 
     const DESCRIPTOR_SOURCE: &str =
         include_str!("../../../../drivers/windows-vhid/report_descriptor.inc");
+    const CONTROL_SOURCE: &str =
+        include_str!("../../../../drivers/windows-vhid/control_descriptor.inc");
     const HEADER_SOURCE: &str = include_str!("../../../../drivers/windows-vhid/coroom_vhid.h");
     const INF_SOURCE: &str = include_str!("../../../../drivers/windows-vhid/coroomvhid.inf");
+    const DEVICES_SOURCE: &str = include_str!("../../../../drivers/windows-vhid/devices.ps1");
+    const INSTALL_SOURCE: &str = include_str!("../../../../drivers/windows-vhid/install.ps1");
 
     const ONE: GuestId = GuestId(1);
+    /// Sin repeticiones durante un test (las cuentas de informes son exactas).
+    const NO_KEEPALIVE: Duration = Duration::from_secs(3600);
     const TWO: GuestId = GuestId(2);
 
     /// Quita los comentarios `//` y `/* */` de un texto en C.
@@ -868,9 +1106,19 @@ mod tests {
         out
     }
 
-    /// Los bytes de `report_descriptor.inc` (solo `0x..`, comas y comentarios).
+    /// Los bytes del mando, `report_descriptor.inc`.
     fn descriptor() -> Vec<u8> {
-        strip_c_comments(DESCRIPTOR_SOURCE)
+        descriptor_bytes(DESCRIPTOR_SOURCE)
+    }
+
+    /// Los bytes de la colección de control, `control_descriptor.inc`.
+    fn control_descriptor() -> Vec<u8> {
+        descriptor_bytes(CONTROL_SOURCE)
+    }
+
+    /// Los bytes de un `.inc` de descriptor (solo `0x..`, comas y comentarios).
+    fn descriptor_bytes(source: &str) -> Vec<u8> {
+        strip_c_comments(source)
             .split(',')
             .map(str::trim)
             .filter(|token| !token.is_empty())
@@ -885,7 +1133,7 @@ mod tests {
             .collect()
     }
 
-    /// Un campo de entrada del descriptor (un elemento de `Input` por `Report Count`).
+    /// Un campo del descriptor (un elemento de `Input`, `Output` o `Feature` por `Report Count`).
     #[derive(Debug, Clone, Copy)]
     struct Field {
         report_id: u8,
@@ -907,11 +1155,15 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct Parsed {
+        /// Campos de entrada.
         fields: Vec<Field>,
-        /// Uso de la colección de aplicación de más fuera (página, uso).
-        application: Option<(u16, u16)>,
+        /// Campos de salida.
+        outputs: Vec<Field>,
+        /// Campos de característica.
+        features: Vec<Field>,
+        /// Uso de cada colección de aplicación de más fuera (página, uso), en orden.
+        applications: Vec<(u16, u16)>,
         max_depth: usize,
-        output_or_feature: usize,
     }
 
     /// Analizador de descriptores HID (elementos cortos, HID 1.11 §6.2.2), lo justo para este.
@@ -921,7 +1173,8 @@ mod tests {
         let (mut report_size, mut report_count, mut report_id) = (0usize, 0usize, 0u8);
         let mut usages: Vec<u16> = Vec::new();
         let (mut usage_min, mut usage_max) = (None::<u16>, None::<u16>);
-        let mut bits: BTreeMap<u8, usize> = BTreeMap::new();
+        // Bits ocupados por cada (tipo de informe, identificador).
+        let mut bits: BTreeMap<(u8, u8), usize> = BTreeMap::new();
         let mut depth = 0usize;
         let mut at = 0;
         while at < descriptor.len() {
@@ -947,9 +1200,9 @@ mod tests {
             let tag = prefix >> 4;
             match (kind, tag) {
                 // Main
-                (0, 0x8) => {
+                (0, 0x8 | 0x9 | 0xB) => {
                     let id_bits = if report_id == 0 { 0 } else { 8 };
-                    let cursor = bits.entry(report_id).or_insert(id_bits);
+                    let cursor = bits.entry((tag, report_id)).or_insert(id_bits);
                     for index in 0..report_count {
                         let usage = if !usages.is_empty() {
                             Some(usages[index.min(usages.len() - 1)])
@@ -960,7 +1213,12 @@ mod tests {
                                 usage
                             })
                         };
-                        parsed.fields.push(Field {
+                        let list = match tag {
+                            0x8 => &mut parsed.fields,
+                            0x9 => &mut parsed.outputs,
+                            _ => &mut parsed.features,
+                        };
+                        list.push(Field {
                             report_id,
                             bit: *cursor,
                             size: report_size,
@@ -973,11 +1231,10 @@ mod tests {
                         *cursor += report_size;
                     }
                 }
-                (0, 0x9 | 0xB) => parsed.output_or_feature += 1,
                 (0, 0xA) => {
                     if depth == 0 {
                         assert_eq!(unsigned, 1, "la colección de fuera es de aplicación");
-                        parsed.application = Some((usage_page, usages[0]));
+                        parsed.applications.push((usage_page, usages[0]));
                     }
                     depth += 1;
                     parsed.max_depth = parsed.max_depth.max(depth);
@@ -1070,14 +1327,14 @@ mod tests {
         assert_eq!(bytes.len(), 85, "longitud del descriptor");
         let parsed = parse(&bytes);
         assert_eq!(
-            parsed.application,
-            Some((GENERIC_DESKTOP, 0x05)),
+            parsed.applications,
+            vec![(GENERIC_DESKTOP, 0x05)],
             "Game Pad"
         );
         assert_eq!(parsed.max_depth, 1);
-        assert_eq!(
-            parsed.output_or_feature, 0,
-            "sin informes de salida (vibración)"
+        assert!(
+            parsed.outputs.is_empty() && parsed.features.is_empty(),
+            "el mando no tiene informes de salida (vibración) ni de característica"
         );
         assert!(
             parsed
@@ -1148,6 +1405,70 @@ mod tests {
             .map(|field| field.size)
             .sum();
         assert_eq!(padding, 4);
+    }
+
+    #[test]
+    fn the_control_collection_carries_the_state_and_the_info() {
+        let bytes = control_descriptor();
+        let parsed = parse(&bytes);
+        assert_eq!(
+            parsed.applications,
+            vec![(CONTROL_USAGE_PAGE, CONTROL_USAGE)]
+        );
+        const { assert!(CONTROL_USAGE_PAGE >= 0xFF00, "página de fabricante") };
+        assert_eq!(parsed.max_depth, 1);
+        assert!(
+            parsed.fields.is_empty(),
+            "sin informes de entrada: los juegos no ven nada en ella"
+        );
+
+        assert!(
+            parsed
+                .outputs
+                .iter()
+                .all(|field| field.report_id == STATE_REPORT_ID && field.size == 8)
+        );
+        let bits: usize = parsed.outputs.iter().map(|field| field.size).sum();
+        assert_eq!(
+            8 + bits,
+            STATE_REPORT_LEN * 8,
+            "informe de estado: identificador e informe del mando"
+        );
+        assert!(
+            parsed
+                .outputs
+                .iter()
+                .all(|field| (field.logical_min, field.logical_max) == (0, 255))
+        );
+
+        assert!(
+            parsed
+                .features
+                .iter()
+                .all(|field| field.report_id == INFO_REPORT_ID && field.size == 8)
+        );
+        let bits: usize = parsed.features.iter().map(|field| field.size).sum();
+        assert_eq!(8 + bits, INFO_REPORT_LEN * 8, "informe de información");
+
+        // El driver los junta: dos colecciones de aplicación con identificadores distintos.
+        let mut both = descriptor();
+        both.extend(&bytes);
+        let parsed = parse(&both);
+        assert_eq!(
+            parsed.applications,
+            vec![(GENERIC_DESKTOP, 0x05), (CONTROL_USAGE_PAGE, CONTROL_USAGE)]
+        );
+        let mut ids: Vec<u8> = parsed
+            .fields
+            .iter()
+            .chain(&parsed.outputs)
+            .chain(&parsed.features)
+            .map(|field| field.report_id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids, vec![REPORT_ID, STATE_REPORT_ID, INFO_REPORT_ID]);
+        assert!(both.len() <= usize::from(u16::MAX));
     }
 
     #[test]
@@ -1336,15 +1657,6 @@ mod tests {
         assert_eq!(number("COROOM_VHID_MAX_SLOTS"), u32::from(DRIVER_SLOTS));
         assert_eq!(number("COROOM_VHID_REPORT_ID"), u32::from(REPORT_ID));
         assert_eq!(number("COROOM_VHID_REPORT_SIZE") as usize, REPORT_LEN);
-        assert_eq!(
-            number("COROOM_VHID_VERSION_INFO_SIZE") as usize,
-            VERSION_INFO_LEN
-        );
-        assert_eq!(number("COROOM_VHID_SLOT_SIZE") as usize, SLOT_LEN);
-        assert_eq!(
-            number("COROOM_VHID_REPORT_PACKET_SIZE") as usize,
-            REPORT_PACKET_LEN
-        );
         assert_eq!(number("COROOM_VHID_HAT_NULL"), u32::from(HAT_NULL));
         assert_eq!(number("COROOM_VHID_AXIS_MAX"), AXIS_MAX as u32);
         for (name, at) in [
@@ -1364,82 +1676,145 @@ mod tests {
             );
         }
         assert_eq!(
-            header_string(&defines, "COROOM_VHID_USER_PATH"),
-            DEVICE_PATH
+            number("COROOM_VHID_CONTROL_USAGE_PAGE"),
+            u32::from(CONTROL_USAGE_PAGE)
         );
         assert_eq!(
-            header_string(&defines, "COROOM_VHID_SDDL"),
-            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)",
-            "solo SYSTEM, administradores y el usuario interactivo"
+            number("COROOM_VHID_CONTROL_USAGE"),
+            u32::from(CONTROL_USAGE)
         );
         assert_eq!(
-            defines["COROOM_VHID_IOCTL(n)"],
-            "CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800 + (n), METHOD_BUFFERED, FILE_ANY_ACCESS)"
+            number("COROOM_VHID_STATE_REPORT_ID"),
+            u32::from(STATE_REPORT_ID)
         );
-        for (name, code) in [
-            ("IOCTL_COROOM_VHID_VERSION", IOCTL_VERSION),
-            ("IOCTL_COROOM_VHID_CREATE", IOCTL_CREATE),
-            ("IOCTL_COROOM_VHID_DESTROY", IOCTL_DESTROY),
-            ("IOCTL_COROOM_VHID_REPORT", IOCTL_REPORT),
-        ] {
-            let n: u32 = defines[name]
-                .strip_prefix("COROOM_VHID_IOCTL(")
-                .and_then(|rest| rest.strip_suffix(')'))
-                .unwrap()
-                .parse()
-                .unwrap();
-            assert_eq!(coroom_ioctl(n), code, "{name}");
+        assert_eq!(
+            number("COROOM_VHID_STATE_REPORT_SIZE") as usize,
+            STATE_REPORT_LEN
+        );
+        assert_eq!(
+            number("COROOM_VHID_INFO_REPORT_ID"),
+            u32::from(INFO_REPORT_ID)
+        );
+        assert_eq!(
+            number("COROOM_VHID_INFO_REPORT_SIZE") as usize,
+            INFO_REPORT_LEN
+        );
+        assert_eq!(number("COROOM_VHID_INFO_SIZE") as usize, INFO_LEN);
+        assert_eq!(
+            Duration::from_millis(u64::from(number("COROOM_VHID_WATCHDOG_MS"))),
+            WATCHDOG
+        );
+        assert!(
+            KEEPALIVE_INTERVAL * 3 < WATCHDOG,
+            "el estado se repite varias veces antes de que salte el perro guardián"
+        );
+        assert_eq!(
+            header_string(&defines, "COROOM_VHID_HARDWARE_ID"),
+            HARDWARE_ID
+        );
+
+        // El INF instala el minidriver de UMDF2 bajo mshidumdf.sys en esos dispositivos raíz, sin
+        // nada de modo kernel propio.
+        let inf: String = INF_SOURCE
+            .lines()
+            .map(|line| line.split(';').next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(inf.contains(&format!("%DeviceDesc% = CoroomVhid, {HARDWARE_ID}")));
+        assert!(inf.contains(&format!("%DeviceDesc% = CoroomVhid_Win10, {HARDWARE_ID}")));
+        assert!(inf.contains("Class       = HIDClass"));
+        assert!(inf.contains("Needs = MsHidUmdf.NT"));
+        assert!(inf.contains("AddService = mshidumdf,0x000001fa,"));
+        assert!(inf.contains("UmdfService                = coroomvhid, CoroomVhid_UmdfService"));
+        assert!(inf.contains("ServiceBinary      = %13%\\coroomvhid.dll"));
+        assert!(
+            !inf.contains(".sys = 1"),
+            "el paquete no lleva drivers de kernel"
+        );
+        assert!(!inf.to_lowercase().contains("vhf"));
+
+        // Los scripts de instalación usan los mismos valores.
+        let slot_value = header_string(&defines, "COROOM_VHID_SLOT_VALUE");
+        assert!(DEVICES_SOURCE.contains(&format!("$CoroomHardwareId = '{HARDWARE_ID}'")));
+        assert!(DEVICES_SOURCE.contains(&format!("$CoroomSlotValue = '{slot_value}'")));
+        assert!(DEVICES_SOURCE.contains(&format!("$CoroomMaxSlots = {DRIVER_SLOTS}")));
+        assert!(
+            DEVICES_SOURCE
+                .contains("$CoroomControlSddl = 'D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)'"),
+            "la colección de control, solo para SYSTEM, administradores y el usuario interactivo"
+        );
+        assert!(INSTALL_SOURCE.contains(&format!("[int] $Pads = {DEFAULT_PADS}")));
+        assert!(INSTALL_SOURCE.contains(&format!("[ValidateRange(1, {DRIVER_SLOTS})]")));
+        for script in [DEVICES_SOURCE, INSTALL_SOURCE] {
+            let lower = script.to_lowercase();
+            assert!(
+                !lower.contains("bcdedit") && !lower.contains("testsigning"),
+                "la instalación no toca la firma de prueba"
+            );
         }
-        assert_eq!(
-            [IOCTL_VERSION, IOCTL_CREATE, IOCTL_DESTROY, IOCTL_REPORT],
-            [0x0022_2000, 0x0022_2004, 0x0022_2008, 0x0022_200C],
-            "CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800 + n, METHOD_BUFFERED, FILE_ANY_ACCESS)"
-        );
-        assert!(INF_SOURCE.contains("Root\\coroomvhid"));
-        assert!(INF_SOURCE.contains("HKR,,\"LowerFilters\",0x00010000,\"vhf\""));
     }
 
     #[test]
-    fn payloads_and_versions() {
-        assert_eq!(slot_payload(7), [7]);
+    fn reports_infos_and_errors() {
         let report = PadReport::neutral().to_bytes();
-        let payload = report_payload(3, &report);
-        assert_eq!(payload[0], 3);
-        assert_eq!(payload[1..], report);
+        let packet = state_report(&report);
+        assert_eq!(packet[0], STATE_REPORT_ID);
+        assert_eq!(packet[1..], report);
+        assert_eq!(packet[1], REPORT_ID, "el informe del mando va entero");
 
         assert_eq!(driver_slot(1), Ok(0));
         assert_eq!(driver_slot(8), Ok(7));
         assert_eq!(driver_slot(0), Err(InputError::NoSuchSlot(0)));
         assert_eq!(driver_slot(9), Err(InputError::NoSuchSlot(9)));
 
-        let info = VersionInfo::parse(&[1, 0, 0, 0, 8, 16, 0, 0, 0xAA]).unwrap();
+        let info = DriverInfo::parse(&[INFO_REPORT_ID, 2, 0, 0, 0, 5, 16, 0, 0, 0xAA]).unwrap();
         assert_eq!(
             info,
-            VersionInfo {
-                protocol: 1,
-                max_slots: 8,
+            DriverInfo {
+                protocol: 2,
+                slot: 5,
                 report_len: 16
             }
         );
         assert_eq!(info.check(), Ok(()));
-        assert!(VersionInfo::parse(&[1, 0, 0]).is_err());
-        let newer = VersionInfo::parse(&[2, 0, 0, 0, 8, 16, 0, 0]).unwrap();
+        assert!(DriverInfo::parse(&[INFO_REPORT_ID, 2, 0, 0]).is_err());
         assert!(
-            matches!(newer.check(), Err(InputError::GamepadUnavailable(text)) if text.contains("versión 2"))
+            DriverInfo::parse(&[STATE_REPORT_ID, 2, 0, 0, 0, 5, 16, 0, 0]).is_err(),
+            "otro informe"
         );
-        let small = VersionInfo::parse(&[1, 0, 0, 0, 4, 16, 0, 0]).unwrap();
-        assert!(small.check().is_err());
+        let older = DriverInfo::parse(&[INFO_REPORT_ID, 1, 0, 0, 0, 0, 16, 0, 0]).unwrap();
+        assert!(
+            matches!(older.check(), Err(InputError::GamepadUnavailable(text)) if text.contains("versión 1"))
+        );
+        let bad_slot = DriverInfo::parse(&[INFO_REPORT_ID, 2, 0, 0, 0, 8, 16, 0, 0]).unwrap();
+        assert!(bad_slot.check().is_err());
+        let bad_len = DriverInfo::parse(&[INFO_REPORT_ID, 2, 0, 0, 0, 0, 17, 0, 0]).unwrap();
+        assert!(bad_len.check().is_err());
 
-        let InputError::GamepadUnavailable(text) = open_error(Some(2), "x") else {
+        let InputError::GamepadUnavailable(text) = not_installed_error() else {
             panic!()
         };
         assert!(text.contains("drivers/windows-vhid/README.md"), "{text}");
-        let InputError::Backend(text) = driver_error(DriverOp::Create, Some(2), Some(170), "x")
-        else {
+        let InputError::GamepadUnavailable(text) = missing_slot_error(6, &[1, 2, 3, 4]) else {
+            panic!()
+        };
+        assert!(
+            text.contains("ranura 6") && text.contains("1, 2, 3, 4") && text.contains("-Pads 8"),
+            "{text}"
+        );
+        let InputError::Backend(text) = driver_error(DriverOp::Open, Some(2), Some(32), "x") else {
             panic!()
         };
         assert!(
             text.contains("ranura 2") && text.contains("otro programa"),
+            "{text}"
+        );
+        let InputError::Backend(text) = driver_error(DriverOp::Report, Some(3), Some(1167), "x")
+        else {
+            panic!()
+        };
+        assert!(
+            text.contains("ranura 3") && text.contains("ya no está"),
             "{text}"
         );
     }
@@ -1568,7 +1943,7 @@ mod tests {
     #[test]
     fn gamepads_are_created_fed_and_destroyed_per_slot() {
         let device = FakeDevice::default();
-        let mut pads = VhidGamepads::with_device(device.clone()).unwrap();
+        let mut pads = VhidGamepads::with_keepalive(device.clone(), NO_KEEPALIVE).unwrap();
         let neutral = PadReport::neutral().to_bytes();
 
         pads.assign(2).unwrap();
@@ -1638,7 +2013,7 @@ mod tests {
     #[test]
     fn release_guest_rests_only_that_guests_pads() {
         let device = FakeDevice::default();
-        let mut pads = VhidGamepads::with_device(device.clone()).unwrap();
+        let mut pads = VhidGamepads::with_keepalive(device.clone(), NO_KEEPALIVE).unwrap();
         pads.assign(1).unwrap();
         pads.assign(4).unwrap();
         pads.inject(&button(1, GamepadButton::B, true), ONE)
@@ -1654,5 +2029,58 @@ mod tests {
             "solo la ranura 1 (la 0 del driver) vuelve al reposo"
         );
         drop(pads);
+    }
+
+    #[test]
+    fn the_pacer_repeats_the_last_report_while_nothing_changes() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let keepalive = Duration::from_millis(250);
+        let mut pacer = ReportPacer::default();
+        assert_eq!(pacer.keepalive_deadline(keepalive), None, "nada enviado");
+
+        let mut pad = PadReport::neutral();
+        let first = pacer.offer(pad.to_bytes(), t0).unwrap();
+        pacer.sent(first, t0);
+        assert_eq!(pacer.keepalive_deadline(keepalive), Some(ms(250)));
+        assert_eq!(pacer.take_keepalive(ms(249), keepalive), None);
+        assert_eq!(pacer.take_keepalive(ms(250), keepalive), Some(first));
+        pacer.sent(first, ms(250));
+        assert_eq!(pacer.keepalive_deadline(keepalive), Some(ms(500)));
+
+        // Con algo pendiente, manda lo pendiente (que ya es más nuevo), no la repetición.
+        pad.set_axis(GamepadAxis::LeftX, 10);
+        assert_eq!(pacer.offer(pad.to_bytes(), ms(251)), None);
+        assert_eq!(pacer.keepalive_deadline(keepalive), None);
+        assert_eq!(pacer.take_keepalive(ms(600), keepalive), None);
+        assert_eq!(pacer.take_due(ms(600)), Some(pad.to_bytes()));
+    }
+
+    #[test]
+    fn idle_gamepads_repeat_their_state_for_the_watchdog() {
+        let device = FakeDevice::default();
+        let mut pads =
+            VhidGamepads::with_keepalive(device.clone(), Duration::from_millis(5)).unwrap();
+        let neutral = PadReport::neutral().to_bytes();
+        pads.assign(3).unwrap();
+        let repeated = |calls: &[Call]| {
+            calls
+                .iter()
+                .filter(|call| **call == Call::Report(2, neutral))
+                .count()
+        };
+        assert!(
+            device.wait_for(|calls| repeated(calls) >= 4),
+            "{:?}",
+            device.calls()
+        );
+        assert_eq!(device.calls()[0], Call::Create(2));
+
+        // Un mando liberado deja de repetirse.
+        pads.release(3).unwrap();
+        let after = device.calls().len();
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(device.calls().len(), after);
+        assert_eq!(device.calls().last(), Some(&Call::Destroy(2)));
     }
 }

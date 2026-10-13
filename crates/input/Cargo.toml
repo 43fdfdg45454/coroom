@@ -13,7 +13,7 @@ default = ["linux-portal", "windows-sendinput", "windows-vhid"]
 linux-portal = ["dep:reis", "dep:evdev", "dep:ashpd", "dep:tokio", "dep:rustix"]
 # Windows: teclado y ratón por `SendInput`.
 windows-sendinput = []
-# Windows: mandos virtuales por el driver propio `coroomvhid.sys` (drivers/windows-vhid). El
+# Windows: mandos virtuales por el driver propio `coroomvhid` (UMDF2, drivers/windows-vhid). El
 # formato de sus informes se compila (y se prueba) en todas las plataformas.
 windows-vhid = ["windows-sendinput"]
 
@@ -36,6 +36,8 @@ tokio = { workspace = true, optional = true, features = ["rt", "sync", "time"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true, features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_HumanInterfaceDevice",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",

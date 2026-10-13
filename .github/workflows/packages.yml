@@ -3,8 +3,8 @@ name: Paquetes
 # Construye todo lo que se adjunta a una publicación, con la versión que calcula ci.yml: el
 # Flatpak (flatpak.yml), el MSIX firmado con el certificado de prueba y el .zip portátil de Windows,
 # la imagen multiarquitectura de coroom-server (solo se construye; «Publicación» la sube a GHCR
-# desde la caché) y el driver de mando virtual en su build de desarrollo (driver.yml). Lo llama
-# ci.yml en cada push a main; a mano, desde la pestaña Actions.
+# desde la caché) y el driver de mando virtual firmado con su certificado de un solo uso
+# (driver.yml). Lo llama ci.yml en cada push a main; a mano, desde la pestaña Actions.
 on:
   workflow_call:
     inputs:
@@ -36,6 +36,8 @@ jobs:
   driver:
     name: Driver de mando virtual
     uses: ./.github/workflows/driver.yml
+    with:
+      version: ${{ inputs.version }}
 
   windows:
     name: Windows (MSIX y zip)
