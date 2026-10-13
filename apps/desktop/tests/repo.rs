@@ -1,4 +1,6 @@
 //! Comprobaciones del repositorio que no son de la aplicación pero rompen la CI si se olvidan.
+//! Solo en Unix: `tools/check-locks.sh` es de bash (la CI lo pasa en Linux).
+#![cfg(unix)]
 
 use std::path::Path;
 use std::process::Command;
@@ -7,7 +9,6 @@ use std::process::Command;
 /// CI compila con `--locked`) y `cargo-sources.json` del Flatpak, al día con las dependencias. Así
 /// `cargo test` falla antes de subir un cambio de dependencias que deja uno viejo.
 #[test]
-#[cfg(unix)]
 fn locks_are_up_to_date() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let output = Command::new(root.join("tools/check-locks.sh"))
