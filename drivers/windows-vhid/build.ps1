@@ -230,7 +230,9 @@ try {
         Remove-Item $staging -Recurse -Force -ErrorAction SilentlyContinue
         New-Item -ItemType Directory -Force -Path $staging | Out-Null
         Copy-Item $packageInf, (Join-Path $package 'coroomvhid.dll') $staging
-        & $inf2cat "/driver:$staging" "/os:10_$($arch.ToUpperInvariant())" /uselocaltime
+        # En ARM64 Inf2Cat no acepta el genérico 10_ARM64: se nombran Windows 10 22H2 (VB) y 11.
+        $os = if ($arch -eq 'ARM64') { '10_VB_ARM64,10_CO_ARM64,10_NI_ARM64' } else { '10_X64' }
+        & $inf2cat "/driver:$staging" "/os:$os" /uselocaltime
         if ($LASTEXITCODE -ne 0) {
             throw "Inf2Cat falló para $arch (código $LASTEXITCODE)."
         }
