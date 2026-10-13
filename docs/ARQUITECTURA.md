@@ -57,7 +57,10 @@ se usa *intra-refresh* en lugar de keyframes (un IDR pesa 3-5 fotogramas).
 | **Sobrecoste del streaming** | **≈ 6-7** | **≈ 53 (30 son RTT)** |
 
 Audio y voz: Opus en tramas de 10 ms, buffer de jitter adaptativo de 20-60 ms, sincronía A/V con
-|A−V| < 40 ms y voz boca-oído en LAN < 80 ms. El cifrado no entra como etapa apreciable: con las dos
+|A−V| < 40 ms y voz boca-oído en LAN < 80 ms. La reproducción es **a demanda** en PipeWire: el
+callback del dispositivo pide cada trama justo cuando la necesita (sin cola intermedia, que añadía
+una trama), y el buffer de jitter se queda en su objetivo sin una trama de más. WASAPI sigue con la
+cola de una trama. El cifrado no entra como etapa apreciable: con las dos
 capas (SFrame y QUIC) el peor caso queda por debajo de 0,2 ms por fotograma.
 
 ### 2.3 Cómo se mide

@@ -6,14 +6,19 @@
 //! - [`CaptureSink`]: un dispositivo de reproducción virtual que consume a ritmo real con una
 //!   latencia fija: `write` bloquea mientras haya más de [`CaptureSink::BUFFER`] en cola, devuelve
 //!   cuándo sonará la trama y guarda todo lo reproducido (con esas horas) en una [`Recording`]
-//!   compartida para que el test la analice. Es para tests: la grabación crece.
+//!   compartida para que el test la analice. Es para tests: la grabación crece. A ritmo real
+//!   reproduce **a demanda** por defecto ([`AudioSink::start_pull`], como la salida de PipeWire):
+//!   un hilo hace de dispositivo, pide cada trama al empezar su hueco de 10 ms y la oye la latencia
+//!   del dispositivo después; con [`CaptureSink::pushed`], con la cola de `write`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::{
     AudioConfig, AudioError, AudioFormat, AudioSink, AudioSource, Captured, FRAME_DURATION, Played,
-    SAMPLES_PER_CHANNEL,
+    Render, SAMPLES_PER_CHANNEL,
 };
 
 /// Senoidal con marcas de tiempo exactas.
@@ -177,9 +182,12 @@ pub struct CaptureSink {
     channels: u16,
     latency: Duration,
     paced: bool,
+    pull: bool,
     queued_until: Option<Instant>,
     recording: Arc<Mutex<Recording>>,
     started: bool,
+    /// A demanda: el hilo que hace de dispositivo y su orden de parar.
+    device: Option<(Arc<AtomicBool>, JoinHandle<()>)>,
 }
 
 impl CaptureSink {
@@ -192,13 +200,21 @@ impl CaptureSink {
             channels: channels.clamp(1, 2),
             latency: crate::DEVICE_LATENCY,
             paced: true,
+            pull: true,
             queued_until: None,
             recording: Arc::new(Mutex::new(Recording {
                 channels: channels.clamp(1, 2),
                 ..Recording::default()
             })),
             started: false,
+            device: None,
         }
+    }
+
+    /// Sin reproducción a demanda: solo la cola de `write` (como WASAPI).
+    pub fn pushed(mut self) -> Self {
+        self.pull = false;
+        self
     }
 
     /// Latencia del dispositivo virtual (lo que tarda en sonar lo que sale de la cola).
@@ -282,7 +298,70 @@ impl AudioSink for CaptureSink {
         Ok(Played { played_at_estimate })
     }
 
+    fn supports_pull(&self) -> bool {
+        self.paced && self.pull
+    }
+
+    fn start_pull(&mut self, config: &AudioConfig, mut render: Render) -> Result<(), AudioError> {
+        if !self.supports_pull() {
+            return Err(AudioError::Unsupported(
+                "sumidero sintético sin ritmo real o con cola".to_owned(),
+            ));
+        }
+        self.stop();
+        self.start(config)?;
+        let frame = SAMPLES_PER_CHANNEL * usize::from(self.channels);
+        let (latency, recording) = (self.latency, Arc::clone(&self.recording));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
+            .name("synthetic-audio".into())
+            .spawn(move || {
+                let mut out = vec![0i16; frame];
+                let mut start = Instant::now();
+                let mut slot = 0u32;
+                while !thread_stop.load(Ordering::Acquire) {
+                    // El hueco de cada trama empieza a su hora, sin acumular los retrasos del
+                    // sueño; si el hilo llega tarde a uno entero, se queda sin nada y vuelve a
+                    // contar desde ahora.
+                    let at = start + FRAME_DURATION * slot;
+                    let now = Instant::now();
+                    if at > now {
+                        std::thread::sleep(at - now);
+                    } else if now - at > FRAME_DURATION {
+                        lock(&recording).underruns += 1;
+                        (start, slot) = (now, 0);
+                        continue;
+                    }
+                    let played_at = at + latency;
+                    out.fill(0);
+                    render(&mut out, played_at);
+                    let mut recording = lock(&recording);
+                    let offset = recording.samples.len();
+                    recording.samples.extend_from_slice(&out);
+                    recording.writes.push((played_at, offset));
+                    drop(recording);
+                    slot += 1;
+                }
+            })
+            .map_err(|err| AudioError::Backend(format!("no se pudo crear el hilo: {err}")))?;
+        self.device = Some((stop, thread));
+        Ok(())
+    }
+
+    fn check(&mut self) -> Result<(), AudioError> {
+        match &self.device {
+            Some((_, thread)) if thread.is_finished() => Err(AudioError::DeviceLost),
+            Some(_) => Ok(()),
+            None => Err(AudioError::Stopped),
+        }
+    }
+
     fn stop(&mut self) {
+        if let Some((stop, thread)) = self.device.take() {
+            stop.store(true, Ordering::Release);
+            let _ = thread.join();
+        }
         self.started = false;
         self.queued_until = None;
     }

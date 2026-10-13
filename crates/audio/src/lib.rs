@@ -261,6 +261,27 @@ pub trait AudioSink: Send {
     /// Encola una trama (muestras intercaladas en [`AudioSink::format`]).
     fn write(&mut self, samples: &[i16]) -> Result<Played, AudioError>;
 
+    /// Si admite la reproducción a demanda ([`AudioSink::start_pull`]).
+    fn supports_pull(&self) -> bool {
+        false
+    }
+
+    /// Abre el dispositivo a demanda: el propio dispositivo llama a `render` desde su hilo justo
+    /// cuando necesita cada trama, en vez de tomarla de una cola que se llenó una trama antes con
+    /// [`AudioSink::write`]. Lo que suena se decide en el último momento y la cola desaparece.
+    /// [`AudioSink::check`] dice después si sigue en marcha.
+    fn start_pull(&mut self, config: &AudioConfig, render: Render) -> Result<(), AudioError> {
+        let _ = (config, render);
+        Err(AudioError::Unsupported(
+            "esta salida no reproduce a demanda".to_owned(),
+        ))
+    }
+
+    /// A demanda: el error si el dispositivo se detuvo.
+    fn check(&mut self) -> Result<(), AudioError> {
+        Ok(())
+    }
+
     /// Suelta el dispositivo.
     fn stop(&mut self);
 
@@ -269,6 +290,10 @@ pub trait AudioSink: Send {
         "salida de audio".to_owned()
     }
 }
+
+/// Lo que pide un dispositivo a demanda ([`AudioSink::start_pull`]): llenar una trama (muestras
+/// intercaladas en [`AudioSink::format`]) cuya primera muestra sonará en el instante que se pasa.
+pub type Render = Box<dyn FnMut(&mut [i16], Instant) + Send>;
 
 /// Qué audio del juego captura el anfitrión (`coroom host --audio`).
 #[derive(Debug, Clone, PartialEq, Eq)]

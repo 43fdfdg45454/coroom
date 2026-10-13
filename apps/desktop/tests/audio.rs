@@ -19,8 +19,8 @@
 //! se acotan a 3 por los parones de la VM (ver `check_game_audio`).
 //!
 //! Cotas: |A−V| y boca-oído usan las marcas del registro (captura del emisor convertida con el
-//! reloj de la sesión y hora estimada de reproducción del sumidero, que tiene 20 ms de cola y 10 ms
-//! de latencia de dispositivo, como uno real con `node.latency = 480/48000`). Los huecos se miden
+//! reloj de la sesión y hora estimada de reproducción del sumidero, que reproduce a demanda con
+//! 10 ms de latencia de dispositivo, como la salida de PipeWire con `node.latency = 480/48000`). Los huecos se miden
 //! dos veces: en el buffer de jitter (tramas seguidas sin paquete) y en la grabación (tramas de
 //! 10 ms por debajo de −40 dBFS, cuando el tono está a −13 dBFS).
 //!

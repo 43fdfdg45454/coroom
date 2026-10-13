@@ -49,6 +49,12 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Cambiado
 
+- Audio con unos 13 ms menos de latencia en Linux (mediana del audio del juego en el test de
+  extremo a extremo: de 46,7 a 33,4 ms; desfase A−V medio de 26 a 15 ms). La salida de PipeWire
+  reproduce a demanda: su callback pide cada trama justo cuando el dispositivo la necesita, en vez
+  de tomarla de una cola llenada una trama antes. Además, el buffer de jitter ya no se queda una
+  trama por encima de su objetivo: se ceba en el objetivo y recorta cuando durante un segundo le
+  sobra una trama. WASAPI sigue con la cola.
 - Windows: el driver de mando virtual pasa de KMDF sobre Virtual HID Framework a un minidriver HID
   de UMDF2 en modo usuario bajo el `mshidumdf.sys` de Windows. Se instala sin firma de prueba y
   con el arranque seguro y la integridad de memoria activados: la CI firma cada paquete con un

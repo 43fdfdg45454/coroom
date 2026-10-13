@@ -43,6 +43,11 @@ pub const JITTER_WINDOW: usize = 200;
 /// Tramas entre dos recortes o estiramientos.
 pub const ADJUST_PERIOD_FRAMES: u32 = 10;
 
+/// Tramas (1 s) en las que la cola no puede bajar del objetivo para recortar: las llegadas que
+/// caen a un lado u otro de la reproducción tienen que verse en la ventana (si no, se recorta,
+/// falta la siguiente y se vuelve a llenar), y un vacío de hace más no frena el recorte.
+pub const TRIM_WINDOW_FRAMES: u32 = 100;
+
 /// Tramas ocultadas seguidas tras vaciarse la cola (sin DTX) antes de volver a cebar (200 ms):
 /// un parón corto de la red se rellena con PLC y el audio sigue en cuanto llega lo siguiente
 /// (con más retardo, que después se recorta).
@@ -155,6 +160,11 @@ pub struct JitterBuffer {
     target_frames: i32,
     extra_frames: i32,
     level: f64,
+    /// Menor cola vista en la ventana actual ([`TRIM_WINDOW_FRAMES`] tramas o desde el último
+    /// ajuste).
+    min_queued: i32,
+    /// Tramas de la ventana actual de `min_queued`.
+    window: u32,
     since_adjust: u32,
     run: u32,
     underrun_run: u32,
@@ -207,6 +217,8 @@ impl JitterBuffer {
             target_frames: frames_for(MIN_TARGET),
             extra_frames: 0,
             level: 0.0,
+            min_queued: i32::MAX,
+            window: 0,
             since_adjust: 0,
             run: 0,
             underrun_run: 0,
@@ -410,7 +422,7 @@ impl JitterBuffer {
             let ready = self
                 .prime_from
                 .is_some_and(|from| now >= from + self.target())
-                || queued > self.desired_frames();
+                || queued >= self.desired_frames();
             if !ready {
                 if self.started && self.last_played.is_none_or(|(_, flags)| flags & DTX == 0) {
                     self.note_gap();
@@ -419,20 +431,39 @@ impl JitterBuffer {
             }
             self.primed = true;
             self.level = f64::from(queued);
+            self.min_queued = i32::MAX;
+            self.window = 0;
             self.since_adjust = 0;
         }
         self.level = self.level * 0.9 + f64::from(queued) * 0.1;
         self.stats.level_frames = self.level;
+        // La ventana es la de las últimas tramas: un vacío de hace segundos no frena el recorte.
+        if self.window >= TRIM_WINDOW_FRAMES {
+            self.window = 0;
+            self.min_queued = i32::MAX;
+        }
+        self.window += 1;
+        self.min_queued = self.min_queued.min(queued);
         self.since_adjust = self.since_adjust.saturating_add(1);
         let desired = f64::from(self.desired_frames());
         let adjust = self.since_adjust >= ADJUST_PERIOD_FRAMES;
 
-        // Sobra cola: se recorta la trama que toca si está (y hay más detrás).
-        if adjust && self.level > desired + 1.0 && queued > 1 && self.slot(next).is_some() {
+        // Sobra cola: se recorta la trama que toca si está (y hay más detrás). Sobra cuando en todo
+        // el periodo la cola no bajó nunca del objetivo: así no se recorta por una llegada que cae
+        // justo antes o después de la trama (la media no lo distingue) y la cola no se queda una
+        // trama por encima del objetivo, que es lo que pasaba con `nivel > objetivo + 1`.
+        if adjust
+            && self.window >= TRIM_WINDOW_FRAMES
+            && self.min_queued > self.desired_frames()
+            && queued > 1
+            && self.slot(next).is_some()
+        {
             self.take(next);
             self.next = Some(next.wrapping_add(1));
             self.stats.trimmed += 1;
             self.level -= 1.0;
+            self.min_queued = i32::MAX;
+            self.window = 0;
             self.since_adjust = 0;
             return self.pop_inner();
         }
@@ -440,6 +471,8 @@ impl JitterBuffer {
         if adjust && self.level < desired - 1.5 && queued > 0 {
             self.stats.stretched += 1;
             self.level += 1.0;
+            self.min_queued = i32::MAX;
+            self.window = 0;
             self.since_adjust = 0;
             return Pop::Plc(Lost {
                 seq: next,
@@ -707,5 +740,73 @@ mod tests {
         buffer.stats.jitter_p95_ms = 25.0;
         assert_eq!(buffer.target(), Duration::from_millis(30));
         assert_eq!(buffer.extra_delay_range_ms(), (10, 200));
+    }
+
+    /// Tramas cada 10 ms que llegan `delay` después de capturarse (más `wobble(seq)`), con la
+    /// reproducción a mitad de cada trama; `extra` es el ajuste de la sincronía que se pide desde
+    /// la trama 50. Devuelve la espera media captura → reproducción del último 1,5 s y los
+    /// contadores.
+    fn hold(delay: Duration, wobble: impl Fn(u32) -> Duration, extra: i32) -> (f64, JitterStats) {
+        let mut buffer = JitterBuffer::new();
+        let base = Instant::now();
+        let mut held = Vec::new();
+        let mut seq = 0;
+        for tick in 0..600u32 {
+            let now = base + FRAME_DURATION * tick + 5 * MS;
+            loop {
+                let at = base + FRAME_DURATION * seq + delay + wobble(seq);
+                if at > now {
+                    break;
+                }
+                buffer.push(seq, seq * 10_000, 0, &packet(seq), at);
+                seq += 1;
+            }
+            if tick >= 50 && tick % 10 == 0 {
+                let (min, _) = buffer.extra_delay_range_ms();
+                buffer.set_extra_delay(extra.max(min));
+            }
+            if let Pop::Frame(frame) = buffer.pop(now)
+                && tick >= 450
+            {
+                held.push((now - (base + FRAME_DURATION * frame.seq)).as_secs_f64() * 1000.0);
+            }
+        }
+        (held.iter().sum::<f64>() / held.len() as f64, buffer.stats())
+    }
+
+    #[test]
+    fn the_queue_settles_at_the_target_not_one_frame_above() {
+        // Llegan 3 ms después de capturarse y se reproducen a los 5 ms de cada trama: con el
+        // objetivo de 2 tramas la espera es 15 ms (antes la cola se quedaba en 3 y eran 25).
+        let (wait, stats) = hold(3 * MS, |_| Duration::ZERO, 0);
+        assert!((wait - 15.0).abs() < 0.5, "{wait} ms {stats:?}");
+        assert_eq!((stats.trimmed, stats.stretched), (0, 0), "{stats:?}");
+        // Con la sincronía pidiendo una trama menos: 5 ms, con un solo recorte.
+        let (wait, stats) = hold(3 * MS, |_| Duration::ZERO, -10);
+        assert!((wait - 5.0).abs() < 0.5, "{wait} ms {stats:?}");
+        assert_eq!((stats.trimmed, stats.stretched), (1, 0), "{stats:?}");
+    }
+
+    #[test]
+    fn an_old_empty_tick_does_not_block_trimming() {
+        // La trama 60 llega 25 ms tarde: la cola se vacía una vez y luego se queda con una de
+        // más. Pasado ese momento se recorta igual (antes el vacío frenaba el recorte para siempre).
+        let late = |seq: u32| if seq == 60 { 25 * MS } else { Duration::ZERO };
+        let (wait, stats) = hold(3 * MS, late, -10);
+        assert!((wait - 5.0).abs() < 0.5, "{wait} ms {stats:?}");
+        assert!(stats.trimmed >= 1, "{stats:?}");
+    }
+
+    #[test]
+    fn arrivals_around_the_tick_keep_the_frame_they_need() {
+        // Llegan entre 4 y 6 ms, a un lado u otro de la reproducción (5 ms): una trama de cola a
+        // veces sobra y a veces no. No se recorta (cada recorte quita 10 ms de audio) ni falta.
+        let wobble = |seq: u32| {
+            Duration::from_micros(u64::from(seq.wrapping_mul(2_654_435_761) >> 22) % 2000)
+        };
+        let (wait, stats) = hold(4 * MS, wobble, -10);
+        assert_eq!((stats.trimmed, stats.stretched), (0, 0), "{stats:?}");
+        assert_eq!(stats.concealed + stats.underruns, 0, "{stats:?}");
+        assert!(wait < 16.0, "{wait} ms");
     }
 }

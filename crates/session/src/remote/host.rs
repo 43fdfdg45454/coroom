@@ -366,7 +366,7 @@ fn start_audio(
                 render,
                 av_sync: false,
             };
-            play_loop(&thread_core, player, &rx, &to_local);
+            play_loop(&thread_core, player, rx, to_local);
             Ok(())
         })
         .map_err(spawn_error)?;

@@ -16,8 +16,10 @@
 //!   (sin distinguir mayúsculas; vale un trozo) y enlazado con `target.object` = su `object.serial`.
 //! - [`MicSource`]: captura del micrófono por defecto o del nodo `--mic NOMBRE` (`target.object`).
 //! - [`PlaybackSink`]: reproducción (`media.category = Playback`, `media.role = Game`) en la salida
-//!   por defecto o en `--speaker NOMBRE`. La hora a la que sonará cada trama es «ahora + lo que hay
-//!   en el anillo + el retardo del grafo» (`pw_stream_get_time_n`, `delay`).
+//!   por defecto o en `--speaker NOMBRE`. Por defecto **a demanda** ([`AudioSink::start_pull`]):
+//!   el callback `process` pide la trama a la sesión justo cuando el grafo la necesita, sin anillo
+//!   de por medio, y sonará «ahora + el retardo del grafo» (`pw_stream_get_time_n`, `delay`). Con
+//!   [`AudioSink::write`], la trama pasa por el anillo y sonará además después de lo que haya en él.
 //!
 //! Sin un servidor de PipeWire en marcha, `start` falla con [`AudioError::Unsupported`] y el motivo.
 
@@ -26,7 +28,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pipewire as pw;
 use pw::spa;
@@ -36,7 +38,7 @@ use pw::spa::pod::Pod;
 use crate::ring::Shared;
 use crate::{
     AudioConfig, AudioError, AudioFormat, AudioSink, AudioSource, Captured, DeviceInfo, DeviceKind,
-    Played, SAMPLE_RATE_HZ,
+    Played, Render, SAMPLE_RATE_HZ,
 };
 
 /// Espera máxima a que el hilo de PipeWire conecte el flujo.
@@ -99,6 +101,42 @@ struct StreamData {
     info: AudioInfoRaw,
     /// Una trama de reproducción (se reutiliza).
     scratch: [i16; crate::MAX_FRAME_SAMPLES],
+    /// Reproducción a demanda.
+    pull: Option<Pull>,
+}
+
+/// Reproducción a demanda: lo que pide cada trama y lo que sobró de la última, si el grafo pide
+/// cuantos de menos de 10 ms.
+struct Pull {
+    render: Render,
+    frame: [i16; crate::MAX_FRAME_SAMPLES],
+    len: usize,
+    pos: usize,
+}
+
+impl Pull {
+    /// Llena `out` (intercalado, `channels` canales) pidiendo tramas nuevas cuando se acaba la
+    /// anterior. La primera muestra de `out` sonará dentro de `delay`.
+    fn fill(&mut self, out: &mut [i16], channels: usize, delay: Duration) {
+        let frame_len = crate::SAMPLES_PER_CHANNEL * channels;
+        let now = Instant::now();
+        let mut written = 0;
+        while written < out.len() {
+            if self.pos == self.len {
+                let ahead = Duration::from_micros(
+                    (written / channels) as u64 * 1_000_000 / u64::from(SAMPLE_RATE_HZ),
+                );
+                let frame = &mut self.frame[..frame_len];
+                frame.fill(0);
+                (self.render)(frame, now + delay + ahead);
+                (self.len, self.pos) = (frame_len, 0);
+            }
+            let n = (self.len - self.pos).min(out.len() - written);
+            out[written..written + n].copy_from_slice(&self.frame[self.pos..self.pos + n]);
+            self.pos += n;
+            written += n;
+        }
+    }
 }
 
 fn format_param(format: AudioFormat) -> Result<Vec<u8>, AudioError> {
@@ -161,8 +199,25 @@ fn process(stream: &pw::stream::Stream, data: &mut StreamData) {
             // Un cuanto (10 ms con `node.latency`): llenar el búfer entero añadiría latencia.
             let frames = (bytes.len() / stride).min(crate::SAMPLES_PER_CHANNEL);
             let wanted = frames * data.channels;
+            if let Ok(time) = stream.time() {
+                let rate = time.rate();
+                if rate.denom > 0 && time.delay() > 0 {
+                    let us = time.delay() as u64 * 1_000_000 * u64::from(rate.num)
+                        / u64::from(rate.denom);
+                    data.shared.delay_us.store(us, Ordering::Relaxed);
+                }
+            }
             let scratch = &mut data.scratch[..wanted];
-            data.shared.pop_into(scratch);
+            match &mut data.pull {
+                Some(pull) => {
+                    let delay = match data.shared.delay_us.load(Ordering::Relaxed) {
+                        0 => crate::DEVICE_LATENCY,
+                        us => Duration::from_micros(us),
+                    };
+                    pull.fill(scratch, data.channels, delay);
+                }
+                None => data.shared.pop_into(scratch),
+            }
             for (chunk, sample) in bytes[..wanted * 2]
                 .as_chunks_mut::<2>()
                 .0
@@ -175,14 +230,6 @@ fn process(stream: &pw::stream::Stream, data: &mut StreamData) {
             *chunk.offset_mut() = 0;
             *chunk.stride_mut() = stride as i32;
             *chunk.size_mut() = (wanted * 2) as u32;
-            if let Ok(time) = stream.time() {
-                let rate = time.rate();
-                if rate.denom > 0 && time.delay() > 0 {
-                    let us = time.delay() as u64 * 1_000_000 * u64::from(rate.num)
-                        / u64::from(rate.denom);
-                    data.shared.delay_us.store(us, Ordering::Relaxed);
-                }
-            }
         }
     }
 }
@@ -193,6 +240,7 @@ fn run_stream(
     format: AudioFormat,
     target: Option<String>,
     shared: Arc<Shared>,
+    pull: Option<Render>,
     quit: pw::channel::Receiver<()>,
     ready: std::sync::mpsc::Sender<Result<(), AudioError>>,
 ) {
@@ -229,6 +277,12 @@ fn run_stream(
             channels: usize::from(format.channels),
             info: AudioInfoRaw::default(),
             scratch: [0; crate::MAX_FRAME_SAMPLES],
+            pull: pull.map(|render| Pull {
+                render,
+                frame: [0; crate::MAX_FRAME_SAMPLES],
+                len: 0,
+                pos: 0,
+            }),
         };
         let errors = Arc::clone(&shared);
         let _listener = stream
@@ -300,13 +354,16 @@ fn spawn(
     format: AudioFormat,
     target: Option<String>,
     shared: &Arc<Shared>,
+    pull: Option<Render>,
 ) -> Result<Running, AudioError> {
     let (quit_tx, quit_rx) = pw::channel::channel::<()>();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let thread_shared = Arc::clone(shared);
     let thread = thread::Builder::new()
         .name("pipewire-audio".into())
-        .spawn(move || run_stream(kind, format, target, thread_shared, quit_rx, ready_tx))
+        .spawn(move || {
+            run_stream(kind, format, target, thread_shared, pull, quit_rx, ready_tx);
+        })
         .map_err(|err| backend(format!("no se pudo crear el hilo: {err}")))?;
     let mut running = Running {
         quit: quit_tx,
@@ -372,7 +429,7 @@ impl AudioSource for MonitorSource {
             capture_sink: self.app.is_none(),
             role: "Game",
         };
-        self.running = Some(spawn(kind, self.format, target.clone(), &shared)?);
+        self.running = Some(spawn(kind, self.format, target.clone(), &shared, None)?);
         self.shared = Some(shared);
         self.target = target;
         Ok(())
@@ -432,7 +489,7 @@ impl AudioSource for MicSource {
             capture_sink: false,
             role: "Communication",
         };
-        self.running = Some(spawn(kind, self.format, device, &shared)?);
+        self.running = Some(spawn(kind, self.format, device, &shared, None)?);
         self.shared = Some(shared);
         Ok(())
     }
@@ -490,9 +547,38 @@ impl AudioSink for PlaybackSink {
         self.latency = config.latency;
         let device = config.device.clone().or_else(|| self.device.clone());
         let shared = Shared::new(self.format);
-        self.running = Some(spawn(Kind::Playback, self.format, device, &shared)?);
+        self.running = Some(spawn(Kind::Playback, self.format, device, &shared, None)?);
         self.shared = Some(shared);
         Ok(())
+    }
+
+    fn supports_pull(&self) -> bool {
+        true
+    }
+
+    fn start_pull(&mut self, config: &AudioConfig, render: Render) -> Result<(), AudioError> {
+        self.stop();
+        self.format = config.format;
+        self.latency = config.latency;
+        let device = config.device.clone().or_else(|| self.device.clone());
+        let shared = Shared::new(self.format);
+        self.running = Some(spawn(
+            Kind::Playback,
+            self.format,
+            device,
+            &shared,
+            Some(render),
+        )?);
+        self.shared = Some(shared);
+        Ok(())
+    }
+
+    fn check(&mut self) -> Result<(), AudioError> {
+        let shared = self.shared.as_ref().ok_or(AudioError::Stopped)?;
+        match shared.lock().failure.clone() {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     fn wait_ready(&mut self) -> Result<(), AudioError> {
@@ -669,7 +755,7 @@ impl crate::apps::AppBackend for AppStreams {
             capture_sink: false,
             role: "Game",
         };
-        let running = spawn(kind, format, Some(stream.to_owned()), &shared)?;
+        let running = spawn(kind, format, Some(stream.to_owned()), &shared, None)?;
         Ok(crate::apps::Tap {
             shared,
             _guard: Box::new(running),
@@ -714,6 +800,44 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>, AudioError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    #[test]
+    fn on_demand_playback_splits_frames_across_small_quanta() {
+        // El grafo pide cuantos de 256 muestras por canal (5,3 ms): cada trama de 480 se pide una
+        // vez, entera, y lo que sobra va al cuanto siguiente sin perder ni repetir muestras.
+        let calls: Arc<Mutex<Vec<Instant>>> = Arc::default();
+        let seen = Arc::clone(&calls);
+        let mut next = 0i16;
+        let mut pull = Pull {
+            render: Box::new(move |out, played_at| {
+                seen.lock().unwrap().push(played_at);
+                for sample in out.as_chunks_mut::<2>().0 {
+                    sample.fill(next);
+                    next = next.wrapping_add(1);
+                }
+            }),
+            frame: [0; crate::MAX_FRAME_SAMPLES],
+            len: 0,
+            pos: 0,
+        };
+        let delay = Duration::from_millis(10);
+        let mut heard = Vec::new();
+        for _ in 0..15 {
+            let mut quantum = [0i16; 256 * 2];
+            pull.fill(&mut quantum, 2, delay);
+            heard.extend(quantum.as_chunks::<2>().0.iter().map(|s| s[0]));
+        }
+        let expected: Vec<i16> = (0..15 * 256).map(|i| i as i16).collect();
+        assert_eq!(heard, expected);
+        let calls = calls.lock().unwrap();
+        // 15 × 256 = 3840 muestras = 8 tramas exactas.
+        assert_eq!(calls.len(), 8);
+        // Una trama pedida a mitad de cuanto suena después de lo que ya se escribió en él.
+        let first = calls[0];
+        assert!(first >= Instant::now() - Duration::from_secs(1));
+        assert!(calls[1] > first, "{calls:?}");
+    }
 
     fn assert_send<T: Send>() {}
 

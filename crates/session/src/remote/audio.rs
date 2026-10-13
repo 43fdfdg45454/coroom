@@ -33,7 +33,7 @@ use coroom_audio::jitter::{JitterBuffer, Pop};
 use coroom_audio::mix::Mixer;
 use coroom_audio::processing::{ProcessingOptions, RenderFeed, VoiceProcessor};
 use coroom_audio::sync::AvSync;
-use coroom_audio::{AudioConfig, AudioSink, AudioSource, MAX_FRAME_SAMPLES};
+use coroom_audio::{AudioConfig, AudioSink, AudioSource, MAX_FRAME_SAMPLES, Render};
 use coroom_transport::crypto::sframe::FrameEncryptor;
 use coroom_transport::proto::audio::{AUDIO_HEADER_LEN, AudioHeader};
 use coroom_transport::proto::media::Track;
@@ -44,7 +44,6 @@ use super::{Core, lock};
 use crate::latency::{
     AudioCounters, AudioSide, AudioStage, AudioTimeline, AudioTrack, AvSummary, LatencyLedger,
 };
-use crate::loopback::Shared;
 
 /// Bytes máximos de un paquete Opus en el cable.
 pub const MAX_PACKET: usize = coroom_audio::jitter::MAX_PACKET;
@@ -57,6 +56,9 @@ const PUBLISH_TICKS: u32 = 50;
 
 /// Un emisor que no envía en este tiempo se olvida (su buffer y su decodificador).
 const IDLE_SOURCE: Duration = Duration::from_secs(60);
+
+/// Cada cuánto mira `audio-play` si el dispositivo a demanda sigue en marcha.
+const PULL_WATCH: Duration = Duration::from_millis(20);
 
 /// Emisores de voz como mucho a la vez.
 const MAX_VOICES: usize = 16;
@@ -731,134 +733,125 @@ pub(crate) struct Player {
 /// Convierte la `capture_us` (32 bits, reloj del anfitrión) de una trama a un instante local.
 pub(crate) type ToLocal = dyn Fn(u32) -> Option<Instant> + Send + Sync;
 
-/// Hilo `audio-play`: buffers, decodificación, mezcla y sumidero; marcas y contadores.
-pub(crate) fn play_loop(
-    core: &Core,
-    mut player: Player,
-    packets: &Receiver<Packet>,
-    to_local: &ToLocal,
-) {
-    let shared: &Shared = &core.shared;
-    let ledger: &LatencyLedger = &core.ledger;
-    let format = player.sink.format();
-    let config = AudioConfig {
-        format,
-        device: None,
-        latency: coroom_audio::DEVICE_LATENCY,
-    };
-    if let Err(err) = player.sink.start(&config) {
-        core.warn(format!("sin salida de audio: {err}"));
-        return;
-    }
-    debug!(salida = %player.sink.describe(), "reproducción de audio");
-    let channels = format.channels;
-    let mut mixer = Mixer::new(channels);
-    let mut out = [0i16; MAX_FRAME_SAMPLES];
-    let frame_len = coroom_audio::SAMPLES_PER_CHANNEL * usize::from(channels);
-    let mut game: Option<Stream> = None;
-    let mut voices: Vec<Stream> = Vec::with_capacity(MAX_VOICES);
-    let mut heard: Vec<Heard> = Vec::with_capacity(MAX_VOICES + 1);
-    let mut av = player.av_sync.then(AvSync::new);
-    let mut last_video = 0u64;
-    let mut ticks = 0u32;
-    while !shared.stopping() {
-        // Al ritmo del dispositivo: se espera su sitio y después se decide qué suena, con lo más
-        // reciente que haya llegado.
-        if let Err(err) = player.sink.wait_ready() {
-            core.warn(format!("la salida de audio se detuvo: {err}"));
-            break;
+/// Guarda un paquete en el buffer de su emisor (lo crea si es nuevo).
+fn accept(core: &Core, packet: Packet, game: &mut Option<Stream>, voices: &mut Vec<Stream>) {
+    let stream = match packet.track {
+        AudioTrack::Game => {
+            if game.is_none() {
+                match Stream::new(AudioTrack::Game, packet.source) {
+                    Ok(stream) => *game = Some(stream),
+                    Err(err) => {
+                        core.warn(format!("audio del juego: {err}"));
+                        return;
+                    }
+                }
+            }
+            game.as_mut()
         }
-        // Lo que llegó desde la última trama.
+        AudioTrack::Voice => {
+            if !voices.iter().any(|v| v.source == packet.source) {
+                if voices.len() >= MAX_VOICES {
+                    return;
+                }
+                match Stream::new(AudioTrack::Voice, packet.source) {
+                    Ok(stream) => voices.push(stream),
+                    Err(err) => {
+                        core.warn(format!("voz: {err}"));
+                        return;
+                    }
+                }
+            }
+            voices.iter_mut().find(|v| v.source == packet.source)
+        }
+    };
+    if let Some(stream) = stream {
+        stream.last_packet = packet.arrived;
+        stream.jitter.push(
+            packet.header.seq,
+            packet.header.capture_us,
+            packet.header.flags,
+            &packet.data[..usize::from(packet.len)],
+            packet.arrived,
+        );
+    }
+}
+
+/// La reproducción trama a trama: buffers, decodificación, mezcla, marcas y contadores. La mueve
+/// el hilo `audio-play` con la cola del sumidero o, a demanda, el propio dispositivo.
+struct Playout {
+    core: Arc<Core>,
+    control: AudioControl,
+    render: Option<RenderFeed>,
+    packets: Receiver<Packet>,
+    to_local: Box<ToLocal>,
+    channels: u16,
+    mixer: Mixer,
+    game: Option<Stream>,
+    voices: Vec<Stream>,
+    heard: Vec<Heard>,
+    av: Option<AvSync>,
+    last_video: u64,
+    ticks: u32,
+    /// Se cerró el canal de paquetes: la sesión termina.
+    closed: Arc<AtomicBool>,
+}
+
+impl Playout {
+    /// Llena `out` (una trama) con lo que toca en `now`, con lo más reciente que haya llegado.
+    /// `false` si el canal de paquetes se cerró.
+    fn fill(&mut self, out: &mut [i16], now: Instant) -> bool {
         loop {
-            let packet = match packets.try_recv() {
-                Ok(packet) => packet,
+            match self.packets.try_recv() {
+                Ok(packet) => accept(&self.core, packet, &mut self.game, &mut self.voices),
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
-            };
-            let stream = match packet.track {
-                AudioTrack::Game => {
-                    if game.is_none() {
-                        match Stream::new(AudioTrack::Game, packet.source) {
-                            Ok(stream) => game = Some(stream),
-                            Err(err) => {
-                                core.warn(format!("audio del juego: {err}"));
-                                continue;
-                            }
-                        }
-                    }
-                    game.as_mut()
+                Err(TryRecvError::Disconnected) => {
+                    self.closed.store(true, Ordering::Release);
+                    return false;
                 }
-                AudioTrack::Voice => {
-                    if !voices.iter().any(|v| v.source == packet.source) {
-                        if voices.len() >= MAX_VOICES {
-                            continue;
-                        }
-                        match Stream::new(AudioTrack::Voice, packet.source) {
-                            Ok(stream) => voices.push(stream),
-                            Err(err) => {
-                                core.warn(format!("voz: {err}"));
-                                continue;
-                            }
-                        }
-                    }
-                    voices.iter_mut().find(|v| v.source == packet.source)
-                }
-            };
-            if let Some(stream) = stream {
-                stream.last_packet = packet.arrived;
-                stream.jitter.push(
-                    packet.header.seq,
-                    packet.header.capture_us,
-                    packet.header.flags,
-                    &packet.data[..usize::from(packet.len)],
-                    packet.arrived,
-                );
             }
         }
-
-        let now = Instant::now();
-        mixer.begin();
-        heard.clear();
-        let game_muted = player.control.game_muted();
-        if let Some(stream) = &mut game
+        self.mixer.begin();
+        self.heard.clear();
+        let game_muted = self.control.game_muted();
+        if let Some(stream) = &mut self.game
             && let Some((offset, info)) = stream.tick(now)
         {
             if !game_muted {
                 let len = stream.frame_len();
-                mixer.add(
+                self.mixer.add(
                     GAME_SOURCE,
                     &stream.pcm[offset..offset + len],
                     stream.channels,
                 );
             }
-            heard.push(info);
+            self.heard.push(info);
         }
-        for stream in &mut voices {
+        for stream in &mut self.voices {
             if let Some((offset, info)) = stream.tick(now) {
                 let len = stream.frame_len();
-                mixer.add(
+                self.mixer.add(
                     stream.source,
                     &stream.pcm[offset..offset + len],
                     stream.channels,
                 );
-                heard.push(info);
+                self.heard.push(info);
             }
         }
-        mixer.finish(&mut out[..frame_len]);
-        let played = match player.sink.write(&out[..frame_len]) {
-            Ok(played) => played,
-            Err(err) => {
-                core.warn(format!("la salida de audio se detuvo: {err}"));
-                break;
-            }
-        };
-        if let Some(render) = &mut player.render {
-            render.feed_render(&out[..frame_len], channels);
+        self.mixer.finish(out);
+        true
+    }
+
+    /// `out`, que [`Playout::fill`] llenó en `decided`, sonará en `played_at`: marcas, sincronía
+    /// y, cada [`PUBLISH_TICKS`] tramas, contadores.
+    fn played(&mut self, out: &[i16], decided: Instant, played_at: Instant) {
+        let ledger = &self.core.ledger;
+        if let Some(render) = &mut self.render {
+            render.feed_render(out, self.channels);
         }
 
         // Marcas de lo que sonó (las tramas reales; lo ocultado no tiene captura).
-        for info in &heard {
-            let Some(capture) = info.capture_us.and_then(to_local) else {
+        for info in &self.heard {
+            let Some(capture) = info.capture_us.and_then(&self.to_local) else {
                 continue;
             };
             let mut timeline = AudioTimeline::default();
@@ -866,26 +859,26 @@ pub(crate) fn play_loop(
             if let Some(arrived) = info.arrived {
                 timeline.mark(AudioStage::Received, arrived);
             }
-            timeline.mark(AudioStage::Decoded, now);
-            timeline.mark(AudioStage::Played, played.played_at_estimate);
+            timeline.mark(AudioStage::Decoded, decided);
+            timeline.mark(AudioStage::Played, played_at);
             ledger.record_audio(info.track, AudioSide::Receiver, timeline);
             if info.track == AudioTrack::Game
-                && let Some(av) = &mut av
+                && let Some(av) = &mut self.av
             {
-                av.on_audio(capture, played.played_at_estimate);
+                av.on_audio(capture, played_at);
             }
         }
 
-        ticks = ticks.wrapping_add(1);
-        if let Some(av) = &mut av
-            && ticks.is_multiple_of(10)
+        self.ticks = self.ticks.wrapping_add(1);
+        if let Some(av) = &mut self.av
+            && self.ticks.is_multiple_of(10)
         {
-            ledger.video_pairs_since(&mut last_video, |captured, presented| {
+            ledger.video_pairs_since(&mut self.last_video, |captured, presented| {
                 av.on_video(captured, presented);
             });
         }
-        if ticks.is_multiple_of(PUBLISH_TICKS) {
-            if let (Some(av), Some(stream)) = (&mut av, &mut game) {
+        if self.ticks.is_multiple_of(PUBLISH_TICKS) {
+            if let (Some(av), Some(stream)) = (&mut self.av, &mut self.game) {
                 let (min, max) = stream.jitter.extra_delay_range_ms();
                 av.set_limits(min, max);
                 let adjust = av.recommend();
@@ -899,19 +892,143 @@ pub(crate) fn play_loop(
                     adjust_ms: stats.adjust_ms,
                 });
             }
-            publish(ledger, game.iter().chain(voices.iter()));
-            voices.retain(|stream| now.saturating_duration_since(stream.last_packet) < IDLE_SOURCE);
-            let speaking = player
+            self.publish();
+            self.voices.retain(|stream| {
+                decided.saturating_duration_since(stream.last_packet) < IDLE_SOURCE
+            });
+            let speaking = self
                 .control
                 .talkers()
                 .into_iter()
                 .map(talker_label)
                 .collect();
-            ledger.set_voice_status(speaking, player.control.status_label());
+            ledger.set_voice_status(speaking, self.control.status_label());
         }
     }
-    publish(ledger, game.iter().chain(voices.iter()));
-    player.sink.stop();
+
+    fn publish(&self) {
+        publish(
+            &self.core.ledger,
+            self.game.iter().chain(self.voices.iter()),
+        );
+    }
+}
+
+/// Hilo `audio-play`. Con un sumidero a demanda ([`AudioSink::start_pull`]) el dispositivo pide
+/// cada trama justo cuando la necesita y este hilo solo vigila; si no, la decide este hilo en
+/// cuanto el sumidero tiene sitio, una trama antes de que suene.
+pub(crate) fn play_loop(
+    core: &Arc<Core>,
+    player: Player,
+    packets: Receiver<Packet>,
+    to_local: impl Fn(u32) -> Option<Instant> + Send + Sync + 'static,
+) {
+    let Player {
+        mut sink,
+        control,
+        render,
+        av_sync,
+    } = player;
+    let format = sink.format();
+    let config = AudioConfig {
+        format,
+        device: None,
+        latency: coroom_audio::DEVICE_LATENCY,
+    };
+    let closed = Arc::new(AtomicBool::new(false));
+    let playout = Playout {
+        core: Arc::clone(core),
+        control,
+        render,
+        packets,
+        to_local: Box::new(to_local),
+        channels: format.channels,
+        mixer: Mixer::new(format.channels),
+        game: None,
+        voices: Vec::with_capacity(MAX_VOICES),
+        heard: Vec::with_capacity(MAX_VOICES + 1),
+        av: av_sync.then(AvSync::new),
+        last_video: 0,
+        ticks: 0,
+        closed: Arc::clone(&closed),
+    };
+    let frame_len = coroom_audio::SAMPLES_PER_CHANNEL * usize::from(format.channels);
+    if sink.supports_pull() {
+        play_pull(core, sink.as_mut(), &config, playout, &closed);
+    } else {
+        play_push(core, sink.as_mut(), &config, playout, frame_len);
+    }
+}
+
+/// A demanda: el dispositivo llama a la reproducción desde su hilo.
+fn play_pull(
+    core: &Core,
+    sink: &mut dyn AudioSink,
+    config: &AudioConfig,
+    playout: Playout,
+    closed: &AtomicBool,
+) {
+    let playout = Arc::new(Mutex::new(playout));
+    let device = Arc::clone(&playout);
+    let render: Render = Box::new(move |out, played_at| {
+        let mut playout = lock(&device);
+        let decided = Instant::now();
+        if playout.fill(out, decided) {
+            playout.played(out, decided, played_at);
+        } else {
+            out.fill(0);
+        }
+    });
+    if let Err(err) = sink.start_pull(config, render) {
+        core.warn(format!("sin salida de audio: {err}"));
+        return;
+    }
+    debug!(salida = %sink.describe(), "reproducción de audio a demanda");
+    while !core.shared.stopping() && !closed.load(Ordering::Acquire) {
+        if let Err(err) = sink.check() {
+            core.warn(format!("la salida de audio se detuvo: {err}"));
+            break;
+        }
+        std::thread::sleep(PULL_WATCH);
+    }
+    sink.stop();
+    lock(&playout).publish();
+}
+
+/// Con la cola del sumidero: se espera su sitio y después se decide qué suena.
+fn play_push(
+    core: &Core,
+    sink: &mut dyn AudioSink,
+    config: &AudioConfig,
+    mut playout: Playout,
+    frame_len: usize,
+) {
+    if let Err(err) = sink.start(config) {
+        core.warn(format!("sin salida de audio: {err}"));
+        return;
+    }
+    debug!(salida = %sink.describe(), "reproducción de audio");
+    let mut out = [0i16; MAX_FRAME_SAMPLES];
+    while !core.shared.stopping() {
+        if let Err(err) = sink.wait_ready() {
+            core.warn(format!("la salida de audio se detuvo: {err}"));
+            break;
+        }
+        let decided = Instant::now();
+        if !playout.fill(&mut out[..frame_len], decided) {
+            return;
+        }
+        let played = match sink.write(&out[..frame_len]) {
+            Ok(played) => played,
+            Err(err) => {
+                core.warn(format!("la salida de audio se detuvo: {err}"));
+                break;
+            }
+        };
+        playout.played(&out[..frame_len], decided, played.played_at_estimate);
+    }
+    playout.publish();
+    sink.stop();
 }
 
 /// Suma los contadores de los buffers por pista y los deja en el registro.
