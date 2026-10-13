@@ -95,6 +95,14 @@ fn sort<B: Ord + Copy>(entries: &mut Vec<(Codec, B)>) {
     entries.dedup();
 }
 
+/// Como [`sort`], con los codificadores en el orden de [`Backend::encoder_rank`] (en Windows,
+/// los nativos del fabricante antes que Vulkan Video).
+fn sort_encoders(entries: &mut Vec<(Codec, Backend)>) {
+    let rank = |codec: Codec| Codec::PREFERENCE.iter().position(|c| *c == codec);
+    entries.sort_by_key(|&(codec, backend)| (rank(codec), backend.encoder_rank()));
+    entries.dedup();
+}
+
 impl Capabilities {
     /// Sondea la máquina la primera vez (unos cientos de milisegundos; hasta unos segundos si un
     /// driver tarda) y devuelve el resultado guardado las siguientes.
@@ -112,7 +120,7 @@ impl Capabilities {
             caps.ffmpeg_version = Some(crate::ffmpeg::version());
             caps.ffmpeg_dir = Some(crate::ffmpeg::library_dir().to_owned());
         }
-        sort(&mut caps.encoders);
+        sort_encoders(&mut caps.encoders);
         sort(&mut caps.decoders);
         caps
     }
@@ -132,7 +140,7 @@ impl Capabilities {
         mut encoders: Vec<(Codec, Backend)>,
         mut decoders: Vec<(Codec, DecoderBackend)>,
     ) -> Capabilities {
-        sort(&mut encoders);
+        sort_encoders(&mut encoders);
         sort(&mut decoders);
         Capabilities {
             encoders,

@@ -126,7 +126,11 @@ futures-util = { version = "=0.3.34", default-features = false, features = ["std
 
 # Captura de plataforma.
 pipewire = { version = "=0.10.1", default-features = false }
-ashpd = { version = "=0.13.13", default-features = false, features = ["tokio", "screencast", "remote_desktop"] }
+# `async-io`, no `tokio`: ashpd comparte una sola conexión a D-Bus en todo el proceso y con `tokio`
+# su lectura vive en el runtime donde se creó; al acabar ese runtime (los portales se llaman desde
+# runtimes de un solo uso) las llamadas siguientes esperaban para siempre. Con `async-io`, zbus la
+# lleva en un hilo propio.
+ashpd = { version = "=0.13.13", default-features = false, features = ["async-io", "screencast", "remote_desktop"] }
 windows = { version = "=0.62.2", default-features = false }
 
 # Entrada. `reis` (libei en Rust, de ids1024) habla el protocolo EI con el socket que da

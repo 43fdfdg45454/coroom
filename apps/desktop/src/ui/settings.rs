@@ -60,6 +60,54 @@ pub enum CodecChoice {
     H264,
 }
 
+/// Codificador del anfitrión.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EncoderChoice {
+    /// El primero que funcione, en el orden de preferencia de esta plataforma.
+    #[default]
+    Auto,
+    /// NVIDIA NVENC.
+    Nvenc,
+    /// AMD AMF.
+    Amf,
+    /// Intel Quick Sync.
+    Qsv,
+    /// Vulkan Video.
+    Vulkan,
+    /// VA-API (Linux).
+    Vaapi,
+    /// Por software.
+    Software,
+}
+
+impl EncoderChoice {
+    /// Backend pedido (`None`: automático).
+    pub fn backend(self) -> Option<coroom_session::codec::Backend> {
+        use coroom_session::codec::Backend;
+        match self {
+            EncoderChoice::Auto => None,
+            EncoderChoice::Nvenc => Some(Backend::Nvenc),
+            EncoderChoice::Amf => Some(Backend::Amf),
+            EncoderChoice::Qsv => Some(Backend::Qsv),
+            EncoderChoice::Vulkan => Some(Backend::VulkanVideo),
+            EncoderChoice::Vaapi => Some(Backend::Vaapi),
+            EncoderChoice::Software => Some(Backend::Software),
+        }
+    }
+}
+
+/// Decodificador del invitado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DecoderChoice {
+    /// Por GPU si se puede.
+    #[default]
+    Auto,
+    /// Por software (más CPU; para descartar fallos del driver).
+    Software,
+}
+
 /// Resolución máxima de lo que se comparte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -113,6 +161,10 @@ pub struct Video {
     /// HDR10 cuando la captura, el codificador y los invitados lo admitan; como invitado,
     /// aceptarlo, y la ventana en HDR si la pantalla lo expone.
     pub hdr: bool,
+    /// Codificador (avanzado).
+    pub encoder: EncoderChoice,
+    /// Decodificador como invitado (avanzado).
+    pub decoder: DecoderChoice,
 }
 
 impl Default for Video {
@@ -124,6 +176,8 @@ impl Default for Video {
             max_resolution: Resolution::P1080,
             chroma_444: false,
             hdr: false,
+            encoder: EncoderChoice::Auto,
+            decoder: DecoderChoice::Auto,
         }
     }
 }

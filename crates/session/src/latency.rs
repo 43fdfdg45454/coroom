@@ -179,6 +179,8 @@ pub struct LatencySummary {
     pub drops: Vec<StageDrops>,
     /// Suma de los descartes.
     pub drops_total: u64,
+    /// Fotogramas que el decodificador rechazó desde el principio (corruptos o sin referencias).
+    pub decode_errors: u64,
     /// Fotogramas presentados por segundo en la ventana.
     pub fps: f64,
     /// Bitrate codificado real en la ventana, en kbit/s.
@@ -730,6 +732,8 @@ struct Inner {
     input_counts: (u64, u64),
     /// Latencia de entrada que informa el anfitrión (en el invitado).
     input_report: Option<InputLatency>,
+    /// Fotogramas que el decodificador rechazó por corruptos o sin referencias.
+    decode_errors: u64,
 }
 
 /// Registro compartido (en `Arc`) de marcas de tiempo por etapa.
@@ -827,6 +831,11 @@ impl LatencyLedger {
     /// Anota un fotograma descartado antes de llegar a `stage`.
     pub fn record_drop(&self, stage: Stage) {
         self.lock().drops[stage.index()] += 1;
+    }
+
+    /// Anota un fotograma que el decodificador rechazó (corrupto o sin referencias).
+    pub fn record_decode_error(&self) {
+        self.lock().decode_errors += 1;
     }
 
     /// Anota que un fotograma necesitó `copies` copias de la imagen en memoria de CPU en `stage`
@@ -1061,6 +1070,7 @@ impl LatencyLedger {
             spans,
             total,
             drops_total: drops.iter().map(|drop| drop.count).sum(),
+            decode_errors: inner.decode_errors,
             drops,
             fps,
             bitrate_kbps,

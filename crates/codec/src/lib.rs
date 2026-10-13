@@ -102,6 +102,32 @@ pub enum Backend {
 }
 
 impl Backend {
+    /// Posición en el orden de preferencia de los codificadores de esta plataforma. En Windows,
+    /// NVENC, AMF y QSV van antes que Vulkan Video: son los que cuidan los fabricantes, y la
+    /// codificación por Vulkan de sus drivers aún da fallos (AV1 con referencias corruptas).
+    pub fn encoder_rank(self) -> usize {
+        let order: &[Backend] = if cfg!(target_os = "windows") {
+            &[
+                Backend::Nvenc,
+                Backend::Amf,
+                Backend::Qsv,
+                Backend::VulkanVideo,
+                Backend::Vaapi,
+                Backend::Software,
+            ]
+        } else {
+            &Backend::ALL
+        };
+        order.iter().position(|b| *b == self).unwrap_or(order.len())
+    }
+
+    /// Si la combinación se queda fuera de la elección automática y solo se usa si se pide a
+    /// mano: AV1 por Vulkan Video en Windows, que en drivers actuales corrompe la imagen al cabo
+    /// de unos segundos.
+    pub fn manual_only(codec: Codec, backend: Backend) -> bool {
+        cfg!(target_os = "windows") && codec == Codec::Av1 && backend == Backend::VulkanVideo
+    }
+
     /// Todos, en orden de preferencia.
     pub const ALL: [Backend; 6] = [
         Backend::VulkanVideo,

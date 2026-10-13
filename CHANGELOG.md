@@ -7,8 +7,25 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ## [Sin publicar]
 
+### Añadido
+
+- *Ajustes → Vídeo → Avanzado*: codificador del anfitrión y decodificador del invitado.
+- El invitado avisa cuando el vídeo llega dañado (muchos fotogramas que el decodificador rechaza).
+
 ### Corregido
 
+- Linux: compartir pantalla se quedaba en «Abriendo la sala…» sin mostrar el diálogo, y el portal
+  Secret no respondía. La conexión a D-Bus de los portales vivía en un runtime que ya había
+  terminado; ahora `ashpd` usa su propio ejecutor (`async-io`).
+- Linux: cada paso del portal de captura tiene un límite de tiempo y explica qué falló. Si el
+  portal RemoteDesktop falla, se comparte la pantalla sin control remoto y se avisa.
+- Windows: la aplicación se cerraba al compartir con Vulkan Video (texturas D3D11 importadas en
+  Vulkan). Esa ruta va con copia salvo `COROOM_ZERO_COPY=1`; NVENC, AMF y Quick Sync siguen sin
+  copias.
+- Windows: NVENC, AMF y Quick Sync van antes que Vulkan Video, y AV1 por Vulkan Video ya no se
+  elige solo (la imagen se volvía gris al cabo de unos segundos).
+- Las notas de la versión decían que el driver de mando virtual se instalaba con la firma de
+  prueba; el paquete va sin firmar y hay que firmarlo en tu equipo.
 - En Flatpak sobre KDE Plasma, iniciar sesión, crear una sala y unirse se quedaban esperando al
   portal Secret sin respuesta. Ahora se espera como mucho 5 s y, si no contesta, se usa un fichero.
 - Crear y unirse a una sala respetan `COROOM_DATA_DIR` al cargar la identidad, como el login.

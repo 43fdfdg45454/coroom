@@ -125,6 +125,41 @@ pub struct State {
     pub probe: bool,
     /// Desde cuándo.
     pub started: Instant,
+    /// Ventana de errores de decodificación: desde cuándo y cuántos había al empezarla.
+    pub decode_window: Option<(Instant, u64)>,
+    /// Último aviso de vídeo dañado.
+    pub corrupt_notice_at: Option<Instant>,
+}
+
+/// Ventana en la que se cuentan los errores de decodificación.
+const DECODE_WINDOW: Duration = Duration::from_secs(5);
+/// Errores en [`DECODE_WINDOW`] a partir de los que el vídeo se da por dañado.
+const DECODE_ERRORS_NOTICE: u64 = 10;
+/// Intervalo mínimo entre dos avisos de vídeo dañado.
+const CORRUPT_NOTICE_PERIOD: Duration = Duration::from_secs(60);
+
+/// Si toca avisar de que el vídeo llega dañado, con `errors` rechazados por el decodificador
+/// desde el principio. Cuenta por ventanas de [`DECODE_WINDOW`] y avisa como mucho una vez por
+/// [`CORRUPT_NOTICE_PERIOD`].
+pub fn corrupt_video_notice(
+    window: &mut Option<(Instant, u64)>,
+    last_notice: &mut Option<Instant>,
+    errors: u64,
+    now: Instant,
+) -> bool {
+    let (since, at_start) = *window.get_or_insert((now, errors));
+    if now.duration_since(since) < DECODE_WINDOW {
+        return false;
+    }
+    *window = Some((now, errors));
+    if errors.saturating_sub(at_start) < DECODE_ERRORS_NOTICE {
+        return false;
+    }
+    if last_notice.is_some_and(|at| now.duration_since(at) < CORRUPT_NOTICE_PERIOD) {
+        return false;
+    }
+    *last_notice = Some(now);
+    true
 }
 
 impl State {
@@ -149,6 +184,8 @@ impl State {
             leaving: false,
             probe: false,
             started: now,
+            decode_window: None,
+            corrupt_notice_at: None,
         }
     }
 
@@ -363,16 +400,29 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
         }
         Event::GuestStats(stats) => {
             let mut notice = None;
+            let mut corrupt = false;
             if let Some(state) = app.guest.as_mut() {
                 let before = state.stats.as_ref().map(|old| old.allowed);
                 if let Some(before) = before {
                     notice = permissions_notice(before, stats.allowed);
                 }
+                corrupt = corrupt_video_notice(
+                    &mut state.decode_window,
+                    &mut state.corrupt_notice_at,
+                    stats.summary.decode_errors,
+                    now,
+                );
                 state.stats = Some(*stats);
                 state.tick(now);
             }
             if let Some((tone, text)) = notice {
                 app.toast(tone, text);
+            }
+            if corrupt {
+                app.toast(
+                    Tone::Warning,
+                    t!("pantalla-guest-el-video-llega-danado").to_owned(),
+                );
             }
         }
         Event::GuestEnded(reason) => {
@@ -1072,6 +1122,24 @@ fn video<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn corrupt_video_is_noticed_once_per_period() {
+        let start = Instant::now();
+        let (mut window, mut last) = (None, None);
+        assert!(!corrupt_video_notice(&mut window, &mut last, 0, start));
+        // Pocos errores en la ventana: no avisa.
+        let t1 = start + DECODE_WINDOW;
+        assert!(!corrupt_video_notice(&mut window, &mut last, 3, t1));
+        // Muchos en la siguiente: avisa.
+        let t2 = t1 + DECODE_WINDOW;
+        assert!(corrupt_video_notice(&mut window, &mut last, 40, t2));
+        // Siguen llegando, pero no se repite antes de tiempo.
+        let t3 = t2 + DECODE_WINDOW;
+        assert!(!corrupt_video_notice(&mut window, &mut last, 80, t3));
+        let t4 = t2 + CORRUPT_NOTICE_PERIOD + DECODE_WINDOW;
+        assert!(corrupt_video_notice(&mut window, &mut last, 200, t4));
+    }
+
     use super::*;
     use crate::ui::app::tests::app;
     use coroom_render::{PresentFrame, PresentImage};

@@ -70,7 +70,11 @@ pub(crate) fn gpu_input_for(backend: Backend, device: Option<&AVHWDeviceContext>
     #[cfg(target_os = "windows")]
     {
         match backend {
-            Backend::Nvenc | Backend::Amf | Backend::Qsv | Backend::VulkanVideo => GpuInput::D3D11,
+            Backend::Nvenc | Backend::Amf | Backend::Qsv => GpuInput::D3D11,
+            // Importar texturas D3D11 en Vulkan cierra la aplicación con drivers actuales: con
+            // Vulkan Video se copia salvo que se pida con `COROOM_ZERO_COPY=1`.
+            Backend::VulkanVideo if crate::gpu::zero_copy_forced() => GpuInput::D3D11,
+            Backend::VulkanVideo => GpuInput::None,
             Backend::Vaapi | Backend::Software => GpuInput::None,
         }
     }

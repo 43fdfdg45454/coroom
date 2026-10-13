@@ -67,6 +67,13 @@ pub const TARGET_NAME: &str = "Lo que elija el portal";
 /// Tiempo máximo para comprobar el portal en `coroom doctor`.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Espera máxima de las llamadas al portal que no esperan al usuario (conectar, leer versiones).
+const PORTAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Espera máxima de una sesión del portal entera, con el diálogo en el que el usuario elige qué
+/// compartir. Si se agota, el diálogo no llegó a mostrarse o nadie lo contestó.
+const DIALOG_TIMEOUT: Duration = Duration::from_secs(180);
+
 /// Lado máximo del mapa de bits del cursor que se reserva en los metadatos.
 const CURSOR_BITMAP_SIDE: usize = 64;
 
@@ -215,6 +222,26 @@ async fn open_screencast(
     ))
 }
 
+/// [`open_screencast`] con [`DIALOG_TIMEOUT`] de límite.
+async fn screencast_with_timeout(
+    proxy: &Screencast,
+    cursor_mode: CursorMode,
+    restore_token: Option<&str>,
+) -> Result<(u32, Option<String>, OwnedFd, PortalSession), CaptureError> {
+    tracing::debug!("portal ScreenCast: abriendo sesión y diálogo");
+    tokio::time::timeout(
+        DIALOG_TIMEOUT,
+        open_screencast(proxy, cursor_mode, restore_token),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(backend(format!(
+            "el diálogo del portal ScreenCast no terminó en {} s (¿no se mostró?)",
+            DIALOG_TIMEOUT.as_secs()
+        )))
+    })
+}
+
 /// Una sola sesión `RemoteDesktop` con las fuentes de `ScreenCast` encima: un diálogo, un token.
 /// Devuelve también el socket de EI (o por qué no se pudo abrir).
 async fn open_shared(
@@ -306,8 +333,23 @@ fn spawn_portal(
             };
             rt.block_on(async move {
                 let opened = async {
-                    let proxy = Screencast::new().await.map_err(portal_error)?;
-                    let cursor_modes = proxy.available_cursor_modes().await.unwrap_or_default();
+                    tracing::debug!("portal ScreenCast: conectando");
+                    let proxy = tokio::time::timeout(PORTAL_TIMEOUT, Screencast::new())
+                        .await
+                        .map_err(|_| {
+                            backend(format!(
+                                "el portal ScreenCast no respondió en {} s",
+                                PORTAL_TIMEOUT.as_secs()
+                            ))
+                        })?
+                        .map_err(portal_error)?;
+                    tracing::debug!(version = proxy.version(), "portal ScreenCast conectado");
+                    let cursor_modes =
+                        tokio::time::timeout(PORTAL_TIMEOUT, proxy.available_cursor_modes())
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .unwrap_or_default();
                     let cursor_mode = if cursor_modes.contains(CursorMode::Metadata) {
                         CursorMode::Metadata
                     } else {
@@ -316,7 +358,13 @@ fn spawn_portal(
                     let token = restore_token.as_deref();
                     let mut keep = None;
                     let (node_id, restore_token, fd, session) = match &eis {
-                        Some(eis) => match open_shared(&proxy, cursor_mode, token).await {
+                        Some(eis) => match tokio::time::timeout(
+                            DIALOG_TIMEOUT,
+                            open_shared(&proxy, cursor_mode, token),
+                        )
+                        .await
+                        .unwrap_or_else(|_| Err(ashpd::Error::Response(ResponseError::Other)))
+                        {
                             Ok((node_id, restore, fd, session, remote, socket)) => {
                                 let _ = eis.send(socket.map(|fd| EisSocket { fd }));
                                 keep = Some(remote);
@@ -330,12 +378,18 @@ fn spawn_portal(
                                 return Err(CaptureError::PermissionDenied);
                             }
                             Err(err) => {
-                                let _ = eis.send(Err(remote_desktop_error(err)));
-                                open_screencast(&proxy, cursor_mode, token).await?
+                                let reason = remote_desktop_error(err);
+                                tracing::warn!(
+                                    %reason,
+                                    "portal RemoteDesktop sin éxito; se comparte solo la pantalla"
+                                );
+                                let _ = eis.send(Err(reason));
+                                screencast_with_timeout(&proxy, cursor_mode, token).await?
                             }
                         },
-                        None => open_screencast(&proxy, cursor_mode, token).await?,
+                        None => screencast_with_timeout(&proxy, cursor_mode, token).await?,
                     };
+                    tracing::debug!(node_id, "portal: sesión de captura abierta");
                     Ok((
                         PortalStream {
                             fd,

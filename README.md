@@ -528,7 +528,8 @@ formato que se usó), si la ventana de `--hdr` pasa a HDR (en Windows, con «Usa
 Linux, con un compositor con gestión de color) y los fps reales a 120.
 
 Si algo falla o sale con copias, `COROOM_ZERO_COPY=0` fuerza la ruta con copia a CPU para
-comparar, y `COROOM_FFMPEG_LOG=warning` muestra los avisos de FFmpeg y las líneas `coroom: …`
+comparar (y `COROOM_ZERO_COPY=1` fuerza las rutas sin copias que van desactivadas por defecto: D3D11 →
+Vulkan Video en Windows), y `COROOM_FFMPEG_LOG=warning` muestra los avisos de FFmpeg y las líneas `coroom: …`
 que dicen por qué se dejó la ruta sin copias. No pegues el
 `--server` ni la huella reales: son de tu instancia.
 

@@ -22,7 +22,8 @@ use iced_widget::{Column, Row, button, column, container, row, text};
 
 use crate::ui::app::{App, AudioDevice, Dialog, Effect, Event, Load, Message};
 use crate::ui::settings::{
-    BITRATE_CHOICES, CodecChoice, FPS_CHOICES, Resolution, Shortcuts, ThemeChoice, VoiceMode,
+    BITRATE_CHOICES, CodecChoice, DecoderChoice, EncoderChoice, FPS_CHOICES, Resolution, Shortcuts,
+    ThemeChoice, VoiceMode,
 };
 use crate::ui::stats;
 use coroom_transport::proto::api::Devices;
@@ -125,6 +126,10 @@ pub enum Msg {
     Page(SettingsPage),
     /// Códec.
     Codec(Choice<CodecChoice>),
+    /// Codificador.
+    Encoder(Choice<EncoderChoice>),
+    /// Decodificador.
+    Decoder(Choice<DecoderChoice>),
     /// Bitrate.
     Bitrate(Choice<u32>),
     /// Fps.
@@ -243,6 +248,8 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             return page_effects(app, page);
         }
         Msg::Codec(choice) => settings.video.codec = choice.value,
+        Msg::Encoder(choice) => settings.video.encoder = choice.value,
+        Msg::Decoder(choice) => settings.video.decoder = choice.value,
         Msg::Bitrate(choice) => settings.video.max_bitrate_kbps = choice.value,
         Msg::Fps(fps) => settings.video.fps = fps,
         Msg::Resolution(choice) => settings.video.max_resolution = choice.value,
@@ -496,6 +503,36 @@ fn video(app: &App) -> Element<'_, Message> {
         .iter()
         .find(|c| c.value == video.max_resolution)
         .cloned();
+    // Solo los backends que existen en esta plataforma.
+    let mut encoders = vec![choice(
+        EncoderChoice::Auto,
+        t!("pantalla-settings-automatico"),
+    )];
+    encoders.extend(
+        [
+            (EncoderChoice::Nvenc, "NVENC (NVIDIA)"),
+            (EncoderChoice::Amf, "AMF (AMD)"),
+            (EncoderChoice::Qsv, "Quick Sync (Intel)"),
+            (EncoderChoice::Vulkan, "Vulkan Video"),
+            (EncoderChoice::Vaapi, "VA-API"),
+        ]
+        .into_iter()
+        .filter(|(c, _)| cfg!(target_os = "linux") || *c != EncoderChoice::Vaapi)
+        .map(|(c, label)| choice(c, label)),
+    );
+    encoders.push(choice(
+        EncoderChoice::Software,
+        t!("pantalla-settings-por-software"),
+    ));
+    let encoder = encoders.iter().find(|c| c.value == video.encoder).cloned();
+    let decoders = vec![
+        choice(DecoderChoice::Auto, t!("pantalla-settings-automatico")),
+        choice(
+            DecoderChoice::Software,
+            t!("pantalla-settings-por-software"),
+        ),
+    ];
+    let decoder = decoders.iter().find(|c| c.value == video.decoder).cloned();
     let fps = ui::segmented(
         FPS_CHOICES
             .iter()
@@ -541,6 +578,22 @@ fn video(app: &App) -> Element<'_, Message> {
                     "HDR",
                     Some(hdr_hint(app)),
                     ui::switch(video.hdr, Some(|on_off| on(Msg::Hdr(on_off)))),
+                ),
+            ],
+        ),
+        ui::section(
+            t!("pantalla-settings-avanzado"),
+            Some(t!("pantalla-settings-cambialos-solo-si-el-video").to_owned()),
+            vec![
+                ui::pref_row(
+                    t!("pantalla-settings-codificador"),
+                    Some(t!("pantalla-settings-codificador-ayuda").to_owned()),
+                    ui::select(encoders, encoder, |c| on(Msg::Encoder(c))),
+                ),
+                ui::pref_row(
+                    t!("pantalla-settings-decodificador"),
+                    Some(t!("pantalla-settings-decodificador-ayuda").to_owned()),
+                    ui::select(decoders, decoder, |c| on(Msg::Decoder(c))),
                 ),
             ],
         ),

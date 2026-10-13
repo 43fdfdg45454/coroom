@@ -314,7 +314,7 @@ jobs:
             echo "- **Linux**: \`coroom-$VERSION-x86_64.flatpak\` (\`flatpak install --user coroom-$VERSION-x86_64.flatpak\`)."
             echo "- **Windows**: \`coroom-$VERSION-x64.msix\` (firmado con el certificado de prueba \`coroom-dev.cer\`, que hay que instalar antes) o el portátil \`coroom-$VERSION-windows-x64.zip\`."
             echo "- **Servidor**: \`docker pull $image\`."
-            echo "- **Driver de mando virtual** (Windows): \`coroomvhid-$VERSION-*-desarrollo.zip\`. Es una build de **desarrollo**: sin firmar (se instala con \`bcdedit /set testsigning on\` y la firma de prueba, ver su README) y con VID/PID 0, para equipos propios; no está pensada para distribuirla."
+            echo "- **Driver de mando virtual** (Windows): \`coroomvhid-$VERSION-*-desarrollo.zip\`. Es una build de **desarrollo**, **sin firmar** y con VID/PID 0: Windows no la carga tal cual, ni con \`testsigning\`. Para usarla hay que firmarla con un certificado propio en tu equipo (\`build.ps1 -TestSign\`, ver su README). Es opcional: sin ella, coroom funciona y el mando puede ir como teclas."
             echo
             if [ -n "$previous" ]; then
               echo "### Cambios desde $previous"

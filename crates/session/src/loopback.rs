@@ -1018,6 +1018,7 @@ pub(crate) fn decode_loop(
             Err(_) => {
                 // Fotograma corrupto o sin referencias: se descarta y se pide un intra.
                 ledger.record_drop(Stage::Decoded);
+                ledger.record_decode_error();
                 decoder.reset();
                 shared.request_keyframe();
             }

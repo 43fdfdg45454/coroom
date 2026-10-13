@@ -104,10 +104,12 @@ impl EncoderSet {
         self
     }
 
-    /// Se queda con `backend` (si es `Some`).
+    /// Se queda con `backend` (si es `Some`). Sin backend pedido, quita las combinaciones que solo
+    /// se usan a mano ([`Backend::manual_only`]).
     pub fn only_backend(mut self, backend: Option<Backend>) -> Self {
-        if let Some(backend) = backend {
-            self.available.retain(|(_, b)| *b == backend);
+        match backend {
+            Some(backend) => self.available.retain(|(_, b)| *b == backend),
+            None => self.available.retain(|&(c, b)| !Backend::manual_only(c, b)),
         }
         self
     }

@@ -393,6 +393,17 @@ impl DecodeOutput {
     }
 }
 
+/// `COROOM_ZERO_COPY=1` (o `on`, `yes`, `true`): fuerza las rutas sin copias que están desactivadas
+/// por defecto por fallos de drivers (D3D11 → Vulkan Video en Windows).
+pub fn zero_copy_forced() -> bool {
+    std::env::var("COROOM_ZERO_COPY").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "on" | "yes" | "true"
+        )
+    })
+}
+
 /// Si el usuario desactivó la ruta sin copias (`COROOM_ZERO_COPY=0`, `off` o `no`): captura en
 /// memoria compartida o en textura de *staging*, subida a la GPU y bajada a CPU (la ruta con copias).
 pub fn zero_copy_disabled() -> bool {

@@ -29,7 +29,7 @@ use super::app::{
 };
 use super::screens::guest::Stats;
 use super::screens::host::SourceChoice;
-use super::settings::{CodecChoice, ServerEntry, Settings, VoiceMode};
+use super::settings::{CodecChoice, DecoderChoice, ServerEntry, Settings, VoiceMode};
 use super::video::{FeedSink, VideoFeed, Wake};
 use crate::account::{self, AccountOptions, AccountStore};
 use crate::probe::{ProbeOptions, Source, start_pipeline_with, to_present_frame};
@@ -434,7 +434,7 @@ impl Backend {
                 CodecChoice::Hevc => Some(coroom_session::codec::Codec::Hevc),
                 CodecChoice::H264 => Some(coroom_session::codec::Codec::H264),
             },
-            encoder: None,
+            encoder: video.encoder.backend(),
             auto_allow: AutoAllow::default(),
             gamepad_to_keys: false,
             audio: HostAudioOptions {
@@ -725,7 +725,10 @@ pub fn join_options(options: &AccountOptions, settings: &Settings, code: String)
         code,
         first_invitation: false,
         frames: None,
-        decoder: None,
+        decoder: match settings.video.decoder {
+            DecoderChoice::Auto => None,
+            DecoderChoice::Software => Some(coroom_session::codec::DecoderBackend::Software),
+        },
         input_script: None,
         audio: JoinAudioOptions {
             disabled: false,
