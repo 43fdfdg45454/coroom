@@ -36,6 +36,11 @@ pub fn seal_key() -> Option<SealKey> {
     .clone()
 }
 
+/// Espera máxima del portal `Secret`. Sin un backend que lo atienda (KDE Plasma sin
+/// gnome-keyring) la petición no termina nunca.
+#[cfg(target_os = "linux")]
+const SECRET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[cfg(target_os = "linux")]
 fn retrieve() -> Result<SealKey, String> {
     // En un hilo propio: quien llama puede estar dentro de un runtime de `tokio`.
@@ -45,7 +50,16 @@ fn retrieve() -> Result<SealKey, String> {
             .build()
             .map_err(|err| err.to_string())?;
         let secret = runtime
-            .block_on(ashpd::desktop::secret::retrieve())
+            .block_on(async {
+                tokio::time::timeout(SECRET_TIMEOUT, ashpd::desktop::secret::retrieve()).await
+            })
+            .map_err(|_| {
+                format!(
+                    "sin respuesta en {} s (¿hay un servicio de secretos con portal, como \
+                     gnome-keyring?)",
+                    SECRET_TIMEOUT.as_secs()
+                )
+            })?
             .map_err(|err| err.to_string())?;
         SealKey::derive(&secret).map_err(|err| err.to_string())
     })

@@ -799,7 +799,21 @@ impl ProbeArgs {
     }
 }
 
+/// Logs a stderr (stdout queda para la salida de los comandos). `RUST_LOG` elige el nivel; por
+/// defecto, avisos y errores.
+fn init_logging() {
+    use std::io::IsTerminal;
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
+        .init();
+}
+
 fn main() -> ExitCode {
+    init_logging();
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => return report_parse_error(&err),

@@ -7,6 +7,14 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ## [Sin publicar]
 
+### Corregido
+
+- En Flatpak sobre KDE Plasma, iniciar sesión, crear una sala y unirse se quedaban esperando al
+  portal Secret sin respuesta. Ahora se espera como mucho 5 s y, si no contesta, se usa un fichero.
+- Crear y unirse a una sala respetan `COROOM_DATA_DIR` al cargar la identidad, como el login.
+- «Cancelar» mientras se entra en una sala vuelve al inicio en el momento.
+- La aplicación escribe sus logs en stderr (`RUST_LOG` elige el nivel; por defecto, avisos).
+
 ### Cambiado
 
 - El Compose del servidor usa solo la imagen publicada, pasa cada variable de `.env` con su valor

@@ -84,6 +84,8 @@ pub struct Backend {
     settings_path: PathBuf,
     host: Arc<Mutex<Option<Arc<Mutex<RemoteSession>>>>>,
     guest: Arc<Mutex<Option<GuestRun>>>,
+    /// Cancelación de la entrada en curso (antes de que haya sesión que cerrar).
+    join_cancel: Option<Arc<AtomicBool>>,
     lobby: Option<Arc<AtomicBool>>,
     local: Arc<Mutex<Option<LocalRun>>>,
     /// Si la ventana puede presentar en HDR.
@@ -145,6 +147,7 @@ impl Backend {
             settings_path,
             host: Arc::new(Mutex::new(None)),
             guest: Arc::new(Mutex::new(None)),
+            join_cancel: None,
             lobby: None,
             local: Arc::new(Mutex::new(None)),
             hdr_display: None,
@@ -293,6 +296,10 @@ impl Backend {
                 let run = lock(&self.guest).take();
                 if let Some(run) = run {
                     self.spawn("salir", move |_| lock(&run.session).close());
+                } else if let Some(cancel) = self.join_cancel.take() {
+                    // Aún conectando: se abandona la entrada y la pantalla se cierra ya.
+                    cancel.store(true, Ordering::Relaxed);
+                    (self.notify)(Message::Event(Event::GuestEnded(None)));
                 }
             }
             Effect::Reconnect => {
@@ -443,8 +450,8 @@ impl Backend {
         let slot = Arc::clone(&self.host);
         let preview = VideoFeed::new(None, Arc::clone(&self.wake));
         self.spawn("sala", move |notify| {
-            let started =
-                load_identity(None, false).and_then(|(identity, _)| start_host(identity, &host));
+            let started = load_identity(crate::ui::settings::explicit_data_dir().as_deref(), false)
+                .and_then(|(identity, _)| start_host(identity, &host));
             let session = match started {
                 Ok(session) => session,
                 Err(err) => {
@@ -501,15 +508,25 @@ impl Backend {
         let feed = VideoFeed::new(self.importer.clone(), Arc::clone(&self.wake));
         let output = self.output.clone();
         let slot = Arc::clone(&self.guest);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.join_cancel = Some(Arc::clone(&cancel));
         self.spawn("invitado", move |notify| {
             let identity = match identity {
                 Some(identity) => Ok(identity),
-                None => load_identity(None, false).map(|(identity, _)| identity),
+                None => load_identity(crate::ui::settings::explicit_data_dir().as_deref(), false)
+                    .map(|(identity, _)| identity),
             };
             let sink = Box::new(FeedSink::new(Arc::clone(&feed)));
             let started =
                 identity.and_then(|identity| start_guest(identity, &options, sink, output));
             let session = match started {
+                Ok(_) | Err(_) if cancel.load(Ordering::Relaxed) => {
+                    if let Ok(mut session) = started {
+                        session.close();
+                    }
+                    feed.close();
+                    return;
+                }
                 Ok(session) => session,
                 Err(err) => {
                     feed.close();
