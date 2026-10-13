@@ -507,3 +507,216 @@ pub fn process_loopback_status() -> String {
         ),
     }
 }
+
+/// Clave de aplicación del proceso `pid`: el nombre de su ejecutable en minúsculas
+/// (`eldenring.exe`). La captura de ventanas calcula la misma para el proceso de la ventana, así
+/// que audio y vídeo de una aplicación se emparejan por ella. `None` si el proceso no existe o no
+/// se puede consultar.
+pub fn app_key_for_pid(pid: u32) -> Option<String> {
+    let path = process_image(pid)?;
+    exe_file_name(&path).map(str::to_lowercase)
+}
+
+/// Nombre de fichero de una ruta de Windows (`C:\\Juegos\\X.exe` → `X.exe`).
+fn exe_file_name(path: &str) -> Option<&str> {
+    let name = path.rsplit(['\\', '/']).next()?.trim();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Nombre visible a partir de la clave: sin la extensión `.exe`.
+fn exe_stem(key: &str) -> &str {
+    key.len()
+        .checked_sub(4)
+        .filter(|&cut| key.is_char_boundary(cut) && key[cut..].eq_ignore_ascii_case(".exe"))
+        .map_or(key, |cut| &key[..cut])
+}
+
+/// Nombre que se muestra: el de la sesión si lo puso la aplicación y no es una referencia a un
+/// recurso (`@%SystemRoot%\\…,-123`); si no, el del ejecutable sin extensión.
+fn display_name(session_name: &str, key: &str) -> String {
+    let name = session_name.trim();
+    if name.is_empty() || name.starts_with('@') {
+        exe_stem(key).to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
+/// Ruta completa del ejecutable del proceso `pid`.
+#[allow(unsafe_code)] // Win32 sin envoltorio seguro; cada bloque lleva su `SAFETY:`.
+fn process_image(pid: u32) -> Option<String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
+    use windows::core::PWSTR;
+
+    // SAFETY: `OpenProcess` no toma punteros; el handle devuelto se cierra abajo en todos los
+    // caminos.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut buffer = vec![0u16; 32_768];
+    let mut len = buffer.len() as u32;
+    // SAFETY: `buffer` es válido y tiene `len` u16 de capacidad; la función escribe como mucho
+    // `len` caracteres y deja en `len` los escritos (sin el nulo).
+    let queried = unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        )
+    };
+    // SAFETY: `process` es un handle abierto por `OpenProcess` y no se usa después.
+    let _ = unsafe { CloseHandle(process) };
+    queried.ok()?;
+    let len = (len as usize).min(buffer.len());
+    Some(String::from_utf16_lossy(&buffer[..len]))
+}
+
+/// Sesiones de audio por aplicación de la salida por defecto; cada una se captura con el
+/// loopback de su proceso.
+pub(crate) struct AppSessions;
+
+impl AppSessions {
+    /// (clave, nombre, pid) de cada sesión viva de la salida por defecto, salvo la de sonidos del
+    /// sistema y la de coroom.
+    #[allow(unsafe_code)] // COM sin envoltorio en `wasapi` (`IsSystemSoundsSession`).
+    fn sessions() -> Result<Vec<(String, String, String)>, AudioError> {
+        use windows::Win32::Media::Audio::{
+            AudioSessionStateExpired, IAudioSessionControl2, IAudioSessionManager2,
+            IMMDeviceEnumerator, MMDeviceEnumerator, eConsole, eRender,
+        };
+        use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree};
+        use windows::core::{HRESULT, Interface};
+
+        // Hilo de la UI o `audio-apps`: COM en MTA (si ya estaba en STA, se usa ese).
+        let _ = wasapi::initialize_mta();
+        let own = std::process::id();
+        // SAFETY: llamadas COM con COM inicializado en este hilo; las interfaces devueltas son
+        // punteros contados que `windows` libera al soltarlos, y la cadena de `GetDisplayName`
+        // se libera con `CoTaskMemFree` tras copiarla.
+        unsafe {
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).map_err(backend)?;
+            let device = enumerator
+                .GetDefaultAudioEndpoint(eRender, eConsole)
+                .map_err(backend)?;
+            let manager: IAudioSessionManager2 =
+                device.Activate(CLSCTX_ALL, None).map_err(backend)?;
+            let sessions = manager.GetSessionEnumerator().map_err(backend)?;
+            let count = sessions.GetCount().map_err(backend)?;
+            let mut out = Vec::new();
+            for index in 0..count {
+                let Ok(control) = sessions.GetSession(index) else {
+                    continue;
+                };
+                let Ok(control) = control.cast::<IAudioSessionControl2>() else {
+                    continue;
+                };
+                // S_OK (0) solo para la sesión de sonidos del sistema; S_FALSE para el resto.
+                if control.IsSystemSoundsSession() == HRESULT(0) {
+                    continue;
+                }
+                let Ok(pid) = control.GetProcessId() else {
+                    continue;
+                };
+                if pid == 0 || pid == own {
+                    continue;
+                }
+                match control.GetState() {
+                    Ok(state) if state != AudioSessionStateExpired => {}
+                    _ => continue,
+                }
+                let Some(key) = app_key_for_pid(pid) else {
+                    continue;
+                };
+                let session_name = match control.GetDisplayName() {
+                    Ok(name) if !name.is_null() => {
+                        let text = name.to_string().unwrap_or_default();
+                        CoTaskMemFree(Some(name.0 as *const _));
+                        text
+                    }
+                    _ => String::new(),
+                };
+                let name = display_name(&session_name, &key);
+                out.push((key, name, pid.to_string()));
+            }
+            Ok(out)
+        }
+    }
+}
+
+impl crate::apps::AppBackend for AppSessions {
+    fn playing(&self) -> Result<Vec<crate::apps::PlayingApp>, AudioError> {
+        // Sin loopback por proceso (antes de Windows 10 20348) no hay audio por aplicación: se
+        // dice aquí para que la interfaz pase al audio de todo el sistema.
+        static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let supported = *SUPPORTED.get_or_init(|| {
+            let _ = wasapi::initialize_mta();
+            AudioClient::new_application_loopback_client(std::process::id(), false).is_ok()
+        });
+        if !supported {
+            return Err(AudioError::Unsupported(
+                "el audio por aplicación necesita Windows 10 20348 o posterior".to_owned(),
+            ));
+        }
+        Ok(crate::apps::group(Self::sessions()?))
+    }
+
+    fn open(&self, stream: &str, format: AudioFormat) -> Result<crate::apps::Tap, AudioError> {
+        let pid: u32 = stream
+            .parse()
+            .map_err(|_| backend(format!("flujo de aplicación no válido: «{stream}»")))?;
+        // Sin el árbol: cada proceso con sesión sale por separado, y con árboles se capturarían
+        // dos veces los padres e hijos que también suenan.
+        let shared = Shared::new(format);
+        let running = Running::start(Endpoint::Process { pid, tree: false }, format, &shared)?;
+        Ok(crate::apps::Tap {
+            shared,
+            _guard: Box::new(running),
+        })
+    }
+
+    fn label(&self) -> &'static str {
+        "WASAPI"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keys_and_names_come_from_the_executable() {
+        assert_eq!(
+            exe_file_name(r"C:\Juegos\Elden Ring\EldenRing.exe"),
+            Some("EldenRing.exe")
+        );
+        assert_eq!(exe_file_name(r"C:\Juegos\"), None);
+        assert_eq!(exe_stem("eldenring.exe"), "eldenring");
+        assert_eq!(exe_stem("herramienta"), "herramienta");
+        assert_eq!(display_name("", "eldenring.exe"), "eldenring");
+        assert_eq!(
+            display_name("@%SystemRoot%\\System32\\x.dll,-1", "x.exe"),
+            "x"
+        );
+        assert_eq!(display_name("Spotify", "spotify.exe"), "Spotify");
+    }
+
+    #[test]
+    fn this_process_has_a_key() {
+        let key = app_key_for_pid(std::process::id()).expect("clave de este proceso");
+        assert!(key.ends_with(".exe"));
+        assert_eq!(key, key.to_lowercase());
+    }
+
+    #[test]
+    fn coroom_never_lists_itself() {
+        use crate::apps::AppBackend;
+        if let Ok(apps) = AppSessions.playing() {
+            let own = std::process::id().to_string();
+            assert!(apps.iter().all(|app| !app.streams.contains(&own)));
+        }
+    }
+}

@@ -59,7 +59,99 @@ pub enum CaptureTarget {
         id: u64,
         /// Título de la ventana.
         title: String,
+        /// Clave de la aplicación dueña de la ventana, la misma que usa el audio por aplicación
+        /// (`coroom_audio::PlayingApp::key`), para marcar su audio. `None` si no se sabe.
+        app: Option<String>,
     },
+}
+
+/// Qué comparte el anfitrión.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShareKind {
+    /// Un monitor entero.
+    #[default]
+    Screen,
+    /// Una sola ventana (si no se puede capturar, el backend pasa a su monitor).
+    App,
+}
+
+/// Lo que se comparte: la clase y, si la interfaz lo eligió, el destino.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ShareChoice {
+    /// Pantalla o aplicación.
+    pub kind: ShareKind,
+    /// Destino elegido de [`share_targets`]; `None` si lo elige el sistema al empezar (el diálogo
+    /// del portal) o, si [`share_targets`] da destinos, el primero.
+    pub target: Option<CaptureTarget>,
+}
+
+/// Destinos que la interfaz puede ofrecer para `kind`. Vacío si los elige el sistema al empezar
+/// (el portal en Linux muestra su propio diálogo).
+pub fn share_targets(kind: ShareKind) -> Result<Vec<CaptureTarget>, CaptureError> {
+    platform::share_targets(kind)
+}
+
+/// Capturador de lo elegido en `choice`, con la sesión del portal compartida con la entrada donde
+/// la hay (como [`screen_capturer_sharing_input`]).
+pub fn share_capturer(
+    choice: &ShareChoice,
+) -> Result<(Box<dyn Capturer>, Option<RemoteDesktopShare>), CaptureError> {
+    platform::share_capturer(choice)
+}
+
+/// Capturador con un destino fijo: [`Capturer::targets`] devuelve solo ese, así la sesión (que
+/// captura el primero) captura lo que eligió la interfaz.
+struct Chosen {
+    inner: Box<dyn Capturer>,
+    target: CaptureTarget,
+}
+
+impl Capturer for Chosen {
+    fn targets(&self) -> Result<Vec<CaptureTarget>, CaptureError> {
+        Ok(vec![self.target.clone()])
+    }
+
+    fn start(&mut self, target: &CaptureTarget) -> Result<(), CaptureError> {
+        self.inner.start(target)
+    }
+
+    fn next_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+        self.inner.next_frame()
+    }
+
+    fn next_frame_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<CapturedFrame>, CaptureError> {
+        self.inner.next_frame_timeout(timeout)
+    }
+
+    fn stop(&mut self) {
+        self.inner.stop();
+    }
+
+    fn set_gpu_frames(&mut self, frames: GpuFrames) -> GpuFrames {
+        self.inner.set_gpu_frames(frames)
+    }
+
+    fn set_options(&mut self, options: CaptureOptions) -> CaptureOptions {
+        self.inner.set_options(options)
+    }
+}
+
+/// Envuelve `inner` para que capture `target` si se eligió uno.
+#[cfg_attr(
+    not(all(feature = "wgc", target_os = "windows")),
+    expect(dead_code, reason = "solo Windows ofrece destinos en la interfaz")
+)]
+fn chosen(inner: Box<dyn Capturer>, target: Option<&CaptureTarget>) -> Box<dyn Capturer> {
+    match target {
+        Some(target) => Box::new(Chosen {
+            inner,
+            target: target.clone(),
+        }),
+        None => inner,
+    }
 }
 
 /// Forma y posición del cursor, que el invitado dibuja en local.
@@ -424,6 +516,20 @@ mod platform {
         Ok((Box::new(capturer), Some(share)))
     }
 
+    pub fn share_targets(
+        _kind: super::ShareKind,
+    ) -> Result<Vec<super::CaptureTarget>, CaptureError> {
+        Ok(Vec::new())
+    }
+
+    pub fn share_capturer(
+        choice: &super::ShareChoice,
+    ) -> Result<(Box<dyn Capturer>, Option<super::RemoteDesktopShare>), CaptureError> {
+        let mut capturer = crate::pipewire::PipeWireCapturer::new().with_kind(choice.kind);
+        let share = capturer.share_remote_desktop();
+        Ok((Box::new(capturer), Some(share)))
+    }
+
     pub fn probe() -> Result<Option<String>, CaptureError> {
         crate::pipewire::portal_status().map(Some)
     }
@@ -442,6 +548,23 @@ mod platform {
     pub fn screen_capturer_sharing_input()
     -> Result<(Box<dyn Capturer>, Option<super::RemoteDesktopShare>), CaptureError> {
         Ok((screen_capturer()?, None))
+    }
+
+    pub fn share_targets(
+        kind: super::ShareKind,
+    ) -> Result<Vec<super::CaptureTarget>, CaptureError> {
+        let capturer = crate::wgc::WgcCapturer::new();
+        match kind {
+            super::ShareKind::Screen => capturer.targets(),
+            super::ShareKind::App => crate::wgc::list_windows(),
+        }
+    }
+
+    pub fn share_capturer(
+        choice: &super::ShareChoice,
+    ) -> Result<(Box<dyn Capturer>, Option<super::RemoteDesktopShare>), CaptureError> {
+        let capturer: Box<dyn Capturer> = Box::new(crate::wgc::WgcCapturer::new());
+        Ok((super::chosen(capturer, choice.target.as_ref()), None))
     }
 
     pub fn probe() -> Result<Option<String>, CaptureError> {
@@ -466,6 +589,18 @@ mod platform {
 
     pub fn screen_capturer_sharing_input()
     -> Result<(Box<dyn Capturer>, Option<super::RemoteDesktopShare>), CaptureError> {
+        Ok((screen_capturer()?, None))
+    }
+
+    pub fn share_targets(
+        _kind: super::ShareKind,
+    ) -> Result<Vec<super::CaptureTarget>, CaptureError> {
+        Ok(Vec::new())
+    }
+
+    pub fn share_capturer(
+        _choice: &super::ShareChoice,
+    ) -> Result<(Box<dyn Capturer>, Option<super::RemoteDesktopShare>), CaptureError> {
         Ok((screen_capturer()?, None))
     }
 

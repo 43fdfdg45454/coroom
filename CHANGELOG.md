@@ -9,6 +9,13 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Añadido
 
+- Compartir tiene dos modos. **Transmitir pantalla**: un monitor, con el audio de todas las
+  aplicaciones salvo las que quites (se recuerdan). **Transmitir una app**: una ventana, con el
+  audio solo de esa aplicación. La lista de audio es igual en Linux y en Windows y coroom nunca se
+  captura a sí misma, así que la voz de la sala no vuelve como eco.
+- Windows: captura de una ventana (con paso automático a su monitor si sale en negro por la
+  pantalla completa exclusiva) y elección del monitor.
+- `--audio apps-except A,B` y `--audio apps-only A,B`.
 - *Ajustes → Vídeo → Avanzado*: codificador del anfitrión y decodificador del invitado.
 - El invitado avisa cuando el vídeo llega dañado (muchos fotogramas que el decodificador rechaza).
 
@@ -34,6 +41,7 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Cambiado
 
+- La pantalla de compartir ya no pide el nombre de la aplicación ni el PID del proceso.
 - El Compose del servidor usa solo la imagen publicada, pasa cada variable de `.env` con su valor
   por defecto y guarda todo en `./data`, también el certificado (`./data/certs`).
 - El modo TLS por defecto del Compose es `files`: el certificado lo pone el operador.

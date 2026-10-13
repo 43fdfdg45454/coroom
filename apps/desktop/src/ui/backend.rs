@@ -28,7 +28,7 @@ use super::app::{
     AccountInfo, App, AudioDevice, Effect, Event, HostRequest, Invitation, Message, VideoSupport,
 };
 use super::screens::guest::Stats;
-use super::screens::host::SourceChoice;
+use super::screens::host::{ShareOptions, SourceChoice};
 use super::settings::{CodecChoice, DecoderChoice, ServerEntry, Settings, VoiceMode};
 use super::video::{FeedSink, VideoFeed, Wake};
 use crate::account::{self, AccountOptions, AccountStore};
@@ -366,6 +366,9 @@ impl Backend {
                     ))));
                 }
             }),
+            Effect::LoadShareOptions(source) => self.spawn("compartir", move |notify| {
+                notify(Message::Event(Event::ShareOptions(share_options(source))));
+            }),
             Effect::LoadVideoSupport => {
                 let hdr_display = self.hdr_display;
                 self.spawn("video", move |notify| {
@@ -416,9 +419,10 @@ impl Backend {
         let host = HostOptions {
             net: net_options(&options, settings),
             source: match request.source {
-                SourceChoice::Screen => Source::Screen,
+                SourceChoice::Screen | SourceChoice::App => Source::Screen,
                 SourceChoice::Synthetic => Source::Synthetic,
             },
+            share: request.share,
             video: coroom_session::loopback::LoopbackConfig {
                 width,
                 height,
@@ -714,6 +718,24 @@ fn net_options(options: &AccountOptions, settings: &Settings) -> NetOptions {
         local_port: Some(settings.network.local_port).filter(|port| *port != 0),
         #[cfg(debug_assertions)]
         insecure_no_sframe: false,
+    }
+}
+
+/// Monitores o ventanas y aplicaciones que suenan, para el paso 1 del anfitrión.
+fn share_options(source: SourceChoice) -> ShareOptions {
+    let targets = match source {
+        SourceChoice::Synthetic => Vec::new(),
+        SourceChoice::Screen | SourceChoice::App => {
+            coroom_session::capture::share_targets(source.kind()).unwrap_or_else(|err| {
+                tracing::debug!(%err, "no se pudieron listar los destinos");
+                Vec::new()
+            })
+        }
+    };
+    ShareOptions {
+        source,
+        targets,
+        apps: coroom_session::audio::playing_apps().map_err(|err| err.to_string()),
     }
 }
 

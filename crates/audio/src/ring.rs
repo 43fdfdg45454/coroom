@@ -175,6 +175,27 @@ impl Shared {
         })
     }
 
+    /// Captura sin esperar: si hay una trama de `format`, la deja en `out` y devuelve `true`. Si
+    /// se acumulan más de [`MAX_CAPTURE_FRAMES`], descarta lo más antiguo, como `read_frame`.
+    pub(crate) fn try_take(&self, format: AudioFormat, out: &mut Vec<i16>) -> bool {
+        let needed = format.samples_per_frame();
+        let mut ring = self.lock();
+        if ring.failure.is_some() || ring.samples.len() < needed {
+            return false;
+        }
+        let excess = ring
+            .samples
+            .len()
+            .saturating_sub(needed * MAX_CAPTURE_FRAMES);
+        if excess > 0 {
+            ring.samples.drain(..excess);
+            ring.overruns += 1;
+        }
+        out.clear();
+        out.extend(ring.samples.drain(..needed));
+        true
+    }
+
     /// Reproducción: espera a que en cola quede como mucho una trama (de las dos que se admiten).
     pub(crate) fn wait_ready(&self, format: AudioFormat) -> Result<(), AudioError> {
         let frame = format.samples_per_frame();

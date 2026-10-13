@@ -375,7 +375,7 @@ struct HostArgs {
     #[arg(long)]
     gamepad_to_keys: bool,
 
-    /// Audio del juego: `system` (por defecto, lo que suena), `none`, `app NOMBRE` (Linux, el nodo
+    /// Audio del juego: `system` (por defecto, lo que suena), `none`, `apps-except A,B` o `apps-only A,B` (mezcla por aplicación, por clave), `app NOMBRE` (Linux, el nodo
     /// de PipeWire de esa aplicación) o `process PID` (Windows, ese proceso y sus hijos).
     #[arg(long, num_args = 1..=2, value_names = ["MODO", "NOMBRE"])]
     audio: Option<Vec<String>>,
@@ -615,6 +615,7 @@ impl HostArgs {
                 SourceArg::Synthetic => Source::Synthetic,
                 SourceArg::Screen => Source::Screen,
             },
+            share: coroom_session::capture::ShareChoice::default(),
             video: LoopbackConfig {
                 width: self.width,
                 height: self.height,

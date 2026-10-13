@@ -21,10 +21,45 @@
 //! - El cursor se lee con `GetCursorInfo` y viaja como metadatos; cuando cambia su `HCURSOR`, la
 //!   forma se lee con `GetIconInfo` + `GetDIBits` (color con alfa, color con máscara o monocromo
 //!   con máscaras AND/XOR) y se convierte a RGBA.
+//!
+//! ## Ventanas
+//!
+//! - [`list_windows`]: ventanas de primer nivel de `EnumWindows` que un usuario querría compartir
+//!   (visibles, sin ocultar por DWM (`DWMWA_CLOAKED`), sin dueña, que no son de herramientas, con
+//!   título y de otro proceso que coroom), ordenadas por título. La clave `app` es el nombre del
+//!   ejecutable en minúsculas con extensión (`eldenring.exe`), la misma que usa el audio por
+//!   aplicación (`coroom_audio::wasapi::app_key_for_pid`).
+//! - [`Capturer::start`] con [`CaptureTarget::Window`]: `CreateForWindow`. Cuando cambia el
+//!   tamaño del contenido (la ventana se redimensiona), el propio callback recrea el pool con
+//!   `Recreate` al nuevo tamaño; mientras tanto el fotograma se recorta al contenido. Si la ventana
+//!   se cierra (evento `Closed` del `GraphicsCaptureItem`, o `IsWindow` falso al esperar
+//!   fotogramas) la captura termina con [`CaptureError::TargetLost`].
+//! - **Pantalla completa exclusiva**: algunos juegos en pantalla completa exclusiva dan
+//!   fotogramas negros (o ninguno) al capturar su ventana. Heurística: mientras no se haya visto
+//!   contenido, si han pasado 2 s desde el inicio, la ventana está en primer plano y cubre todo su
+//!   monitor, y además
+//!   - en la ruta por CPU, todos los fotogramas recibidos eran negros (se mira una rejilla de
+//!     8 × 8 píxeles de cada uno), o
+//!   - en la ruta sin copia (texturas de GPU, donde leer píxeles obligaría a sincronizar el
+//!     contexto con el codificador), no ha llegado ningún fotograma,
+//!
+//!   se pasa sin avisar a capturar el monitor que contiene la ventana (`MonitorFromWindow`), con
+//!   el mismo pool y las mismas opciones, y se deja constancia en el registro de errores. Con el
+//!   primer fotograma con contenido (CPU) o el primero que llega (GPU) la heurística se desarma.
+//!   Tras el cambio, si la ventana se cierra, también termina con [`CaptureError::TargetLost`].
+//!
+//! ## Zona capturada y entrada
+//!
+//! [`captured_area`] da el rectángulo que se está capturando en coordenadas del escritorio virtual
+//! (píxeles físicos): el del monitor, o el de la ventana (`DWMWA_EXTENDED_FRAME_BOUNDS`, que es lo
+//! que captura WGC), calculado en cada consulta para seguir a la ventana si se mueve. La
+//! inyección de ratón absoluto del anfitrión lo usa para llevar las coordenadas del fotograma a la
+//! pantalla, y la posición del cursor que viaja con cada fotograma es relativa a él.
 
 // Las llamadas a Win32 y COM de este backend son `unsafe`: cada bloque explica su invariante.
 #![allow(unsafe_code)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -34,28 +69,37 @@ use windows::Graphics::Capture::{
 };
 use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
-use windows::Win32::Foundation::{HMODULE, LPARAM, RECT, TRUE};
+use windows::Graphics::SizeInt32;
+use windows::Win32::Foundation::{CloseHandle, HMODULE, HWND, LPARAM, RECT, TRUE};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
     D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
 };
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
+};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject,
     EnumDisplayMonitors, GetDC, GetDIBits, GetMonitorInfoW, GetObjectW, HBITMAP, HDC, HMONITOR,
-    MONITORINFO, MONITORINFOEXW, ReleaseDC,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromWindow, ReleaseDC,
+};
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CURSOR_SHOWING, CURSORINFO, GetCursorInfo, GetIconInfo, HCURSOR, HICON, ICONINFO,
-    MONITORINFOF_PRIMARY,
+    CURSOR_SHOWING, CURSORINFO, EnumWindows, GW_OWNER, GWL_EXSTYLE, GetCursorInfo,
+    GetForegroundWindow, GetIconInfo, GetWindow, GetWindowLongW, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HCURSOR, HICON, ICONINFO,
+    IsWindow, IsWindowVisible, MONITORINFOF_PRIMARY, WS_EX_TOOLWINDOW,
 };
-use windows::core::{BOOL, IInspectable, Interface, Ref};
+use windows::core::{BOOL, IInspectable, Interface, PWSTR, Ref};
 
 use crate::mailbox::Mailbox;
 use crate::{
@@ -91,7 +135,6 @@ struct Monitor {
     handle: HMONITOR,
     name: String,
     primary: bool,
-    origin: (i32, i32),
 }
 
 unsafe extern "system" fn collect_monitor(
@@ -134,21 +177,19 @@ fn list_monitors() -> Result<Vec<Monitor>, CaptureError> {
         let ok = unsafe {
             GetMonitorInfoW(handle, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO)
         };
-        let (name, primary, origin) = if ok.as_bool() {
+        let (name, primary) = if ok.as_bool() {
             let len = info
                 .szDevice
                 .iter()
                 .position(|&c| c == 0)
                 .unwrap_or(info.szDevice.len());
             let device = String::from_utf16_lossy(&info.szDevice[..len]);
-            let rect = info.monitorInfo.rcMonitor;
             (
                 device.trim_start_matches(r"\\.\").to_owned(),
                 info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
-                (rect.left, rect.top),
             )
         } else {
-            (format!("Monitor {}", index + 1), false, (0, 0))
+            (format!("Monitor {}", index + 1), false)
         };
         let rect_name = if primary {
             format!("{name} (principal)")
@@ -159,11 +200,303 @@ fn list_monitors() -> Result<Vec<Monitor>, CaptureError> {
             handle,
             name: rect_name,
             primary,
-            origin,
         });
     }
     monitors.sort_by_key(|monitor| !monitor.primary);
     Ok(monitors)
+}
+
+/// Tiempo sin contenido tras el que una ventana en pantalla completa pasa a su monitor.
+const FULLSCREEN_GRACE: Duration = Duration::from_secs(2);
+
+/// Cada cuánto se comprueba la ventana (cerrada, pantalla completa) mientras se esperan
+/// fotogramas.
+const WINDOW_POLL: Duration = Duration::from_millis(250);
+
+/// Rectángulo en coordenadas del escritorio virtual, en píxeles físicos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenArea {
+    /// Borde izquierdo.
+    pub left: i32,
+    /// Borde superior.
+    pub top: i32,
+    /// Ancho (mayor que 0).
+    pub width: i32,
+    /// Alto (mayor que 0).
+    pub height: i32,
+}
+
+impl ScreenArea {
+    fn from_rect(rect: RECT) -> Option<Self> {
+        let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+        (width > 0 && height > 0).then_some(Self {
+            left: rect.left,
+            top: rect.top,
+            width,
+            height,
+        })
+    }
+
+    /// Si `self` cubre entero a `other`.
+    fn covers(&self, other: &Self) -> bool {
+        self.left <= other.left
+            && self.top <= other.top
+            && self.left + self.width >= other.left + other.width
+            && self.top + self.height >= other.top + other.height
+    }
+}
+
+/// `HWND` guardado como número: el identificador es global del sistema, no un puntero de este
+/// proceso, y así los tipos que lo guardan son `Send`.
+fn hwnd(id: u64) -> HWND {
+    HWND(id as usize as *mut std::ffi::c_void)
+}
+
+fn hmonitor(id: u64) -> HMONITOR {
+    HMONITOR(id as usize as *mut std::ffi::c_void)
+}
+
+/// Qué se captura, para calcular su rectángulo cuando haga falta.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// `HMONITOR` como número.
+    Monitor(u64),
+    /// `HWND` como número.
+    Window(u64),
+}
+
+impl Source {
+    fn area(self) -> Option<ScreenArea> {
+        match self {
+            Self::Monitor(id) => monitor_area(hmonitor(id)),
+            Self::Window(id) => window_area(hwnd(id)),
+        }
+    }
+}
+
+fn monitor_area(monitor: HMONITOR) -> Option<ScreenArea> {
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `info` es un `MONITORINFO` local con `cbSize` correcto; con un `HMONITOR` que ya no
+    // existe la llamada solo falla.
+    let ok = unsafe { GetMonitorInfoW(monitor, &mut info) };
+    if ok.as_bool() {
+        ScreenArea::from_rect(info.rcMonitor)
+    } else {
+        None
+    }
+}
+
+/// Rectángulo visible de la ventana (sin la sombra), el mismo que captura WGC.
+fn window_area(window: HWND) -> Option<ScreenArea> {
+    // SAFETY: `IsWindow` admite cualquier valor; las llamadas siguientes con una ventana que acaba
+    // de cerrarse solo fallan.
+    if !unsafe { IsWindow(Some(window)) }.as_bool() {
+        return None;
+    }
+    let mut rect = RECT::default();
+    // SAFETY: `rect` es un `RECT` local y se pasa su tamaño exacto, como pide
+    // `DWMWA_EXTENDED_FRAME_BOUNDS`.
+    let dwm = unsafe {
+        DwmGetWindowAttribute(
+            window,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rect as *mut RECT as *mut std::ffi::c_void,
+            std::mem::size_of::<RECT>() as u32,
+        )
+    };
+    if dwm.is_err() {
+        // SAFETY: `rect` es un `RECT` local donde escribe `GetWindowRect`.
+        unsafe { GetWindowRect(window, &mut rect) }.ok()?;
+    }
+    ScreenArea::from_rect(rect)
+}
+
+/// Captura activa del proceso: su generación (para que un `stop` antiguo no borre la de otra) y
+/// qué captura.
+static ACTIVE: Mutex<Option<(u64, Source)>> = Mutex::new(None);
+
+/// Generaciones de [`ACTIVE`].
+static GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Rectángulo que captura ahora este proceso en coordenadas del escritorio virtual (el monitor, la
+/// ventana donde esté ahora, o el monitor de respaldo de una ventana en pantalla completa).
+/// `None` si no hay captura o la ventana ya no existe. La inyección de ratón absoluto lo usa para
+/// llevar las coordenadas del fotograma a la pantalla.
+pub fn captured_area() -> Option<ScreenArea> {
+    let source = ACTIVE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .map(|(_, source)| source)?;
+    source.area()
+}
+
+unsafe extern "system" fn collect_window(window: HWND, data: LPARAM) -> BOOL {
+    // SAFETY: `data` es el puntero a `Vec<u64>` que `list_windows` pasa a `EnumWindows`, vivo y
+    // sin otros préstamos durante toda la enumeración, que es síncrona y en el mismo hilo.
+    let list = unsafe { &mut *(data.0 as *mut Vec<u64>) };
+    list.push(window.0 as usize as u64);
+    TRUE
+}
+
+/// Ventanas de primer nivel que se pueden compartir, ordenadas por título (ver el módulo).
+pub fn list_windows() -> Result<Vec<CaptureTarget>, CaptureError> {
+    let mut handles: Vec<u64> = Vec::new();
+    // SAFETY: el callback solo usa `data` como `&mut Vec<u64>` (ver `collect_window`) y `handles`
+    // vive hasta que `EnumWindows` vuelve.
+    unsafe {
+        EnumWindows(
+            Some(collect_window),
+            LPARAM(&mut handles as *mut Vec<u64> as isize),
+        )
+    }
+    .map_err(|err| backend("EnumWindows", err))?;
+    let own = std::process::id();
+    let mut windows: Vec<(String, CaptureTarget)> = handles
+        .into_iter()
+        .filter_map(|id| shareable_window(id, own))
+        .map(|target| {
+            let key = match &target {
+                CaptureTarget::Window { title, .. } => title.to_lowercase(),
+                CaptureTarget::Monitor { name, .. } => name.to_lowercase(),
+            };
+            (key, target)
+        })
+        .collect();
+    windows.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(windows.into_iter().map(|(_, target)| target).collect())
+}
+
+/// La ventana `id` como destino si es de las que se comparten (ver el módulo).
+fn shareable_window(id: u64, own_pid: u32) -> Option<CaptureTarget> {
+    let window = hwnd(id);
+    // SAFETY: consultas de solo lectura sobre una ventana de `EnumWindows`; si se cerró entre
+    // medias, solo fallan o dan valores vacíos.
+    unsafe {
+        if !IsWindowVisible(window).as_bool() {
+            return None;
+        }
+        if GetWindow(window, GW_OWNER).is_ok_and(|owner| !owner.is_invalid()) {
+            return None;
+        }
+        if GetWindowLongW(window, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0 != 0 {
+            return None;
+        }
+    }
+    let mut cloaked: u32 = 0;
+    // SAFETY: `DWMWA_CLOAKED` escribe un `DWORD` en `cloaked`, local y del tamaño indicado.
+    let cloaked_ok = unsafe {
+        DwmGetWindowAttribute(
+            window,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut std::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    if cloaked_ok.is_ok() && cloaked != 0 {
+        return None;
+    }
+    let mut pid: u32 = 0;
+    // SAFETY: `pid` es un `u32` local donde escribe el identificador del proceso.
+    unsafe { GetWindowThreadProcessId(window, Some(&mut pid)) };
+    if pid == 0 || pid == own_pid {
+        return None;
+    }
+    // SAFETY: solo lee la longitud del título.
+    let len = unsafe { GetWindowTextLengthW(window) };
+    if len <= 0 {
+        return None;
+    }
+    let mut buffer = vec![0u16; len as usize + 1];
+    // SAFETY: `buffer` es un slice local; la API escribe como mucho `buffer.len()` caracteres con
+    // el nulo final.
+    let copied = unsafe { GetWindowTextW(window, &mut buffer) };
+    let copied = usize::try_from(copied).ok()?.min(buffer.len());
+    let title = String::from_utf16_lossy(&buffer[..copied])
+        .trim()
+        .to_owned();
+    if title.is_empty() {
+        return None;
+    }
+    Some(CaptureTarget::Window {
+        id,
+        title,
+        app: app_key_for_pid(pid),
+    })
+}
+
+/// Clave de aplicación del proceso `pid`: nombre del ejecutable en minúsculas con extensión
+/// (`eldenring.exe`). Debe coincidir con `coroom_audio::wasapi::app_key_for_pid`.
+fn app_key_for_pid(pid: u32) -> Option<String> {
+    // SAFETY: abre el proceso solo para consultas limitadas; el `HANDLE` se cierra abajo.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut buffer = [0u16; 1024];
+    let mut size = buffer.len() as u32;
+    // SAFETY: `buffer` tiene `size` caracteres de capacidad y `size` es local; la API escribe la
+    // ruta y deja en `size` su longitud sin el nulo.
+    let result = unsafe {
+        QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut size,
+        )
+    };
+    // SAFETY: `process` es el `HANDLE` abierto arriba, que no se usa más.
+    unsafe {
+        let _ = CloseHandle(process);
+    }
+    result.ok()?;
+    let path = String::from_utf16_lossy(&buffer[..(size as usize).min(buffer.len())]);
+    let name = path.rsplit(['\\', '/']).next()?.trim();
+    (!name.is_empty()).then(|| name.to_lowercase())
+}
+
+/// Si algún punto de una rejilla de 8 × 8 tiene color (no es negro). `bytes_per_pixel` es 4
+/// (BGRA de 8 bits) u 8 (RGBA en `f16`).
+fn has_content(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    stride: usize,
+    bytes_per_pixel: usize,
+) -> bool {
+    const GRID: u32 = 8;
+    for gy in 0..GRID {
+        let y = (height - 1) * gy / (GRID - 1).max(1);
+        for gx in 0..GRID {
+            let x = (width - 1) * gx / (GRID - 1).max(1);
+            let at = y as usize * stride + x as usize * bytes_per_pixel;
+            let Some(px) = data.get(at..at + bytes_per_pixel) else {
+                continue;
+            };
+            let lit = if bytes_per_pixel == 4 {
+                px[..3].iter().any(|&c| c > 8)
+            } else {
+                // `f16` por canal: magnitud por encima de ~1/128 (exponente sin signo ≥ 0x2000).
+                px[..6]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .any(|c| u16::from_le_bytes(*c) & 0x7fff > 0x2000)
+            };
+            if lit {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Lo que el callback cuenta para la heurística de pantalla completa.
+#[derive(Debug, Default)]
+struct Watch {
+    /// Fotogramas recibidos.
+    frames: u64,
+    /// Algún fotograma con contenido (solo en la ruta por CPU, donde se puede mirar).
+    content: bool,
 }
 
 fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext), CaptureError> {
@@ -353,9 +686,17 @@ struct FrameCopier {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     staging: Option<(ID3D11Texture2D, u32, u32)>,
-    next_id: u64,
-    origin: (i32, i32),
+    /// Contador de fotogramas del capturador (sigue entre capturas, también al pasar al monitor).
+    next_id: Arc<AtomicU64>,
+    /// Qué se captura: la posición del cursor es relativa a su rectángulo.
+    source: Source,
     mailbox: Arc<Mailbox>,
+    /// Formato, búferes y tamaño actuales del pool, para recrearlo si cambia el contenido.
+    pixel_format: DirectXPixelFormat,
+    buffers: i32,
+    pool_size: SizeInt32,
+    /// Cuenta para la heurística de pantalla completa (solo al capturar una ventana).
+    watch: Option<Arc<Mutex<Watch>>>,
     /// Última forma del cursor leída (se relee cuando cambia el `HCURSOR`).
     cursor_shape: Option<Arc<CursorShape>>,
     /// Entregar la textura en vez de copiarla a CPU.
@@ -367,7 +708,11 @@ struct FrameCopier {
 impl FrameCopier {
     /// Cursor actual y su forma (releída solo si cambió).
     fn cursor(&mut self) -> Option<CursorState> {
-        let (state, handle) = cursor_state(self.origin)?;
+        let origin = self
+            .source
+            .area()
+            .map_or((0, 0), |area| (area.left, area.top));
+        let (state, handle) = cursor_state(origin)?;
         let stale = self
             .cursor_shape
             .as_ref()
@@ -432,13 +777,27 @@ impl FrameCopier {
         unsafe { texture.GetDesc(&mut desc) };
         let width = desc.Width.min(u32::try_from(content.Width).unwrap_or(0));
         let height = desc.Height.min(u32::try_from(content.Height).unwrap_or(0));
+        if content.Width > 0
+            && content.Height > 0
+            && (content.Width, content.Height) != (self.pool_size.Width, self.pool_size.Height)
+        {
+            // La ventana cambió de tamaño: los siguientes fotogramas, al tamaño nuevo. El pool es
+            // *free-threaded*, así que se puede recrear desde su propio callback; los fotogramas
+            // ya entregados conservan sus texturas.
+            let device = winrt_device(&self.device)?;
+            pool.Recreate(&device, self.pixel_format, self.buffers, content)
+                .map_err(|err| backend("Recreate", err))?;
+            self.pool_size = content;
+        }
         if width == 0 || height == 0 {
             return Ok(());
         }
         if self.gpu {
+            if let Some(watch) = &self.watch {
+                watch.lock().unwrap_or_else(PoisonError::into_inner).frames += 1;
+            }
             // Sin copia: la textura y el fotograma, que la retiene, van al codificador.
-            let frame_id = self.next_id;
-            self.next_id += 1;
+            let frame_id = self.next_id.fetch_add(1, Ordering::Relaxed);
             let release: crate::Release = Arc::new(frame);
             self.mailbox.put(CapturedFrame {
                 frame_id,
@@ -490,8 +849,14 @@ impl FrameCopier {
                 "la textura mapeada no tiene el tamaño esperado".into(),
             ));
         }
-        let frame_id = self.next_id;
-        self.next_id += 1;
+        if let Some(watch) = &self.watch {
+            let mut watch = watch.lock().unwrap_or_else(PoisonError::into_inner);
+            watch.frames += 1;
+            if !watch.content && has_content(&data, width, height, row, bytes_per_pixel as usize) {
+                watch.content = true;
+            }
+        }
+        let frame_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.mailbox.put(CapturedFrame {
             frame_id,
             width,
@@ -521,16 +886,27 @@ impl FrameCopier {
 struct Running {
     pool: Direct3D11CaptureFramePool,
     session: GraphicsCaptureSession,
+    item: GraphicsCaptureItem,
     token: i64,
+    closed_token: i64,
     mailbox: Arc<Mailbox>,
+    /// Generación con la que se anotó en [`ACTIVE`].
+    generation: u64,
+    /// Ventana capturada (`HWND` como número), también tras pasar a su monitor.
+    window: Option<u64>,
+    /// Entrega texturas de GPU (no se pueden mirar sus píxeles).
+    gpu: bool,
+    /// Heurística de pantalla completa armada: cuándo empezó y lo que cuenta el callback.
+    fullscreen_watch: Option<(Instant, Arc<Mutex<Watch>>)>,
 }
 
-/// Capturador de monitores con Windows.Graphics.Capture.
+/// Capturador de monitores y ventanas con Windows.Graphics.Capture.
 #[derive(Default)]
 pub struct WgcCapturer {
     running: Option<Running>,
     gpu: bool,
     options: CaptureOptions,
+    next_id: Arc<AtomicU64>,
 }
 
 impl WgcCapturer {
@@ -538,39 +914,54 @@ impl WgcCapturer {
     pub fn new() -> Self {
         Self::default()
     }
-}
 
-impl Capturer for WgcCapturer {
-    fn targets(&self) -> Result<Vec<CaptureTarget>, CaptureError> {
-        Ok(list_monitors()?
-            .into_iter()
-            .map(|monitor| CaptureTarget::Monitor {
-                id: monitor.handle.0 as usize as u64,
-                name: monitor.name,
-            })
-            .collect())
-    }
-
-    fn start(&mut self, target: &CaptureTarget) -> Result<(), CaptureError> {
-        self.stop();
-        let CaptureTarget::Monitor { id, .. } = target else {
-            return Err(CaptureError::Unsupported(
-                "por ahora solo se capturan monitores en Windows".into(),
-            ));
-        };
+    fn start_monitor(&mut self, id: u64, window: Option<u64>) -> Result<(), CaptureError> {
         let monitors = list_monitors()?;
         let monitor = monitors
             .iter()
-            .find(|monitor| monitor.handle.0 as usize as u64 == *id)
+            .find(|monitor| monitor.handle.0 as usize as u64 == id)
             .or_else(|| monitors.first())
             .ok_or(CaptureError::TargetLost)?
             .clone();
-
         let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
             .map_err(|err| backend("IGraphicsCaptureItemInterop", err))?;
         // SAFETY: `monitor.handle` viene de `EnumDisplayMonitors` en esta misma llamada.
         let item: GraphicsCaptureItem = unsafe { interop.CreateForMonitor(monitor.handle) }
             .map_err(|err| backend("CreateForMonitor", err))?;
+        let source = Source::Monitor(monitor.handle.0 as usize as u64);
+        self.begin(item, source, window, false)
+    }
+
+    fn start_window(&mut self, id: u64) -> Result<(), CaptureError> {
+        let window = hwnd(id);
+        // SAFETY: `IsWindow` admite cualquier valor.
+        if id == 0 || !unsafe { IsWindow(Some(window)) }.as_bool() {
+            return Err(CaptureError::TargetLost);
+        }
+        let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
+            .map_err(|err| backend("IGraphicsCaptureItemInterop", err))?;
+        // SAFETY: `window` es una ventana que existía justo arriba; si se cerró entre medias,
+        // `CreateForWindow` solo falla.
+        let item: GraphicsCaptureItem =
+            unsafe { interop.CreateForWindow(window) }.map_err(|err| {
+                // SAFETY: como arriba.
+                if unsafe { IsWindow(Some(window)) }.as_bool() {
+                    backend("CreateForWindow", err)
+                } else {
+                    CaptureError::TargetLost
+                }
+            })?;
+        self.begin(item, Source::Window(id), Some(id), true)
+    }
+
+    /// Arranca la captura de `item`. Con `watch`, arma la heurística de pantalla completa.
+    fn begin(
+        &mut self,
+        item: GraphicsCaptureItem,
+        source: Source,
+        window: Option<u64>,
+        watch: bool,
+    ) -> Result<(), CaptureError> {
         let (device, context) = create_device()?;
         let d3d_device = winrt_device(&device)?;
         let size = item
@@ -584,10 +975,11 @@ impl Capturer for WgcCapturer {
         } else {
             DirectXPixelFormat::B8G8R8A8UIntNormalized
         };
+        let buffers = if gpu { GPU_BUFFERS } else { BUFFERS };
         let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &d3d_device,
             pixel_format,
-            if gpu { GPU_BUFFERS } else { BUFFERS },
+            buffers,
             size,
         )
         .map_err(|err| backend("CreateFreeThreaded", err))?;
@@ -605,13 +997,18 @@ impl Capturer for WgcCapturer {
         });
 
         let mailbox = Arc::new(Mailbox::default());
+        let watch = watch.then(|| Arc::new(Mutex::new(Watch::default())));
         let copier = Mutex::new(FrameCopier {
             device,
             context,
             staging: None,
-            next_id: 0,
-            origin: monitor.origin,
+            next_id: Arc::clone(&self.next_id),
+            source,
             mailbox: Arc::clone(&mailbox),
+            pixel_format,
+            buffers,
+            pool_size: size,
+            watch: watch.clone(),
             cursor_shape: None,
             gpu,
             hdr,
@@ -628,46 +1025,164 @@ impl Capturer for WgcCapturer {
                 Ok(())
             },
         );
-        let token = pool
-            .FrameArrived(&handler)
-            .map_err(|err| backend("FrameArrived", err))?;
-        session
-            .StartCapture()
-            .map_err(|err| backend("StartCapture", err))?;
+        let closed_mailbox = Arc::clone(&mailbox);
+        let closed = TypedEventHandler::new(
+            move |_item: Ref<GraphicsCaptureItem>, _args: Ref<IInspectable>| {
+                closed_mailbox.fail(CaptureError::TargetLost);
+                Ok(())
+            },
+        );
+        let closed_token = item
+            .Closed(&closed)
+            .map_err(|err| backend("GraphicsCaptureItem.Closed", err))?;
+        let token = match pool.FrameArrived(&handler) {
+            Ok(token) => token,
+            Err(err) => {
+                let _ = item.RemoveClosed(closed_token);
+                return Err(backend("FrameArrived", err));
+            }
+        };
+        if let Err(err) = session.StartCapture() {
+            let _ = pool.RemoveFrameArrived(token);
+            let _ = item.RemoveClosed(closed_token);
+            let _ = session.Close();
+            let _ = pool.Close();
+            return Err(backend("StartCapture", err));
+        }
+        let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
+        *ACTIVE.lock().unwrap_or_else(PoisonError::into_inner) = Some((generation, source));
         self.running = Some(Running {
             pool,
             session,
+            item,
             token,
+            closed_token,
             mailbox,
+            generation,
+            window,
+            gpu,
+            fullscreen_watch: watch.map(|watch| (Instant::now(), watch)),
         });
         Ok(())
     }
 
-    fn next_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
-        let Some(running) = &self.running else {
-            return Err(CaptureError::Backend("la captura no está iniciada".into()));
+    /// Comprueba la ventana capturada: si se cerró, [`CaptureError::TargetLost`]; si parece en
+    /// pantalla completa exclusiva sin imagen, pasa a su monitor (ver el módulo).
+    fn check_window(&mut self) -> Result<(), CaptureError> {
+        let Some(running) = &mut self.running else {
+            return Ok(());
         };
-        running
-            .mailbox
-            .take(None)?
-            .ok_or_else(|| CaptureError::Backend("la captura terminó".into()))
+        let Some(id) = running.window else {
+            return Ok(());
+        };
+        let window = hwnd(id);
+        // SAFETY: `IsWindow` admite cualquier valor.
+        if !unsafe { IsWindow(Some(window)) }.as_bool() {
+            return Err(CaptureError::TargetLost);
+        }
+        let Some((started, watch)) = &running.fullscreen_watch else {
+            return Ok(());
+        };
+        let (frames, content) = {
+            let watch = watch.lock().unwrap_or_else(PoisonError::into_inner);
+            (watch.frames, watch.content)
+        };
+        // En la ruta por GPU no se miran píxeles: cualquier fotograma cuenta como contenido.
+        if content || (running.gpu && frames > 0) {
+            running.fullscreen_watch = None;
+            return Ok(());
+        }
+        if started.elapsed() < FULLSCREEN_GRACE {
+            return Ok(());
+        }
+        // SAFETY: sin precondiciones.
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground != window {
+            return Ok(());
+        }
+        // SAFETY: `window` existe (comprobado arriba); con una que acaba de cerrarse, da el
+        // monitor más cercano.
+        let monitor = unsafe { MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) };
+        let (Some(window_area), Some(monitor_area)) = (window_area(window), monitor_area(monitor))
+        else {
+            return Ok(());
+        };
+        if !window_area.covers(&monitor_area) {
+            return Ok(());
+        }
+        eprintln!(
+            "AVISO: la ventana capturada no da imagen en {} s y ocupa su monitor (¿pantalla \
+             completa exclusiva?): se pasa a capturar el monitor",
+            FULLSCREEN_GRACE.as_secs()
+        );
+        self.stop();
+        self.start_monitor(monitor.0 as usize as u64, Some(id))
+    }
+}
+
+impl Capturer for WgcCapturer {
+    fn targets(&self) -> Result<Vec<CaptureTarget>, CaptureError> {
+        Ok(list_monitors()?
+            .into_iter()
+            .map(|monitor| CaptureTarget::Monitor {
+                id: monitor.handle.0 as usize as u64,
+                name: monitor.name,
+            })
+            .collect())
+    }
+
+    fn start(&mut self, target: &CaptureTarget) -> Result<(), CaptureError> {
+        self.stop();
+        match target {
+            CaptureTarget::Monitor { id, .. } => self.start_monitor(*id, None),
+            CaptureTarget::Window { id, .. } => self.start_window(*id),
+        }
+    }
+
+    fn next_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+        loop {
+            if let Some(frame) = self.next_frame_timeout(WINDOW_POLL)? {
+                return Ok(frame);
+            }
+        }
     }
 
     fn next_frame_timeout(
         &mut self,
         timeout: Duration,
     ) -> Result<Option<CapturedFrame>, CaptureError> {
-        let Some(running) = &self.running else {
-            return Err(CaptureError::Backend("la captura no está iniciada".into()));
-        };
-        running.mailbox.take(Some(timeout))
+        let deadline = Instant::now() + timeout;
+        loop {
+            let Some(running) = &self.running else {
+                return Err(CaptureError::Backend("la captura no está iniciada".into()));
+            };
+            let wait = if running.window.is_some() {
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(WINDOW_POLL)
+            } else {
+                deadline.saturating_duration_since(Instant::now())
+            };
+            if let Some(frame) = running.mailbox.take(Some(wait))? {
+                return Ok(Some(frame));
+            }
+            self.check_window()?;
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+        }
     }
 
     fn stop(&mut self) {
         if let Some(running) = self.running.take() {
             let _ = running.pool.RemoveFrameArrived(running.token);
+            let _ = running.item.RemoveClosed(running.closed_token);
             let _ = running.session.Close();
             let _ = running.pool.Close();
+            let mut active = ACTIVE.lock().unwrap_or_else(PoisonError::into_inner);
+            if active.is_some_and(|(generation, _)| generation == running.generation) {
+                *active = None;
+            }
         }
     }
 

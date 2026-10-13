@@ -21,6 +21,7 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
+pub mod apps;
 pub mod codec;
 pub mod jitter;
 pub mod mix;
@@ -276,6 +277,9 @@ pub enum GameCapture {
     App(String),
     /// Solo un proceso y sus hijos (WASAPI, loopback por proceso; Windows 10 20348+).
     Process(u32),
+    /// La mezcla de las aplicaciones que elige el filtro ([`apps::AppMixSource`]), igual en todas
+    /// las plataformas. coroom nunca entra.
+    Apps(apps::AppFilter),
 }
 
 impl fmt::Display for GameCapture {
@@ -285,6 +289,15 @@ impl fmt::Display for GameCapture {
             GameCapture::System => f.write_str("salida del sistema"),
             GameCapture::App(name) => write!(f, "aplicación «{name}»"),
             GameCapture::Process(pid) => write!(f, "proceso {pid} y sus hijos"),
+            GameCapture::Apps(apps::AppFilter::AllExcept(excluded)) if excluded.is_empty() => {
+                f.write_str("todas las aplicaciones")
+            }
+            GameCapture::Apps(apps::AppFilter::AllExcept(excluded)) => {
+                write!(f, "todas las aplicaciones salvo {}", excluded.join(", "))
+            }
+            GameCapture::Apps(apps::AppFilter::Only(included)) => {
+                write!(f, "solo {}", included.join(", "))
+            }
         }
     }
 }
@@ -317,6 +330,12 @@ pub struct DeviceInfo {
 pub fn game_source(spec: &GameCapture) -> Result<Option<Box<dyn AudioSource>>, AudioError> {
     if *spec == GameCapture::None {
         return Ok(None);
+    }
+    if let GameCapture::Apps(filter) = spec {
+        return Ok(Some(Box::new(apps::AppMixSource::new(
+            app_backend()?,
+            filter.clone(),
+        ))));
     }
     #[cfg(all(target_os = "linux", feature = "pipewire"))]
     {
@@ -351,6 +370,32 @@ pub fn game_source(spec: &GameCapture) -> Result<Option<Box<dyn AudioSource>>, A
             "este binario no tiene captura de audio del sistema ({spec})"
         )))
     }
+}
+
+/// Backend del audio por aplicación de la plataforma.
+fn app_backend() -> Result<std::sync::Arc<dyn apps::AppBackend>, AudioError> {
+    #[cfg(all(target_os = "linux", feature = "pipewire"))]
+    {
+        Ok(std::sync::Arc::new(pipewire::AppStreams))
+    }
+    #[cfg(all(target_os = "windows", feature = "wasapi"))]
+    {
+        Ok(std::sync::Arc::new(wasapi::AppSessions))
+    }
+    #[cfg(not(any(
+        all(target_os = "linux", feature = "pipewire"),
+        all(target_os = "windows", feature = "wasapi")
+    )))]
+    {
+        Err(AudioError::Unsupported(
+            "este binario no tiene audio por aplicación".to_owned(),
+        ))
+    }
+}
+
+/// Aplicaciones que reproducen audio ahora, sin coroom, ordenadas por nombre.
+pub fn playing_apps() -> Result<Vec<apps::PlayingApp>, AudioError> {
+    app_backend()?.playing()
 }
 
 /// Micrófono de la plataforma (`None`: el del sistema).

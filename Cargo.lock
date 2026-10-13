@@ -1224,8 +1224,10 @@ dependencies = [
  "opusic-c",
  "opusic-sys",
  "pipewire",
+ "tracing",
  "wasapi",
  "webrtc-audio-processing",
+ "windows",
 ]
 
 [[package]]

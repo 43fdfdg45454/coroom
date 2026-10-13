@@ -173,11 +173,23 @@ fn remote_desktop_error(err: ashpd::Error) -> String {
     }
 }
 
+/// Tipos de fuente que ofrece el diálogo del portal.
+type Sources = ashpd::enumflags2::BitFlags<SourceType>;
+
+/// Fuentes del diálogo para lo que se comparte.
+fn sources(kind: crate::ShareKind) -> Sources {
+    match kind {
+        crate::ShareKind::Screen => SourceType::Monitor.into(),
+        crate::ShareKind::App => SourceType::Window.into(),
+    }
+}
+
 /// Sesión `ScreenCast` sola (sin entrada).
 async fn open_screencast(
     proxy: &Screencast,
     cursor_mode: CursorMode,
     restore_token: Option<&str>,
+    sources: Sources,
 ) -> Result<(u32, Option<String>, OwnedFd, PortalSession), CaptureError> {
     let session = proxy
         .create_session(Default::default())
@@ -185,7 +197,7 @@ async fn open_screencast(
         .map_err(portal_error)?;
     let mut options = SelectSourcesOptions::default()
         .set_cursor_mode(cursor_mode)
-        .set_sources(SourceType::Monitor | SourceType::Window)
+        .set_sources(sources)
         .set_multiple(false);
     // `persist_mode` y el token existen desde la versión 4 de la interfaz.
     if proxy.version() >= 4 {
@@ -227,11 +239,12 @@ async fn screencast_with_timeout(
     proxy: &Screencast,
     cursor_mode: CursorMode,
     restore_token: Option<&str>,
+    sources: Sources,
 ) -> Result<(u32, Option<String>, OwnedFd, PortalSession), CaptureError> {
     tracing::debug!("portal ScreenCast: abriendo sesión y diálogo");
     tokio::time::timeout(
         DIALOG_TIMEOUT,
-        open_screencast(proxy, cursor_mode, restore_token),
+        open_screencast(proxy, cursor_mode, restore_token, sources),
     )
     .await
     .unwrap_or_else(|_| {
@@ -248,6 +261,7 @@ async fn open_shared(
     screencast: &Screencast,
     cursor_mode: CursorMode,
     restore_token: Option<&str>,
+    sources: Sources,
 ) -> Result<
     (
         u32,
@@ -275,7 +289,7 @@ async fn open_shared(
             &session,
             SelectSourcesOptions::default()
                 .set_cursor_mode(cursor_mode)
-                .set_sources(SourceType::Monitor | SourceType::Window)
+                .set_sources(sources)
                 .set_multiple(false),
         )
         .await?
@@ -311,6 +325,7 @@ async fn open_shared(
 fn spawn_portal(
     restore_token: Option<String>,
     eis: Option<EisSender>,
+    sources: Sources,
 ) -> Result<
     (
         PortalStream,
@@ -321,17 +336,18 @@ fn spawn_portal(
 > {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let handle = thread::Builder::new()
-        .name("portal".into())
-        .spawn(move || {
-            let rt = match runtime() {
-                Ok(rt) => rt,
-                Err(err) => {
-                    let _ = ready_tx.send(Err(err));
-                    return;
-                }
-            };
-            rt.block_on(async move {
+    let handle =
+        thread::Builder::new()
+            .name("portal".into())
+            .spawn(move || {
+                let rt = match runtime() {
+                    Ok(rt) => rt,
+                    Err(err) => {
+                        let _ = ready_tx.send(Err(err));
+                        return;
+                    }
+                };
+                rt.block_on(async move {
                 let opened = async {
                     tracing::debug!("portal ScreenCast: conectando");
                     let proxy = tokio::time::timeout(PORTAL_TIMEOUT, Screencast::new())
@@ -360,7 +376,7 @@ fn spawn_portal(
                     let (node_id, restore_token, fd, session) = match &eis {
                         Some(eis) => match tokio::time::timeout(
                             DIALOG_TIMEOUT,
-                            open_shared(&proxy, cursor_mode, token),
+                            open_shared(&proxy, cursor_mode, token, sources),
                         )
                         .await
                         .unwrap_or_else(|_| Err(ashpd::Error::Response(ResponseError::Other)))
@@ -384,10 +400,10 @@ fn spawn_portal(
                                     "portal RemoteDesktop sin éxito; se comparte solo la pantalla"
                                 );
                                 let _ = eis.send(Err(reason));
-                                screencast_with_timeout(&proxy, cursor_mode, token).await?
+                                screencast_with_timeout(&proxy, cursor_mode, token, sources).await?
                             }
                         },
-                        None => screencast_with_timeout(&proxy, cursor_mode, token).await?,
+                        None => screencast_with_timeout(&proxy, cursor_mode, token, sources).await?,
                     };
                     tracing::debug!(node_id, "portal: sesión de captura abierta");
                     Ok((
@@ -413,8 +429,8 @@ fn spawn_portal(
                     }
                 }
             });
-        })
-        .map_err(|err| backend(format!("no se pudo crear el hilo del portal: {err}")))?;
+            })
+            .map_err(|err| backend(format!("no se pudo crear el hilo del portal: {err}")))?;
     match ready_rx.recv() {
         Ok(Ok(stream)) => Ok((stream, stop_tx, handle)),
         Ok(Err(err)) => {
@@ -1157,6 +1173,7 @@ struct Running {
 pub struct PipeWireCapturer {
     restore_token: Option<String>,
     running: Option<Running>,
+    kind: crate::ShareKind,
     gpu: GpuFrames,
     options: CaptureOptions,
     eis: Option<EisSender>,
@@ -1173,6 +1190,7 @@ impl PipeWireCapturer {
         Self {
             restore_token: Some(token.into()),
             running: None,
+            kind: crate::ShareKind::Screen,
             gpu: GpuFrames::Off,
             options: CaptureOptions::default(),
             eis: None,
@@ -1185,6 +1203,13 @@ impl PipeWireCapturer {
         let (tx, rx) = std::sync::mpsc::channel();
         self.eis = Some(tx);
         RemoteDesktopShare { rx }
+    }
+
+    /// Qué ofrece el diálogo del portal: monitores ([`crate::ShareKind::Screen`]) o ventanas
+    /// ([`crate::ShareKind::App`]).
+    pub fn with_kind(mut self, kind: crate::ShareKind) -> Self {
+        self.kind = kind;
+        self
     }
 
     /// Token que devolvió el portal para restaurar esta selección la próxima vez.
@@ -1203,8 +1228,11 @@ impl Capturer for PipeWireCapturer {
 
     fn start(&mut self, _target: &CaptureTarget) -> Result<(), CaptureError> {
         self.stop();
-        let (portal, portal_stop, portal_thread) =
-            spawn_portal(self.restore_token.clone(), self.eis.clone())?;
+        let (portal, portal_stop, portal_thread) = spawn_portal(
+            self.restore_token.clone(),
+            self.eis.clone(),
+            sources(self.kind),
+        )?;
         if portal.restore_token.is_some() {
             self.restore_token = portal.restore_token;
         }

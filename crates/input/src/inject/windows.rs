@@ -4,9 +4,11 @@
 //!   extendidas) con la tabla evdev → set 1 de [`crate::keymap`]: la tecla física, sea cual sea la
 //!   distribución del anfitrión.
 //! - **Ratón**: relativo con `MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE` (que Windows no junte
-//!   los movimientos); absoluto con `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK` sobre el
-//!   monitor principal (el que captura WGC) expresado en coordenadas del escritorio virtual; rueda
-//!   con `MOUSEEVENTF_WHEEL`/`HWHEEL` (`WHEEL_DELTA` = 120, como el cable).
+//!   los movimientos); absoluto con `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK` sobre la
+//!   zona capturada (el monitor o la ventana que comparte WGC, donde esté ahora; la da la fuente
+//!   de [`set_pointer_area_source`]) o, sin ella, sobre el monitor principal, expresada en
+//!   coordenadas del escritorio virtual; rueda con `MOUSEEVENTF_WHEEL`/`HWHEEL`
+//!   (`WHEEL_DELTA` = 120, como el cable).
 //! - **Mandos** (feature `windows-vhid`): un mando HID genérico por ranura con el
 //!   driver propio sobre Virtual HID Framework ([`super::windows_vhid::VhidGamepads`]), que se
 //!   abre al asignar la primera ranura. Sin el driver, [`InputSink::assign_gamepad`] devuelve
@@ -17,6 +19,8 @@
 //! cada uno).
 
 #![allow(unsafe_code)]
+
+use std::sync::{PoisonError, RwLock};
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
@@ -41,6 +45,38 @@ use crate::{GuestId, InputError, InputEvent, MouseButton};
 pub const GAMEPAD_HELP: &str = "Windows no tiene API de usuario para crear un mando virtual: hace \
     falta el driver de mando virtual de coroom (drivers/windows-vhid/README.md). Sin él, \
     `coroom host --gamepad-to-keys` convierte los mandos en teclas con un perfil fijo";
+
+/// Rectángulo de la pantalla en coordenadas del escritorio virtual (píxeles físicos).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PointerArea {
+    /// Borde izquierdo.
+    pub left: i32,
+    /// Borde superior.
+    pub top: i32,
+    /// Ancho.
+    pub width: i32,
+    /// Alto.
+    pub height: i32,
+}
+
+/// Fuente de la zona capturada (ver [`set_pointer_area_source`]).
+pub type PointerAreaSource = fn() -> Option<PointerArea>;
+
+/// Quién dice qué zona de la pantalla se está capturando.
+static AREA_SOURCE: RwLock<Option<PointerAreaSource>> = RwLock::new(None);
+
+/// Fija la fuente de la zona capturada: el ratón absoluto (relativo al fotograma) se lleva a esa
+/// zona. Se consulta en cada movimiento, así que puede seguir a una ventana que se mueve. Si da
+/// `None` (o no hay fuente), se usa el monitor principal.
+pub fn set_pointer_area_source(source: PointerAreaSource) {
+    *AREA_SOURCE.write().unwrap_or_else(PoisonError::into_inner) = Some(source);
+}
+
+/// Zona capturada según la fuente, si la hay y es válida.
+fn captured_area() -> Option<PointerArea> {
+    let source = (*AREA_SOURCE.read().unwrap_or_else(PoisonError::into_inner))?;
+    source().filter(|area| area.width > 0 && area.height > 0)
+}
 
 /// Estado de la entrada del anfitrión para `coroom doctor`.
 pub fn status() -> Vec<String> {
@@ -150,8 +186,8 @@ impl SendInputSink {
         Self::mouse(0, 0, data, flags)
     }
 
-    /// Posición normalizada del monitor principal en coordenadas normalizadas del escritorio
-    /// virtual (`0..=65535`).
+    /// Posición normalizada de la zona capturada (o del monitor principal) en coordenadas
+    /// normalizadas del escritorio virtual (`0..=65535`).
     fn absolute(x: u16, y: u16) -> INPUT {
         // SAFETY: `GetSystemMetrics` no tiene precondiciones; solo lee métricas del sistema.
         let metric = |index| unsafe { GetSystemMetrics(index) };
@@ -160,16 +196,22 @@ impl SendInputSink {
             metric(SM_CXVIRTUALSCREEN).max(1),
             metric(SM_CYVIRTUALSCREEN).max(1),
         );
-        let (pw, ph) = (metric(SM_CXSCREEN).max(1), metric(SM_CYSCREEN).max(1));
-        let to_desk = |value: u16, primary: i32, origin: i32, virtual_size: i32| {
-            // Píxel del monitor principal (en el origen) → coordenada normalizada del escritorio.
-            let pixel = f64::from(value) / 65535.0 * f64::from(primary - 1);
+        // Sin zona capturada, el monitor principal (su origen es el del escritorio, (0, 0)).
+        let area = captured_area().unwrap_or_else(|| PointerArea {
+            left: 0,
+            top: 0,
+            width: metric(SM_CXSCREEN).max(1),
+            height: metric(SM_CYSCREEN).max(1),
+        });
+        let to_desk = |value: u16, start: i32, size: i32, origin: i32, virtual_size: i32| {
+            // Píxel de la zona → coordenada normalizada del escritorio virtual.
+            let pixel = f64::from(start) + f64::from(value) / 65535.0 * f64::from(size - 1);
             ((pixel - f64::from(origin)) * 65535.0 / f64::from((virtual_size - 1).max(1))).round()
                 as i32
         };
         Self::mouse(
-            to_desk(x, pw, vx, vw),
-            to_desk(y, ph, vy, vh),
+            to_desk(x, area.left, area.width, vx, vw),
+            to_desk(y, area.top, area.height, vy, vh),
             0,
             MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
         )

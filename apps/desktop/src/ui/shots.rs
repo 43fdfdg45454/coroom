@@ -200,7 +200,7 @@ pub fn scenes() -> Vec<Scene> {
 
 type Builder = fn(&mut App);
 
-const BUILDERS: [(&str, Builder); 23] = [
+const BUILDERS: [(&str, Builder); 24] = [
     ("01-servidores", servers),
     ("02-servidor-nuevo", new_server),
     ("03-entrar", sign_in),
@@ -209,6 +209,7 @@ const BUILDERS: [(&str, Builder); 23] = [
     ("06-inicio-vacio", home_empty),
     ("07-amigos", friends),
     ("08-compartir", host_setup),
+    ("08-compartir-app", host_setup_app),
     ("09-sala-abierta", host_room),
     ("10-dejar-de-compartir", host_stop_dialog),
     ("11-conectando", guest_connecting),
@@ -409,8 +410,57 @@ fn friends(app: &mut App) {
     app.friends_page.add_name = "hugo".to_owned();
 }
 
+fn playing(apps: &[(&str, &str)]) -> Vec<coroom_session::audio::apps::PlayingApp> {
+    apps.iter()
+        .map(|(key, name)| coroom_session::audio::apps::PlayingApp::new(key, name, Vec::new()))
+        .collect()
+}
+
 fn host_setup(app: &mut App) {
+    use super::screens::host::{ShareOptions, SourceChoice};
     signed_in(app, Page::Host);
+    app.settings.audio.excluded_apps = vec![super::settings::RememberedApp {
+        key: "discord.exe".to_owned(),
+        name: "Discord".to_owned(),
+    }];
+    app.update(Message::Event(Event::ShareOptions(ShareOptions {
+        source: SourceChoice::Screen,
+        targets: vec![coroom_session::capture::CaptureTarget::Monitor {
+            id: 1,
+            name: "Monitor principal · 2560 × 1440".to_owned(),
+        }],
+        apps: Ok(playing(&[
+            ("juego.exe", "Juego"),
+            ("firefox.exe", "Firefox"),
+            ("discord.exe", "Discord"),
+        ])),
+    })));
+}
+
+fn host_setup_app(app: &mut App) {
+    use super::screens::host::{Msg, ShareOptions, SourceChoice};
+    signed_in(app, Page::Host);
+    app.update(Message::Host(Msg::Source(SourceChoice::App)));
+    app.update(Message::Event(Event::ShareOptions(ShareOptions {
+        source: SourceChoice::App,
+        targets: vec![
+            coroom_session::capture::CaptureTarget::Window {
+                id: 7,
+                title: "Juego".to_owned(),
+                app: Some("juego.exe".to_owned()),
+            },
+            coroom_session::capture::CaptureTarget::Window {
+                id: 8,
+                title: "Firefox".to_owned(),
+                app: Some("firefox.exe".to_owned()),
+            },
+        ],
+        apps: Ok(playing(&[
+            ("juego.exe", "Juego"),
+            ("firefox.exe", "Firefox"),
+            ("discord.exe", "Discord"),
+        ])),
+    })));
 }
 
 fn guest_status(id: u32, name: &str, permissions: Permissions, rtt: f64) -> GuestStatus {

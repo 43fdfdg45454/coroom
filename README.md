@@ -424,6 +424,8 @@ con él.
 | `--audio system` | por defecto: lo que suena en la salida del sistema (monitor del *sink* por defecto en PipeWire, *loopback* en WASAPI) |
 | `--audio app NOMBRE` | Linux: solo esa aplicación (su nodo de PipeWire, por `application.name`, el ejecutable o `node.name`; vale un trozo) |
 | `--audio process PID` | Windows: solo ese proceso y sus hijos (**loopback por proceso**, Windows 10 20348 o posterior) |
+| `--audio apps-except A,B` | todas las aplicaciones que suenan salvo esas claves (el ejecutable en minúsculas en Windows, `discord.exe`; `application.name` en PipeWire); las que empiezan a sonar después entran solas |
+| `--audio apps-only A,B` | solo esas aplicaciones |
 | `--audio none` | sin audio del juego |
 | `--voice [--mic NOMBRE]` | el anfitrión habla por la sala (activación por voz) |
 | `--speaker NOMBRE` | dónde suena la voz de los invitados (por defecto, la salida del sistema) |

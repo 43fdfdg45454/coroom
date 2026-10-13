@@ -209,6 +209,17 @@ pub struct Audio {
     pub push_to_talk_key: String,
     /// Supresión de ruido (WebRTC, Linux).
     pub noise_suppression: bool,
+    /// Aplicaciones que se quitan siempre del audio al transmitir la pantalla.
+    pub excluded_apps: Vec<RememberedApp>,
+}
+
+/// Aplicación recordada en la lista de audio.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RememberedApp {
+    /// Clave (`coroom_session::audio::apps::PlayingApp::key`).
+    pub key: String,
+    /// Nombre para mostrar.
+    pub name: String,
 }
 
 impl Default for Audio {
@@ -220,6 +231,7 @@ impl Default for Audio {
             voice_mode: VoiceMode::Activity,
             push_to_talk_key: "F12".to_owned(),
             noise_suppression: true,
+            excluded_apps: Vec::new(),
         }
     }
 }

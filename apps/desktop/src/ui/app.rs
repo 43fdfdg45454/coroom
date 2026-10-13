@@ -233,6 +233,8 @@ pub enum Event {
     },
     /// Lo que este equipo hace con 4:4:4 y HDR.
     VideoSupport(VideoSupport),
+    /// Lo que se puede compartir.
+    ShareOptions(host::ShareOptions),
     /// Un efecto no pudo hacerse (aviso para el usuario).
     Failed(String),
 }
@@ -302,6 +304,8 @@ pub enum Message {
 pub struct HostRequest {
     /// Fuente.
     pub source: host::SourceChoice,
+    /// Pantalla o aplicación, y el destino elegido.
+    pub share: coroom_session::capture::ShareChoice,
     /// Audio del juego.
     pub audio: coroom_session::audio::GameCapture,
     /// Voz del anfitrión.
@@ -397,6 +401,8 @@ pub enum Effect {
     OpenUrl(String),
     /// Ver qué hace este equipo con 4:4:4 y HDR.
     LoadVideoSupport,
+    /// Mirar qué se puede compartir con esa fuente (monitores o ventanas y lo que suena).
+    LoadShareOptions(host::SourceChoice),
 }
 
 /// Toast.
@@ -617,6 +623,11 @@ impl App {
         if let Some(at) = self.update.next_check {
             consider(at);
         }
+        if self.page == Page::Host
+            && let Some(at) = self.host.next_refresh()
+        {
+            consider(at);
+        }
         if let Some(guest) = &self.guest
             && let Some(at) = guest.next_tick()
         {
@@ -654,6 +665,12 @@ impl App {
                 if self.update.next_check.is_some_and(|at| at <= now) {
                     self.update.next_check = None;
                     return self.check_updates(false);
+                }
+                if self.page == Page::Host
+                    && self.screen == Screen::Main
+                    && self.host.next_refresh().is_some_and(|at| at <= now)
+                {
+                    return host::refresh(self);
                 }
                 Vec::new()
             }
@@ -785,6 +802,7 @@ impl App {
                 effects.push(Effect::LoadFriends);
             }
             Page::Settings => effects.extend(settings_screen::on_open(self)),
+            Page::Host if !self.host.refreshing => effects.extend(host::refresh(self)),
             _ => {}
         }
         effects
@@ -937,6 +955,10 @@ impl App {
             | Event::GuestStats(_)
             | Event::GuestEnded(_) => guest::on_event(self, event),
             Event::UpdateChecked { result, at } => self.update_checked(result, at),
+            Event::ShareOptions(options) => {
+                host::on_share_options(self, options);
+                Vec::new()
+            }
             Event::VideoSupport(support) => {
                 self.video_support = Some(support);
                 Vec::new()

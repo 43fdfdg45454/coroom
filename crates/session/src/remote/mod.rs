@@ -855,6 +855,19 @@ impl RemoteSession {
         ledger: Arc<LatencyLedger>,
         sink: Box<dyn InputSink>,
     ) -> Self {
+        // Windows: el ratón absoluto del invitado (relativo al fotograma) va a la zona que captura
+        // WGC (monitor o ventana, donde esté ahora).
+        #[cfg(windows)]
+        coroom_input::inject::windows::set_pointer_area_source(|| {
+            coroom_capture::wgc::captured_area().map(|area| {
+                coroom_input::inject::windows::PointerArea {
+                    left: area.left,
+                    top: area.top,
+                    width: area.width,
+                    height: area.height,
+                }
+            })
+        });
         let sframe = config.sframe();
         Self::new(
             Core::new(Role::Host, identity, ledger, sframe),

@@ -28,6 +28,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use coroom_render::NullPresenter;
+use coroom_session::audio::apps::AppFilter;
 use coroom_session::audio::processing::ProcessingOptions;
 use coroom_session::audio::synthetic::{CaptureSink, ToneSource};
 use coroom_session::audio::{AudioFormat, AudioSink, AudioSource, GameCapture};
@@ -670,8 +671,25 @@ pub fn parse_game_capture(values: &[String]) -> Result<GameCapture, String> {
             .map(GameCapture::Process)
             .map_err(|_| format!("«{pid}» no es un PID: --audio process PID")),
         (Some("process"), None) => Err("falta el PID: --audio process PID".into()),
+        (Some(mode @ ("apps-except" | "apps-only")), list) => {
+            let keys: Vec<String> = list
+                .map(|list| {
+                    list.split(',')
+                        .map(str::trim)
+                        .filter(|key| !key.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(GameCapture::Apps(if mode == "apps-except" {
+                AppFilter::AllExcept(keys)
+            } else {
+                AppFilter::Only(keys)
+            }))
+        }
         (Some(other), _) => Err(format!(
-            "--audio no entiende «{other}» (usa none, system, app NOMBRE o process PID)"
+            "--audio no entiende «{other}» (usa none, system, apps-except A,B, apps-only A,B, app \
+             NOMBRE o process PID)"
         )),
         (None, _) => Err("--audio necesita un modo".into()),
     }
@@ -749,6 +767,8 @@ pub struct HostOptions {
     pub net: NetOptions,
     /// Fuente de vídeo.
     pub source: Source,
+    /// Con [`Source::Screen`]: pantalla o aplicación, y el destino si la interfaz lo eligió.
+    pub share: coroom_session::capture::ShareChoice,
     /// Vídeo (`frames`: termina tras enviar tantos fotogramas).
     pub video: LoopbackConfig,
     /// Códec forzado (`None`: el que se negocie).
@@ -784,7 +804,7 @@ pub fn start_host(identity: Identity, options: &HostOptions) -> Result<RemoteSes
     let config = remote_config(&options.net)?;
     let encoders = host_encoders(options.codec, options.encoder)?;
     let (capturer, share) = match options.source {
-        Source::Screen => coroom_session::capture::screen_capturer_sharing_input()
+        Source::Screen => coroom_session::capture::share_capturer(&options.share)
             .map_err(|err| format!("no se puede capturar la pantalla: {err}"))?,
         Source::Synthetic => (
             make_capturer(&ProbeOptions::h264(options.source, options.video))?,
@@ -1251,6 +1271,21 @@ mod tests {
         assert!(parse(&["process", "cuatro"]).is_err_and(|err| err.contains("PID")));
         assert!(parse(&["app"]).is_err_and(|err| err.contains("NOMBRE")));
         assert!(parse(&["todo"]).is_err_and(|err| err.contains("none, system")));
+        assert_eq!(
+            parse(&["apps-except", "discord.exe, steam.exe"]),
+            Ok(GameCapture::Apps(AppFilter::AllExcept(vec![
+                "discord.exe".into(),
+                "steam.exe".into()
+            ])))
+        );
+        assert_eq!(
+            parse(&["apps-except"]),
+            Ok(GameCapture::Apps(AppFilter::AllExcept(Vec::new())))
+        );
+        assert_eq!(
+            parse(&["apps-only", "juego"]),
+            Ok(GameCapture::Apps(AppFilter::Only(vec!["juego".into()])))
+        );
         assert!(parse(&["system", "sobra"]).is_err());
     }
 

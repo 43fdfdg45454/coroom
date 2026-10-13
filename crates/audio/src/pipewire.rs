@@ -528,6 +528,7 @@ struct Node {
     description: String,
     app: String,
     binary: String,
+    pid: String,
     serial: String,
 }
 
@@ -560,6 +561,7 @@ fn enumerate() -> Result<Vec<Node>, AudioError> {
                 description: get("node.description"),
                 app: get("application.name"),
                 binary: get("application.process.binary"),
+                pid: get("application.process.id"),
                 serial: get("object.serial"),
             });
         })
@@ -621,6 +623,62 @@ fn resolve_app(name: &str) -> Result<String, AudioError> {
                 format!("{name} (reproducen ahora: {})", playing.join(", "))
             })
         })
+}
+
+/// Si el nodo es de coroom (por el proceso o por el nombre: en Flatpak el PID es otro).
+fn is_own(node: &Node) -> bool {
+    node.pid == std::process::id().to_string()
+        || node.app.eq_ignore_ascii_case("coroom")
+        || node.name.starts_with("coroom-")
+}
+
+/// Audio por aplicación con PipeWire: cada flujo de reproducción (`Stream/Output/Audio`) de una
+/// aplicación, enlazado por su `object.serial`.
+pub(crate) struct AppStreams;
+
+impl crate::apps::AppBackend for AppStreams {
+    fn playing(&self) -> Result<Vec<crate::apps::PlayingApp>, AudioError> {
+        Ok(crate::apps::group(
+            enumerate()?
+                .into_iter()
+                .filter(|node| node.class == "Stream/Output/Audio" && !is_own(node))
+                .map(|node| {
+                    let key = [&node.app, &node.binary, &node.name]
+                        .into_iter()
+                        .find(|field| !field.is_empty())
+                        .cloned()
+                        .unwrap_or_default();
+                    let name = if node.app.is_empty() {
+                        key.clone()
+                    } else {
+                        node.app.clone()
+                    };
+                    let stream = if node.serial.is_empty() {
+                        node.name
+                    } else {
+                        node.serial
+                    };
+                    (key, name, stream)
+                }),
+        ))
+    }
+
+    fn open(&self, stream: &str, format: AudioFormat) -> Result<crate::apps::Tap, AudioError> {
+        let shared = Shared::new(format);
+        let kind = Kind::Capture {
+            capture_sink: false,
+            role: "Game",
+        };
+        let running = spawn(kind, format, Some(stream.to_owned()), &shared)?;
+        Ok(crate::apps::Tap {
+            shared,
+            _guard: Box::new(running),
+        })
+    }
+
+    fn label(&self) -> &'static str {
+        "PipeWire"
+    }
 }
 
 /// Dispositivos y aplicaciones con audio.
