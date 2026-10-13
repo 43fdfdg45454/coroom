@@ -5,13 +5,15 @@
 //!   viva la sesión (y su conexión D-Bus) mientras dura la captura. Tipos `Monitor | Window`,
 //!   cursor como metadatos si el portal lo anuncia (si no, oculto) y `persist_mode` con token de
 //!   restauración opcional ([`PipeWireCapturer::with_restore_token`]).
-//! - **Sesión compartida con `RemoteDesktop`** ([`PipeWireCapturer::share_remote_desktop`]):
-//!   la sesión se crea con el portal `RemoteDesktop` (teclado y puntero, `persist_mode` y token de
-//!   restauración en `SelectDevices`), las fuentes de pantalla se eligen con `ScreenCast` sobre esa
-//!   **misma sesión** y `RemoteDesktop.Start` muestra un solo diálogo para las dos cosas. Después
-//!   se abre el nodo de PipeWire como siempre y `ConnectToEIS` da el socket de libei para la
-//!   inyección del anfitrión ([`RemoteDesktopShare`]). Si el escritorio no tiene portal
-//!   `RemoteDesktop`, la captura sigue sola con `ScreenCast` y la entrega de EI falla con el motivo.
+//! - **Entrada del anfitrión** ([`PipeWireCapturer::share_remote_desktop`]): primero la sesión
+//!   `ScreenCast` sola, con el selector de monitores y ventanas del escritorio; después, una sesión
+//!   `RemoteDesktop` aparte solo de teclado y puntero (`persist_mode` y su propio token en
+//!   `SelectDevices`) cuyo `ConnectToEIS` da el socket de libei ([`RemoteDesktopShare`]), junto con
+//!   la zona elegida ([`SharedArea`]) para colocar el puntero. No se usa una sola sesión
+//!   `RemoteDesktop` con las fuentes encima: el diálogo de KDE para ese caso solo pide permiso y
+//!   transmite todos los monitores, sin dejar elegir uno ni una ventana. Si el escritorio no tiene
+//!   portal `RemoteDesktop` o el usuario lo rechaza, la captura sigue y la entrega de EI falla con
+//!   el motivo.
 //! - Con el fd y el id de nodo, un hilo `pipewire` ejecuta `pipewire::main_loop` con un `Stream`
 //!   conectado al nodo y metadatos de cursor (`SPA_META_Cursor`, con el mapa de bits de la forma
 //!   cuando cambia, que se convierte a RGBA).
@@ -58,7 +60,7 @@ use crate::mailbox::Mailbox;
 use crate::{
     CURSOR_MAX_SIDE, CaptureError, CaptureOptions, CaptureTarget, CapturedFrame, Capturer,
     CursorShape, CursorState, DmaBufFrame, DmaBufPlane, EisSocket, FramePixels, GpuFrames,
-    RemoteDesktopShare,
+    RemoteDesktopShare, SharedArea,
 };
 
 /// Nombre del único objetivo: el selector lo muestra el portal.
@@ -139,24 +141,17 @@ struct PortalStream {
     fd: OwnedFd,
     node_id: u32,
     restore_token: Option<String>,
+    /// Token de la sesión `RemoteDesktop` de la entrada.
+    input_token: Option<String>,
 }
 
 /// Socket de EI que se entrega a la inyección (o por qué no lo hay).
 type EisSender = std::sync::mpsc::Sender<Result<EisSocket, String>>;
 
-/// Sesiones del portal que hay que mantener vivas mientras dura la captura.
-enum PortalSession {
-    ScreenCast(Session<Screencast>),
-    RemoteDesktop(Session<RemoteDesktop>),
-}
-
-impl PortalSession {
-    async fn close(&self) {
-        let _ = match self {
-            PortalSession::ScreenCast(session) => session.close().await,
-            PortalSession::RemoteDesktop(session) => session.close().await,
-        };
-    }
+/// Sesión `RemoteDesktop` de la entrada, viva mientras dura la captura.
+struct InputSession {
+    _proxy: RemoteDesktop,
+    session: Session<RemoteDesktop>,
 }
 
 fn remote_desktop_error(err: ashpd::Error) -> String {
@@ -184,13 +179,39 @@ fn sources(kind: crate::ShareKind) -> Sources {
     }
 }
 
-/// Sesión `ScreenCast` sola (sin entrada).
+/// Qué eligió el usuario, según lo que cuenta el portal del flujo.
+fn shared_area(
+    source: Option<SourceType>,
+    position: Option<(i32, i32)>,
+    size: Option<(i32, i32)>,
+) -> SharedArea {
+    match (source, position, size) {
+        (Some(SourceType::Window), _, Some((width, height))) => SharedArea::Window {
+            width: u32::try_from(width).unwrap_or(0),
+            height: u32::try_from(height).unwrap_or(0),
+        },
+        (Some(SourceType::Window), _, None) => SharedArea::Unknown,
+        (_, Some((x, y)), _) => SharedArea::Monitor { x, y },
+        _ => SharedArea::Unknown,
+    }
+}
+
+/// Sesión `ScreenCast` abierta.
+struct ScreenCastOpen {
+    node_id: u32,
+    restore_token: Option<String>,
+    fd: OwnedFd,
+    session: Session<Screencast>,
+    area: SharedArea,
+}
+
+/// Sesión `ScreenCast` sola: es la que muestra el selector de monitores y ventanas del escritorio.
 async fn open_screencast(
     proxy: &Screencast,
     cursor_mode: CursorMode,
     restore_token: Option<&str>,
     sources: Sources,
-) -> Result<(u32, Option<String>, OwnedFd, PortalSession), CaptureError> {
+) -> Result<ScreenCastOpen, CaptureError> {
     let session = proxy
         .create_session(Default::default())
         .await
@@ -221,17 +242,19 @@ async fn open_screencast(
         return Err(CaptureError::PermissionDenied);
     };
     let node_id = stream.pipe_wire_node_id();
+    let area = shared_area(stream.source_type(), stream.position(), stream.size());
     let restore_token = streams.restore_token().map(str::to_owned);
     let fd = proxy
         .open_pipe_wire_remote(&session, Default::default())
         .await
         .map_err(portal_error)?;
-    Ok((
+    Ok(ScreenCastOpen {
         node_id,
         restore_token,
         fd,
-        PortalSession::ScreenCast(session),
-    ))
+        session,
+        area,
+    })
 }
 
 /// [`open_screencast`] con [`DIALOG_TIMEOUT`] de límite.
@@ -240,7 +263,7 @@ async fn screencast_with_timeout(
     cursor_mode: CursorMode,
     restore_token: Option<&str>,
     sources: Sources,
-) -> Result<(u32, Option<String>, OwnedFd, PortalSession), CaptureError> {
+) -> Result<ScreenCastOpen, CaptureError> {
     tracing::debug!("portal ScreenCast: abriendo sesión y diálogo");
     tokio::time::timeout(
         DIALOG_TIMEOUT,
@@ -255,75 +278,44 @@ async fn screencast_with_timeout(
     })
 }
 
-/// Una sola sesión `RemoteDesktop` con las fuentes de `ScreenCast` encima: un diálogo, un token.
-/// Devuelve también el socket de EI (o por qué no se pudo abrir).
-async fn open_shared(
-    screencast: &Screencast,
-    cursor_mode: CursorMode,
+/// Sesión `RemoteDesktop` solo de teclado y puntero, después de la de `ScreenCast`. Va aparte
+/// porque, con las fuentes de pantalla en la misma sesión, el diálogo de KDE solo pide permiso y
+/// transmite todos los monitores: nunca deja elegir uno ni una ventana.
+async fn open_input(
     restore_token: Option<&str>,
-    sources: Sources,
-) -> Result<
-    (
-        u32,
-        Option<String>,
-        OwnedFd,
-        PortalSession,
-        RemoteDesktop,
-        Result<OwnedFd, String>,
-    ),
-    ashpd::Error,
-> {
+) -> Result<(InputSession, OwnedFd, Option<String>), ashpd::Error> {
     let remote = RemoteDesktop::new().await?;
     let session = remote.create_session(Default::default()).await?;
     let mut devices =
         SelectDevicesOptions::default().set_devices(DeviceType::Keyboard | DeviceType::Pointer);
-    // En una sesión compartida, la persistencia y el token van en `SelectDevices` (versión 2).
+    // La persistencia y el token van en `SelectDevices` desde la versión 2.
     if remote.version() >= 2 {
         devices = devices
             .set_persist_mode(PersistMode::ExplicitlyRevoked)
             .set_restore_token(restore_token);
     }
     remote.select_devices(&session, devices).await?.response()?;
-    screencast
-        .select_sources(
-            &session,
-            SelectSourcesOptions::default()
-                .set_cursor_mode(cursor_mode)
-                .set_sources(sources)
-                .set_multiple(false),
-        )
-        .await?
-        .response()?;
     let selected = remote
         .start(&session, None, Default::default())
         .await?
         .response()?;
-    let Some(stream) = selected.streams().first() else {
-        return Err(ashpd::Error::Response(ResponseError::Cancelled));
-    };
-    let node_id = stream.pipe_wire_node_id();
     let token = selected.restore_token().map(str::to_owned);
-    let fd = screencast
-        .open_pipe_wire_remote(&session, Default::default())
-        .await?;
-    let eis = remote
-        .connect_to_eis(&session, Default::default())
-        .await
-        .map_err(remote_desktop_error);
+    let fd = remote.connect_to_eis(&session, Default::default()).await?;
     Ok((
-        node_id,
-        token,
+        InputSession {
+            _proxy: remote,
+            session,
+        },
         fd,
-        PortalSession::RemoteDesktop(session),
-        remote,
-        eis,
+        token,
     ))
 }
 
 /// Abre la sesión del portal en un hilo propio y la mantiene viva hasta recibir `stop`. Con `eis`,
-/// la sesión es la compartida con `RemoteDesktop` y el socket de EI sale por ahí.
+/// abre después la sesión `RemoteDesktop` de la entrada y el socket de EI sale por ahí.
 fn spawn_portal(
     restore_token: Option<String>,
+    input_token: Option<String>,
     eis: Option<EisSender>,
     sources: Sources,
 ) -> Result<
@@ -371,27 +363,31 @@ fn spawn_portal(
                     } else {
                         CursorMode::Hidden
                     };
-                    let token = restore_token.as_deref();
-                    let mut keep = None;
-                    let (node_id, restore_token, fd, session) = match &eis {
-                        Some(eis) => match tokio::time::timeout(
+                    let screen = screencast_with_timeout(
+                        &proxy,
+                        cursor_mode,
+                        restore_token.as_deref(),
+                        sources,
+                    )
+                    .await?;
+                    tracing::debug!(node_id = screen.node_id, area = ?screen.area, "portal: captura abierta");
+                    let mut input = None;
+                    let mut new_input_token = None;
+                    if let Some(eis) = &eis {
+                        let opened = tokio::time::timeout(
                             DIALOG_TIMEOUT,
-                            open_shared(&proxy, cursor_mode, token, sources),
+                            open_input(input_token.as_deref()),
                         )
                         .await
-                        .unwrap_or_else(|_| Err(ashpd::Error::Response(ResponseError::Other)))
-                        {
-                            Ok((node_id, restore, fd, session, remote, socket)) => {
-                                let _ = eis.send(socket.map(|fd| EisSocket { fd }));
-                                keep = Some(remote);
-                                (node_id, restore, fd, session)
-                            }
-                            // El usuario canceló el diálogo: no se insiste con otro.
-                            Err(ashpd::Error::Response(ResponseError::Cancelled)) => {
-                                let _ = eis.send(Err(
-                                    "el usuario canceló el diálogo del portal".to_owned()
-                                ));
-                                return Err(CaptureError::PermissionDenied);
+                        .unwrap_or_else(|_| Err(ashpd::Error::Response(ResponseError::Other)));
+                        match opened {
+                            Ok((session, fd, token)) => {
+                                let _ = eis.send(Ok(EisSocket {
+                                    fd,
+                                    area: screen.area,
+                                }));
+                                input = Some(session);
+                                new_input_token = token;
                             }
                             Err(err) => {
                                 let reason = remote_desktop_error(err);
@@ -400,31 +396,34 @@ fn spawn_portal(
                                     "portal RemoteDesktop sin éxito; se comparte solo la pantalla"
                                 );
                                 let _ = eis.send(Err(reason));
-                                screencast_with_timeout(&proxy, cursor_mode, token, sources).await?
                             }
-                        },
-                        None => screencast_with_timeout(&proxy, cursor_mode, token, sources).await?,
-                    };
-                    tracing::debug!(node_id, "portal: sesión de captura abierta");
+                        }
+                    }
                     Ok((
                         PortalStream {
-                            fd,
-                            node_id,
-                            restore_token,
+                            fd: screen.fd,
+                            node_id: screen.node_id,
+                            restore_token: screen.restore_token,
+                            input_token: new_input_token,
                         },
-                        (proxy, keep),
-                        session,
+                        (proxy, screen.session, input),
                     ))
                 };
                 match opened.await {
-                    Ok((stream, _proxies, session)) => {
+                    Ok((stream, (_proxy, session, input))) => {
                         if ready_tx.send(Ok(stream)).is_ok() {
-                            // La sesión vive mientras el capturador no pida parar.
+                            // Las sesiones viven mientras el capturador no pida parar.
                             let _ = stop_rx.await;
                         }
-                        session.close().await;
+                        if let Some(input) = input {
+                            let _ = input.session.close().await;
+                        }
+                        let _ = session.close().await;
                     }
                     Err(err) => {
+                        if let Some(eis) = &eis {
+                            let _ = eis.send(Err(format!("no se abrió la captura: {err}")));
+                        }
                         let _ = ready_tx.send(Err(err));
                     }
                 }
@@ -1172,6 +1171,7 @@ struct Running {
 #[derive(Default)]
 pub struct PipeWireCapturer {
     restore_token: Option<String>,
+    input_token: Option<String>,
     running: Option<Running>,
     kind: crate::ShareKind,
     gpu: GpuFrames,
@@ -1189,6 +1189,7 @@ impl PipeWireCapturer {
     pub fn with_restore_token(token: impl Into<String>) -> Self {
         Self {
             restore_token: Some(token.into()),
+            input_token: None,
             running: None,
             kind: crate::ShareKind::Screen,
             gpu: GpuFrames::Off,
@@ -1230,11 +1231,15 @@ impl Capturer for PipeWireCapturer {
         self.stop();
         let (portal, portal_stop, portal_thread) = spawn_portal(
             self.restore_token.clone(),
+            self.input_token.clone(),
             self.eis.clone(),
             sources(self.kind),
         )?;
         if portal.restore_token.is_some() {
             self.restore_token = portal.restore_token;
+        }
+        if portal.input_token.is_some() {
+            self.input_token = portal.input_token;
         }
         let mailbox = Arc::new(Mailbox::default());
         let (quit, quit_rx) = pw::channel::channel::<()>();
@@ -1344,6 +1349,35 @@ mod tests {
     use super::*;
 
     fn assert_send<T: Send>() {}
+
+    #[test]
+    fn shared_area_follows_what_the_portal_reports() {
+        assert_eq!(
+            shared_area(
+                Some(SourceType::Monitor),
+                Some((2560, 0)),
+                Some((1920, 1080))
+            ),
+            SharedArea::Monitor { x: 2560, y: 0 }
+        );
+        assert_eq!(
+            shared_area(Some(SourceType::Window), Some((10, 20)), Some((800, 600))),
+            SharedArea::Window {
+                width: 800,
+                height: 600
+            },
+            "la posición de una ventana no sirve para colocar el puntero"
+        );
+        assert_eq!(
+            shared_area(None, Some((-1920, 0)), None),
+            SharedArea::Monitor { x: -1920, y: 0 }
+        );
+        assert_eq!(shared_area(None, None, None), SharedArea::Unknown);
+        assert_eq!(
+            shared_area(Some(SourceType::Window), None, None),
+            SharedArea::Unknown
+        );
+    }
 
     #[test]
     fn capturer_is_send_and_offers_the_portal_target() {

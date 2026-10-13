@@ -453,16 +453,40 @@ pub fn screen_capturer() -> Result<Box<dyn Capturer>, CaptureError> {
     platform::screen_capturer()
 }
 
-/// Socket del protocolo EI (libei) de la sesión del portal `RemoteDesktop` compartida con la
-/// captura (solo existe en Linux).
+/// Socket del protocolo EI (libei) de la sesión del portal `RemoteDesktop` que abre la captura
+/// (solo existe en Linux).
 #[derive(Debug)]
 pub struct EisSocket {
     /// Socket Unix.
     #[cfg(unix)]
     pub fd: std::os::fd::OwnedFd,
+    /// Qué eligió el usuario en el selector del portal.
+    pub area: SharedArea,
 }
 
-/// Entrega del socket de EI de la sesión compartida, cuando el usuario acepta el portal.
+/// Zona del escritorio que se transmite, en coordenadas lógicas del compositor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SharedArea {
+    /// El portal no lo dijo.
+    #[default]
+    Unknown,
+    /// Un monitor con la esquina superior izquierda en `(x, y)`.
+    Monitor {
+        /// Esquina superior izquierda.
+        x: i32,
+        /// Esquina superior izquierda.
+        y: i32,
+    },
+    /// Una ventana (Wayland no dice dónde está).
+    Window {
+        /// Ancho lógico.
+        width: u32,
+        /// Alto lógico.
+        height: u32,
+    },
+}
+
+/// Entrega del socket de EI de la sesión `RemoteDesktop`, cuando el usuario acepta el portal.
 #[derive(Debug)]
 pub struct RemoteDesktopShare {
     rx: std::sync::mpsc::Receiver<Result<EisSocket, String>>,

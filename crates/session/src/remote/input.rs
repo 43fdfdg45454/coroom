@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use coroom_input::capture::Allowed;
-use coroom_input::inject::{EisConnection, EisProvider};
+use coroom_input::inject::{EisConnection, EisProvider, PointerArea};
 use coroom_input::script::ScriptTarget;
 use coroom_input::send::{InputLink, InputSender, SenderSnapshot};
 use coroom_input::{EventClass, InputError, InputEvent, InputSink};
@@ -55,19 +55,27 @@ const LATENCY_WINDOW: usize = 2048;
 const MAX_NEGATIVE_US: i64 = 2_000;
 
 /// Socket de EI de la captura (`coroom_capture::RemoteDesktopShare`) como proveedor de la inyección:
-/// la sesión del portal es una sola para las dos cosas.
+/// la captura abre la sesión `RemoteDesktop` después de la suya y dice qué se transmite.
 pub fn eis_provider(share: coroom_capture::RemoteDesktopShare) -> EisProvider {
     Box::new(move || {
-        share.wait(Duration::from_secs(300)).map(|socket| {
-            // Fuera de Unix no hay descriptor que pasar (la inyección por EI es de Linux).
-            #[cfg(not(unix))]
-            let _ = socket;
-            EisConnection {
+        share
+            .wait(Duration::from_secs(300))
+            .map(|socket| EisConnection {
                 #[cfg(unix)]
                 fd: socket.fd,
-            }
-        })
+                area: pointer_area(socket.area),
+            })
     })
+}
+
+fn pointer_area(area: coroom_capture::SharedArea) -> PointerArea {
+    match area {
+        coroom_capture::SharedArea::Unknown => PointerArea::Unknown,
+        coroom_capture::SharedArea::Monitor { x, y } => PointerArea::Monitor { x, y },
+        coroom_capture::SharedArea::Window { width, height } => {
+            PointerArea::Window { width, height }
+        }
+    }
 }
 
 // --- Anfitrión ---------------------------------------------------------------------------------

@@ -53,12 +53,37 @@ pub trait InputSink: Send {
 }
 
 /// Conexión EIS (libei) ya abierta por quien tenga la sesión del portal `RemoteDesktop` (la
-/// captura de pantalla, que comparte la sesión con `ScreenCast`).
+/// captura de pantalla, que la abre después de su sesión `ScreenCast`).
 #[derive(Debug)]
 pub struct EisConnection {
     /// Socket Unix del protocolo EI.
     #[cfg(unix)]
     pub fd: std::os::fd::OwnedFd,
+    /// Qué se transmite, para llevar la posición absoluta del invitado al sitio correcto.
+    pub area: PointerArea,
+}
+
+/// Zona del escritorio que ve el invitado, en coordenadas lógicas del compositor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PointerArea {
+    /// Sin datos: la posición absoluta va a la primera región del dispositivo.
+    #[default]
+    Unknown,
+    /// Un monitor: la región de EI que empieza en `(x, y)`.
+    Monitor {
+        /// Esquina superior izquierda.
+        x: i32,
+        /// Esquina superior izquierda.
+        y: i32,
+    },
+    /// Una ventana: Wayland no dice dónde está, así que la posición absoluta se convierte en
+    /// movimiento relativo escalado a su tamaño.
+    Window {
+        /// Ancho lógico.
+        width: u32,
+        /// Alto lógico.
+        height: u32,
+    },
 }
 
 /// Quien da la conexión EIS cuando hace falta (bloquea hasta tenerla).

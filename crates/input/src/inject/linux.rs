@@ -4,10 +4,9 @@
 //! **libei** (`reis` 0.7, de ids1024, mantenida): el anfitrión es un *sender* de EI. El socket lo da
 //! el portal `RemoteDesktop` (`ConnectToEIS`, versión 2 del portal, xdg-desktop-portal ≥ 1.17):
 //!
-//! - con la captura PipeWire, de la **sesión del portal compartida** con `ScreenCast` (una sola
-//!   sesión `RemoteDesktop` con las fuentes de pantalla seleccionadas encima, un solo diálogo y un
-//!   solo token de restauración; ver `coroom_capture::pipewire`), que llega como
-//!   [`EisProvider`](super::EisProvider);
+//! - con la captura PipeWire, de la sesión `RemoteDesktop` que abre la captura justo después de
+//!   la suya de `ScreenCast` (ver `coroom_capture::pipewire`), que llega como
+//!   [`EisProvider`](super::EisProvider) junto con la zona que se transmite;
 //! - si no (fuente sintética), abriendo aquí una sesión `RemoteDesktop` solo de dispositivos.
 //!
 //! La conexión se abre en un hilo propio la primera vez que hace falta ([`InputSink::prepare`] o el
@@ -15,8 +14,11 @@
 //! [`InputError::NotReady`]. Ese hilo hace el *handshake*, se ata a las capacidades `pointer`,
 //! `pointer_absolute`, `keyboard`, `scroll` y `button` del asiento y atiende los dispositivos
 //! (`resumed` → `start_emulating`). Cada evento es una petición más `frame` y `flush`. La posición
-//! absoluta se escala a la primera región del dispositivo absoluto (el monitor capturado) y la rueda
-//! va por `scroll_discrete` (1/120 de muesca, positivo hacia abajo en EI).
+//! absoluta se escala a la región del dispositivo absoluto que corresponde al monitor capturado
+//! ([`PointerArea::Monitor`]; si no hay datos, la primera). Con una ventana, Wayland no dice dónde
+//! está: la posición absoluta se convierte en movimiento relativo escalado a su tamaño
+//! ([`PointerArea::Window`]). La rueda va por `scroll_discrete` (1/120 de muesca, positivo hacia
+//! abajo en EI).
 //!
 //! **uinput** (`evdev` 0.13): un dispositivo por ranura, "coroom Gamepad N", con el
 //! vendor/product del mando de Xbox 360 (`045e:028e`) y la disposición del driver `xpad` (A, B,
@@ -38,7 +40,7 @@ use reis::ei;
 use reis::event::{DeviceCapability, EiEvent};
 use tracing::{debug, warn};
 
-use super::{EisConnection, EisProvider, InputSink, PadTracker, PressedKeys};
+use super::{EisConnection, EisProvider, InputSink, PadTracker, PointerArea, PressedKeys};
 use crate::keymap::evdev as codes;
 use crate::{GamepadAxis, GamepadButton, GuestId, InputError, InputEvent, MouseButton};
 
@@ -81,6 +83,10 @@ struct EiState {
 struct EiInput {
     context: ei::Context,
     state: Arc<Mutex<EiState>>,
+    /// Qué se transmite.
+    area: PointerArea,
+    /// Última posición absoluta recibida, para [`PointerArea::Window`].
+    last_absolute: Mutex<Option<(u16, u16)>>,
     /// Sesión del portal propia (si no se comparte con la captura): se cierra al soltarla.
     _portal: Option<PortalGuard>,
 }
@@ -88,7 +94,11 @@ struct EiInput {
 impl EiInput {
     /// Hace el *handshake* con `fd` y lanza el hilo `ei`. Vuelve cuando hay algún dispositivo
     /// listo o pasa [`EI_DEVICE_WAIT`].
-    fn connect(fd: OwnedFd, portal: Option<PortalGuard>) -> Result<EiInput, String> {
+    fn connect(
+        fd: OwnedFd,
+        area: PointerArea,
+        portal: Option<PortalGuard>,
+    ) -> Result<EiInput, String> {
         let context = ei::Context::new(UnixStream::from(fd))
             .map_err(|err| format!("socket de EI no válido: {err}"))?;
         let state = Arc::new(Mutex::new(EiState::default()));
@@ -107,6 +117,8 @@ impl EiInput {
         Ok(EiInput {
             context,
             state,
+            area,
+            last_absolute: Mutex::new(None),
             _portal: portal,
         })
     }
@@ -185,13 +197,29 @@ impl EiInput {
     }
 
     fn absolute(&self, x: u16, y: u16) -> Result<(), InputError> {
+        if let PointerArea::Window { width, height } = self.area {
+            let last = lock(&self.last_absolute).replace((x, y));
+            let Some((dx, dy)) = window_delta(last, (x, y), (width, height)) else {
+                return Ok(());
+            };
+            return self.motion(dx, dy);
+        }
+        let monitor = match self.area {
+            PointerArea::Monitor { x, y } => Some((x, y)),
+            _ => None,
+        };
         self.with_device(DeviceCapability::PointerAbsolute, |device| {
             let Some(pointer) = device.interface::<ei::PointerAbsolute>() else {
                 return;
             };
-            let (ox, oy, w, h) = device
-                .regions()
-                .first()
+            let regions = device.regions();
+            let (ox, oy, w, h) = monitor
+                .and_then(|(x, y)| {
+                    regions.iter().find(|region| {
+                        i64::from(region.x) == i64::from(x) && i64::from(region.y) == i64::from(y)
+                    })
+                })
+                .or_else(|| regions.first())
                 .map(|region| (region.x, region.y, region.width, region.height))
                 .or_else(|| device.dimensions().map(|(w, h)| (0, 0, w, h)))
                 .unwrap_or((0, 0, 1920, 1080));
@@ -213,6 +241,18 @@ impl EiInput {
             }
         })
     }
+}
+
+/// Movimiento relativo, en píxeles lógicos de una ventana de `size`, entre dos posiciones
+/// absolutas del invitado (`0..=65535`). La primera posición solo sirve de referencia.
+fn window_delta(last: Option<(u16, u16)>, now: (u16, u16), size: (u32, u32)) -> Option<(i32, i32)> {
+    let (lx, ly) = last?;
+    let step = |from: u16, to: u16, side: u32| {
+        let delta = (f64::from(to) - f64::from(from)) / f64::from(u16::MAX) * f64::from(side);
+        delta.round() as i32
+    };
+    let delta = (step(lx, now.0, size.0), step(ly, now.1, size.1));
+    (delta != (0, 0)).then_some(delta)
 }
 
 /// Hilo `ei`: *handshake*, asientos y dispositivos.
@@ -427,10 +467,11 @@ impl EiBackend {
             .name("ei-conexión".into())
             .spawn(move || {
                 let connected = match provider {
-                    Some(provider) => {
-                        provider().and_then(|EisConnection { fd }| EiInput::connect(fd, None))
-                    }
-                    None => own_portal().and_then(|(fd, guard)| EiInput::connect(fd, Some(guard))),
+                    Some(provider) => provider()
+                        .and_then(|EisConnection { fd, area }| EiInput::connect(fd, area, None)),
+                    None => own_portal().and_then(|(fd, guard)| {
+                        EiInput::connect(fd, PointerArea::Unknown, Some(guard))
+                    }),
                 };
                 let _ = tx.send(connected);
             });
@@ -811,6 +852,24 @@ impl InputSink for LinuxSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_delta_turns_positions_into_motion() {
+        assert_eq!(
+            window_delta(None, (100, 100), (800, 600)),
+            None,
+            "la primera es la referencia"
+        );
+        assert_eq!(window_delta(Some((5, 5)), (5, 5), (800, 600)), None);
+        assert_eq!(
+            window_delta(Some((0, 0)), (u16::MAX, u16::MAX / 2), (800, 600)),
+            Some((800, 300))
+        );
+        assert_eq!(
+            window_delta(Some((u16::MAX, u16::MAX)), (0, 0), (800, 600)),
+            Some((-800, -600))
+        );
+    }
 
     #[test]
     fn axes_follow_the_xpad_layout() {
