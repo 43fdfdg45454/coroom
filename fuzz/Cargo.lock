@@ -732,6 +732,7 @@ dependencies = [
  "bytemuck",
  "opusic-c",
  "opusic-sys",
+ "tracing",
 ]
 
 [[package]]

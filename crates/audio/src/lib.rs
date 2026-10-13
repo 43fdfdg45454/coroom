@@ -29,10 +29,14 @@ pub mod processing;
 pub mod sync;
 pub mod synthetic;
 
-#[cfg(any(
-    all(target_os = "linux", feature = "pipewire"),
-    all(target_os = "windows", feature = "wasapi")
-))]
+// La mezcla por aplicación (`apps`) lo usa siempre; sin backend nativo, solo ella.
+#[cfg_attr(
+    not(any(
+        all(target_os = "linux", feature = "pipewire"),
+        all(target_os = "windows", feature = "wasapi")
+    )),
+    allow(dead_code)
+)]
 mod ring;
 
 #[cfg(all(target_os = "linux", feature = "pipewire"))]

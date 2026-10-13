@@ -81,6 +81,13 @@ impl AppFilter {
 
 /// Junta flujos por aplicación: una entrada por clave, con todos sus flujos, sin duplicados y
 /// ordenada por nombre.
+#[cfg_attr(
+    not(any(
+        all(target_os = "linux", feature = "pipewire"),
+        all(target_os = "windows", feature = "wasapi")
+    )),
+    allow(dead_code)
+)]
 pub(crate) fn group(
     streams: impl IntoIterator<Item = (String, String, String)>,
 ) -> Vec<PlayingApp> {
