@@ -80,9 +80,27 @@ pub enum ShareKind {
 pub struct ShareChoice {
     /// Pantalla o aplicación.
     pub kind: ShareKind,
-    /// Destino elegido de [`share_targets`]; `None` si lo elige el sistema al empezar (el diálogo
-    /// del portal) o, si [`share_targets`] da destinos, el primero.
+    /// Destino elegido de [`share_targets`] o de [`pick_share`]; `None` si lo elige el sistema al
+    /// empezar (el diálogo del portal) o, si [`share_targets`] da destinos, el primero.
     pub target: Option<CaptureTarget>,
+    /// Token del portal de [`pick_share`]: al empezar, el portal repite esa elección sin volver a
+    /// preguntar (si el escritorio no puede, vuelve a mostrar su selector).
+    pub restore_token: Option<String>,
+}
+
+/// Lo que eligió el usuario en el selector del sistema antes de abrir la sala.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PickedShare {
+    /// Monitor o ventana, con lo que el sistema dice de él (en Wayland, solo el tamaño).
+    pub target: CaptureTarget,
+    /// Token para repetir la elección al empezar.
+    pub restore_token: Option<String>,
+}
+
+/// Abre el selector del sistema para elegir ya qué compartir (el portal `ScreenCast` en Linux).
+/// `Ok(None)` donde la interfaz lista los destinos ella misma ([`share_targets`]).
+pub fn pick_share(kind: ShareKind) -> Result<Option<PickedShare>, CaptureError> {
+    platform::pick_share(kind)
 }
 
 /// Destinos que la interfaz puede ofrecer para `kind`. Vacío si los elige el sistema al empezar
@@ -549,9 +567,15 @@ mod platform {
     pub fn share_capturer(
         choice: &super::ShareChoice,
     ) -> Result<(Box<dyn Capturer>, Option<super::RemoteDesktopShare>), CaptureError> {
-        let mut capturer = crate::pipewire::PipeWireCapturer::new().with_kind(choice.kind);
+        let mut capturer = crate::pipewire::PipeWireCapturer::new()
+            .with_kind(choice.kind)
+            .restoring(choice.restore_token.clone());
         let share = capturer.share_remote_desktop();
         Ok((Box::new(capturer), Some(share)))
+    }
+
+    pub fn pick_share(kind: super::ShareKind) -> Result<Option<super::PickedShare>, CaptureError> {
+        crate::pipewire::pick(kind).map(Some)
     }
 
     pub fn probe() -> Result<Option<String>, CaptureError> {
@@ -591,6 +615,10 @@ mod platform {
         Ok((super::chosen(capturer, choice.target.as_ref()), None))
     }
 
+    pub fn pick_share(_kind: super::ShareKind) -> Result<Option<super::PickedShare>, CaptureError> {
+        Ok(None)
+    }
+
     pub fn probe() -> Result<Option<String>, CaptureError> {
         crate::wgc::support_status().map(Some)
     }
@@ -626,6 +654,10 @@ mod platform {
         _choice: &super::ShareChoice,
     ) -> Result<(Box<dyn Capturer>, Option<super::RemoteDesktopShare>), CaptureError> {
         Ok((screen_capturer()?, None))
+    }
+
+    pub fn pick_share(_kind: super::ShareKind) -> Result<Option<super::PickedShare>, CaptureError> {
+        Ok(None)
     }
 
     pub fn probe() -> Result<Option<String>, CaptureError> {

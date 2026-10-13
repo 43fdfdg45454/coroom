@@ -120,6 +120,11 @@ pub enum ButtonClass {
         /// Si es el elegido.
         selected: bool,
     },
+    /// Tarjeta de una opción excluyente (qué compartir): borde de acento si es la elegida.
+    Choice {
+        /// Si es la elegida.
+        selected: bool,
+    },
 }
 
 impl button::Catalog for Theme {
@@ -241,6 +246,29 @@ impl button::Catalog for Theme {
                     radius::PILL,
                 ),
                 shadow: Shadow::default(),
+                snap: true,
+            },
+            ButtonClass::Choice { selected } => button::Style {
+                background: Some(Background::Color(if hovered || pressed {
+                    p.card_hover.color()
+                } else {
+                    p.card.color()
+                })),
+                text_color: p.text.color(),
+                border: outline(
+                    if selected {
+                        p.accent_bg.color()
+                    } else {
+                        p.border.color()
+                    },
+                    2.0,
+                    radius::CARD,
+                ),
+                shadow: if selected {
+                    self.shadow(3.0, 1.0, 0.08, 0.0)
+                } else {
+                    Shadow::default()
+                },
                 snap: true,
             },
             ButtonClass::Segment { selected } => button::Style {

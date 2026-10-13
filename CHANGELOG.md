@@ -18,9 +18,17 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 - `--audio apps-except A,B` y `--audio apps-only A,B`.
 - *Ajustes → Vídeo → Avanzado*: codificador del anfitrión y decodificador del invitado.
 - El invitado avisa cuando el vídeo llega dañado (muchos fotogramas que el decodificador rechaza).
+- Linux (Wayland): «Elegir…» / «Cambiar…» abre el selector del escritorio antes de transmitir, la
+  pantalla muestra lo elegido y al empezar se repite sin volver a preguntar.
 
 ### Corregido
 
+- KDE Plasma: compartir solo ofrecía «control remoto» sobre todos los monitores, sin dejar elegir
+  uno ni una ventana. La captura y el control remoto van ahora en dos sesiones del portal: primero
+  el selector de pantallas y ventanas del escritorio, después el permiso de teclado y ratón. Con un
+  monitor, el ratón del invitado va a ese monitor; con una ventana, se mueve en relativo.
+- La pantalla «Compartir» vuelve al diseño aprobado: dos tarjetas con icono, lo elegido a la vista
+  con «Cambiar…», la lista de audio con su estado y «Empezar a transmitir».
 - Linux: compartir pantalla se quedaba en «Abriendo la sala…» sin mostrar el diálogo, y el portal
   Secret no respondía. La conexión a D-Bus de los portales vivía en un runtime que ya había
   terminado; ahora `ashpd` usa su propio ejecutor (`async-io`).

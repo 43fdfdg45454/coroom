@@ -200,7 +200,7 @@ pub fn scenes() -> Vec<Scene> {
 
 type Builder = fn(&mut App);
 
-const BUILDERS: [(&str, Builder); 24] = [
+const BUILDERS: [(&str, Builder); 26] = [
     ("01-servidores", servers),
     ("02-servidor-nuevo", new_server),
     ("03-entrar", sign_in),
@@ -210,6 +210,8 @@ const BUILDERS: [(&str, Builder); 24] = [
     ("07-amigos", friends),
     ("08-compartir", host_setup),
     ("08-compartir-app", host_setup_app),
+    ("08-compartir-wayland", host_setup_wayland),
+    ("08-compartir-app-wayland", host_setup_app_wayland),
     ("09-sala-abierta", host_room),
     ("10-dejar-de-compartir", host_stop_dialog),
     ("11-conectando", guest_connecting),
@@ -459,6 +461,51 @@ fn host_setup_app(app: &mut App) {
             ("juego.exe", "Juego"),
             ("firefox.exe", "Firefox"),
             ("discord.exe", "Discord"),
+        ])),
+    })));
+}
+
+/// Como en Wayland: sin lista de monitores; lo elegido en el selector del sistema.
+fn host_setup_wayland(app: &mut App) {
+    use super::screens::host::{ShareOptions, SourceChoice};
+    signed_in(app, Page::Host);
+    app.settings.audio.excluded_apps = vec![super::settings::RememberedApp {
+        key: "discord".to_owned(),
+        name: "Discord".to_owned(),
+    }];
+    app.update(Message::Event(Event::ShareOptions(ShareOptions {
+        source: SourceChoice::Screen,
+        targets: Vec::new(),
+        apps: Ok(playing(&[
+            ("juego", "Juego"),
+            ("firefox", "Firefox"),
+            ("discord", "Discord"),
+        ])),
+    })));
+    app.update(Message::Event(Event::SharePicked(
+        SourceChoice::Screen,
+        Ok(Some(coroom_session::capture::PickedShare {
+            target: coroom_session::capture::CaptureTarget::Monitor {
+                id: 0,
+                name: "2560 × 1440".to_owned(),
+            },
+            restore_token: None,
+        })),
+    )));
+}
+
+/// Como en Wayland, transmitiendo una app todavía sin elegir.
+fn host_setup_app_wayland(app: &mut App) {
+    use super::screens::host::{Msg, ShareOptions, SourceChoice};
+    signed_in(app, Page::Host);
+    app.update(Message::Host(Msg::Source(SourceChoice::App)));
+    app.update(Message::Event(Event::ShareOptions(ShareOptions {
+        source: SourceChoice::App,
+        targets: Vec::new(),
+        apps: Ok(playing(&[
+            ("juego", "Juego"),
+            ("firefox", "Firefox"),
+            ("discord", "Discord"),
         ])),
     })));
 }

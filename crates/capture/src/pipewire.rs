@@ -203,6 +203,8 @@ struct ScreenCastOpen {
     fd: OwnedFd,
     session: Session<Screencast>,
     area: SharedArea,
+    /// Tamaño lógico que dice el portal.
+    size: Option<(i32, i32)>,
 }
 
 /// Sesión `ScreenCast` sola: es la que muestra el selector de monitores y ventanas del escritorio.
@@ -243,6 +245,7 @@ async fn open_screencast(
     };
     let node_id = stream.pipe_wire_node_id();
     let area = shared_area(stream.source_type(), stream.position(), stream.size());
+    let size = stream.size();
     let restore_token = streams.restore_token().map(str::to_owned);
     let fd = proxy
         .open_pipe_wire_remote(&session, Default::default())
@@ -254,6 +257,7 @@ async fn open_screencast(
         fd,
         session,
         area,
+        size,
     })
 }
 
@@ -276,6 +280,62 @@ async fn screencast_with_timeout(
             DIALOG_TIMEOUT.as_secs()
         )))
     })
+}
+
+/// Abre el selector del portal para elegir qué compartir antes de abrir la sala y devuelve lo
+/// elegido con su token de restauración. La sesión se cierra enseguida: al empezar, la captura
+/// repite la elección con el token (el portal no vuelve a preguntar si puede restaurarla).
+pub fn pick(kind: crate::ShareKind) -> Result<crate::PickedShare, CaptureError> {
+    runtime()?.block_on(async {
+        let proxy = tokio::time::timeout(PORTAL_TIMEOUT, Screencast::new())
+            .await
+            .map_err(|_| {
+                backend(format!(
+                    "el portal ScreenCast no respondió en {} s",
+                    PORTAL_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(portal_error)?;
+        if proxy.version() < 4 {
+            return Err(CaptureError::Unsupported(
+                "el portal ScreenCast de este escritorio no recuerda la elección (versión 4 o \
+                 posterior): eliges al empezar a transmitir"
+                    .into(),
+            ));
+        }
+        let cursor_mode = tokio::time::timeout(PORTAL_TIMEOUT, proxy.available_cursor_modes())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .filter(|modes| modes.contains(CursorMode::Metadata))
+            .map_or(CursorMode::Hidden, |_| CursorMode::Metadata);
+        let screen = screencast_with_timeout(&proxy, cursor_mode, None, sources(kind)).await?;
+        let _ = screen.session.close().await;
+        Ok(crate::PickedShare {
+            target: picked_target(screen.area, screen.size),
+            restore_token: screen.restore_token,
+        })
+    })
+}
+
+/// Destino que se muestra para lo elegido en el portal (Wayland no da nombres: solo el tamaño).
+fn picked_target(area: SharedArea, size: Option<(i32, i32)>) -> CaptureTarget {
+    let size = size.map(|(w, h)| (w.max(0).unsigned_abs(), h.max(0).unsigned_abs()));
+    match (area, size) {
+        (SharedArea::Window { width, height }, _) => CaptureTarget::Window {
+            id: 0,
+            title: format!("{width} × {height}"),
+            app: None,
+        },
+        (_, Some((width, height))) => CaptureTarget::Monitor {
+            id: 0,
+            name: format!("{width} × {height}"),
+        },
+        (_, None) => CaptureTarget::Monitor {
+            id: 0,
+            name: String::new(),
+        },
+    }
 }
 
 /// Sesión `RemoteDesktop` solo de teclado y puntero, después de la de `ScreenCast`. Va aparte
@@ -1210,6 +1270,12 @@ impl PipeWireCapturer {
     /// ([`crate::ShareKind::App`]).
     pub fn with_kind(mut self, kind: crate::ShareKind) -> Self {
         self.kind = kind;
+        self
+    }
+
+    /// Repite la elección de [`pick`] con su token (sin token, el portal pregunta).
+    pub fn restoring(mut self, token: Option<String>) -> Self {
+        self.restore_token = token;
         self
     }
 

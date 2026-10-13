@@ -369,6 +369,15 @@ impl Backend {
             Effect::LoadShareOptions(source) => self.spawn("compartir", move |notify| {
                 notify(Message::Event(Event::ShareOptions(share_options(source))));
             }),
+            Effect::PickShare(source) => self.spawn("elegir", move |notify| {
+                let picked = match coroom_session::capture::pick_share(source.kind()) {
+                    Ok(picked) => Ok(picked),
+                    // Cerrar el selector no es un error: se queda como estaba.
+                    Err(coroom_session::capture::CaptureError::PermissionDenied) => Ok(None),
+                    Err(err) => Err(err.to_string()),
+                };
+                notify(Message::Event(Event::SharePicked(source, picked)));
+            }),
             Effect::LoadVideoSupport => {
                 let hdr_display = self.hdr_display;
                 self.spawn("video", move |notify| {

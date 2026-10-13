@@ -235,6 +235,11 @@ pub enum Event {
     VideoSupport(VideoSupport),
     /// Lo que se puede compartir.
     ShareOptions(host::ShareOptions),
+    /// Lo que se eligió en el selector del sistema (`Ok(None)`: nada, o lo canceló).
+    SharePicked(
+        host::SourceChoice,
+        Result<Option<coroom_session::capture::PickedShare>, String>,
+    ),
     /// Un efecto no pudo hacerse (aviso para el usuario).
     Failed(String),
 }
@@ -403,6 +408,8 @@ pub enum Effect {
     LoadVideoSupport,
     /// Mirar qué se puede compartir con esa fuente (monitores o ventanas y lo que suena).
     LoadShareOptions(host::SourceChoice),
+    /// Abrir el selector del sistema para elegir ya el monitor o la ventana.
+    PickShare(host::SourceChoice),
 }
 
 /// Toast.
@@ -957,6 +964,10 @@ impl App {
             Event::UpdateChecked { result, at } => self.update_checked(result, at),
             Event::ShareOptions(options) => {
                 host::on_share_options(self, options);
+                Vec::new()
+            }
+            Event::SharePicked(source, picked) => {
+                host::on_share_picked(self, source, picked);
                 Vec::new()
             }
             Event::VideoSupport(support) => {

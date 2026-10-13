@@ -1,11 +1,13 @@
 //! Pantalla 4: anfitrión.
 //!
-//! Paso 1, qué compartir: **Transmitir pantalla** (un monitor, con el audio de todas las
-//! aplicaciones salvo las que quites, que se recuerdan) o **Transmitir una app** (una ventana, con
-//! el audio solo de esa aplicación), o la fuente de prueba; y la voz. La lista de audio es la misma
-//! en todos los sistemas: las aplicaciones que suenan, refrescadas cada [`REFRESH`]. Donde el
-//! sistema elige el monitor o la ventana con su propio diálogo, la fila lo dice; donde no, se elige
-//! aquí. Paso 2, la sala abierta: el código grande con copiar, la vista previa de lo
+//! Antes de abrir, qué compartir (el boceto aprobado): dos tarjetas, **Transmitir pantalla** (un
+//! monitor, con el audio de todas las aplicaciones salvo las que quites, que se recuerdan) y
+//! **Transmitir una app** (una ventana, con el audio solo de esa aplicación), más la fuente de
+//! prueba como enlace; el monitor o la ventana elegidos con "Cambiar…"; la lista de audio, la voz y
+//! la calidad. La lista de audio es la misma en todos los sistemas: las aplicaciones que suenan,
+//! refrescadas cada [`REFRESH`]. Donde el sistema elige el monitor o la ventana con su propio
+//! selector (el portal en Wayland), "Elegir…" lo abre ya y la elección se repite al empezar con su
+//! token; donde no, se elige aquí de la lista. Después, la sala abierta: el código grande con copiar, la vista previa de lo
 //! que se comparte, los invitados con sus permisos como interruptores (teclado y ratón, mando con
 //! ranura, voz), sus estadísticas (ruta, RTT, bitrate, pérdida, latencia de entrada), pausar a
 //! todos, expulsar, invitar a amigos conectados y "Dejar de compartir".
@@ -15,7 +17,7 @@ use std::time::Duration;
 
 use coroom_session::audio::GameCapture;
 use coroom_session::audio::apps::{AppFilter, PlayingApp, normalize};
-use coroom_session::capture::{CaptureTarget, ShareChoice, ShareKind};
+use coroom_session::capture::{CaptureTarget, PickedShare, ShareChoice, ShareKind};
 use coroom_session::remote::{GuestStatus, SessionEvent, permissions_label};
 use coroom_session::{GuestId, Permissions};
 use coroom_ui::Element;
@@ -143,6 +145,10 @@ pub struct State {
     pub source: SourceChoice,
     /// Monitor o ventana elegido (si el sistema deja elegirlo aquí).
     pub target: Option<CaptureTarget>,
+    /// Lo elegido en el selector del sistema (Wayland), para la fuente actual.
+    pub picked: Option<PickedShare>,
+    /// Esperando al selector del sistema.
+    pub picking: bool,
     /// Lo que se puede compartir (`None`: aún no se ha mirado).
     pub options: Option<ShareOptions>,
     /// Mirando qué se puede compartir.
@@ -195,6 +201,14 @@ impl State {
             .filter(|options| options.source == self.source)
             .and_then(|options| options.apps.as_ref().ok())
             .map(Vec::as_slice)
+    }
+
+    /// Si el monitor o la ventana los elige el selector del sistema (no hay lista aquí).
+    fn system_picks(&self) -> bool {
+        self.options
+            .as_ref()
+            .filter(|options| options.source == self.source)
+            .is_some_and(|options| options.targets.is_empty())
     }
 
     /// Clave de la aplicación de la ventana elegida, si el sistema la dice.
@@ -306,6 +320,10 @@ pub enum Msg {
     AppAudio(String, String, bool),
     /// Voz.
     Voice(bool),
+    /// Abrir el selector del sistema para elegir el monitor o la ventana.
+    Pick,
+    /// Volver a Inicio sin abrir la sala.
+    Cancel,
     /// Abrir la sala.
     Start,
     /// Copiar el código.
@@ -359,6 +377,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             if app.host.source != source {
                 app.host.source = source;
                 app.host.target = None;
+                app.host.picked = None;
                 app.host.only_chosen = false;
                 app.host.only.clear();
                 app.host.auto_select();
@@ -389,6 +408,14 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
         }
         Msg::Voice(voice) => app.host.voice = voice,
+        Msg::Pick => {
+            if app.host.picking || app.host.is_open() {
+                return Vec::new();
+            }
+            app.host.picking = true;
+            return vec![Effect::PickShare(app.host.source)];
+        }
+        Msg::Cancel => return app.update(Message::Navigate(Page::Home)),
         Msg::Start => {
             if app.host.is_open() {
                 return Vec::new();
@@ -402,7 +429,17 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                     source: app.host.source,
                     share: ShareChoice {
                         kind: app.host.source.kind(),
-                        target: app.host.target.clone(),
+                        target: app
+                            .host
+                            .picked
+                            .as_ref()
+                            .map(|picked| picked.target.clone())
+                            .or_else(|| app.host.target.clone()),
+                        restore_token: app
+                            .host
+                            .picked
+                            .as_ref()
+                            .and_then(|picked| picked.restore_token.clone()),
                     },
                     audio,
                     voice: app.host.voice,
@@ -496,6 +533,30 @@ pub fn on_share_options(app: &mut App, options: ShareOptions) {
     };
     host.options = Some(options);
     host.auto_select();
+}
+
+/// Lo elegido en el selector del sistema.
+pub fn on_share_picked(
+    app: &mut App,
+    source: SourceChoice,
+    picked: Result<Option<PickedShare>, String>,
+) {
+    app.host.picking = false;
+    if source != app.host.source {
+        return;
+    }
+    match picked {
+        Ok(Some(picked)) => {
+            app.host.picked = Some(picked);
+            app.host.only_chosen = false;
+            app.host.auto_select();
+        }
+        Ok(None) => {}
+        Err(err) => app.toast(
+            Tone::Warning,
+            t!("pantalla-host-no-se-pudo-abrir-el-selector", error = err),
+        ),
+    }
 }
 
 /// Si dos destinos son el mismo monitor o ventana.
@@ -655,24 +716,34 @@ pub fn view(app: &App) -> Element<'_, Message> {
     }
 }
 
+/// Tarjeta de una de las dos fuentes, con su icono y el borde de acento si es la elegida.
 fn choice<'a>(
+    icon: Icon,
     title: &'a str,
     subtitle: &'a str,
     selected: bool,
     message: Message,
 ) -> Element<'a, Message> {
-    let mark = if selected {
-        icon_with(Icon::CircleCheck, 20.0, SvgClass::Accent)
+    let class = if selected {
+        SvgClass::Accent
     } else {
-        container(ui::gap(0.0))
-            .width(Length::Fixed(20.0))
-            .height(Length::Fixed(20.0))
-            .into()
+        SvgClass::Secondary
     };
-    button(ui::pref_row(title, Some(subtitle.to_owned()), mark))
-        .padding(0)
+    let content = row![
+        icon_with(icon, 28.0, class),
+        column![
+            ui::strong(title),
+            ui::secondary(subtitle).wrapping(Wrapping::WordOrGlyph)
+        ]
+        .spacing(space::XXS)
+        .width(Length::Fill),
+    ]
+    .spacing(space::S)
+    .align_y(Alignment::Start);
+    button(content)
+        .padding(space::M)
         .width(Length::Fill)
-        .class(ButtonClass::Flat)
+        .class(ButtonClass::Choice { selected })
         .on_press(message)
         .into()
 }
@@ -687,30 +758,47 @@ fn setup(app: &App) -> Element<'_, Message> {
         CodecChoice::Hevc => "HEVC",
         CodecChoice::H264 => "H.264",
     };
-    let source = ui::section(
-        t!("pantalla-host-que-compartir"),
-        None,
-        vec![
-            choice(
-                t!("pantalla-host-transmitir-pantalla"),
-                t!("pantalla-host-un-monitor-entero-con-el-audio"),
-                state.source == SourceChoice::Screen,
+    let cards = row![
+        choice(
+            Icon::Monitor,
+            t!("pantalla-host-transmitir-pantalla"),
+            t!("pantalla-host-un-monitor-entero-con-el-audio"),
+            state.source == SourceChoice::Screen,
+            on(Msg::Source(SourceChoice::Screen)),
+        ),
+        choice(
+            Icon::AppWindow,
+            t!("pantalla-host-transmitir-una-app"),
+            t!("pantalla-host-una-sola-ventana-con-el-audio"),
+            state.source == SourceChoice::App,
+            on(Msg::Source(SourceChoice::App)),
+        ),
+    ]
+    .spacing(space::S);
+    let test_source: Element<'_, Message> = if state.source == SourceChoice::Synthetic {
+        ui::banner(
+            Tone::Info,
+            t!("pantalla-host-se-transmitira-la-fuente-de-prueba"),
+            Some((
+                t!("pantalla-host-volver-a-la-pantalla"),
                 on(Msg::Source(SourceChoice::Screen)),
+            )),
+        )
+    } else {
+        row![
+            ui::button_with(
+                Kind::Link,
+                t!("pantalla-host-usar-la-fuente-de-prueba"),
+                None,
+                Some(on(Msg::Source(SourceChoice::Synthetic))),
             ),
-            choice(
-                t!("pantalla-host-transmitir-una-app"),
-                t!("pantalla-host-una-sola-ventana-con-el-audio"),
-                state.source == SourceChoice::App,
-                on(Msg::Source(SourceChoice::App)),
-            ),
-            choice(
-                t!("pantalla-host-fuente-de-prueba"),
-                t!("pantalla-host-un-patron-animado-sirve-para-probar"),
-                state.source == SourceChoice::Synthetic,
-                on(Msg::Source(SourceChoice::Synthetic)),
-            ),
-        ],
-    );
+            ui::caption(t!("pantalla-host-un-patron-animado-sirve-para-probar")),
+        ]
+        .spacing(space::XS)
+        .align_y(Alignment::Center)
+        .into()
+    };
+    let source = column![cards, test_source].spacing(space::XS);
     let target = target_section(state);
     let audio = audio_section(app);
     let voice = ui::section(
@@ -746,8 +834,8 @@ fn setup(app: &App) -> Element<'_, Message> {
     let mut page = Column::new()
         .spacing(space::L)
         .push(ui::page_header(
-            t!("pantalla-host-compartir-mi-pantalla"),
-            Some(t!("pantalla-host-paso-1-de-2-elige-que").to_owned()),
+            t!("pantalla-host-compartir"),
+            Some(t!("pantalla-host-elige-que-ven-y-oyen").to_owned()),
             vec![],
         ))
         .push(source);
@@ -762,7 +850,7 @@ fn setup(app: &App) -> Element<'_, Message> {
             Some((t!("pantalla-host-reintentar"), on(Msg::Start))),
         ));
     }
-    let action: Element<'_, Message> = if state.starting {
+    let actions: Element<'_, Message> = if state.starting {
         container(ui::progress(
             t!("pantalla-host-abriendo-la-sala-en-linux-elige"),
             None,
@@ -771,51 +859,49 @@ fn setup(app: &App) -> Element<'_, Message> {
         .width(Length::Fixed(420.0))
         .into()
     } else {
-        ui::button_with(
-            Kind::Primary,
-            t!("pantalla-host-abrir-la-sala"),
-            Some(Icon::ShareScreen),
-            Some(on(Msg::Start)),
-        )
+        row![
+            ui::button_with(
+                Kind::Normal,
+                t!("app-cancelar"),
+                None,
+                Some(on(Msg::Cancel)),
+            ),
+            ui::button_with(
+                Kind::Primary,
+                t!("pantalla-host-empezar-a-transmitir"),
+                None,
+                (!state.picking).then(|| on(Msg::Start)),
+            ),
+        ]
+        .spacing(space::S)
         .into()
     };
-    page = page.push(row![ui::fill(), action].align_y(Alignment::Center));
+    page = page.push(row![ui::fill(), actions].align_y(Alignment::Center));
     ui::page(page)
 }
 
-/// Monitor o ventana: el selector, o que lo elige el sistema al empezar.
+/// Monitor o ventana: lo elegido con "Cambiar…" (el selector del sistema) o la lista de aquí.
 fn target_section(state: &State) -> Option<Element<'_, Message>> {
-    let (title, label, empty) = match state.source {
-        SourceChoice::Screen => (
-            t!("pantalla-host-pantalla"),
-            t!("pantalla-host-monitor"),
-            t!("pantalla-host-eliges-la-pantalla-al-empezar"),
-        ),
-        SourceChoice::App => (
-            t!("pantalla-host-aplicacion"),
-            t!("pantalla-host-ventana"),
-            t!("pantalla-host-eliges-la-ventana-al-empezar"),
-        ),
+    let (title, label) = match state.source {
+        SourceChoice::Screen => (t!("pantalla-host-pantalla"), t!("pantalla-host-monitor")),
+        SourceChoice::App => (t!("pantalla-host-aplicacion"), t!("pantalla-host-ventana")),
         SourceChoice::Synthetic => return None,
     };
-    let targets: Vec<TargetOption> = state
-        .options
-        .as_ref()
-        .filter(|options| options.source == state.source)
-        .map(|options| options.targets.iter().cloned().map(TargetOption).collect())
-        .unwrap_or_default();
     let mut rows = Vec::new();
-    if targets.is_empty() {
+    if state.options.is_none() {
         rows.push(ui::pref_row(
-            if state.options.is_none() {
-                t!("pantalla-host-buscando")
-            } else {
-                empty
-            },
+            t!("pantalla-host-buscando"),
             None,
             ui::gap(0.0),
         ));
+    } else if state.system_picks() {
+        rows.push(picked_row(state));
     } else {
+        let targets: Vec<TargetOption> = state
+            .options
+            .iter()
+            .flat_map(|options| options.targets.iter().cloned().map(TargetOption))
+            .collect();
         let selected = state.target.clone().map(TargetOption);
         rows.push(ui::pref_row(
             label,
@@ -829,11 +915,93 @@ fn target_section(state: &State) -> Option<Element<'_, Message>> {
     Some(ui::section(title, None, rows))
 }
 
+/// Fila de lo elegido en el selector del sistema, con el botón que lo abre.
+fn picked_row(state: &State) -> Element<'_, Message> {
+    let app = state.source == SourceChoice::App;
+    let (text, subtitle) = match (&state.picked, state.picking) {
+        (_, true) => (
+            t!("pantalla-host-elige-en-el-selector-del-sistema").to_owned(),
+            None,
+        ),
+        (Some(picked), false) => (picked_label(&picked.target), None),
+        (None, false) => (
+            if app {
+                t!("pantalla-host-aun-no-has-elegido-ventana")
+            } else {
+                t!("pantalla-host-aun-no-has-elegido-monitor")
+            }
+            .to_owned(),
+            Some(t!("pantalla-host-si-no-eliges-ahora").to_owned()),
+        ),
+    };
+    let action = match (&state.picked, app) {
+        (None, _) => t!("pantalla-host-elegir"),
+        (Some(_), false) => t!("pantalla-host-cambiar-puntos"),
+        (Some(_), true) => t!("pantalla-host-elegir-otra"),
+    };
+    ui::pref_row(
+        text,
+        subtitle,
+        ui::button_with(
+            Kind::Normal,
+            action,
+            None,
+            (!state.picking).then(|| on(Msg::Pick)),
+        ),
+    )
+}
+
+/// Cómo se nombra lo elegido en el selector del sistema (Wayland solo da el tamaño).
+fn picked_label(target: &CaptureTarget) -> String {
+    match target {
+        CaptureTarget::Monitor { name, .. } if name.is_empty() => {
+            t!("pantalla-host-monitor").to_owned()
+        }
+        CaptureTarget::Monitor { name, .. } => {
+            t!("pantalla-host-monitor-de-size", size = name.as_str())
+        }
+        CaptureTarget::Window { title, .. } => {
+            t!("pantalla-host-ventana-de-size", size = title.as_str())
+        }
+    }
+}
+
 /// Texto secundario dentro de una sección.
 fn note(content: &str) -> Element<'_, Message> {
     container(ui::caption(content))
         .padding(Padding::from([4.0, 16.0]))
         .into()
+}
+
+/// Fila de la lista de audio: la casilla, el nombre y la nota a la derecha.
+fn audio_row<'a>(
+    name: String,
+    note_text: &'a str,
+    checked: Option<bool>,
+    toggle: Option<Message>,
+) -> Element<'a, Message> {
+    let mark: Element<'a, Message> = match checked {
+        Some(checked) => checkbox(checked)
+            .on_toggle_maybe(toggle.map(|message| move |_| message.clone()))
+            .size(18.0)
+            .into(),
+        None => icon_with(Icon::CircleCheck, 18.0, SvgClass::Accent),
+    };
+    let label: Element<'a, Message> = if checked == Some(false) {
+        ui::secondary(name).into()
+    } else {
+        ui::body(name).into()
+    };
+    row![
+        mark,
+        container(label).width(Length::Fill),
+        ui::caption(note_text)
+    ]
+    .spacing(space::S)
+    .align_y(Alignment::Center)
+    .padding(Padding::from([10.0, 16.0]))
+    .height(Length::Shrink)
+    .into()
 }
 
 /// Audio que se envía: las aplicaciones con su casilla.
@@ -880,22 +1048,24 @@ fn audio_section(app: &App) -> Element<'_, Message> {
                 checked,
                 note,
             } = row;
-            let label = name.clone();
-            rows.push(ui::pref_row(
-                label,
-                Some(note.to_owned()),
-                checkbox(checked)
-                    .on_toggle(move |on_off| on(Msg::AppAudio(key.clone(), name.clone(), on_off)))
-                    .size(18.0),
-            ));
+            let toggle = on(Msg::AppAudio(key, name.clone(), !checked));
+            rows.push(audio_row(name, note, Some(checked), Some(toggle)));
         }
     }
-    rows.push(note(t!("pantalla-host-coroom-nunca-se-envia-a-si")));
-    ui::section(
-        t!("pantalla-host-audio-que-se-envia"),
-        Some(subtitle.to_owned()),
-        rows,
-    )
+    let header = row![
+        ui::strong(t!("pantalla-host-audio-que-se-envia")),
+        ui::caption(subtitle).wrapping(Wrapping::WordOrGlyph),
+    ]
+    .spacing(space::XS)
+    .align_y(Alignment::End);
+    column![
+        header,
+        ui::boxed_list(rows),
+        container(ui::caption(t!("pantalla-host-coroom-nunca-se-envia-a-si")))
+            .padding(Padding::from([0.0, 4.0])),
+    ]
+    .spacing(space::XS)
+    .into()
 }
 
 fn code_card<'a>(room: &'a Room) -> Element<'a, Message> {
@@ -1339,6 +1509,7 @@ mod tests {
                 share: ShareChoice {
                     kind: ShareKind::App,
                     target: Some(game),
+                    restore_token: None,
                 },
                 audio: GameCapture::Apps(AppFilter::Only(vec![
                     "juego.exe".into(),
@@ -1387,6 +1558,75 @@ mod tests {
             apps: Err("no".into()),
         })));
         assert_eq!(app.host.game_capture(&[]), GameCapture::System);
+    }
+
+    #[test]
+    fn the_system_picker_choice_is_shown_and_reused_when_starting() {
+        let mut app = app();
+        app.update(Message::Navigate(Page::Host));
+        app.update(Message::Host(Msg::Source(SourceChoice::Screen)));
+        app.update(Message::Event(Event::ShareOptions(ShareOptions {
+            source: SourceChoice::Screen,
+            targets: Vec::new(),
+            apps: Ok(Vec::new()),
+        })));
+        assert!(app.host.system_picks());
+        assert_eq!(
+            app.update(Message::Host(Msg::Pick)),
+            [Effect::PickShare(SourceChoice::Screen)]
+        );
+        assert!(
+            app.update(Message::Host(Msg::Pick)).is_empty(),
+            "un solo selector a la vez"
+        );
+        let monitor = CaptureTarget::Monitor {
+            id: 0,
+            name: "2560 × 1440".to_owned(),
+        };
+        app.update(Message::Event(Event::SharePicked(
+            SourceChoice::Screen,
+            Ok(Some(PickedShare {
+                target: monitor.clone(),
+                restore_token: Some("token".to_owned()),
+            })),
+        )));
+        assert!(!app.host.picking);
+        assert_eq!(picked_label(&monitor), "Monitor · 2560 × 1440");
+        let effects = app.update(Message::Host(Msg::Start));
+        let Effect::StartHost(request) = &effects[1] else {
+            panic!("se esperaba abrir la sala: {effects:?}");
+        };
+        assert_eq!(request.share.target, Some(monitor));
+        assert_eq!(request.share.restore_token.as_deref(), Some("token"));
+    }
+
+    #[test]
+    fn changing_the_source_forgets_the_picked_target() {
+        let mut app = app();
+        app.update(Message::Navigate(Page::Host));
+        app.host.picked = Some(PickedShare {
+            target: CaptureTarget::Monitor {
+                id: 0,
+                name: String::new(),
+            },
+            restore_token: None,
+        });
+        app.update(Message::Host(Msg::Source(SourceChoice::App)));
+        assert_eq!(app.host.picked, None);
+        app.update(Message::Event(Event::SharePicked(
+            SourceChoice::Screen,
+            Ok(Some(PickedShare {
+                target: CaptureTarget::Monitor {
+                    id: 0,
+                    name: String::new(),
+                },
+                restore_token: None,
+            })),
+        )));
+        assert_eq!(
+            app.host.picked, None,
+            "una respuesta para otra fuente no vale"
+        );
     }
 
     #[test]
