@@ -730,9 +730,11 @@ name = "coroom-audio"
 version = "1.0.0"
 dependencies = [
  "bytemuck",
+ "libc",
  "opusic-c",
  "opusic-sys",
  "tracing",
+ "zbus",
 ]
 
 [[package]]

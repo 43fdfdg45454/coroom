@@ -134,6 +134,12 @@ jobs:
       - name: Formato
         run: cargo fmt --all --check
 
+      # Los locks del workspace y de fuzz/ (que se compila con --locked más abajo) y las fuentes del
+      # Flatpak, al día con las dependencias: falla aquí en segundos, no a mitad de la CI.
+      - name: Locks al día
+        if: runner.os == 'Linux'
+        run: tools/check-locks.sh
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 

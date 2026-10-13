@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# No sube nada con un lock viejo (tools/check-locks.sh). Se activa con:
+#   git config core.hooksPath .githooks
+exec "$(git rev-parse --show-toplevel)/tools/check-locks.sh"

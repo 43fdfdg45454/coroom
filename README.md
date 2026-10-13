@@ -565,7 +565,7 @@ Linux y Windows en cada push y pull request.
   `org.freedesktop.Platform` 26.08 con las extensiones `rust-stable` y `llvm22`; compila FFmpeg
   8.1.3 en LGPL (Vulkan, VA-API, NVENC/NVDEC, AMF, SVT-AV1 y dav1d del runtime) y coroom con cargo
   **sin red**. Las crates de crates.io van en `packaging/flatpak/cargo-sources.json`, que hay que
-  regenerar cada vez que cambia `Cargo.lock` (la CI de Flatpak lo comprueba):
+  regenerar cada vez que cambia `Cargo.lock` (`tools/check-locks.sh` lo comprueba, también en la CI):
 
   ```bash
   curl -LO https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py

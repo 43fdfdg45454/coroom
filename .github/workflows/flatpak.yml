@@ -45,26 +45,7 @@ jobs:
       # `Cargo.lock` y `cargo-sources.json` tienen que ir a la par: si alguien cambió las
       # dependencias sin regenerarlo (README, «Flatpak»), aquí se ve antes de construir.
       - name: Fuentes de cargo al día
-        run: |
-          python3 - <<'EOF'
-          import json, re, sys
-          lock = open("Cargo.lock", encoding="utf-8").read()
-          wanted = set()
-          for block in lock.split("[[package]]")[1:]:
-              if "source = \"registry+" not in block:
-                  continue
-              name = re.search(r'^name = "([^"]+)"', block, re.M).group(1)
-              version = re.search(r'^version = "([^"]+)"', block, re.M).group(1)
-              wanted.add(f"{name}-{version}")
-          sources = json.load(open("packaging/flatpak/cargo-sources.json", encoding="utf-8"))
-          have = {s["dest"].rsplit("/", 1)[-1] for s in sources if s.get("type") == "archive"}
-          missing, extra = sorted(wanted - have), sorted(have - wanted)
-          if missing or extra:
-              print("cargo-sources.json no corresponde a Cargo.lock; regenera con flatpak-cargo-generator.py")
-              print("faltan:", missing[:20], "sobran:", extra[:20])
-              sys.exit(1)
-          print(f"{len(have)} crates vendorizadas")
-          EOF
+        run: tools/check-locks.sh --flatpak-only
 
       - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:

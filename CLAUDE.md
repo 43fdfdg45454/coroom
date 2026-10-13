@@ -73,6 +73,8 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo deny check
+tools/check-locks.sh [--fix]               # Cargo.lock del workspace y de fuzz/, y cargo-sources.json del Flatpak
+git config core.hooksPath .githooks        # una vez por clon: el pre-push ejecuta tools/check-locks.sh
 cargo run -p coroom-server                 # HTTP/3 en UDP 4433 y HTTP/2 con TLS en TCP 8443 (desarrollo, autofirmado)
 cargo run -p coroom-server -- backup data/copia.db       # copia en línea de la base (también admin reset-password NOMBRE, migrate)
 cargo run -p coroom                        # la aplicación (COROOM_DATA_DIR=dir para un perfil aparte)
@@ -102,6 +104,11 @@ cd deploy && cp .env.sample .env && docker compose up -d
   sube cuando sale una stable nueva y pasa clippy.
 - Licencias: Apache-2.0 salvo `apps/server` (AGPL-3.0-or-later).
 - Commits en imperativo, descriptivos, sin identificadores de modelos de IA.
+- **Dependencias**: `fuzz/` es un workspace aparte con su propio `Cargo.lock`, que la CI compila con
+  `--locked`. Tras tocar dependencias de cualquier crate, `tools/check-locks.sh --fix` y commit de
+  los locks en el mismo commit. Lo vigilan el test `locks_are_up_to_date`, el `pre-push` de
+  `.githooks/`, el paso «Locks al día» de la CI y, en Claude Code, el gancho de
+  `.claude/settings.json` que bloquea `git push` con un lock viejo.
 - **Versionado con GitVersion** (`GitVersion.yml`): la CI calcula `X.Y.Z` en cada push a `main`,
   crea la etiqueta `vX.Y.Z` y publica la release con los paquetes. Para subir menor o mayor,
   `+semver: minor` / `+semver: major` en el mensaje de un commit. No editar la versión a mano
