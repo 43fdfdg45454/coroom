@@ -353,6 +353,36 @@ where
         .into()
 }
 
+/// Selector desplegable de ancho fijo, para opciones de texto largo (títulos de ventana): sin él,
+/// el desplegable toma el ancho de la opción más larga y aplasta el resto de la fila. Las opciones
+/// deberían venir ya recortadas ([`ellipsize`]) para caber.
+pub fn select_fixed<'a, T, M>(
+    options: impl std::borrow::Borrow<[T]> + 'a,
+    selected: Option<T>,
+    on_select: impl Fn(T) -> M + 'a,
+    width: f32,
+) -> Element<'a, M>
+where
+    T: ToString + PartialEq + Clone + 'a,
+    M: Clone + 'a,
+{
+    pick_list(options, selected, on_select)
+        .padding(Padding::from([8.0, 12.0]))
+        .text_size(type_size::BODY)
+        .font(UI)
+        .width(Length::Fixed(width))
+        .into()
+}
+
+/// `text` con como mucho `max` caracteres: si sobra, lo corta y termina en «…».
+pub fn ellipsize(text: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    if text.chars().count() <= max {
+        return text.into();
+    }
+    let kept: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", kept.trim_end()).into()
+}
+
 /// Selector segmentado: `(texto, mensaje, elegido)` por opción.
 pub fn segmented<'a, M: Clone + 'a>(options: Vec<(String, M, bool)>) -> Element<'a, M> {
     let buttons = options.into_iter().map(|(label, message, selected)| {
@@ -360,6 +390,7 @@ pub fn segmented<'a, M: Clone + 'a>(options: Vec<(String, M, bool)>) -> Element<
             text(label)
                 .size(type_size::BODY)
                 .font(SEMIBOLD)
+                .wrapping(Wrapping::None)
                 .align_x(Horizontal::Center),
         )
         .padding(Padding::from([6.0, 14.0]))
@@ -1006,5 +1037,15 @@ mod tests {
         assert_eq!(initials("bea"), "B");
         assert_eq!(initials("  "), "?");
         assert_eq!(initials("Carla de la Vega"), "CD");
+    }
+
+    #[test]
+    fn ellipsize_cuts_long_text_only() {
+        assert_eq!(ellipsize("Juego", 10), "Juego");
+        assert_eq!(
+            ellipsize("Fatal Fury: City of the Wolves", 12),
+            "Fatal Fury:…"
+        );
+        assert_eq!(ellipsize("ñandú ñandú", 6), "ñandú…");
     }
 }

@@ -99,7 +99,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CURSOR_SHOWING, CURSORINFO, EnumWindows, GW_OWNER, GWL_EXSTYLE, GetCursorInfo,
     GetForegroundWindow, GetIconInfo, GetWindow, GetWindowLongW, GetWindowRect,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HCURSOR, HICON, ICONINFO,
-    IsWindow, IsWindowVisible, MONITORINFOF_PRIMARY, WS_EX_TOOLWINDOW,
+    IsIconic, IsWindow, IsWindowVisible, MONITORINFOF_PRIMARY, WS_EX_TOOLWINDOW,
 };
 use windows::core::{BOOL, IInspectable, Interface, PWSTR, Ref};
 
@@ -492,6 +492,25 @@ fn has_content(
     false
 }
 
+/// Firma de una rejilla de 32 × 32 píxeles (FNV-1a): dos fotogramas con la misma firma se cuentan
+/// como repetidos ([`crate::SourceCounters::repeated`]). Basta para el registro: un cambio que no
+/// toque ningún punto de la rejilla pasa por repetido.
+fn signature(data: &[u8], width: u32, height: u32, stride: usize, bytes_per_pixel: usize) -> u64 {
+    const GRID: u32 = 32;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for gy in 0..GRID {
+        let y = (height.saturating_sub(1)) * gy / (GRID - 1);
+        for gx in 0..GRID {
+            let x = (width.saturating_sub(1)) * gx / (GRID - 1);
+            let at = y as usize * stride + x as usize * bytes_per_pixel;
+            for &byte in data.get(at..at + bytes_per_pixel).unwrap_or(&[]) {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+    }
+    hash
+}
+
 /// Lo que el callback cuenta para la heurística de pantalla completa.
 #[derive(Debug, Default)]
 struct Watch {
@@ -707,6 +726,8 @@ struct FrameCopier {
     hdr: bool,
     /// Qué refrescos del monitor se entregan para la cadencia pedida.
     pacer: FramePacer,
+    /// Firma del último fotograma copiado a CPU ([`signature`]).
+    last_signature: Option<u64>,
 }
 
 impl FrameCopier {
@@ -763,12 +784,14 @@ impl FrameCopier {
         let frame = pool
             .TryGetNextFrame()
             .map_err(|err| backend("TryGetNextFrame", err))?;
+        crate::counters::record_arrived();
         // Sin marca de tiempo (no debería pasar) se entregan todos: el codificador toma el último.
         if let Ok(time) = frame.SystemRelativeTime()
             && !self.pacer.accept(Duration::from_nanos(
                 u64::try_from(time.Duration).unwrap_or(0) * 100,
             ))
         {
+            crate::counters::record_paced_out();
             let _ = frame.Close();
             return Ok(());
         }
@@ -869,6 +892,12 @@ impl FrameCopier {
                 watch.content = true;
             }
         }
+        // WGC entrega un fotograma también cuando solo se mueve el cursor: si la ventana no se
+        // redibuja, todos salen iguales y el registro lo cuenta.
+        let signature = signature(&data, width, height, row, bytes_per_pixel as usize);
+        if self.last_signature.replace(signature) == Some(signature) {
+            crate::counters::record_repeated();
+        }
         let frame_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.mailbox.put(CapturedFrame {
             frame_id,
@@ -964,6 +993,16 @@ impl WgcCapturer {
                     CaptureError::TargetLost
                 }
             })?;
+        // Para el registro: qué ventana, de qué tamaño y si está minimizada (una ventana
+        // minimizada no se redibuja y WGC repite su última imagen).
+        // SAFETY: `IsIconic` admite cualquier ventana; la de arriba existía.
+        let minimized = unsafe { IsIconic(window) }.as_bool();
+        tracing::info!(
+            window = %item.DisplayName().unwrap_or_default(),
+            size = ?item.Size().map(|size| (size.Width, size.Height)).ok(),
+            minimized,
+            "WGC: captura de ventana"
+        );
         self.begin(item, Source::Window(id), Some(id), true)
     }
 
@@ -1013,6 +1052,7 @@ impl WgcCapturer {
             device,
             context,
             staging: None,
+            last_signature: None,
             next_id: Arc::clone(&self.next_id),
             source,
             mailbox: Arc::clone(&mailbox),
@@ -1122,9 +1162,9 @@ impl WgcCapturer {
         if !window_area.covers(&monitor_area) {
             return Ok(());
         }
-        eprintln!(
-            "AVISO: la ventana capturada no da imagen en {} s y ocupa su monitor (¿pantalla \
-             completa exclusiva?): se pasa a capturar el monitor",
+        tracing::warn!(
+            "la ventana capturada no da imagen en {} s y ocupa su monitor (¿pantalla completa \
+             exclusiva?): se pasa a capturar el monitor",
             FULLSCREEN_GRACE.as_secs()
         );
         self.stop();

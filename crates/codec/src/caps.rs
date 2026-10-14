@@ -88,6 +88,9 @@ pub struct Capabilities {
     /// Codificadores y decodificadores que abren pero fallaron la comprobación de imagen (su
     /// imagen no coincide con la original), con el motivo: `«codificar AV1 con Vulkan Video: …»`.
     pub rejected: Vec<String>,
+    /// Codificadores por hardware que FFmpeg trae pero que no abren en esta máquina, con el
+    /// motivo (lo normal si falta esa GPU o su driver): `«codificar HEVC con NVENC: …»`.
+    pub unavailable: Vec<String>,
 }
 
 static PROBED: OnceLock<Capabilities> = OnceLock::new();
@@ -121,6 +124,7 @@ impl Capabilities {
             caps.encoders.extend(probed.encoders);
             caps.decoders.extend(probed.decoders);
             caps.rejected = probed.rejected;
+            caps.unavailable = probed.unavailable;
             caps.ffmpeg_version = Some(crate::ffmpeg::version());
             caps.ffmpeg_dir = Some(crate::ffmpeg::library_dir().to_owned());
         }
@@ -137,6 +141,7 @@ impl Capabilities {
             ffmpeg_version: None,
             ffmpeg_dir: None,
             rejected: Vec::new(),
+            unavailable: Vec::new(),
         }
     }
 
@@ -153,6 +158,7 @@ impl Capabilities {
             ffmpeg_version: None,
             ffmpeg_dir: None,
             rejected: Vec::new(),
+            unavailable: Vec::new(),
         }
     }
 
@@ -200,6 +206,12 @@ impl fmt::Display for Capabilities {
                     .collect(),
             );
             writeln!(f, "{:<6} {encoders:<12} {decoders}", codec.to_string())?;
+        }
+        if !self.unavailable.is_empty() {
+            writeln!(f, "Por hardware que no abren en este equipo:")?;
+            for line in &self.unavailable {
+                writeln!(f, "  {line}")?;
+            }
         }
         if !self.rejected.is_empty() {
             writeln!(

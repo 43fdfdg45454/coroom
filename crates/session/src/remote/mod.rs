@@ -134,6 +134,24 @@ pub const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 /// Espera antes del primer reintento; se duplica en cada uno ([`reconnect_delay`]).
 pub const RECONNECT_BASE_DELAY: Duration = Duration::from_millis(500);
 
+/// Bitrate máximo «sin límite» (kbit/s): el control de tasa sube mientras el camino no haga cola,
+/// hasta llenar el enlace. Es un techo técnico, no uno que se espere alcanzar: un codificador
+/// por hardware a 4K60 casi sin pérdidas se queda por debajo.
+pub const UNLIMITED_KBPS: u32 = 500_000;
+
+/// Bitrate con el que arranca el control de tasa para un máximo `max_kbps`: la mitad, sin pasar de
+/// 40 Mbit/s (sube un 5 % cada 100 ms sin cola, así que el máximo de siempre llega en ~1,5 s y
+/// «sin límite» no empieza llenando el enlace con el primer intra, el más grande).
+pub fn start_kbps(max_kbps: u32) -> u32 {
+    (max_kbps / 2).clamp(1, 40_000)
+}
+
+/// Bitrate mínimo del control de tasa para un máximo `max_kbps`: una décima parte, entre 0,1 y
+/// 8 Mbit/s.
+pub fn min_kbps(max_kbps: u32) -> u32 {
+    (max_kbps / 10).clamp(100, 8_000).min(max_kbps.max(1))
+}
+
 /// Espera antes del reintento `attempt` (desde 1): 0,5 s, 1 s, 2 s, 4 s y 8 s.
 pub fn reconnect_delay(attempt: u32) -> Duration {
     RECONNECT_BASE_DELAY * 2u32.saturating_pow(attempt.saturating_sub(1).min(10))
@@ -1508,6 +1526,17 @@ mod tests {
     use super::*;
     use crate::loopback::NullSink;
     use coroom_capture::synthetic::SyntheticCapturer;
+
+    #[test]
+    fn rate_limits_keep_the_usual_maxima_and_tame_unlimited() {
+        // Los máximos de siempre: arranque en la mitad y mínimo en la décima parte.
+        assert_eq!((start_kbps(10_000), min_kbps(10_000)), (5_000, 1_000));
+        assert_eq!((start_kbps(80_000), min_kbps(80_000)), (40_000, 8_000));
+        assert_eq!((start_kbps(500), min_kbps(500)), (250, 100));
+        // Sin límite no arranca en 250 Mbit/s ni se queda con un mínimo de 50.
+        assert_eq!(start_kbps(UNLIMITED_KBPS), 40_000);
+        assert_eq!(min_kbps(UNLIMITED_KBPS), 8_000);
+    }
 
     fn config() -> RemoteConfig {
         RemoteConfig::new(

@@ -381,7 +381,7 @@ pub(crate) fn start(
         .map_err(|err| media(&PipelineError::Capture(err)))?;
 
     let links = Arc::new(std::sync::Mutex::new(Links::default()));
-    let encode = Arc::new(EncodeControl::new(video.bitrate_kbps));
+    let encode = Arc::new(EncodeControl::new(super::start_kbps(video.bitrate_kbps)));
     let gate = Arc::new(KeyframeGate::default());
     let (input, inject_thread) = HostInput::start(core, sink)?;
     *lock(&core.host_input) = Some(Arc::clone(&input));
@@ -896,12 +896,11 @@ impl HostCtx {
         MediaSenderConfig {
             frame_interval: Duration::from_secs_f64(1.0 / f64::from(self.video.fps.max(1))),
             rate: RateConfig {
-                min_kbps: (max / 10).max(100).min(max),
+                min_kbps: super::min_kbps(max),
                 max_kbps: max,
-                // Se arranca en la mitad y el control de tasa sube un 5 % cada 100 ms sin cola (el
-                // máximo en ~1,5 s): arrancar en el máximo llenaba la cola de un enlace más lento
-                // con el primer intra, el más grande.
-                start_kbps: (max / 2).max(1),
+                // Arrancar en el máximo llenaba la cola de un enlace más lento con el primer intra,
+                // el más grande ([`super::start_kbps`]).
+                start_kbps: super::start_kbps(max),
             },
         }
     }
@@ -2096,7 +2095,7 @@ async fn run_host(
         config.bind,
         EndpointOptions {
             congestion: Congestion::Media,
-            initial_target_kbps: video.bitrate_kbps,
+            initial_target_kbps: super::start_kbps(video.bitrate_kbps),
         },
     )
     .map_err(network("no se pudo abrir el socket UDP"))?;

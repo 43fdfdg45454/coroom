@@ -166,6 +166,7 @@ pub(crate) struct StatsWindow {
     drops: [u64; Stage::ALL.len()],
     link: LinkCounters,
     audio: [AudioCounters; 2],
+    source: coroom_capture::SourceCounters,
 }
 
 impl StatsWindow {
@@ -176,6 +177,7 @@ impl StatsWindow {
             drops: drops(ledger),
             link: LinkCounters::default(),
             audio: AudioTrack::ALL.map(|track| ledger.audio_counters(track)),
+            source: coroom_capture::source_counters(),
         }
     }
 
@@ -255,7 +257,8 @@ impl StatsWindow {
         (seconds, delta, dropped)
     }
 
-    /// Línea del anfitrión: `captura/codifica/envía` en fps, tiempos de codificación, objetivo y
+    /// Línea del anfitrión: `captura/codifica/envía` en fps (y lo que dio la fuente antes de la
+    /// cadencia, [`coroom_capture::SourceCounters`]), tiempos de codificación, objetivo y
     /// bitrate real, intra forzados y peticiones agrupadas, cambios de bitrate y descartes.
     pub(crate) fn host_line(
         &mut self,
@@ -266,12 +269,19 @@ impl StatsWindow {
         let (seconds, d, dropped) = self.advance(counters, ledger);
         let (p50, p95) = take_percentiles(&counters.encode_us);
         let fps = |n: u64| n as f64 / seconds;
+        let now = coroom_capture::source_counters();
+        let source = now.since(std::mem::replace(&mut self.source, now));
         format!(
-            "anfitrión: captura {:.1} fps, codifica {:.1} fps ({p50:.1}/{p95:.1} ms p50/p95), \
+            "anfitrión: captura {:.1} fps (la fuente da {:.1}: fuera de cadencia {:.1}, solo \
+             cursor {:.1}, repetidos {:.1}), codifica {:.1} fps ({p50:.1}/{p95:.1} ms p50/p95), \
              envía {:.1} fps, objetivo {target_kbps} kbit/s, real {:.0} kbit/s, intra forzados {} \
              (agrupados {}), cambios de bitrate {}, sin enviar por enlace atascado {}, descartes \
              {dropped}",
             fps(d[0]),
+            fps(source.arrived),
+            fps(source.paced_out),
+            fps(source.empty),
+            fps(source.repeated),
             fps(d[1]),
             fps(d[3]),
             d[2] as f64 * 8.0 / 1000.0 / seconds,
@@ -361,6 +371,7 @@ mod tests {
         assert!(line.contains("intra forzados 1"), "{line}");
         assert!(line.contains("descartes envío=1"), "{line}");
         assert!(line.contains("objetivo 8000 kbit/s"), "{line}");
+        assert!(line.contains("(la fuente da "), "{line}");
         // La siguiente solo cuenta lo nuevo.
         let line = window.host_line(&counters, &ledger, 8_000);
         assert!(line.contains("intra forzados 0"), "{line}");

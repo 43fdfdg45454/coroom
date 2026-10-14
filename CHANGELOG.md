@@ -9,6 +9,17 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Añadido
 
+- **Bitrate máximo «Sin límite»** (Ajustes → Vídeo y el panel «Transmisión» de la sala), además
+  de 150 Mbit/s: el control de tasa sube mientras el camino no haga cola, hasta llenar el enlace
+  (techo técnico de 500 Mbit/s). Arranca en 40 Mbit/s como mucho, para no llenar un enlace lento
+  con el primer intra, y si el codificador no acepta un bitrate tan alto, sigue con el que tenía
+  en vez de cortar la sesión.
+- **Más diagnóstico en el registro**: la línea de estadísticas del anfitrión dice cuántos
+  fotogramas dio la fuente antes de la cadencia y cuántos sobraban, llegaron solo con el cursor o
+  repetían la imagen anterior (`captura 30.0 fps (la fuente da 60.0: …)`); en Windows se anota
+  qué ventana se captura, su tamaño y si está minimizada; y el sondeo dice por qué no abre cada
+  codificador por hardware que trae FFmpeg (también en `coroom doctor`, «Por hardware que no
+  abren en este equipo»).
 - **Cada uno decide a quién oye** (protocolo 9: hay que actualizar también el servidor). El
   anfitrión manda a los invitados quién está en la sala, con su nombre; el invitado los ve en el
   panel «Personas en la sala» de la barra y silencia o vuelve a oír a cada uno con el icono de
@@ -63,6 +74,14 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **Anfitrión Linux a 120 fps daba unos 30**, a ratos ninguno: con el ratón en movimiento,
+  PipeWire manda búferes solo con el cursor, y la cadencia pedida los contaba como fotogramas. El
+  hueco lo ocupaba uno de esos y el fotograma del juego que llegaba detrás se descartaba; si solo
+  se movía el cursor, no pasaba ninguno. Ahora la cadencia solo cuenta los búferes con imagen.
+- **Panel «Transmisión» en Windows**: con un título de ventana largo, el desplegable se quedaba
+  con todo el ancho de la fila y el texto de al lado salía con una letra por línea. La ventana (o
+  el monitor) va ahora en su propia fila, con un desplegable de ancho fijo y los títulos largos
+  recortados con «…»; lo mismo en la pantalla de compartir.
 - **Cortes de 100-350 ms con pérdida de paquetes**: cuando se perdía un paquete del vídeo, el
   aviso del invitado para pedirlo (`Nack`) y la petición de intra iban solo por el stream de
   control de QUIC; si ese aviso también se perdía, QUIC no lo reenviaba hasta su temporizador

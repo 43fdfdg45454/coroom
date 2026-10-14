@@ -388,8 +388,18 @@ pub struct Settings {
 /// Valores admitidos de fps.
 pub const FPS_CHOICES: [u32; 3] = [30, 60, 120];
 
-/// Bitrates máximos que se ofrecen (kbit/s).
-pub const BITRATE_CHOICES: [u32; 6] = [5_000, 10_000, 20_000, 30_000, 50_000, 80_000];
+/// Bitrates máximos que se ofrecen (kbit/s). El último es «sin límite»
+/// ([`coroom_session::remote::UNLIMITED_KBPS`]).
+pub const BITRATE_CHOICES: [u32; 8] = [
+    5_000,
+    10_000,
+    20_000,
+    30_000,
+    50_000,
+    80_000,
+    150_000,
+    coroom_session::remote::UNLIMITED_KBPS,
+];
 
 impl Settings {
     /// Corrige valores fuera de rango (por ejemplo, de una edición a mano).
@@ -397,7 +407,10 @@ impl Settings {
         if !FPS_CHOICES.contains(&self.video.fps) {
             self.video.fps = Video::default().fps;
         }
-        self.video.max_bitrate_kbps = self.video.max_bitrate_kbps.clamp(500, 500_000);
+        self.video.max_bitrate_kbps = self
+            .video
+            .max_bitrate_kbps
+            .clamp(500, coroom_session::remote::UNLIMITED_KBPS);
         if !self.input.shortcuts.is_valid() {
             self.input.shortcuts = Shortcuts::default();
         }

@@ -263,8 +263,29 @@ pub fn codec_choices() -> Vec<Choice<CodecChoice>> {
 pub fn bitrate_choices() -> Vec<Choice<u32>> {
     BITRATE_CHOICES
         .iter()
-        .map(|kbps| choice(*kbps, stats::kbps(f64::from(*kbps))))
+        .map(|kbps| choice(*kbps, bitrate_label(*kbps)))
         .collect()
+}
+
+/// Un bitrate máximo dentro de una frase: «80 Mbit/s», «sin límite» o, con `of_bitrate`, «sin
+/// límite de bitrate» (donde no se dice antes que es el bitrate).
+pub fn bitrate_phrase(kbps: u32, of_bitrate: bool) -> String {
+    if kbps < coroom_session::remote::UNLIMITED_KBPS {
+        stats::kbps(f64::from(kbps))
+    } else if of_bitrate {
+        t!("pantalla-settings-sin-limite-de-bitrate").to_owned()
+    } else {
+        t!("pantalla-settings-sin-limite-frase").to_owned()
+    }
+}
+
+/// Cómo se nombra un bitrate máximo en el selector: «80 Mbit/s» o «Sin límite».
+pub fn bitrate_label(kbps: u32) -> String {
+    if kbps >= coroom_session::remote::UNLIMITED_KBPS {
+        t!("pantalla-settings-sin-limite").to_owned()
+    } else {
+        stats::kbps(f64::from(kbps))
+    }
 }
 
 /// Reduce un mensaje.
@@ -587,7 +608,14 @@ fn video(app: &App) -> Element<'_, Message> {
                 ),
                 ui::pref_row(
                     t!("pantalla-settings-bitrate-maximo"),
-                    Some(t!("pantalla-settings-el-control-de-tasa-lo-baja").to_owned()),
+                    Some(
+                        if video.max_bitrate_kbps >= coroom_session::remote::UNLIMITED_KBPS {
+                            t!("pantalla-settings-sin-limite-ayuda")
+                        } else {
+                            t!("pantalla-settings-el-control-de-tasa-lo-baja")
+                        }
+                        .to_owned()
+                    ),
                     ui::select(bitrates, bitrate, |c| on(Msg::Bitrate(c))),
                 ),
                 ui::pref_row(t!("pantalla-settings-fotogramas-por-segundo"), None, fps),
@@ -1447,6 +1475,20 @@ fn diagnostics(app: &App) -> Element<'_, Message> {
 mod tests {
     use super::*;
     use crate::ui::app::tests::app;
+
+    #[test]
+    fn unlimited_bitrate_is_named_as_such() {
+        let unlimited = coroom_session::remote::UNLIMITED_KBPS;
+        assert_eq!(bitrate_label(unlimited), "Sin límite");
+        assert_eq!(bitrate_phrase(unlimited, false), "sin límite");
+        assert_eq!(bitrate_phrase(unlimited, true), "sin límite de bitrate");
+        assert_eq!(bitrate_label(80_000), stats::kbps(80_000.0));
+        assert_eq!(
+            bitrate_choices().last().map(|c| c.value),
+            Some(unlimited),
+            "«Sin límite» es la última opción"
+        );
+    }
 
     /// Ajustes explica si 4:4:4 y HDR están disponibles con el códec elegido.
     #[test]

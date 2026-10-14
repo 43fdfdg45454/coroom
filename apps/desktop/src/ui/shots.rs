@@ -614,9 +614,10 @@ fn host_room_switch(app: &mut App) {
     use super::screens::host::{Msg, ShareOptions, SourceChoice, TargetOption};
     host_room(app);
     app.update(Message::Host(Msg::Source(SourceChoice::App)));
+    // Un título largo, como los de Windows: no debe aplastar el selector Pantalla/Aplicación.
     let game = coroom_session::capture::CaptureTarget::Window {
         id: 7,
-        title: "Juego".to_owned(),
+        title: "Fatal Fury: City of the Wolves — Edición especial (DirectX 12)".to_owned(),
         app: Some("juego.exe".to_owned()),
     };
     app.update(Message::Event(Event::ShareOptions(ShareOptions {

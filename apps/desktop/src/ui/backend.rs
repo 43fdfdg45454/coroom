@@ -112,7 +112,11 @@ pub fn video_support(hdr_display: Option<bool>) -> VideoSupport {
     // el sondeo se hace una vez).
     static LOGGED: std::sync::Once = std::sync::Once::new();
     LOGGED.call_once(|| {
-        for line in &coroom_session::codec::Capabilities::probe().rejected {
+        let caps = coroom_session::codec::Capabilities::probe();
+        for line in &caps.unavailable {
+            tracing::info!("no disponible: {line}");
+        }
+        for line in &caps.rejected {
             tracing::warn!("descartado por la comprobación de imagen: {line}");
         }
     });

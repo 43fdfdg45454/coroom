@@ -171,13 +171,32 @@ fn encode_some(encoder: &mut dyn Encoder, side: u32, frames: u64) -> Vec<Vec<Enc
 
 /// Resultado del sondeo de un codificador.
 enum EncoderProbe {
-    /// No está en esta build o no abre (lo normal sin esa GPU: no se dice nada).
+    /// No está en esta build (no se dice nada).
     Missing,
+    /// Está en la build pero no abre o no codifica aquí (lo normal sin esa GPU): por qué.
+    Unavailable(String),
     /// Abre, pero su imagen no se decodifica bien: por qué.
     Rejected(String),
     /// Funciona; con hardware, los primeros fotogramas de la comprobación (muestra para los
     /// decodificadores).
     Works(Vec<Vec<EncodedSlice>>),
+}
+
+/// Abre el codificador con la configuración del sondeo y codifica hasta que sale un paquete.
+fn open_and_encode(codec: Codec, backend: Backend) -> Result<(), String> {
+    // Primero el dispositivo por separado, para tener el motivo de FFmpeg si falla (sin CUDA, una
+    // GPU sin el bloque de codificación…).
+    if let Some(device) = super::encoder_device(backend) {
+        super::create_device(device)?;
+    }
+    let mut encoder = FfmpegEncoder::new(codec, backend).map_err(|err| err.to_string())?;
+    encoder
+        .configure(&probe_config(codec, ENCODE_SIDE))
+        .map_err(|err| format!("no abre: {err}"))?;
+    if encode_some(&mut encoder, ENCODE_SIDE, 1).is_empty() {
+        return Err("abre, pero no saca ningún fotograma".to_owned());
+    }
+    Ok(())
 }
 
 fn probe_encoder(codec: Codec, backend: Backend) -> EncoderProbe {
@@ -187,14 +206,18 @@ fn probe_encoder(codec: Codec, backend: Backend) -> EncoderProbe {
     if !compiled {
         return EncoderProbe::Missing;
     }
-    let opens = with_timeout(&format!("{}-{}", codec.id(), backend.id()), move || {
-        let mut encoder = FfmpegEncoder::new(codec, backend).ok()?;
-        encoder.configure(&probe_config(codec, ENCODE_SIDE)).ok()?;
-        (!encode_some(&mut encoder, ENCODE_SIDE, 1).is_empty()).then_some(())
-    })
-    .is_some();
-    if !opens {
-        return EncoderProbe::Missing;
+    let opened = with_timeout(&format!("{}-{}", codec.id(), backend.id()), move || {
+        Some(open_and_encode(codec, backend))
+    });
+    match opened {
+        Some(Ok(())) => {}
+        Some(Err(reason)) => return EncoderProbe::Unavailable(reason),
+        None => {
+            return EncoderProbe::Unavailable(format!(
+                "no respondió en {} s",
+                PROBE_TIMEOUT.as_secs()
+            ));
+        }
     }
     if !backend.is_hardware() {
         return EncoderProbe::Works(Vec::new());
@@ -413,6 +436,8 @@ pub(crate) struct Probed {
     pub(crate) decoders: Vec<(Codec, DecoderBackend)>,
     /// Los que abren pero fallaron la comprobación de imagen: `«AV1/Vulkan Video: por qué»`.
     pub(crate) rejected: Vec<String>,
+    /// Codificadores por hardware de la build que no abren aquí, con el motivo.
+    pub(crate) unavailable: Vec<String>,
 }
 
 /// Codificadores y decodificadores de FFmpeg que funcionan aquí, en orden de preferencia.
@@ -426,6 +451,14 @@ pub(crate) fn probe() -> Probed {
         for backend in platform_encoders() {
             match probe_encoder(codec, backend) {
                 EncoderProbe::Missing => {}
+                // El software siempre está; uno que falle es raro y ya lo dirá al usarlo.
+                EncoderProbe::Unavailable(reason) if backend.is_hardware() => {
+                    probed.unavailable.push(format!(
+                        "codificar {codec} con {}: {reason}",
+                        crate::encoder_label(codec, backend)
+                    ));
+                }
+                EncoderProbe::Unavailable(_) => {}
                 EncoderProbe::Rejected(reason) => probed.rejected.push(format!(
                     "codificar {codec} con {}: {reason}",
                     crate::encoder_label(codec, backend)

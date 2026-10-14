@@ -28,7 +28,7 @@ use coroom_ui::tokens::{size, space, text as type_size};
 use coroom_ui::widget::{self as ui, Kind};
 use iced_core::text::Wrapping;
 use iced_core::{Alignment, Length, Padding};
-use iced_widget::{Column, button, checkbox, column, container, row};
+use iced_widget::{Column, Row, button, checkbox, column, container, row};
 
 use crate::ui::app::{App, Dialog, Effect, Event, HostRequest, Load, Message, Page};
 use crate::ui::screens::settings as settings_screen;
@@ -72,12 +72,20 @@ impl SourceChoice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetOption(pub CaptureTarget);
 
+/// Caracteres de un monitor o una ventana en su desplegable ([`TARGET_SELECT_WIDTH`]): los títulos
+/// de ventana de Windows son largos.
+const TARGET_LABEL_CHARS: usize = 40;
+
+/// Ancho del desplegable de monitores o ventanas.
+const TARGET_SELECT_WIDTH: f32 = 360.0;
+
 impl std::fmt::Display for TargetOption {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.0 {
-            CaptureTarget::Monitor { name, .. } => f.write_str(name),
-            CaptureTarget::Window { title, .. } => f.write_str(title),
-        }
+        let label = match &self.0 {
+            CaptureTarget::Monitor { name, .. } => name,
+            CaptureTarget::Window { title, .. } => title,
+        };
+        f.write_str(&ui::ellipsize(label, TARGET_LABEL_CHARS))
     }
 }
 
@@ -798,7 +806,7 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                         Tone::Info,
                         t!(
                             "pantalla-host-video-de-la-sala-cambiado",
-                            valor = stats::kbps(f64::from(kbps))
+                            valor = settings_screen::bitrate_phrase(kbps, false)
                         ),
                     ),
                     Err(err) => app.toast(
@@ -1031,7 +1039,7 @@ fn setup(app: &App) -> Element<'_, Message> {
                 width = width,
                 height = height,
                 fps = video.fps,
-                valor = stats::kbps(f64::from(video.max_bitrate_kbps)),
+                valor = settings_screen::bitrate_phrase(video.max_bitrate_kbps, true),
                 codec = codec
             )),
             ui::button_with(
@@ -1130,7 +1138,12 @@ fn target_section(state: &State) -> Option<Element<'_, Message>> {
         rows.push(ui::pref_row(
             label,
             None,
-            ui::select(targets, selected, |target| on(Msg::Target(target))),
+            ui::select_fixed(
+                targets,
+                selected,
+                |target| on(Msg::Target(target)),
+                TARGET_SELECT_WIDTH,
+            ),
         ));
     }
     if state.source == SourceChoice::App {
@@ -1631,6 +1644,22 @@ fn transmission<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
     ]);
     let options = state.current_options();
     let busy = state.picking || state.switching.is_some();
+    let now = state.shared.as_ref().map(sharing_label).unwrap_or_default();
+    let subtitle = match &state.switching {
+        Some(switching) => t!(
+            "pantalla-host-cambiando-a",
+            que = sharing_label(switching).as_str()
+        ),
+        None if state.source_changed() => t!("pantalla-host-ahora-cambiar", que = now.as_str()),
+        None => t!("pantalla-host-ahora", que = now.as_str()),
+    };
+    rows.push(ui::pref_row(
+        t!("pantalla-host-que-compartes"),
+        Some(subtitle),
+        kinds,
+    ));
+    // El monitor o la ventana, en su fila: con el título de una ventana de Windows al lado del
+    // selector de arriba, el desplegable se quedaba con todo el ancho (una letra por línea).
     let target: Option<Element<'a, Message>> = match state.source {
         SourceChoice::Synthetic => None,
         _ if state.system_picks() => Some(
@@ -1647,37 +1676,36 @@ fn transmission<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
             .map(|options| {
                 let targets: Vec<TargetOption> =
                     options.targets.iter().cloned().map(TargetOption).collect();
-                ui::select(targets, state.target.clone().map(TargetOption), |target| {
-                    on(Msg::Target(target))
-                })
+                ui::select_fixed(
+                    targets,
+                    state.target.clone().map(TargetOption),
+                    |target| on(Msg::Target(target)),
+                    TARGET_SELECT_WIDTH,
+                )
             }),
     };
-    let mut control = row![kinds].spacing(space::S).align_y(Alignment::Center);
-    if let Some(target) = target {
-        control = control.push(target);
-    }
-    if state.switching.is_none() && state.source_changed() {
-        control = control.push(ui::button_with(
+    let apply = (state.switching.is_none() && state.source_changed()).then(|| {
+        ui::button_with(
             Kind::Primary,
             t!("pantalla-host-compartir-esto"),
             None,
             (!busy).then(|| on(Msg::ApplySource)),
-        ));
+        )
+    });
+    if target.is_some() || apply.is_some() {
+        let mut control = Row::new().spacing(space::S).align_y(Alignment::Center);
+        if let Some(target) = target {
+            control = control.push(target);
+        }
+        if let Some(apply) = apply {
+            control = control.push(apply);
+        }
+        let label = match state.source {
+            SourceChoice::App => t!("pantalla-host-ventana"),
+            _ => t!("pantalla-host-monitor"),
+        };
+        rows.push(ui::pref_row(label, None, control));
     }
-    let now = state.shared.as_ref().map(sharing_label).unwrap_or_default();
-    let subtitle = match &state.switching {
-        Some(switching) => t!(
-            "pantalla-host-cambiando-a",
-            que = sharing_label(switching).as_str()
-        ),
-        None if state.source_changed() => t!("pantalla-host-ahora-cambiar", que = now.as_str()),
-        None => t!("pantalla-host-ahora", que = now.as_str()),
-    };
-    rows.push(ui::pref_row(
-        t!("pantalla-host-que-compartes"),
-        Some(subtitle),
-        control,
-    ));
 
     // Audio: las casillas se aplican al momento.
     match state

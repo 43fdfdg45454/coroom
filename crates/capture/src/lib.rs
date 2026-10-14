@@ -31,6 +31,9 @@ use std::time::{Duration, Instant};
 
 pub mod synthetic;
 
+mod counters;
+pub use counters::{SourceCounters, source_counters};
+
 #[cfg_attr(
     not(any(
         all(feature = "wgc", target_os = "windows"),

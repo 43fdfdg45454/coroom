@@ -1046,17 +1046,6 @@ fn process(stream: &pw::stream::Stream, state: &mut StreamState) {
         return;
     };
     let captured_at = Instant::now();
-    // Cadencia pedida: los fotogramas que sobran vuelven al compositor sin copiar nada. Se usan
-    // siempre las mismas marcas (las del compositor o la llegada) para no mezclar relojes.
-    let pts = buffer.pts();
-    let compositor = *state.compositor_pts.get_or_insert(pts.is_some());
-    let at = match pts {
-        Some(pts) if compositor => pts,
-        _ => captured_at.saturating_duration_since(state.epoch),
-    };
-    if !state.pacer.accept(at) {
-        return;
-    }
     let meta = buffer.cursor().filter(|cursor| cursor.is_valid());
     if let Some(meta) = meta
         && let Some(bitmap) = meta.bitmap()
@@ -1090,6 +1079,23 @@ fn process(stream: &pw::stream::Stream, state: &mut StreamState) {
         || size.height == 0
     {
         // Búfer solo con metadatos (el cursor se movió y la imagen no cambió) o dañado.
+        crate::counters::record_empty();
+        return;
+    }
+    crate::counters::record_arrived();
+    // Cadencia pedida: los fotogramas que sobran vuelven al compositor sin copiar nada. Solo
+    // cuentan los búferes con imagen: uno solo de cursor ocupaba el hueco de la cadencia y el
+    // fotograma del juego que llegaba detrás se descartaba (con el ratón en movimiento, 120 fps
+    // pedidos daban unos 30, y ninguno si solo se movía el cursor). Se usan siempre las mismas
+    // marcas (las del compositor o la llegada) para no mezclar relojes.
+    let pts = buffer.pts();
+    let compositor = *state.compositor_pts.get_or_insert(pts.is_some());
+    let at = match pts {
+        Some(pts) if compositor => pts,
+        _ => captured_at.saturating_duration_since(state.epoch),
+    };
+    if !state.pacer.accept(at) {
+        crate::counters::record_paced_out();
         return;
     }
     let (pixels, cpu_copies) = if state.dmabuf && data.type_() == DataType::DmaBuf {
