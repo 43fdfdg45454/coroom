@@ -7,11 +7,12 @@
 //! sesiones mandan sus eventos (un hilo los reenvía) y su estado cada 250-500 ms (otro hilo lo
 //! pide), así la ventana nunca espera a la red.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use coroom_render::wgpu::VideoImporter;
 use coroom_session::codec::DecodeOutput;
@@ -35,7 +36,7 @@ use crate::account::{self, AccountOptions, AccountStore};
 use crate::probe::{ProbeOptions, Source, start_pipeline_with, to_present_frame};
 use crate::remote::{
     AutoAllow, HostAudioOptions, HostOptions, JoinAudioOptions, JoinOptions, NetOptions,
-    load_identity, start_guest, start_host,
+    load_identity, prepare_host, start_guest, start_prepared_host,
 };
 
 /// Entrega un mensaje a la interfaz (desde cualquier hilo).
@@ -49,6 +50,13 @@ pub const HOST_STATUS_PERIOD: Duration = Duration::from_millis(500);
 
 /// Espera antes de reabrir la sala de espera si se cae.
 const LOBBY_RETRY: Duration = Duration::from_secs(5);
+
+/// Lo más que se espera a que la sala conecte con el servidor al abrirla; después se avisa y se
+/// vuelve a la sala de espera (si arranca tarde, se cierra sola).
+pub const HOST_START_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Lo más que se espera al salir a que cada sesión se cierre.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 
 /// Mandos del invitado que lleva la ventana (teclado, ratón, mandos y audio).
 #[derive(Clone)]
@@ -86,7 +94,8 @@ pub struct Backend {
     guest: Arc<Mutex<Option<GuestRun>>>,
     /// Cancelación de la entrada en curso (antes de que haya sesión que cerrar).
     join_cancel: Option<Arc<AtomicBool>>,
-    lobby: Option<Arc<AtomicBool>>,
+    /// Sala de espera en marcha: su parada y el servidor al que escucha.
+    lobby: Option<(Arc<AtomicBool>, Option<String>)>,
     local: Arc<Mutex<Option<LocalRun>>>,
     /// Si la ventana puede presentar en HDR.
     hdr_display: Option<bool>,
@@ -160,16 +169,18 @@ impl Backend {
     }
 
     fn spawn(&self, name: &str, job: impl FnOnce(Notify) + Send + 'static) {
-        let notify = Arc::clone(&self.notify);
-        let spawned = thread::Builder::new()
-            .name(format!("coroom-{name}"))
-            .spawn(move || job(notify));
-        if let Err(err) = spawned {
-            (self.notify)(Message::Event(Event::Failed(t!(
-                "backend-no-se-pudo-arrancar-una-tarea",
-                err = err
-            ))));
-        }
+        self.spawn_or(name, Event::Failed, job);
+    }
+
+    /// Como [`Backend::spawn`]; si la tarea entra en pánico, avisa con `on_panic` (la sala o la
+    /// sesión del invitado, para que la pantalla no se quede esperando).
+    fn spawn_or(
+        &self,
+        name: &str,
+        on_panic: fn(String) -> Event,
+        job: impl FnOnce(Notify) + Send + 'static,
+    ) {
+        spawn_job(Arc::clone(&self.notify), name, on_panic, job);
     }
 
     /// Mandos del invitado, cuando su sesión ya arrancó.
@@ -260,7 +271,8 @@ impl Backend {
             Effect::StopHost => {
                 let host = lock(&self.host).take();
                 if let Some(session) = host {
-                    self.spawn("cerrar-sala", move |_| lock(&session).close());
+                    tracing::info!("cerrando la sala");
+                    close_detached(session);
                 }
             }
             Effect::SetPermissions(guest, permissions) => {
@@ -300,7 +312,8 @@ impl Backend {
             Effect::Leave => {
                 let run = lock(&self.guest).take();
                 if let Some(run) = run {
-                    self.spawn("salir", move |_| lock(&run.session).close());
+                    tracing::info!("saliendo de la sala");
+                    close_detached(run.session);
                 } else if let Some(cancel) = self.join_cancel.take() {
                     // Aún conectando: se abandona la entrada y la pantalla se cierra ya.
                     cancel.store(true, Ordering::Relaxed);
@@ -417,15 +430,26 @@ impl Backend {
         });
     }
 
+    /// Abre la sala de espera; si ya escucha al mismo servidor, la deja como está (cerrarla y
+    /// abrirla haría que los amigos te vieran desconectado un momento).
     fn start_lobby(&mut self, options: AccountOptions) {
+        if self
+            .lobby
+            .as_ref()
+            .is_some_and(|(_, server)| *server == options.server)
+        {
+            return;
+        }
         self.stop_lobby();
         let stop = Arc::new(AtomicBool::new(false));
-        self.lobby = Some(Arc::clone(&stop));
+        self.lobby = Some((Arc::clone(&stop), options.server.clone()));
+        tracing::info!("sala de espera abierta");
         self.spawn("espera", move |notify| lobby(&options, &stop, &notify));
     }
 
     fn stop_lobby(&mut self) {
-        if let Some(stop) = self.lobby.take() {
+        if let Some((stop, _)) = self.lobby.take() {
+            tracing::info!("sala de espera cerrada");
             stop.store(true, Ordering::Release);
         }
     }
@@ -468,14 +492,30 @@ impl Backend {
             },
             invites: Vec::new(),
         };
+        tracing::info!(
+            source = ?request.source,
+            share = ?host.share.kind,
+            codec = ?host.codec,
+            encoder = ?host.encoder,
+            width,
+            height,
+            fps = video.fps,
+            bitrate_kbps = video.max_bitrate_kbps,
+            yuv444 = video.chroma_444,
+            hdr = video.hdr,
+            "abriendo la sala"
+        );
         let slot = Arc::clone(&self.host);
         let preview = VideoFeed::new(None, Arc::clone(&self.wake));
-        self.spawn("sala", move |notify| {
-            let started = load_identity(crate::ui::settings::explicit_data_dir().as_deref(), false)
-                .and_then(|(identity, _)| start_host(identity, &host));
-            let session = match started {
+        let on_panic: fn(String) -> Event = |reason| Event::HostEnded(Some(reason));
+        self.spawn_or("sala", on_panic, move |notify| {
+            let prepared =
+                load_identity(crate::ui::settings::explicit_data_dir().as_deref(), false)
+                    .and_then(|(identity, _)| prepare_host(identity, &host));
+            let mut session = match prepared {
                 Ok(session) => session,
                 Err(err) => {
+                    tracing::warn!(error = %err, "no se pudo preparar la sala");
                     notify(Message::Event(Event::HostStarted(Err(err))));
                     return;
                 }
@@ -490,37 +530,47 @@ impl Backend {
                 }
                 None => preview_notify(Message::Event(Event::PreviewUnavailable)),
             }))));
+            // La captura ya está elegida (el diálogo del sistema no cuenta): desde aquí, si el
+            // servidor no contesta, se avisa en vez de quedarse en «Abriendo la sala…».
+            let gate = StartGate::new();
+            gate.watch(HOST_START_TIMEOUT, Arc::clone(&notify), || {
+                Event::HostStarted(Err(t!(
+                    "backend-la-sala-no-respondio",
+                    secs = HOST_START_TIMEOUT.as_secs()
+                )))
+            });
+            let started = start_prepared_host(&mut session);
+            if !gate.settle() {
+                tracing::warn!("la sala arrancó después del plazo; se cierra");
+                session.close();
+                return;
+            }
+            if let Err(err) = started {
+                tracing::warn!(error = %err, "no se pudo abrir la sala");
+                notify(Message::Event(Event::HostStarted(Err(err))));
+                return;
+            }
+            tracing::info!("sala abierta");
             let events = session.events();
             let session = Arc::new(Mutex::new(session));
-            *lock(&slot) = Some(Arc::clone(&session));
+            // La de antes (si terminó sola y nadie la quitó) se cierra aparte, nunca bajo el
+            // cerrojo: cerrar espera a sus hilos.
+            let old = lock(&slot).replace(Arc::clone(&session));
+            if let Some(old) = old {
+                close_detached(old);
+            }
             notify(Message::Event(Event::HostStarted(Ok(preview))));
-            forward_events(events, &notify, Event::Host, Event::HostEnded);
-            drop(session);
-        });
-        // Estado de los invitados mientras haya sala.
-        let slot = Arc::clone(&self.host);
-        self.spawn("invitados", move |notify| {
-            // Se espera a que la sala exista (o a que falle al abrirse).
-            for _ in 0..600 {
-                if lock(&slot).is_some() {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
-            loop {
-                let Some(session) = lock(&slot).clone() else {
-                    return;
-                };
-                let (finished, guests) = {
-                    let session = lock(&session);
-                    (session.is_finished(), session.guests())
-                };
-                if finished {
-                    return;
-                }
-                notify(Message::Event(Event::HostGuests(guests)));
-                thread::sleep(HOST_STATUS_PERIOD);
-            }
+            poll_host_guests(Arc::downgrade(&session), Arc::clone(&notify));
+            let reason = forward_events(events, &notify, Event::Host, &session, "host");
+            // Terminó (sola o porque se cerró): sale del hueco si sigue siendo la de ahora, para
+            // que la próxima sala no tropiece con ella.
+            drop(take_if(&slot, |current| Arc::ptr_eq(current, &session)));
+            close_detached(session);
+            tracing::info!(
+                reason = reason.as_deref().unwrap_or("cierre normal"),
+                "sala cerrada"
+            );
+            notify(Message::Event(Event::HostEnded(reason)));
         });
     }
 
@@ -531,7 +581,14 @@ impl Backend {
         let slot = Arc::clone(&self.guest);
         let cancel = Arc::new(AtomicBool::new(false));
         self.join_cancel = Some(Arc::clone(&cancel));
-        self.spawn("invitado", move |notify| {
+        tracing::info!(
+            decoder = ?options.decoder,
+            yuv444 = options.yuv444,
+            hdr = options.hdr,
+            "entrando en una sala"
+        );
+        let on_panic: fn(String) -> Event = |reason| Event::GuestEnded(Some(reason));
+        self.spawn_or("invitado", on_panic, move |notify| {
             let identity = match identity {
                 Some(identity) => Ok(identity),
                 None => load_identity(crate::ui::settings::explicit_data_dir().as_deref(), false)
@@ -550,11 +607,13 @@ impl Backend {
                 }
                 Ok(session) => session,
                 Err(err) => {
+                    tracing::warn!(error = %err, "no se pudo entrar en la sala");
                     feed.close();
                     notify(Message::Event(Event::GuestStarted(Err(err))));
                     return;
                 }
             };
+            tracing::info!("dentro de la sala");
             let controls = GuestControls {
                 input: session.input(),
                 audio: session.audio(),
@@ -562,10 +621,13 @@ impl Backend {
             };
             let events = session.events();
             let session = Arc::new(Mutex::new(session));
-            *lock(&slot) = Some(GuestRun {
+            let old = lock(&slot).replace(GuestRun {
                 session: Arc::clone(&session),
                 controls: controls.clone(),
             });
+            if let Some(old) = old {
+                close_detached(old.session);
+            }
             notify(Message::Event(Event::GuestStarted(Ok(Arc::clone(&feed)))));
             let stats_notify = Arc::clone(&notify);
             let stats_session = Arc::downgrade(&session);
@@ -591,9 +653,15 @@ impl Backend {
                     }
                 });
             drop(poller);
-            forward_events(events, &notify, Event::Guest, Event::GuestEnded);
+            let reason = forward_events(events, &notify, Event::Guest, &session, "guest");
+            drop(take_if(&slot, |run| Arc::ptr_eq(&run.session, &session)));
+            close_detached(session);
             feed.close();
-            drop(session);
+            tracing::info!(
+                reason = reason.as_deref().unwrap_or("cierre normal"),
+                "fuera de la sala"
+            );
+            notify(Message::Event(Event::GuestEnded(reason)));
         });
     }
 
@@ -665,17 +733,21 @@ impl Backend {
     /// invitado, si había sesión, y el motivo si terminó por un error.
     pub fn shutdown(&mut self) -> Option<Result<LatencySummary, String>> {
         self.stop_lobby();
-        if let Some(session) = lock(&self.host).take() {
-            lock(&session).close();
+        let host = lock(&self.host).take();
+        if let Some(session) = host {
+            close_within(SHUTDOWN_WAIT, move || lock(&session).close());
         }
-        let guest = lock(&self.guest).take().map(|run| {
-            let mut session = lock(&run.session);
-            let reason = session.end_reason();
-            session.close();
-            match reason {
-                Some(err) => Err(err.to_string()),
-                None => Ok(session.summary()),
-            }
+        let run = lock(&self.guest).take();
+        let guest = run.and_then(|run| {
+            close_within(SHUTDOWN_WAIT, move || {
+                let mut session = lock(&run.session);
+                let reason = session.end_reason();
+                session.close();
+                match reason {
+                    Some(err) => Err(err.to_string()),
+                    None => Ok(session.summary()),
+                }
+            })
         });
         guest.or_else(|| self.finish_probe())
     }
@@ -695,22 +767,204 @@ fn stats(summary: LatencySummary, controls: &GuestControls, feed: &VideoFeed) ->
     }
 }
 
-/// Reenvía los eventos de una sesión hasta el final.
+/// Reenvía los eventos de una sesión hasta el final (y los deja en el registro). Devuelve el
+/// motivo si terminó por un error: el de la sesión o, si no dice ninguno, el del pipeline (un
+/// codificador o la captura que fallan), para que la interfaz no diga «Has dejado de compartir».
 fn forward_events(
     events: crossbeam_channel::Receiver<SessionEvent>,
     notify: &Notify,
     each: fn(SessionEvent) -> Event,
-    end: fn(Option<String>) -> Event,
-) {
+    session: &Mutex<RemoteSession>,
+    role: &'static str,
+) -> Option<String> {
+    let mut reason = None;
     while let Ok(event) = events.recv() {
-        if let SessionEvent::Ended(reason) = &event {
-            let reason = reason.as_ref().map(SessionError::to_string);
-            notify(Message::Event(end(reason)));
-            return;
+        match &event {
+            SessionEvent::Warning(_) | SessionEvent::RelayUnavailable(_) => {
+                tracing::warn!(role, %event, "aviso de la sesión");
+            }
+            _ => tracing::info!(role, %event, "evento de la sesión"),
+        }
+        if let SessionEvent::Ended(ended) = event {
+            reason = ended;
+            break;
         }
         notify(Message::Event(each(event)));
     }
-    notify(Message::Event(end(None)));
+    reason
+        .or_else(|| {
+            // Sin esperar: si alguien la está cerrando, el motivo ya llegó con el evento.
+            let session = match session.try_lock() {
+                Ok(session) => session,
+                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(TryLockError::WouldBlock) => return None,
+            };
+            session.end_reason()
+        })
+        .as_ref()
+        .map(SessionError::to_string)
+}
+
+/// Lanza `job` en un hilo propio; si entra en pánico, avisa con `on_panic` y el motivo.
+fn spawn_job(
+    notify: Notify,
+    name: &str,
+    on_panic: fn(String) -> Event,
+    job: impl FnOnce(Notify) + Send + 'static,
+) {
+    let task = name.to_owned();
+    let inner = Arc::clone(&notify);
+    let spawned = thread::Builder::new()
+        .name(format!("coroom-{name}"))
+        .spawn(move || {
+            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| job(Arc::clone(&inner)))) {
+                let err = panic_message(panic.as_ref());
+                tracing::error!(task, error = %err, "una tarea entró en pánico");
+                inner(Message::Event(on_panic(t!(
+                    "backend-fallo-interno",
+                    task = task,
+                    err = err
+                ))));
+            }
+        });
+    if let Err(err) = spawned {
+        notify(Message::Event(Event::Failed(t!(
+            "backend-no-se-pudo-arrancar-una-tarea",
+            err = err
+        ))));
+    }
+}
+
+/// El texto de un pánico.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "?".to_owned())
+}
+
+/// Saca lo que hay en `slot` si `is_mine` (y lo devuelve: se suelta fuera del cerrojo).
+fn take_if<T>(slot: &Mutex<Option<T>>, is_mine: impl FnOnce(&T) -> bool) -> Option<T> {
+    let mut slot = lock(slot);
+    if slot.as_ref().is_some_and(is_mine) {
+        slot.take()
+    } else {
+        None
+    }
+}
+
+/// Cierra la sesión en un hilo aparte: `close` espera a sus hilos y puede tardar (o no volver si
+/// alguno se quedó colgado), y nunca debe hacerlo bajo un cerrojo ni en el hilo de la ventana.
+fn close_detached(session: Arc<Mutex<RemoteSession>>) {
+    let spawned = thread::Builder::new()
+        .name("coroom-cerrar".into())
+        .spawn(move || lock(&session).close());
+    if let Err(err) = spawned {
+        tracing::warn!(error = %err, "no se pudo cerrar la sesión aparte");
+    }
+}
+
+/// Hace `job` en otro hilo y espera su resultado como mucho `wait` (al salir de la aplicación).
+fn close_within<T: Send + 'static>(
+    wait: Duration,
+    job: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = thread::Builder::new()
+        .name("coroom-cerrar".into())
+        .spawn(move || {
+            let _ = tx.send(job());
+        });
+    if spawned.is_err() {
+        return None;
+    }
+    let result = rx.recv_timeout(wait).ok();
+    if result.is_none() {
+        tracing::warn!(segundos = wait.as_secs(), "una sesión no se cerró a tiempo");
+    }
+    result
+}
+
+/// Estado de los invitados del anfitrión cada [`HOST_STATUS_PERIOD`] mientras la sala siga.
+fn poll_host_guests(session: std::sync::Weak<Mutex<RemoteSession>>, notify: Notify) {
+    let spawned = thread::Builder::new()
+        .name("coroom-invitados".into())
+        .spawn(move || {
+            while let Some(session) = session.upgrade() {
+                let (finished, guests) = {
+                    let session = lock(&session);
+                    (session.is_finished(), session.guests())
+                };
+                drop(session);
+                if finished {
+                    return;
+                }
+                notify(Message::Event(Event::HostGuests(guests)));
+                thread::sleep(HOST_STATUS_PERIOD);
+            }
+        });
+    if let Err(err) = spawned {
+        tracing::warn!(error = %err, "sin estado de los invitados");
+    }
+}
+
+/// Quién decide cómo acabó un arranque: el arranque o el plazo, el primero que llegue.
+#[derive(Clone)]
+struct StartGate(Arc<(Mutex<bool>, Condvar)>);
+
+impl StartGate {
+    fn new() -> Self {
+        Self(Arc::new((Mutex::new(false), Condvar::new())))
+    }
+
+    /// Si en `timeout` nadie llamó a [`StartGate::settle`], avisa con `event` (desde otro hilo).
+    fn watch(
+        &self,
+        timeout: Duration,
+        notify: Notify,
+        event: impl FnOnce() -> Event + Send + 'static,
+    ) {
+        let gate = self.clone();
+        let spawned = thread::Builder::new()
+            .name("coroom-plazo".into())
+            .spawn(move || {
+                let (decided, wake) = &*gate.0;
+                let deadline = Instant::now() + timeout;
+                let mut done = lock(decided);
+                while !*done {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    done = wake
+                        .wait_timeout(done, left)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0;
+                }
+                if !*done {
+                    *done = true;
+                    drop(done);
+                    tracing::warn!(?timeout, "arranque fuera de plazo");
+                    notify(Message::Event(event()));
+                }
+            });
+        if let Err(err) = spawned {
+            tracing::warn!(error = %err, "sin plazo para el arranque");
+        }
+    }
+
+    /// El arranque terminó: `true` si llegó a tiempo (y el plazo ya no avisará).
+    fn settle(&self) -> bool {
+        let (decided, wake) = &*self.0;
+        let mut done = lock(decided);
+        if *done {
+            return false;
+        }
+        *done = true;
+        wake.notify_all();
+        true
+    }
 }
 
 /// Opciones de cuenta de un servidor conocido.
@@ -740,18 +994,22 @@ fn net_options(options: &AccountOptions, settings: &Settings) -> NetOptions {
 
 /// Monitores o ventanas y aplicaciones que suenan, para el paso 1 del anfitrión.
 fn share_options(source: SourceChoice) -> ShareOptions {
-    let targets = match source {
-        SourceChoice::Synthetic => Vec::new(),
+    let (targets, targets_error) = match source {
+        SourceChoice::Synthetic => (Vec::new(), None),
         SourceChoice::Screen | SourceChoice::App => {
-            coroom_session::capture::share_targets(source.kind()).unwrap_or_else(|err| {
-                tracing::debug!(%err, "no se pudieron listar los destinos");
-                Vec::new()
-            })
+            match coroom_session::capture::share_targets(source.kind()) {
+                Ok(targets) => (targets, None),
+                Err(err) => {
+                    tracing::warn!(%err, ?source, "no se pudieron listar los destinos");
+                    (Vec::new(), Some(err.to_string()))
+                }
+            }
         }
     };
     ShareOptions {
         source,
         targets,
+        targets_error,
         apps: coroom_session::audio::playing_apps().map_err(|err| err.to_string()),
     }
 }
@@ -909,4 +1167,85 @@ fn lobby_once(options: &AccountOptions, stop: &AtomicBool, notify: &Notify) -> R
         endpoint.close();
         result
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Un `notify` que guarda los mensajes en un canal.
+    fn recorder() -> (Notify, crossbeam_channel::Receiver<Message>) {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let notify: Notify = Arc::new(move |message| {
+            let _ = tx.send(message);
+        });
+        (notify, rx)
+    }
+
+    /// Una tarea que entra en pánico avisa con el motivo (la pantalla no se queda esperando).
+    #[test]
+    fn a_panicking_job_reports_instead_of_vanishing() {
+        let (notify, rx) = recorder();
+        let on_panic: fn(String) -> Event = |reason| Event::HostEnded(Some(reason));
+        spawn_job(notify, "sala", on_panic, |_| panic!("códec roto"));
+        let message = rx.recv_timeout(Duration::from_secs(10)).expect("aviso");
+        let Message::Event(Event::HostEnded(Some(reason))) = message else {
+            panic!("se esperaba el final de la sala: {message:?}");
+        };
+        assert!(reason.contains("códec roto"), "{reason}");
+        assert!(reason.contains("sala"), "{reason}");
+    }
+
+    /// El plazo avisa si el arranque no termina; un arranque que llega después ya no cuenta, y
+    /// uno a tiempo no deja aviso.
+    #[test]
+    fn the_start_timeout_wins_only_when_the_start_is_late() {
+        let (notify, rx) = recorder();
+        let late = StartGate::new();
+        late.watch(Duration::from_millis(50), Arc::clone(&notify), || {
+            Event::HostStarted(Err("plazo".into()))
+        });
+        let message = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("aviso del plazo");
+        assert!(matches!(
+            message,
+            Message::Event(Event::HostStarted(Err(ref err))) if err == "plazo"
+        ));
+        assert!(!late.settle(), "el arranque tardío se descarta");
+
+        let on_time = StartGate::new();
+        on_time.watch(Duration::from_millis(200), notify, || {
+            Event::HostStarted(Err("plazo".into()))
+        });
+        assert!(on_time.settle());
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "sin aviso"
+        );
+    }
+
+    /// La sesión que termina sola sale del hueco, pero no se lleva la que ya la sustituyó.
+    #[test]
+    fn an_ended_session_leaves_the_slot_only_if_it_is_still_there() {
+        let first = Arc::new(1);
+        let second = Arc::new(2);
+        let slot = Mutex::new(Some(Arc::clone(&second)));
+        assert!(take_if(&slot, |current| Arc::ptr_eq(current, &first)).is_none());
+        assert!(lock(&slot).is_some(), "la nueva sigue");
+        assert!(take_if(&slot, |current| Arc::ptr_eq(current, &second)).is_some());
+        assert!(lock(&slot).is_none());
+    }
+
+    /// Cerrar al salir no espera para siempre a una sesión colgada.
+    #[test]
+    fn closing_on_exit_is_bounded() {
+        let started = Instant::now();
+        let result = close_within(Duration::from_millis(50), || {
+            thread::sleep(Duration::from_secs(5));
+        });
+        assert!(result.is_none());
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert_eq!(close_within(Duration::from_secs(5), || 7), Some(7));
+    }
 }

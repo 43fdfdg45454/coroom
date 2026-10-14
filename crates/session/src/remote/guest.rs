@@ -45,6 +45,7 @@ use crate::loopback::{
     CHANNEL_CAPACITY, Compressed, DecodeControl, FrameSink, decode_loop, extend_frame_id,
     present_loop, send_latest, spawn_stage,
 };
+use crate::stats::{LinkCounters, StatsWindow, bump};
 use crate::{SessionError, SessionState};
 
 /// Espera a la explicación de la señalización cuando se cae la conexión con el anfitrión.
@@ -725,6 +726,7 @@ async fn run_guest(
     // Si la conexión con el anfitrión se cae, se espera un poco a que la señalización diga por qué
     // (expulsión o sala cerrada): el cierre de QUIC llega antes que el aviso del servidor.
     let mut lost: Option<(SessionError, Instant)> = None;
+    let mut stats = StatsWindow::new(&core.shared.counters, &core.ledger);
     if result.is_ok() {
         result = loop {
             tokio::select! {
@@ -757,6 +759,22 @@ async fn run_guest(
                 _ = tick.tick() => {
                     if core.shared.stopping() && lost.is_none() {
                         break Ok(Exit::Closed);
+                    }
+                    if stats.due() {
+                        let link = lock(&core.link).receiver.as_ref().map(|receiver| {
+                            let s = receiver.stats();
+                            LinkCounters {
+                                dropped: s.dropped,
+                                late: s.late,
+                                lost_objects: s.lost_objects,
+                                nacks: s.nacks,
+                                keyframe_requests: s.keyframe_requests,
+                            }
+                        });
+                        if let Some(link) = link {
+                            let line = stats.guest_line(&core.shared.counters, &core.ledger, link);
+                            tracing::info!(target: "coroom::stats", "{line}");
+                        }
                     }
                     if let Some((err, deadline)) = &lost
                         && Instant::now() >= *deadline
@@ -881,12 +899,13 @@ async fn receive(
     }
 
     let (yuv444, hdr) = decode.accept;
-    let caps = GuestCapabilities::from_decoders(&decode.set, yuv444, hdr);
+    // Sin los decodificadores que ya fallaron en esta sesión (ver `DecodeControl`).
+    let caps = GuestCapabilities::from_decoders(&decode.usable(), yuv444, hdr);
     let control_task = tokio::spawn(control_loop(
         Arc::clone(core),
         control_rx,
         Arc::clone(&receiver),
-        decode,
+        Arc::clone(&decode),
     ));
     // Estimación de calidad: RTT con el anfitrión antes de que arranque el códec (el
     // anfitrión no lo crea hasta tener las capacidades de este invitado).
@@ -914,7 +933,7 @@ async fn receive(
             }
         })
     };
-    let result = media_loop(core, &receiver, &reply, frames).await;
+    let result = media_loop(core, &receiver, &reply, frames, &decode).await;
     input_task.abort();
     if let Some(task) = &audio_task {
         task.stop();
@@ -1148,12 +1167,71 @@ impl Timings {
     }
 }
 
-/// Recibe, descifra y entrega a la decodificación.
+/// Periodo del vigilante del vídeo de [`media_loop`].
+const WATCH_PERIOD: Duration = Duration::from_millis(100);
+
+/// Sin imagen decodificada durante esto mientras llegan fotogramas, el vídeo está atascado.
+const STALL: Duration = Duration::from_millis(500);
+
+/// Vigila que el vídeo avance aunque no llegue nada: el intra que el anfitrión manda al conectar
+/// puede llegar antes de que el decodificador esté abierto y, con la pantalla quieta, no llega
+/// ningún otro fotograma que dispare una petición (el invitado se quedaba en «Entrando en la
+/// sala» con audio y entrada funcionando).
+#[derive(Debug)]
+struct VideoWatch {
+    decoded: u64,
+    decoded_at: Option<Instant>,
+    received_at: Option<Instant>,
+    started: Instant,
+}
+
+/// Espera al primer fotograma de una conexión antes de pedirlo (el anfitrión manda un intra en
+/// cuanto recibe las capacidades).
+const FIRST_FRAME_GRACE: Duration = Duration::from_secs(1);
+
+impl VideoWatch {
+    fn new(decoded: u64) -> Self {
+        Self {
+            decoded,
+            decoded_at: None,
+            received_at: None,
+            started: Instant::now(),
+        }
+    }
+
+    /// Si hay que pedir un intra: con el códec ya elegido, mientras no se haya decodificado nada en
+    /// esta conexión (en cuanto llega algo de vídeo, o pasado [`FIRST_FRAME_GRACE`] aunque no
+    /// llegue nada), o si llegan fotogramas pero no se decodifica ninguno desde hace [`STALL`].
+    fn stalled(&mut self, now: Instant, decoded: u64, codec_known: bool) -> bool {
+        if decoded != self.decoded {
+            self.decoded = decoded;
+            self.decoded_at = Some(now);
+        }
+        if !codec_known {
+            return false;
+        }
+        match self.decoded_at {
+            None => {
+                self.received_at.is_some()
+                    || now.saturating_duration_since(self.started) >= FIRST_FRAME_GRACE
+            }
+            Some(at) => {
+                self.received_at.is_some_and(|received| received > at)
+                    && now.saturating_duration_since(at) >= STALL
+            }
+        }
+    }
+}
+
+/// Recibe, descifra y entrega a la decodificación; con un temporizador propio pide intra si el
+/// vídeo no avanza ([`VideoWatch`]) y vuelve a anunciar las capacidades si el hilo `decode` se
+/// quedó sin decodificadores de un códec.
 async fn media_loop(
     core: &Arc<Core>,
     receiver: &MediaReceiver,
     control: &ControlSender,
     (frames, evict): &FrameQueue,
+    decode: &DecodeControl,
 ) -> Result<(), SessionError> {
     let ledger = &core.ledger;
     let shared = &core.shared;
@@ -1161,8 +1239,34 @@ async fn media_loop(
     let mut last_id = None;
     let mut dropped_seen = 0u64;
     let mut last_request: Option<Instant> = None;
+    // Último grupo de vídeo recibido: va en los `KeyframeRequest` (el anfitrión ignora las
+    // peticiones anteriores al intra que acaba de mandar).
+    let mut last_group = 0u32;
+    let mut watch = VideoWatch::new(shared.counters.decoded.load(Ordering::Relaxed));
+    let mut tick = tokio::time::interval(WATCH_PERIOD);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        let frame = receiver.recv_frame().await.map_err(|err| {
+        // `recv_frame` se puede cancelar: lo recibido se queda en el receptor.
+        let received = tokio::select! {
+            frame = receiver.recv_frame() => Some(frame),
+            _ = tick.tick() => None,
+        };
+        let Some(frame) = received else {
+            if decode.take_renegotiation() {
+                let (yuv444, hdr) = decode.accept;
+                let caps = GuestCapabilities::from_decoders(&decode.usable(), yuv444, hdr);
+                debug!(?caps, "se vuelven a anunciar las capacidades");
+                let _ = control.send(&caps.to_message());
+            }
+            let decoded = shared.counters.decoded.load(Ordering::Relaxed);
+            if watch.stalled(Instant::now(), decoded, decode.wanted().is_some()) {
+                shared.request_keyframe();
+            }
+            let rtt = receiver.clock_rtt().unwrap_or_default();
+            request_keyframe(control, last_group, shared, &mut last_request, rtt);
+            continue;
+        };
+        let frame = frame.map_err(|err| {
             SessionError::Network(format!("se perdió la conexión con el anfitrión: {err}"))
         })?;
         let dropped = receiver.stats().dropped;
@@ -1175,6 +1279,13 @@ async fn media_loop(
         }
         let frame_id = extend_frame_id(last_id, frame.group);
         last_id = Some(frame_id);
+        last_group = frame.group;
+        watch.received_at = Some(frame.received_at);
+        bump(&shared.counters.received);
+        shared
+            .counters
+            .received_bytes
+            .fetch_add(frame.payload.len() as u64, Ordering::Relaxed);
         ledger.mark(frame_id, Stage::Received, frame.received_at);
         if core.removed.load(Ordering::Acquire) || shared.stopping() {
             return Ok(());
@@ -1196,7 +1307,8 @@ async fn media_loop(
                     debug!(error = %err, group = frame.group, "fotograma sin descifrar");
                     ledger.record_drop(Stage::Decrypted);
                     shared.request_keyframe();
-                    request_keyframe(control, frame.group, shared, &mut last_request);
+                    let rtt = receiver.clock_rtt().unwrap_or_default();
+                    request_keyframe(control, frame.group, shared, &mut last_request, rtt);
                     continue;
                 }
             }
@@ -1222,23 +1334,28 @@ async fn media_loop(
             Ok(false) => {}
             Err(()) => return Ok(()),
         }
-        request_keyframe(control, frame.group, shared, &mut last_request);
+        let rtt = receiver.clock_rtt().unwrap_or_default();
+        request_keyframe(control, frame.group, shared, &mut last_request, rtt);
     }
 }
 
-/// Envía un `KeyframeRequest` si alguien lo pidió (decodificador, descarte o descifrado) y no se
-/// pidió otro hace menos de [`KEYFRAME_REQUEST_PERIOD`].
+/// Envía un `KeyframeRequest` si alguien lo pidió (decodificador, descarte, descifrado o el
+/// vigilante) y no se pidió otro hace menos de [`KEYFRAME_REQUEST_PERIOD`] o de dos RTT (lo que
+/// tarda en llegar el intra pedido).
 fn request_keyframe(
     control: &ControlSender,
     group: u32,
     shared: &crate::loopback::Shared,
     last: &mut Option<Instant>,
+    rtt: Duration,
 ) {
-    if last.is_some_and(|at| at.elapsed() < KEYFRAME_REQUEST_PERIOD) {
+    let period = KEYFRAME_REQUEST_PERIOD.max(rtt * 2);
+    if last.is_some_and(|at| at.elapsed() < period) {
         return;
     }
     if shared.take_keyframe_request() {
         let _ = control.send(&ControlMessage::KeyframeRequest { group });
+        bump(&shared.counters.keyframe_requests);
         *last = Some(Instant::now());
     }
 }

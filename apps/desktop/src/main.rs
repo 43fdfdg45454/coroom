@@ -800,25 +800,31 @@ impl ProbeArgs {
     }
 }
 
-/// Logs a stderr (stdout queda para la salida de los comandos). `RUST_LOG` elige el nivel; por
-/// defecto, avisos y errores.
-fn init_logging() {
-    use std::io::IsTerminal;
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::stderr().is_terminal())
-        .init();
+/// Logs a stderr (stdout queda para la salida de los comandos; `RUST_LOG` elige el nivel y, por
+/// defecto, avisos y errores) y, con `to_file`, también al fichero de registro del directorio de
+/// datos ([`coroom_desktop::logging`]).
+fn init_logging(to_file: bool) {
+    coroom_desktop::logging::init(to_file);
+}
+
+/// Si la orden escribe el fichero de registro: la aplicación y las que abren sesiones. Las demás
+/// (`doctor`, las de cuenta…) no, para no rotar el registro de la última sesión.
+fn logs_to_file(command: Option<&Command>) -> bool {
+    matches!(
+        command,
+        None | Some(Command::Host(_) | Command::Join(_) | Command::Probe(_))
+    )
 }
 
 fn main() -> ExitCode {
-    init_logging();
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
-        Err(err) => return report_parse_error(&err),
+        Err(err) => {
+            init_logging(false);
+            return report_parse_error(&err);
+        }
     };
+    init_logging(logs_to_file(cli.command.as_ref()));
     match cli.command {
         Some(Command::Doctor) => doctor(),
         Some(Command::Probe(args)) => probe(&args),

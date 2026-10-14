@@ -41,13 +41,15 @@ use coroom_capture::{
     GpuFrames,
 };
 use coroom_codec::{
-    Codec, CodecError, DEFAULT_SLICES, Decoder, DecoderSet, EncodedSlice, Encoder, EncoderConfig,
-    GpuInput, PixelFormat, RawFrame, VideoFormat, decoder_label, encoder_label,
+    Codec, CodecError, DEFAULT_SLICES, Decoder, DecoderBackend, DecoderSet, EncodedSlice, Encoder,
+    EncoderConfig, GpuInput, PixelFormat, RawFrame, VideoFormat, decoder_label, encoder_label,
 };
 use coroom_transport::loopback::{UdpLoopback, UdpReceiver, UdpSender};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
+use tracing::warn;
 
 use crate::latency::{LatencyLedger, LatencySummary, Stage};
+use crate::stats::{Counters, bump};
 
 /// Capacidad de cada canal entre etapas.
 pub const CHANNEL_CAPACITY: usize = 2;
@@ -328,6 +330,8 @@ pub(crate) struct Shared {
     failure: Mutex<Option<PipelineError>>,
     /// Vista previa de la captura, si alguien la pidió.
     pub(crate) preview: Mutex<Option<Arc<crate::preview::PreviewTap>>>,
+    /// Contadores de las etapas para el registro periódico ([`crate::stats`]).
+    pub(crate) counters: Counters,
 }
 
 impl Shared {
@@ -539,15 +543,40 @@ impl EncodeControl {
     }
 }
 
+/// Abre un decodificador de `codec` en `format` con lo que quede de un [`DecoderSet`].
+pub(crate) type DecoderOpener = Box<
+    dyn Fn(&DecoderSet, Codec, VideoFormat) -> Result<Box<dyn Decoder>, CodecError> + Send + Sync,
+>;
+
 /// Control del decodificador desde fuera del pipeline (invitado de la sesión remota): el códec que
 /// anunció el anfitrión; el hilo `decode` abre el decodificador de ese códec con lo mejor de
 /// `set` antes del siguiente fotograma (y lo vuelve a abrir si cambia).
-#[derive(Debug)]
+///
+/// Respaldo: un decodificador que no saca imagen con los intra que recibe ([`DecodeHealth`]) se
+/// aparta (`excluded`) y se abre el siguiente del orden; si no queda ninguno de ese códec, el hilo
+/// `decode` pide renegociar y el invitado vuelve a anunciar sus capacidades sin él, con lo que el
+/// anfitrión elige otro códec (normalmente H.264).
 pub(crate) struct DecodeControl {
     pub(crate) set: DecoderSet,
     wanted: Mutex<Option<(Codec, VideoFormat)>>,
     /// Lo que el invitado acepta además de 4:2:0 SDR: `(4:4:4, HDR10)`.
     pub(crate) accept: (bool, bool),
+    /// Decodificadores que fallaron en esta sesión.
+    excluded: Mutex<Vec<(Codec, DecoderBackend)>>,
+    /// El invitado tiene que volver a anunciar sus capacidades ([`DecodeControl::usable`]).
+    renegotiate: AtomicBool,
+    opener: DecoderOpener,
+}
+
+impl fmt::Debug for DecodeControl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DecodeControl")
+            .field("set", &self.set)
+            .field("wanted", &self.wanted())
+            .field("accept", &self.accept)
+            .field("excluded", &self.excluded())
+            .finish_non_exhaustive()
+    }
 }
 
 impl DecodeControl {
@@ -556,6 +585,9 @@ impl DecodeControl {
             set,
             wanted: Mutex::new(None),
             accept: (false, false),
+            excluded: Mutex::new(Vec::new()),
+            renegotiate: AtomicBool::new(false),
+            opener: Box::new(|set, codec, format| set.open_format(codec, format)),
         }
     }
 
@@ -565,13 +597,67 @@ impl DecodeControl {
         self
     }
 
+    /// Con otra forma de abrir los decodificadores (los tests usan decodificadores falsos).
+    #[cfg(test)]
+    pub(crate) fn with_opener(mut self, opener: DecoderOpener) -> Self {
+        self.opener = opener;
+        self
+    }
+
     /// Pide decodificar `codec` en `format` a partir de ahora.
     pub(crate) fn request(&self, codec: Codec, format: VideoFormat) {
         *self.wanted.lock().unwrap_or_else(PoisonError::into_inner) = Some((codec, format));
     }
 
-    fn wanted(&self) -> Option<(Codec, VideoFormat)> {
+    pub(crate) fn wanted(&self) -> Option<(Codec, VideoFormat)> {
         *self.wanted.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn excluded(&self) -> Vec<(Codec, DecoderBackend)> {
+        self.excluded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Los decodificadores que quedan (sin los que fallaron): lo que se abre y lo que se anuncia.
+    pub(crate) fn usable(&self) -> DecoderSet {
+        self.set.without(&self.excluded())
+    }
+
+    fn open(&self, codec: Codec, format: VideoFormat) -> Result<Box<dyn Decoder>, CodecError> {
+        (self.opener)(&self.usable(), codec, format)
+    }
+
+    /// Aparta el decodificador `backend` de `codec`.
+    fn exclude(&self, codec: Codec, backend: DecoderBackend) {
+        let mut excluded = self.excluded.lock().unwrap_or_else(PoisonError::into_inner);
+        if !excluded.contains(&(codec, backend)) {
+            excluded.push((codec, backend));
+        }
+    }
+
+    /// Aparta todos los decodificadores de `codec` y pide renegociar sin él. Si con eso no quedase
+    /// ninguno, se vuelve a empezar con todos: mejor reintentar que quedarse sin vídeo.
+    fn give_up_codec(&self, codec: Codec) {
+        for &(c, backend) in self.set.available() {
+            if c == codec {
+                self.exclude(c, backend);
+            }
+        }
+        if self.usable().is_empty() {
+            warn!("ningún decodificador funcionó; se vuelve a probar con todos");
+            self.excluded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clear();
+        }
+        self.renegotiate.store(true, Ordering::Release);
+    }
+
+    /// Consume una petición de renegociación del hilo `decode`.
+    pub(crate) fn take_renegotiation(&self) -> bool {
+        self.renegotiate.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -783,6 +869,7 @@ pub(crate) fn capture_loop(
             };
             ledger.mark(frame.frame_id, Stage::Captured, frame.captured_at);
             ledger.record_cpu_copies(Stage::Captured, frame.cpu_copies);
+            bump(&shared.counters.captured);
             if let Some(cursor) = frame.cursor {
                 *shared.cursor.lock().unwrap_or_else(PoisonError::into_inner) = Some(cursor);
             }
@@ -807,6 +894,65 @@ pub(crate) fn capture_loop(
     result
 }
 
+/// Cambio relativo de bitrate por debajo del cual no se reabre un codificador sin bitrate en
+/// caliente ([`Encoder::live_bitrate`]): cada reapertura es un intra.
+pub(crate) const REOPEN_STEP: f64 = 0.20;
+
+/// Tiempo mínimo entre dos subidas de bitrate de un codificador sin bitrate en caliente. El control
+/// de tasa sube un 5 % cada 100 ms y su salida cambia con cada 10 %: aplicado tal cual, SVT-AV1,
+/// VA-API, AMF, Vulkan u OpenH264 se reabrían (y mandaban un intra) varias veces por segundo.
+pub(crate) const REOPEN_INCREASE_PERIOD: Duration = Duration::from_secs(4);
+
+/// Sin captura durante esto y con un intra pedido, se vuelve a codificar el último fotograma (la
+/// pantalla está quieta: WGC y PipeWire solo entregan fotogramas cuando cambia algo).
+pub(crate) const IDLE_KEYFRAME: Duration = Duration::from_millis(250);
+
+/// Decide cuándo se aplica al codificador el bitrate objetivo. Con bitrate en caliente, siempre;
+/// sin él, las bajadas de al menos [`REOPEN_STEP`] al momento (si no, se congestiona el enlace) y
+/// las subidas de al menos [`REOPEN_STEP`] como mucho cada [`REOPEN_INCREASE_PERIOD`].
+#[derive(Debug, Default)]
+pub(crate) struct BitrateGate {
+    applied: Option<u32>,
+    last_increase: Option<Instant>,
+}
+
+impl BitrateGate {
+    /// El bitrate que hay que aplicar ahora para `target`, si hay que cambiarlo.
+    pub(crate) fn decide(&mut self, target: u32, live: bool, now: Instant) -> Option<u32> {
+        let Some(applied) = self.applied else {
+            self.applied = Some(target);
+            self.last_increase = Some(now);
+            return Some(target);
+        };
+        if target == applied {
+            return None;
+        }
+        let change = (f64::from(target) - f64::from(applied)).abs() / f64::from(applied.max(1));
+        let apply = live
+            || (change >= REOPEN_STEP
+                && (target < applied
+                    || self.last_increase.is_none_or(|at| {
+                        now.saturating_duration_since(at) >= REOPEN_INCREASE_PERIOD
+                    })));
+        if !apply {
+            return None;
+        }
+        if target > applied {
+            self.last_increase = Some(now);
+        }
+        self.applied = Some(target);
+        Some(target)
+    }
+}
+
+/// Lo siguiente que codifica el hilo `encode`.
+enum EncodeInput {
+    /// Un fotograma de la captura.
+    Captured(CapturedFrame),
+    /// El último fotograma otra vez, como intra ([`IDLE_KEYFRAME`]).
+    Repeat,
+}
+
 pub(crate) fn encode_loop(
     mut encoder: Option<Box<dyn Encoder>>,
     rx: Receiver<CapturedFrame>,
@@ -816,43 +962,114 @@ pub(crate) fn encode_loop(
     ledger: &LatencyLedger,
     control: Option<&EncodeControl>,
 ) -> Result<(), PipelineError> {
-    let mut bitrate = control.map(|control| control.bitrate_kbps.load(Ordering::Acquire));
-    while let Some(frame) = recv_latest(&rx, shared, ledger, Stage::Encoded) {
+    let mut gate = BitrateGate::default();
+    // Último fotograma de CPU, para volver a codificarlo como intra si se pide uno con la
+    // pantalla quieta. Los de GPU no se guardan aquí: retendrían un búfer del pool de la captura
+    // (WGC tiene tres) y la captura se quedaría sin dónde escribir. Con ellos repite el propio
+    // codificador si guarda una copia ([`Encoder::repeat_last`]: la de D3D11); con DMA-BUF, el
+    // intra sale con el siguiente cambio de pantalla.
+    let mut last: Option<RawFrame> = None;
+    let mut last_at = Instant::now();
+    loop {
+        if shared.stopping() {
+            break;
+        }
+        let input = match rx.recv_timeout(POLL) {
+            Ok(mut frame) => {
+                // Como `recv_latest`: el más reciente, y los demás cuentan como descartes.
+                while let Ok(newer) = rx.try_recv() {
+                    ledger.record_drop(Stage::Encoded);
+                    frame = newer;
+                }
+                last_at = Instant::now();
+                EncodeInput::Captured(frame)
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if shared.keyframe_requested.load(Ordering::Acquire)
+                    && last_at.elapsed() >= IDLE_KEYFRAME
+                {
+                    // Un intento cada `IDLE_KEYFRAME` como mucho.
+                    last_at = Instant::now();
+                    EncodeInput::Repeat
+                } else {
+                    continue;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        let raw = match input {
+            EncodeInput::Captured(frame) => {
+                // H.264 4:2:0 necesita un tamaño par: se recorta la última fila o columna si sobra.
+                let raw = to_raw_frame(frame);
+                if raw.width == 0 || raw.height == 0 {
+                    ledger.record_drop(Stage::Encoded);
+                    continue;
+                }
+                Some(raw)
+            }
+            // Sin imagen de CPU guardada, repite el codificador (si puede).
+            EncodeInput::Repeat => last.take(),
+        };
+        // Sin invitados o sin códec no se codifica, pero se guarda la imagen: si la pantalla está
+        // quieta cuando llegue uno, es la que se le envía.
+        let keep = |raw: Option<RawFrame>| raw.filter(|raw| raw.gpu.is_none());
         if let Some(control) = control {
             if let Some(next) = control.take_next() {
                 // Códec nuevo (negociación): sale ya configurado y su primer fotograma es intra.
                 encoder = Some(next);
-                bitrate = None;
+                gate = BitrateGate::default();
             }
             if !control.active.load(Ordering::Acquire) {
+                last = keep(raw);
                 continue;
             }
         }
         let Some(encoder) = encoder.as_mut() else {
             // Todavía no hay códec (el anfitrión espera las capacidades del invitado).
+            last = keep(raw);
             continue;
         };
         if let Some(control) = control {
             let target = control.bitrate_kbps.load(Ordering::Acquire);
-            if bitrate != Some(target) {
-                encoder.set_bitrate(target).map_err(PipelineError::Codec)?;
-                bitrate = Some(target);
+            if let Some(kbps) = gate.decide(target, encoder.live_bitrate(), Instant::now()) {
+                encoder.set_bitrate(kbps).map_err(PipelineError::Codec)?;
+                bump(&shared.counters.bitrate_changes);
             }
         }
-        let frame_id = frame.frame_id;
-        // H.264 4:2:0 necesita un tamaño par: se recorta la última fila o columna si sobra.
-        let raw = to_raw_frame(frame);
-        if raw.width == 0 || raw.height == 0 {
-            ledger.record_drop(Stage::Encoded);
-            continue;
-        }
-        if shared.keyframe_requested.swap(false, Ordering::AcqRel) {
+        let forced = shared.take_keyframe_request();
+        if forced {
             encoder.request_keyframe();
         }
-        let slices = encoder.encode(&raw).map_err(PipelineError::Codec)?;
+        let started = Instant::now();
+        let slices = match &raw {
+            Some(raw) => encoder.encode(raw).map_err(PipelineError::Codec)?,
+            None => match encoder.repeat_last() {
+                Some(slices) => slices.map_err(PipelineError::Codec)?,
+                None => {
+                    // Nada que repetir: el intra queda pedido para el siguiente fotograma.
+                    if forced {
+                        shared.request_keyframe();
+                    }
+                    continue;
+                }
+            },
+        };
+        if forced {
+            bump(&shared.counters.forced_keyframes);
+        }
         let encoded_at = Instant::now();
-        // La imagen (y el búfer de la captura que retiene) se suelta en cuanto se codifica.
-        drop(raw);
+        shared.counters.record_encode(encoded_at - started);
+        // El fotograma repetido conserva su id: sus marcas de captura son las del original.
+        let Some(frame_id) = raw
+            .as_ref()
+            .map(|raw| raw.frame_id)
+            .or_else(|| slices.first().map(|slice| slice.frame_id))
+        else {
+            ledger.record_drop(Stage::Encoded);
+            continue;
+        };
+        // La imagen de GPU (y el búfer de la captura que retiene) se suelta en cuanto se codifica.
+        last = keep(raw);
         ledger.record_cpu_copies(Stage::Encoded, encoder.cpu_copies());
         if slices.is_empty() {
             // El codificador se saltó el fotograma.
@@ -875,6 +1092,11 @@ pub(crate) fn encode_loop(
             ledger.mark(frame_id, Stage::Encrypted, encoded_at);
         }
         ledger.record_encoded_bytes_at(data.len() as u64, encoded_at);
+        bump(&shared.counters.encoded);
+        shared
+            .counters
+            .encoded_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
         let compressed = Compressed {
             frame_id,
             keyframe,
@@ -902,6 +1124,7 @@ fn send_loop(
             .send_frame(wire_id, frame.keyframe, &frame.data)
             .map_err(|err| PipelineError::Transport(err.to_string()))?;
         ledger.mark(frame.frame_id, Stage::Sent, Instant::now());
+        bump(&shared.counters.sent);
     }
     Ok(())
 }
@@ -962,38 +1185,67 @@ pub(crate) fn decode_loop(
     // Formato del decodificador que pidió `control` (el de la sesión remota; en local, el del
     // decodificador que se dio).
     let mut opened_format: Option<VideoFormat> = None;
+    // Lo pedido que no se pudo abrir: no se reintenta en cada fotograma, sino cuando cambie.
+    let mut unavailable: Option<(Codec, VideoFormat)> = None;
+    let mut health = DecodeHealth::default();
+    // En la sesión remota los ids son los grupos, consecutivos: un hueco es un fotograma perdido
+    // (grupo vencido, descartado en la cola o sin descifrar). En local no: los ids son los de la
+    // captura, que tiene sus propios descartes antes de codificar.
+    let mut last_id: Option<u64> = None;
+    // Tras una pérdida, un error o al abrir el decodificador se espera al siguiente intra:
+    // decodificar contra referencias que faltan da basura sin error en AV1 (dav1d y los de
+    // hardware no avisan) y artefactos que se arrastran en H.264 y HEVC.
+    let mut need_keyframe = control.is_some();
+    let mut last_none_request: Option<Instant> = None;
     while let Some(frame) = recv_or_stop(&rx, shared) {
+        let now = Instant::now();
+        if control.is_some() {
+            if last_id.is_some_and(|last| frame.frame_id != last.wrapping_add(1)) {
+                need_keyframe = true;
+            }
+            last_id = Some(frame.frame_id);
+        }
         if let Some(control) = control
-            && let Some((codec, format)) = control.wanted()
+            && let Some(wanted @ (codec, format)) = control.wanted()
             && (decoder
                 .as_ref()
                 .is_none_or(|current| current.codec() != codec)
                 || opened_format != Some(format))
+            && unavailable != Some(wanted)
         {
-            let opened = control
-                .set
-                .open_format(codec, format)
-                .map_err(PipelineError::Codec)?;
-            let suffix = if format.is_default() {
-                String::new()
-            } else {
-                format!(" · {format}")
-            };
-            ledger.set_video(format!(
-                "{codec} · decodifica {}{suffix}",
-                decoder_label(codec, opened.backend())
-            ));
-            decoder = Some(opened);
-            opened_format = Some(format);
+            decoder = None;
+            opened_format = None;
+            match control.open(codec, format) {
+                Ok(opened) => {
+                    set_decoder_label(ledger, codec, format, opened.backend());
+                    decoder = Some(opened);
+                    opened_format = Some(format);
+                    unavailable = None;
+                }
+                Err(err) => {
+                    // Ningún decodificador de este códec abre: se renegocia sin él.
+                    warn!(%codec, %format, error = %err, "no abre ningún decodificador");
+                    unavailable = Some(wanted);
+                    control.give_up_codec(codec);
+                }
+            }
+            health = DecodeHealth::default();
             // Lo anterior era de otro códec o formato: hace falta un intra del nuevo.
+            need_keyframe = true;
             shared.request_keyframe();
         }
-        let Some(decoder) = decoder.as_mut() else {
+        let Some(current) = decoder.as_mut() else {
             // Aún no se sabe el códec (no ha llegado `CodecSelected`).
             ledger.record_drop(Stage::Decoded);
             shared.request_keyframe();
             continue;
         };
+        if need_keyframe && !frame.keyframe {
+            ledger.record_drop(Stage::Decoded);
+            shared.request_keyframe();
+            continue;
+        }
+        need_keyframe = false;
         let slice = EncodedSlice {
             frame_id: frame.frame_id,
             index: 0,
@@ -1001,10 +1253,14 @@ pub(crate) fn decode_loop(
             keyframe: frame.keyframe,
             data: frame.data,
         };
-        match decoder.decode(std::slice::from_ref(&slice)) {
+        let result = current.decode(std::slice::from_ref(&slice));
+        shared.counters.record_decode(now.elapsed());
+        match result {
             Ok(Some(mut image)) => {
+                health = DecodeHealth::default();
                 ledger.mark(frame.frame_id, Stage::Decoded, Instant::now());
-                ledger.record_cpu_copies(Stage::Decoded, decoder.cpu_copies());
+                ledger.record_cpu_copies(Stage::Decoded, current.cpu_copies());
+                bump(&shared.counters.decoded);
                 image.frame_id = frame.frame_id;
                 // El espacio de color negociado manda (`CodecSelected`).
                 if let Some(format) = opened_format {
@@ -1014,17 +1270,124 @@ pub(crate) fn decode_loop(
                     break;
                 }
             }
-            Ok(None) => ledger.record_drop(Stage::Decoded),
+            Ok(None) => {
+                ledger.record_drop(Stage::Decoded);
+                health.failed(frame.keyframe, false, now);
+                // Un fotograma normal sin imagen: el decodificador se quedó sin referencias
+                // sin decir nada. Se pide un intra (sin insistir más que el invitado).
+                if !frame.keyframe
+                    && last_none_request
+                        .is_none_or(|at| now.saturating_duration_since(at) >= DECODER_RETRY)
+                {
+                    shared.request_keyframe();
+                    last_none_request = Some(now);
+                }
+            }
             Err(_) => {
                 // Fotograma corrupto o sin referencias: se descarta y se pide un intra.
                 ledger.record_drop(Stage::Decoded);
                 ledger.record_decode_error();
-                decoder.reset();
+                current.reset();
                 shared.request_keyframe();
+                health.failed(frame.keyframe, true, now);
+                need_keyframe = control.is_some();
+            }
+        }
+        if let Some(control) = control
+            && health.broken(now)
+            && let Some(failed) = decoder.take()
+        {
+            // El decodificador no saca imagen con los intra que recibe: el siguiente del orden.
+            let (codec, backend) = (failed.codec(), failed.backend());
+            drop(failed);
+            bump(&shared.counters.decoder_fallbacks);
+            control.exclude(codec, backend);
+            health = DecodeHealth::default();
+            need_keyframe = true;
+            shared.request_keyframe();
+            let format = opened_format.unwrap_or(VideoFormat::SDR_420);
+            match control.open(codec, format) {
+                Ok(next) => {
+                    warn!(
+                        from = %decoder_label(codec, backend),
+                        to = %decoder_label(codec, next.backend()),
+                        "el decodificador no saca imagen; se cambia"
+                    );
+                    set_decoder_label(ledger, codec, format, next.backend());
+                    decoder = Some(next);
+                }
+                Err(_) => {
+                    warn!(
+                        %codec,
+                        "ningún decodificador de este códec saca imagen; se renegocia sin él"
+                    );
+                    opened_format = None;
+                    unavailable = control.wanted();
+                    control.give_up_codec(codec);
+                }
             }
         }
     }
     Ok(())
+}
+
+/// Fallos con un intra ya entregado (sin ninguna imagen desde entonces) tras los que se deja el
+/// decodificador.
+pub(crate) const FALLBACK_ERRORS: u32 = 4;
+
+/// Tiempo sin imagen desde el primer intra entregado (con al menos dos) tras el que se deja el
+/// decodificador.
+pub(crate) const FALLBACK_STALL: Duration = Duration::from_secs(2);
+
+/// Intervalo mínimo entre dos intra que pide el decodificador porque un fotograma no dio imagen.
+const DECODER_RETRY: Duration = Duration::from_millis(250);
+
+/// Si el decodificador funciona: cuenta los intra que se le dieron sin que saliera ninguna imagen
+/// y los errores desde el primero de ellos. Los errores de antes de un intra no cuentan: son los
+/// de una pérdida normal (faltan referencias hasta que llegue el intra pedido).
+#[derive(Debug, Default)]
+struct DecodeHealth {
+    keyframes: u32,
+    errors: u32,
+    since: Option<Instant>,
+}
+
+impl DecodeHealth {
+    fn failed(&mut self, keyframe: bool, error: bool, now: Instant) {
+        if keyframe {
+            self.keyframes += 1;
+            self.since.get_or_insert(now);
+        }
+        if error && self.keyframes > 0 {
+            self.errors += 1;
+        }
+    }
+
+    fn broken(&self, now: Instant) -> bool {
+        self.errors >= FALLBACK_ERRORS
+            || (self.keyframes >= 2
+                && self
+                    .since
+                    .is_some_and(|since| now.saturating_duration_since(since) >= FALLBACK_STALL))
+    }
+}
+
+/// Texto del vídeo del invitado: `AV1 · decodifica dav1d`.
+fn set_decoder_label(
+    ledger: &LatencyLedger,
+    codec: Codec,
+    format: VideoFormat,
+    backend: DecoderBackend,
+) {
+    let suffix = if format.is_default() {
+        String::new()
+    } else {
+        format!(" · {format}")
+    };
+    ledger.set_video(format!(
+        "{codec} · decodifica {}{suffix}",
+        decoder_label(codec, backend)
+    ));
 }
 
 pub(crate) fn present_loop(
@@ -1047,6 +1410,7 @@ pub(crate) fn present_loop(
         .map_err(PipelineError::Sink)?;
         ledger.mark(frame_id, Stage::Presented, Instant::now());
         ledger.record_cpu_copies(Stage::Presented, sink.cpu_copies());
+        bump(&shared.counters.presented);
         presented += 1;
         if frames.is_some_and(|limit| presented >= limit) {
             shared.finish(None);
@@ -1224,6 +1588,384 @@ mod tests {
             released.load(Ordering::SeqCst),
             "el búfer vuelve al soltar la imagen"
         );
+    }
+
+    /// Decodificador falso: da una imagen por fotograma si `works`, si no un error; anota los ids
+    /// que le llegan.
+    struct FakeDecoder {
+        codec: Codec,
+        backend: DecoderBackend,
+        works: bool,
+        seen: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl Decoder for FakeDecoder {
+        fn codec(&self) -> Codec {
+            self.codec
+        }
+
+        fn backend(&self) -> DecoderBackend {
+            self.backend
+        }
+
+        fn decode(&mut self, slices: &[EncodedSlice]) -> Result<Option<RawFrame>, CodecError> {
+            let id = slices.first().map_or(0, |slice| slice.frame_id);
+            self.seen.lock().unwrap().push(id);
+            if self.works {
+                Ok(Some(RawFrame::cpu(
+                    id,
+                    (2, 2),
+                    PixelFormat::I420,
+                    2,
+                    vec![0; RawFrame::i420_len(2, 2)],
+                )))
+            } else {
+                Err(CodecError::Backend("falla siempre".into()))
+            }
+        }
+
+        fn reset(&mut self) {}
+    }
+
+    /// Hace pasar `frames` (`(id, intra)`) por `decode_loop` con `control` y devuelve los ids de
+    /// las imágenes que salieron.
+    fn run_decode(control: &DecodeControl, shared: &Shared, frames: &[(u64, bool)]) -> Vec<u64> {
+        let ledger = LatencyLedger::new();
+        let (tx, rx) = bounded::<Compressed>(frames.len().max(1));
+        let (out_tx, out_rx) = bounded::<RawFrame>(frames.len().max(1));
+        for &(frame_id, keyframe) in frames {
+            tx.send(Compressed {
+                frame_id,
+                keyframe,
+                data: vec![1, 2, 3],
+            })
+            .unwrap();
+        }
+        drop(tx);
+        decode_loop(
+            None,
+            rx,
+            out_tx,
+            out_rx.clone(),
+            shared,
+            &ledger,
+            Some(control),
+        )
+        .unwrap();
+        out_rx.try_iter().map(|frame| frame.frame_id).collect()
+    }
+
+    /// Abre `FakeDecoder` con el primer backend que quede de `codec`; los de `broken` fallan.
+    fn fake_opener(
+        broken: Vec<(Codec, DecoderBackend)>,
+        seen: Arc<Mutex<Vec<u64>>>,
+    ) -> DecoderOpener {
+        Box::new(move |set, codec, _format| {
+            let &(_, backend) = set
+                .available()
+                .iter()
+                .find(|(c, _)| *c == codec)
+                .ok_or_else(|| CodecError::Unsupported("no queda ninguno".into()))?;
+            Ok(Box::new(FakeDecoder {
+                codec,
+                backend,
+                works: !broken.contains(&(codec, backend)),
+                seen: Arc::clone(&seen),
+            }))
+        })
+    }
+
+    fn av1_set() -> DecoderSet {
+        DecoderSet::new([
+            (Codec::Av1, DecoderBackend::Vaapi),
+            (Codec::Av1, DecoderBackend::Software),
+            (Codec::H264, DecoderBackend::Software),
+        ])
+    }
+
+    /// Un decodificador que nunca saca imagen se deja por el siguiente del orden.
+    #[test]
+    fn a_broken_decoder_falls_back_to_the_next_backend() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let control = DecodeControl::new(av1_set()).with_opener(fake_opener(
+            vec![(Codec::Av1, DecoderBackend::Vaapi)],
+            Arc::clone(&seen),
+        ));
+        control.request(Codec::Av1, VideoFormat::SDR_420);
+        let shared = Shared::default();
+        let frames: Vec<(u64, bool)> = (1..=12).map(|id| (id, true)).collect();
+        let decoded = run_decode(&control, &shared, &frames);
+        assert_eq!(shared.counters.decoder_fallbacks.load(Ordering::Relaxed), 1);
+        // Los cuatro primeros fallan con VA-API; desde el quinto, dav1d.
+        assert_eq!(decoded, (5..=12).collect::<Vec<_>>());
+        assert_eq!(
+            control.usable().available(),
+            &[
+                (Codec::Av1, DecoderBackend::Software),
+                (Codec::H264, DecoderBackend::Software)
+            ]
+        );
+        assert!(!control.take_renegotiation());
+    }
+
+    /// Si no queda ningún decodificador del códec que funcione, se pide renegociar sin él (el
+    /// anfitrión baja a H.264) y el invitado anuncia solo lo que le queda.
+    #[test]
+    fn without_working_decoders_the_guest_renegotiates_without_the_codec() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let control = DecodeControl::new(av1_set()).with_opener(fake_opener(
+            vec![
+                (Codec::Av1, DecoderBackend::Vaapi),
+                (Codec::Av1, DecoderBackend::Software),
+            ],
+            Arc::clone(&seen),
+        ));
+        control.request(Codec::Av1, VideoFormat::SDR_420);
+        let shared = Shared::default();
+        let frames: Vec<(u64, bool)> = (1..=20).map(|id| (id, true)).collect();
+        assert!(run_decode(&control, &shared, &frames).is_empty());
+        assert!(control.take_renegotiation());
+        assert_eq!(
+            control.usable().available(),
+            &[(Codec::H264, DecoderBackend::Software)]
+        );
+        // Lo que no abre no se reintenta en cada fotograma: después de los dos respaldos, nada.
+        assert_eq!(seen.lock().unwrap().len(), 8);
+        // El anfitrión pasa a H.264: se abre y decodifica.
+        control.request(Codec::H264, VideoFormat::SDR_420);
+        let decoded = run_decode(&control, &shared, &[(21, false), (22, true), (23, false)]);
+        assert_eq!(decoded, vec![22, 23], "espera al intra del códec nuevo");
+    }
+
+    /// Tras un grupo perdido (un hueco en los ids) no se decodifica contra referencias que faltan:
+    /// se descarta hasta el siguiente intra y se pide uno (AV1 no da error, da basura).
+    #[test]
+    fn after_a_lost_group_frames_wait_for_the_next_keyframe() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let control =
+            DecodeControl::new(av1_set()).with_opener(fake_opener(Vec::new(), Arc::clone(&seen)));
+        control.request(Codec::Av1, VideoFormat::SDR_420);
+        let shared = Shared::default();
+        // El primer intra se perdió: llegan 1 y 2 (sin intra), luego el 3 (intra), el 4, se
+        // pierde el 5, y llegan 6, 7 y el intra 8.
+        let frames = [
+            (1, false),
+            (2, false),
+            (3, true),
+            (4, false),
+            (6, false),
+            (7, false),
+            (8, true),
+            (9, false),
+        ];
+        let decoded = run_decode(&control, &shared, &frames);
+        assert_eq!(decoded, vec![3, 4, 8, 9]);
+        assert_eq!(*seen.lock().unwrap(), vec![3, 4, 8, 9]);
+        assert!(shared.take_keyframe_request(), "se pidió un intra");
+    }
+
+    /// Codificador falso: cuenta los cambios de bitrate y los fotogramas, y anota si cada uno fue
+    /// intra.
+    struct FakeEncoder {
+        live: bool,
+        bitrates: Arc<AtomicU32>,
+        keyframes: Arc<Mutex<Vec<(u64, bool)>>>,
+        keyframe: bool,
+    }
+
+    impl Encoder for FakeEncoder {
+        fn codec(&self) -> Codec {
+            Codec::H264
+        }
+
+        fn backend(&self) -> coroom_codec::Backend {
+            coroom_codec::Backend::Software
+        }
+
+        fn configure(&mut self, _config: &EncoderConfig) -> Result<(), CodecError> {
+            Ok(())
+        }
+
+        fn set_bitrate(&mut self, _bitrate_kbps: u32) -> Result<(), CodecError> {
+            self.bitrates.fetch_add(1, Ordering::SeqCst);
+            if !self.live {
+                // Reabrir: el siguiente fotograma es intra.
+                self.keyframe = true;
+            }
+            Ok(())
+        }
+
+        fn live_bitrate(&self) -> bool {
+            self.live
+        }
+
+        fn request_keyframe(&mut self) {
+            self.keyframe = true;
+        }
+
+        fn encode(&mut self, frame: &RawFrame) -> Result<Vec<EncodedSlice>, CodecError> {
+            let keyframe = std::mem::take(&mut self.keyframe);
+            self.keyframes
+                .lock()
+                .unwrap()
+                .push((frame.frame_id, keyframe));
+            Ok(vec![EncodedSlice {
+                frame_id: frame.frame_id,
+                index: 0,
+                count: 1,
+                keyframe,
+                data: vec![0; 16],
+            }])
+        }
+    }
+
+    fn cpu_frame(frame_id: u64) -> CapturedFrame {
+        CapturedFrame {
+            frame_id,
+            width: 4,
+            height: 4,
+            captured_at: Instant::now(),
+            cursor: None,
+            cursor_shape: None,
+            pixels: FramePixels::Bgra {
+                data: vec![0; 64],
+                stride: 16,
+            },
+            cpu_copies: 0,
+        }
+    }
+
+    /// Lanza `encode_loop` con un `FakeEncoder` y un `EncodeControl` activo.
+    struct EncodeHarness {
+        shared: Arc<Shared>,
+        control: Arc<EncodeControl>,
+        frames: Sender<CapturedFrame>,
+        bitrates: Arc<AtomicU32>,
+        encoded: Arc<Mutex<Vec<(u64, bool)>>>,
+        thread: JoinHandle<()>,
+        _out: Receiver<Compressed>,
+    }
+
+    impl EncodeHarness {
+        fn start(live: bool, kbps: u32) -> Self {
+            let shared = Arc::new(Shared::default());
+            let control = Arc::new(EncodeControl::new(kbps));
+            control.active.store(true, Ordering::SeqCst);
+            let bitrates = Arc::new(AtomicU32::new(0));
+            let encoded = Arc::new(Mutex::new(Vec::new()));
+            let encoder = FakeEncoder {
+                live,
+                bitrates: Arc::clone(&bitrates),
+                keyframes: Arc::clone(&encoded),
+                keyframe: true,
+            };
+            let (frames, rx) = bounded::<CapturedFrame>(CHANNEL_CAPACITY);
+            let (tx, out) = bounded::<Compressed>(4096);
+            let thread = {
+                let (shared, control, evict) =
+                    (Arc::clone(&shared), Arc::clone(&control), out.clone());
+                thread::spawn(move || {
+                    let ledger = LatencyLedger::new();
+                    encode_loop(
+                        Some(Box::new(encoder)),
+                        rx,
+                        tx,
+                        evict,
+                        &shared,
+                        &ledger,
+                        Some(&control),
+                    )
+                    .unwrap();
+                })
+            };
+            Self {
+                shared,
+                control,
+                frames,
+                bitrates,
+                encoded,
+                thread,
+                _out: out,
+            }
+        }
+
+        fn stop(self) -> (u32, Vec<(u64, bool)>) {
+            self.shared.stop.store(true, Ordering::SeqCst);
+            drop(self.frames);
+            self.thread.join().unwrap();
+            let encoded = self.encoded.lock().unwrap().clone();
+            (self.bitrates.load(Ordering::SeqCst), encoded)
+        }
+    }
+
+    /// Con un objetivo que oscila (como el del control de tasa: pasos del 10 % y alguno grande),
+    /// un codificador sin bitrate en caliente se reabre pocas veces; uno con él lo sigue siempre.
+    #[test]
+    fn a_fluctuating_target_reopens_a_non_live_encoder_a_bounded_number_of_times() {
+        for live in [false, true] {
+            let harness = EncodeHarness::start(live, 10_000);
+            let targets = [
+                10_000, 11_000, 12_100, 11_000, 7_000, 15_000, 10_000, 16_000,
+            ];
+            let mut changes = 0;
+            for (i, frame) in (0..80u64).enumerate() {
+                let target = targets[(i / 10) % targets.len()];
+                let previous = harness.control.bitrate_kbps.swap(target, Ordering::SeqCst);
+                if previous != target {
+                    changes += 1;
+                }
+                harness.frames.send(cpu_frame(frame)).unwrap();
+                thread::sleep(Duration::from_millis(10));
+            }
+            thread::sleep(Duration::from_millis(50));
+            let (bitrates, encoded) = harness.stop();
+            let keyframes = encoded.iter().filter(|(_, keyframe)| *keyframe).count();
+            if live {
+                // El primero y cada cambio.
+                assert_eq!(bitrates as usize, changes + 1, "{encoded:?}");
+            } else {
+                // El primero y la bajada de ≥ 20 % (a 7 000); los pasos del 10 % no, y las subidas
+                // tampoco: no han pasado 4 s desde la apertura. Un intra por cada uno.
+                assert_eq!(bitrates, 2, "{bitrates} reaperturas de {changes} cambios");
+                assert_eq!(keyframes, 2, "{encoded:?}");
+            }
+        }
+    }
+
+    /// Con la pantalla quieta, un intra pedido sale repitiendo el último fotograma (antes había
+    /// que esperar a que la pantalla cambiase).
+    #[test]
+    fn a_keyframe_request_on_a_still_screen_repeats_the_last_frame() {
+        let harness = EncodeHarness::start(true, 10_000);
+        for frame in 0..3 {
+            harness.frames.send(cpu_frame(frame)).unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+        thread::sleep(Duration::from_millis(100));
+        harness.shared.request_keyframe();
+        thread::sleep(IDLE_KEYFRAME + Duration::from_millis(300));
+        let (_, encoded) = harness.stop();
+        assert_eq!(encoded.len(), 4, "{encoded:?}");
+        assert_eq!(encoded[3], (2, true), "el último otra vez, intra");
+    }
+
+    #[test]
+    fn the_bitrate_gate_spaces_reopens_but_not_live_changes() {
+        let start = Instant::now();
+        let mut gate = BitrateGate::default();
+        assert_eq!(gate.decide(10_000, false, start), Some(10_000));
+        // −10 %: no; −20 %: al momento.
+        assert_eq!(gate.decide(9_000, false, start), None);
+        assert_eq!(gate.decide(8_000, false, start), Some(8_000));
+        // +25 % antes de 4 s desde la última subida (la apertura): no; pasados, sí.
+        let at = |ms| start + Duration::from_millis(ms);
+        assert_eq!(gate.decide(10_000, false, at(1_000)), None);
+        assert_eq!(gate.decide(10_000, false, at(4_000)), Some(10_000));
+        assert_eq!(gate.decide(13_000, false, at(5_000)), None);
+        // En caliente, cualquier cambio.
+        let mut live = BitrateGate::default();
+        assert_eq!(live.decide(10_000, true, start), Some(10_000));
+        assert_eq!(live.decide(10_100, true, start), Some(10_100));
     }
 
     #[test]

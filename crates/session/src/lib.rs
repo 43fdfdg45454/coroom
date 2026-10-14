@@ -27,6 +27,7 @@ pub mod latency;
 pub mod loopback;
 pub mod preview;
 pub mod remote;
+pub mod stats;
 
 use latency::{LatencyLedger, LatencySummary};
 use loopback::{FrameSink, LoopbackConfig, LoopbackPipeline};

@@ -998,6 +998,11 @@ impl RemoteSession {
         &self.core.ledger
     }
 
+    /// Contadores acumulados del vídeo (para diagnóstico y tests).
+    pub fn video_counters(&self) -> crate::stats::VideoCounters {
+        self.core.shared.counters.video()
+    }
+
     /// Huella de la identidad local.
     pub fn fingerprint(&self) -> String {
         self.core.identity.fingerprint()

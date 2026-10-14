@@ -13,6 +13,7 @@ use coroom_transport::media::{
 use coroom_transport::proto::PROTOCOL_VERSION;
 use coroom_transport::proto::control::{Hello, Role};
 use coroom_transport::proto::media::Track;
+use coroom_transport::rate::RateConfig;
 use coroom_transport::{Endpoint, EndpointOptions, PeerConnection};
 
 pub const TIMEOUT: Duration = Duration::from_secs(10);
@@ -101,6 +102,31 @@ pub async fn transmit(
     size: impl Fn(u32) -> usize + Send + 'static,
     fps: u32,
 ) -> Run {
+    transmit_with(
+        host_conn,
+        guest_conn,
+        host,
+        guest,
+        frames,
+        size,
+        fps,
+        RateConfig::default(),
+    )
+    .await
+}
+
+/// Como [`transmit`], con los límites del control de tasa del emisor.
+#[allow(clippy::too_many_arguments)]
+pub async fn transmit_with(
+    host_conn: PeerConnection,
+    guest_conn: PeerConnection,
+    host: &Peer,
+    guest: &Peer,
+    frames: u32,
+    size: impl Fn(u32) -> usize + Send + 'static,
+    fps: u32,
+    rate: RateConfig,
+) -> Run {
     let interval = Duration::from_secs(1) / fps;
     let accept = {
         let host_conn = host_conn.clone();
@@ -119,7 +145,7 @@ pub async fn transmit(
         host_conn,
         MediaSenderConfig {
             frame_interval: interval,
-            ..MediaSenderConfig::default()
+            rate,
         },
     ));
     let receiver = Arc::new(MediaReceiver::new(

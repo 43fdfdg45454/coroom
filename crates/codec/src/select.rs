@@ -242,6 +242,14 @@ impl DecoderSet {
         self
     }
 
+    /// El mismo conjunto sin las combinaciones de `excluded` (los decodificadores que fallaron en
+    /// la sesión: el siguiente que se abra es el que viene después en el orden).
+    pub fn without(&self, excluded: &[(Codec, DecoderBackend)]) -> Self {
+        let mut out = self.clone();
+        out.available.retain(|pair| !excluded.contains(pair));
+        out
+    }
+
     /// Combinaciones disponibles (lo que se anuncia al anfitrión).
     pub fn available(&self) -> &[(Codec, DecoderBackend)] {
         &self.available
@@ -354,5 +362,8 @@ mod tests {
         let decoders = DecoderSet::openh264();
         assert_eq!(decoders.open(Codec::H264).unwrap().codec(), Codec::H264);
         assert!(decoders.open(Codec::Av1).is_err());
+        let without = decoders.without(&[(Codec::H264, DecoderBackend::Software)]);
+        assert!(without.is_empty());
+        assert!(without.open(Codec::H264).is_err());
     }
 }

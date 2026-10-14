@@ -355,6 +355,11 @@ pub struct AudioCounters {
     pub jitter_p95_ms: f64,
     /// Paquetes enviados (emisor).
     pub sent: u64,
+    /// Veces que la salida de audio (el dispositivo o su cola) se quedó sin nada y sonó silencio;
+    /// la salida es común a las pistas, así que es el mismo valor en las dos.
+    pub device_underruns: u64,
+    /// Veces que no cupo en la cola de la salida lo que se escribió y se perdió audio.
+    pub device_overruns: u64,
 }
 
 impl AudioCounters {
@@ -455,6 +460,13 @@ impl fmt::Display for AudioSummary {
             )?;
             if c.sent > 0 {
                 write!(f, " · {} enviados", c.sent)?;
+            }
+            if c.device_underruns + c.device_overruns > 0 {
+                write!(
+                    f,
+                    " · salida sin audio {} · desbordes {}",
+                    c.device_underruns, c.device_overruns
+                )?;
             }
             for span in &track.spans {
                 write!(

@@ -81,10 +81,8 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             app.invitations.retain(|invitation| invitation.code != code);
             guest::start(app, code)
         }
-        Msg::Share => {
-            app.page = Page::Host;
-            Vec::new()
-        }
+        // Por `Navigate`, que pide ya lo que se puede compartir (o la lista de amigos).
+        Msg::Share => app.update(Message::Navigate(Page::Host)),
         Msg::Invite(user) => {
             let name = app
                 .friends
@@ -98,10 +96,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             );
             vec![Effect::Invite(user)]
         }
-        Msg::AddFriends => {
-            app.page = Page::Friends;
-            Vec::new()
-        }
+        Msg::AddFriends => app.update(Message::Navigate(Page::Friends)),
     }
 }
 
@@ -432,5 +427,24 @@ mod tests {
         let effects = app.update(Message::Home(Msg::Accept("K7Q2MZ".into())));
         assert!(effects.contains(&Effect::Join("K7Q2MZ".into())));
         assert!(app.invitations.is_empty());
+    }
+
+    /// «Compartir pantalla» pasa por `Navigate`: pide ya qué se puede compartir (antes se quedaba
+    /// en «Buscando…»).
+    #[test]
+    fn share_asks_for_what_can_be_shared() {
+        use crate::ui::screens::host::SourceChoice;
+        let mut app = app();
+        app.screen = Screen::Main;
+        assert_eq!(
+            app.update(Message::Home(Msg::Share)),
+            [Effect::LoadShareOptions(SourceChoice::Screen)]
+        );
+        assert_eq!(app.page, Page::Host);
+        assert!(app.host.refreshing);
+        app.page = Page::Home;
+        let effects = app.update(Message::Home(Msg::AddFriends));
+        assert_eq!(app.page, Page::Friends);
+        assert!(effects.contains(&Effect::LoadFriends), "{effects:?}");
     }
 }

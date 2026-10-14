@@ -250,8 +250,9 @@ impl JitterBuffer {
     }
 
     fn desired_frames(&self) -> i32 {
-        // El ajuste de la sincronía puede quitar el margen y el mínimo de 20 ms, pero no bajar del
-        // p95 del jitter medido (ni de una trama).
+        // El ajuste de la sincronía puede quitar el margen, pero no bajar del p95 del jitter medido
+        // ni del mínimo de 20 ms: con una sola trama en cola, cualquier llegada un poco tarde se
+        // oculta con PLC y una racha de ellas suena robótica.
         (self.target_frames + self.extra_frames).max(self.floor_frames())
     }
 
@@ -268,7 +269,7 @@ impl JitterBuffer {
     }
 
     /// Ajuste que se puede pedir ahora con [`JitterBuffer::set_extra_delay`], en ms: de lo que
-    /// falta para el mínimo (el p95 del jitter, o una trama) a lo que sobra hasta el máximo.
+    /// falta para el mínimo (el p95 del jitter, o [`MIN_TARGET`]) a lo que sobra hasta el máximo.
     pub fn extra_delay_range_ms(&self) -> (i32, i32) {
         let frame = crate::FRAME_DURATION_MS as i32;
         let floor = self.floor_frames();
@@ -281,7 +282,7 @@ impl JitterBuffer {
     fn floor_frames(&self) -> i32 {
         ((self.stats.jitter_p95_ms * 1000.0) as u64)
             .div_ceil(FRAME_US as u64)
-            .clamp(1, frames_for(MAX_TARGET) as u64) as i32
+            .clamp(frames_for(MIN_TARGET) as u64, frames_for(MAX_TARGET) as u64) as i32
     }
 
     fn slot(&self, seq: u32) -> Option<&Slot> {
@@ -753,11 +754,33 @@ mod tests {
         assert_eq!(buffer.target(), Duration::from_millis(50));
         assert_eq!(buffer.extra_delay_ms(), 30);
         buffer.set_extra_delay(-500);
-        assert_eq!(buffer.target(), FRAME_DURATION, "nunca menos de una trama");
+        assert_eq!(buffer.target(), MIN_TARGET, "nunca menos del mínimo");
         // Ni del p95 del jitter medido.
         buffer.stats.jitter_p95_ms = 25.0;
         assert_eq!(buffer.target(), Duration::from_millis(30));
         assert_eq!(buffer.extra_delay_range_ms(), (10, 200));
+    }
+
+    #[test]
+    fn av_sync_never_takes_the_target_below_the_minimum() {
+        // La sincronía pide todo lo que puede quitar: el objetivo se queda en 20 ms (dos tramas);
+        // con una sola, cada llegada un poco tarde era una trama de PLC (audio robótico).
+        let mut buffer = JitterBuffer::new();
+        let (min, _) = buffer.extra_delay_range_ms();
+        assert_eq!(min, 0, "con el objetivo mínimo no hay nada que quitar");
+        buffer.set_extra_delay(-200);
+        assert_eq!(buffer.desired_frames(), frames_for(MIN_TARGET));
+        assert_eq!(buffer.target(), MIN_TARGET);
+        // Con un objetivo mayor por el jitter, sí se puede bajar, pero solo hasta el p95.
+        buffer.stats.jitter_p95_ms = 8.0;
+        buffer.target_frames = 4;
+        assert_eq!(buffer.extra_delay_range_ms(), (-20, 200));
+        assert_eq!(buffer.target(), MIN_TARGET);
+        // Llegadas que bailan 1-9 ms con la sincronía pidiendo −50 ms: nada se oculta.
+        let wobble = |seq: u32| MS * (seq * 7 % 9);
+        let (_, stats) = hold(MS, wobble, -50);
+        assert!(stats.target_ms >= 20.0, "{stats:?}");
+        assert_eq!(stats.concealed + stats.underruns, 0, "{stats:?}");
     }
 
     /// Tramas cada 10 ms que llegan `delay` después de capturarse (más `wobble(seq)`), con la
@@ -799,10 +822,10 @@ mod tests {
         let (wait, stats) = hold(3 * MS, |_| Duration::ZERO, 0);
         assert!((wait - 15.0).abs() < 0.5, "{wait} ms {stats:?}");
         assert_eq!((stats.trimmed, stats.stretched), (0, 0), "{stats:?}");
-        // Con la sincronía pidiendo una trama menos: 5 ms, con un solo recorte.
+        // Con la sincronía pidiendo una trama menos, la cola no baja del mínimo (dos tramas).
         let (wait, stats) = hold(3 * MS, |_| Duration::ZERO, -10);
-        assert!((wait - 5.0).abs() < 0.5, "{wait} ms {stats:?}");
-        assert_eq!((stats.trimmed, stats.stretched), (1, 0), "{stats:?}");
+        assert!((wait - 15.0).abs() < 0.5, "{wait} ms {stats:?}");
+        assert_eq!((stats.trimmed, stats.stretched), (0, 0), "{stats:?}");
     }
 
     #[test]
@@ -829,8 +852,8 @@ mod tests {
         // La trama 60 llega 25 ms tarde: la cola se vacía una vez y luego se queda con una de
         // más. Pasado ese momento se recorta igual (antes el vacío frenaba el recorte para siempre).
         let late = |seq: u32| if seq == 60 { 25 * MS } else { Duration::ZERO };
-        let (wait, stats) = hold(3 * MS, late, -10);
-        assert!((wait - 5.0).abs() < 0.5, "{wait} ms {stats:?}");
+        let (wait, stats) = hold(3 * MS, late, 0);
+        assert!((wait - 15.0).abs() < 0.5, "{wait} ms {stats:?}");
         assert!(stats.trimmed >= 1, "{stats:?}");
     }
 

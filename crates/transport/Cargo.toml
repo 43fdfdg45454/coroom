@@ -35,8 +35,9 @@ tracing.workspace = true
 wtransport-proto.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-# `timeBeginPeriod`: resolución de 1 ms para el pacer de QUIC y los temporizadores (ver quic.rs).
-windows = { workspace = true, features = ["Win32_Media"] }
+# `timeBeginPeriod` y `SetProcessInformation`: resolución de 1 ms para el pacer de QUIC y los
+# temporizadores, también con la ventana oculta o minimizada (ver quic.rs).
+windows = { workspace = true, features = ["Win32_Media", "Win32_System_Threading"] }
 
 [dev-dependencies]
 bytes.workspace = true

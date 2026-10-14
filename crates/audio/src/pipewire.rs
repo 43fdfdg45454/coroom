@@ -28,17 +28,17 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use pipewire as pw;
 use pw::spa;
 use pw::spa::param::audio::{AudioFormat as SpaAudioFormat, AudioInfoRaw};
 use pw::spa::pod::Pod;
 
-use crate::ring::Shared;
+use crate::ring::{Pull, Shared};
 use crate::{
-    AudioConfig, AudioError, AudioFormat, AudioSink, AudioSource, Captured, DeviceInfo, DeviceKind,
-    Played, Render, SAMPLE_RATE_HZ,
+    AudioConfig, AudioError, AudioFormat, AudioSink, AudioSource, Captured, DeviceCounters,
+    DeviceInfo, DeviceKind, Played, Render, SAMPLE_RATE_HZ,
 };
 
 /// Espera máxima a que el hilo de PipeWire conecte el flujo.
@@ -103,40 +103,6 @@ struct StreamData {
     scratch: [i16; crate::MAX_FRAME_SAMPLES],
     /// Reproducción a demanda.
     pull: Option<Pull>,
-}
-
-/// Reproducción a demanda: lo que pide cada trama y lo que sobró de la última, si el grafo pide
-/// cuantos de menos de 10 ms.
-struct Pull {
-    render: Render,
-    frame: [i16; crate::MAX_FRAME_SAMPLES],
-    len: usize,
-    pos: usize,
-}
-
-impl Pull {
-    /// Llena `out` (intercalado, `channels` canales) pidiendo tramas nuevas cuando se acaba la
-    /// anterior. La primera muestra de `out` sonará dentro de `delay`.
-    fn fill(&mut self, out: &mut [i16], channels: usize, delay: Duration) {
-        let frame_len = crate::SAMPLES_PER_CHANNEL * channels;
-        let now = Instant::now();
-        let mut written = 0;
-        while written < out.len() {
-            if self.pos == self.len {
-                let ahead = Duration::from_micros(
-                    (written / channels) as u64 * 1_000_000 / u64::from(SAMPLE_RATE_HZ),
-                );
-                let frame = &mut self.frame[..frame_len];
-                frame.fill(0);
-                (self.render)(frame, now + delay + ahead);
-                (self.len, self.pos) = (frame_len, 0);
-            }
-            let n = (self.len - self.pos).min(out.len() - written);
-            out[written..written + n].copy_from_slice(&self.frame[self.pos..self.pos + n]);
-            self.pos += n;
-            written += n;
-        }
-    }
 }
 
 fn format_param(format: AudioFormat) -> Result<Vec<u8>, AudioError> {
@@ -277,12 +243,7 @@ fn run_stream(
             channels: usize::from(format.channels),
             info: AudioInfoRaw::default(),
             scratch: [0; crate::MAX_FRAME_SAMPLES],
-            pull: pull.map(|render| Pull {
-                render,
-                frame: [0; crate::MAX_FRAME_SAMPLES],
-                len: 0,
-                pos: 0,
-            }),
+            pull: pull.map(Pull::new),
         };
         let errors = Arc::clone(&shared);
         let _listener = stream
@@ -575,10 +536,17 @@ impl AudioSink for PlaybackSink {
 
     fn check(&mut self) -> Result<(), AudioError> {
         let shared = self.shared.as_ref().ok_or(AudioError::Stopped)?;
-        match shared.lock().failure.clone() {
+        match shared.failure() {
             Some(err) => Err(err),
             None => Ok(()),
         }
+    }
+
+    fn device_counters(&self) -> DeviceCounters {
+        self.shared
+            .as_ref()
+            .map(|shared| shared.counters())
+            .unwrap_or_default()
     }
 
     fn wait_ready(&mut self) -> Result<(), AudioError> {
@@ -800,44 +768,6 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>, AudioError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    #[test]
-    fn on_demand_playback_splits_frames_across_small_quanta() {
-        // El grafo pide cuantos de 256 muestras por canal (5,3 ms): cada trama de 480 se pide una
-        // vez, entera, y lo que sobra va al cuanto siguiente sin perder ni repetir muestras.
-        let calls: Arc<Mutex<Vec<Instant>>> = Arc::default();
-        let seen = Arc::clone(&calls);
-        let mut next = 0i16;
-        let mut pull = Pull {
-            render: Box::new(move |out, played_at| {
-                seen.lock().unwrap().push(played_at);
-                for sample in out.as_chunks_mut::<2>().0 {
-                    sample.fill(next);
-                    next = next.wrapping_add(1);
-                }
-            }),
-            frame: [0; crate::MAX_FRAME_SAMPLES],
-            len: 0,
-            pos: 0,
-        };
-        let delay = Duration::from_millis(10);
-        let mut heard = Vec::new();
-        for _ in 0..15 {
-            let mut quantum = [0i16; 256 * 2];
-            pull.fill(&mut quantum, 2, delay);
-            heard.extend(quantum.as_chunks::<2>().0.iter().map(|s| s[0]));
-        }
-        let expected: Vec<i16> = (0..15 * 256).map(|i| i as i16).collect();
-        assert_eq!(heard, expected);
-        let calls = calls.lock().unwrap();
-        // 15 × 256 = 3840 muestras = 8 tramas exactas.
-        assert_eq!(calls.len(), 8);
-        // Una trama pedida a mitad de cuanto suena después de lo que ya se escribió en él.
-        let first = calls[0];
-        assert!(first >= Instant::now() - Duration::from_secs(1));
-        assert!(calls[1] > first, "{calls:?}");
-    }
 
     fn assert_send<T: Send>() {}
 

@@ -165,20 +165,35 @@ impl FfmpegDecoder {
     }
 
     /// Espera en CPU a que la GPU termine de escribir la imagen Vulkan de `access` (así la marca
-    /// `decodificado` mide la decodificación de verdad). `device` es el de la imagen.
-    fn wait_for_gpu(&mut self, device: &AVHWDeviceContext, access: &VkFrameAccess) {
+    /// `decodificado` mide la decodificación de verdad). `device` es el de la imagen. Devuelve si
+    /// la GPU terminó a tiempo: si no, la imagen no se puede presentar (estaría a medio escribir o
+    /// el dispositivo se perdió) y el fotograma cuenta como error de decodificación.
+    fn wait_for_gpu(&mut self, device: &AVHWDeviceContext, access: &VkFrameAccess) -> bool {
         let key = buffer_key(device.as_ptr());
         if !self.waiters.iter().any(|(known, _)| *known == key) {
             let Some(waiter) = SemaphoreWaiter::new(device) else {
-                return;
+                // Sin `vkWaitSemaphores` no se puede esperar: se presenta como hasta ahora.
+                return true;
             };
             self.waiters.push((key, waiter));
         }
         let state = crate::gpu::VulkanFrameAccess::lock(access);
         crate::gpu::VulkanFrameAccess::unlock(access, None);
-        if let Some((_, waiter)) = self.waiters.iter().find(|(known, _)| *known == key) {
-            waiter.wait(state.semaphore, state.semaphore_value, GPU_WAIT_NS);
-        }
+        self.waiters
+            .iter()
+            .find(|(known, _)| *known == key)
+            .is_none_or(|(_, waiter)| {
+                waiter.wait(state.semaphore, state.semaphore_value, GPU_WAIT_NS)
+            })
+    }
+
+    /// Error de un fotograma cuya GPU no terminó en [`GPU_WAIT_NS`].
+    fn gpu_timeout(&self) -> CodecError {
+        CodecError::Backend(format!(
+            "la GPU no terminó de decodificar con {} en {} ms",
+            self.backend,
+            GPU_WAIT_NS / 1_000_000
+        ))
     }
 
     fn open(
@@ -237,7 +252,7 @@ impl FfmpegDecoder {
             );
             match vulkan {
                 Some(shared) => {
-                    if let Some(image) = self.vulkan_image(frame.clone(), &shared, size) {
+                    if let Some(image) = self.vulkan_image(frame.clone(), &shared, size)? {
                         self.hw_frames += 1;
                         self.gpu_frames += 1;
                         self.copies = 0;
@@ -251,8 +266,9 @@ impl FfmpegDecoder {
                     if frame.format == ffi::AV_PIX_FMT_VULKAN
                         && let Some(device) = self.device.clone()
                         && let Some((access, _)) = VkFrameAccess::new(frame.clone())
+                        && !self.wait_for_gpu(&device, &access)
                     {
-                        self.wait_for_gpu(&device, &access);
+                        return Err(self.gpu_timeout());
                     }
                     let kind = rsmpeg::avutil::get_pix_fmt_name(frame.format).map_or_else(
                         || "gpu".to_owned(),
@@ -270,27 +286,37 @@ impl FfmpegDecoder {
     }
 
     /// Imagen Vulkan presentable en el dispositivo del presentador, decodificada en él o mapeada a
-    /// él. `None` si no se puede (se baja a CPU).
+    /// él. `Ok(None)` si no se puede (se baja a CPU); error si la GPU no terminó a tiempo.
     fn vulkan_image(
         &mut self,
         frame: AVFrame,
         shared: &Arc<SharedVulkanDevice>,
         size: (u32, u32),
-    ) -> Option<GpuImage> {
+    ) -> Result<Option<GpuImage>, CodecError> {
         let frame = if frame.format == ffi::AV_PIX_FMT_VULKAN && self.device_is_shared {
             frame
         } else {
-            self.map_to_vulkan(&frame, shared)?
+            let Some(mapped) = self.map_to_vulkan(&frame, shared) else {
+                return Ok(None);
+            };
+            mapped
         };
         let device = if self.device_is_shared {
-            self.device.clone()?
+            self.device.clone()
         } else {
-            self.map_device.clone()?
+            self.map_device.clone()
         };
-        let (access, info) = VkFrameAccess::new(frame)?;
-        self.wait_for_gpu(&device, &access);
+        let Some(device) = device else {
+            return Ok(None);
+        };
+        let Some((access, info)) = VkFrameAccess::new(frame) else {
+            return Ok(None);
+        };
+        if !self.wait_for_gpu(&device, &access) {
+            return Err(self.gpu_timeout());
+        }
         let (instance, device) = handles(&device);
-        Some(GpuImage::Vulkan(Arc::new(VulkanImage {
+        Ok(Some(GpuImage::Vulkan(Arc::new(VulkanImage {
             width: size.0,
             height: size.1,
             image_width: info.extent.0,
@@ -299,7 +325,7 @@ impl FfmpegDecoder {
             instance,
             device,
             access,
-        })))
+        }))))
     }
 
     /// Mapea un fotograma de VA-API o D3D11VA al dispositivo Vulkan del presentador
@@ -511,22 +537,36 @@ impl Decoder for FfmpegDecoder {
         let frame_id = first.frame_id;
         let pts = i64::try_from(frame_id).unwrap_or(i64::MAX);
         let packet = packet_from(slices, pts)?;
-        match self.ctx.send_packet(Some(&packet)) {
-            Ok(()) => {}
-            // Hay fotogramas sin recoger: se sacan abajo y el paquete se reenvía.
-            Err(RsmpegError::DecoderFullError) => {}
-            Err(RsmpegError::SendPacketError(code)) if code == ffi::AVERROR_INVALIDDATA => {
-                return Err(CodecError::MissingReference);
-            }
-            Err(err) => return Err(backend_error("entregar el paquete", &err)),
-        }
         let mut latest = None;
-        loop {
-            match self.ctx.receive_frame() {
-                Ok(frame) => latest = Some(frame),
-                Err(RsmpegError::DecoderDrainError | RsmpegError::DecoderFlushedError) => break,
-                Err(err) => return Err(backend_error("recibir el fotograma", &err)),
+        // Como mucho dos intentos: si el decodificador está lleno (`EAGAIN`), se recogen los
+        // fotogramas que tiene y el paquete se entrega otra vez; perderlo rompería las referencias.
+        let mut pending = true;
+        for _ in 0..2 {
+            match self.ctx.send_packet(Some(&packet)) {
+                Ok(()) => pending = false,
+                Err(RsmpegError::DecoderFullError) => {}
+                Err(RsmpegError::SendPacketError(code)) if code == ffi::AVERROR_INVALIDDATA => {
+                    return Err(CodecError::MissingReference);
+                }
+                Err(err) => return Err(backend_error("entregar el paquete", &err)),
             }
+            loop {
+                match self.ctx.receive_frame() {
+                    Ok(frame) => latest = Some(frame),
+                    Err(RsmpegError::DecoderDrainError | RsmpegError::DecoderFlushedError) => {
+                        break;
+                    }
+                    Err(err) => return Err(backend_error("recibir el fotograma", &err)),
+                }
+            }
+            if !pending {
+                break;
+            }
+        }
+        if pending {
+            // Lleno aun después de vaciarlo: el paquete no entró y lo que siga no tiene su
+            // referencia. Se avisa como pérdida (la sesión pide un intra).
+            return Err(CodecError::MissingReference);
         }
         match latest {
             Some(frame) => {

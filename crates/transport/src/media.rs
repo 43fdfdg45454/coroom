@@ -4,9 +4,13 @@
 //! su longitud (4 bytes, para recortar el relleno cuando se reconstruye por FEC), se parte en
 //! objetos de origen de como mucho `max_packet − 16` bytes y se le añaden símbolos de reparación
 //! RaptorQ en la proporción `repair_ratio` (0 % sin pérdida, lineal hasta 30 % con pérdida ≥ 5 %,
-//! actualizada con cada `Feedback`; 10 % hasta el primero, cuando la pérdida aún no se conoce). Todo sale con **pacing**: el fotograma se reparte en no más de
-//! `min(intervalo / 2, 4 ms)`. Guarda los objetos de origen de los últimos 16 grupos para responder
-//! a los `Nack`.
+//! actualizada con cada `Feedback`; 10 % hasta el primero, cuando la pérdida aún no se conoce).
+//! Todo sale con **pacing** ([`pacing_duration`]): el fotograma se reparte en lo que tardaría a
+//! 1,25 veces el bitrate objetivo, como mucho 0,8 intervalos (2 intervalos un intra). Antes se
+//! metía en 4 ms: a 120 fps un intra de cientos de KB salía a varios cientos de Mbit/s, llenaba la
+//! cola del camino y el búfer del socket del receptor (64 KB en Windows) y se perdía entero, con lo
+//! que se pedía otro intra igual de grande. Guarda los objetos de origen de los últimos 16 grupos
+//! para responder a los `Nack`; los reenvíos grandes salen con el mismo ritmo.
 //!
 //! **Receptor** ([`MediaReceiver`]): reensambla por pista y grupo, con FEC; plazo por grupo de
 //! 1,5 intervalos desde su primer objeto; a mitad de plazo, si faltan objetos que la FEC no puede
@@ -72,8 +76,68 @@ pub const FEEDBACK_INTERVAL: Duration = Duration::from_millis(50);
 /// Periodo de los `Ping` del receptor.
 pub const PING_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Duración máxima del pacing de un fotograma.
-pub const MAX_PACING: Duration = Duration::from_millis(4);
+/// Ritmo del pacing sobre el bitrate objetivo: algo por encima, para que un fotograma algo mayor
+/// que la media no se retrase más de lo que tarda en salir.
+pub const PACING_GAIN: f64 = 1.25;
+
+/// Parte del intervalo que puede ocupar el pacing de un fotograma normal: lo que sobra deja al hilo
+/// `send` ponerse al día si un fotograma llegó tarde.
+pub const FRAME_PACING_SHARE: f64 = 0.8;
+
+/// Intervalos que puede ocupar el pacing de un intra (como mucho dos fotogramas esperan detrás, lo
+/// que cabe en el canal del codificador).
+pub const KEYFRAME_PACING_INTERVALS: u32 = 2;
+
+/// Objetos de un `Nack` que se reenvían de golpe; los demás, con el ritmo del pacing.
+pub const NACK_BURST: usize = 8;
+
+/// Tiempo en que se reparten los `bytes` de un fotograma: lo que tardan a [`PACING_GAIN`] veces
+/// `target_kbps`, como mucho [`FRAME_PACING_SHARE`] de `interval` (o [`KEYFRAME_PACING_INTERVALS`]
+/// intervalos si es un intra).
+pub fn pacing_duration(
+    bytes: usize,
+    target_kbps: u32,
+    interval: Duration,
+    keyframe: bool,
+) -> Duration {
+    let rate_bps = PACING_GAIN * f64::from(target_kbps.max(1)) * 1000.0;
+    let spread = Duration::from_secs_f64(bytes as f64 * 8.0 / rate_bps);
+    let cap = if keyframe {
+        interval * KEYFRAME_PACING_INTERVALS
+    } else {
+        interval.mul_f64(FRAME_PACING_SHARE)
+    };
+    spread.min(cap)
+}
+
+/// Envía `packets` por `conn` repartidos en `pacing` (en ráfagas de 0,5 ms: los temporizadores no
+/// dan más resolución). Devuelve los que salieron, o el primer error que no sea de tamaño.
+async fn send_paced(
+    conn: &PeerConnection,
+    packets: Vec<Bytes>,
+    pacing: Duration,
+    group: u32,
+) -> Result<usize, TransportError> {
+    let n = packets.len() as u32;
+    let start = tokio::time::Instant::now();
+    let mut sent = 0;
+    for (i, packet) in packets.into_iter().enumerate() {
+        let due = start + pacing * i as u32 / n.max(1);
+        if due > tokio::time::Instant::now() + Duration::from_micros(500) {
+            tokio::time::sleep_until(due).await;
+        }
+        match conn.send_datagram(packet) {
+            Ok(()) => sent += 1,
+            // El MTU del camino bajó a mitad del fotograma (detección de agujero negro): ese
+            // objeto se pierde y los siguientes fotogramas ya usan el tamaño nuevo.
+            Err(TransportError::Datagram(quinn::SendDatagramError::TooLarge)) => {
+                debug!(group, "datagrama mayor que el MTU actual; se descarta");
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(sent)
+}
 
 /// Proporción de reparación hasta el primer `Feedback` (la pérdida aún no se conoce).
 pub const INITIAL_REPAIR_RATIO: f64 = 0.10;
@@ -556,29 +620,19 @@ impl MediaSender {
             repairs: repairs.len(),
             bytes: sources.iter().chain(&repairs).map(Bytes::len).sum(),
         };
-        let pacing = (self.config.frame_interval / 2).min(MAX_PACING);
+        let pacing = pacing_duration(
+            report.bytes,
+            self.target_kbps(),
+            self.config.frame_interval,
+            keyframe,
+        );
         let all: Vec<Bytes> = sources.into_iter().chain(repairs).collect();
-        let n = all.len() as u32;
-        let start = tokio::time::Instant::now();
-        for (i, packet) in all.into_iter().enumerate() {
-            let due = start + pacing * i as u32 / n.max(1);
-            if due > tokio::time::Instant::now() + Duration::from_micros(500) {
-                tokio::time::sleep_until(due).await;
-            }
-            match self.conn.send_datagram(packet) {
-                Ok(()) => {}
-                // El MTU del camino bajó a mitad del fotograma (detección de agujero negro): ese
-                // objeto se pierde y los siguientes fotogramas ya usan el tamaño nuevo.
-                Err(TransportError::Datagram(quinn::SendDatagramError::TooLarge)) => {
-                    debug!(group, "datagrama mayor que el MTU actual; se descarta");
-                }
-                Err(err) => return Err(err),
-            }
-        }
+        send_paced(&self.conn, all, pacing, group).await?;
         Ok(report)
     }
 
-    /// Reenvía los objetos de origen que pide un `Nack` (todos si `missing` está vacío).
+    /// Reenvía los objetos de origen que pide un `Nack` (todos si `missing` está vacío). Devuelve
+    /// cuántos salen (los de un reenvío grande, en una tarea con pacing).
     pub fn on_nack(&self, track: Track, group: u32, missing: &[u16]) -> usize {
         let packets: Vec<Bytes> = match self.state.lock() {
             Ok(state) => match state
@@ -595,6 +649,24 @@ impl MediaSender {
             },
             Err(_) => Vec::new(),
         };
+        // Un reenvío grande (un intra entero) de golpe es la misma ráfaga que se evita al enviar:
+        // pasado [`NACK_BURST`], sale con el ritmo del pacing en una tarea aparte.
+        let runtime = tokio::runtime::Handle::try_current();
+        if packets.len() > NACK_BURST
+            && let Ok(runtime) = runtime
+        {
+            let bytes = packets.iter().map(Bytes::len).sum();
+            let pacing =
+                pacing_duration(bytes, self.target_kbps(), self.config.frame_interval, true);
+            let conn = self.conn.clone();
+            let count = packets.len();
+            runtime.spawn(async move {
+                if let Err(err) = send_paced(&conn, packets, pacing, group).await {
+                    debug!(error = %err, group, "no se pudo reenviar lo que pidió un Nack");
+                }
+            });
+            return count;
+        }
         let mut sent = 0;
         for packet in packets {
             if self.conn.send_datagram(packet).is_ok() {
@@ -889,6 +961,17 @@ pub struct ReceiverCore {
     stats: ReceiverStats,
     highest_group: u32,
     owd_pending: Vec<(u32, i32)>,
+    /// Último `KeyframeRequest` de vídeo, mientras no llegue un intra (ver [`keyframe_hold`]).
+    last_keyframe_request: Option<Instant>,
+}
+
+/// Tiempo tras un `KeyframeRequest` en que no se pide otro por perder un fotograma normal: lo que
+/// tarda en llegar el intra pedido (ida y vuelta, su pacing de 2 intervalos y margen). Cuando se
+/// perdían varios grupos seguidos (una ráfaga que no cabe en el búfer del socket), cada uno pedía su
+/// intra y el anfitrión enviaba uno detrás de otro, cada uno con su propia ráfaga. Si lo que se
+/// pierde es un intra, se pide otro siempre.
+fn keyframe_hold(interval: Duration, rtt: Duration) -> Duration {
+    (rtt * 2 + interval * 4).max(Duration::from_millis(50))
 }
 
 impl ReceiverCore {
@@ -921,6 +1004,7 @@ impl ReceiverCore {
             stats: ReceiverStats::default(),
             highest_group: 0,
             owd_pending: Vec::new(),
+            last_keyframe_request: None,
         }
     }
 
@@ -1183,9 +1267,13 @@ impl ReceiverCore {
                 if state.count.is_none() {
                     self.stats.lost_objects += 1;
                 }
-                if track == Track::Video {
+                let held = self.last_keyframe_request.is_some_and(|at| {
+                    now.saturating_duration_since(at) < keyframe_hold(interval, rtt)
+                });
+                if track == Track::Video && (state.keyframe || !held) {
                     self.outbox.push(ControlMessage::KeyframeRequest { group });
                     self.stats.keyframe_requests += 1;
+                    self.last_keyframe_request = Some(now);
                 }
                 tracks.push(track);
             }
@@ -1258,6 +1346,10 @@ impl ReceiverCore {
                     continue;
                 }
                 self.stats.delivered += 1;
+                if state.keyframe && track == Track::Video {
+                    // Llegó un intra: la próxima pérdida vuelve a pedir otro al momento.
+                    self.last_keyframe_request = None;
+                }
                 self.ready.push_back(CompleteFrame {
                     track,
                     group: next,
@@ -1906,5 +1998,72 @@ mod tests {
         assert_eq!(clock.offset_us(), Some(50_000));
         let remote = clock.remote_us_i32(base + Duration::from_micros(100_000));
         assert_eq!(remote, Some(150_000));
+    }
+
+    /// El pacing reparte cada fotograma al ritmo de 1,25 veces el objetivo, sin pasar de 0,8
+    /// intervalos (2 en un intra): a 120 fps y 20 Mbit/s, un intra de 400 KB ya no sale en 4 ms.
+    #[test]
+    fn pacing_follows_the_target_and_is_capped_per_frame() {
+        let interval = Duration::from_micros(8_333);
+        // 20 KB a 20 Mbit/s × 1,25 = 25 Mbit/s: 6,4 ms.
+        let normal = pacing_duration(20_000, 20_000, interval, false);
+        assert!((normal.as_secs_f64() - 0.0064).abs() < 1e-6, "{normal:?}");
+        // 100 KB serían 32 ms: se recorta a 0,8 intervalos.
+        assert_eq!(
+            pacing_duration(100_000, 20_000, interval, false),
+            interval.mul_f64(FRAME_PACING_SHARE)
+        );
+        // Un intra de 400 KB: 2 intervalos (16,7 ms) en vez de los 4 ms de antes.
+        assert_eq!(
+            pacing_duration(400_000, 20_000, interval, true),
+            interval * 2
+        );
+        // Lo pequeño apenas espera; un objetivo de 0 no divide por cero.
+        assert!(pacing_duration(1_200, 80_000, interval, false) < Duration::from_micros(100));
+        assert_eq!(
+            pacing_duration(1_200, 0, interval, false),
+            interval.mul_f64(FRAME_PACING_SHARE)
+        );
+    }
+
+    /// Varios grupos de vídeo perdidos seguidos piden un solo intra mientras ese viene de camino;
+    /// si lo que se pierde es el intra, se pide otro aunque no haya pasado la espera.
+    #[test]
+    fn a_burst_of_lost_groups_requests_a_single_keyframe() {
+        let mut core = ReceiverCore::new(INTERVAL);
+        let start = Instant::now();
+        let rtt = Duration::from_millis(2);
+        let (g0, _) = packetize(0, &payload(100, 0), 1184, 0);
+        core.push(&g0[0], start, None);
+        assert!(core.pop_frame().is_some());
+        // Los grupos 1 a 5 llegan a medias (falta el objeto 0 de cada uno).
+        for group in 1..=5 {
+            let (sources, _) = packetize(group, &payload(3000, group as u8), 1184, 0);
+            for packet in sources.iter().skip(1) {
+                core.push(packet, start, None);
+            }
+        }
+        core.poll(start + Duration::from_millis(500), rtt);
+        let requests: Vec<_> = core
+            .take_messages()
+            .into_iter()
+            .filter(|m| matches!(m, ControlMessage::KeyframeRequest { .. }))
+            .collect();
+        assert_eq!(requests, vec![ControlMessage::KeyframeRequest { group: 1 }]);
+        assert_eq!(core.stats().dropped, 5);
+
+        // El intra que llega (grupo 6) se pierde también a medias: se pide otro enseguida.
+        let (sources, _) = packetize(6, &payload(3000, 6), 1184, 0);
+        for packet in sources.iter().skip(1) {
+            let mut keyframe = packet.clone();
+            keyframe[2] |= ObjectHeader::KEYFRAME;
+            core.push(&keyframe, start + Duration::from_millis(510), None);
+        }
+        // 60 ms después del primero: dentro de la espera (70 ms), pero es un intra.
+        core.poll(start + Duration::from_millis(560), rtt);
+        assert!(
+            core.take_messages()
+                .contains(&ControlMessage::KeyframeRequest { group: 6 })
+        );
     }
 }

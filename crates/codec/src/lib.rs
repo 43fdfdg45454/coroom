@@ -546,11 +546,26 @@ pub trait Encoder: Send {
     /// Configura o reconfigura el codificador.
     fn configure(&mut self, config: &EncoderConfig) -> Result<(), CodecError>;
 
-    /// Cambia el bitrate objetivo sin reiniciar (el control de tasa lo llama cada 100 ms).
+    /// Cambia el bitrate objetivo (el control de tasa lo llama cada 100 ms). Si el backend no lo
+    /// admite en caliente ([`Encoder::live_bitrate`]), reabre y el siguiente fotograma sale intra.
     fn set_bitrate(&mut self, bitrate_kbps: u32) -> Result<(), CodecError>;
+
+    /// Si [`Encoder::set_bitrate`] cambia el bitrate sin reabrir (sin intra). Por defecto, no: la
+    /// sesión espacia entonces los cambios para no forzar un intra con cada uno.
+    fn live_bitrate(&self) -> bool {
+        false
+    }
 
     /// Fuerza que el siguiente fotograma sea intra.
     fn request_keyframe(&mut self);
+
+    /// Vuelve a codificar como intra el último fotograma de GPU que guarda el propio codificador
+    /// (con la pantalla quieta la captura no entrega ninguno y la sesión no puede guardar la
+    /// imagen de GPU de la captura sin retener su pool). `None` si no guarda ninguno: por
+    /// defecto, y en las rutas que retendrían un búfer de la captura (DMA-BUF).
+    fn repeat_last(&mut self) -> Option<Result<Vec<EncodedSlice>, CodecError>> {
+        None
+    }
 
     /// Codifica un fotograma y devuelve sus slices.
     fn encode(&mut self, frame: &RawFrame) -> Result<Vec<EncodedSlice>, CodecError>;

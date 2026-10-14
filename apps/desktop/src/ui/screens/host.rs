@@ -87,6 +87,8 @@ pub struct ShareOptions {
     pub source: SourceChoice,
     /// Monitores o ventanas (vacío: los elige el sistema al empezar).
     pub targets: Vec<CaptureTarget>,
+    /// Por qué no se pudieron listar los monitores o las ventanas (`targets` va vacío).
+    pub targets_error: Option<String>,
     /// Aplicaciones que suenan (o por qué no se puede elegir el audio por aplicación).
     pub apps: Result<Vec<PlayingApp>, String>,
 }
@@ -197,32 +199,41 @@ impl State {
         self.room.as_ref().map(|room| Arc::clone(&room.preview))
     }
 
-    /// Cuándo toca volver a mirar qué se puede compartir (solo en el paso 1).
-    pub fn next_refresh(&self) -> Option<std::time::Instant> {
+    /// Cuándo toca volver a mirar qué se puede compartir (solo en el paso 1): `now` si nunca se
+    /// ha mirado, `None` con la sala abierta o mientras se mira. Es el plazo que espera la
+    /// ventana; [`State::refresh_due`] dice si ya llegó.
+    pub fn next_refresh(&self, now: std::time::Instant) -> Option<std::time::Instant> {
         if self.is_open() || self.refreshing {
             return None;
         }
-        Some(
-            self.refreshed_at
-                .map_or_else(std::time::Instant::now, |at| at + REFRESH),
-        )
+        Some(self.refreshed_at.map_or(now, |at| at + REFRESH))
+    }
+
+    /// Si toca volver a mirar qué se puede compartir.
+    pub fn refresh_due(&self, now: std::time::Instant) -> bool {
+        !self.is_open()
+            && !self.refreshing
+            && self.refreshed_at.is_none_or(|at| now >= at + REFRESH)
+    }
+
+    /// Lo que se puede compartir con la fuente elegida (`None`: aún no se ha mirado para ella).
+    fn current_options(&self) -> Option<&ShareOptions> {
+        self.options
+            .as_ref()
+            .filter(|options| options.source == self.source)
     }
 
     /// Aplicaciones que suenan, si el audio por aplicación funciona.
     fn playing(&self) -> Option<&[PlayingApp]> {
-        self.options
-            .as_ref()
-            .filter(|options| options.source == self.source)
+        self.current_options()
             .and_then(|options| options.apps.as_ref().ok())
             .map(Vec::as_slice)
     }
 
     /// Si el monitor o la ventana los elige el selector del sistema (no hay lista aquí).
     fn system_picks(&self) -> bool {
-        self.options
-            .as_ref()
-            .filter(|options| options.source == self.source)
-            .is_some_and(|options| options.targets.is_empty())
+        self.current_options()
+            .is_some_and(|options| options.targets.is_empty() && options.targets_error.is_none())
     }
 
     /// Clave de la aplicación de la ventana elegida, si el sistema la dice.
@@ -439,28 +450,27 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             let audio = app.host.game_capture(&app.settings.audio.excluded_apps);
             app.host.starting = true;
             app.host.error = None;
-            return vec![
-                Effect::StopLobby,
-                Effect::StartHost(HostRequest {
-                    source: app.host.source,
-                    share: ShareChoice {
-                        kind: app.host.source.kind(),
-                        target: app
-                            .host
-                            .picked
-                            .as_ref()
-                            .map(|picked| picked.target.clone())
-                            .or_else(|| app.host.target.clone()),
-                        restore_token: app
-                            .host
-                            .picked
-                            .as_ref()
-                            .and_then(|picked| picked.restore_token.clone()),
-                    },
-                    audio,
-                    voice: app.host.voice,
-                }),
-            ];
+            // La sala de espera sigue hasta que la sala esté abierta: así los amigos te siguen
+            // viendo conectado mientras arranca (y si no arranca).
+            return vec![Effect::StartHost(HostRequest {
+                source: app.host.source,
+                share: ShareChoice {
+                    kind: app.host.source.kind(),
+                    target: app
+                        .host
+                        .picked
+                        .as_ref()
+                        .map(|picked| picked.target.clone())
+                        .or_else(|| app.host.target.clone()),
+                    restore_token: app
+                        .host
+                        .picked
+                        .as_ref()
+                        .and_then(|picked| picked.restore_token.clone()),
+                },
+                audio,
+                voice: app.host.voice,
+            })];
         }
         Msg::CopyCode => {
             if let Some(code) = app.host.room.as_ref().and_then(|room| room.code.clone()) {
@@ -534,7 +544,31 @@ pub fn on_share_options(app: &mut App, options: ShareOptions) {
     app.host.refreshing = false;
     app.host.refreshed_at = Some(app.now);
     if options.source != app.host.source {
+        // Llegó tarde, para la fuente de antes: se vuelve a mirar en el próximo `Tick`.
+        app.host.refreshed_at = None;
         return;
+    }
+    // Si no se pudo listar qué compartir, se avisa una vez (la lista se mira cada pocos
+    // segundos) y la sección lo explica mientras dure.
+    let known = app
+        .host
+        .current_options()
+        .and_then(|old| old.targets_error.as_ref());
+    if let Some(err) = &options.targets_error
+        && known != Some(err)
+    {
+        let text = if options.source == SourceChoice::App {
+            t!(
+                "pantalla-host-no-se-pudieron-listar-las-ventanas",
+                error = err
+            )
+        } else {
+            t!(
+                "pantalla-host-no-se-pudieron-listar-los-monitores",
+                error = err
+            )
+        };
+        app.toast(Tone::Warning, text);
     }
     let host = &mut app.host;
     // El destino elegido se mantiene si sigue existiendo (con su título de ahora); si no, el
@@ -611,6 +645,8 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                 relay: None,
             });
             app.page = Page::Host;
+            // La sala lleva su propia señalización: la de espera ya sobra.
+            return vec![Effect::StopLobby];
         }
         Event::HostStarted(Err(err)) => {
             app.host.starting = false;
@@ -921,7 +957,21 @@ fn target_section(state: &State) -> Option<Element<'_, Message>> {
         SourceChoice::Synthetic => return None,
     };
     let mut rows = Vec::new();
-    if state.options.is_none() {
+    let options = state.current_options();
+    if let Some(err) = options.and_then(|options| options.targets_error.as_ref())
+        && options.is_some_and(|options| options.targets.is_empty())
+    {
+        rows.push(ui::pref_row(
+            if state.source == SourceChoice::App {
+                t!("pantalla-host-no-se-pudieron-listar-las-ventanas-titulo")
+            } else {
+                t!("pantalla-host-no-se-pudieron-listar-los-monitores-titulo")
+            },
+            Some(err.clone()),
+            ui::gap(0.0),
+        ));
+    } else if options.is_none() {
+        // Aún no se ha mirado, o lo que hay es de la otra fuente.
         rows.push(ui::pref_row(
             t!("pantalla-host-buscando"),
             None,
@@ -930,8 +980,7 @@ fn target_section(state: &State) -> Option<Element<'_, Message>> {
     } else if state.system_picks() {
         rows.push(picked_row(state));
     } else {
-        let targets: Vec<TargetOption> = state
-            .options
+        let targets: Vec<TargetOption> = options
             .iter()
             .flat_map(|options| options.targets.iter().cloned().map(TargetOption))
             .collect();
@@ -1041,9 +1090,7 @@ fn audio_row<'a>(
 fn audio_section(app: &App) -> Element<'_, Message> {
     let state = &app.host;
     let unsupported = state
-        .options
-        .as_ref()
-        .filter(|options| options.source == state.source)
+        .current_options()
         .and_then(|options| options.apps.as_ref().err());
     let subtitle = match state.source {
         SourceChoice::App => t!("pantalla-host-marcada-la-aplicacion-que-elegiste"),
@@ -1065,7 +1112,7 @@ fn audio_section(app: &App) -> Element<'_, Message> {
         let audio_rows = state.audio_rows(&app.settings.audio.excluded_apps);
         if audio_rows.is_empty() {
             rows.push(ui::pref_row(
-                if state.options.is_none() {
+                if state.current_options().is_none() {
                     t!("pantalla-host-buscando")
                 } else {
                     t!("pantalla-host-ninguna-aplicacion-suena-ahora")
@@ -1499,6 +1546,7 @@ mod tests {
         app.update(Message::Event(Event::ShareOptions(ShareOptions {
             source: SourceChoice::Screen,
             targets: Vec::new(),
+            targets_error: None,
             apps: Ok(playing(&["juego.exe", "discord.exe"])),
         })));
         let rows = app.host.audio_rows(&app.settings.audio.excluded_apps);
@@ -1514,6 +1562,7 @@ mod tests {
         app.update(Message::Event(Event::ShareOptions(ShareOptions {
             source: SourceChoice::Screen,
             targets: Vec::new(),
+            targets_error: None,
             apps: Ok(playing(&["juego.exe"])),
         })));
         let rows = app.host.audio_rows(&app.settings.audio.excluded_apps);
@@ -1526,15 +1575,13 @@ mod tests {
         let effects = app.update(Message::Host(Msg::Start));
         assert_eq!(
             effects,
-            [
-                Effect::StopLobby,
-                Effect::StartHost(HostRequest {
-                    source: SourceChoice::Screen,
-                    share: ShareChoice::default(),
-                    audio: GameCapture::Apps(AppFilter::AllExcept(vec!["discord.exe".into()])),
-                    voice: true,
-                })
-            ]
+            [Effect::StartHost(HostRequest {
+                source: SourceChoice::Screen,
+                share: ShareChoice::default(),
+                audio: GameCapture::Apps(AppFilter::AllExcept(vec!["discord.exe".into()])),
+                voice: true,
+            })],
+            "la sala de espera sigue hasta que la sala abra"
         );
         assert!(app.host.starting && app.host.is_open());
         assert!(
@@ -1561,6 +1608,7 @@ mod tests {
         app.update(Message::Event(Event::ShareOptions(ShareOptions {
             source: SourceChoice::App,
             targets: vec![game.clone(), window(8, "Navegador", Some("firefox.exe"))],
+            targets_error: None,
             apps: Ok(playing(&["discord.exe", "firefox.exe"])),
         })));
         assert_eq!(app.host.target, Some(game.clone()));
@@ -1582,7 +1630,7 @@ mod tests {
         )));
         let effects = app.update(Message::Host(Msg::Start));
         assert_eq!(
-            effects[1],
+            effects[0],
             Effect::StartHost(HostRequest {
                 source: SourceChoice::App,
                 share: ShareChoice {
@@ -1607,6 +1655,7 @@ mod tests {
         app.update(Message::Event(Event::ShareOptions(ShareOptions {
             source: SourceChoice::App,
             targets: Vec::new(),
+            targets_error: None,
             apps: Ok(playing(&["discord", "firefox", "juego"])),
         })));
         assert_eq!(app.host.only, ["juego"]);
@@ -1619,6 +1668,7 @@ mod tests {
         app.update(Message::Event(Event::ShareOptions(ShareOptions {
             source: SourceChoice::App,
             targets: Vec::new(),
+            targets_error: None,
             apps: Ok(playing(&["discord", "juego", "otro"])),
         })));
         assert!(
@@ -1634,6 +1684,7 @@ mod tests {
         app.update(Message::Event(Event::ShareOptions(ShareOptions {
             source: SourceChoice::App,
             targets: Vec::new(),
+            targets_error: None,
             apps: Err("no".into()),
         })));
         assert_eq!(app.host.game_capture(&[]), GameCapture::System);
@@ -1647,6 +1698,7 @@ mod tests {
         app.update(Message::Event(Event::ShareOptions(ShareOptions {
             source: SourceChoice::Screen,
             targets: Vec::new(),
+            targets_error: None,
             apps: Ok(Vec::new()),
         })));
         assert!(app.host.system_picks());
@@ -1672,7 +1724,7 @@ mod tests {
         assert!(!app.host.picking);
         assert_eq!(picked_label(&monitor), "Monitor · 2560 × 1440");
         let effects = app.update(Message::Host(Msg::Start));
-        let Effect::StartHost(request) = &effects[1] else {
+        let Effect::StartHost(request) = &effects[0] else {
             panic!("se esperaba abrir la sala: {effects:?}");
         };
         assert_eq!(request.share.target, Some(monitor));
@@ -1770,6 +1822,118 @@ mod tests {
         let effects = app.update(Message::Event(Event::HostEnded(None)));
         assert!(app.host.room.is_none());
         assert!(effects.is_empty(), "sin cuenta no hay sala de espera");
+    }
+
+    /// Sin haber mirado nunca (se llegó a la página sin `Navigate`), el `Tick` pide la lista; y
+    /// el plazo que espera la ventana nunca queda en el pasado tras un `Tick` (sin bucle de
+    /// redibujado).
+    #[test]
+    fn the_tick_refreshes_when_never_refreshed_without_busy_looping() {
+        let mut app = app();
+        app.screen = crate::ui::app::Screen::Main;
+        app.page = Page::Host;
+        assert!(app.host.refreshed_at.is_none());
+        assert_eq!(app.next_tick(), Some(app.now), "toca ya");
+        assert_eq!(
+            app.update(Message::Tick),
+            [Effect::LoadShareOptions(SourceChoice::Screen)]
+        );
+        assert_eq!(app.next_tick(), None, "mirando: nada que esperar");
+        assert!(app.update(Message::Tick).is_empty(), "una sola petición");
+        app.update(Message::Event(Event::ShareOptions(ShareOptions {
+            source: SourceChoice::Screen,
+            targets: Vec::new(),
+            targets_error: None,
+            apps: Ok(Vec::new()),
+        })));
+        let next = app.next_tick().expect("siguiente vistazo");
+        assert_eq!(next, app.now + REFRESH);
+        assert!(app.update(Message::Tick).is_empty(), "aún no toca");
+        app.now = next;
+        assert_eq!(
+            app.update(Message::Tick),
+            [Effect::LoadShareOptions(SourceChoice::Screen)]
+        );
+        // Fuera de la barra lateral no se mira ni se espera.
+        app.host.refreshing = false;
+        app.screen = crate::ui::app::Screen::Login;
+        assert!(app.update(Message::Tick).is_empty());
+        assert_eq!(app.next_tick(), None);
+    }
+
+    /// Lo que llega para la otra fuente no se muestra como una lista vacía: se sigue buscando.
+    #[test]
+    fn options_for_another_source_are_still_searching() {
+        let mut app = app();
+        app.screen = crate::ui::app::Screen::Main;
+        app.update(Message::Navigate(Page::Host));
+        app.update(Message::Event(Event::ShareOptions(ShareOptions {
+            source: SourceChoice::Screen,
+            targets: vec![CaptureTarget::Monitor {
+                id: 1,
+                name: "Monitor".into(),
+            }],
+            targets_error: None,
+            apps: Ok(Vec::new()),
+        })));
+        app.update(Message::Host(Msg::Source(SourceChoice::App)));
+        assert!(
+            app.host.current_options().is_none(),
+            "las de la pantalla no valen"
+        );
+        assert!(!app.host.system_picks());
+        // La respuesta tardía de la pantalla tampoco, y se vuelve a pedir la de la app.
+        app.update(Message::Event(Event::ShareOptions(ShareOptions {
+            source: SourceChoice::Screen,
+            targets: Vec::new(),
+            targets_error: None,
+            apps: Ok(Vec::new()),
+        })));
+        assert!(app.host.current_options().is_none());
+        assert_eq!(
+            app.update(Message::Tick),
+            [Effect::LoadShareOptions(SourceChoice::App)]
+        );
+    }
+
+    /// Si no se pueden listar los monitores, se avisa una vez y no se finge el selector del
+    /// sistema.
+    #[test]
+    fn a_failed_enumeration_is_explained_once() {
+        let mut app = app();
+        app.screen = crate::ui::app::Screen::Main;
+        app.update(Message::Navigate(Page::Host));
+        let failed = || {
+            Message::Event(Event::ShareOptions(ShareOptions {
+                source: SourceChoice::Screen,
+                targets: Vec::new(),
+                targets_error: Some("sin acceso a la pantalla".into()),
+                apps: Ok(Vec::new()),
+            }))
+        };
+        app.update(failed());
+        app.update(failed());
+        let warnings = app
+            .toasts
+            .iter()
+            .filter(|t| t.text.contains("sin acceso a la pantalla"))
+            .count();
+        assert_eq!(warnings, 1, "{:?}", app.toasts);
+        assert!(!app.host.system_picks());
+    }
+
+    /// La sala de espera se cierra cuando la sala ya está abierta, no antes.
+    #[test]
+    fn the_lobby_stops_once_the_room_is_open() {
+        let mut app = app();
+        let effects = app.update(Message::Host(Msg::Start));
+        assert!(!effects.contains(&Effect::StopLobby), "{effects:?}");
+        assert_eq!(
+            app.update(Message::Event(Event::HostStarted(
+                Ok(VideoFeed::detached())
+            ))),
+            [Effect::StopLobby]
+        );
     }
 
     #[test]

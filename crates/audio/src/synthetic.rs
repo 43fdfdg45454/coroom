@@ -17,8 +17,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::{
-    AudioConfig, AudioError, AudioFormat, AudioSink, AudioSource, Captured, FRAME_DURATION, Played,
-    Render, SAMPLES_PER_CHANNEL,
+    AudioConfig, AudioError, AudioFormat, AudioSink, AudioSource, Captured, DeviceCounters,
+    FRAME_DURATION, Played, Render, SAMPLES_PER_CHANNEL,
 };
 
 /// Senoidal con marcas de tiempo exactas.
@@ -211,7 +211,7 @@ impl CaptureSink {
         }
     }
 
-    /// Sin reproducción a demanda: solo la cola de `write` (como WASAPI).
+    /// Sin reproducción a demanda: solo la cola de `write` (como un sumidero sin `start_pull`).
     pub fn pushed(mut self) -> Self {
         self.pull = false;
         self
@@ -364,6 +364,13 @@ impl AudioSink for CaptureSink {
         }
         self.started = false;
         self.queued_until = None;
+    }
+
+    fn device_counters(&self) -> DeviceCounters {
+        DeviceCounters {
+            underruns: lock(&self.recording).underruns,
+            overruns: 0,
+        }
     }
 
     fn describe(&self) -> String {

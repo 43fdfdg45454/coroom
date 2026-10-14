@@ -441,6 +441,7 @@ fn host_setup(app: &mut App) {
             id: 1,
             name: "Monitor principal · 2560 × 1440".to_owned(),
         }],
+        targets_error: None,
         apps: Ok(playing(&[
             ("juego.exe", "Juego"),
             ("firefox.exe", "Firefox"),
@@ -467,6 +468,7 @@ fn host_setup_app(app: &mut App) {
                 app: Some("firefox.exe".to_owned()),
             },
         ],
+        targets_error: None,
         apps: Ok(playing(&[
             ("juego.exe", "Juego"),
             ("firefox.exe", "Firefox"),
@@ -486,6 +488,7 @@ fn host_setup_wayland(app: &mut App) {
     app.update(Message::Event(Event::ShareOptions(ShareOptions {
         source: SourceChoice::Screen,
         targets: Vec::new(),
+        targets_error: None,
         apps: Ok(playing(&[
             ("juego", "Juego"),
             ("firefox", "Firefox"),
@@ -512,6 +515,7 @@ fn host_setup_app_wayland(app: &mut App) {
     app.update(Message::Event(Event::ShareOptions(ShareOptions {
         source: SourceChoice::App,
         targets: Vec::new(),
+        targets_error: None,
         apps: Ok(playing(&[
             ("juego", "Juego"),
             ("firefox", "Firefox"),

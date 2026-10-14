@@ -229,8 +229,8 @@ Deuda técnica conocida:
 - **Driver de mando de Windows**: es UMDF2 (modo usuario), así que no necesita la firma de
   Microsoft que exige el código de kernel: la CI firma cada paquete con un certificado autofirmado
   de un solo uso cuya clave borra al terminar, e `install.ps1` confía en él en el equipo
-  (`drivers/windows-vhid/README.md`, «Firma»). Sin probar todavía en un Windows real (Steam, Smart
-  App Control). Los mandos HID se crean al momento con la Virtual HID Framework desde un
+  (`drivers/windows-vhid/README.md`, «Firma»). La CI lo instala en un Windows y lo prueba con el
+  cliente; falta probarlo con juegos, Steam y Smart App Control. Los mandos HID se crean al momento con la Virtual HID Framework desde un
   dispositivo de control; los cuatro Xbox 360 existen desde la instalación, pero los juegos solo
   los ven mientras coroom los usa. Los IOCTL de `xusb22` no están documentados: se siguen los
   valores de HIDMaestro.

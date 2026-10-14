@@ -53,6 +53,8 @@ backend-la-prueba-se-detuvo-err = la prueba se detuvo: { $err }
 backend-no-se-pudo-abrir-url-err = No se pudo abrir { $url }: { $err }
 backend-no-se-pudo-arrancar-una-tarea = no se pudo arrancar una tarea: { $err }
 backend-sin-audio-en-la-prueba-local = sin audio en la prueba local
+backend-fallo-interno = Fallo interno en «{ $task }»: { $err }. Mira el registro de coroom para enviarlo.
+backend-la-sala-no-respondio = El servidor no respondió en { $secs } s al abrir la sala. Comprueba la conexión y vuelve a intentarlo.
 
 ## pantalla-friends
 
@@ -284,6 +286,10 @@ pantalla-host-no-se-pudo-abrir-el-selector = No se pudo abrir el selector del si
 pantalla-host-monitor = Monitor
 pantalla-host-ventana = Ventana
 pantalla-host-buscando = Buscando…
+pantalla-host-no-se-pudieron-listar-los-monitores = No se pudieron listar los monitores: { $error }
+pantalla-host-no-se-pudieron-listar-las-ventanas = No se pudieron listar las ventanas: { $error }
+pantalla-host-no-se-pudieron-listar-los-monitores-titulo = No se pudieron listar los monitores
+pantalla-host-no-se-pudieron-listar-las-ventanas-titulo = No se pudieron listar las ventanas
 pantalla-host-si-la-ventana-se-ve-en-negro = Si la ventana se ve en negro (pantalla completa exclusiva), se transmite su monitor y el audio sigue siendo solo el de la aplicación.
 pantalla-host-audio-que-se-envia = Audio que se envía
 pantalla-host-marcada-la-aplicacion-que-elegiste = Marcada, la aplicación que elegiste. Puedes añadir otras.

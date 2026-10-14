@@ -179,3 +179,90 @@ async fn a_shared_sender_follows_the_slowest_receiver() {
     assert_eq!(sender.source_target_kbps(1), None);
     assert_eq!(sender.target_kbps(), fast);
 }
+
+/// Caudal sostenido: 80 Mbit/s (60 fotogramas de 166 KB por segundo) a través de un proxy sin
+/// pérdida con ~1 ms y ~30 ms de RTT llegan casi enteros. Con la ventana de `target × RTT × 2` y
+/// suelo de 64 KB, un ACK retrasado dejaba una LAN en ~17 Mbit/s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn eighty_megabits_flow_at_lan_and_internet_rtt() {
+    use coroom_transport::rate::RateConfig;
+
+    const KBPS: u32 = 80_000;
+    const FPS: u32 = 60;
+    const SECONDS: u32 = 3;
+    let size = (KBPS as usize * 1000 / 8) / FPS as usize;
+    for one_way in [Duration::from_micros(500), Duration::from_millis(15)] {
+        let options = EndpointOptions {
+            initial_target_kbps: KBPS,
+            ..EndpointOptions::default()
+        };
+        let host = common::peer(options);
+        let proxy = UdpLossy::start(
+            host.endpoint.local_addr().expect("dirección"),
+            LossyConfig {
+                loss: 0.0,
+                delay: one_way,
+                jitter: Duration::ZERO,
+                rate_bps: None,
+                queue_limit: Duration::from_millis(200),
+                seed: 1,
+            },
+        )
+        .await
+        .expect("proxy");
+        let guest = common::peer(options);
+        host.endpoint.admit(guest.identity.public_key());
+        let accept = {
+            let endpoint = host.endpoint.clone();
+            tokio::spawn(async move { endpoint.accept_peer().await })
+        };
+        let guest_conn = guest
+            .endpoint
+            .connect_peer(proxy.addr(), host.identity.public_key())
+            .await
+            .expect("conexión a través del proxy");
+        let host_conn = accept.await.expect("tarea");
+        let started = std::time::Instant::now();
+        let run = common::transmit_with(
+            host_conn,
+            guest_conn,
+            &host,
+            &guest,
+            FPS * SECONDS,
+            move |_| size,
+            FPS,
+            RateConfig {
+                min_kbps: KBPS,
+                max_kbps: KBPS,
+                start_kbps: KBPS,
+            },
+        )
+        .await;
+        let elapsed = started.elapsed();
+        let bytes: usize = run
+            .frames
+            .iter()
+            .map(|(frame, _)| frame.payload.len())
+            .sum();
+        let mbps = bytes as f64 * 8.0 / elapsed.as_secs_f64() / 1e6;
+        let latencies: Vec<Duration> = run.frames.iter().map(|(_, latency)| *latency).collect();
+        eprintln!(
+            "RTT ~{:?}: {} de {} fotogramas, {mbps:.1} Mbit/s en {elapsed:?}, latencia p50 {:?} \
+             p95 {:?}, descartados {}",
+            one_way * 2,
+            run.frames.len(),
+            FPS * SECONDS,
+            percentile(&latencies, 0.5),
+            percentile(&latencies, 0.95),
+            run.stats.dropped,
+        );
+        let delivered = run.frames.len() as f64 / f64::from(FPS * SECONDS);
+        assert!(delivered >= 0.97, "entregados {:.1} %", delivered * 100.0);
+        // El tiempo incluye la espera final del último fotograma: ≥ 70 de los 80 Mbit/s.
+        assert!(mbps >= 70.0, "{mbps:.1} Mbit/s con RTT ~{:?}", one_way * 2);
+        assert!(
+            percentile(&latencies, 0.95) < Duration::from_millis(60) + one_way * 4,
+            "la cola no crece"
+        );
+    }
+}

@@ -25,6 +25,7 @@ pub mod apps;
 pub mod codec;
 pub mod jitter;
 pub mod mix;
+pub mod pacing;
 pub mod processing;
 pub mod realtime;
 pub mod sync;
@@ -283,6 +284,12 @@ pub trait AudioSink: Send {
         Ok(())
     }
 
+    /// Veces que el dispositivo (o la cola hacia él) se quedó sin audio o tuvo de más, desde
+    /// [`AudioSink::start`]. Por defecto, ninguna.
+    fn device_counters(&self) -> DeviceCounters {
+        DeviceCounters::default()
+    }
+
     /// Suelta el dispositivo.
     fn stop(&mut self);
 
@@ -290,6 +297,15 @@ pub trait AudioSink: Send {
     fn describe(&self) -> String {
         "salida de audio".to_owned()
     }
+}
+
+/// Faltas y sobras de audio de un dispositivo de reproducción ([`AudioSink::device_counters`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeviceCounters {
+    /// Veces que el dispositivo (o su cola) se quedó sin audio y sonó silencio.
+    pub underruns: u64,
+    /// Veces que no cupo lo que se escribió y se perdió audio.
+    pub overruns: u64,
 }
 
 /// Lo que pide un dispositivo a demanda ([`AudioSink::start_pull`]): llenar una trama (muestras

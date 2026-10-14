@@ -1,10 +1,17 @@
 //! Audio por **WASAPI** en Windows (feature `wasapi`) con la crate `wasapi` 0.26 (HEnquist, MIT,
 //! mantenida: publicada en octubre de 2026, sobre `windows` 0.62 como el resto del proyecto).
 //!
-//! Todo en **modo compartido por eventos** con el búfer mínimo (10 ms) y `S16LE` 48 kHz con
-//! conversión automática (`AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`). Cada flujo vive en su hilo
-//! (`wasapi-audio`), que inicializa COM (MTA), espera los eventos del dispositivo y copia entre su
-//! búfer y el anillo compartido con el hilo de audio de la sesión (como el backend de PipeWire).
+//! Todo en **modo compartido por eventos** y `S16LE` 48 kHz con conversión automática
+//! (`AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`). Cada flujo vive en su hilo (`wasapi-audio`), que
+//! inicializa COM (MTA), espera los eventos del dispositivo y copia entre su búfer y el anillo
+//! compartido con el hilo de audio de la sesión (como el backend de PipeWire).
+//!
+//! La reproducción va **a demanda** por defecto ([`AudioSink::start_pull`]): en cada evento se
+//! rellena el búfer del dispositivo hasta el nivel de [`crate::pacing::Pacing`] (dos periodos del
+//! motor o 20 ms, lo que sea más, y un margen) pidiendo las tramas a la sesión en ese momento. El
+//! motor no consume siempre 480 tramas por pasada (mezcla a 44,1 kHz, periodos de 512 tramas o de
+//! 20 ms en USB y Bluetooth, despertares tardíos que funden dos eventos): escribir una trama de
+//! 10 ms por evento lo dejaba sin audio a trozos y el sonido era robótico.
 //!
 //! - [`LoopbackSource`]: *loopback* del dispositivo de salida por defecto (lo que suena).
 //! - [`ProcessLoopbackSource`]: **loopback por proceso** (`AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`
@@ -12,8 +19,9 @@
 //!   solo el audio del proceso `--audio process PID` y de sus hijos. Necesita Windows 10 20348 o
 //!   posterior; [`process_loopback_status`] lo comprueba para `coroom doctor`.
 //! - [`MicSource`] y [`PlaybackSink`]: el dispositivo por defecto o el que se nombre (`--mic`,
-//!   `--speaker`, por su nombre visible). La hora a la que suena cada trama es «ahora + lo que hay
-//!   en el anillo + el relleno del búfer del dispositivo» (`GetCurrentPadding`).
+//!   `--speaker`, por su nombre visible). A demanda, cada trama sonará «ahora + el relleno del búfer
+//!   del dispositivo» (`GetCurrentPadding`); con [`AudioSink::write`], además después de lo que
+//!   haya en el anillo.
 //!
 //! En *loopback* WASAPI no da eventos mientras no suena nada: el anillo entrega silencio si en
 //! 40 ms no llega audio (ver [`crate::ring`]). No se puede ejecutar en la CI de Linux; se comprueba
@@ -29,17 +37,22 @@ use wasapi::{
     SampleType, StreamMode, WaveFormat,
 };
 
-use crate::ring::Shared;
+use crate::pacing::{Pacing, hns_to_frames};
+use crate::ring::{Pull, Shared};
 use crate::{
-    AudioConfig, AudioError, AudioFormat, AudioSink, AudioSource, Captured, DeviceInfo, DeviceKind,
-    Played, SAMPLE_RATE_HZ, SAMPLES_PER_CHANNEL,
+    AudioConfig, AudioError, AudioFormat, AudioSink, AudioSource, Captured, DeviceCounters,
+    DeviceInfo, DeviceKind, Played, Render, SAMPLE_RATE_HZ, SAMPLES_PER_CHANNEL,
 };
 
 /// Espera máxima a que el hilo abra el dispositivo.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Duración del búfer compartido que se pide (10 ms, en unidades de 100 ns).
+/// Duración del búfer compartido que se pide para capturar (10 ms, en unidades de 100 ns).
 const BUFFER_HNS: i64 = 100_000;
+
+/// Duración del búfer que se pide para reproducir (50 ms): tiene que caber el nivel objetivo con
+/// periodos de 20 ms. No añade latencia: se rellena solo hasta el objetivo.
+const RENDER_BUFFER_HNS: i64 = 500_000;
 
 fn backend(err: impl std::fmt::Display) -> AudioError {
     AudioError::Backend(format!("WASAPI: {err}"))
@@ -60,7 +73,7 @@ enum Endpoint {
 
 enum Io {
     Capture(AudioCaptureClient),
-    Render(AudioRenderClient),
+    Render(AudioRenderClient, Pacing),
 }
 
 fn device(
@@ -107,24 +120,69 @@ fn open(endpoint: &Endpoint, format: AudioFormat) -> Result<(AudioClient, Handle
         usize::from(format.channels),
         None,
     );
-    let mode = StreamMode::EventsShared {
-        autoconvert: true,
-        buffer_duration_hns: BUFFER_HNS,
-    };
     let direction = match endpoint {
         Endpoint::Render(_) => Direction::Render,
         _ => Direction::Capture,
+    };
+    let mode = StreamMode::EventsShared {
+        autoconvert: true,
+        buffer_duration_hns: match direction {
+            Direction::Render => RENDER_BUFFER_HNS,
+            Direction::Capture => BUFFER_HNS,
+        },
     };
     client
         .initialize_client(&wave, &direction, &mode)
         .map_err(backend)?;
     let handle = client.set_get_eventhandle().map_err(backend)?;
     let io = match direction {
-        Direction::Render => Io::Render(client.get_audiorenderclient().map_err(backend)?),
+        Direction::Render => {
+            let render = client.get_audiorenderclient().map_err(backend)?;
+            let pacing = render_pacing(&client)?;
+            // Un periodo de silencio antes de arrancar: la primera pasada del motor tiene qué leer
+            // y el primer evento ya rellena hasta el objetivo.
+            let prefill = pacing.prefill();
+            let silence = vec![0u8; prefill * 2 * usize::from(format.channels)];
+            render
+                .write_to_device(prefill, &silence, None)
+                .map_err(backend)?;
+            Io::Render(render, pacing)
+        }
         Direction::Capture => Io::Capture(client.get_audiocaptureclient().map_err(backend)?),
     };
     client.start_stream().map_err(backend)?;
     Ok((client, handle, io))
+}
+
+/// Búfer y periodo de un flujo de reproducción ya inicializado, en tramas de nuestro formato (a
+/// 48 kHz: con la conversión automática, el búfer y el relleno se cuentan en él).
+fn render_pacing(client: &AudioClient) -> Result<Pacing, AudioError> {
+    let buffer = client.get_buffer_size().map_err(backend)? as usize;
+    let (period_hns, min_period_hns) = client.get_device_period().unwrap_or((0, 0));
+    let pacing = Pacing::new(buffer, hns_to_frames(period_hns));
+    match client.get_mixformat() {
+        Ok(mix) => tracing::debug!(
+            buffer_frames = buffer,
+            period_hns,
+            min_period_hns,
+            period_frames = pacing.period,
+            target_frames = pacing.target,
+            mix_rate_hz = mix.get_samplespersec(),
+            mix_channels = mix.get_nchannels(),
+            mix_bits = mix.get_bitspersample(),
+            "salida WASAPI"
+        ),
+        Err(err) => tracing::debug!(
+            buffer_frames = buffer,
+            period_hns,
+            min_period_hns,
+            period_frames = pacing.period,
+            target_frames = pacing.target,
+            error = %err,
+            "salida WASAPI (sin formato de mezcla)"
+        ),
+    }
+    Ok(pacing)
 }
 
 /// Cuerpo del hilo `wasapi-audio`.
@@ -132,6 +190,7 @@ fn run(
     endpoint: Endpoint,
     format: AudioFormat,
     shared: Arc<Shared>,
+    pull: Option<Render>,
     stop: Arc<AtomicBool>,
     ready: std::sync::mpsc::Sender<Result<(), AudioError>>,
 ) {
@@ -152,9 +211,16 @@ fn run(
     let _ = ready.send(Ok(()));
     let channels = usize::from(format.channels);
     let bytes_per_frame = 2 * channels;
-    // Búferes reservados una vez: 100 ms de bytes y una trama de muestras.
-    let mut bytes = vec![0u8; SAMPLES_PER_CHANNEL * 10 * bytes_per_frame];
-    let mut samples = vec![0i16; SAMPLES_PER_CHANNEL * 10 * channels];
+    // Búferes reservados una vez: 100 ms o el objetivo de relleno, lo que sea más.
+    let frames_max = match &io {
+        Io::Render(_, pacing) => pacing.target.max(SAMPLES_PER_CHANNEL * 10),
+        Io::Capture(_) => SAMPLES_PER_CHANNEL * 10,
+    };
+    let mut bytes = vec![0u8; frames_max * bytes_per_frame];
+    let mut samples = vec![0i16; frames_max * channels];
+    let mut pull = pull.map(Pull::new);
+    // El primer evento llega tras consumir el relleno inicial: vacío entonces no es una falta.
+    let mut rendered = false;
     while !stop.load(Ordering::Acquire) {
         let event = handle.wait_for_event(100);
         match &io {
@@ -191,23 +257,35 @@ fn run(
                     }
                 }
             }
-            Io::Render(render) => {
-                let available = match client.get_available_space_in_frames() {
+            Io::Render(render, pacing) => {
+                let padding = match client.get_current_padding() {
                     Ok(frames) => frames as usize,
                     Err(err) => {
                         shared.fail(backend(err));
                         return;
                     }
                 };
-                // Un cuanto como mucho: llenar el búfer entero de silencio añadiría latencia.
-                let frames = available
-                    .min(SAMPLES_PER_CHANNEL)
+                if padding == 0 && rendered {
+                    // El motor se lo llevó todo: en su pasada siguiente sonaría silencio.
+                    shared.note_underrun();
+                }
+                // Hasta el objetivo, no el búfer entero: llenarlo de más añadiría latencia.
+                let frames = pacing
+                    .frames_to_write(padding)
                     .min(samples.len() / channels);
                 if frames == 0 {
                     continue;
                 }
                 let wanted = frames * channels;
-                shared.pop_into(&mut samples[..wanted]);
+                match &mut pull {
+                    Some(pull) => {
+                        let delay = Duration::from_micros(
+                            padding as u64 * 1_000_000 / u64::from(SAMPLE_RATE_HZ),
+                        );
+                        pull.fill(&mut samples[..wanted], channels, delay);
+                    }
+                    None => shared.pop_into(&mut samples[..wanted]),
+                }
                 for (chunk, sample) in bytes[..wanted * 2]
                     .as_chunks_mut::<2>()
                     .0
@@ -220,6 +298,7 @@ fn run(
                     shared.fail(backend(err));
                     return;
                 }
+                rendered = true;
                 if let Ok(padding) = client.get_current_padding() {
                     let us = u64::from(padding) * 1_000_000 / u64::from(SAMPLE_RATE_HZ);
                     shared.delay_us.store(us, Ordering::Relaxed);
@@ -241,6 +320,7 @@ impl Running {
         endpoint: Endpoint,
         format: AudioFormat,
         shared: &Arc<Shared>,
+        pull: Option<Render>,
     ) -> Result<Self, AudioError> {
         let stop = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -248,7 +328,7 @@ impl Running {
             let (stop, shared) = (Arc::clone(&stop), Arc::clone(shared));
             thread::Builder::new()
                 .name("wasapi-audio".into())
-                .spawn(move || run(endpoint, format, shared, stop, ready_tx))
+                .spawn(move || run(endpoint, format, shared, pull, stop, ready_tx))
                 .map_err(|err| backend(format!("no se pudo crear el hilo: {err}")))?
         };
         let mut running = Self {
@@ -307,7 +387,12 @@ impl Capture {
             *name = Some(device.clone());
         }
         let shared = Shared::new(self.format);
-        self.running = Some(Running::start(self.endpoint.clone(), self.format, &shared)?);
+        self.running = Some(Running::start(
+            self.endpoint.clone(),
+            self.format,
+            &shared,
+            None,
+        )?);
         self.shared = Some(shared);
         Ok(())
     }
@@ -439,9 +524,45 @@ impl AudioSink for PlaybackSink {
             Endpoint::Render(device),
             self.format,
             &shared,
+            None,
         )?);
         self.shared = Some(shared);
         Ok(())
+    }
+
+    fn supports_pull(&self) -> bool {
+        true
+    }
+
+    fn start_pull(&mut self, config: &AudioConfig, render: Render) -> Result<(), AudioError> {
+        self.stop();
+        self.format = config.format;
+        self.latency = config.latency;
+        let device = config.device.clone().or_else(|| self.device.clone());
+        let shared = Shared::new(self.format);
+        self.running = Some(Running::start(
+            Endpoint::Render(device),
+            self.format,
+            &shared,
+            Some(render),
+        )?);
+        self.shared = Some(shared);
+        Ok(())
+    }
+
+    fn check(&mut self) -> Result<(), AudioError> {
+        let shared = self.shared.as_ref().ok_or(AudioError::Stopped)?;
+        match shared.failure() {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    fn device_counters(&self) -> DeviceCounters {
+        self.shared
+            .as_ref()
+            .map(|shared| shared.counters())
+            .unwrap_or_default()
     }
 
     fn wait_ready(&mut self) -> Result<(), AudioError> {
@@ -676,7 +797,12 @@ impl crate::apps::AppBackend for AppSessions {
         // Sin el árbol: cada proceso con sesión sale por separado, y con árboles se capturarían
         // dos veces los padres e hijos que también suenan.
         let shared = Shared::new(format);
-        let running = Running::start(Endpoint::Process { pid, tree: false }, format, &shared)?;
+        let running = Running::start(
+            Endpoint::Process { pid, tree: false },
+            format,
+            &shared,
+            None,
+        )?;
         Ok(crate::apps::Tap {
             shared,
             _guard: Box::new(running),

@@ -412,10 +412,21 @@ impl Hub {
     }
 
     /// Avisa a los amigos conectados de que `user` entra o sale.
+    ///
+    /// Quien llama decide `online` bajo el cerrojo, pero avisa después de esperar a la base de
+    /// datos (los amigos); entretanto otra sesión del mismo usuario puede haber entrado o salido
+    /// (la sala de espera da paso a la sala del anfitrión). Por eso se vuelve a mirar el estado
+    /// ahora, con el cerrojo que también cubre la entrega: un aviso que ya no es verdad se descarta
+    /// y el último que llega a los amigos siempre es el estado real.
     fn announce(&self, user: i64, friends: &[i64], online: bool) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
+        let now_online = inner.online.get(&user).is_some_and(|set| !set.is_empty());
+        if now_online != online {
+            debug!(user, online, "aviso de presencia caducado; se descarta");
+            return;
+        }
         let message = SignalMessage::Presence {
             user: u64::try_from(user).unwrap_or(0),
             online,
@@ -1221,6 +1232,60 @@ mod tests {
             }
         }
         assert!(hub.join_room(again, &code, [2; 32], vec![1], addr).is_ok());
+    }
+
+    /// La sala de espera da paso a la sala del anfitrión: el «desconectado» de la sesión que se
+    /// cierra, decidido antes de que la otra entrase, llega tarde y no tapa el «conectado».
+    #[test]
+    fn a_late_offline_announcement_does_not_overtake_online() {
+        let hub = Hub::new(HubConfig::new(8), Relay::new());
+        let (tx, mut friend_rx) = mpsc::channel(SESSION_QUEUE);
+        let (close, _closed) = oneshot::channel();
+        let friend = Account {
+            user: Some(1),
+            name: "Bea".to_owned(),
+            device_pk: None,
+        };
+        hub.register(tx, close, friend).expect("sesión del amigo");
+        let lobby = session(&hub, Some(2));
+        // La sala de espera se cierra: era la última sesión, toca «desconectado»…
+        assert_eq!(hub.leave(lobby), Some(2));
+        // …pero antes de avisar (se esperaba a la base de datos) entra la sala del anfitrión.
+        let (host, first) = {
+            let (tx, _rx) = mpsc::channel(SESSION_QUEUE);
+            let (close, _closed) = oneshot::channel();
+            let account = Account {
+                user: Some(2),
+                name: "Ana".to_owned(),
+                device_pk: None,
+            };
+            hub.register(tx, close, account).expect("sesión de la sala")
+        };
+        assert!(first);
+        hub.announce(2, &[1], true);
+        hub.announce(2, &[1], false);
+        let mut seen = Vec::new();
+        while let Ok(message) = friend_rx.try_recv() {
+            seen.push(message);
+        }
+        assert_eq!(
+            seen,
+            [SignalMessage::Presence {
+                user: 2,
+                online: true
+            }],
+            "el aviso caducado se descarta"
+        );
+        // Al cerrarse de verdad, sí llega.
+        assert_eq!(hub.leave(host), Some(2));
+        hub.announce(2, &[1], false);
+        assert_eq!(
+            friend_rx.try_recv().ok(),
+            Some(SignalMessage::Presence {
+                user: 2,
+                online: false
+            })
+        );
     }
 
     /// Ejecuta un futuro hasta el final en un runtime de un hilo.

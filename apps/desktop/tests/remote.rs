@@ -20,7 +20,11 @@
 //! - (i) el modo desarrollo (`COROOM_DEV_TOKEN`) sigue funcionando sin cuentas;
 //! - (j) reconexión: el invitado que pierde el enlace (aquí, `reconnect()`) avisa con
 //!   `Reconnecting`, vuelve a entrar en la misma sala con `Reconnected` y sigue presentando, y
-//!   antes del vídeo mide la calidad del enlace (`QualityEstimate`).
+//!   antes del vídeo mide la calidad del enlace (`QualityEstimate`);
+//! - (k) pantalla quieta: dos invitados seguidos ven la imagen aunque la captura no entregue
+//!   ningún fotograma más;
+//! - (l) un enlace con poca cola pierde las ráfagas de los intra y el vídeo se recupera sin una
+//!   tormenta de intra.
 //!
 //! Los tests (a)–(e) usan OpenH264 en los dos extremos, para que sus cotas de
 //! tiempo sigan siendo comparables.
@@ -37,6 +41,7 @@ use std::time::{Duration, Instant};
 use common::{Account, TestServer};
 use coroom_session::Session;
 use coroom_session::capture::synthetic::SyntheticCapturer;
+use coroom_session::capture::{CaptureError, CaptureTarget, CapturedFrame, Capturer};
 use coroom_session::codec::{Backend, Codec, DecoderBackend, DecoderSet, EncoderSet};
 use coroom_session::latency::{LatencyLedger, LatencySummary, Stage};
 use coroom_session::loopback::{DecodedFrame, FrameSink, LoopbackConfig, NullSink, SinkError};
@@ -816,5 +821,158 @@ fn j_a_guest_reconnects_and_keeps_presenting() {
     assert_eq!(guest.room_code(), Some(code));
     guest.close();
     host.close();
+    drop(server);
+}
+
+/// Fuente que entrega unos pocos fotogramas y después deja la pantalla quieta, como WGC o PipeWire
+/// (solo entregan fotogramas cuando cambia algo).
+struct StillCapturer {
+    inner: SyntheticCapturer,
+    left: u32,
+}
+
+impl Capturer for StillCapturer {
+    fn targets(&self) -> Result<Vec<CaptureTarget>, CaptureError> {
+        self.inner.targets()
+    }
+
+    fn start(&mut self, target: &CaptureTarget) -> Result<(), CaptureError> {
+        self.inner.start(target)
+    }
+
+    fn next_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+        self.inner.next_frame()
+    }
+
+    fn next_frame_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<CapturedFrame>, CaptureError> {
+        if self.left == 0 {
+            std::thread::sleep(timeout);
+            return Ok(None);
+        }
+        self.left -= 1;
+        self.inner.next_frame().map(Some)
+    }
+
+    fn stop(&mut self) {
+        self.inner.stop();
+    }
+}
+
+/// (k) Pantalla quieta: el anfitrión capturó cinco fotogramas antes de que llegase nadie. Un
+/// invitado entra, ve la imagen y se va; otro entra y también la ve enseguida (antes se quedaba en
+/// «Entrando en la sala»: el intra del anfitrión llegaba antes de abrir su decodificador y no salía
+/// ningún otro).
+#[test]
+fn k_a_guest_joining_a_still_screen_sees_it() {
+    let _serial = serial();
+    common::load_factor();
+    let server = TestServer::start();
+    let account = server.config();
+    let mut host = RemoteSession::host(
+        account.identity,
+        account.config,
+        Box::new(StillCapturer {
+            inner: SyntheticCapturer::new(640, 360, FPS),
+            left: 5,
+        }),
+        EncoderSet::openh264(),
+        video(None),
+        Arc::new(LatencyLedger::new()),
+    );
+    host.start().expect("arranque del anfitrión");
+    let code = room_code(&host);
+    let bound = Duration::from_secs(3).mul_f64(common::load_factor());
+    for name in ["A", "B"] {
+        let mut guest = guest(server.config(), &code, None);
+        wait_until(
+            &format!("la conexión de {name}"),
+            Duration::from_secs(15),
+            || {
+                assert!(!guest.is_finished(), "{:?}", guest.end_reason());
+                guest.state() == SessionState::Active
+            },
+        );
+        let connected = Instant::now();
+        wait_until(
+            &format!("un fotograma en {name}"),
+            bound + Duration::from_secs(5),
+            || guest.summary().frames_presented >= 1,
+        );
+        let took = connected.elapsed();
+        println!(
+            "{name}: primer fotograma {took:?} después de conectar; {:?}",
+            guest.video_counters()
+        );
+        assert!(took <= bound, "{name} tardó {took:?} (cota {bound:?})");
+        guest.close();
+        wait_until("la salida del invitado", Duration::from_secs(10), || {
+            host.guests().is_empty()
+        });
+    }
+    let counters = host.video_counters();
+    println!("anfitrión: {counters:?}");
+    assert!(
+        counters.encoded <= 20,
+        "con la pantalla quieta casi no se codifica: {counters:?}"
+    );
+    host.close();
+    drop(server);
+}
+
+/// (l) Un enlace con poca cola (2 Mbit/s y 15 ms, como un búfer de socket pequeño): las ráfagas
+/// de un intra no caben y se pierden. El vídeo se recupera y los intra forzados no se disparan
+/// (antes, cada grupo perdido pedía un intra que volvía a desbordar la cola).
+#[test]
+fn l_a_shallow_queue_does_not_start_a_keyframe_storm() {
+    let _serial = serial();
+    common::load_factor();
+    let server = TestServer::start();
+    let port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .and_then(|socket| socket.local_addr())
+        .expect("puerto libre")
+        .port();
+    let host_addr: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, port).into();
+    let proxy = server
+        .runtime
+        .block_on(UdpLossy::start(
+            host_addr,
+            LossyConfig {
+                loss: 0.0,
+                delay: Duration::from_millis(2),
+                jitter: Duration::ZERO,
+                rate_bps: Some(2_000_000),
+                queue_limit: Duration::from_millis(15),
+                seed: 7,
+            },
+        ))
+        .expect("proxy");
+    let mut host_config = server.config();
+    host_config.bind = Some(host_addr);
+    host_config.advertise_candidates = Some(vec![proxy.addr()]);
+    let host = host(host_config);
+    let code = room_code(&host);
+    let mut guest_config = server.config();
+    guest_config.advertise_candidates = Some(Vec::new());
+    let guest = guest(guest_config, &code, Some(FRAMES));
+    let (summary, guest, host) = finish(guest, host);
+    let (sent, received) = (host.video_counters(), guest.video_counters());
+    println!(
+        "{summary}\nproxy: {} reenviados, {} descartados por la cola\nanfitrión {sent:?}\n\
+         invitado {received:?}",
+        proxy.stats().forwarded(),
+        proxy.stats().queue_drops()
+    );
+    let gap = max_gap(guest.ledger());
+    let bound = Duration::from_secs(2).mul_f64(common::load_factor());
+    assert!(gap <= bound, "hueco de {gap:?} (cota {bound:?})");
+    // 300 fotogramas en 10 s: como mucho unos pocos intra por segundo.
+    assert!(
+        sent.forced_keyframes <= 20,
+        "{} intra forzados",
+        sent.forced_keyframes
+    );
     drop(server);
 }

@@ -213,6 +213,9 @@ pub struct VulkanDeviceShare {
     pub synchronization2: bool,
     /// `samplerYcbcrConversion` activada.
     pub sampler_ycbcr_conversion: bool,
+    /// Extensiones de mantenimiento de vídeo que el driver ofrece y este dispositivo no activa
+    /// (para el registro: FFmpeg, en su propio dispositivo, sí las usa).
+    pub unused_video_extensions: Vec<String>,
     /// El dispositivo de `wgpu`, que debe vivir mientras se use.
     pub keepalive: Arc<dyn Any + Send + Sync>,
 }

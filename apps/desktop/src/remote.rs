@@ -737,8 +737,19 @@ pub fn host_audio(options: &HostAudioOptions, headless: bool) -> HostAudio {
         };
     }
     let game = match coroom_session::audio::game_source(&options.game) {
-        Ok(game) => game,
+        Ok(game) => {
+            match &game {
+                Some(source) => tracing::info!(
+                    capture = ?options.game,
+                    format = ?source.format(),
+                    "audio del juego"
+                ),
+                None => tracing::info!(capture = ?options.game, "sin audio del juego"),
+            }
+            game
+        }
         Err(err) => {
+            tracing::warn!(error = %err, "sin audio del juego");
             eprintln!("Aviso: sin audio del juego: {err}");
             None
         }
@@ -746,11 +757,13 @@ pub fn host_audio(options: &HostAudioOptions, headless: bool) -> HostAudio {
     let voice = if options.voice {
         match coroom_session::audio::mic_source(options.mic.as_deref()) {
             Ok(mic) => {
+                tracing::info!(mic = ?options.mic, format = ?mic.format(), "micrófono");
                 let mut voice = VoiceInput::new(mic);
                 voice.processing.noise_suppression = options.noise_suppression;
                 Some(voice)
             }
             Err(err) => {
+                tracing::warn!(error = %err, "sin micrófono");
                 eprintln!("Aviso: sin micrófono: {err}");
                 None
             }
@@ -762,8 +775,12 @@ pub fn host_audio(options: &HostAudioOptions, headless: bool) -> HostAudio {
         options.speaker.as_deref(),
         AudioFormat::VOICE,
     ) {
-        Ok(sink) => Some(sink),
+        Ok(sink) => {
+            tracing::info!(speaker = ?options.speaker, format = ?sink.format(), "salida de audio");
+            Some(sink)
+        }
         Err(err) => {
+            tracing::warn!(error = %err, "sin salida para la voz de los invitados");
             eprintln!("Aviso: no se oirá la voz de los invitados: {err}");
             None
         }
@@ -820,12 +837,33 @@ pub fn host_encoders(codec: Option<Codec>, encoder: Option<Backend>) -> Result<E
             encoder.map_or_else(|| "cualquier backend".to_owned(), |b| b.to_string())
         ));
     }
+    let available: Vec<String> = set
+        .available()
+        .iter()
+        .map(|(codec, backend)| format!("{codec}/{backend}"))
+        .collect();
+    tracing::info!(?codec, ?encoder, codificadores = ?available, "codificadores del anfitrión");
     Ok(set)
 }
 
 /// Prepara y arranca la sesión del anfitrión. Con la pantalla, la captura y la inyección de
 /// teclado y ratón comparten una sola sesión del portal (un diálogo y un token en Linux).
 pub fn start_host(identity: Identity, options: &HostOptions) -> Result<RemoteSession, String> {
+    let mut session = prepare_host(identity, options)?;
+    start_prepared_host(&mut session)?;
+    Ok(session)
+}
+
+/// Arranca la sala preparada con [`prepare_host`] (conecta con el servidor y la crea).
+pub fn start_prepared_host(session: &mut RemoteSession) -> Result<(), String> {
+    session
+        .start()
+        .map_err(|err| format!("no se pudo arrancar la sala: {err}"))
+}
+
+/// Prepara la sesión del anfitrión sin arrancarla: codificadores, captura (en Linux, el diálogo
+/// del portal si no hay token), entrada y audio.
+pub fn prepare_host(identity: Identity, options: &HostOptions) -> Result<RemoteSession, String> {
     let config = remote_config(&options.net)?;
     let encoders = host_encoders(options.codec, options.encoder)?;
     let (capturer, share) = match options.source {
@@ -841,7 +879,7 @@ pub fn start_host(identity: Identity, options: &HostOptions) -> Result<RemoteSes
         eis: share.map(eis_provider),
     });
     let audio = host_audio(&options.audio, options.net.headless);
-    let mut session = RemoteSession::host_with_sink(
+    Ok(RemoteSession::host_with_sink(
         identity,
         config,
         capturer,
@@ -850,11 +888,7 @@ pub fn start_host(identity: Identity, options: &HostOptions) -> Result<RemoteSes
         Arc::new(LatencyLedger::new()),
         sink,
     )
-    .with_host_audio(audio);
-    session
-        .start()
-        .map_err(|err| format!("no se pudo arrancar la sala: {err}"))?;
-    Ok(session)
+    .with_host_audio(audio))
 }
 
 /// Audio de `coroom join`.
@@ -911,17 +945,24 @@ pub fn guest_audio(options: &JoinAudioOptions, headless: bool) -> Option<GuestAu
             frame_ms: 10,
         });
     }
-    let speaker =
-        match coroom_session::audio::playback_sink(options.speaker.as_deref(), AudioFormat::GAME) {
-            Ok(sink) => Some(sink),
-            Err(err) => {
-                eprintln!("Aviso: sin salida de audio: {err}");
-                None
-            }
-        };
+    let speaker = match coroom_session::audio::playback_sink(
+        options.speaker.as_deref(),
+        AudioFormat::GAME,
+    ) {
+        Ok(sink) => {
+            tracing::info!(speaker = ?options.speaker, format = ?sink.format(), "salida de audio");
+            Some(sink)
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "sin salida de audio");
+            eprintln!("Aviso: sin salida de audio: {err}");
+            None
+        }
+    };
     let voice = if options.voice {
         match coroom_session::audio::mic_source(options.mic.as_deref()) {
             Ok(mic) => {
+                tracing::info!(mic = ?options.mic, format = ?mic.format(), "micrófono");
                 let mut voice = VoiceInput {
                     talk,
                     ..VoiceInput::new(mic)
@@ -930,6 +971,7 @@ pub fn guest_audio(options: &JoinAudioOptions, headless: bool) -> Option<GuestAu
                 Some(voice)
             }
             Err(err) => {
+                tracing::warn!(error = %err, "sin micrófono");
                 eprintln!("Aviso: sin micrófono: {err}");
                 None
             }
@@ -1089,8 +1131,19 @@ pub fn start_guest(
         .only_backend(options.decoder)
         .with_output(output);
     if decoders.is_empty() {
+        tracing::warn!(decoder = ?options.decoder, "sin decodificador");
         return Err("este equipo no tiene ese decodificador; mira `coroom doctor`".to_owned());
     }
+    let available: Vec<String> = decoders
+        .available()
+        .iter()
+        .map(|(codec, backend)| format!("{codec}/{backend}"))
+        .collect();
+    tracing::info!(
+        decoder = ?options.decoder,
+        decodificadores = ?available,
+        "decodificadores del invitado"
+    );
     let mut session = RemoteSession::guest(
         identity,
         config,

@@ -133,3 +133,9 @@ Las letras de `Ctrl+Alt` se cambian en Ajustes → Entrada (no pueden coincidir 
 
 Con `coroom doctor` en una terminal tienes el mismo diagnóstico en texto, para pegarlo al pedir
 ayuda (no incluye secretos).
+
+La aplicación guarda un **registro** de cada ejecución en `logs/coroom.log`, dentro del
+directorio de datos (`%APPDATA%\coroom\logs` en Windows, `~/.local/share/coroom/logs` en Linux, o
+el de `COROOM_DATA_DIR`); la ejecución anterior queda en `coroom.1.log`. `coroom doctor` dice la
+ruta exacta. Si algo falla (una sala que no abre, el vídeo que se corta), cierra coroom y manda
+esos dos ficheros junto con el diagnóstico.

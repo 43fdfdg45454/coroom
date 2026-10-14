@@ -149,10 +149,23 @@ impl ExternalVulkanImage for VulkanBridge {
 /// si lo comparte (cero copias), si no en CPU.
 pub fn decode_output_for(share: Option<Arc<VulkanDeviceShare>>) -> DecodeOutput {
     match share {
-        Some(share) => DecodeOutput::Gpu {
-            vulkan: Some(Arc::new(to_shared_device(&share))),
-        },
-        None => DecodeOutput::Cpu,
+        Some(share) => {
+            tracing::info!(
+                "vídeo recibido: con Vulkan Video se decodifica en el dispositivo de la ventana, sin \
+                 copia; extensiones de vídeo que el driver ofrece y ese dispositivo no activa: {}",
+                coroom_render::wgpu::unused_label(&share.unused_video_extensions)
+            );
+            DecodeOutput::Gpu {
+                vulkan: Some(Arc::new(to_shared_device(&share))),
+            }
+        }
+        None => {
+            tracing::info!(
+                "vídeo recibido: se copia a memoria para presentarlo (sin dispositivo Vulkan \
+                 compartido, o COROOM_ZERO_COPY=0)"
+            );
+            DecodeOutput::Cpu
+        }
     }
 }
 

@@ -28,8 +28,11 @@
 //! más de una vez por segundo, para no reconfigurar el codificador a cada informe.
 //!
 //! [`MediaControllerFactory`] construye el controlador de congestión propio para `quinn`: fija
-//! la ventana a `target_kbps × RTT × 2` (nunca por debajo de 64 KB) para que QUIC no frene los
-//! datagramas por su cuenta, y cuenta los eventos de congestión por ECN que `quinn` le notifica
+//! la ventana a `target_kbps × (RTT + 25 ms de retraso de los ACK) × 1,5` (nunca por debajo de
+//! 64 KB) para que QUIC no frene los
+//! datagramas por su cuenta pero tampoco deje salir ráfagas muy por encima del objetivo (el pacer de
+//! `quinn` reparte la ventana en un RTT: con ×2 las ráfagas iban a 2,5 veces el objetivo y llenaban
+//! la cola del camino), y cuenta los eventos de congestión por ECN que `quinn` le notifica
 //! (`on_congestion_event` con `lost_bytes == 0`). Se compara con el BBR
 //! de `quinn` ([`Congestion::Bbr`]) en el spike `tests/spike.rs`.
 //!
@@ -44,7 +47,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use quinn::congestion::{BbrConfig, Controller, ControllerFactory};
+use quinn::congestion::{BbrConfig, Controller, ControllerFactory, CubicConfig};
 // `quinn` no reexporta el estimador de RTT que recibe `Controller::on_ack`.
 use quinn_proto::RttEstimator;
 
@@ -52,7 +55,7 @@ use quinn_proto::RttEstimator;
 pub const MIN_WINDOW: u64 = 64 * 1024;
 
 /// Factor de la ventana sobre el producto bitrate × RTT.
-pub const WINDOW_RTT_FACTOR: u64 = 2;
+pub const WINDOW_RTT_FACTOR: f64 = 1.5;
 
 /// Cola a partir de la cual el emisor reduce el bitrate.
 pub const QUEUE_THRESHOLD: Duration = Duration::from_millis(10);
@@ -360,11 +363,19 @@ impl CongestionShared {
     }
 }
 
-/// Ventana del controlador de medios para un bitrate y un RTT.
+/// Retraso de los ACK que se suma al RTT en la ventana: el `max_ack_delay` por defecto de QUIC
+/// (RFC 9000 §18.2). Los bytes siguen en vuelo hasta que llega su ACK, y el RTT que da `quinn` ya
+/// descuenta ese retraso: con una ventana de `target × RTT` en una LAN (1 ms) cualquier ACK
+/// retrasado (un receptor ocupado, un temporizador de Windows) dejaba la conexión limitada a la
+/// ventana mínima por cada espera del ACK (64 KB cada 25 ms son ~20 Mbit/s).
+pub const ACK_DELAY_ALLOWANCE: Duration = Duration::from_millis(25);
+
+/// Ventana del controlador de medios para un bitrate y un RTT:
+/// `target × (RTT + ACK_DELAY_ALLOWANCE) × WINDOW_RTT_FACTOR`, nunca menos de [`MIN_WINDOW`].
 pub fn media_window(target_kbps: u32, rtt: Duration) -> u64 {
     let bytes_per_second = u64::from(target_kbps) * 1000 / 8;
-    let bdp = (bytes_per_second as f64 * rtt.as_secs_f64()) as u64;
-    (bdp * WINDOW_RTT_FACTOR).max(MIN_WINDOW)
+    let bdp = bytes_per_second as f64 * (rtt + ACK_DELAY_ALLOWANCE).as_secs_f64();
+    ((bdp * WINDOW_RTT_FACTOR) as u64).max(MIN_WINDOW)
 }
 
 /// Controlador de congestión de `quinn` que no frena los medios por debajo de su bitrate objetivo.
@@ -456,11 +467,14 @@ impl ControllerFactory for MediaControllerFactory {
 /// Controlador de congestión de las conexiones de medios.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Congestion {
-    /// [`MediaController`]: ventana `target × RTT × 2`, nunca < 64 KB (por defecto).
+    /// [`MediaController`]: ventana `target × (RTT + 25 ms) × 1,5`, nunca < 64 KB (por defecto).
     #[default]
     Media,
     /// BBR de `quinn` (referencia del spike).
     Bbr,
+    /// El controlador por defecto de `quinn` (CUBIC): para conexiones sin medios, como la
+    /// señalización, que no deben depender del bitrate de vídeo.
+    Standard,
 }
 
 impl Congestion {
@@ -472,6 +486,7 @@ impl Congestion {
         match self {
             Congestion::Media => MediaControllerFactory::new(Arc::clone(shared)),
             Congestion::Bbr => Arc::new(BbrConfig::default()),
+            Congestion::Standard => Arc::new(CubicConfig::default()),
         }
     }
 }
@@ -704,9 +719,11 @@ mod tests {
 
     #[test]
     fn media_window_follows_the_contract() {
-        assert_eq!(media_window(8_000, Duration::from_millis(1)), MIN_WINDOW);
-        // 8 Mbit/s = 1 MB/s; × 100 ms × 2 = 200 KB.
-        assert_eq!(media_window(8_000, Duration::from_millis(100)), 200_000);
+        assert_eq!(media_window(1_000, Duration::from_millis(1)), MIN_WINDOW);
+        // 8 Mbit/s = 1 MB/s; × (100 + 25) ms × 1,5 = 187,5 KB.
+        assert_eq!(media_window(8_000, Duration::from_millis(100)), 187_500);
+        // 80 Mbit/s en una LAN: el retraso de los ACK cuenta (10 MB/s × 26 ms × 1,5 = 390 KB).
+        assert_eq!(media_window(80_000, Duration::from_millis(1)), 390_000);
     }
 
     #[test]

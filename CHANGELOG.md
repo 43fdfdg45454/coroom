@@ -9,6 +9,11 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Añadido
 
+- **Registro en un fichero** (`<datos>/logs/coroom.log`, el de la ejecución anterior en
+  `coroom.1.log`; `coroom doctor` dice dónde): sesiones, códec y backends elegidos, errores del
+  decodificador, formato del audio, una línea cada 5 s con los fotogramas por segundo y tiempos de
+  cada etapa en cada lado, si el vídeo recibido va sin copia y las extensiones de Vulkan Video que
+  el driver ofrece sin activar.
 - **Mandos tal cual** (protocolo 8). Con anfitrión Linux, el mando del invitado llega con su
   VID/PID, su nombre y su descriptor HID (UHID), y sus informes sin traducir: Steam, SDL y los
   juegos lo ven como ese mando, con sus botones extra, y la vibración y las luces vuelven al
@@ -40,6 +45,32 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
   pantalla muestra lo elegido y al empezar se repite sin volver a preguntar.
 
 ### Corregido
+
+- **Vídeo que no llegaba o se congelaba** («Entrando en la sala» con el audio sonando, un solo
+  fotograma y nada más, al volver a entrar en una sala): el invitado pide un intra mientras no
+  tiene imagen, sin esperar a que lleguen fotogramas; el anfitrión manda uno cuando el invitado
+  está listo y repite el último con la pantalla quieta; tras una pérdida no se decodifica contra
+  referencias que faltan (con AV1 salía basura) y un decodificador que falla una y otra vez da
+  paso al siguiente o a otro códec.
+- **Cortes de vídeo periódicos, descartados y saltos de latencia por internet**: cada fotograma
+  sale repartido a un ritmo cercano al bitrate (antes, en 4 ms: un intra a 120 fps desbordaba el
+  búfer del socket del receptor y se pedía otro igual de grande), con búferes de socket de 8 MB,
+  el envío empieza a la mitad del máximo, un solo intra en vuelo a la vez y los reenvíos grandes
+  también con ritmo. En los codificadores que no cambian de bitrate en marcha (todos menos NVENC y
+  QSV), los cambios pequeños ya no reinician el codificador.
+- **Audio robotizado en un invitado Windows**: WASAPI reproduce a demanda, como PipeWire, y llena
+  el búfer del dispositivo hasta unos 20 ms en cada vuelta (antes, 10 ms como mucho: con un
+  periodo distinto del de 480 muestras se quedaba sin audio unas cien veces por segundo). La
+  sincronía con el vídeo ya no deja el colchón del audio por debajo de 20 ms.
+- **«Abriendo la sala…» para siempre y desconectado del servidor** tras terminar una sala sola:
+  la sesión anterior se cierra aparte, el arranque tiene un límite de tiempo y, si falla, se dice
+  por qué y se sigue conectado; los errores de la sesión se muestran en lugar de «Has dejado de
+  compartir». En el servidor, un «desconectado» que llega tarde ya no pisa al «conectado».
+- **«Buscando…» en Compartir** hasta tocar algo: la lista se pide al entrar y el refresco
+  automático funciona (antes la ventana se redibujaba sin parar); los errores al listar pantallas
+  y ventanas se muestran.
+- Windows: el ahorro de energía ya no anula los temporizadores de 1 ms de coroom.
+- La señalización usa el control de congestión estándar de QUIC.
 
 - **Driver de mandos de Windows** (el de la v1.3.0 puede no arrancar: hay que volver a ejecutar
   `install.ps1` con el paquete nuevo). El INF pedía UMDF 2.35, la última del WDK con el que se

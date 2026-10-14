@@ -23,6 +23,10 @@ pub fn report() -> Result<Vec<String>, String> {
     out.push(format!("Versión del protocolo: {PROTOCOL_VERSION}"));
     let data_dir = crate::remote::default_data_dir();
     out.push(format!("Directorio de datos: {}", data_dir.display()));
+    out.push(format!(
+        "Registro: {} (la ejecución anterior, en coroom.1.log; mándalo al pedir ayuda)",
+        crate::logging::log_path().display()
+    ));
     if !crate::portal::in_flatpak() {
         out.push(if KeyringStore::is_available() {
             "Llavero del sistema: disponible (identidad y credenciales de cada servidor)".to_owned()

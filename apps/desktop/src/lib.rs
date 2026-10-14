@@ -8,6 +8,7 @@ pub mod l10n;
 
 pub mod account;
 pub mod doctor;
+pub mod logging;
 pub mod portal;
 pub mod probe;
 pub mod remote;

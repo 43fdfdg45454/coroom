@@ -25,7 +25,7 @@
 //! hasta enviarlo (y que se comparte entre todos los destinos).
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,7 +35,9 @@ use coroom_audio::jitter::{JitterBuffer, Pop};
 use coroom_audio::mix::Mixer;
 use coroom_audio::processing::{ProcessingOptions, RenderFeed, VoiceProcessor};
 use coroom_audio::sync::AvSync;
-use coroom_audio::{AudioConfig, AudioSink, AudioSource, MAX_FRAME_SAMPLES, Render};
+use coroom_audio::{
+    AudioConfig, AudioSink, AudioSource, DeviceCounters, MAX_FRAME_SAMPLES, Render,
+};
 use coroom_transport::PeerConnection;
 use coroom_transport::crypto::sframe::FrameEncryptor;
 use coroom_transport::proto::audio::{AUDIO_HEADER_LEN, AudioHeader};
@@ -735,6 +737,28 @@ pub(crate) struct Player {
     pub(crate) av_sync: bool,
 }
 
+/// Faltas y sobras de la salida ([`AudioSink::device_counters`]): las deja el hilo que tiene el
+/// sumidero y las publica la reproducción, que a demanda corre en el hilo del dispositivo.
+#[derive(Debug, Default)]
+struct DeviceStats {
+    underruns: AtomicU64,
+    overruns: AtomicU64,
+}
+
+impl DeviceStats {
+    fn store(&self, counters: DeviceCounters) {
+        self.underruns.store(counters.underruns, Ordering::Relaxed);
+        self.overruns.store(counters.overruns, Ordering::Relaxed);
+    }
+
+    fn load(&self) -> DeviceCounters {
+        DeviceCounters {
+            underruns: self.underruns.load(Ordering::Relaxed),
+            overruns: self.overruns.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Convierte la `capture_us` (32 bits, reloj del anfitrión) de una trama a un instante local.
 pub(crate) type ToLocal = dyn Fn(u32) -> Option<Instant> + Send + Sync;
 
@@ -799,6 +823,8 @@ struct Playout {
     ticks: u32,
     /// Se cerró el canal de paquetes: la sesión termina.
     closed: Arc<AtomicBool>,
+    /// Faltas y sobras de la salida.
+    device: Arc<DeviceStats>,
 }
 
 impl Playout {
@@ -915,6 +941,7 @@ impl Playout {
         publish(
             &self.core.ledger,
             self.game.iter().chain(self.voices.iter()),
+            self.device.load(),
         );
     }
 }
@@ -941,6 +968,7 @@ pub(crate) fn play_loop(
         latency: coroom_audio::DEVICE_LATENCY,
     };
     let closed = Arc::new(AtomicBool::new(false));
+    let device = Arc::new(DeviceStats::default());
     let playout = Playout {
         core: Arc::clone(core),
         control,
@@ -956,12 +984,13 @@ pub(crate) fn play_loop(
         last_video: 0,
         ticks: 0,
         closed: Arc::clone(&closed),
+        device: Arc::clone(&device),
     };
     let frame_len = coroom_audio::SAMPLES_PER_CHANNEL * usize::from(format.channels);
     if sink.supports_pull() {
-        play_pull(core, sink.as_mut(), &config, playout, &closed);
+        play_pull(core, sink.as_mut(), &config, playout, &closed, &device);
     } else {
-        play_push(core, sink.as_mut(), &config, playout, frame_len);
+        play_push(core, sink.as_mut(), &config, playout, frame_len, &device);
     }
 }
 
@@ -972,6 +1001,7 @@ fn play_pull(
     config: &AudioConfig,
     playout: Playout,
     closed: &AtomicBool,
+    device_stats: &DeviceStats,
 ) {
     let playout = Arc::new(Mutex::new(playout));
     let device = Arc::clone(&playout);
@@ -994,8 +1024,10 @@ fn play_pull(
             core.warn(format!("la salida de audio se detuvo: {err}"));
             break;
         }
+        device_stats.store(sink.device_counters());
         std::thread::sleep(PULL_WATCH);
     }
+    device_stats.store(sink.device_counters());
     sink.stop();
     lock(&playout).publish();
 }
@@ -1007,6 +1039,7 @@ fn play_push(
     config: &AudioConfig,
     mut playout: Playout,
     frame_len: usize,
+    device: &DeviceStats,
 ) {
     // Con la cola, este hilo marca el ritmo del sumidero (a demanda lo marca el dispositivo).
     realtime("audio-play");
@@ -1032,8 +1065,10 @@ fn play_push(
                 break;
             }
         };
+        device.store(sink.device_counters());
         playout.played(&out[..frame_len], decided, played.played_at_estimate);
     }
+    device.store(sink.device_counters());
     playout.publish();
     sink.stop();
 }
@@ -1089,9 +1124,18 @@ impl AudioReader {
     }
 }
 
-/// Suma los contadores de los buffers por pista y los deja en el registro.
-fn publish<'a>(ledger: &LatencyLedger, streams: impl Iterator<Item = &'a Stream>) {
-    let mut totals = [AudioCounters::default(); 2];
+/// Suma los contadores de los buffers por pista y los deja en el registro, con los de la salida
+/// (común a las pistas: el mismo valor en cada una).
+fn publish<'a>(
+    ledger: &LatencyLedger,
+    streams: impl Iterator<Item = &'a Stream>,
+    device: DeviceCounters,
+) {
+    let mut totals = [AudioCounters {
+        device_underruns: device.underruns,
+        device_overruns: device.overruns,
+        ..AudioCounters::default()
+    }; 2];
     let mut seen = [false; 2];
     for stream in streams {
         let index = match stream.track {
@@ -1193,6 +1237,33 @@ mod tests {
                 Instant::now()
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn output_underruns_are_published_with_the_jitter_counters() {
+        let ledger = LatencyLedger::new();
+        let game = Stream::new(AudioTrack::Game, 1).expect("emisor");
+        let device = DeviceStats::default();
+        device.store(DeviceCounters {
+            underruns: 7,
+            overruns: 2,
+        });
+        publish(&ledger, std::iter::once(&game), device.load());
+        let summary = ledger.audio_summary().expect("resumen");
+        let counters = summary
+            .tracks
+            .iter()
+            .find(|track| track.track == AudioTrack::Game)
+            .expect("juego")
+            .counters;
+        assert_eq!(
+            (counters.device_underruns, counters.device_overruns),
+            (7, 2)
+        );
+        assert!(
+            summary.to_string().contains("salida sin audio 7"),
+            "{summary}"
         );
     }
 

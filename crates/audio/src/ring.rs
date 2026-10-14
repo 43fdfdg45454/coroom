@@ -1,13 +1,14 @@
 //! Anillo de muestras entre el hilo de un backend nativo (el callback de PipeWire, el bucle de
 //! eventos de WASAPI) y el hilo de audio de la sesión. Se reserva al abrir el flujo: ni el
-//! callback ni el lector asignan después.
+//! callback ni el lector asignan después. También [`Pull`], la reproducción a demanda de esos
+//! mismos hilos.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use crate::{AudioError, AudioFormat, Captured, Played};
+use crate::{AudioError, AudioFormat, Captured, DeviceCounters, Played, Render, SAMPLE_RATE_HZ};
 
 /// Capacidad del anillo: 500 ms.
 const RING_MS: usize = 500;
@@ -60,6 +61,26 @@ impl Shared {
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, Ring> {
         self.ring.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Veces que faltó o sobró audio.
+    pub(crate) fn counters(&self) -> DeviceCounters {
+        let ring = self.lock();
+        DeviceCounters {
+            underruns: ring.underruns,
+            overruns: ring.overruns,
+        }
+    }
+
+    /// El dispositivo se quedó sin audio (lo detecta el backend, a demanda o con la cola).
+    #[cfg_attr(not(all(target_os = "windows", feature = "wasapi")), allow(dead_code))]
+    pub(crate) fn note_underrun(&self) {
+        self.lock().underruns += 1;
+    }
+
+    /// El error del flujo, si se detuvo.
+    pub(crate) fn failure(&self) -> Option<AudioError> {
+        self.lock().failure.clone()
     }
 
     pub(crate) fn fail(&self, err: AudioError) {
@@ -234,6 +255,9 @@ impl Shared {
         }
         let queued = format.duration_of(ring.samples.len());
         let room = ring.capacity.saturating_sub(ring.samples.len());
+        if samples.len() > room {
+            ring.overruns += 1;
+        }
         ring.samples.extend(samples.iter().take(room));
         ring.last_push = Some(Instant::now());
         drop(ring);
@@ -242,6 +266,49 @@ impl Shared {
         Ok(Played {
             played_at_estimate: Instant::now() + queued + delay,
         })
+    }
+}
+
+/// Reproducción a demanda: lo que pide cada trama y lo que sobró de la última, si el dispositivo
+/// pide cuantos que no son de 10 ms.
+pub(crate) struct Pull {
+    render: Render,
+    frame: [i16; crate::MAX_FRAME_SAMPLES],
+    len: usize,
+    pos: usize,
+}
+
+impl Pull {
+    pub(crate) fn new(render: Render) -> Self {
+        Self {
+            render,
+            frame: [0; crate::MAX_FRAME_SAMPLES],
+            len: 0,
+            pos: 0,
+        }
+    }
+
+    /// Llena `out` (intercalado, `channels` canales) pidiendo tramas nuevas cuando se acaba la
+    /// anterior. La primera muestra de `out` sonará dentro de `delay`.
+    pub(crate) fn fill(&mut self, out: &mut [i16], channels: usize, delay: Duration) {
+        let frame_len = crate::SAMPLES_PER_CHANNEL * channels;
+        let now = Instant::now();
+        let mut written = 0;
+        while written < out.len() {
+            if self.pos == self.len {
+                let ahead = Duration::from_micros(
+                    (written / channels) as u64 * 1_000_000 / u64::from(SAMPLE_RATE_HZ),
+                );
+                let frame = &mut self.frame[..frame_len];
+                frame.fill(0);
+                (self.render)(frame, now + delay + ahead);
+                (self.len, self.pos) = (frame_len, 0);
+            }
+            let n = (self.len - self.pos).min(out.len() - written);
+            out[written..written + n].copy_from_slice(&self.frame[self.pos..self.pos + n]);
+            self.pos += n;
+            written += n;
+        }
     }
 }
 
@@ -280,5 +347,79 @@ mod tests {
             shared.read_frame(AudioFormat::VOICE, &mut out),
             Err(AudioError::DeviceLost)
         );
+        // El silencio por falta de captura y el hueco del dispositivo cuentan como faltas.
+        assert_eq!(
+            shared.counters(),
+            DeviceCounters {
+                underruns: 2,
+                overruns: 0
+            }
+        );
+        assert_eq!(shared.failure(), Some(AudioError::DeviceLost));
+    }
+
+    #[test]
+    fn overruns_and_underruns_are_counted() {
+        let shared = Shared::new(AudioFormat::VOICE);
+        // 500 ms de capacidad: lo que no cabe desplaza a lo más antiguo.
+        shared.push(std::iter::repeat_n(1, 24_000 + 10));
+        assert_eq!(shared.counters().overruns, 10);
+        shared.note_underrun();
+        assert_eq!(shared.counters().underruns, 1);
+    }
+
+    #[test]
+    fn on_demand_playback_splits_frames_across_small_quanta() {
+        // El grafo pide cuantos de 256 muestras por canal (5,3 ms): cada trama de 480 se pide una
+        // vez, entera, y lo que sobra va al cuanto siguiente sin perder ni repetir muestras.
+        let calls: Arc<Mutex<Vec<Instant>>> = Arc::default();
+        let seen = Arc::clone(&calls);
+        let mut next = 0i16;
+        let mut pull = Pull::new(Box::new(move |out: &mut [i16], played_at: Instant| {
+            seen.lock().unwrap().push(played_at);
+            for sample in out.as_chunks_mut::<2>().0 {
+                sample.fill(next);
+                next = next.wrapping_add(1);
+            }
+        }));
+        let delay = Duration::from_millis(10);
+        let mut heard = Vec::new();
+        for _ in 0..15 {
+            let mut quantum = [0i16; 256 * 2];
+            pull.fill(&mut quantum, 2, delay);
+            heard.extend(quantum.as_chunks::<2>().0.iter().map(|s| s[0]));
+        }
+        let expected: Vec<i16> = (0..15 * 256).map(|i| i as i16).collect();
+        assert_eq!(heard, expected);
+        let calls = calls.lock().unwrap();
+        // 15 × 256 = 3840 muestras = 8 tramas exactas.
+        assert_eq!(calls.len(), 8);
+        // Una trama pedida a mitad de cuanto suena después de lo que ya se escribió en él.
+        let first = calls[0];
+        assert!(first >= Instant::now() - Duration::from_secs(1));
+        assert!(calls[1] > first, "{calls:?}");
+    }
+
+    #[test]
+    fn pulling_odd_quanta_asks_for_whole_frames_in_order() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&calls);
+        let mut next = 0i16;
+        let mut pull = Pull::new(Box::new(move |frame: &mut [i16], at: Instant| {
+            frame.fill(next);
+            next += 1;
+            seen.lock().expect("lista").push(at);
+        }));
+        let mut out = [0i16; 512];
+        pull.fill(&mut out, 1, Duration::from_millis(5));
+        assert_eq!((out[479], out[480], out[511]), (0, 1, 1));
+        pull.fill(&mut out[..448], 1, Duration::ZERO);
+        assert_eq!((out[0], out[447]), (1, 1), "sigue con lo que sobró");
+        pull.fill(&mut out[..1], 1, Duration::ZERO);
+        assert_eq!(out[0], 2);
+        let calls = calls.lock().expect("lista");
+        assert_eq!(calls.len(), 3);
+        // La segunda trama de la primera llamada suena 10 ms después que la primera.
+        assert_eq!(calls[1] - calls[0], Duration::from_millis(10));
     }
 }

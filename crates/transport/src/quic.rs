@@ -8,7 +8,13 @@
 //! TLS 1.3 con claves públicas crudas e intercambio X25519MLKEM768 ([`crate::tls`]); ALPN
 //! `coroom-p2p/1` entre pares. Transporte: datagramas para medios (RFC 9221), `keep_alive` de 5 s,
 //! `idle_timeout` de 15 s, migración de ruta activada y el controlador de congestión de medios
-//! ([`crate::rate::MediaController`]) salvo que se pida BBR.
+//! ([`crate::rate::MediaController`]) salvo que se pida BBR. La señalización (HTTP/3) no lleva
+//! medios y usa el controlador por defecto de `quinn` ([`Congestion::Standard`]).
+//!
+//! Búferes: el socket pide [`SOCKET_BUFFER`] al sistema en los dos sentidos (un intra de cientos de
+//! KB llega en pocos milisegundos y los 64 KB por defecto de Windows, o los ~208 KB de
+//! `net.core.rmem_max` en Linux, lo descartaban entero); la cola de datagramas por enviar de cada
+//! conexión guarda unos 250 ms al bitrate máximo ([`datagram_send_buffer`]): más sería vídeo viejo.
 //!
 //! Streams de cada conexión: el primer byte de cada stream bidireccional dice su tipo (control o
 //! entrada). El **control** lo abre siempre el invitado con [`PeerConnection::open_control`] y lo
@@ -67,8 +73,29 @@ pub const INITIAL_MTU: u16 = 1252;
 /// Espera máxima del saludo de un stream de control.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Búfer de datagramas recibidos y por enviar de cada conexión.
+/// Búfer de datagramas recibidos de cada conexión (y por enviar, en [`transport_config`]).
 const DATAGRAM_BUFFER: usize = 4 * 1024 * 1024;
+
+/// Medios por enviar que guarda como mucho la cola de datagramas de una conexión: lo que lleve más
+/// de esto esperando ya es vídeo viejo, y `quinn` descarta el más antiguo cuando se llena.
+pub const SEND_QUEUE_TIME: Duration = Duration::from_millis(250);
+
+/// Suelo de la cola de datagramas por enviar ([`datagram_send_buffer`]): deja pasar el intra de un
+/// bitrate bajo. El techo es [`DATAGRAM_BUFFER`].
+const MIN_SEND_BUFFER: usize = 512 * 1024;
+
+/// Búfer del socket UDP que se pide al sistema en cada sentido (`SO_RCVBUF` y `SO_SNDBUF`).
+pub const SOCKET_BUFFER: usize = 8 * 1024 * 1024;
+
+/// Por debajo de esto, el búfer de recepción que dio el sistema merece un aviso.
+const SMALL_SOCKET_BUFFER: usize = 1024 * 1024;
+
+/// Cola de datagramas por enviar de una conexión de medios: [`SEND_QUEUE_TIME`] a `max_kbps`,
+/// acotada a [512 KB, 4 MB].
+pub fn datagram_send_buffer(max_kbps: u32) -> usize {
+    let bytes = (u64::from(max_kbps) * 1000 / 8) as f64 * SEND_QUEUE_TIME.as_secs_f64();
+    (bytes as usize).clamp(MIN_SEND_BUFFER, DATAGRAM_BUFFER)
+}
 
 /// Datagramas que espera cada cola de una conexión (medios y entrada) antes de descartar el más
 /// antiguo.
@@ -111,6 +138,14 @@ pub struct EndpointOptions {
     pub initial_target_kbps: u32,
 }
 
+impl EndpointOptions {
+    /// Bitrate máximo de los medios de este `Endpoint` (el objetivo inicial que se le da es el
+    /// máximo del usuario), con el que se dimensiona la cola de datagramas por enviar.
+    pub fn max_kbps(&self) -> u32 {
+        self.initial_target_kbps
+    }
+}
+
 impl Default for EndpointOptions {
     fn default() -> Self {
         Self {
@@ -142,6 +177,40 @@ pub fn transport_config(
     config
 }
 
+/// Configuración de transporte de las conexiones del `Endpoint`: la de [`transport_config`] con la
+/// cola de datagramas por enviar de [`datagram_send_buffer`] para `max_kbps`.
+fn endpoint_transport_config(
+    shared: &Arc<CongestionShared>,
+    congestion: Congestion,
+    max_kbps: u32,
+) -> quinn::TransportConfig {
+    let mut config = transport_config(shared, congestion);
+    config.datagram_send_buffer_size(datagram_send_buffer(max_kbps));
+    config
+}
+
+/// Pide [`SOCKET_BUFFER`] de recepción y de envío al socket y anota lo que dio el sistema (Linux
+/// lo recorta a `net.core.rmem_max`/`wmem_max` y devuelve el doble de lo que reserva).
+fn grow_socket_buffers(socket: &socket2::Socket) {
+    if let Err(err) = socket.set_recv_buffer_size(SOCKET_BUFFER) {
+        tracing::warn!(error = %err, "no se pudo ampliar el búfer de recepción del socket UDP");
+    }
+    if let Err(err) = socket.set_send_buffer_size(SOCKET_BUFFER) {
+        tracing::warn!(error = %err, "no se pudo ampliar el búfer de envío del socket UDP");
+    }
+    let recv = socket.recv_buffer_size().unwrap_or(0);
+    let send = socket.send_buffer_size().unwrap_or(0);
+    tracing::info!(recv, send, "búferes del socket UDP");
+    if recv < SMALL_SOCKET_BUFFER {
+        tracing::warn!(
+            recv,
+            "el sistema dio un búfer de recepción UDP pequeño: un fotograma clave grande puede \
+             perderse entero (en Linux: sysctl -w net.core.rmem_max=8388608 \
+             net.core.wmem_max=8388608)"
+        );
+    }
+}
+
 /// Abre el socket UDP: doble pila en `[::]` si se puede; si no, IPv4.
 fn bind_socket(addr: Option<SocketAddr>) -> Result<std::net::UdpSocket, TransportError> {
     use socket2::{Domain, Protocol, Socket, Type};
@@ -151,6 +220,7 @@ fn bind_socket(addr: Option<SocketAddr>) -> Result<std::net::UdpSocket, Transpor
         if addr.is_ipv6() && addr.ip().is_unspecified() {
             socket.set_only_v6(false)?;
         }
+        grow_socket_buffers(&socket);
         socket.bind(&addr.into())?;
         Ok(socket.into())
     };
@@ -215,14 +285,44 @@ impl fmt::Debug for Endpoint {
 /// y con eso el pacer de QUIC (ráfagas de 2 ms) y los `sleep` de tokio llegan hasta 15 ms tarde:
 /// el caudal se hunde y la latencia crece. Como hacen los juegos y los clientes de streaming, el
 /// proceso pide 1 ms una sola vez; desde Windows 10 2004 solo afecta a este proceso y el sistema
-/// lo libera al terminar. En los demás sistemas no hace falta.
-// Única llamada `unsafe` de esta crate: la API de Windows, con su invariante en el `SAFETY`.
+/// lo libera al terminar. Windows 11 ignora además esa petición si la ventana del proceso está
+/// oculta o minimizada (o si no tiene ventana), salvo que el proceso se salga de esa regulación con
+/// `SetProcessInformation(ProcessPowerThrottling)` y `PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION`
+/// (el bit en la máscara de control y la de estado a 0: «no regular la resolución»). En los demás
+/// sistemas no hace falta.
+// Únicas llamadas `unsafe` de esta crate: la API de Windows, con su invariante en el `SAFETY`.
 #[allow(unsafe_code)]
 fn high_resolution_timers() {
     #[cfg(windows)]
     {
+        use windows::Win32::System::Threading::{
+            GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
+            ProcessPowerThrottling, SetProcessInformation,
+        };
+
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
+            let state = PROCESS_POWER_THROTTLING_STATE {
+                Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+                StateMask: 0,
+            };
+            // SAFETY: `GetCurrentProcess` devuelve un pseudo-identificador que no hay que cerrar;
+            // `state` es un `PROCESS_POWER_THROTTLING_STATE` válido que vive durante la llamada y
+            // su tamaño es el que se pasa. Los Windows anteriores a 11 rechazan el bit con un
+            // error, que solo se anota.
+            let throttling = unsafe {
+                SetProcessInformation(
+                    GetCurrentProcess(),
+                    ProcessPowerThrottling,
+                    std::ptr::from_ref(&state).cast(),
+                    std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+                )
+            };
+            if let Err(err) = throttling {
+                tracing::debug!(error = %err, "sin exención de la regulación de temporizadores");
+            }
             // SAFETY: `timeBeginPeriod` solo recibe el periodo en milisegundos y no toca memoria
             // nuestra; el periodo queda pedido hasta que el proceso termina.
             let result = unsafe { windows::Win32::Media::timeBeginPeriod(1) };
@@ -328,9 +428,10 @@ impl Endpoint {
                 .map_err(|err| TransportError::Tls(err.to_string()))?;
         let shared = CongestionShared::new(self.inner.options.initial_target_kbps);
         let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-        config.transport_config(Arc::new(transport_config(
+        config.transport_config(Arc::new(endpoint_transport_config(
             &shared,
             self.inner.options.congestion,
+            self.inner.options.max_kbps(),
         )));
         let connection = self
             .inner
@@ -354,6 +455,8 @@ impl Endpoint {
     }
 
     /// Conecta con el servidor de coroom en `addr` con el ALPN `alpn` (señalización `h3` o relay).
+    /// El relay lleva medios y usa el controlador del `Endpoint`; la señalización, el de `quinn`
+    /// ([`Congestion::Standard`]): sus streams no tienen por qué ir al ritmo de un bitrate de vídeo.
     pub async fn connect_server(
         &self,
         addr: SocketAddr,
@@ -364,10 +467,15 @@ impl Endpoint {
         let crypto = QuicClientConfig::try_from(tls::server_client_config(trust, alpn)?)
             .map_err(|err| TransportError::Tls(err.to_string()))?;
         let shared = CongestionShared::new(self.inner.options.initial_target_kbps);
+        let congestion = match alpn {
+            Alpn::H3 => Congestion::Standard,
+            Alpn::Relay | Alpn::P2p => self.inner.options.congestion,
+        };
         let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-        config.transport_config(Arc::new(transport_config(
+        config.transport_config(Arc::new(endpoint_transport_config(
             &shared,
-            self.inner.options.congestion,
+            congestion,
+            self.inner.options.max_kbps(),
         )));
         let connection = self
             .inner
@@ -446,7 +554,11 @@ fn server_config(
 ) -> ServerConfigWithShared {
     let shared = CongestionShared::new(options.initial_target_kbps);
     let mut config = quinn::ServerConfig::with_crypto(Arc::clone(crypto) as _);
-    config.transport_config(Arc::new(transport_config(&shared, options.congestion)));
+    config.transport_config(Arc::new(endpoint_transport_config(
+        &shared,
+        options.congestion,
+        options.max_kbps(),
+    )));
     config.migration(true);
     ServerConfigWithShared(config, shared)
 }

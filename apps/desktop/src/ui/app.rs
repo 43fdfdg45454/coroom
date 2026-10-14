@@ -636,8 +636,10 @@ impl App {
             consider(at);
         }
         if self.page == Page::Host
-            && let Some(at) = self.host.next_refresh()
+            && self.screen == Screen::Main
+            && let Some(at) = self.host.next_refresh(self.now)
         {
+            // Si ya toca, el próximo `Tick` pide la lista y deja de tocar (nunca un bucle).
             consider(at);
         }
         if let Some(guest) = &self.guest
@@ -674,17 +676,18 @@ impl App {
                 if let Some(guest) = &mut self.guest {
                     guest.tick(now);
                 }
+                let mut effects = Vec::new();
                 if self.update.next_check.is_some_and(|at| at <= now) {
                     self.update.next_check = None;
-                    return self.check_updates(false);
+                    effects.extend(self.check_updates(false));
                 }
                 if self.page == Page::Host
                     && self.screen == Screen::Main
-                    && self.host.next_refresh().is_some_and(|at| at <= now)
+                    && self.host.refresh_due(now)
                 {
-                    return host::refresh(self);
+                    effects.extend(host::refresh(self));
                 }
-                Vec::new()
+                effects
             }
             Message::Navigate(page) => self.navigate(page),
             Message::Shortcut(shortcut) => self.shortcut(shortcut),

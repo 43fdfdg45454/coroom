@@ -53,10 +53,130 @@ use crate::loopback::{
     CHANNEL_CAPACITY, Compressed, EncodeControl, LoopbackConfig, PipelineError, capture_loop,
     encode_loop, recv_or_stop, spawn_stage,
 };
+use crate::stats::{StatsWindow, bump};
 use crate::{GuestId, Permissions, SessionError, SessionState};
 
 /// Clave de época pendiente de instalar (la del último invitado añadido).
 type PendingEpoch = (u64, Vec<(u32, MediaKey)>);
+
+/// Una petición de intra para un grupo anterior al último intra enviado se da por servida si ese
+/// intra salió hace menos de esto (el invitado lo pidió antes de que le llegase).
+const STALE_REQUEST_WINDOW: Duration = Duration::from_secs(1);
+
+/// Margen de la espera entre dos intra forzados, además del RTT y dos intervalos.
+const KEYFRAME_MARGIN: Duration = Duration::from_millis(10);
+
+/// Espera máxima entre dos intra forzados con el retroceso ([`KeyframeGate`]).
+const MAX_KEYFRAME_SPACING: Duration = Duration::from_secs(1);
+
+/// Intra forzados seguidos (cada uno a menos de [`MAX_KEYFRAME_SPACING`] del anterior) a partir de
+/// los que la espera ya no crece (×2 con cada uno: 1, 2, 4, 8 y 16 veces la base).
+const MAX_KEYFRAME_BACKOFF: u32 = 4;
+
+/// Qué hacer con un `KeyframeRequest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyframeDecision {
+    /// Forzar un intra ya.
+    Now,
+    /// Forzarlo pasado este tiempo (ya salió uno hace poco): las peticiones de entretanto se
+    /// agrupan en este.
+    Later(Duration),
+    /// Ya está servida (viene un intra de camino o hay uno aplazado).
+    Ignore,
+}
+
+/// Limita los intra forzados por `KeyframeRequest` y agrupa los de todos los invitados. Sin esto,
+/// cada grupo perdido pedía un intra y cada intra (el fotograma más grande) desbordaba otra vez el
+/// búfer del receptor: una tormenta de intra que congelaba el vídeo decenas de segundos.
+///
+/// - Una petición de un grupo anterior al último intra enviado, si este salió hace menos de
+///   [`STALE_REQUEST_WINDOW`], ya está servida.
+/// - Si hay uno pedido que aún no ha salido, o uno aplazado, se agrupa con él.
+/// - Entre dos intra forzados pasa al menos `RTT + 2 intervalos + margen` desde que terminó de
+///   salir el anterior (lo que tarda en llegar y en saberse si llegó), duplicado con cada intra
+///   forzado seguido hasta [`MAX_KEYFRAME_SPACING`]; las peticiones de antes se aplazan a ese
+///   momento.
+#[derive(Debug, Default)]
+pub(crate) struct KeyframeGate {
+    state: std::sync::Mutex<GateState>,
+}
+
+#[derive(Debug, Default)]
+struct GateState {
+    /// Último intra enviado: su grupo y cuándo terminó de salir.
+    sent: Option<(u32, Instant)>,
+    /// Último intra forzado por una petición.
+    forced: Option<Instant>,
+    /// Intra forzados seguidos.
+    backoff: u32,
+    /// Hay uno aplazado.
+    deferred: bool,
+}
+
+impl KeyframeGate {
+    /// El intra del grupo `group` terminó de salir en `at`.
+    pub(crate) fn on_sent(&self, group: u32, at: Instant) {
+        lock(&self.state).sent = Some((group, at));
+    }
+
+    /// Decide qué hacer con una petición del grupo `group` con este RTT e intervalo.
+    fn on_request(
+        &self,
+        group: u32,
+        rtt: Duration,
+        interval: Duration,
+        now: Instant,
+    ) -> KeyframeDecision {
+        let mut state = lock(&self.state);
+        if let Some((sent_group, at)) = state.sent
+            && (sent_group.wrapping_sub(group) as i32) > 0
+            && now.saturating_duration_since(at) < STALE_REQUEST_WINDOW
+        {
+            return KeyframeDecision::Ignore;
+        }
+        // Pedido y aún sin salir (si en un segundo no salió, el codificador no estaba: se vuelve a
+        // pedir).
+        let pending = state.forced.is_some_and(|forced| {
+            state.sent.is_none_or(|(_, at)| at < forced)
+                && now.saturating_duration_since(forced) < MAX_KEYFRAME_SPACING
+        });
+        if pending || state.deferred {
+            return KeyframeDecision::Ignore;
+        }
+        let base = rtt + interval * 2 + KEYFRAME_MARGIN;
+        let spacing = (base * (1 << state.backoff)).min(MAX_KEYFRAME_SPACING);
+        let since = state.sent.map(|(_, at)| at);
+        match since {
+            Some(at) if now.saturating_duration_since(at) < spacing => {
+                state.deferred = true;
+                KeyframeDecision::Later(spacing - now.saturating_duration_since(at))
+            }
+            _ => {
+                Self::force(&mut state, now);
+                KeyframeDecision::Now
+            }
+        }
+    }
+
+    /// Lanza el intra aplazado.
+    fn fire_deferred(&self, now: Instant) {
+        let mut state = lock(&self.state);
+        state.deferred = false;
+        Self::force(&mut state, now);
+    }
+
+    fn force(state: &mut GateState, now: Instant) {
+        let quick = state
+            .forced
+            .is_some_and(|at| now.saturating_duration_since(at) < MAX_KEYFRAME_SPACING);
+        state.backoff = if quick {
+            (state.backoff + 1).min(MAX_KEYFRAME_BACKOFF)
+        } else {
+            0
+        };
+        state.forced = Some(now);
+    }
+}
 
 /// Emisor de una conexión directa con un invitado.
 struct DirectLink {
@@ -248,6 +368,7 @@ pub(crate) fn start(
 
     let links = Arc::new(std::sync::Mutex::new(Links::default()));
     let encode = Arc::new(EncodeControl::new(video.bitrate_kbps));
+    let gate = Arc::new(KeyframeGate::default());
     let (input, inject_thread) = HostInput::start(core, sink)?;
     *lock(&core.host_input) = Some(Arc::clone(&input));
     let (raw_tx, raw_rx) = bounded::<CapturedFrame>(CHANNEL_CAPACITY);
@@ -283,10 +404,15 @@ pub(crate) fn start(
         threads.push(("encode", handle));
     }
     {
-        let (core, links, handle) = (Arc::clone(core), Arc::clone(&links), handle.clone());
+        let (core, links, handle, gate) = (
+            Arc::clone(core),
+            Arc::clone(&links),
+            handle.clone(),
+            Arc::clone(&gate),
+        );
         let frames = video.frames;
         let thread = spawn_stage(&core.shared.clone(), "send", move || {
-            send_loop(&core, &enc_rx, &links, &handle, frames)
+            send_loop(&core, &enc_rx, &links, &handle, frames, &gate)
         })
         .map_err(spawn_error)?;
         threads.push(("send", thread));
@@ -304,6 +430,7 @@ pub(crate) fn start(
         encoders,
         links,
         encode,
+        gate,
         input,
         audio_info,
         commands,
@@ -591,6 +718,7 @@ fn send_loop(
     links: &std::sync::Mutex<Links>,
     handle: &Handle,
     frames: Option<u64>,
+    gate: &KeyframeGate,
 ) -> Result<(), PipelineError> {
     let shared = &core.shared;
     let ledger = &core.ledger;
@@ -639,6 +767,10 @@ fn send_loop(
         };
         let sent_at = Instant::now();
         ledger.mark(frame.frame_id, Stage::Sent, sent_at);
+        bump(&shared.counters.sent);
+        if frame.keyframe {
+            gate.on_sent(group, sent_at);
+        }
         for result in &results {
             if let Err(err) = result {
                 debug!(error = %err, group, "no se pudo enviar el fotograma a un invitado");
@@ -685,6 +817,8 @@ struct HostCtx {
     signal: SignalSender,
     links: Arc<std::sync::Mutex<Links>>,
     encode: Arc<EncodeControl>,
+    /// Límite de los intra forzados por `KeyframeRequest`.
+    gate: Arc<KeyframeGate>,
     pending: std::sync::Mutex<Option<PendingEpoch>>,
     /// Datos del relay de la sala; `None` si el servidor no lo da (cuota agotada o sin relay).
     relay_info: std::sync::Mutex<Option<RelayInfo>>,
@@ -720,7 +854,10 @@ impl HostCtx {
             rate: RateConfig {
                 min_kbps: (max / 10).max(100).min(max),
                 max_kbps: max,
-                start_kbps: max,
+                // Se arranca en la mitad y el control de tasa sube un 5 % cada 100 ms sin cola (el
+                // máximo en ~1,5 s): arrancar en el máximo llenaba la cola de un enlace más lento
+                // con el primer intra, el más grande.
+                start_kbps: (max / 2).max(1),
             },
         }
     }
@@ -746,11 +883,12 @@ impl HostCtx {
         self.encode.active.store(connected > 0, Ordering::Release);
     }
 
-    /// Tras conectar un invitado: intra, objetivo actual, evento y, si en
-    /// [`CAPABILITIES_TIMEOUT`] no dice qué decodifica, H.264 por software.
+    /// Tras conectar un invitado: objetivo actual, evento y, si en [`CAPABILITIES_TIMEOUT`] no
+    /// dice qué decodifica, H.264 por software. El intra para él no se pide aquí: su decodificador
+    /// no está abierto hasta que lleguen sus capacidades y reciba `CodecSelected`, y lo pide
+    /// [`renegotiate`].
     fn after_attach(self: &Arc<Self>, guest: GuestId, path: Path, control: &ControlSender) {
         self.update_active();
-        self.core.shared.request_keyframe();
         let kbps = self.encode.bitrate_kbps.load(Ordering::Acquire);
         let _ = control.send(&ControlMessage::TargetBitrate { kbps });
         let permissions = lock(&self.core.guests).get_mut(&guest).map(|status| {
@@ -1119,7 +1257,10 @@ async fn control_reader(
             None => sender.handle_control(message, &reply),
         };
         match rest {
-            Some(ControlMessage::KeyframeRequest { .. }) => ctx.core.shared.request_keyframe(),
+            Some(ControlMessage::KeyframeRequest { group }) => {
+                let rtt = sender.connection().rtt();
+                keyframe_request(&ctx, group, rtt);
+            }
             Some(ControlMessage::Capabilities(caps)) => {
                 let caps = GuestCapabilities::from_wire(&caps);
                 debug!(guest = guest.0, ?caps, "capacidades del invitado");
@@ -1183,6 +1324,9 @@ async fn renegotiate(ctx: &Arc<HostCtx>, guest: Option<GuestId>) {
         if current.is_some_and(|(c, _, f)| c == codec && f == format) {
             if let Some(guest) = guest {
                 announce(ctx, codec, format, Some(guest));
+                // El invitado acaba de abrir (o va a abrir) su decodificador: necesita un intra.
+                // Con la pantalla quieta, el hilo `encode` repite el último fotograma.
+                ctx.core.shared.request_keyframe();
             }
             return;
         }
@@ -1231,6 +1375,24 @@ async fn renegotiate(ctx: &Arc<HostCtx>, guest: Option<GuestId>) {
             ));
         }
         available.retain(|(c, _)| *c != codec);
+    }
+}
+
+/// Atiende un `KeyframeRequest` del grupo `group` de un invitado con este RTT ([`KeyframeGate`]).
+fn keyframe_request(ctx: &Arc<HostCtx>, group: u32, rtt: Duration) {
+    let interval = Duration::from_secs_f64(1.0 / f64::from(ctx.video.fps.max(1)));
+    match ctx.gate.on_request(group, rtt, interval, Instant::now()) {
+        KeyframeDecision::Now => ctx.core.shared.request_keyframe(),
+        KeyframeDecision::Later(wait) => {
+            bump(&ctx.core.shared.counters.coalesced_requests);
+            let ctx = Arc::clone(ctx);
+            tokio::spawn(async move {
+                tokio::time::sleep(wait).await;
+                ctx.gate.fire_deferred(Instant::now());
+                ctx.core.shared.request_keyframe();
+            });
+        }
+        KeyframeDecision::Ignore => bump(&ctx.core.shared.counters.coalesced_requests),
     }
 }
 
@@ -1337,10 +1499,16 @@ async fn rate_loop(ctx: Arc<HostCtx>) {
     let mut tick = tokio::time::interval(RATE_PERIOD);
     let mut ticks = 0u32;
     let mut reported = BTreeMap::new();
+    let mut stats = StatsWindow::new(&ctx.core.shared.counters, &ctx.core.ledger);
     loop {
         tick.tick().await;
         if ctx.core.ended() {
             break;
+        }
+        if stats.due() && ctx.encode.active.load(Ordering::Acquire) {
+            let target = ctx.encode.bitrate_kbps.load(Ordering::Acquire);
+            let line = stats.host_line(&ctx.core.shared.counters, &ctx.core.ledger, target);
+            tracing::info!(target: "coroom::stats", "{line}");
         }
         ticks = ticks.wrapping_add(1);
         if ticks.is_multiple_of(INPUT_REPORT_TICKS) {
@@ -1724,6 +1892,7 @@ async fn host_main(
     encoders: EncoderSet,
     links: Arc<std::sync::Mutex<Links>>,
     encode: Arc<EncodeControl>,
+    gate: Arc<KeyframeGate>,
     input: Arc<HostInput>,
     audio_info: AudioInfo,
     commands: mpsc::UnboundedReceiver<Command>,
@@ -1735,6 +1904,7 @@ async fn host_main(
         encoders,
         links,
         encode,
+        gate,
         input,
         audio_info,
         commands,
@@ -1751,6 +1921,7 @@ async fn run_host(
     encoders: EncoderSet,
     links: Arc<std::sync::Mutex<Links>>,
     encode: Arc<EncodeControl>,
+    gate: Arc<KeyframeGate>,
     input: Arc<HostInput>,
     audio_info: AudioInfo,
     mut commands: mpsc::UnboundedReceiver<Command>,
@@ -1848,6 +2019,7 @@ async fn run_host(
         signal: signal.sender(),
         links,
         encode,
+        gate,
         pending: std::sync::Mutex::new(None),
         relay_lock: tokio::sync::Mutex::new(()),
         hello: Hello {
@@ -1937,5 +2109,88 @@ pub(crate) fn signal_error(err: coroom_transport::TransportError) -> SessionErro
             SessionError::Rejected(message)
         }
         other => SessionError::Network(format!("no se pudo conectar con el servidor: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RTT: Duration = Duration::from_millis(20);
+    const INTERVAL: Duration = Duration::from_micros(16_667);
+
+    /// Las peticiones de una tormenta (cada grupo perdido pide un intra, de varios invitados) se
+    /// agrupan: uno ya, los demás esperan a que llegue y, si siguen, salen espaciados cada vez más.
+    #[test]
+    fn keyframe_requests_are_coalesced_and_spaced() {
+        let gate = KeyframeGate::default();
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        assert_eq!(
+            gate.on_request(10, RTT, INTERVAL, at(0)),
+            KeyframeDecision::Now
+        );
+        // Mientras no ha salido, todo lo demás se agrupa con él.
+        for group in 11..20 {
+            assert_eq!(
+                gate.on_request(group, RTT, INTERVAL, at(5)),
+                KeyframeDecision::Ignore
+            );
+        }
+        // Sale en el grupo 20 a los 10 ms: lo pedido por grupos anteriores ya está servido.
+        gate.on_sent(20, at(10));
+        assert_eq!(
+            gate.on_request(18, RTT, INTERVAL, at(30)),
+            KeyframeDecision::Ignore
+        );
+        // Una pérdida posterior al intra antes de RTT + 2 intervalos + margen (63 ms): se aplaza
+        // al final de esa espera y se agrupa con las siguientes.
+        let decision = gate.on_request(21, RTT, INTERVAL, at(40));
+        let KeyframeDecision::Later(wait) = decision else {
+            unreachable!("se aplaza: {decision:?}");
+        };
+        assert!(
+            wait > Duration::ZERO && wait < Duration::from_millis(200),
+            "{wait:?}"
+        );
+        assert_eq!(
+            gate.on_request(22, RTT, INTERVAL, at(41)),
+            KeyframeDecision::Ignore
+        );
+        gate.fire_deferred(at(40) + wait);
+        let sent = at(40) + wait + Duration::from_millis(5);
+        gate.on_sent(30, sent);
+        // Otro seguido: la espera se duplica (retroceso).
+        let decision = gate.on_request(31, RTT, INTERVAL, sent + Duration::from_millis(70));
+        assert!(
+            matches!(decision, KeyframeDecision::Later(_)),
+            "{decision:?}"
+        );
+        // Pasado un segundo sin intra forzados, vuelve la espera corta.
+        gate.fire_deferred(at(400));
+        gate.on_sent(40, at(410));
+        assert_eq!(
+            gate.on_request(41, RTT, INTERVAL, at(2_000)),
+            KeyframeDecision::Now
+        );
+    }
+
+    /// Un intra pedido que nunca sale (el codificador aún no estaba) no bloquea las peticiones.
+    #[test]
+    fn a_keyframe_that_never_left_does_not_block_later_requests() {
+        let gate = KeyframeGate::default();
+        let start = Instant::now();
+        assert_eq!(
+            gate.on_request(0, RTT, INTERVAL, start),
+            KeyframeDecision::Now
+        );
+        assert_eq!(
+            gate.on_request(0, RTT, INTERVAL, start + Duration::from_millis(100)),
+            KeyframeDecision::Ignore
+        );
+        assert_eq!(
+            gate.on_request(0, RTT, INTERVAL, start + MAX_KEYFRAME_SPACING),
+            KeyframeDecision::Now
+        );
     }
 }

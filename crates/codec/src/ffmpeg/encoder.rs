@@ -42,8 +42,15 @@ const OUTPUT_WAIT_FRAMES: u32 = 3;
 /// Espera mínima al paquete, aunque los fps sean altos.
 const OUTPUT_WAIT_MIN: Duration = Duration::from_millis(50);
 
-/// Pausa entre dos sondeos del paquete de salida.
+/// Pausa entre dos sondeos del paquete de salida, pasado [`OUTPUT_SPIN`].
 const OUTPUT_POLL: Duration = Duration::from_micros(200);
+
+/// Tiempo de espera al paquete en que se sondea sin dormir (cediendo el hilo con `yield_now`). Un
+/// `sleep` de 200 µs dura en Windows lo que el reloj del sistema (1 ms con `timeBeginPeriod`,
+/// 15,6 ms si el sistema ignora la petición con la ventana oculta o minimizada): con NVENC o QSV el
+/// paquete sale en 1 a 3 ms y cada `sleep` de más se come un fotograma a 60 fps. Pasado este tiempo
+/// (un codificador lento, como SVT-AV1 en un equipo justo) se duerme para no gastar un núcleo.
+const OUTPUT_SPIN: Duration = Duration::from_millis(4);
 
 /// Opciones de baja latencia de cada backend, tal como las acepta `avcodec_open2` (genéricas de
 /// `AVCodecContext` y privadas del codificador). Comprobadas contra la ayuda de cada codificador de
@@ -278,6 +285,11 @@ pub struct FfmpegEncoder {
     in_flight: VecDeque<(i64, u64)>,
     unused_options: Vec<String>,
     reopened: u64,
+    /// Paquetes que no correspondían a ningún fotograma pendiente (descartados).
+    orphan_packets: u64,
+    /// Último fotograma de GPU entregado que no retiene nada de la captura (la copia D3D11 en el
+    /// pool propio) y su id, para [`Encoder::repeat_last`].
+    last_hw: Option<(AVFrame, u64)>,
     /// Importación de imágenes de GPU.
     importer: Option<GpuImporter>,
     /// La importación sin copias falló una vez: se usa el modo de respaldo.
@@ -326,6 +338,8 @@ impl FfmpegEncoder {
             in_flight: VecDeque::new(),
             unused_options: Vec::new(),
             reopened: 0,
+            orphan_packets: 0,
+            last_hw: None,
             importer: None,
             zero_copy_failed: false,
             gpu_note: None,
@@ -354,6 +368,12 @@ impl FfmpegEncoder {
     /// Veces que se reabrió el codificador después de configurarlo (por bitrate o por tamaño).
     pub fn reopened(&self) -> u64 {
         self.reopened
+    }
+
+    /// Paquetes descartados por no corresponder a ningún fotograma pendiente (tras cada uno, el
+    /// siguiente fotograma sale intra).
+    pub fn orphan_packets(&self) -> u64 {
+        self.orphan_packets
     }
 
     fn open(&mut self, config: &EncoderConfig) -> Result<Session, CodecError> {
@@ -464,6 +484,7 @@ impl FfmpegEncoder {
         imported: Option<AVHWFramesContext>,
     ) -> Result<(), CodecError> {
         self.session = None;
+        self.last_hw = None;
         let session = self.open_with(&config, imported)?;
         self.session = Some(session);
         self.config = Some(config);
@@ -473,8 +494,10 @@ impl FfmpegEncoder {
 
     /// Recoge los paquetes que haya; espera al del fotograma `pts` como mucho `wait`.
     fn drain(&mut self, pts: i64, wait: Duration) -> Result<Vec<EncodedSlice>, CodecError> {
-        let deadline = Instant::now() + wait;
+        let started = Instant::now();
+        let deadline = started + wait;
         let mut packets: Vec<(u64, bool, Vec<u8>)> = Vec::new();
+        let mut orphans = 0u32;
         let Some(session) = self.session.as_mut() else {
             return Ok(Vec::new());
         };
@@ -493,18 +516,37 @@ impl FfmpegEncoder {
                     }
                     if let Some(frame_id) = frame_id.or_else(|| packets.last().map(|p| p.0)) {
                         packets.push((frame_id, keyframe, data));
+                    } else {
+                        // Un paquete de ningún fotograma pendiente (pts inesperado): se pierde, y
+                        // con él las referencias de lo que venga detrás.
+                        orphans += 1;
                     }
                 }
                 Err(RsmpegError::EncoderDrainError) => {
                     let done = self.in_flight.front().is_none_or(|&(front, _)| front > pts);
-                    if done || Instant::now() >= deadline {
+                    let now = Instant::now();
+                    if done || now >= deadline {
                         break;
                     }
-                    std::thread::sleep(OUTPUT_POLL);
+                    if now.duration_since(started) < OUTPUT_SPIN {
+                        std::thread::yield_now();
+                    } else {
+                        std::thread::sleep(OUTPUT_POLL);
+                    }
                 }
                 Err(RsmpegError::EncoderFlushedError) => break,
                 Err(err) => return Err(backend_error("recibir el paquete", &err)),
             }
+        }
+        if orphans > 0 {
+            // El invitado no tendrá la referencia de ese paquete: el siguiente fotograma, intra.
+            self.keyframe_requested = true;
+            self.orphan_packets += u64::from(orphans);
+            super::log_warning(&format!(
+                "{} entregó {orphans} paquete(s) sin fotograma pendiente; se descartan y se pide un \
+                 intra",
+                self.backend
+            ));
         }
         let mut slices: Vec<EncodedSlice> = Vec::with_capacity(packets.len());
         for (frame_id, keyframe, data) in packets {
@@ -814,6 +856,7 @@ impl Encoder for FfmpegEncoder {
             ));
         }
         self.session = None;
+        self.last_hw = None;
         let session = self.open(config)?;
         self.session = Some(session);
         self.config = Some(*config);
@@ -851,6 +894,29 @@ impl Encoder for FfmpegEncoder {
             return Ok(());
         }
         self.reopen(config)
+    }
+
+    fn live_bitrate(&self) -> bool {
+        supports_live_bitrate(self.backend)
+    }
+
+    fn repeat_last(&mut self) -> Option<Result<Vec<EncodedSlice>, CodecError>> {
+        let (last, frame_id) = self.last_hw.as_ref()?;
+        let (mut hw, frame_id) = (last.clone(), *frame_id);
+        let fps = self.config?.fps;
+        let pts = self.next_pts;
+        self.next_pts += 1;
+        self.keyframe_requested = false;
+        hw.set_pts(pts);
+        hw.set_pict_type(picture_type(true));
+        let session = self.session.as_mut()?;
+        Some(match session.ctx.send_frame(Some(&hw)) {
+            Ok(()) | Err(RsmpegError::SendFrameAgainError) => {
+                self.copies = 0;
+                self.finish_frame(pts, frame_id, fps)
+            }
+            Err(err) => Err(backend_error("entregar el fotograma repetido", &err)),
+        })
     }
 
     fn request_keyframe(&mut self) {
@@ -923,6 +989,7 @@ impl FfmpegEncoder {
         config: EncoderConfig,
     ) -> Result<Vec<EncodedSlice>, CodecError> {
         self.ensure_cpu_session(config)?;
+        self.last_hw = None;
         let pts = self.next_pts;
         self.next_pts += 1;
         let keyframe = std::mem::take(&mut self.keyframe_requested);
@@ -1030,8 +1097,23 @@ impl FfmpegEncoder {
                         Ok(()) | Err(RsmpegError::SendFrameAgainError) => {}
                         Err(err) => return Err(backend_error("entregar el fotograma", &err)),
                     }
+                    // Una textura D3D11 se copió a una del pool propio (8): guardar esa no retiene
+                    // nada de la captura. Un DMA-BUF mapeado sí retendría el búfer de PipeWire.
+                    #[cfg(windows)]
+                    {
+                        self.last_hw =
+                            matches!(image, GpuImage::D3D11(_)).then(|| (hw, frame.frame_id));
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        drop(hw);
+                        self.last_hw = None;
+                    }
                 }
-                Prepared::Cpu(raw) => copies += self.send_cpu(&raw, pts, keyframe)?,
+                Prepared::Cpu(raw) => {
+                    self.last_hw = None;
+                    copies += self.send_cpu(&raw, pts, keyframe)?;
+                }
             }
             sent = true;
         }

@@ -258,12 +258,21 @@ unsafe fn queue_families(
 }
 
 /// Lo que hay que pedir al abrir el dispositivo para compartirlo con el decodificador.
+/// Extensiones de mantenimiento de Vulkan Video (`ash` 0.38 solo trae la primera).
+const VIDEO_MAINTENANCE: [&CStr; 2] = [
+    ash::khr::video_maintenance1::NAME,
+    c"VK_KHR_video_maintenance2",
+];
+
 struct VideoPlan {
     features: ::wgpu::Features,
     limits: ::wgpu::Limits,
     extensions: Vec<&'static CStr>,
     families: Vec<SharedQueueFamily>,
     codecs: Vec<&'static str>,
+    /// Extensiones de mantenimiento de vídeo que el driver ofrece y este dispositivo no activa:
+    /// FFmpeg las activa en su propio dispositivo y, sin ellas, decodifica AV1 por otro camino.
+    unused_video_extensions: Vec<String>,
 }
 
 /// Comprueba si `adapter` puede compartir su dispositivo con el decodificador y qué pedir; si no,
@@ -346,12 +355,18 @@ fn video_plan(adapter: &::wgpu::Adapter) -> Result<VideoPlan, String> {
     let families = plan_queue_families(&families, 0).ok_or_else(|| {
         "no hay una familia de decodificación y otra de cómputo aparte de la de wgpu".to_owned()
     })?;
+    let unused_video_extensions = VIDEO_MAINTENANCE
+        .iter()
+        .filter(|name| has(name) && !extensions.contains(name))
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect();
     Ok(VideoPlan {
         features,
         limits,
         extensions,
         families,
         codecs: codecs.into_iter().map(|(_, label)| label).collect(),
+        unused_video_extensions,
     })
 }
 
@@ -362,13 +377,24 @@ pub fn probe_zero_copy() -> String {
     match pollster::block_on(select_adapter(&instance, None)) {
         Ok(adapter) => match video_plan(&adapter) {
             Ok(plan) => format!(
-                "dispositivo Vulkan compartido con el decodificador (Vulkan Video: {}; colas {:?})",
+                "dispositivo Vulkan compartido con el decodificador (Vulkan Video: {}; colas {:?}; \
+                 ofrecidas sin activar: {})",
                 plan.codecs.join(", "),
-                plan.families.iter().map(|f| f.index).collect::<Vec<_>>()
+                plan.families.iter().map(|f| f.index).collect::<Vec<_>>(),
+                unused_label(&plan.unused_video_extensions)
             ),
             Err(reason) => format!("sin importación de imágenes Vulkan: {reason}"),
         },
         Err(err) => format!("sin adaptador gráfico ({err})"),
+    }
+}
+
+/// Las extensiones ofrecidas sin activar, o «ninguna».
+pub fn unused_label(names: &[String]) -> String {
+    if names.is_empty() {
+        "ninguna".to_owned()
+    } else {
+        names.join(", ")
     }
 }
 
@@ -387,6 +413,7 @@ fn open_video_device(
         limits,
         extensions,
         families: plan,
+        unused_video_extensions,
         ..
     } = video_plan(adapter).ok()?;
     let extra_families: Vec<u32> = plan
@@ -472,6 +499,7 @@ fn open_video_device(
             timeline_semaphore: true,
             synchronization2: true,
             sampler_ycbcr_conversion: false,
+            unused_video_extensions: unused_video_extensions.clone(),
             keepalive: Arc::new(device.clone()),
         };
         let importer = VulkanImporter {
