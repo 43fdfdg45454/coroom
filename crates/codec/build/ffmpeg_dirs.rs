@@ -103,9 +103,14 @@ fn ffmpeg_dirs() -> Result<FfmpegDirs, String> {
 /// solo aplica `RUNPATH` a las dependencias directas del ejecutable, y las builds de BtbN no llevan
 /// `rpath` propio, así que `libswresample` y `libswscale` (dependencias de `libavcodec`, no del
 /// binario) no se encontrarían. `DT_RPATH` sí vale para toda la cadena.
+///
+/// Nunca a un directorio del sistema (`/usr`, `/lib`): el cargador ya lo busca, y un `DT_RPATH`
+/// ahí pasa por delante de las rutas que añade el runtime (en el Flatpak 1.6.2 se saltaba la
+/// extensión `codecs-extra` y cargaba el FFmpeg recortado de la Platform).
 fn emit_rpath(lib: &Path) {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if target_os != "windows" && target_os != "macos" {
+    let system = ["/usr", "/lib", "/lib64"].iter().any(|dir| lib.starts_with(dir));
+    if target_os != "windows" && target_os != "macos" && !system {
         println!("cargo:rustc-link-arg=-Wl,--disable-new-dtags");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
     }

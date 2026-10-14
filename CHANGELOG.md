@@ -74,6 +74,12 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **El Flatpak 1.6.2 se cerraba al abrirlo** (fallo de segmentación dentro de FFmpeg al comprobar
+  los codificadores): el `rpath` que se añade al compilar apuntaba a las bibliotecas del sistema
+  del runtime y pasaba por delante de la extensión `codecs-extra`, así que se cargaba el FFmpeg
+  recortado de la Platform en vez del de la extensión. El `rpath` ya no apunta nunca a un
+  directorio del sistema, y el registro (al arrancar) y `coroom doctor` dicen de qué directorio se
+  cargó FFmpeg de verdad.
 - **Anfitrión Linux a 120 fps daba unos 30**, a ratos ninguno: con el ratón en movimiento,
   PipeWire manda búferes solo con el cursor, y la cadencia pedida los contaba como fotogramas. El
   hueco lo ocupaba uno de esos y el fotograma del juego que llegaba detrás se descartaba; si solo

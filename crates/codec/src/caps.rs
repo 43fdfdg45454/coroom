@@ -83,7 +83,7 @@ pub struct Capabilities {
     pub decoders: Vec<(Codec, DecoderBackend)>,
     /// Versión de FFmpeg cargada (`None` sin la feature `ffmpeg`).
     pub ffmpeg_version: Option<String>,
-    /// Directorio de las bibliotecas de FFmpeg con el que se compiló.
+    /// Directorio de las bibliotecas de FFmpeg cargadas (en Linux; si no, el de compilación).
     pub ffmpeg_dir: Option<String>,
     /// Codificadores y decodificadores que abren pero fallaron la comprobación de imagen (su
     /// imagen no coincide con la original), con el motivo: `«codificar AV1 con Vulkan Video: …»`.
@@ -126,7 +126,7 @@ impl Capabilities {
             caps.rejected = probed.rejected;
             caps.unavailable = probed.unavailable;
             caps.ffmpeg_version = Some(crate::ffmpeg::version());
-            caps.ffmpeg_dir = Some(crate::ffmpeg::library_dir().to_owned());
+            caps.ffmpeg_dir = Some(crate::ffmpeg::library_dir());
         }
         sort_encoders(&mut caps.encoders);
         sort(&mut caps.decoders);

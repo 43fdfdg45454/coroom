@@ -21,7 +21,9 @@
 #   sola no trae los codificadores de Vulkan ni el decodificador `hevc`. La extensión se instala
 #   sola con el runtime (sin `no-autodownload`). Es GPL (x264 y x265); coroom la usa, no la
 #   distribuye. Si alguien la bloquea (`flatpak mask`), queda el FFmpeg de la Platform y coroom elige
-#   otro codificador (VA-API, NVENC o el software).
+#   otro codificador (VA-API, NVENC o el software). El binario no lleva `rpath` a /usr/lib (ver
+#   `emit_rpath` en `crates/codec/build/ffmpeg_dirs.rs`): uno ahí pasaba por delante de la
+#   extensión y cargaba siempre el FFmpeg de la Platform (la 1.6.2 se cerraba al abrir).
 # - coroom con cargo sin red: `cargo-sources.json` (generado con `flatpak-cargo-generator.py` de
 #   flatpak-builder-tools desde `Cargo.lock`) vendoriza las crates de crates.io; las copias
 #   parcheadas de `vendor/` vienen con el propio código. libopus (`opusic-sys`) y el procesado de

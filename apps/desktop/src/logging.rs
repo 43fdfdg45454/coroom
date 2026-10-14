@@ -157,6 +157,9 @@ pub fn init(to_file: bool) -> Option<PathBuf> {
         version = env!("CARGO_PKG_VERSION"),
         os = std::env::consts::OS,
         arch = std::env::consts::ARCH,
+        // De dónde se cargó FFmpeg (en el Flatpak, la extensión `codecs-extra` o la Platform):
+        // antes del sondeo de codificadores, por si un driver o una biblioteca lo tumba.
+        ffmpeg = %coroom_session::codec::ffmpeg::library_dir(),
         "coroom arranca"
     );
     Some(path)

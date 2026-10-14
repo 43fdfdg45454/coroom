@@ -52,9 +52,24 @@ pub fn version() -> String {
         .into_owned()
 }
 
-/// Directorio de las bibliotecas de FFmpeg con el que se compiló (el de `FFMPEG_LIBS_DIR`).
-pub fn library_dir() -> &'static str {
-    env!("COROOM_FFMPEG_LIB_DIR")
+/// Directorio de las bibliotecas de FFmpeg: en Linux, el de la `libavcodec` cargada de verdad (la
+/// que aparece en `/proc/self/maps`: en el Flatpak, la de la extensión `codecs-extra` si está); si
+/// no se puede saber, el de compilación (`FFMPEG_LIBS_DIR`).
+pub fn library_dir() -> String {
+    loaded_library_dir().unwrap_or_else(|| env!("COROOM_FFMPEG_LIB_DIR").to_owned())
+}
+
+/// Directorio de la `libavcodec` mapeada en este proceso.
+fn loaded_library_dir() -> Option<String> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    maps.lines()
+        .filter_map(|line| line.split_whitespace().nth(5))
+        .find(|path| path.contains("/libavcodec.so"))
+        .and_then(|path| std::path::Path::new(path).parent())
+        .map(|dir| dir.display().to_string())
 }
 
 // Constantes de enumeraciones de C como `i32`: `bindgen` las da como `u32` en Linux y como `i32` en
