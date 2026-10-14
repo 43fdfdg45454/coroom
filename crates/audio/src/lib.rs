@@ -403,9 +403,9 @@ pub fn game_source(spec: &GameCapture) -> Result<Option<Box<dyn AudioSource>>, A
     #[cfg(all(target_os = "windows", feature = "wasapi"))]
     {
         match spec {
-            GameCapture::Process(pid) => Ok(Some(Box::new(wasapi::ProcessLoopbackSource::new(
-                *pid, true,
-            )))),
+            GameCapture::Process(pid) => {
+                Ok(Some(Box::new(wasapi::ProcessLoopbackSource::new(*pid))))
+            }
             GameCapture::App(name) => Err(AudioError::Unsupported(format!(
                 "en Windows el audio de una aplicación se elige por proceso: --audio process PID \
                  (no «{name}»)"

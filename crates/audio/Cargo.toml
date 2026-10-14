@@ -33,12 +33,14 @@ webrtc-audio-processing = { workspace = true, optional = true, features = ["bund
 
 [target.'cfg(target_os = "windows")'.dependencies]
 wasapi = { workspace = true, optional = true }
-# Sesiones de audio por aplicación (IsSystemSoundsSession) y el ejecutable de cada proceso.
+# Sesiones de audio por aplicación (IsSystemSoundsSession), el ejecutable de cada proceso y su
+# padre (ToolHelp).
 windows = { workspace = true, optional = true, features = [
     "Win32_Foundation",
     "Win32_Media_Audio",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
 ] }
 

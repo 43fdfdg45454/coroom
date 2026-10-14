@@ -61,10 +61,13 @@ fn backend(err: impl std::fmt::Display) -> AudioError {
 /// Qué abrir.
 #[derive(Debug, Clone)]
 enum Endpoint {
-    /// Loopback de la salida por defecto.
-    Loopback,
-    /// Loopback de un proceso (y su árbol si `tree`).
-    Process { pid: u32, tree: bool },
+    /// Loopback de un proceso y de todos sus descendientes. Windows no captura un proceso sin
+    /// sus hijos: `new_application_loopback_client(pid, false)` no es «sin el árbol» sino «todo el
+    /// sistema salvo ese árbol» (`PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE`).
+    ProcessTree(u32),
+    /// Todo lo que suena salvo coroom (este proceso y sus hijos): las voces que reproduce la sala
+    /// no vuelven como audio del juego. Windows 10 20348+; antes, toda la salida por defecto.
+    AllButSelf,
     /// Captura de un micrófono.
     Capture(Option<String>),
     /// Reproducción.
@@ -94,11 +97,25 @@ fn device(
 fn open(endpoint: &Endpoint, format: AudioFormat) -> Result<(AudioClient, Handle, Io), AudioError> {
     let enumerator = DeviceEnumerator::new().map_err(backend)?;
     let mut client = match endpoint {
-        Endpoint::Loopback => device(&enumerator, Direction::Render, None)?
-            .get_iaudioclient()
-            .map_err(backend)?,
-        Endpoint::Process { pid, tree } => {
-            AudioClient::new_application_loopback_client(*pid, *tree).map_err(|err| {
+        Endpoint::AllButSelf => {
+            // `false`: EXCLUDE_TARGET_PROCESS_TREE de este proceso.
+            match AudioClient::new_application_loopback_client(std::process::id(), false) {
+                Ok(client) => client,
+                Err(err) => {
+                    tracing::warn!(
+                        %err,
+                        "sin loopback por proceso: se captura toda la salida, también las voces \
+                         que reproduce coroom"
+                    );
+                    device(&enumerator, Direction::Render, None)?
+                        .get_iaudioclient()
+                        .map_err(backend)?
+                }
+            }
+        }
+        Endpoint::ProcessTree(pid) => {
+            // `true`: INCLUDE_TARGET_PROCESS_TREE (con `false` sería todo menos el proceso).
+            AudioClient::new_application_loopback_client(*pid, true).map_err(|err| {
                 AudioError::Unsupported(format!(
                     "no se pudo abrir el loopback del proceso {pid} ({err}); hace falta Windows 10 \
                      20348 o posterior y que el proceso exista"
@@ -434,8 +451,8 @@ macro_rules! capture_source {
 
             fn describe(&self) -> String {
                 match &self.0.endpoint {
-                    Endpoint::Loopback => "loopback de la salida por defecto (WASAPI)".to_owned(),
-                    Endpoint::Process { pid, .. } => {
+                    Endpoint::AllButSelf => "todo lo que suena salvo coroom (WASAPI)".to_owned(),
+                    Endpoint::ProcessTree(pid) => {
                         format!("loopback del proceso {pid} y sus hijos (WASAPI)")
                     }
                     Endpoint::Capture(Some(name)) => format!("micrófono «{name}» (WASAPI)"),
@@ -455,9 +472,9 @@ capture_source!(
 capture_source!(MicSource, "Micrófono.");
 
 impl LoopbackSource {
-    /// Lo que suena en la salida por defecto.
+    /// Lo que suena, salvo coroom (en Windows anterior a 10 20348, toda la salida por defecto).
     pub fn new() -> Self {
-        Self(Capture::new(Endpoint::Loopback, AudioFormat::GAME))
+        Self(Capture::new(Endpoint::AllButSelf, AudioFormat::GAME))
     }
 }
 
@@ -468,15 +485,9 @@ impl Default for LoopbackSource {
 }
 
 impl ProcessLoopbackSource {
-    /// Solo el proceso `pid` (y su árbol si `include_tree`).
-    pub fn new(pid: u32, include_tree: bool) -> Self {
-        Self(Capture::new(
-            Endpoint::Process {
-                pid,
-                tree: include_tree,
-            },
-            AudioFormat::GAME,
-        ))
+    /// El proceso `pid` y sus descendientes.
+    pub fn new(pid: u32) -> Self {
+        Self(Capture::new(Endpoint::ProcessTree(pid), AudioFormat::GAME))
     }
 }
 
@@ -794,15 +805,10 @@ impl crate::apps::AppBackend for AppSessions {
         let pid: u32 = stream
             .parse()
             .map_err(|_| backend(format!("flujo de aplicación no válido: «{stream}»")))?;
-        // Sin el árbol: cada proceso con sesión sale por separado, y con árboles se capturarían
-        // dos veces los padres e hijos que también suenan.
+        // Con su árbol (Windows no captura un proceso solo); `covering` ya quitó los procesos
+        // cuyo ancestro también se captura, que si no saldrían dos veces.
         let shared = Shared::new(format);
-        let running = Running::start(
-            Endpoint::Process { pid, tree: false },
-            format,
-            &shared,
-            None,
-        )?;
+        let running = Running::start(Endpoint::ProcessTree(pid), format, &shared, None)?;
         Ok(crate::apps::Tap {
             shared,
             _guard: Box::new(running),
@@ -812,6 +818,73 @@ impl crate::apps::AppBackend for AppSessions {
     fn label(&self) -> &'static str {
         "WASAPI"
     }
+
+    fn covering(&self, streams: Vec<String>) -> Vec<String> {
+        let parents = parent_pids();
+        let wanted: std::collections::HashSet<u32> =
+            streams.iter().filter_map(|s| s.parse().ok()).collect();
+        streams
+            .into_iter()
+            .filter(|stream| {
+                stream
+                    .parse::<u32>()
+                    .map_or(true, |pid| !has_ancestor_in(pid, &parents, &wanted))
+            })
+            .collect()
+    }
+}
+
+/// Padre de cada proceso vivo (`CreateToolhelp32Snapshot`). Vacío si no se puede consultar.
+#[allow(unsafe_code)] // Win32 sin envoltorio seguro; cada bloque lleva su `SAFETY:`.
+fn parent_pids() -> std::collections::HashMap<u32, u32> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let mut out = std::collections::HashMap::new();
+    // SAFETY: sin punteros de entrada; el handle se cierra abajo.
+    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+        return out;
+    };
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `entry` es local con `dwSize` puesto, como piden las dos funciones, que escriben en
+    // él; `snapshot` es válido hasta `CloseHandle`.
+    unsafe {
+        let mut more = Process32FirstW(snapshot, &mut entry).is_ok();
+        while more {
+            out.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+            more = Process32NextW(snapshot, &mut entry).is_ok();
+        }
+        let _ = CloseHandle(snapshot);
+    }
+    out
+}
+
+/// Si algún ancestro de `pid` (como mucho 32 niveles: los PID se reutilizan y podría haber un
+/// ciclo) está en `set`.
+fn has_ancestor_in(
+    pid: u32,
+    parents: &std::collections::HashMap<u32, u32>,
+    set: &std::collections::HashSet<u32>,
+) -> bool {
+    let mut current = pid;
+    for _ in 0..32 {
+        match parents.get(&current) {
+            Some(&parent) if parent != 0 && parent != current => {
+                if set.contains(&parent) {
+                    return true;
+                }
+                current = parent;
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -840,6 +913,25 @@ mod tests {
         let key = app_key_for_pid(std::process::id()).expect("clave de este proceso");
         assert!(key.ends_with(".exe"));
         assert_eq!(key, key.to_lowercase());
+    }
+
+    #[test]
+    fn a_process_whose_ancestor_is_captured_is_left_to_it() {
+        let parents = std::collections::HashMap::from([(30, 20), (20, 10), (10, 0), (40, 10)]);
+        let set = std::collections::HashSet::from([10, 30]);
+        assert!(
+            has_ancestor_in(30, &parents, &set),
+            "su abuelo 10 ya lo cubre"
+        );
+        assert!(!has_ancestor_in(10, &parents, &set));
+        let only_child = std::collections::HashSet::from([30]);
+        assert!(!has_ancestor_in(30, &parents, &only_child));
+        let cycle = std::collections::HashMap::from([(1, 2), (2, 1)]);
+        assert!(!has_ancestor_in(
+            1,
+            &cycle,
+            &std::collections::HashSet::from([3])
+        ));
     }
 
     #[test]

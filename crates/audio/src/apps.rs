@@ -130,6 +130,13 @@ pub(crate) trait AppBackend: Send + Sync + 'static {
 
     /// Nombre del backend para [`AudioSource::describe`].
     fn label(&self) -> &'static str;
+
+    /// De los flujos que se quieren capturar, los que hay que abrir: en Windows cada captura
+    /// incluye a los procesos hijos, así que se quita el que ya cubre un ancestro (si no, sonaría
+    /// dos veces). Por defecto, todos.
+    fn covering(&self, streams: Vec<String>) -> Vec<String> {
+        streams
+    }
 }
 
 /// Capturas abiertas, por flujo.
@@ -201,6 +208,7 @@ fn sync_taps(backend: &dyn AppBackend, filter: &AppFilter, format: AudioFormat, 
             return;
         }
     };
+    let wanted = backend.covering(wanted);
     let stale: Vec<String> = {
         let open = taps.lock().unwrap_or_else(PoisonError::into_inner);
         open.keys()

@@ -37,7 +37,8 @@ sesión de uno que ya no uses.
 
    Si el sistema elige el monitor o la ventana con su propio diálogo, lo eliges al abrir la sala.
    coroom nunca se envía a sí misma, así que la voz de la sala no vuelve como eco. Si el equipo no
-   puede separar el audio por aplicación (Windows anterior a 10 20348), se envía todo lo que suena.
+   puede separar el audio por aplicación (Windows anterior a 10 20348), se envía todo lo que suena,
+   también las voces de la sala que reproduce coroom.
 3. Activa la **voz** si quieres hablar con el micrófono.
 4. Pulsa **Abrir la sala**. Aparece el **código de la sala** (6 letras y números, sin `0`, `1`, `I`
    ni `O`): dáselo a tus invitados, o pulsa **Invitar** junto a un amigo conectado.

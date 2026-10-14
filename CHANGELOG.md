@@ -58,6 +58,14 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **Anfitrión Windows: los invitados se oían a sí mismos** en el audio del juego. Cada aplicación
+  se capturaba con `new_application_loopback_client(pid, false)`, que en WASAPI no es «el proceso
+  sin sus hijos» sino «todo el sistema salvo ese proceso»: cada captura traía todo lo demás,
+  también las voces de la sala que reproduce coroom (y el resto del audio repetido una vez por
+  aplicación). Ahora cada aplicación se captura con su árbol de procesos (sin repetir un proceso
+  cuyo padre ya se captura) y, cuando no se separa por aplicación, se captura todo salvo coroom.
+  En Windows anterior a 10 20348 no hay forma de quitar a coroom: se sigue capturando toda la
+  salida.
 - **Cuelgues de 17 s del vídeo**: si se perdían más de 8 fotogramas enteros seguidos (un corte de
   wifi de unos 150 ms a 60 fps), el receptor se quedaba esperando un fotograma que nadie iba a
   pedir y descartaba todo lo demás hasta reiniciar la pista 1024 fotogramas después. Ahora esos
