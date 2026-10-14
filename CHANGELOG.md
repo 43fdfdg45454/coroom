@@ -46,6 +46,11 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **Anfitrión Windows a 48 fps en lugar de 60 con un monitor de 144 Hz.** Se le pedía a WGC un
+  intervalo mínimo de `1 / fps` entre fotogramas, y eso redondea al múltiplo del refresco (tres
+  refrescos de 6,9 ms: 20,8 ms). Ahora WGC entrega cada refresco y la captura se queda con los de
+  la cadencia pedida por su marca de tiempo (`SystemRelativeTime`), alternando huecos de dos y
+  tres refrescos: 60 de media con cualquier monitor de 60 Hz o más.
 - **Con anfitrión Linux y codificador por GPU, la captura se paraba a los pocos fotogramas**
   (invitados en «Entrando en la sala… Vídeo» con el audio sonando, o con un solo fotograma, en
   cualquier códec). Los filtros de Vulkan de FFmpeg sueltan su entrada al reutilizar su contexto

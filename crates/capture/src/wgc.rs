@@ -16,8 +16,10 @@
 //!   - Con HDR pedido ([`Capturer::set_options`]), el pool va en `R16G16B16A16Float`
 //!     (scRGB lineal: lo que entrega WGC con la pantalla en HDR, y SDR en coma flotante si no) y
 //!     el fotograma baja a CPU como [`FramePixels::Rgba16F`] (sin la ruta de texturas).
-//! - Con `max_fps`, `MinUpdateInterval` de la sesión a `1 / max_fps` (Windows 11 24H2;
-//!   en versiones anteriores WGC ya entrega por evento a la frecuencia de la pantalla).
+//! - WGC entrega cada refresco del monitor (`MinUpdateInterval` de 1 ms en Windows 11 24H2; en
+//!   versiones anteriores ya entrega por evento a esa frecuencia) y [`FramePacer`] se queda con
+//!   los de la cadencia `max_fps` por su `SystemRelativeTime`. Un intervalo mínimo de `1 / max_fps`
+//!   redondeaba al múltiplo del refresco: 60 fps con un monitor de 144 Hz daban 48.
 //! - El cursor se lee con `GetCursorInfo` y viaja como metadatos; cuando cambia su `HCURSOR`, la
 //!   forma se lee con `GetIconInfo` + `GetDIBits` (color con alfa, color con máscara o monocromo
 //!   con máscaras AND/XOR) y se convierte a RGBA.
@@ -104,7 +106,7 @@ use windows::core::{BOOL, IInspectable, Interface, PWSTR, Ref};
 use crate::mailbox::Mailbox;
 use crate::{
     CURSOR_MAX_SIDE, CaptureError, CaptureOptions, CaptureTarget, CapturedFrame, Capturer,
-    CursorShape, CursorState, D3D11Frame, FramePixels, GpuFrames,
+    CursorShape, CursorState, D3D11Frame, FramePacer, FramePixels, GpuFrames,
 };
 
 /// Búferes del pool de captura en memoria de CPU (cada fotograma se copia y se suelta enseguida).
@@ -703,6 +705,8 @@ struct FrameCopier {
     gpu: bool,
     /// Pool en `R16G16B16A16Float`: 8 bytes por píxel y [`FramePixels::Rgba16F`].
     hdr: bool,
+    /// Qué refrescos del monitor se entregan para la cadencia pedida.
+    pacer: FramePacer,
 }
 
 impl FrameCopier {
@@ -759,6 +763,15 @@ impl FrameCopier {
         let frame = pool
             .TryGetNextFrame()
             .map_err(|err| backend("TryGetNextFrame", err))?;
+        // Sin marca de tiempo (no debería pasar) se entregan todos: el codificador toma el último.
+        if let Ok(time) = frame.SystemRelativeTime()
+            && !self.pacer.accept(Duration::from_nanos(
+                u64::try_from(time.Duration).unwrap_or(0) * 100,
+            ))
+        {
+            let _ = frame.Close();
+            return Ok(());
+        }
         let captured_at = Instant::now();
         let cursor = self.cursor();
         let content = frame
@@ -989,12 +1002,10 @@ impl WgcCapturer {
         // Solo existen en versiones recientes: si fallan, se captura con borde o con cursor.
         let _ = session.SetIsBorderRequired(false);
         let _ = session.SetIsCursorCaptureEnabled(false);
-        // Windows 11 24H2: no más de `max_fps` fotogramas por segundo (en unidades de 100 ns). En
-        // versiones anteriores no existe y WGC entrega a la frecuencia de la pantalla.
-        let fps = i64::from(self.options.max_fps.max(1));
-        let _ = session.SetMinUpdateInterval(TimeSpan {
-            Duration: 10_000_000 / fps,
-        });
+        // Windows 11 24H2 limita por defecto la frecuencia de entrega: 1 ms (en unidades de 100 ns)
+        // para recibir cada refresco del monitor. La cadencia la elige `FramePacer`. En versiones
+        // anteriores no existe y WGC ya entrega a la frecuencia de la pantalla.
+        let _ = session.SetMinUpdateInterval(TimeSpan { Duration: 10_000 });
 
         let mailbox = Arc::new(Mailbox::default());
         let watch = watch.then(|| Arc::new(Mutex::new(Watch::default())));
@@ -1012,6 +1023,7 @@ impl WgcCapturer {
             cursor_shape: None,
             gpu,
             hdr,
+            pacer: FramePacer::new(self.options.max_fps),
         });
         let handler = TypedEventHandler::new(
             move |sender: Ref<Direct3D11CaptureFramePool>, _args: Ref<IInspectable>| {
