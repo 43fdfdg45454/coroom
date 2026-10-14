@@ -108,6 +108,14 @@ pub fn video_support(hdr_display: Option<bool>) -> VideoSupport {
     };
     let encoders = EncoderSet::probe();
     let decoders = DecoderSet::probe();
+    // Lo que descartó la comprobación de imagen del sondeo, en el registro (una vez por proceso:
+    // el sondeo se hace una vez).
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        for line in &coroom_session::codec::Capabilities::probe().rejected {
+            tracing::warn!("descartado por la comprobación de imagen: {line}");
+        }
+    });
     let encodes = |format: VideoFormat| -> Vec<(Codec, String)> {
         Codec::PREFERENCE
             .into_iter()

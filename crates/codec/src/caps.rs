@@ -85,6 +85,9 @@ pub struct Capabilities {
     pub ffmpeg_version: Option<String>,
     /// Directorio de las bibliotecas de FFmpeg con el que se compiló.
     pub ffmpeg_dir: Option<String>,
+    /// Codificadores y decodificadores que abren pero fallaron la comprobación de imagen (su
+    /// imagen no coincide con la original), con el motivo: `«codificar AV1/Vulkan Video: …»`.
+    pub rejected: Vec<String>,
 }
 
 static PROBED: OnceLock<Capabilities> = OnceLock::new();
@@ -114,9 +117,10 @@ impl Capabilities {
         let mut caps = Self::openh264_only();
         #[cfg(feature = "ffmpeg")]
         {
-            let (encoders, decoders) = crate::ffmpeg::probe::probe();
-            caps.encoders.extend(encoders);
-            caps.decoders.extend(decoders);
+            let probed = crate::ffmpeg::probe::probe();
+            caps.encoders.extend(probed.encoders);
+            caps.decoders.extend(probed.decoders);
+            caps.rejected = probed.rejected;
             caps.ffmpeg_version = Some(crate::ffmpeg::version());
             caps.ffmpeg_dir = Some(crate::ffmpeg::library_dir().to_owned());
         }
@@ -132,6 +136,7 @@ impl Capabilities {
             decoders: vec![(Codec::H264, DecoderBackend::Software)],
             ffmpeg_version: None,
             ffmpeg_dir: None,
+            rejected: Vec::new(),
         }
     }
 
@@ -147,6 +152,7 @@ impl Capabilities {
             decoders,
             ffmpeg_version: None,
             ffmpeg_dir: None,
+            rejected: Vec::new(),
         }
     }
 
@@ -194,6 +200,15 @@ impl fmt::Display for Capabilities {
                     .collect(),
             );
             writeln!(f, "{:<6} {encoders:<12} {decoders}", codec.to_string())?;
+        }
+        if !self.rejected.is_empty() {
+            writeln!(
+                f,
+                "Descartados por la comprobación de imagen (abren, pero su vídeo sale dañado):"
+            )?;
+            for line in &self.rejected {
+                writeln!(f, "  {line}")?;
+            }
         }
         Ok(())
     }

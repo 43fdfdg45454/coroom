@@ -104,12 +104,10 @@ impl EncoderSet {
         self
     }
 
-    /// Se queda con `backend` (si es `Some`). Sin backend pedido, quita las combinaciones que solo
-    /// se usan a mano ([`Backend::manual_only`]).
+    /// Se queda con `backend` (si es `Some`).
     pub fn only_backend(mut self, backend: Option<Backend>) -> Self {
-        match backend {
-            Some(backend) => self.available.retain(|(_, b)| *b == backend),
-            None => self.available.retain(|&(c, b)| !Backend::manual_only(c, b)),
+        if let Some(backend) = backend {
+            self.available.retain(|(_, b)| *b == backend);
         }
         self
     }
@@ -318,31 +316,6 @@ mod tests {
             slices: 1,
             format: VideoFormat::SDR_420,
         }
-    }
-
-    #[test]
-    fn av1_by_vulkan_is_only_used_when_asked_for() {
-        let all = EncoderSet::new([
-            (Codec::Av1, Backend::VulkanVideo),
-            (Codec::Av1, Backend::Nvenc),
-            (Codec::Hevc, Backend::VulkanVideo),
-        ]);
-        assert_eq!(
-            all.clone().only_backend(None).available(),
-            &[
-                (Codec::Av1, Backend::Nvenc),
-                (Codec::Hevc, Backend::VulkanVideo)
-            ],
-            "en automático, AV1 por NVENC y HEVC por Vulkan"
-        );
-        assert_eq!(
-            all.only_backend(Some(Backend::VulkanVideo)).available(),
-            &[
-                (Codec::Av1, Backend::VulkanVideo),
-                (Codec::Hevc, Backend::VulkanVideo)
-            ],
-            "pedido a mano, sí"
-        );
     }
 
     #[test]
