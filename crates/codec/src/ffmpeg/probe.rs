@@ -427,7 +427,7 @@ pub(crate) fn probe() -> Probed {
             match probe_encoder(codec, backend) {
                 EncoderProbe::Missing => {}
                 EncoderProbe::Rejected(reason) => probed.rejected.push(format!(
-                    "codificar {}: {reason}",
+                    "codificar {codec} con {}: {reason}",
                     crate::encoder_label(codec, backend)
                 )),
                 EncoderProbe::Works(sample) => {
@@ -457,7 +457,7 @@ pub(crate) fn probe() -> Probed {
                     DecoderProbe::Missing => false,
                     DecoderProbe::Rejected(reason) => {
                         probed.rejected.push(format!(
-                            "decodificar {}: {reason}",
+                            "decodificar {codec} con {}: {reason}",
                             crate::decoder_label(codec, backend)
                         ));
                         false

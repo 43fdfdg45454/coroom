@@ -57,6 +57,21 @@ pub const MIN_WINDOW: u64 = 64 * 1024;
 /// Factor de la ventana sobre el producto bitrate × RTT.
 pub const WINDOW_RTT_FACTOR: f64 = 1.5;
 
+/// Corte de la red que la ventana aguanta sin llenarse: lo enviado durante un corte se pierde,
+/// pero `quinn` lo cuenta en vuelo hasta que un ACK posterior lo da por perdido. Con una ventana de
+/// solo 1,5 × BDP, un corte de 40 ms la llenaba, la conexión dejaba de enviar y volvía con el
+/// temporizador de pérdida (PTO) de QUIC, que se duplica en cada intento sin respuesta: tras un
+/// corte de 600 ms, 600 ms más sin vídeo. El ritmo lo siguen poniendo el control de tasa y el
+/// pacing de los medios; esta ventana nunca fue para frenarlos.
+pub const OUTAGE_ALLOWANCE: Duration = Duration::from_secs(2);
+
+/// Ventana que usa el controlador de medios: la de [`media_window`] o la que aguanta un corte de
+/// [`OUTAGE_ALLOWANCE`] al bitrate objetivo, la mayor.
+pub fn controller_window(target_kbps: u32, rtt: Duration) -> u64 {
+    let outage = (u64::from(target_kbps) * 1000 / 8) as f64 * OUTAGE_ALLOWANCE.as_secs_f64();
+    media_window(target_kbps, rtt).max(outage as u64)
+}
+
 /// Cola a partir de la cual el emisor reduce el bitrate.
 pub const QUEUE_THRESHOLD: Duration = Duration::from_millis(10);
 
@@ -435,7 +450,7 @@ impl Controller for MediaController {
     fn on_mtu_update(&mut self, _new_mtu: u16) {}
 
     fn window(&self) -> u64 {
-        let window = media_window(self.shared.target_kbps(), self.rtt);
+        let window = controller_window(self.shared.target_kbps(), self.rtt);
         self.shared.window.store(window, Ordering::Relaxed);
         window
     }
@@ -445,7 +460,7 @@ impl Controller for MediaController {
     }
 
     fn initial_window(&self) -> u64 {
-        media_window(self.shared.target_kbps(), self.rtt)
+        controller_window(self.shared.target_kbps(), self.rtt)
     }
 
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
@@ -767,6 +782,12 @@ mod tests {
         assert_eq!(media_window(8_000, Duration::from_millis(100)), 187_500);
         // 80 Mbit/s en una LAN: el retraso de los ACK cuenta (10 MB/s × 26 ms × 1,5 = 390 KB).
         assert_eq!(media_window(80_000, Duration::from_millis(1)), 390_000);
+        // La del controlador aguanta 2 s de corte al bitrate objetivo.
+        assert_eq!(
+            controller_window(80_000, Duration::from_millis(1)),
+            20_000_000
+        );
+        assert_eq!(controller_window(100, Duration::from_millis(1)), MIN_WINDOW);
     }
 
     #[test]

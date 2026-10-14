@@ -41,7 +41,8 @@ use super::audio::{
 };
 use super::input::{HostInput, Job};
 use super::negotiate::{
-    GuestCapabilities, choose_codec, choose_format, codec_to_wire, format_to_wire, shape_to_message,
+    GuestCapabilities, choose_codec, choose_format, codec_to_wire, format_shortfall,
+    format_to_wire, shape_to_message,
 };
 use super::wire::{Payload, pairwise_info, require_pq_offer};
 use super::{
@@ -282,32 +283,42 @@ impl Links {
     }
 
     /// Ruta, RTT y objetivo de cada invitado conectado.
-    fn status(&self) -> Vec<(GuestId, Path, f64, Option<u32>)> {
+    fn status(&self) -> Vec<LinkStatus> {
         let mut out: Vec<_> = self
             .direct
             .iter()
-            .map(|(guest, link)| {
-                (
-                    *guest,
-                    Path::Direct,
-                    link.sender.connection().rtt().as_secs_f64() * 1000.0,
-                    Some(link.sender.target_kbps()),
-                )
+            .map(|(guest, link)| LinkStatus {
+                guest: *guest,
+                path: Path::Direct,
+                remote: link.sender.connection().remote_address(),
+                rtt_ms: link.sender.connection().rtt().as_secs_f64() * 1000.0,
+                target_kbps: Some(link.sender.target_kbps()),
             })
             .collect();
         if let Some(relay) = &self.relay {
-            let rtt = relay.sender.connection().rtt().as_secs_f64() * 1000.0;
+            let conn = relay.sender.connection();
+            let rtt_ms = conn.rtt().as_secs_f64() * 1000.0;
             for guest in relay.guests.keys() {
-                out.push((
-                    *guest,
-                    Path::Relayed,
-                    rtt,
-                    relay.sender.source_target_kbps(u64::from(guest.0)),
-                ));
+                out.push(LinkStatus {
+                    guest: *guest,
+                    path: Path::Relayed,
+                    remote: conn.remote_address(),
+                    rtt_ms,
+                    target_kbps: relay.sender.source_target_kbps(u64::from(guest.0)),
+                });
             }
         }
         out
     }
+}
+
+/// Estado del enlace de un invitado para su [`GuestStatus`].
+struct LinkStatus {
+    guest: GuestId,
+    path: Path,
+    remote: std::net::SocketAddr,
+    rtt_ms: f64,
+    target_kbps: Option<u32>,
 }
 
 /// Arranca los hilos del anfitrión y su tarea de red. El codificador no se crea aquí: espera a
@@ -748,6 +759,22 @@ fn send_loop(
             &frame.data
         };
         ledger.mark(frame.frame_id, Stage::Encrypted, Instant::now());
+        // Un enlace atascado (su cola de QUIC lleva más de STALE_QUEUE) no recibe este fotograma:
+        // saldría tarde y retrasaría el intra que lo arregla. Mientras dure se piden intra, así el
+        // primero que salga cuando se vacíe la cola ya es uno (los grupos no enviados los da por
+        // perdidos el receptor sin esperar al intra).
+        let (targets, stalled): (Vec<_>, Vec<_>) = targets
+            .into_iter()
+            .partition(|target| !target.sender.stalled());
+        if !stalled.is_empty() {
+            bump(&shared.counters.stalled_sends);
+            shared.request_keyframe();
+            if targets.is_empty() {
+                ledger.record_drop(Stage::Sent);
+                group = group.wrapping_add(1);
+                continue;
+            }
+        }
         let results = if targets.len() == 1 {
             vec![handle.block_on(targets[0].sender.send_frame(
                 Track::Video,
@@ -830,6 +857,8 @@ struct HostCtx {
     encoders: std::sync::Mutex<EncoderSet>,
     /// Bitrate máximo en kbit/s (`video.bitrate_kbps` al abrir; cambia con [`Command::Video`]).
     max_kbps: AtomicU32,
+    /// Último aviso de por qué el vídeo no va en el formato pedido.
+    format_note: std::sync::Mutex<Option<String>>,
     /// Lo que decodifica cada invitado conectado, cuando ya lo dijo (o venció la espera).
     guest_caps: std::sync::Mutex<BTreeMap<GuestId, GuestCapabilities>>,
     /// Códec y backend en uso; el cerrojo serializa las renegociaciones.
@@ -913,12 +942,19 @@ impl HostCtx {
     /// dice qué decodifica, H.264 por software. El intra para él no se pide aquí: su decodificador
     /// no está abierto hasta que lleguen sus capacidades y reciba `CodecSelected`, y lo pide
     /// [`renegotiate`].
-    fn after_attach(self: &Arc<Self>, guest: GuestId, path: Path, control: &ControlSender) {
+    fn after_attach(
+        self: &Arc<Self>,
+        guest: GuestId,
+        path: Path,
+        remote: std::net::SocketAddr,
+        control: &ControlSender,
+    ) {
         self.update_active();
         let kbps = self.encode.bitrate_kbps.load(Ordering::Acquire);
         let _ = control.send(&ControlMessage::TargetBitrate { kbps });
         let permissions = lock(&self.core.guests).get_mut(&guest).map(|status| {
             status.path = Some(path);
+            status.remote = Some(remote);
             status.permissions
         });
         // Entrada: el estado del hilo `inject` y lo que el invitado necesita para capturar.
@@ -967,7 +1003,11 @@ impl HostCtx {
                 });
             }
         }
-        self.core.emit(SessionEvent::GuestConnected { guest, path });
+        self.core.emit(SessionEvent::GuestConnected {
+            guest,
+            path,
+            remote,
+        });
         let ctx = Arc::clone(self);
         tokio::spawn(async move {
             tokio::time::sleep(CAPABILITIES_TIMEOUT).await;
@@ -1163,7 +1203,7 @@ fn attach_direct(
             control: reply.clone(),
         },
     );
-    ctx.after_attach(guest, Path::Direct, &reply);
+    ctx.after_attach(guest, Path::Direct, connection.remote_address(), &reply);
     tokio::spawn(control_reader(
         Arc::clone(ctx),
         guest,
@@ -1240,7 +1280,12 @@ async fn relay_accept_loop(
         if let Some(relay) = &mut lock(&ctx.links).relay {
             relay.guests.insert(guest, reply.clone());
         }
-        ctx.after_attach(guest, Path::Relayed, &reply);
+        ctx.after_attach(
+            guest,
+            Path::Relayed,
+            sender.connection().remote_address(),
+            &reply,
+        );
         tokio::spawn(control_reader(
             Arc::clone(&ctx),
             guest,
@@ -1325,14 +1370,21 @@ async fn control_reader(
 /// códec elegido no abre en ese formato, prueba el de siempre y luego los demás códecs comunes.
 async fn renegotiate(ctx: &Arc<HostCtx>, guest: Option<GuestId>) {
     let mut current = ctx.current.lock().await;
-    let guests: Vec<GuestCapabilities> = {
+    let named: Vec<(String, GuestCapabilities)> = {
         let caps = lock(&ctx.guest_caps);
         let links = lock(&ctx.links);
+        let statuses = lock(&ctx.core.guests);
         caps.iter()
             .filter(|(id, _)| links.contains(**id))
-            .map(|(_, caps)| caps.clone())
+            .map(|(id, caps)| {
+                let name = statuses
+                    .get(id)
+                    .map_or_else(|| format!("el invitado {}", id.0), |s| s.name.clone());
+                (name, caps.clone())
+            })
             .collect()
     };
+    let guests: Vec<GuestCapabilities> = named.iter().map(|(_, caps)| caps.clone()).collect();
     let decoders: Vec<_> = guests.iter().map(|caps| caps.decoders.clone()).collect();
     let encoders = lock(&ctx.encoders).clone();
     let mut available = encoders.available().to_vec();
@@ -1348,6 +1400,18 @@ async fn renegotiate(ctx: &Arc<HostCtx>, guest: Option<GuestId>) {
             return;
         };
         let format = choose_format(codec, &candidates, &encoders, &guests);
+        // Si no va en el formato pedido (4:4:4, HDR), se dice por qué, una vez por motivo.
+        let wanted = candidates.first().copied().unwrap_or(VideoFormat::SDR_420);
+        let note = format_shortfall(codec, wanted, format, &encoders, &named);
+        {
+            let mut last = lock(&ctx.format_note);
+            if note != *last {
+                if let Some(note) = &note {
+                    ctx.core.warn(note.clone());
+                }
+                *last = note;
+            }
+        }
         if current.is_some_and(|(c, _, f)| c == codec && f == format) {
             if let Some(guest) = guest {
                 announce(ctx, codec, format, Some(guest));
@@ -1555,11 +1619,12 @@ async fn rate_loop(ctx: Arc<HostCtx>) {
             }
         }
         let mut guests = lock(&ctx.core.guests);
-        for (guest, path, rtt_ms, target) in status {
-            if let Some(entry) = guests.get_mut(&guest) {
-                entry.path = Some(path);
-                entry.rtt_ms = Some(rtt_ms);
-                entry.target_kbps = target;
+        for link in status {
+            if let Some(entry) = guests.get_mut(&link.guest) {
+                entry.path = Some(link.path);
+                entry.remote = Some(link.remote);
+                entry.rtt_ms = Some(link.rtt_ms);
+                entry.target_kbps = link.target_kbps;
             }
         }
     }
@@ -1780,6 +1845,7 @@ impl Room {
                 permissions: Permissions::VIEW_ONLY,
                 leaf: added.leaf_index,
                 path: None,
+                remote: None,
                 rtt_ms: None,
                 target_kbps: None,
                 input_key: false,
@@ -2056,6 +2122,7 @@ async fn run_host(
             relay_token: None,
         },
         max_kbps: AtomicU32::new(video.bitrate_kbps),
+        format_note: std::sync::Mutex::new(None),
         encoders: std::sync::Mutex::new(encoders),
         guest_caps: std::sync::Mutex::new(BTreeMap::new()),
         current: tokio::sync::Mutex::new(None),

@@ -106,6 +106,8 @@ pub struct State {
     pub keys: bool,
     /// Ruta.
     pub path: Option<Path>,
+    /// Dirección del anfitrión (o del relay) por la que va la conexión.
+    pub remote: Option<std::net::SocketAddr>,
     /// Estimación.
     pub estimate: Option<Estimate>,
     /// Códec.
@@ -181,6 +183,7 @@ impl State {
             safety_number: None,
             keys: false,
             path: None,
+            remote: None,
             estimate: None,
             codec: None,
             stats: None,
@@ -565,7 +568,10 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
             return vec![Effect::SaveSettings];
         }
         SessionEvent::EpochChanged { .. } => state.keys = true,
-        SessionEvent::Connected { path } => state.path = Some(path),
+        SessionEvent::Connected { path, remote } => {
+            state.path = Some(path);
+            state.remote = Some(remote);
+        }
         SessionEvent::QualityEstimate { rtt_ms, level } => {
             state.estimate = Some(Estimate {
                 rtt_ms,
@@ -732,9 +738,15 @@ fn connecting<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     steps = steps.push(step(
         link,
         t!("pantalla-guest-conexion-con-el-anfitrion"),
-        state.path.map(|path| match path {
-            Path::Direct => t!("pantalla-guest-directa-entre-los-dos-equipos").to_owned(),
-            Path::Relayed => t!("pantalla-guest-por-el-relay-del-servidor").to_owned(),
+        state.path.map(|path| {
+            let text = match path {
+                Path::Direct => t!("pantalla-guest-directa-entre-los-dos-equipos"),
+                Path::Relayed => t!("pantalla-guest-por-el-relay-del-servidor"),
+            };
+            match state.remote {
+                Some(remote) => format!("{text} · {remote}"),
+                None => text.to_owned(),
+            }
         }),
     ));
     steps = steps.push(step(
@@ -848,13 +860,14 @@ fn top_bar<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         facts.push(format!("RTT {}", stats::ms(rtt)));
     }
     if let Some(path) = state.path {
-        facts.push(
-            match path {
-                Path::Direct => "directo",
-                Path::Relayed => "relay",
-            }
-            .to_owned(),
-        );
+        let path = match path {
+            Path::Direct => "directo",
+            Path::Relayed => "relay",
+        };
+        facts.push(match state.remote {
+            Some(remote) => format!("{path} {remote}"),
+            None => path.to_owned(),
+        });
     }
     if let Some(codec) = state.codec.as_ref().and_then(|c| c.split(' ').next()) {
         facts.push(codec.to_owned());
@@ -1389,6 +1402,7 @@ mod tests {
         );
         app.update(Message::Event(Event::Guest(SessionEvent::Connected {
             path: Path::Direct,
+            remote: "192.0.2.10:4433".parse().expect("dirección"),
         })));
         app.update(Message::Event(Event::Guest(
             SessionEvent::QualityEstimate {

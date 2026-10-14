@@ -241,6 +241,9 @@ fn page_effects(app: &mut App, page: SettingsPage) -> Vec<Effect> {
 fn live_video(app: &App) -> Vec<Effect> {
     let mut effects = vec![Effect::SaveSettings];
     if app.host.room.is_some() {
+        let video = &app.settings.video;
+        let (codec, encoder, kbps) = (video.codec, video.encoder, video.max_bitrate_kbps);
+        tracing::info!(?codec, ?encoder, kbps, "vídeo pedido para la sala abierta");
         effects.push(Effect::SetVideo);
     }
     effects

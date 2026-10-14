@@ -36,6 +36,28 @@ pub struct LossyConfig {
     pub queue_limit: Duration,
     /// Semilla del generador pseudoaleatorio.
     pub seed: u64,
+    /// Cortes periódicos: cada `period` (desde que arranca el proxy) se pierde todo durante
+    /// `length`, en los dos sentidos (un corte de wifi, un túnel de VPN que se renegocia).
+    pub outages: Option<Outages>,
+}
+
+/// Cortes periódicos del proxy ([`LossyConfig::outages`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Outages {
+    /// Cada cuánto empieza un corte.
+    pub period: Duration,
+    /// Cuánto dura.
+    pub length: Duration,
+}
+
+impl Outages {
+    /// Si `elapsed` desde el arranque cae dentro de un corte.
+    pub fn active(&self, elapsed: Duration) -> bool {
+        let period = self.period.as_nanos().max(1);
+        let phase = elapsed.as_nanos() % period;
+        // El primer periodo no tiene corte: deja conectar a los dos extremos.
+        elapsed.as_nanos() >= period && phase < self.length.as_nanos()
+    }
 }
 
 /// Perfiles de la matriz de red, los mismos que `tools/netem.sh`.
@@ -54,6 +76,7 @@ impl LossyConfig {
             rate_bps: None,
             queue_limit: Duration::from_millis(200),
             seed: 0x5EED_C0DE,
+            outages: None,
         };
         let ms = Duration::from_millis;
         Some(match name {
@@ -97,6 +120,7 @@ impl LossyConfig {
             rate_bps: None,
             queue_limit: Duration::from_millis(200),
             seed: 0x5EED_C0DE,
+            outages: None,
         }
     }
 }
@@ -217,6 +241,7 @@ impl Ord for Pending {
 
 async fn run(socket: UdpSocket, target: SocketAddr, config: LossyConfig, stats: Arc<LossyStats>) {
     let mut rng = Rng::new(config.seed);
+    let started = Instant::now();
     let mut queue: BinaryHeap<Reverse<Pending>> = BinaryHeap::new();
     let mut client: Option<SocketAddr> = None;
     // Momento en que queda libre el enlace limitado en cada sentido (hacia target, hacia cliente).
@@ -237,7 +262,8 @@ async fn run(socket: UdpSocket, target: SocketAddr, config: LossyConfig, stats: 
                     client = Some(from);
                     (target, 0)
                 };
-                if rng.next_f64() < config.loss {
+                let cut = config.outages.is_some_and(|o| o.active(started.elapsed()));
+                if cut || rng.next_f64() < config.loss {
                     stats.dropped.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
@@ -318,6 +344,7 @@ mod tests {
                 rate_bps: None,
                 queue_limit: Duration::from_millis(100),
                 seed: 42,
+                outages: None,
             },
         )
         .await

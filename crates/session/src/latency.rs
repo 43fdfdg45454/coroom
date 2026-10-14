@@ -584,6 +584,8 @@ impl fmt::Display for InputLatency {
 pub struct LinkSummary {
     /// Ruta: `"directo"` o `"relay"`.
     pub path: String,
+    /// Dirección del otro extremo (el anfitrión o el relay).
+    pub remote: Option<String>,
     /// RTT suavizado de QUIC, en ms.
     pub rtt_ms: f64,
     /// Bitrate objetivo que aplica el anfitrión (el mínimo de los invitados), en kbit/s.
@@ -610,10 +612,13 @@ impl fmt::Display for LinkSummary {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "Enlace con {}: {} · RTT {:.1} ms · objetivo {} kbit/s · pérdida {:.1} % · {} \
+            "Enlace con {}: {}{} · RTT {:.1} ms · objetivo {} kbit/s · pérdida {:.1} % · {} \
              grupos descartados, {} recuperados",
             self.peer_name,
             self.path,
+            self.remote
+                .as_deref()
+                .map_or_else(String::new, |remote| format!(" ({remote})")),
             self.rtt_ms,
             self.target_kbps,
             self.loss_percent,
@@ -1404,6 +1409,7 @@ mod tests {
         let mut remote = summary.clone();
         remote.link = Some(LinkSummary {
             path: "relay".to_owned(),
+            remote: Some("198.51.100.7:4433".to_owned()),
             rtt_ms: 12.5,
             target_kbps: 8_000,
             loss_percent: 2.0,
@@ -1417,7 +1423,7 @@ mod tests {
         });
         let table = remote.to_string();
         assert!(
-            table.contains("Enlace con Ana: relay · RTT 12.5 ms"),
+            table.contains("Enlace con Ana: relay (198.51.100.7:4433) · RTT 12.5 ms"),
             "{table}"
         );
         assert!(table.contains("época MLS 3"), "{table}");

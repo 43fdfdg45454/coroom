@@ -42,8 +42,10 @@ sesión de uno que ya no uses.
 4. Pulsa **Abrir la sala**. Aparece el **código de la sala** (6 letras y números, sin `0`, `1`, `I`
    ni `O`): dáselo a tus invitados, o pulsa **Invitar** junto a un amigo conectado.
 
-Mientras la sala está abierta ves a cada invitado con su conexión (directa o por el relay), su RTT,
-su latencia de entrada y su **número de seguridad**.
+Mientras la sala está abierta ves a cada invitado con su conexión (directa o por el relay, con la
+dirección IP y el puerto por los que va), su RTT, su latencia de entrada y su **número de
+seguridad**. «Directo» quiere decir que los dos equipos hablan entre sí sin pasar por el servidor;
+por el relay, la dirección que ves es la del servidor.
 
 ### Cambiar con la sala abierta
 

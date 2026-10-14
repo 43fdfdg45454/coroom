@@ -26,7 +26,9 @@
 //! - (l) un enlace con poca cola pierde las ráfagas de los intra y el vídeo se recupera sin una
 //!   tormenta de intra;
 //! - (m) con la sala abierta, el anfitrión cambia de fuente (a otro tamaño), de códec y de bitrate
-//!   máximo y el invitado sigue presentando sin salir.
+//!   máximo y el invitado sigue presentando sin salir;
+//! - (n) cortes de red de 600 ms cada 3 s con 1 % de pérdida y 10 Mbit/s: el vídeo vuelve como
+//!   mucho 500 ms después de cada corte.
 //!
 //! Los tests (a)–(e) usan OpenH264 en los dos extremos, para que sus cotas de
 //! tiempo sigan siendo comparables.
@@ -948,6 +950,7 @@ fn l_a_shallow_queue_does_not_start_a_keyframe_storm() {
                 rate_bps: Some(2_000_000),
                 queue_limit: Duration::from_millis(15),
                 seed: 7,
+                outages: None,
             },
         ))
         .expect("proxy");
@@ -1064,5 +1067,165 @@ fn m_the_host_changes_source_codec_and_quality_while_open() {
     assert_eq!(host.end_reason(), None);
     guest.close();
     host.close();
+    drop(server);
+}
+
+/// Fuente sintética con ruido en cada fotograma: el patrón liso comprime tanto que no llega a
+/// ningún bitrate alto. El ruido se calcula una vez y cada fotograma lo usa desplazado.
+struct NoisyCapturer {
+    inner: SyntheticCapturer,
+    noise: Vec<u64>,
+}
+
+impl NoisyCapturer {
+    fn new(inner: SyntheticCapturer) -> Self {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let noise = (0..(1 << 16))
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state & 0x0f0f_0f0f_0f0f_0f0f
+            })
+            .collect();
+        Self { inner, noise }
+    }
+
+    fn add_noise(&self, frame: &mut CapturedFrame) {
+        if let coroom_session::capture::FramePixels::Bgra { data, .. } = &mut frame.pixels {
+            let offset = (frame.frame_id as usize).wrapping_mul(7919);
+            let (words, _) = data.as_chunks_mut::<8>();
+            for (i, word) in words.iter_mut().enumerate() {
+                let noise = self.noise[(i + offset) % self.noise.len()];
+                *word = (u64::from_ne_bytes(*word) ^ noise).to_ne_bytes();
+            }
+        }
+    }
+}
+
+impl Capturer for NoisyCapturer {
+    fn targets(&self) -> Result<Vec<CaptureTarget>, CaptureError> {
+        self.inner.targets()
+    }
+
+    fn start(&mut self, target: &CaptureTarget) -> Result<(), CaptureError> {
+        self.inner.start(target)
+    }
+
+    fn next_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+        let mut frame = self.inner.next_frame()?;
+        self.add_noise(&mut frame);
+        Ok(frame)
+    }
+
+    fn next_frame_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<CapturedFrame>, CaptureError> {
+        let mut frame = self.inner.next_frame_timeout(timeout)?;
+        if let Some(frame) = frame.as_mut() {
+            self.add_noise(frame);
+        }
+        Ok(frame)
+    }
+
+    fn stop(&mut self) {
+        self.inner.stop();
+    }
+}
+
+/// (n) Cortes de red: a través de un proxy con 1 % de pérdida que además lo pierde todo durante
+/// 600 ms cada 3 s (wifi que se cae, VPN que se renegocia), el vídeo vuelve como mucho 500 ms
+/// después de cada corte: entre dos fotogramas presentados no pasa más que el corte y 500 ms.
+#[test]
+fn n_video_recovers_within_half_a_second_after_each_outage() {
+    const OUTAGE: Duration = Duration::from_millis(600);
+    const RECOVERY: Duration = Duration::from_millis(500);
+    let _serial = serial();
+    common::load_factor();
+    let server = TestServer::start();
+    let port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .and_then(|socket| socket.local_addr())
+        .expect("puerto libre")
+        .port();
+    let host_addr: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, port).into();
+    let proxy_started = Instant::now();
+    let proxy = server
+        .runtime
+        .block_on(UdpLossy::start(
+            host_addr,
+            LossyConfig {
+                loss: 0.01,
+                delay: Duration::from_millis(3),
+                jitter: Duration::from_millis(2),
+                rate_bps: None,
+                queue_limit: Duration::from_millis(200),
+                seed: 11,
+                outages: Some(coroom_transport::lossy::Outages {
+                    period: Duration::from_secs(3),
+                    length: OUTAGE,
+                }),
+            },
+        ))
+        .expect("proxy");
+    let mut host_config = server.config();
+    host_config.bind = Some(host_addr);
+    host_config.advertise_candidates = Some(vec![proxy.addr()]);
+    // Con bitrate alto, como en uso real: la cola de datagramas por enviar de QUIC (512 KB, unos
+    // 0,4 s aquí) no aguanta el corte y descarta fotogramas enteros. A 1,5 Mbit/s cabía el corte
+    // entero y no se perdía ningún grupo completo.
+    let mut host = RemoteSession::host(
+        host_config.identity,
+        host_config.config,
+        Box::new(NoisyCapturer::new(SyntheticCapturer::new(1280, 720, FPS))),
+        EncoderSet::openh264(),
+        LoopbackConfig {
+            width: 1280,
+            height: 720,
+            bitrate_kbps: 10_000,
+            ..video(None)
+        },
+        Arc::new(LatencyLedger::new()),
+    );
+    host.start().expect("arranque del anfitrión");
+    let code = room_code(&host);
+    let mut guest_config = server.config();
+    guest_config.advertise_candidates = Some(Vec::new());
+    // 12 s de vídeo: tres cortes.
+    let guest = guest(guest_config, &code, Some(360));
+    let ledger = Arc::clone(guest.ledger());
+    let (summary, _guest, _host) = finish(guest, host);
+    let gap = max_gap(&ledger);
+    let mut timelines = ledger.timelines();
+    timelines.retain(|t| t.at(Stage::Presented).is_some());
+    timelines.sort_by_key(|t| t.at(Stage::Presented));
+    for pair in timelines.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        let (pa, pb) = (
+            a.at(Stage::Presented).unwrap(),
+            b.at(Stage::Presented).unwrap(),
+        );
+        if pb - pa > Duration::from_millis(300) {
+            let rel = |at: Instant| at.saturating_duration_since(proxy_started).as_millis();
+            println!(
+                "hueco {:?}: de {} ms a {} ms (desde el proxy); después: captura {} ms, recibido {} ms",
+                pb - pa,
+                rel(pa),
+                rel(pb),
+                b.at(Stage::Captured).map_or(0, rel),
+                b.at(Stage::Received).map_or(0, rel),
+            );
+        }
+    }
+    println!(
+        "{summary}\nhueco máximo {gap:?}; proxy: {} reenviados, {} perdidos",
+        proxy.stats().forwarded(),
+        proxy.stats().dropped()
+    );
+    assert!(
+        gap <= OUTAGE + RECOVERY,
+        "el vídeo tardó {:?} en volver tras un corte de {OUTAGE:?} (cota {RECOVERY:?})",
+        gap.saturating_sub(OUTAGE)
+    );
     drop(server);
 }

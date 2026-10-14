@@ -86,7 +86,7 @@ pub struct Capabilities {
     /// Directorio de las bibliotecas de FFmpeg con el que se compiló.
     pub ffmpeg_dir: Option<String>,
     /// Codificadores y decodificadores que abren pero fallaron la comprobación de imagen (su
-    /// imagen no coincide con la original), con el motivo: `«codificar AV1/Vulkan Video: …»`.
+    /// imagen no coincide con la original), con el motivo: `«codificar AV1 con Vulkan Video: …»`.
     pub rejected: Vec<String>,
 }
 

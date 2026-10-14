@@ -9,6 +9,8 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Añadido
 
+- **Dirección de la conexión**: la sala muestra por qué IP y puerto va cada invitado («directo
+  192.0.2.24:50412») y el invitado ve la del anfitrión (o la del relay); también en el registro.
 - **Cambios con la sala abierta** (panel «Transmisión» de la sala): qué se comparte (pantalla o
   aplicación, y el monitor o la ventana), las aplicaciones que suenan y el códec y el bitrate
   máximo, sin cerrar la sala ni echar a nadie. Al cambiar de fuente, los invitados ven la última
@@ -56,6 +58,26 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **Cuelgues de 17 s del vídeo**: si se perdían más de 8 fotogramas enteros seguidos (un corte de
+  wifi de unos 150 ms a 60 fps), el receptor se quedaba esperando un fotograma que nadie iba a
+  pedir y descartaba todo lo demás hasta reiniciar la pista 1024 fotogramas después. Ahora esos
+  fotogramas se dan por perdidos al momento, se pide un intra y, en cuanto llega uno entero, se
+  entrega sin esperar a los plazos de lo anterior.
+- **Recuperación tras un corte de red en menos de 500 ms** (antes, segundos): la ventana de
+  congestión de QUIC se llenaba con lo enviado durante el corte y la conexión no volvía hasta el
+  temporizador de pérdida de QUIC, que se duplica en cada intento; ahora aguanta 2 s de corte al
+  bitrate objetivo. Un enlace atascado ya no acumula fotogramas viejos que retrasan el intra que lo
+  arregla. Test con cortes de 600 ms y 1 % de pérdida: el vídeo vuelve en 100–130 ms.
+- `Nack` de más con bitrates altos: se pedía lo que faltaba de un fotograma 12,5 ms después de su
+  primer paquete, cuando el pacing aún lo estaba enviando (80 Mbit/s: unas 150 peticiones y 3000
+  paquetes repetidos cada 5 s en una LAN). Ahora se pide tras un silencio del fotograma, y el plazo
+  de un intra incluye los dos intervalos en que se reparte (antes vencía a mitad de camino y
+  empezaba una tormenta de intra).
+- Si el vídeo no va en 4:4:4 o HDR aunque se pidió, el anfitrión ve por qué: qué invitado no lo
+  acepta (desactivado en su equipo o sin decodificador) o que su codificador no lo hace.
+- Cambiar el códec o el bitrate con la sala abierta lo confirma con un aviso y queda en el
+  registro; el panel muestra el bitrate que se usa ahora.
+- Los descartes de la comprobación de imagen dicen el códec («codificar HEVC con AMF»).
 - **Comprobación de imagen de los códecs por GPU al abrirse.** El sondeo ya no solo mira que
   cada codificador abra: los de hardware codifican 300 fotogramas de un patrón en movimiento (unos
   10 s, con fotogramas predichos), se decodifican por software y cada uno se compara con el

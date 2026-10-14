@@ -303,6 +303,8 @@ pub enum SessionEvent {
         guest: GuestId,
         /// Ruta.
         path: Path,
+        /// Dirección del invitado (o del relay) vista desde aquí.
+        remote: SocketAddr,
     },
     /// Anfitrión: el invitado salió o se le expulsó.
     GuestLeft {
@@ -324,6 +326,8 @@ pub enum SessionEvent {
     Connected {
         /// Ruta.
         path: Path,
+        /// Dirección del anfitrión (o del relay) vista desde aquí.
+        remote: SocketAddr,
     },
     /// Invitado: RTT medido con el anfitrión antes de pedir el vídeo (durante
     /// [`RemoteConfig::quality_probe`]) y nivel esperado (`docs/ARQUITECTURA.md` §2.1).
@@ -404,8 +408,12 @@ impl fmt::Display for SessionEvent {
                 guest.0,
                 permissions_label(permissions)
             ),
-            SessionEvent::GuestConnected { guest, path } => {
-                write!(f, "Invitado {} conectado ({path}).", guest.0)
+            SessionEvent::GuestConnected {
+                guest,
+                path,
+                remote,
+            } => {
+                write!(f, "Invitado {} conectado ({path}, {remote}).", guest.0)
             }
             SessionEvent::GuestLeft {
                 guest,
@@ -427,7 +435,9 @@ impl fmt::Display for SessionEvent {
                 "Dentro de la sala de {host_name}.\n  Huella del anfitrión: {host_fingerprint}\n  Número de \
                  seguridad: {safety_number} (compáralo con el que ve el anfitrión)"
             ),
-            SessionEvent::Connected { path } => write!(f, "Conectado con el anfitrión ({path})."),
+            SessionEvent::Connected { path, remote } => {
+                write!(f, "Conectado con el anfitrión ({path}, {remote}).")
+            }
             SessionEvent::QualityEstimate { rtt_ms, level } => write!(
                 f,
                 "RTT con el anfitrión: {rtt_ms:.1} ms. Calidad esperada: {level} ({}).",
@@ -512,6 +522,8 @@ pub struct GuestStatus {
     pub leaf: u32,
     /// Ruta, cuando ya está conectado.
     pub path: Option<Path>,
+    /// Dirección del otro extremo de la conexión (el invitado o, por el relay, el servidor).
+    pub remote: Option<SocketAddr>,
     /// RTT de su conexión (en el relay, el del tramo anfitrión ↔ relay), en ms.
     pub rtt_ms: Option<f64>,
     /// Bitrate objetivo que pide su control de tasa, en kbit/s.
@@ -795,6 +807,10 @@ impl Core {
             path: link
                 .path
                 .map_or_else(|| "sin conectar".to_owned(), |path| path.to_string()),
+            remote: link
+                .connection
+                .as_ref()
+                .map(|conn| conn.remote_address().to_string()),
             rtt_ms,
             target_kbps: link.target_kbps,
             loss_percent: if total == 0 {

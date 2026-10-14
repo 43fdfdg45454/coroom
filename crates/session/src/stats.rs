@@ -39,6 +39,8 @@ pub(crate) struct Counters {
     pub(crate) bitrate_changes: AtomicU64,
     /// Decodificadores que se dejaron por fallar.
     pub(crate) decoder_fallbacks: AtomicU64,
+    /// Fotogramas que no se enviaron a algún invitado por tener su enlace atascado.
+    pub(crate) stalled_sends: AtomicU64,
     encode_us: Mutex<Vec<u32>>,
     decode_us: Mutex<Vec<u32>>,
 }
@@ -120,7 +122,7 @@ impl Counters {
         push_sample(&self.decode_us, took);
     }
 
-    fn snapshot(&self) -> [u64; 13] {
+    fn snapshot(&self) -> [u64; 14] {
         [
             &self.captured,
             &self.encoded,
@@ -135,6 +137,7 @@ impl Counters {
             &self.keyframe_requests,
             &self.bitrate_changes,
             &self.decoder_fallbacks,
+            &self.stalled_sends,
         ]
         .map(|counter| counter.load(Ordering::Relaxed))
     }
@@ -159,7 +162,7 @@ pub(crate) struct LinkCounters {
 #[derive(Debug)]
 pub(crate) struct StatsWindow {
     at: Instant,
-    counters: [u64; 13],
+    counters: [u64; 14],
     drops: [u64; Stage::ALL.len()],
     link: LinkCounters,
     audio: [AudioCounters; 2],
@@ -224,11 +227,11 @@ impl StatsWindow {
     }
 
     /// Diferencias desde la línea anterior: segundos, contadores y descartes por etapa.
-    fn advance(&mut self, counters: &Counters, ledger: &LatencyLedger) -> (f64, [u64; 13], String) {
+    fn advance(&mut self, counters: &Counters, ledger: &LatencyLedger) -> (f64, [u64; 14], String) {
         let now = Instant::now();
         let seconds = now.duration_since(self.at).as_secs_f64().max(1e-3);
         let current = counters.snapshot();
-        let mut delta = [0; 13];
+        let mut delta = [0; 14];
         for (i, value) in current.iter().enumerate() {
             delta[i] = value.saturating_sub(self.counters[i]);
         }
@@ -266,7 +269,8 @@ impl StatsWindow {
         format!(
             "anfitrión: captura {:.1} fps, codifica {:.1} fps ({p50:.1}/{p95:.1} ms p50/p95), \
              envía {:.1} fps, objetivo {target_kbps} kbit/s, real {:.0} kbit/s, intra forzados {} \
-             (agrupados {}), cambios de bitrate {}, descartes {dropped}",
+             (agrupados {}), cambios de bitrate {}, sin enviar por enlace atascado {}, descartes \
+             {dropped}",
             fps(d[0]),
             fps(d[1]),
             fps(d[3]),
@@ -274,6 +278,7 @@ impl StatsWindow {
             d[8],
             d[9],
             d[11],
+            d[13],
         )
     }
 

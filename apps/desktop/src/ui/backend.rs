@@ -512,6 +512,7 @@ impl Backend {
     /// Códec, codificador y bitrate máximo de los ajustes a la sala abierta.
     fn set_video(&self, settings: &Settings) {
         let Some(session) = lock(&self.host).clone() else {
+            tracing::warn!("cambio de vídeo sin sala abierta");
             return;
         };
         let video = &settings.video;
@@ -530,11 +531,13 @@ impl Backend {
                     })
                     .map_err(|err| err.to_string())
             });
-            let ok = changed.is_ok();
-            tracing::info!(?codec, ?encoder, max_kbps, ok, "vídeo de la sala cambiado");
-            if let Err(err) = changed {
-                notify(Message::Event(Event::Failed(err)));
+            match &changed {
+                Ok(()) => tracing::info!(?codec, ?encoder, max_kbps, "vídeo de la sala cambiado"),
+                Err(err) => tracing::warn!(error = %err, "no se pudo cambiar el vídeo de la sala"),
             }
+            notify(Message::Event(Event::VideoChanged(
+                changed.map(|()| max_kbps),
+            )));
         });
     }
 

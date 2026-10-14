@@ -704,6 +704,8 @@ struct PeerInner {
     media_datagrams: Arc<DatagramQueue>,
     input_datagrams: Arc<DatagramQueue>,
     audio_datagrams: Arc<DatagramQueue>,
+    /// Tamaño de la cola de datagramas por enviar (el hueco libre al crearse, con nada en cola).
+    send_queue_capacity: usize,
     streams_task: JoinHandle<()>,
     datagrams_task: JoinHandle<()>,
 }
@@ -770,8 +772,10 @@ impl PeerConnection {
             Arc::clone(&input_datagrams),
             Arc::clone(&audio_datagrams),
         ));
+        let send_queue_capacity = conn.datagram_send_buffer_space();
         Self {
             inner: Arc::new(PeerInner {
+                send_queue_capacity,
                 conn,
                 peer_key,
                 path,
@@ -825,6 +829,13 @@ impl PeerConnection {
             .conn
             .max_datagram_size()
             .map_or(0, |size| size.min(ObjectHeader::MAX_PACKET))
+    }
+
+    /// Bytes de datagramas que esperan para salir (la ventana de congestión no los deja pasar).
+    pub fn datagram_queued_bytes(&self) -> usize {
+        self.inner
+            .send_queue_capacity
+            .saturating_sub(self.inner.conn.datagram_send_buffer_space())
     }
 
     /// Envía un datagrama (no bloquea; si el búfer está lleno, `quinn` descarta los más antiguos).

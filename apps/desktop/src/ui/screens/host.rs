@@ -772,6 +772,23 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
             };
         }
         Event::Host(event) => return session_event(app, event),
+        Event::VideoChanged(result) => {
+            if app.host.room.is_some() {
+                match result {
+                    Ok(kbps) => app.toast(
+                        Tone::Info,
+                        t!(
+                            "pantalla-host-video-de-la-sala-cambiado",
+                            valor = stats::kbps(f64::from(kbps))
+                        ),
+                    ),
+                    Err(err) => app.toast(
+                        Tone::Warning,
+                        t!("pantalla-host-no-se-pudo-cambiar-el-video", error = err),
+                    ),
+                }
+            }
+        }
         Event::SourceSwitched(result) => {
             let requested = app.host.switching.take();
             if app.host.room.is_none() {
@@ -1326,9 +1343,13 @@ fn guest_card<'a>(app: &'a App, status: &'a GuestStatus) -> Element<'a, Message>
     let connected = status.path.is_some();
     let mut facts = Vec::new();
     if let Some(path) = status.path {
-        facts.push(match path {
+        let path = match path {
             coroom_transport::Path::Direct => "directo".to_owned(),
             coroom_transport::Path::Relayed => t!("pantalla-host-por-el-relay").to_owned(),
+        };
+        facts.push(match status.remote {
+            Some(remote) => format!("{path} {remote}"),
+            None => path,
         });
     }
     if let Some(rtt) = status.rtt_ms {
@@ -1674,9 +1695,22 @@ fn transmission<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
             Message::Settings(settings_screen::Msg::Codec(c))
         }),
     ));
+    // El objetivo de ahora es el del invitado más lento (el control de tasa lo baja si hace falta).
+    let current = room
+        .guests
+        .iter()
+        .filter_map(|status| status.target_kbps)
+        .min();
+    let bitrate_note = match current {
+        Some(kbps) => t!(
+            "pantalla-host-el-bitrate-se-aplica-ya-ahora",
+            valor = stats::kbps(f64::from(kbps))
+        ),
+        None => t!("pantalla-host-el-bitrate-se-aplica-ya").to_owned(),
+    };
     rows.push(ui::pref_row(
         t!("pantalla-settings-bitrate-maximo"),
-        Some(t!("pantalla-host-el-bitrate-se-aplica-ya").to_owned()),
+        Some(bitrate_note),
         row![
             ui::select(bitrates, bitrate, |c| {
                 Message::Settings(settings_screen::Msg::Bitrate(c))
@@ -1777,6 +1811,7 @@ mod tests {
             permissions: Permissions::VIEW_ONLY,
             leaf: id,
             path: None,
+            remote: None,
             rtt_ms: None,
             target_kbps: None,
             input_key: true,

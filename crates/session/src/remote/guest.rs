@@ -895,6 +895,7 @@ async fn receive(
     core.set_state(SessionState::Active);
     core.emit(SessionEvent::Connected {
         path: established.path,
+        remote: connection.remote_address(),
     });
     if core.reconnect_attempts.swap(0, Ordering::AcqRel) > 0 {
         core.emit(SessionEvent::Reconnected {

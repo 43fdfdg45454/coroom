@@ -536,6 +536,12 @@ fn guest_status(id: u32, name: &str, permissions: Permissions, rtt: f64) -> Gues
         permissions,
         leaf: id,
         path: Some(if id == 1 { Path::Direct } else { Path::Relayed }),
+        // Direcciones de documentación (RFC 5737), no de nadie.
+        remote: Some(if id == 1 {
+            "192.0.2.24:50412".parse().expect("dirección")
+        } else {
+            "198.51.100.7:4433".parse().expect("dirección")
+        }),
         rtt_ms: Some(rtt),
         target_kbps: Some(if id == 1 { 24_000 } else { 9_500 }),
         input_key: true,
@@ -657,6 +663,7 @@ fn joined(app: &mut App, estimate: bool, frame: bool) {
     })));
     app.update(Message::Event(Event::Guest(SessionEvent::Connected {
         path: Path::Direct,
+        remote: "192.0.2.10:4433".parse().expect("dirección"),
     })));
     if estimate {
         app.update(Message::Event(Event::Guest(
@@ -890,6 +897,7 @@ fn sample_stats() -> Stats {
     summary.bitrate_kbps = 19_800.0;
     summary.link = Some(LinkSummary {
         path: "directo".to_owned(),
+        remote: Some("192.0.2.10:4433".to_owned()),
         rtt_ms: 13.8,
         target_kbps: 24_000,
         loss_percent: 0.3,

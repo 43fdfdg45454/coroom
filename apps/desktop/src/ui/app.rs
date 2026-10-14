@@ -219,6 +219,9 @@ pub enum Event {
     HostEnded(Option<String>),
     /// Anfitrión: se cambió lo que se comparte con la sala abierta, o no se pudo.
     SourceSwitched(Result<(), String>),
+    /// Anfitrión: el vídeo de la sala abierta ya usa el bitrate máximo (kbit/s) y el códec de los
+    /// ajustes, o no se pudo.
+    VideoChanged(Result<u32, String>),
     /// Invitado: la sesión arrancó (con la fuente del vídeo) o no pudo.
     GuestStarted(Result<Arc<VideoFeed>, String>),
     /// Invitado: un evento de la sesión.
@@ -977,7 +980,8 @@ impl App {
             | Event::HostGuests(_)
             | Event::PreviewUnavailable
             | Event::HostEnded(_)
-            | Event::SourceSwitched(_) => host::on_event(self, event),
+            | Event::SourceSwitched(_)
+            | Event::VideoChanged(_) => host::on_event(self, event),
             Event::GuestStarted(_)
             | Event::Guest(_)
             | Event::GuestStats(_)

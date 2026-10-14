@@ -223,6 +223,7 @@ async fn eighty_megabits_flow_at_lan_and_internet_rtt() {
                 rate_bps: None,
                 queue_limit: Duration::from_millis(200),
                 seed: 1,
+                outages: None,
             },
         )
         .await

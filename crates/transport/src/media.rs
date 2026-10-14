@@ -140,6 +140,11 @@ async fn send_paced(
     Ok(sent)
 }
 
+/// Espera en la cola de datagramas de QUIC (al bitrate objetivo) a partir de la que el enlace se
+/// da por atascado (un corte de wifi, una VPN que se renegocia): lo que se pusiera detrás saldría
+/// tarde, cuando el invitado ya no lo quiere, y retrasaría el intra que lo arregla.
+pub const STALE_QUEUE: Duration = Duration::from_millis(150);
+
 /// Proporción de reparación hasta el primer `Feedback` (la pérdida aún no se conoce).
 pub const INITIAL_REPAIR_RATIO: f64 = 0.10;
 
@@ -178,6 +183,14 @@ const MAX_DEADLINE_INTERVALS: f64 = 4.0;
 
 /// `Nack` por grupo como mucho (el segundo, si el reenvío también se perdió).
 const MAX_NACKS: u8 = 2;
+
+/// Silencio de un grupo (ningún objeto suyo llega) tras el que lo que falta se da por perdido y
+/// se pide: una fracción del intervalo, acotada. Un grupo llega repartido por el pacing (hasta el
+/// 80 % del intervalo, dos intervalos si es un intra): contar desde el primer objeto pedía como
+/// perdido lo que aún no se había enviado.
+fn quiet_gap(interval: Duration) -> Duration {
+    (interval / 4).clamp(Duration::from_millis(3), Duration::from_millis(10))
+}
 
 /// Muestras del reloj para las medianas.
 const CLOCK_SAMPLES: usize = 8;
@@ -482,6 +495,19 @@ impl MediaSender {
     /// Proporción de reparación actual.
     pub fn repair_ratio(&self) -> f64 {
         self.state.lock().map_or(0.0, |state| state.repair_ratio)
+    }
+
+    /// Lo que espera en la cola de datagramas por enviar de QUIC, en tiempo al bitrate objetivo.
+    pub fn send_queue_delay(&self) -> Duration {
+        let queued = self.conn.datagram_queued_bytes() as f64;
+        let rate = f64::from(self.target_kbps().max(1)) * 1000.0 / 8.0;
+        Duration::from_secs_f64(queued / rate)
+    }
+
+    /// Si la cola de QUIC lleva más de [`STALE_QUEUE`]: el enlace está atascado y lo que se envíe
+    /// ahora llegaría tarde.
+    pub fn stalled(&self) -> bool {
+        self.send_queue_delay() > STALE_QUEUE
     }
 
     /// Bitrate objetivo para el codificador: el mínimo de los receptores que informan (el inicial
@@ -1096,6 +1122,12 @@ impl ReceiverCore {
         let next = self.next.get(&track).copied().unwrap_or(group);
         // Cotas de memoria frente a un emisor malicioso: grupos abiertos por pista y huecos de
         // objetos reservados en total.
+        if !self.groups.contains_key(&(track, group)) && self.open_groups(track) >= MAX_OPEN_GROUPS
+        {
+            // Lleno: antes de rechazar, que avance lo que se pueda (un hueco viejo atascaba la
+            // pista hasta el reinicio de RESET_DISTANCE grupos, 17 s a 60 fps).
+            self.deliver(track, now);
+        }
         let known = self.groups.get(&(track, group));
         if known.is_none() && self.open_groups(track) >= MAX_OPEN_GROUPS {
             self.stats.invalid += 1;
@@ -1144,6 +1176,12 @@ impl ReceiverCore {
             state.count = Some(header.object_count);
             state.sources = vec![None; usize::from(header.object_count)];
             state.keyframe = header.is_keyframe();
+            if state.keyframe {
+                // Un intra sale repartido en hasta KEYFRAME_PACING_INTERVALS intervalos: su plazo
+                // los incluye.
+                let pacing = interval * KEYFRAME_PACING_INTERVALS;
+                state.deadline = state.deadline.max(state.first + pacing + interval / 2);
+            }
             // Los reenvíos tras un Nack no son muestras de OWD válidas.
             if let Some(arrival) = arrival_remote.filter(|_| !state.nacked)
                 && self.owd_pending.len() < 64
@@ -1167,6 +1205,14 @@ impl ReceiverCore {
                 Some(_) => {}
                 None => state.symbol_size = Some(len),
             }
+        }
+
+        // Mientras el grupo sigue llegando, lo que falta no está perdido: el `Nack` espera a un
+        // silencio y el plazo da tiempo a la cola del grupo (sin pasar del máximo).
+        if !state.nacked {
+            state.nack_at = state.nack_at.max(now + quiet_gap(interval));
+            let cap = state.first + interval.mul_f64(MAX_DEADLINE_INTERVALS);
+            state.deadline = state.deadline.max((now + interval / 2).min(cap));
         }
 
         let is_source = !header.is_repair();
@@ -1230,7 +1276,7 @@ impl ReceiverCore {
                 finish(state, &block, now, &mut self.stats, Recovery::Fec);
             }
         }
-        self.deliver(track);
+        self.deliver(track, now);
     }
 
     /// Grupos de `track` que aún no se han entregado ni olvidado.
@@ -1302,9 +1348,62 @@ impl ReceiverCore {
                 tracks.push(track);
             }
         }
+        // Todas las pistas, no solo las que vencieron algo: así un hueco viejo se salta aunque no
+        // llegue nada más.
+        tracks.extend(self.next.keys().copied());
+        tracks.sort_unstable_by_key(|track| *track as u8);
         tracks.dedup();
         for track in tracks {
-            self.deliver(track);
+            self.deliver(track, now);
+        }
+    }
+
+    /// Si ya llegó entero un intra de `track` por delante de lo que falta por entregar, lo de
+    /// antes ya no sirve (el decodificador vuelve a empezar en el intra): se descarta sin esperar a
+    /// sus plazos ni a sus `Nack` y se entrega el intra enseguida.
+    fn jump_to_keyframe(&mut self, track: Track) {
+        let Some(&next) = self.next.get(&track) else {
+            return;
+        };
+        let keyframe = self
+            .groups
+            .range((track, next.wrapping_add(1))..=(track, u32::MAX))
+            .filter(|(_, state)| state.keyframe && state.done.is_some() && !state.expired)
+            .map(|(&(_, group), _)| group)
+            .next_back();
+        let Some(keyframe) = keyframe else {
+            return;
+        };
+        let stale: Vec<u32> = self
+            .groups
+            .range((track, next)..(track, keyframe))
+            .map(|(&(_, group), _)| group)
+            .collect();
+        for group in stale {
+            if let Some(state) = self.groups.remove(&(track, group))
+                && state.done.is_none()
+                && !state.expired
+            {
+                self.stats.dropped += 1;
+            }
+        }
+        self.next.insert(track, keyframe);
+    }
+
+    /// Da por perdido entero el grupo `group` de `track` (un hueco que ya nadie va a llenar) y, si
+    /// es vídeo, pide un intra (uno por ráfaga, como al vencer un plazo).
+    fn skip_lost(&mut self, track: Track, group: u32, now: Instant) {
+        self.next.insert(track, group.wrapping_add(1));
+        self.stats.dropped += 1;
+        self.stats.lost_objects += 1;
+        let interval = self.track_interval(track);
+        let held = self.last_keyframe_request.is_some_and(|at| {
+            now.saturating_duration_since(at) < keyframe_hold(interval, Duration::ZERO)
+        });
+        if track == Track::Video && !held {
+            self.outbox.push(ControlMessage::KeyframeRequest { group });
+            self.stats.keyframe_requests += 1;
+            self.last_keyframe_request = Some(now);
         }
     }
 
@@ -1339,14 +1438,28 @@ impl ReceiverCore {
     }
 
     /// Entrega en orden los grupos resueltos de `track`.
-    fn deliver(&mut self, track: Track) {
+    fn deliver(&mut self, track: Track, now: Instant) {
+        self.jump_to_keyframe(track);
         loop {
             let Some(&next) = self.next.get(&track) else {
                 return;
             };
             let Some(state) = self.groups.get(&(track, next)) else {
-                // Hueco: se resuelve al crear el grupo vacío con el siguiente datagrama.
-                return;
+                // Hueco: un grupo del que no llegó nada. Si está entre los MAX_PLACEHOLDERS
+                // anteriores al más nuevo, el siguiente datagrama crea su grupo vacío (y se pide);
+                // si es más viejo, ya nadie lo va a crear: se da por perdido entero y se sigue.
+                let newest = self
+                    .groups
+                    .range((track, next)..=(track, u32::MAX))
+                    .next_back()
+                    .map(|(&(_, group), _)| group);
+                match newest {
+                    Some(newest) if newest - next > MAX_PLACEHOLDERS => {
+                        self.skip_lost(track, next, now);
+                        continue;
+                    }
+                    _ => return,
+                }
             };
             if state.done.is_none() && !state.expired {
                 return;
@@ -1845,6 +1958,86 @@ mod tests {
         // Lo que llegue después del grupo descartado se ignora.
         core.push(&sources[0], start + Duration::from_millis(52), None);
         assert!(core.pop_frame().is_none());
+    }
+
+    /// Un corte de la red se lleva más de MAX_PLACEHOLDERS fotogramas enteros: los grupos de los
+    /// que no llegó nada se dan por perdidos, se pide un intra y lo que llega después se entrega
+    /// enseguida (antes, la pista se quedaba esperando un grupo que nadie iba a crear hasta el
+    /// reinicio de RESET_DISTANCE grupos: 17 s sin vídeo a 60 fps).
+    #[test]
+    fn a_burst_longer_than_the_placeholders_does_not_stall_the_track() {
+        let mut core = ReceiverCore::new(INTERVAL);
+        let start = Instant::now();
+        let rtt = Duration::from_millis(5);
+        let at = |group: u32| start + INTERVAL * group;
+        for group in 0..3 {
+            let (sources, _) = packetize(group, &payload(3000, group as u8), 1184, 0);
+            for packet in &sources {
+                core.push(packet, at(group), None);
+            }
+        }
+        while core.pop_frame().is_some() {}
+        // Se pierden del 3 al 29 enteros (450 ms); a partir del 30 todo llega.
+        let mut presented = Vec::new();
+        for group in 30..90 {
+            let (sources, _) = packetize(group, &payload(3000, group as u8), 1184, 0);
+            for packet in &sources {
+                core.push(packet, at(group), None);
+            }
+            core.poll(at(group) + INTERVAL / 2, rtt);
+            while let Some(frame) = core.pop_frame() {
+                presented.push((frame.group, group));
+            }
+        }
+        let first = presented.first().copied().expect("vídeo después del corte");
+        assert!(
+            first.1 - first.0 <= 4,
+            "el primer grupo tras el corte sale como mucho 4 fotogramas tarde: {first:?}"
+        );
+        assert!(presented.iter().any(|(group, _)| *group == 89));
+        assert!(
+            core.take_messages()
+                .iter()
+                .any(|m| matches!(m, ControlMessage::KeyframeRequest { .. })),
+            "se pide un intra"
+        );
+        assert_eq!(core.stats().invalid, 0, "nada se rechaza por grupos llenos");
+    }
+
+    /// Un fotograma repartido por el pacing (80 % del intervalo) y un intra repartido en dos
+    /// intervalos llegan enteros sin pedir nada: el `Nack` espera a que el grupo deje de llegar.
+    #[test]
+    fn paced_groups_are_not_nacked_while_they_keep_arriving() {
+        let mut core = ReceiverCore::new(INTERVAL);
+        let start = Instant::now();
+        let rtt = Duration::from_millis(3);
+        for (group, spread, keyframe) in [
+            (0u32, INTERVAL.mul_f64(0.8), false),
+            (1, INTERVAL * 2, true),
+        ] {
+            let (mut sources, _) = packetize(group, &payload(120_000, group as u8), 1184, 0);
+            if keyframe {
+                for packet in &mut sources {
+                    let (mut header, body) =
+                        ObjectHeader::parse_datagram(packet).expect("cabecera");
+                    header.flags |= ObjectHeader::KEYFRAME;
+                    *packet = datagram(header, body).to_vec();
+                }
+            }
+            let begin = start + INTERVAL * 3 * group;
+            let n = sources.len() as u32;
+            for (i, packet) in sources.iter().enumerate() {
+                let now = begin + spread * i as u32 / n;
+                core.poll(now, rtt);
+                core.push(packet, now, None);
+            }
+            core.poll(begin + spread, rtt);
+            let frame = core.pop_frame().expect("grupo entero");
+            assert_eq!(frame.group, group);
+            assert_eq!(frame.keyframe, keyframe);
+        }
+        assert_eq!(core.stats().nacks, 0, "{:?}", core.take_messages());
+        assert_eq!(core.stats().dropped, 0);
     }
 
     #[test]

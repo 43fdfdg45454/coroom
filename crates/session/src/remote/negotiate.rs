@@ -244,6 +244,46 @@ pub fn choose_format(
         .unwrap_or(VideoFormat::SDR_420)
 }
 
+/// Por qué el vídeo no va en el formato pedido (`wanted`, el primero de los candidatos) sino en
+/// `chosen`: el codificador del anfitrión no lo hace o algún invitado (por su nombre) no lo
+/// acepta. `None` si va en el pedido.
+pub fn format_shortfall(
+    codec: Codec,
+    wanted: VideoFormat,
+    chosen: VideoFormat,
+    host: &EncoderSet,
+    guests: &[(String, GuestCapabilities)],
+) -> Option<String> {
+    if wanted == chosen {
+        return None;
+    }
+    let reason = if !host.supports(codec, wanted) {
+        format!("este equipo no codifica {codec} en {wanted}")
+    } else {
+        let names: Vec<&str> = guests
+            .iter()
+            .filter(|(_, caps)| !caps.accepts(codec, wanted))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if names.is_empty() {
+            return None;
+        }
+        format!(
+            "{} no lo {} (desactivado en Ajustes → Vídeo de su equipo, o su equipo no lo \
+             decodifica en {codec})",
+            names.join(", "),
+            if names.len() == 1 {
+                "acepta"
+            } else {
+                "aceptan"
+            }
+        )
+    };
+    Some(format!(
+        "Pediste {wanted}, pero el vídeo va en {chosen}: {reason}."
+    ))
+}
+
 /// Elige el códec del flujo: el mejor que el anfitrión codifica (`host`) y todos los invitados
 /// (`guests`) decodifican, con el orden del módulo. `None` si no hay invitados o no hay ninguno
 /// común.
@@ -472,5 +512,37 @@ mod tests {
             .expect("forma válida");
         assert_eq!(*back, shape);
         assert!(shape_from_message(1, (2, 2), (0, 0), vec![0; 3]).is_none());
+    }
+
+    #[test]
+    fn the_host_is_told_why_444_is_not_used() {
+        use coroom_codec::Backend;
+        let host = EncoderSet::new([(Codec::Hevc, Backend::VulkanVideo)]);
+        let with = GuestCapabilities {
+            yuv444: vec![Codec::Hevc],
+            ..GuestCapabilities::new(vec![(Codec::Hevc, DecoderBackend::Software)])
+        };
+        let without = GuestCapabilities::new(vec![(Codec::Hevc, DecoderBackend::Software)]);
+        let guests = vec![("Bea".to_owned(), with), ("Nahu".to_owned(), without)];
+        let caps: Vec<GuestCapabilities> = guests.iter().map(|(_, c)| c.clone()).collect();
+        let candidates = [VideoFormat::SDR_444, VideoFormat::SDR_420];
+        let chosen = choose_format(Codec::Hevc, &candidates, &host, &caps);
+        assert_eq!(chosen, VideoFormat::SDR_420);
+        let note =
+            format_shortfall(Codec::Hevc, candidates[0], chosen, &host, &guests).expect("aviso");
+        assert!(note.contains("Nahu no lo acepta"), "{note}");
+        assert!(!note.contains("Bea"), "{note}");
+        // Un codificador que no lo hace: la culpa es del anfitrión.
+        let software = EncoderSet::new([(Codec::H264, Backend::Software)]);
+        let note = format_shortfall(Codec::H264, candidates[0], chosen, &software, &guests)
+            .expect("aviso");
+        assert!(
+            note.contains("este equipo no codifica H.264 en 4:4:4"),
+            "{note}"
+        );
+        assert_eq!(
+            format_shortfall(Codec::Hevc, chosen, chosen, &host, &guests),
+            None
+        );
     }
 }
