@@ -321,6 +321,31 @@ mod tests {
     }
 
     #[test]
+    fn av1_by_vulkan_is_only_used_when_asked_for() {
+        let all = EncoderSet::new([
+            (Codec::Av1, Backend::VulkanVideo),
+            (Codec::Av1, Backend::Nvenc),
+            (Codec::Hevc, Backend::VulkanVideo),
+        ]);
+        assert_eq!(
+            all.clone().only_backend(None).available(),
+            &[
+                (Codec::Av1, Backend::Nvenc),
+                (Codec::Hevc, Backend::VulkanVideo)
+            ],
+            "en automático, AV1 por NVENC y HEVC por Vulkan"
+        );
+        assert_eq!(
+            all.only_backend(Some(Backend::VulkanVideo)).available(),
+            &[
+                (Codec::Av1, Backend::VulkanVideo),
+                (Codec::Hevc, Backend::VulkanVideo)
+            ],
+            "pedido a mano, sí"
+        );
+    }
+
+    #[test]
     fn gpu_input_follows_the_preferred_hardware_backend() {
         assert_eq!(EncoderSet::openh264().gpu_input(), GpuInput::None);
         assert_eq!(gpu_input_for(Backend::Software), GpuInput::None);

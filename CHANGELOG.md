@@ -46,6 +46,10 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **AV1 por Vulkan Video ya no se elige solo en Linux** (como ya pasaba en Windows): con anfitrión
+  Linux y NVIDIA daba artefactos que no salen con SVT-AV1 ni con HEVC por Vulkan Video. En
+  Automático, AV1 va por NVENC, AMF, Quick Sync o VA-API; sin ellos, se negocia HEVC por Vulkan
+  Video. Se puede seguir eligiendo a mano en Ajustes → Vídeo → Avanzado.
 - **Anfitrión Windows a 48 fps en lugar de 60 con un monitor de 144 Hz.** Se le pedía a WGC un
   intervalo mínimo de `1 / fps` entre fotogramas, y eso redondea al múltiplo del refresco (tres
   refrescos de 6,9 ms: 20,8 ms). Ahora WGC entrega cada refresco y la captura se queda con los de

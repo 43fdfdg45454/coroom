@@ -122,10 +122,11 @@ impl Backend {
     }
 
     /// Si la combinación se queda fuera de la elección automática y solo se usa si se pide a
-    /// mano: AV1 por Vulkan Video en Windows, que en drivers actuales corrompe la imagen al cabo
-    /// de unos segundos.
+    /// mano: AV1 por Vulkan Video, que con los drivers actuales corrompe la imagen (en Windows,
+    /// gris al cabo de unos segundos; en Linux con NVIDIA, artefactos que con SVT-AV1 y con HEVC
+    /// por Vulkan no salen). Sin él, AV1 va por NVENC, AMF, QSV o VA-API si los hay.
     pub fn manual_only(codec: Codec, backend: Backend) -> bool {
-        cfg!(target_os = "windows") && codec == Codec::Av1 && backend == Backend::VulkanVideo
+        codec == Codec::Av1 && backend == Backend::VulkanVideo
     }
 
     /// Todos, en orden de preferencia.

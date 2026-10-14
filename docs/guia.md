@@ -104,9 +104,10 @@ Las letras de `Ctrl+Alt` se cambian en Ajustes → Entrada (no pueden coincidir 
   el anfitrión, el equipo y todos los invitados lo admiten; si no, Ajustes te dice por qué).
   En **Avanzado**, el codificador del anfitrión y el decodificador del invitado: déjalos en
   Automático salvo que el vídeo se vea gris o corrupto o la aplicación se cierre al compartir. En
-  Windows, Automático usa NVENC, AMF o Quick Sync antes que Vulkan Video, y AV1 por Vulkan Video
-  solo se usa si lo eliges (con los drivers actuales corrompe la imagen). Si el invitado recibe
-  muchos fotogramas dañados, la aplicación lo avisa.
+  Windows, Automático usa NVENC, AMF o Quick Sync antes que Vulkan Video. En Windows y en Linux,
+  AV1 por Vulkan Video solo se usa si lo eliges (con los drivers actuales corrompe la imagen): en
+  Automático, AV1 va por NVENC, AMF, Quick Sync o VA-API, y si no hay, se usa HEVC por Vulkan.
+  Si el invitado recibe muchos fotogramas dañados, la aplicación lo avisa.
 - **Audio**: dispositivos, voz por actividad o pulsar para hablar.
 - **Entrada**: atajos y mandos.
 - **Red**: puerto local y **Usar siempre el relay** (para redes que bloquean el UDP entre equipos).
