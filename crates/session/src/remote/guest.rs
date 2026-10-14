@@ -775,6 +775,9 @@ async fn run_guest(
                             let line = stats.guest_line(&core.shared.counters, &core.ledger, link);
                             tracing::info!(target: "coroom::stats", "{line}");
                         }
+                        if let Some(line) = stats.audio_line(&core.ledger) {
+                            tracing::info!(target: "coroom::stats", "{line}");
+                        }
                     }
                     if let Some((err, deadline)) = &lost
                         && Instant::now() >= *deadline

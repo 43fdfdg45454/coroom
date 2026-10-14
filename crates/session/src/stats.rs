@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::latency::{LatencyLedger, Stage};
+use crate::latency::{AudioCounters, AudioTrack, LatencyLedger, Stage};
 
 /// Cada cuánto se escribe la línea de estadísticas.
 pub const STATS_PERIOD: Duration = Duration::from_secs(5);
@@ -162,6 +162,7 @@ pub(crate) struct StatsWindow {
     counters: [u64; 13],
     drops: [u64; Stage::ALL.len()],
     link: LinkCounters,
+    audio: [AudioCounters; 2],
 }
 
 impl StatsWindow {
@@ -171,7 +172,50 @@ impl StatsWindow {
             counters: counters.snapshot(),
             drops: drops(ledger),
             link: LinkCounters::default(),
+            audio: AudioTrack::ALL.map(|track| ledger.audio_counters(track)),
         }
+    }
+
+    /// Línea del audio recibido desde la anterior, una parte por pista con paquetes: recibidos,
+    /// tramas ocultadas (y de ellas recuperadas con FEC y DRED), tardíos, veces que se vació la
+    /// cola, tramas recortadas y estiradas, racha más larga sin paquete, objetivo y jitter p95, y
+    /// las faltas y desbordes de la salida. `None` si no llegó audio.
+    pub(crate) fn audio_line(&mut self, ledger: &LatencyLedger) -> Option<String> {
+        let now = AudioTrack::ALL.map(|track| ledger.audio_counters(track));
+        let before = std::mem::replace(&mut self.audio, now);
+        let parts: Vec<String> = AudioTrack::ALL
+            .into_iter()
+            .zip(now.into_iter().zip(before))
+            .filter_map(|(track, (now, mut before))| {
+                if now.received < before.received {
+                    // Buffer nuevo (reconexión): empieza de cero.
+                    before = AudioCounters::default();
+                }
+                let d = |f: fn(&AudioCounters) -> u64| f(&now).saturating_sub(f(&before));
+                let received = d(|c| c.received);
+                (received > 0).then(|| {
+                    format!(
+                        "{}: recibe {received}, ocultadas {} (FEC {}, DRED {}), tardíos {}, \
+                         vacíos {}, recortadas {}, estiradas {}, racha máx. {} tramas, objetivo \
+                         {:.0} ms, jitter p95 {:.1} ms, salida sin datos {} y desbordada {}",
+                        track.label(),
+                        d(|c| c.concealed),
+                        d(|c| c.recovered_fec),
+                        d(|c| c.recovered_dred),
+                        d(|c| c.late),
+                        d(|c| c.underruns),
+                        d(|c| c.trimmed),
+                        d(|c| c.stretched),
+                        now.max_gap_frames,
+                        now.jitter_target_ms,
+                        now.jitter_p95_ms,
+                        d(|c| c.device_underruns),
+                        d(|c| c.device_overruns),
+                    )
+                })
+            })
+            .collect();
+        (!parts.is_empty()).then(|| format!("invitado, audio: {}", parts.join("; ")))
     }
 
     /// Si ya toca otra línea.
@@ -325,5 +369,37 @@ mod tests {
             },
         );
         assert!(line.contains("grupos perdidos 2"), "{line}");
+    }
+
+    #[test]
+    fn the_audio_line_counts_what_is_new_per_track() {
+        let counters = Counters::default();
+        let ledger = LatencyLedger::new();
+        let mut window = StatsWindow::new(&counters, &ledger);
+        assert_eq!(window.audio_line(&ledger), None, "sin audio no hay línea");
+        let game = |received, concealed, device_underruns| AudioCounters {
+            received,
+            concealed,
+            device_underruns,
+            max_gap_frames: 3,
+            jitter_target_ms: 20.0,
+            ..AudioCounters::default()
+        };
+        ledger.set_audio_counters(AudioTrack::Game, game(250, 4, 2));
+        let line = window.audio_line(&ledger).unwrap();
+        assert!(
+            line.contains("audio del juego: recibe 250, ocultadas 4"),
+            "{line}"
+        );
+        assert!(line.contains("salida sin datos 2"), "{line}");
+        assert!(!line.contains("voz"), "{line}");
+        ledger.set_audio_counters(AudioTrack::Game, game(500, 5, 2));
+        let line = window.audio_line(&ledger).unwrap();
+        assert!(line.contains("recibe 250, ocultadas 1"), "{line}");
+        assert!(line.contains("salida sin datos 0"), "{line}");
+        // Reconexión: los contadores vuelven a empezar.
+        ledger.set_audio_counters(AudioTrack::Game, game(10, 0, 0));
+        let line = window.audio_line(&ledger).unwrap();
+        assert!(line.contains("recibe 10,"), "{line}");
     }
 }

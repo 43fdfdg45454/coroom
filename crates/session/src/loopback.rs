@@ -953,6 +953,17 @@ enum EncodeInput {
     Repeat,
 }
 
+/// Si `encode_loop` puede guardar `raw` para repetirlo: las imágenes de CPU y los DMA-BUF de
+/// PipeWire (negocia de 4 a 16 búferes: retener uno no deja a la captura sin dónde escribir).
+fn can_repeat(raw: &RawFrame) -> bool {
+    match &raw.gpu {
+        None => true,
+        #[cfg(unix)]
+        Some(coroom_codec::GpuImage::DmaBuf(_)) => true,
+        Some(_) => false,
+    }
+}
+
 pub(crate) fn encode_loop(
     mut encoder: Option<Box<dyn Encoder>>,
     rx: Receiver<CapturedFrame>,
@@ -963,11 +974,11 @@ pub(crate) fn encode_loop(
     control: Option<&EncodeControl>,
 ) -> Result<(), PipelineError> {
     let mut gate = BitrateGate::default();
-    // Último fotograma de CPU, para volver a codificarlo como intra si se pide uno con la
-    // pantalla quieta. Los de GPU no se guardan aquí: retendrían un búfer del pool de la captura
-    // (WGC tiene tres) y la captura se quedaría sin dónde escribir. Con ellos repite el propio
-    // codificador si guarda una copia ([`Encoder::repeat_last`]: la de D3D11); con DMA-BUF, el
-    // intra sale con el siguiente cambio de pantalla.
+    // Último fotograma, para volver a codificarlo como intra si se pide uno con la pantalla quieta
+    // (o con una ventana que no se redibuja: oculta, minimizada o un juego en pausa). Se guardan
+    // los de CPU y los DMA-BUF de PipeWire, que retienen uno de sus 4 a 16 búferes
+    // ([`can_repeat`]). Los D3D11 no: WGC tiene tres y la captura se quedaría sin dónde escribir;
+    // con ellos repite el propio codificador desde su copia ([`Encoder::repeat_last`]).
     let mut last: Option<RawFrame> = None;
     let mut last_at = Instant::now();
     loop {
@@ -1012,7 +1023,7 @@ pub(crate) fn encode_loop(
         };
         // Sin invitados o sin códec no se codifica, pero se guarda la imagen: si la pantalla está
         // quieta cuando llegue uno, es la que se le envía.
-        let keep = |raw: Option<RawFrame>| raw.filter(|raw| raw.gpu.is_none());
+        let keep = |raw: Option<RawFrame>| raw.filter(can_repeat);
         if let Some(control) = control {
             if let Some(next) = control.take_next() {
                 // Códec nuevo (negociación): sale ya configurado y su primer fotograma es intra.
@@ -1068,7 +1079,7 @@ pub(crate) fn encode_loop(
             ledger.record_drop(Stage::Encoded);
             continue;
         };
-        // La imagen de GPU (y el búfer de la captura que retiene) se suelta en cuanto se codifica.
+        // Una imagen D3D11 (y el búfer de la captura que retiene) se suelta en cuanto se codifica.
         last = keep(raw);
         ledger.record_cpu_copies(Stage::Encoded, encoder.cpu_copies());
         if slices.is_empty() {
@@ -1947,6 +1958,53 @@ mod tests {
         let (_, encoded) = harness.stop();
         assert_eq!(encoded.len(), 4, "{encoded:?}");
         assert_eq!(encoded[3], (2, true), "el último otra vez, intra");
+    }
+
+    /// Lo mismo con DMA-BUF de PipeWire: la ventana capturada que deja de redibujarse (oculta o en
+    /// pausa) no dejaba al invitado sin imagen. El búfer se retiene hasta el siguiente fotograma.
+    #[cfg(unix)]
+    #[test]
+    fn a_keyframe_request_on_a_still_dmabuf_screen_repeats_the_last_frame() {
+        use coroom_capture::{DmaBufFrame, DmaBufPlane};
+        let released = Arc::new(AtomicU32::new(0));
+        struct Release(Arc<AtomicU32>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let dmabuf_frame = |frame_id| CapturedFrame {
+            pixels: FramePixels::DmaBuf(Arc::new(DmaBufFrame {
+                planes: vec![DmaBufPlane {
+                    fd: std::fs::File::open("/dev/null").unwrap().into(),
+                    offset: 0,
+                    stride: 16,
+                }],
+                modifier: 0,
+                fourcc: coroom_codec::gpu::DRM_FORMAT_XRGB8888,
+                width: 4,
+                height: 4,
+                release: Some(Arc::new(Release(Arc::clone(&released)))),
+            })),
+            ..cpu_frame(frame_id)
+        };
+        let harness = EncodeHarness::start(true, 10_000);
+        for frame in 0..3 {
+            harness.frames.send(dmabuf_frame(frame)).unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            released.load(Ordering::SeqCst),
+            2,
+            "solo se retiene el último"
+        );
+        harness.shared.request_keyframe();
+        thread::sleep(IDLE_KEYFRAME + Duration::from_millis(300));
+        let (_, encoded) = harness.stop();
+        assert_eq!(encoded.len(), 4, "{encoded:?}");
+        assert_eq!(encoded[3], (2, true), "el último otra vez, intra");
+        assert_eq!(released.load(Ordering::SeqCst), 3, "al parar se devuelve");
     }
 
     #[test]

@@ -46,6 +46,14 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **Invitado sin imagen con anfitrión Linux** cuando la ventana o la pantalla capturada deja de
+  redibujarse (un juego en pausa al perder el foco, una ventana tapada o minimizada): con la
+  captura de PipeWire por DMA-BUF no había nada que repetir y el invitado se quedaba en el primer
+  fotograma o sin entrar, pidiendo intra en vano. Ahora se retiene el último búfer (uno de los 4 a
+  16 que se negocian) y el intra sale con él.
+- El registro del invitado lleva también una línea de **audio** cada 5 s: paquetes, tramas
+  ocultadas, tardíos, veces que se vació la cola, recortes y estiramientos y las faltas de la
+  salida.
 - **Vídeo que no llegaba o se congelaba** («Entrando en la sala» con el audio sonando, un solo
   fotograma y nada más, al volver a entrar en una sala): el invitado pide un intra mientras no
   tiene imagen, sin esperar a que lleguen fotogramas; el anfitrión manda uno cuando el invitado

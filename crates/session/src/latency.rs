@@ -916,6 +916,11 @@ impl LatencyLedger {
         audio.counters[track.index()] = AudioCounters { sent, ..counters };
     }
 
+    /// Contadores actuales de `track`.
+    pub fn audio_counters(&self, track: AudioTrack) -> AudioCounters {
+        self.audio().counters[track.index()]
+    }
+
     /// Suma `packets` enviados en `track`.
     pub fn record_audio_sent(&self, track: AudioTrack, packets: u64) {
         self.audio().counters[track.index()].sent += packets;
