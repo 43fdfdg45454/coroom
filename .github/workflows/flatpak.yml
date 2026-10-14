@@ -3,7 +3,8 @@ name: Flatpak
 # Construye el Flatpak de coroom (packaging/flatpak/) con flatpak-builder en el contenedor
 # de flatpak-github-actions del runtime 26.08 y deja el .flatpak como artefacto. `packages.yml` lo
 # llama con la versión calculada en cada push a main y «Publicación» adjunta el paquete a la
-# release; en los pull requests que tocan el empaquetado se construye con la versión 0.0.0.
+# release; en los pull requests que tocan el empaquetado se construye con la versión 1.0.0, la base
+# de `Cargo.toml` (las crates se piden entre sí con `^1.0.0`: con 0.0.0 cargo no las resuelve).
 on:
   pull_request:
     paths:
@@ -17,14 +18,14 @@ on:
         description: Versión X.Y.Z
         required: false
         type: string
-        default: 0.0.0
+        default: 1.0.0
   workflow_call:
     inputs:
       version:
         description: Versión X.Y.Z
         required: false
         type: string
-        default: 0.0.0
+        default: 1.0.0
 
 permissions:
   contents: read
@@ -41,7 +42,7 @@ jobs:
 
       - uses: ./.github/actions/version
         with:
-          version: ${{ inputs.version || '0.0.0' }}
+          version: ${{ inputs.version || '1.0.0' }}
 
       # `Cargo.lock` y `cargo-sources.json` tienen que ir a la par: si alguien cambió las
       # dependencias sin regenerarlo (README, «Flatpak»), aquí se ve antes de construir.
@@ -64,7 +65,7 @@ jobs:
       - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
           manifest-path: packaging/flatpak/io.github._43fdfdg45454.coroom.yml
-          bundle: coroom-${{ inputs.version || '0.0.0' }}-x86_64.flatpak
+          bundle: coroom-${{ inputs.version || '1.0.0' }}-x86_64.flatpak
           cache: true
           restore-cache: false
           save-cache: false
@@ -77,5 +78,5 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: flatpak
-          path: coroom-${{ inputs.version || '0.0.0' }}-x86_64.flatpak
+          path: coroom-${{ inputs.version || '1.0.0' }}-x86_64.flatpak
           if-no-files-found: error
