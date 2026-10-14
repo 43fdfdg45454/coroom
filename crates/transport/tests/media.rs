@@ -11,6 +11,11 @@ use coroom_transport::EndpointOptions;
 use coroom_transport::lossy::{LossyConfig, UdpLossy};
 
 const FRAMES: u32 = 300;
+
+/// Los tests de este fichero miden pérdidas y huecos en `localhost`: de uno en uno, para que el de
+/// 80 Mbit/s no le quite CPU ni búfer de socket a los demás (en el runner de Windows, con dos
+/// núcleos, se perdían objetos sin red de por medio).
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const SIZE: usize = 20 * 1024;
 
 fn check_payloads(run: &Run) {
@@ -47,6 +52,7 @@ fn summary(label: &str, run: &Run) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_frame_arrives_without_loss() {
+    let _serial = SERIAL.lock().await;
     let (host, host_conn, guest, guest_conn) =
         connected_pair(EndpointOptions::default(), None).await;
     let run = transmit(host_conn, guest_conn, &host, &guest, FRAMES, |_| SIZE, 60).await;
@@ -65,6 +71,7 @@ async fn every_frame_arrives_without_loss() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fec_and_nack_survive_loss_and_jitter() {
+    let _serial = SERIAL.lock().await;
     let host_options = EndpointOptions::default();
     // El proxy se pone delante del anfitrión: hace falta su dirección antes de conectar.
     let host = common::peer(host_options);
@@ -115,6 +122,7 @@ async fn fec_and_nack_survive_loss_and_jitter() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tiny_and_huge_frames_round_trip() {
+    let _serial = SERIAL.lock().await;
     let (host, host_conn, guest, guest_conn) =
         connected_pair(EndpointOptions::default(), None).await;
     // 0 bytes, 1 byte, justo un objeto, un objeto + 1, y un intra de 200 KB.
@@ -142,6 +150,7 @@ async fn tiny_and_huge_frames_round_trip() {
 /// objetivo es el del más lento y al olvidarlo manda el siguiente.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_shared_sender_follows_the_slowest_receiver() {
+    let _serial = SERIAL.lock().await;
     use coroom_transport::media::{MediaSender, MediaSenderConfig};
     use coroom_transport::proto::control::Feedback;
     use coroom_transport::proto::media::Track;
@@ -185,6 +194,7 @@ async fn a_shared_sender_follows_the_slowest_receiver() {
 /// suelo de 64 KB, un ACK retrasado dejaba una LAN en ~17 Mbit/s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn eighty_megabits_flow_at_lan_and_internet_rtt() {
+    let _serial = SERIAL.lock().await;
     use coroom_transport::rate::RateConfig;
 
     const KBPS: u32 = 80_000;
