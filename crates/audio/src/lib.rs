@@ -222,6 +222,12 @@ pub trait AudioSource: Send {
         "fuente de audio".to_owned()
     }
 
+    /// Cambia qué aplicaciones se envían, en marcha. `false` si esta fuente no separa por
+    /// aplicación (todo el sistema, un dispositivo): entonces no cambia nada.
+    fn set_app_filter(&mut self, _filter: &apps::AppFilter) -> bool {
+        false
+    }
+
     /// Como [`AudioSource::read`], en coma flotante (`[-1, 1]`). Devuelve las muestras escritas.
     /// Es una comodidad: el pipeline usa [`AudioSource::read`].
     fn read_frame(&mut self, buffer: &mut [f32]) -> Result<usize, AudioError> {

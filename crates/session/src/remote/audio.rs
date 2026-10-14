@@ -479,6 +479,14 @@ pub(crate) fn game_capture_loop(
     let mut frame = Vec::with_capacity(MAX_FRAME_SAMPLES);
     let mut pcm = Vec::with_capacity(MAX_FRAME_SAMPLES * 2);
     while !shared.stopping() {
+        let filter = lock(&core.game_filter).take();
+        if let Some(filter) = filter {
+            if source.set_app_filter(&filter) {
+                debug!(fuente = %source.describe(), "audio del juego cambiado");
+            } else {
+                core.warn("esta fuente de audio no separa por aplicación: se sigue enviando todo");
+            }
+        }
         let captured_at = match read_packet(source.as_mut(), frames, &mut frame, &mut pcm) {
             Ok(at) => at,
             Err(err) => {

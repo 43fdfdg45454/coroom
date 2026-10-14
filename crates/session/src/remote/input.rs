@@ -100,6 +100,8 @@ pub(crate) enum Job {
     },
     /// Pausa global.
     Paused(bool),
+    /// Conexión EIS de la captura nueva (cambio de fuente con la sala abierta, Linux).
+    Eis(EisProvider),
     /// El invitado salió, fue expulsado o perdió la conexión.
     GuestGone(GuestId),
 }
@@ -508,6 +510,7 @@ impl Worker {
                 self.pads(guest, pads);
             }
             Job::Permissions { guest, permissions } => self.permissions(guest, permissions),
+            Job::Eis(eis) => self.sink.replace_eis(eis),
             Job::Paused(paused) => {
                 let was = self.paused;
                 self.paused = paused;

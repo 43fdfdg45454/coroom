@@ -31,6 +31,7 @@ use iced_core::{Alignment, Length, Padding};
 use iced_widget::{Column, button, checkbox, column, container, row};
 
 use crate::ui::app::{App, Dialog, Effect, Event, HostRequest, Load, Message, Page};
+use crate::ui::screens::settings as settings_screen;
 use crate::ui::settings::{CodecChoice, KnownPeer, RememberedApp};
 use crate::ui::stats;
 use crate::ui::video::{VideoFeed, video_view};
@@ -186,6 +187,33 @@ pub struct State {
     pub error: Option<String>,
     /// Sala abierta.
     pub room: Option<Room>,
+    /// Lo que se transmite desde que se abrió la sala (o desde el último cambio).
+    pub shared: Option<Sharing>,
+    /// Cambiando lo que se comparte con la sala abierta: lo pedido.
+    pub switching: Option<Sharing>,
+}
+
+/// Fuente y monitor o ventana de una transmisión.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sharing {
+    /// Fuente.
+    pub source: SourceChoice,
+    /// Monitor o ventana de la lista.
+    pub target: Option<CaptureTarget>,
+    /// Lo elegido en el selector del sistema.
+    pub picked: Option<PickedShare>,
+}
+
+impl Sharing {
+    /// Si es lo mismo (el título de una ventana puede cambiar sin que cambie la ventana).
+    fn same(&self, other: &Sharing) -> bool {
+        let targets = match (&self.target, &other.target) {
+            (Some(a), Some(b)) => same_target(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        self.source == other.source && targets && self.picked == other.picked
+    }
 }
 
 impl State {
@@ -199,11 +227,11 @@ impl State {
         self.room.as_ref().map(|room| Arc::clone(&room.preview))
     }
 
-    /// Cuándo toca volver a mirar qué se puede compartir (solo en el paso 1): `now` si nunca se
-    /// ha mirado, `None` con la sala abierta o mientras se mira. Es el plazo que espera la
-    /// ventana; [`State::refresh_due`] dice si ya llegó.
+    /// Cuándo toca volver a mirar qué se puede compartir (antes de abrir la sala y con ella
+    /// abierta, para cambiar de fuente): `now` si nunca se ha mirado, `None` mientras se abre o se
+    /// mira. Es el plazo que espera la ventana; [`State::refresh_due`] dice si ya llegó.
     pub fn next_refresh(&self, now: std::time::Instant) -> Option<std::time::Instant> {
-        if self.is_open() || self.refreshing {
+        if self.starting || self.refreshing {
             return None;
         }
         Some(self.refreshed_at.map_or(now, |at| at + REFRESH))
@@ -211,9 +239,39 @@ impl State {
 
     /// Si toca volver a mirar qué se puede compartir.
     pub fn refresh_due(&self, now: std::time::Instant) -> bool {
-        !self.is_open()
-            && !self.refreshing
-            && self.refreshed_at.is_none_or(|at| now >= at + REFRESH)
+        !self.starting && !self.refreshing && self.refreshed_at.is_none_or(|at| now >= at + REFRESH)
+    }
+
+    /// Lo elegido ahora en la pantalla.
+    pub fn sharing(&self) -> Sharing {
+        Sharing {
+            source: self.source,
+            target: self.target.clone(),
+            picked: self.picked.clone(),
+        }
+    }
+
+    /// Con la sala abierta, si lo elegido no es lo que se transmite.
+    pub fn source_changed(&self) -> bool {
+        self.shared
+            .as_ref()
+            .is_some_and(|shared| !shared.same(&self.sharing()))
+    }
+
+    /// Lo que se pide capturar.
+    fn share_choice(&self) -> ShareChoice {
+        ShareChoice {
+            kind: self.source.kind(),
+            target: self
+                .picked
+                .as_ref()
+                .map(|picked| picked.target.clone())
+                .or_else(|| self.target.clone()),
+            restore_token: self
+                .picked
+                .as_ref()
+                .and_then(|picked| picked.restore_token.clone()),
+        }
     }
 
     /// Lo que se puede compartir con la fuente elegida (`None`: aún no se ha mirado para ella).
@@ -247,7 +305,9 @@ impl State {
     /// Rehace la selección automática de la app: la de la ventana o, si el sistema no la dice,
     /// la primera que suena y no parece un navegador, un chat o una tienda.
     fn auto_select(&mut self) {
-        if self.only_chosen || self.source != SourceChoice::App {
+        // Con la sala abierta, el audio de lo que ya se transmite no cambia solo.
+        let live = self.room.is_some() && !self.source_changed();
+        if self.only_chosen || self.source != SourceChoice::App || live {
             return;
         }
         let guess = self.target_app().map(normalize).or_else(|| {
@@ -325,7 +385,8 @@ impl State {
             return GameCapture::System;
         }
         match self.source {
-            SourceChoice::App if self.only.is_empty() => GameCapture::None,
+            // Aunque no se marque ninguna, la captura por aplicación arranca: así se puede marcar
+            // una con la sala abierta.
             SourceChoice::App => GameCapture::Apps(AppFilter::Only(self.only.clone())),
             SourceChoice::Screen | SourceChoice::Synthetic => GameCapture::Apps(
                 AppFilter::AllExcept(excluded.iter().map(|app| normalize(&app.key)).collect()),
@@ -373,6 +434,8 @@ pub enum Msg {
     Safety(GuestId),
     /// Ir a Ajustes → Vídeo.
     VideoSettings,
+    /// Con la sala abierta: compartir lo elegido en vez de lo de ahora.
+    ApplySource,
 }
 
 fn guest(app: &App, id: GuestId) -> Option<&GuestStatus> {
@@ -418,6 +481,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         }
         Msg::AppAudio(key, name, on) => {
             let key = normalize(&key);
+            let mut effects = Vec::new();
             if app.host.source == SourceChoice::App {
                 app.host.only.retain(|known| *known != key);
                 if on {
@@ -431,12 +495,20 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 if !on {
                     excluded.push(RememberedApp { key, name });
                 }
-                return vec![Effect::SaveSettings];
+                effects.push(Effect::SaveSettings);
             }
+            // Con la sala abierta, el audio de lo que se transmite cambia ya (si se está eligiendo
+            // otra fuente, va con ella al cambiar).
+            if app.host.room.is_some() && !app.host.source_changed() {
+                effects.push(Effect::SetAppAudio(
+                    app.host.game_capture(&app.settings.audio.excluded_apps),
+                ));
+            }
+            return effects;
         }
         Msg::Voice(voice) => app.host.voice = voice,
         Msg::Pick => {
-            if app.host.picking || app.host.is_open() {
+            if app.host.picking || app.host.starting || app.host.switching.is_some() {
                 return Vec::new();
             }
             app.host.picking = true;
@@ -450,24 +522,13 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             let audio = app.host.game_capture(&app.settings.audio.excluded_apps);
             app.host.starting = true;
             app.host.error = None;
+            app.host.shared = Some(app.host.sharing());
+            app.host.switching = None;
             // La sala de espera sigue hasta que la sala esté abierta: así los amigos te siguen
             // viendo conectado mientras arranca (y si no arranca).
             return vec![Effect::StartHost(HostRequest {
                 source: app.host.source,
-                share: ShareChoice {
-                    kind: app.host.source.kind(),
-                    target: app
-                        .host
-                        .picked
-                        .as_ref()
-                        .map(|picked| picked.target.clone())
-                        .or_else(|| app.host.target.clone()),
-                    restore_token: app
-                        .host
-                        .picked
-                        .as_ref()
-                        .and_then(|picked| picked.restore_token.clone()),
-                },
+                share: app.host.share_choice(),
                 audio,
                 voice: app.host.voice,
             })];
@@ -526,13 +587,29 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             app.settings_page.page = super::settings::SettingsPage::Video;
             return app.update(Message::Navigate(Page::Settings));
         }
+        Msg::ApplySource => return apply_source(app),
     }
     Vec::new()
 }
 
+/// Con la sala abierta, pide compartir lo elegido (con el audio que le toca).
+fn apply_source(app: &mut App) -> Vec<Effect> {
+    let host = &mut app.host;
+    if host.room.is_none() || host.switching.is_some() || !host.source_changed() {
+        return Vec::new();
+    }
+    host.switching = Some(host.sharing());
+    vec![Effect::SwitchSource(HostRequest {
+        source: host.source,
+        share: host.share_choice(),
+        audio: host.game_capture(&app.settings.audio.excluded_apps),
+        voice: host.voice,
+    })]
+}
+
 /// Pide mirar otra vez qué se puede compartir.
 pub fn refresh(app: &mut App) -> Vec<Effect> {
-    if app.host.is_open() {
+    if app.host.starting {
         return Vec::new();
     }
     app.host.refreshing = true;
@@ -587,20 +664,26 @@ pub fn on_share_options(app: &mut App, options: ShareOptions) {
 }
 
 /// Lo elegido en el selector del sistema.
+///
+/// Con la sala abierta, lo elegido se comparte enseguida: el diálogo del sistema ya fue la
+/// confirmación.
 pub fn on_share_picked(
     app: &mut App,
     source: SourceChoice,
     picked: Result<Option<PickedShare>, String>,
-) {
+) -> Vec<Effect> {
     app.host.picking = false;
     if source != app.host.source {
-        return;
+        return Vec::new();
     }
     match picked {
         Ok(Some(picked)) => {
             app.host.picked = Some(picked);
             app.host.only_chosen = false;
             app.host.auto_select();
+            if app.host.room.is_some() {
+                return apply_source(app);
+            }
         }
         Ok(None) => {}
         Err(err) => app.toast(
@@ -608,6 +691,7 @@ pub fn on_share_picked(
             t!("pantalla-host-no-se-pudo-abrir-el-selector", error = err),
         ),
     }
+    Vec::new()
 }
 
 /// Si dos destinos son el mismo monitor o ventana.
@@ -650,6 +734,7 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
         }
         Event::HostStarted(Err(err)) => {
             app.host.starting = false;
+            app.host.shared = None;
             app.host.error = Some(err);
             return vec![Effect::StartLobby];
         }
@@ -665,6 +750,8 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
         }
         Event::HostEnded(reason) => {
             let was_open = app.host.room.take().is_some();
+            app.host.shared = None;
+            app.host.switching = None;
             app.host.starting = false;
             app.host.stopping = false;
             if let Some(reason) = reason {
@@ -685,6 +772,24 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
             };
         }
         Event::Host(event) => return session_event(app, event),
+        Event::SourceSwitched(result) => {
+            let requested = app.host.switching.take();
+            if app.host.room.is_none() {
+                return Vec::new();
+            }
+            match result {
+                Ok(()) => {
+                    app.toast(Tone::Info, t!("pantalla-host-ahora-compartes-otra-cosa"));
+                    if requested.is_some() {
+                        app.host.shared = requested;
+                    }
+                }
+                Err(err) => app.toast(
+                    Tone::Warning,
+                    t!("pantalla-host-no-se-pudo-cambiar-la-fuente", error = err),
+                ),
+            }
+        }
         _ => {}
     }
     Vec::new()
@@ -1417,6 +1522,7 @@ fn room_view<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
         .spacing(space::M)
         .align_y(Alignment::Start),
     );
+    page = page.push(transmission(app, room));
     let guests: Element<'a, Message> = if room.guests.is_empty() {
         ui::card(ui::empty_state(
             Icon::Users,
@@ -1438,6 +1544,179 @@ fn room_view<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
     );
     page = page.push(invite_friends(app, room));
     ui::page(page)
+}
+
+/// Qué se comparte, su audio y el vídeo, con la sala abierta: se cambian sin cerrarla.
+fn transmission<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
+    let state = &app.host;
+    let mut rows: Vec<Element<'a, Message>> = Vec::new();
+
+    // Qué compartes: pantalla o aplicación, el monitor o la ventana y, si cambió, el botón.
+    let kinds = ui::segmented(vec![
+        (
+            t!("pantalla-host-pantalla").to_owned(),
+            on(Msg::Source(SourceChoice::Screen)),
+            state.source == SourceChoice::Screen,
+        ),
+        (
+            t!("pantalla-host-aplicacion").to_owned(),
+            on(Msg::Source(SourceChoice::App)),
+            state.source == SourceChoice::App,
+        ),
+    ]);
+    let options = state.current_options();
+    let busy = state.picking || state.switching.is_some();
+    let target: Option<Element<'a, Message>> = match state.source {
+        SourceChoice::Synthetic => None,
+        _ if state.system_picks() => Some(
+            ui::button_with(
+                Kind::Normal,
+                t!("pantalla-host-cambiar-puntos"),
+                None,
+                (!busy).then(|| on(Msg::Pick)),
+            )
+            .into(),
+        ),
+        _ => options
+            .filter(|options| !options.targets.is_empty())
+            .map(|options| {
+                let targets: Vec<TargetOption> =
+                    options.targets.iter().cloned().map(TargetOption).collect();
+                ui::select(targets, state.target.clone().map(TargetOption), |target| {
+                    on(Msg::Target(target))
+                })
+            }),
+    };
+    let mut control = row![kinds].spacing(space::S).align_y(Alignment::Center);
+    if let Some(target) = target {
+        control = control.push(target);
+    }
+    if state.switching.is_none() && state.source_changed() {
+        control = control.push(ui::button_with(
+            Kind::Primary,
+            t!("pantalla-host-compartir-esto"),
+            None,
+            (!busy).then(|| on(Msg::ApplySource)),
+        ));
+    }
+    let now = state.shared.as_ref().map(sharing_label).unwrap_or_default();
+    let subtitle = match &state.switching {
+        Some(switching) => t!(
+            "pantalla-host-cambiando-a",
+            que = sharing_label(switching).as_str()
+        ),
+        None if state.source_changed() => t!("pantalla-host-ahora-cambiar", que = now.as_str()),
+        None => t!("pantalla-host-ahora", que = now.as_str()),
+    };
+    rows.push(ui::pref_row(
+        t!("pantalla-host-que-compartes"),
+        Some(subtitle),
+        control,
+    ));
+
+    // Audio: las casillas se aplican al momento.
+    match state
+        .current_options()
+        .and_then(|options| options.apps.as_ref().err())
+    {
+        Some(why) => rows.push(ui::pref_row(
+            t!("pantalla-host-audio"),
+            Some(t!(
+                "pantalla-host-este-equipo-no-separa-el-audio",
+                why = why
+            )),
+            icon_with(Icon::CircleCheck, 20.0, SvgClass::Accent),
+        )),
+        None => {
+            let audio_rows = state.audio_rows(&app.settings.audio.excluded_apps);
+            rows.push(ui::pref_row(
+                t!("pantalla-host-audio"),
+                Some(
+                    if audio_rows.is_empty() {
+                        t!("pantalla-host-ninguna-aplicacion-suena-ahora")
+                    } else {
+                        t!("pantalla-host-marca-lo-que-oyen")
+                    }
+                    .to_owned(),
+                ),
+                ui::gap(0.0),
+            ));
+            for AudioRow {
+                key,
+                name,
+                checked,
+                note,
+            } in audio_rows
+            {
+                let toggle = on(Msg::AppAudio(key, name.clone(), !checked));
+                rows.push(audio_row(name, note, Some(checked), Some(toggle)));
+            }
+        }
+    }
+
+    // Vídeo: códec y bitrate máximo, también en Ajustes.
+    let video = &app.settings.video;
+    let codecs = settings_screen::codec_choices();
+    let codec = codecs.iter().find(|c| c.value == video.codec).cloned();
+    let bitrates = settings_screen::bitrate_choices();
+    let bitrate = bitrates
+        .iter()
+        .find(|c| c.value == video.max_bitrate_kbps)
+        .cloned();
+    let in_use = room.codec.as_ref().map_or_else(
+        || t!("pantalla-host-cambiar-de-codec-corta-un-momento").to_owned(),
+        |codec| t!("pantalla-host-en-uso-codec", codec = codec.as_str()),
+    );
+    rows.push(ui::pref_row(
+        t!("pantalla-settings-codec-preferido"),
+        Some(in_use),
+        ui::select(codecs, codec, |c| {
+            Message::Settings(settings_screen::Msg::Codec(c))
+        }),
+    ));
+    rows.push(ui::pref_row(
+        t!("pantalla-settings-bitrate-maximo"),
+        Some(t!("pantalla-host-el-bitrate-se-aplica-ya").to_owned()),
+        row![
+            ui::select(bitrates, bitrate, |c| {
+                Message::Settings(settings_screen::Msg::Bitrate(c))
+            }),
+            ui::button_with(
+                Kind::Link,
+                t!("pantalla-host-mas-ajustes-de-video"),
+                None,
+                Some(on(Msg::VideoSettings)),
+            ),
+        ]
+        .spacing(space::S)
+        .align_y(Alignment::Center),
+    ));
+    ui::section(
+        t!("pantalla-host-transmision"),
+        Some(t!("pantalla-host-transmision-ayuda").to_owned()),
+        rows,
+    )
+}
+
+/// Cómo se nombra una transmisión («la pantalla», «Ventana: Fatal Fury»…).
+fn sharing_label(sharing: &Sharing) -> String {
+    let target = sharing
+        .picked
+        .as_ref()
+        .map(|picked| picked_label(&picked.target))
+        .or_else(|| {
+            sharing.target.as_ref().map(|target| match target {
+                CaptureTarget::Monitor { name, .. } if !name.is_empty() => name.clone(),
+                CaptureTarget::Window { title, .. } if !title.is_empty() => title.clone(),
+                _ => picked_label(target),
+            })
+        });
+    match (sharing.source, target) {
+        (SourceChoice::Synthetic, _) => t!("pantalla-host-la-fuente-de-prueba").to_owned(),
+        (_, Some(target)) => target,
+        (SourceChoice::Screen, None) => t!("pantalla-host-pantalla").to_owned(),
+        (SourceChoice::App, None) => t!("pantalla-host-ventana").to_owned(),
+    }
 }
 
 fn invite_friends<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
@@ -1677,8 +1956,8 @@ mod tests {
         );
         assert_eq!(
             app.host.game_capture(&[]),
-            GameCapture::None,
-            "sin nada marcado, sin audio"
+            GameCapture::Apps(AppFilter::Only(Vec::new())),
+            "sin nada marcado no suena nada, pero se puede marcar con la sala abierta"
         );
         // Sin audio por aplicación en el equipo: todo lo que suena.
         app.update(Message::Event(Event::ShareOptions(ShareOptions {
@@ -1945,5 +2224,77 @@ mod tests {
         );
         assert_eq!(pad_choices(0, 2).len(), 3);
         assert_eq!(spaced("K7Q2MZ"), "K7Q 2MZ");
+    }
+
+    #[test]
+    fn with_the_room_open_the_source_audio_and_video_change_live() {
+        let mut app = app();
+        app.screen = crate::ui::app::Screen::Main;
+        app.update(Message::Host(Msg::Source(SourceChoice::App)));
+        let game = window(1, "Fatal Fury", Some("fatalfury.exe"));
+        let other = window(2, "Otro juego", Some("otro.exe"));
+        app.update(Message::Event(Event::ShareOptions(ShareOptions {
+            source: SourceChoice::App,
+            targets: vec![game.clone(), other.clone()],
+            targets_error: None,
+            apps: Ok(playing(&["fatalfury.exe", "otro.exe", "discord.exe"])),
+        })));
+        open_room(&mut app);
+        assert!(!app.host.source_changed());
+
+        // Audio: marcar una aplicación más se aplica ya a la sala.
+        let effects = app.update(Message::Host(Msg::AppAudio(
+            "discord.exe".into(),
+            "discord".into(),
+            true,
+        )));
+        assert_eq!(
+            effects,
+            [Effect::SetAppAudio(GameCapture::Apps(AppFilter::Only(
+                vec!["fatalfury.exe".into(), "discord.exe".into()]
+            )))]
+        );
+
+        // Fuente: elegir otra ventana no cambia nada hasta «Compartir esto».
+        assert!(
+            app.update(Message::Host(Msg::Target(TargetOption(other.clone()))))
+                .is_empty()
+        );
+        assert!(app.host.source_changed());
+        let effects = app.update(Message::Host(Msg::ApplySource));
+        let [Effect::SwitchSource(request)] = effects.as_slice() else {
+            panic!("{effects:?}");
+        };
+        assert_eq!(request.share.target, Some(other.clone()));
+        assert_eq!(
+            request.audio,
+            GameCapture::Apps(AppFilter::Only(vec!["otro.exe".into()])),
+            "el audio de la ventana nueva va con ella"
+        );
+        assert!(
+            app.update(Message::Host(Msg::ApplySource)).is_empty(),
+            "una vez cada vez"
+        );
+        app.update(Message::Event(Event::SourceSwitched(Ok(()))));
+        assert!(!app.host.source_changed());
+        assert_eq!(
+            app.host.shared.as_ref().and_then(|s| s.target.clone()),
+            Some(other)
+        );
+
+        // Si no arranca, sigue lo de antes y se avisa.
+        app.update(Message::Host(Msg::Target(TargetOption(game))));
+        app.update(Message::Host(Msg::ApplySource));
+        app.update(Message::Event(Event::SourceSwitched(Err("no".into()))));
+        assert!(app.host.switching.is_none());
+        assert!(
+            app.host.source_changed(),
+            "lo elegido sigue sin transmitirse"
+        );
+
+        // Vídeo: el bitrate de la sala se aplica ya (y se guarda).
+        let bitrate = settings_screen::bitrate_choices()[0].clone();
+        let effects = app.update(Message::Settings(settings_screen::Msg::Bitrate(bitrate)));
+        assert_eq!(effects, [Effect::SaveSettings, Effect::SetVideo]);
     }
 }

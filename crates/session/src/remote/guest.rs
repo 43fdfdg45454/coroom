@@ -749,7 +749,8 @@ async fn run_guest(
                         | Command::PermissionsChanged(_)
                         | Command::Invite(_)
                         | Command::GamepadMode { .. }
-                        | Command::GamepadOutput { .. },
+                        | Command::GamepadOutput { .. }
+                        | Command::Video(_),
                     ) => {}
                 },
                 Some(end) = disconnected.recv() => match end {

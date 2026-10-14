@@ -237,6 +237,33 @@ fn page_effects(app: &mut App, page: SettingsPage) -> Vec<Effect> {
     }
 }
 
+/// Guarda y, con la sala abierta, le aplica el vídeo nuevo.
+fn live_video(app: &App) -> Vec<Effect> {
+    let mut effects = vec![Effect::SaveSettings];
+    if app.host.room.is_some() {
+        effects.push(Effect::SetVideo);
+    }
+    effects
+}
+
+/// Códecs del selector, con «Automático».
+pub fn codec_choices() -> Vec<Choice<CodecChoice>> {
+    vec![
+        choice(CodecChoice::Auto, t!("pantalla-settings-automatico")),
+        choice(CodecChoice::Av1, "AV1"),
+        choice(CodecChoice::Hevc, "HEVC"),
+        choice(CodecChoice::H264, "H.264"),
+    ]
+}
+
+/// Bitrates máximos del selector.
+pub fn bitrate_choices() -> Vec<Choice<u32>> {
+    BITRATE_CHOICES
+        .iter()
+        .map(|kbps| choice(*kbps, stats::kbps(f64::from(*kbps))))
+        .collect()
+}
+
 /// Reduce un mensaje.
 pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
     let save = vec![Effect::SaveSettings];
@@ -247,10 +274,20 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             app.settings_page.capturing = None;
             return page_effects(app, page);
         }
-        Msg::Codec(choice) => settings.video.codec = choice.value,
-        Msg::Encoder(choice) => settings.video.encoder = choice.value,
+        // Con la sala abierta, el códec, el codificador y el bitrate se aplican también a ella.
+        Msg::Codec(choice) => {
+            settings.video.codec = choice.value;
+            return live_video(app);
+        }
+        Msg::Encoder(choice) => {
+            settings.video.encoder = choice.value;
+            return live_video(app);
+        }
         Msg::Decoder(choice) => settings.video.decoder = choice.value,
-        Msg::Bitrate(choice) => settings.video.max_bitrate_kbps = choice.value,
+        Msg::Bitrate(choice) => {
+            settings.video.max_bitrate_kbps = choice.value;
+            return live_video(app);
+        }
         Msg::Fps(fps) => settings.video.fps = fps,
         Msg::Resolution(choice) => settings.video.max_resolution = choice.value,
         Msg::Chroma444(on) => settings.video.chroma_444 = on,
@@ -478,17 +515,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
 
 fn video(app: &App) -> Element<'_, Message> {
     let video = &app.settings.video;
-    let codecs = vec![
-        choice(CodecChoice::Auto, t!("pantalla-settings-automatico")),
-        choice(CodecChoice::Av1, "AV1"),
-        choice(CodecChoice::Hevc, "HEVC"),
-        choice(CodecChoice::H264, "H.264"),
-    ];
+    let codecs = codec_choices();
     let codec = codecs.iter().find(|c| c.value == video.codec).cloned();
-    let bitrates: Vec<Choice<u32>> = BITRATE_CHOICES
-        .iter()
-        .map(|kbps| choice(*kbps, stats::kbps(f64::from(*kbps))))
-        .collect();
+    let bitrates = bitrate_choices();
     let bitrate = bitrates
         .iter()
         .find(|c| c.value == video.max_bitrate_kbps)

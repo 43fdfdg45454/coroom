@@ -180,6 +180,19 @@ impl RateController {
         self.config
     }
 
+    /// Cambia el máximo en marcha (el anfitrión baja o sube la calidad con la sala abierta): al
+    /// bajarlo, el objetivo baja ya; al subirlo, crece desde donde está como sin cola.
+    pub fn set_max_kbps(&mut self, max_kbps: u32) {
+        let max = max_kbps.max(1);
+        self.config.min_kbps = self.config.min_kbps.min(max);
+        self.config.max_kbps = max;
+        self.config.start_kbps = self.config.start_kbps.clamp(self.config.min_kbps, max);
+        let cap = f64::from(max);
+        self.estimate = self.estimate.min(cap);
+        self.loss_estimate = self.loss_estimate.min(cap);
+        self.output = self.output.clamp(self.config.min_kbps, max);
+    }
+
     /// Bitrate objetivo para el codificador, con histéresis.
     pub fn target_kbps(&self) -> u32 {
         self.output
@@ -518,6 +531,36 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn the_maximum_changes_while_running() {
+        let start = Instant::now();
+        let mut controller = RateController::new(RateConfig {
+            min_kbps: 1_000,
+            max_kbps: 10_000,
+            start_kbps: 5_000,
+        });
+        let calm = run(&mut controller, start, 0..40, |_| 20, 0.0);
+        let peak = *calm.last().expect("muestras");
+        assert!(peak > 9_000, "llega cerca del máximo: {peak}");
+        controller.set_max_kbps(4_000);
+        assert!(controller.target_kbps() <= 4_000, "bajar el máximo baja ya");
+        let lowered = run(&mut controller, start, 40..60, |_| 20, 0.0);
+        assert!(lowered.iter().all(|&kbps| kbps <= 4_000), "{lowered:?}");
+        controller.set_max_kbps(20_000);
+        let raised = run(&mut controller, start, 60..120, |_| 20, 0.0);
+        assert!(
+            *raised.last().expect("muestras") > 10_000.max(peak),
+            "subirlo deja crecer por encima del de antes: {raised:?}"
+        );
+        controller.set_max_kbps(500);
+        assert_eq!(
+            controller.config().min_kbps,
+            500,
+            "el mínimo no pasa del máximo"
+        );
+        assert_eq!(controller.target_kbps(), 500);
     }
 
     #[test]

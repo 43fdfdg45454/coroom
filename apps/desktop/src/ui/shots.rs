@@ -201,7 +201,7 @@ pub fn scenes() -> Vec<Scene> {
 
 type Builder = fn(&mut App);
 
-const BUILDERS: [(&str, Builder); 29] = [
+const BUILDERS: [(&str, Builder); 30] = [
     ("01-servidores", servers),
     ("01-servidores-cambiar", |app| {
         home(app);
@@ -222,6 +222,7 @@ const BUILDERS: [(&str, Builder); 29] = [
     ("08-compartir-wayland", host_setup_wayland),
     ("08-compartir-app-wayland", host_setup_app_wayland),
     ("09-sala-abierta", host_room),
+    ("09-sala-cambiar-fuente", host_room_switch),
     ("10-dejar-de-compartir", host_stop_dialog),
     ("11-conectando", guest_connecting),
     ("12-estimacion", guest_estimate),
@@ -551,7 +552,7 @@ fn with_pad(status: GuestStatus, pad: GuestPad) -> GuestStatus {
 }
 
 fn host_room(app: &mut App) {
-    signed_in(app, Page::Host);
+    host_setup(app);
     let preview = VideoFeed::detached();
     preview.push(game_frame(1, 640, 360), None, None);
     app.update(Message::Host(super::screens::host::Msg::Start));
@@ -598,6 +599,30 @@ fn host_room(app: &mut App) {
             },
         ),
     ])));
+    app.toasts.clear();
+}
+
+/// Con la sala abierta, eligiendo una ventana en vez de la pantalla.
+fn host_room_switch(app: &mut App) {
+    use super::screens::host::{Msg, ShareOptions, SourceChoice, TargetOption};
+    host_room(app);
+    app.update(Message::Host(Msg::Source(SourceChoice::App)));
+    let game = coroom_session::capture::CaptureTarget::Window {
+        id: 7,
+        title: "Juego".to_owned(),
+        app: Some("juego.exe".to_owned()),
+    };
+    app.update(Message::Event(Event::ShareOptions(ShareOptions {
+        source: SourceChoice::App,
+        targets: vec![game.clone()],
+        targets_error: None,
+        apps: Ok(playing(&[
+            ("juego.exe", "Juego"),
+            ("firefox.exe", "Firefox"),
+            ("discord.exe", "Discord"),
+        ])),
+    })));
+    app.update(Message::Host(Msg::Target(TargetOption(game))));
     app.toasts.clear();
 }
 

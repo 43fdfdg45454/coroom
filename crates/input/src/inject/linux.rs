@@ -967,6 +967,14 @@ impl InputSink for LinuxSink {
         self.ei.start();
     }
 
+    /// La sesión del portal de antes se cierra con su captura (y con ella sus dispositivos, que
+    /// sueltan lo pulsado): se conecta ya a la nueva, sin esperar al siguiente evento.
+    fn replace_eis(&mut self, eis: EisProvider) {
+        self.pressed = PressedKeys::default();
+        self.ei = EiBackend::Idle(Some(eis));
+        self.ei.start();
+    }
+
     fn describe(&self) -> String {
         "libei (portal RemoteDesktop), uinput y UHID".to_owned()
     }

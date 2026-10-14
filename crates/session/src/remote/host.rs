@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -46,7 +46,7 @@ use super::negotiate::{
 use super::wire::{Payload, pairwise_info, require_pq_offer};
 use super::{
     CAPABILITIES_TIMEOUT, CURSOR_PERIOD, Command, Core, GuestStatus, RATE_PERIOD, REPLY_TIMEOUT,
-    RemoteConfig, SessionEvent, Started, advertised_candidates, lock,
+    RemoteConfig, SessionEvent, Started, VideoChange, advertised_candidates, lock,
 };
 use crate::latency::{AudioTrack, Stage};
 use crate::loopback::{
@@ -360,8 +360,9 @@ pub(crate) fn start(
     // Sin copias: la captura entrega lo que importa el codificador preferido; si se
     // negocia otro que no lo importa, ese baja la imagen a CPU (con las copias contadas).
     // Con 4:4:4 o HDR pedidos la captura va en CPU: esas conversiones son de CPU.
-    capturer.set_gpu_frames(video.gpu_frames(&encoders.gpu_input()));
+    let gpu = capturer.set_gpu_frames(video.gpu_frames(&encoders.gpu_input()));
     capturer.set_options(video.capture_options());
+    *lock(&core.capture_setup) = Some((gpu, video.capture_options()));
     capturer
         .start(&target)
         .map_err(|err| media(&PipelineError::Capture(err)))?;
@@ -506,6 +507,7 @@ fn start_audio(
             host_audio.game_bitrate
         };
         info.game = Some((bitrate, frame_ms));
+        core.game_audio.store(true, Ordering::Release);
         let (thread_core, out) = (Arc::clone(core), Arc::clone(&out));
         let handle = spawn_stage(&core.shared, "audio-cap", move || {
             game_capture_loop(&thread_core, game, bitrate, frame_ms, out.as_ref());
@@ -824,8 +826,10 @@ struct HostCtx {
     relay_info: std::sync::Mutex<Option<RelayInfo>>,
     relay_lock: tokio::sync::Mutex<()>,
     hello: Hello,
-    /// Codificadores del anfitrión (lo que puede elegir).
-    encoders: EncoderSet,
+    /// Codificadores del anfitrión (lo que puede elegir; cambian con [`Command::Video`]).
+    encoders: std::sync::Mutex<EncoderSet>,
+    /// Bitrate máximo en kbit/s (`video.bitrate_kbps` al abrir; cambia con [`Command::Video`]).
+    max_kbps: AtomicU32,
     /// Lo que decodifica cada invitado conectado, cuando ya lo dijo (o venció la espera).
     guest_caps: std::sync::Mutex<BTreeMap<GuestId, GuestCapabilities>>,
     /// Códec y backend en uso; el cerrojo serializa las renegociaciones.
@@ -848,7 +852,7 @@ impl HostCtx {
     }
 
     fn sender_config(&self) -> MediaSenderConfig {
-        let max = self.video.bitrate_kbps.max(1);
+        let max = self.max_kbps.load(Ordering::Acquire).max(1);
         MediaSenderConfig {
             frame_interval: Duration::from_secs_f64(1.0 / f64::from(self.video.fps.max(1))),
             rate: RateConfig {
@@ -859,6 +863,28 @@ impl HostCtx {
                 // con el primer intra, el más grande.
                 start_kbps: (max / 2).max(1),
             },
+        }
+    }
+
+    /// Otros codificadores o bitrate máximo con la sala abierta.
+    fn change_video(self: &Arc<Self>, change: VideoChange) {
+        if let Some(max) = change.max_kbps {
+            let max = max.max(1);
+            self.max_kbps.store(max, Ordering::Release);
+            for sender in lock(&self.links).senders() {
+                sender.set_max_kbps(max);
+            }
+            debug!(kbps = max, "bitrate máximo");
+        }
+        if let Some(encoders) = change.encoders {
+            *lock(&self.encoders) = encoders;
+            let ctx = Arc::clone(self);
+            tokio::spawn(async move {
+                // Sin códec actual, la negociación vuelve a abrir aunque salga el mismo códec:
+                // así un cambio solo de backend también se aplica.
+                ctx.current.lock().await.take();
+                renegotiate(&ctx, None).await;
+            });
         }
     }
 
@@ -1308,7 +1334,8 @@ async fn renegotiate(ctx: &Arc<HostCtx>, guest: Option<GuestId>) {
             .collect()
     };
     let decoders: Vec<_> = guests.iter().map(|caps| caps.decoders.clone()).collect();
-    let mut available = ctx.encoders.available().to_vec();
+    let encoders = lock(&ctx.encoders).clone();
+    let mut available = encoders.available().to_vec();
     let candidates = ctx.video.format_candidates();
     loop {
         let Some(codec) = choose_codec(&available, &decoders) else {
@@ -1320,7 +1347,7 @@ async fn renegotiate(ctx: &Arc<HostCtx>, guest: Option<GuestId>) {
             }
             return;
         };
-        let format = choose_format(codec, &candidates, &ctx.encoders, &guests);
+        let format = choose_format(codec, &candidates, &encoders, &guests);
         if current.is_some_and(|(c, _, f)| c == codec && f == format) {
             if let Some(guest) = guest {
                 announce(ctx, codec, format, Some(guest));
@@ -1344,7 +1371,7 @@ async fn renegotiate(ctx: &Arc<HostCtx>, guest: Option<GuestId>) {
                 slices: DEFAULT_SLICES,
                 format,
             };
-            let encoders = ctx.encoders.clone();
+            let encoders = encoders.clone();
             let opened = tokio::task::spawn_blocking(move || encoders.open(&config)).await;
             let err = match opened {
                 Ok(Ok(encoder)) => {
@@ -2028,7 +2055,8 @@ async fn run_host(
             role: WireRole::Host,
             relay_token: None,
         },
-        encoders,
+        max_kbps: AtomicU32::new(video.bitrate_kbps),
+        encoders: std::sync::Mutex::new(encoders),
         guest_caps: std::sync::Mutex::new(BTreeMap::new()),
         current: tokio::sync::Mutex::new(None),
         input,
@@ -2081,6 +2109,7 @@ async fn run_host(
                 Some(Command::GamepadOutput { guest, slot, data }) => {
                     ctx.send_to_guest(guest, &ControlMessage::GamepadOutput { slot, data });
                 }
+                Some(Command::Video(change)) => ctx.change_video(change),
                 Some(Command::Reconnect) => {}
                 Some(Command::Invite(user)) => {
                     let invite = SignalMessage::Invite { to_user: user, code: room.code.clone() };

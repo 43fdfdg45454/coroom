@@ -36,7 +36,7 @@ use crate::account::{self, AccountOptions, AccountStore};
 use crate::probe::{ProbeOptions, Source, start_pipeline_with, to_present_frame};
 use crate::remote::{
     AutoAllow, HostAudioOptions, HostOptions, JoinAudioOptions, JoinOptions, NetOptions,
-    load_identity, prepare_host, start_guest, start_prepared_host,
+    host_encoders, load_identity, prepare_host, share_source, start_guest, start_prepared_host,
 };
 
 /// Entrega un mensaje a la interfaz (desde cualquier hilo).
@@ -283,6 +283,16 @@ impl Backend {
                     close_detached(session);
                 }
             }
+            Effect::SwitchSource(request) => self.switch_source(request, &app.settings),
+            Effect::SetAppAudio(audio) => {
+                if let coroom_session::audio::GameCapture::Apps(filter) = audio
+                    && let Some(session) = lock(&self.host).clone()
+                    && let Err(err) = lock(&session).set_app_audio(filter)
+                {
+                    (self.notify)(Message::Event(Event::Failed(err.to_string())));
+                }
+            }
+            Effect::SetVideo => self.set_video(&app.settings),
             Effect::SetPermissions(guest, permissions) => {
                 if let Some(session) = lock(&self.host).clone()
                     && let Err(err) = lock(&session).set_permissions(guest, permissions)
@@ -462,31 +472,81 @@ impl Backend {
         }
     }
 
+    /// Compartir otra cosa con la sala abierta: la captura nueva arranca en su hilo (en Linux
+    /// puede preguntar el portal) y la sesión la adopta; si no arranca, sigue la de antes.
+    fn switch_source(&self, request: HostRequest, settings: &Settings) {
+        let Some(session) = lock(&self.host).clone() else {
+            return;
+        };
+        let control = match lock(&session).host_control() {
+            Ok(control) => control,
+            Err(err) => {
+                (self.notify)(Message::Event(Event::SourceSwitched(Err(err.to_string()))));
+                return;
+            }
+        };
+        let source = host_source(request.source);
+        let video = host_video(settings);
+        tracing::info!(source = ?request.source, share = ?request.share.kind, "cambiando la fuente");
+        self.spawn("fuente", move |notify| {
+            let switched =
+                share_source(source, &request.share, video).and_then(|(capturer, share)| {
+                    control
+                        .switch_capture(capturer, share.map(coroom_session::remote::eis_provider))
+                        .map_err(|err| err.to_string())
+                });
+            if switched.is_ok()
+                && let coroom_session::audio::GameCapture::Apps(filter) = request.audio
+                && let Err(err) = control.set_app_audio(filter)
+            {
+                tracing::debug!(error = %err, "audio de la fuente nueva");
+            }
+            match &switched {
+                Ok(()) => tracing::info!("fuente cambiada"),
+                Err(err) => tracing::warn!(error = %err, "no se pudo cambiar la fuente"),
+            }
+            notify(Message::Event(Event::SourceSwitched(switched)));
+        });
+    }
+
+    /// Códec, codificador y bitrate máximo de los ajustes a la sala abierta.
+    fn set_video(&self, settings: &Settings) {
+        let Some(session) = lock(&self.host).clone() else {
+            return;
+        };
+        let video = &settings.video;
+        let (codec, encoder) = (codec_preference(video.codec), video.encoder.backend());
+        let max_kbps = video.max_bitrate_kbps;
+        let control = lock(&session).host_control();
+        self.spawn("video", move |notify| {
+            // El sondeo de codificadores ya está hecho (se guarda): esto no abre nada.
+            let changed = host_encoders(codec, encoder).and_then(|encoders| {
+                control
+                    .and_then(|control| {
+                        control.set_video(coroom_session::remote::VideoChange {
+                            encoders: Some(encoders),
+                            max_kbps: Some(max_kbps),
+                        })
+                    })
+                    .map_err(|err| err.to_string())
+            });
+            let ok = changed.is_ok();
+            tracing::info!(?codec, ?encoder, max_kbps, ok, "vídeo de la sala cambiado");
+            if let Err(err) = changed {
+                notify(Message::Event(Event::Failed(err)));
+            }
+        });
+    }
+
     fn start_host(&mut self, options: AccountOptions, request: HostRequest, settings: &Settings) {
         let video = &settings.video;
         let (width, height) = video.max_resolution.size();
         let host = HostOptions {
             net: net_options(&options, settings),
-            source: match request.source {
-                SourceChoice::Screen | SourceChoice::App => Source::Screen,
-                SourceChoice::Synthetic => Source::Synthetic,
-            },
+            source: host_source(request.source),
             share: request.share,
-            video: coroom_session::loopback::LoopbackConfig {
-                width,
-                height,
-                fps: video.fps,
-                bitrate_kbps: video.max_bitrate_kbps,
-                frames: None,
-                yuv444: video.chroma_444,
-                hdr: video.hdr,
-            },
-            codec: match video.codec {
-                CodecChoice::Auto => None,
-                CodecChoice::Av1 => Some(coroom_session::codec::Codec::Av1),
-                CodecChoice::Hevc => Some(coroom_session::codec::Codec::Hevc),
-                CodecChoice::H264 => Some(coroom_session::codec::Codec::H264),
-            },
+            video: host_video(settings),
+            codec: codec_preference(video.codec),
             encoder: video.encoder.backend(),
             auto_allow: AutoAllow::default(),
             gamepad_to_keys: false,
@@ -1175,6 +1235,39 @@ fn lobby_once(options: &AccountOptions, stop: &AtomicBool, notify: &Notify) -> R
         endpoint.close();
         result
     })
+}
+
+/// Captura que usa la sala para la fuente elegida en la pantalla.
+fn host_source(source: SourceChoice) -> Source {
+    match source {
+        SourceChoice::Screen | SourceChoice::App => Source::Screen,
+        SourceChoice::Synthetic => Source::Synthetic,
+    }
+}
+
+/// Vídeo de la sala según los ajustes.
+fn host_video(settings: &Settings) -> coroom_session::loopback::LoopbackConfig {
+    let video = &settings.video;
+    let (width, height) = video.max_resolution.size();
+    coroom_session::loopback::LoopbackConfig {
+        width,
+        height,
+        fps: video.fps,
+        bitrate_kbps: video.max_bitrate_kbps,
+        frames: None,
+        yuv444: video.chroma_444,
+        hdr: video.hdr,
+    }
+}
+
+/// Códec preferido de los ajustes (`None`: el mejor común).
+fn codec_preference(choice: CodecChoice) -> Option<coroom_session::codec::Codec> {
+    match choice {
+        CodecChoice::Auto => None,
+        CodecChoice::Av1 => Some(coroom_session::codec::Codec::Av1),
+        CodecChoice::Hevc => Some(coroom_session::codec::Codec::Hevc),
+        CodecChoice::H264 => Some(coroom_session::codec::Codec::H264),
+    }
 }
 
 #[cfg(test)]

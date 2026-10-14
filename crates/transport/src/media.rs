@@ -40,6 +40,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -396,6 +397,8 @@ pub const DEFAULT_SOURCE: u64 = 0;
 pub struct MediaSender {
     conn: PeerConnection,
     config: MediaSenderConfig,
+    /// Máximo de [`MediaSender::set_max_kbps`] (0: el de `config`).
+    max_kbps: AtomicU32,
     state: Mutex<SenderState>,
 }
 
@@ -417,6 +420,7 @@ impl MediaSender {
         Self {
             conn,
             config,
+            max_kbps: AtomicU32::new(0),
             state: Mutex::new(SenderState {
                 history: VecDeque::with_capacity(HISTORY_GROUPS + 1),
                 repair_ratio: INITIAL_REPAIR_RATIO,
@@ -438,6 +442,27 @@ impl MediaSender {
     /// Conexión de este emisor.
     pub fn connection(&self) -> &PeerConnection {
         &self.conn
+    }
+
+    /// Cambia el bitrate máximo en marcha, para todos los receptores (los que informen después
+    /// también lo usan).
+    pub fn set_max_kbps(&self, max_kbps: u32) {
+        self.max_kbps.store(max_kbps.max(1), Ordering::Release);
+        if let Ok(mut state) = self.state.lock() {
+            for source in &mut state.sources {
+                source.rate.set_max_kbps(max_kbps);
+            }
+        }
+    }
+
+    /// Límites del control de tasa, con el máximo de [`MediaSender::set_max_kbps`] si lo hay.
+    fn rate_config(&self) -> RateConfig {
+        let mut rate = RateController::new(self.config.rate);
+        let max = self.max_kbps.load(Ordering::Acquire);
+        if max > 0 {
+            rate.set_max_kbps(max);
+        }
+        rate.config()
     }
 
     /// Fija los 16 bits bajos de la época SFrame que llevan las cabeceras.
@@ -462,7 +487,7 @@ impl MediaSender {
     /// Bitrate objetivo para el codificador: el mínimo de los receptores que informan (el inicial
     /// mientras no informa ninguno).
     pub fn target_kbps(&self) -> u32 {
-        let start = || RateController::new(self.config.rate).target_kbps();
+        let start = || RateController::new(self.rate_config()).target_kbps();
         self.state.lock().map_or_else(
             |_| start(),
             |state| {
@@ -476,11 +501,10 @@ impl MediaSender {
     /// Copia del control de tasa del receptor que limita (estimación, cola y pérdida).
     pub fn rate(&self) -> Option<RateController> {
         let state = self.state.lock().ok()?;
-        Some(
-            state
-                .limiting()
-                .map_or_else(|| RateController::new(self.config.rate), |s| s.rate.clone()),
-        )
+        Some(state.limiting().map_or_else(
+            || RateController::new(self.rate_config()),
+            |s| s.rate.clone(),
+        ))
     }
 
     /// Objetivo del receptor `source`, si ya informó.
@@ -499,7 +523,7 @@ impl MediaSender {
             state.sources.retain(|s| s.id != source);
             let target = state
                 .limiting()
-                .map_or(self.config.rate.start_kbps, |s| s.rate.target_kbps());
+                .map_or(self.rate_config().start_kbps, |s| s.rate.target_kbps());
             state.repair_ratio = if state.sources.is_empty() {
                 INITIAL_REPAIR_RATIO
             } else {
@@ -688,7 +712,7 @@ impl MediaSender {
         let now = Instant::now();
         let ecn_events = self.conn.congestion().ecn_events();
         let Ok(mut state) = self.state.lock() else {
-            return self.config.rate.start_kbps;
+            return self.rate_config().start_kbps;
         };
         let state = &mut *state;
         let owd: Vec<i64> = feedback
@@ -713,7 +737,7 @@ impl MediaSender {
             None => {
                 state
                     .sources
-                    .push(FeedbackSource::new(source, self.config.rate));
+                    .push(FeedbackSource::new(source, self.rate_config()));
                 state.sources.len() - 1
             }
         };
@@ -753,7 +777,7 @@ impl MediaSender {
             .fold(0.0, f64::max);
         let target = state
             .limiting()
-            .map_or(self.config.rate.start_kbps, |s| s.rate.target_kbps());
+            .map_or(self.rate_config().start_kbps, |s| s.rate.target_kbps());
         self.conn.set_target_kbps(target);
         target
     }

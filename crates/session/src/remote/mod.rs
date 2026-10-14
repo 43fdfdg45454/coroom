@@ -85,10 +85,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use coroom_capture::Capturer;
+use coroom_audio::apps::AppFilter;
+use coroom_capture::{CaptureOptions, Capturer, GpuFrames};
 use coroom_codec::{Codec, DecoderSet, EncoderSet};
 use coroom_input::InputSink;
-use coroom_input::inject::{SinkOptions, platform_sink};
+use coroom_input::inject::{EisProvider, SinkOptions, platform_sink};
 use coroom_transport::crypto::hpke::PairwiseSecret;
 use coroom_transport::crypto::sframe::MediaKey;
 use coroom_transport::crypto::{Identity, MediaKeyRing, SafetyNumber, sha256_fingerprint};
@@ -551,6 +552,16 @@ pub struct GuestPad {
     pub note: Option<String>,
 }
 
+/// Cambio de vídeo con la sala abierta ([`RemoteSession::set_video`]).
+#[derive(Debug, Clone, Default)]
+pub struct VideoChange {
+    /// Codificadores entre los que elegir ahora (`EncoderSet::probe().only_codec(…)…`): se
+    /// renegocia con los invitados y, si sale otro códec o backend, se abre (un intra).
+    pub encoders: Option<EncoderSet>,
+    /// Bitrate máximo nuevo en kbit/s: el control de tasa de cada invitado lo usa enseguida.
+    pub max_kbps: Option<u32>,
+}
+
 /// Órdenes de la interfaz a la tarea de red.
 #[derive(Debug)]
 pub(crate) enum Command {
@@ -571,6 +582,8 @@ pub(crate) enum Command {
         slot: u8,
         data: Vec<u8>,
     },
+    /// Anfitrión: otros codificadores (otro códec o backend preferido) o bitrate máximo.
+    Video(VideoChange),
     /// Invitado: volver a entrar en la sala ya.
     Reconnect,
     Close,
@@ -632,6 +645,13 @@ pub(crate) struct Core {
     pub(crate) audio_tx: Mutex<Option<channel::Sender<audio::Packet>>>,
     /// Órdenes a la tarea de red (para el hilo `inject`: modo y salida de los mandos tal cual).
     pub(crate) commands: Mutex<Option<mpsc::UnboundedSender<Command>>>,
+    /// Anfitrión: cómo se arranca una captura (imágenes de GPU y opciones), para las que
+    /// sustituyan a la primera.
+    pub(crate) capture_setup: Mutex<Option<(GpuFrames, CaptureOptions)>>,
+    /// Anfitrión: aplicaciones cuyo audio se envía, pendiente de que lo recoja `audio-cap`.
+    pub(crate) game_filter: Mutex<Option<AppFilter>>,
+    /// Anfitrión: hay hilo `audio-cap` (la sala se abrió con audio del juego).
+    pub(crate) game_audio: AtomicBool,
 }
 
 /// Cerrojo que sobrevive a un pánico de otro hilo (el estado se sustituye entero).
@@ -667,6 +687,9 @@ impl Core {
             audio: AudioControl::default(),
             audio_tx: Mutex::new(None),
             commands: Mutex::new(None),
+            capture_setup: Mutex::new(None),
+            game_filter: Mutex::new(None),
+            game_audio: AtomicBool::new(false),
             joined_once: AtomicBool::new(false),
             reconnect_attempts: AtomicU32::new(0),
         }
@@ -838,6 +861,87 @@ enum Parts {
 pub(crate) struct Started {
     pub(crate) main: tokio::task::JoinHandle<()>,
     pub(crate) threads: Vec<(&'static str, JoinHandle<()>)>,
+}
+
+/// Mando del anfitrión para cambiar lo que se transmite con la sala abierta
+/// ([`RemoteSession::host_control`]); se puede clonar y usar desde cualquier hilo.
+#[derive(Clone)]
+pub struct HostControl {
+    core: Arc<Core>,
+    commands: mpsc::UnboundedSender<Command>,
+}
+
+impl fmt::Debug for HostControl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostControl").finish_non_exhaustive()
+    }
+}
+
+impl HostControl {
+    /// Anfitrión: cambia lo que se comparte con la sala abierta. Arranca `capturer` (en Linux
+    /// puede abrir el diálogo del portal, así que bloquea: llámala fuera del hilo de la ventana)
+    /// y el hilo `capture` la adopta en el siguiente fotograma; los invitados ven la última imagen
+    /// hasta el intra de la nueva. `eis` es la conexión EIS de su sesión del portal (Linux, la de
+    /// [`coroom_capture::share_capturer`]): el teclado y el ratón pasan a ella. Si no arranca, la
+    /// captura de antes sigue y se devuelve el error.
+    pub fn switch_capture(
+        &self,
+        mut capturer: Box<dyn Capturer>,
+        eis: Option<EisProvider>,
+    ) -> Result<(), SessionError> {
+        let setup = lock(&self.core.capture_setup).clone();
+        let Some((gpu, options)) = setup else {
+            return Err(SessionError::Network("la sesión no está en marcha".into()));
+        };
+        if self.core.ended() {
+            return Err(SessionError::Network("la sesión terminó".into()));
+        }
+        let capture =
+            |err: coroom_capture::CaptureError| SessionError::Media(format!("captura: {err}"));
+        let target = capturer
+            .targets()
+            .map_err(capture)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| SessionError::Media("captura: no hay nada que capturar".into()))?;
+        capturer.set_gpu_frames(gpu);
+        capturer.set_options(options);
+        capturer.start(&target).map_err(capture)?;
+        if self.core.ended() {
+            capturer.stop();
+            return Err(SessionError::Network("la sesión terminó".into()));
+        }
+        self.core.shared.next_capturer.put(capturer);
+        if let (Some(eis), Some(input)) = (eis, lock(&self.core.host_input).as_ref()) {
+            input.job(input::Job::Eis(eis));
+        }
+        Ok(())
+    }
+
+    /// Anfitrión: cambia qué aplicaciones suenan en la sala, sin cortar el audio. Hace falta
+    /// que la sala se abriera con audio por aplicación (`GameCapture::Apps`).
+    pub fn set_app_audio(&self, filter: AppFilter) -> Result<(), SessionError> {
+        if !self.core.game_audio.load(Ordering::Acquire) {
+            return Err(SessionError::Media(
+                "la sala se abrió sin audio del juego".into(),
+            ));
+        }
+        *lock(&self.core.game_filter) = Some(filter);
+        Ok(())
+    }
+
+    /// Anfitrión: cambia el códec o el backend preferidos y el bitrate máximo con la sala
+    /// abierta ([`VideoChange`]).
+    pub fn set_video(&self, change: VideoChange) -> Result<(), SessionError> {
+        if change.encoders.as_ref().is_some_and(EncoderSet::is_empty) {
+            return Err(SessionError::Media(
+                "no hay ningún codificador disponible con las opciones dadas".into(),
+            ));
+        }
+        self.commands
+            .send(Command::Video(change))
+            .map_err(|_| SessionError::Network("la sesión terminó".into()))
+    }
 }
 
 /// Sesión remota de anfitrión o de invitado.
@@ -1092,6 +1196,39 @@ impl RemoteSession {
             .as_ref()
             .and_then(|commands| commands.send(Command::Invite(user)).ok())
             .ok_or(SessionError::Network("la sesión no está en marcha".into()))
+    }
+
+    /// Anfitrión con la sala en marcha: mando para cambiar lo que se transmite desde otro hilo
+    /// sin tener la sesión ([`HostControl`]).
+    pub fn host_control(&self) -> Result<HostControl, SessionError> {
+        self.require_host()?;
+        let commands = self
+            .commands
+            .clone()
+            .ok_or(SessionError::Network("la sesión no está en marcha".into()))?;
+        Ok(HostControl {
+            core: Arc::clone(&self.core),
+            commands,
+        })
+    }
+
+    /// [`HostControl::switch_capture`].
+    pub fn switch_capture(
+        &self,
+        capturer: Box<dyn Capturer>,
+        eis: Option<EisProvider>,
+    ) -> Result<(), SessionError> {
+        self.host_control()?.switch_capture(capturer, eis)
+    }
+
+    /// [`HostControl::set_app_audio`].
+    pub fn set_app_audio(&self, filter: AppFilter) -> Result<(), SessionError> {
+        self.host_control()?.set_app_audio(filter)
+    }
+
+    /// [`HostControl::set_video`].
+    pub fn set_video(&self, change: VideoChange) -> Result<(), SessionError> {
+        self.host_control()?.set_video(change)
     }
 
     /// Invitado: deja la conexión actual y vuelve a entrar en la sala enseguida (el mismo camino

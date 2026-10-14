@@ -54,6 +54,12 @@ pub trait InputSink: Send {
     /// del primer evento. La sesión la llama al conceder teclado y ratón a algún invitado.
     fn prepare(&mut self) {}
 
+    /// La captura cambió de fuente con la sala abierta y su sesión nueva del portal trae otra
+    /// conexión EIS (Linux): el teclado y el ratón pasan a ella. Donde no hay portal, nada.
+    fn replace_eis(&mut self, eis: EisProvider) {
+        let _ = eis;
+    }
+
     /// Nombre del backend para los avisos (`libei + uinput`, `SendInput`…).
     fn describe(&self) -> String;
 
@@ -733,6 +739,10 @@ impl<S: InputSink> InputSink for GamepadToKeys<S> {
 
     fn prepare(&mut self) {
         self.inner.prepare();
+    }
+
+    fn replace_eis(&mut self, eis: EisProvider) {
+        self.inner.replace_eis(eis);
     }
 
     fn describe(&self) -> String {

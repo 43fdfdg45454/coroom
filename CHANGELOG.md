@@ -9,6 +9,16 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Añadido
 
+- **Cambios con la sala abierta** (panel «Transmisión» de la sala): qué se comparte (pantalla o
+  aplicación, y el monitor o la ventana), las aplicaciones que suenan y el códec y el bitrate
+  máximo, sin cerrar la sala ni echar a nadie. Al cambiar de fuente, los invitados ven la última
+  imagen hasta el primer fotograma de la nueva (si tiene otro tamaño, el codificador se reabre
+  solo); si la nueva no arranca, sigue la de antes. En Linux, el teclado y el ratón de los
+  invitados pasan a la sesión del portal nueva. El audio cambia sin cortarse; el bitrate se aplica
+  al momento al control de tasa de cada invitado (también subiéndolo por encima del de al abrir) y
+  un códec o codificador nuevo se renegocia con los invitados (un intra). El códec, el codificador
+  y el bitrate de Ajustes → Vídeo también se aplican a la sala abierta; la resolución, los fps,
+  4:4:4 y HDR, a la siguiente.
 - **Registro en un fichero** (`<datos>/logs/coroom.log`, el de la ejecución anterior en
   `coroom.1.log`; `coroom doctor` dice dónde): sesiones, códec y backends elegidos, errores del
   decodificador, formato del audio, una línea cada 5 s con los fotogramas por segundo y tiempos de

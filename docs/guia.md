@@ -45,6 +45,19 @@ sesión de uno que ya no uses.
 Mientras la sala está abierta ves a cada invitado con su conexión (directa o por el relay), su RTT,
 su latencia de entrada y su **número de seguridad**.
 
+### Cambiar con la sala abierta
+
+En **Transmisión**, debajo del código, cambias sin cerrar la sala (los invitados siguen dentro):
+
+- **Qué compartes**: elige pantalla o aplicación y el monitor o la ventana, y pulsa **Compartir
+  esto** (en Linux, **Cambiar…** abre el selector del sistema y lo elegido se comparte al
+  aceptarlo). Los invitados ven la última imagen un momento hasta que llega la nueva; si la nueva
+  no se puede capturar, sigue la de antes y te lo dice.
+- **Audio**: marca o desmarca aplicaciones; se aplica al momento, sin cortar.
+- **Códec preferido** y **bitrate máximo**: el bitrate se aplica enseguida; cambiar de códec vuelve
+  a negociar con los invitados y corta el vídeo un instante. El codificador de Ajustes → Vídeo
+  también se aplica a la sala abierta; la resolución, los fps, 4:4:4 y HDR, a la siguiente.
+
 ## Unirte a una sala
 
 1. En **Inicio**, escribe el código en **Unirme a una sala** y pulsa **Entrar**, o acepta una

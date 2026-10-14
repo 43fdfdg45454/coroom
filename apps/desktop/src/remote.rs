@@ -866,14 +866,7 @@ pub fn start_prepared_host(session: &mut RemoteSession) -> Result<(), String> {
 pub fn prepare_host(identity: Identity, options: &HostOptions) -> Result<RemoteSession, String> {
     let config = remote_config(&options.net)?;
     let encoders = host_encoders(options.codec, options.encoder)?;
-    let (capturer, share) = match options.source {
-        Source::Screen => coroom_session::capture::share_capturer(&options.share)
-            .map_err(|err| format!("no se puede capturar la pantalla: {err}"))?,
-        Source::Synthetic => (
-            make_capturer(&ProbeOptions::h264(options.source, options.video))?,
-            None,
-        ),
-    };
+    let (capturer, share) = share_source(options.source, &options.share, options.video)?;
     let sink = platform_sink(SinkOptions {
         gamepad_to_keys: options.gamepad_to_keys,
         eis: share.map(eis_provider),
@@ -889,6 +882,26 @@ pub fn prepare_host(identity: Identity, options: &HostOptions) -> Result<RemoteS
         sink,
     )
     .with_host_audio(audio))
+}
+
+/// Captura de lo elegido (al abrir la sala o al cambiar de fuente con ella abierta) y, en Linux, la
+/// conexión EIS de su sesión del portal para el teclado y el ratón.
+pub fn share_source(
+    source: Source,
+    share: &coroom_session::capture::ShareChoice,
+    video: LoopbackConfig,
+) -> Result<
+    (
+        Box<dyn coroom_session::capture::Capturer>,
+        Option<coroom_session::capture::RemoteDesktopShare>,
+    ),
+    String,
+> {
+    match source {
+        Source::Screen => coroom_session::capture::share_capturer(share)
+            .map_err(|err| format!("no se puede capturar la pantalla: {err}")),
+        Source::Synthetic => Ok((make_capturer(&ProbeOptions::h264(source, video))?, None)),
+    }
 }
 
 /// Audio de `coroom join`.

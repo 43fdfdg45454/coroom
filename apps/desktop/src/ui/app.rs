@@ -217,6 +217,8 @@ pub enum Event {
     PreviewUnavailable,
     /// Anfitrión: la sala se cerró (`Some` con el motivo si fue un error).
     HostEnded(Option<String>),
+    /// Anfitrión: se cambió lo que se comparte con la sala abierta, o no se pudo.
+    SourceSwitched(Result<(), String>),
     /// Invitado: la sesión arrancó (con la fuente del vídeo) o no pudo.
     GuestStarted(Result<Arc<VideoFeed>, String>),
     /// Invitado: un evento de la sesión.
@@ -371,6 +373,13 @@ pub enum Effect {
     StartHost(HostRequest),
     /// Cerrar la sala.
     StopHost,
+    /// Compartir otra cosa con la sala abierta (`audio`: el de la fuente nueva; `voice` no
+    /// cuenta).
+    SwitchSource(HostRequest),
+    /// Cambiar qué aplicaciones suenan en la sala abierta.
+    SetAppAudio(coroom_session::audio::GameCapture),
+    /// Aplicar a la sala abierta el códec, el codificador y el bitrate máximo de los ajustes.
+    SetVideo,
     /// Permisos de un invitado.
     SetPermissions(GuestId, Permissions),
     /// Expulsar.
@@ -967,7 +976,8 @@ impl App {
             | Event::Host(_)
             | Event::HostGuests(_)
             | Event::PreviewUnavailable
-            | Event::HostEnded(_) => host::on_event(self, event),
+            | Event::HostEnded(_)
+            | Event::SourceSwitched(_) => host::on_event(self, event),
             Event::GuestStarted(_)
             | Event::Guest(_)
             | Event::GuestStats(_)
@@ -977,10 +987,7 @@ impl App {
                 host::on_share_options(self, options);
                 Vec::new()
             }
-            Event::SharePicked(source, picked) => {
-                host::on_share_picked(self, source, picked);
-                Vec::new()
-            }
+            Event::SharePicked(source, picked) => host::on_share_picked(self, source, picked),
             Event::VideoSupport(support) => {
                 self.video_support = Some(support);
                 Vec::new()

@@ -24,7 +24,9 @@
 //! - (k) pantalla quieta: dos invitados seguidos ven la imagen aunque la captura no entregue
 //!   ningún fotograma más;
 //! - (l) un enlace con poca cola pierde las ráfagas de los intra y el vídeo se recupera sin una
-//!   tormenta de intra.
+//!   tormenta de intra;
+//! - (m) con la sala abierta, el anfitrión cambia de fuente (a otro tamaño), de códec y de bitrate
+//!   máximo y el invitado sigue presentando sin salir.
 //!
 //! Los tests (a)–(e) usan OpenH264 en los dos extremos, para que sus cotas de
 //! tiempo sigan siendo comparables.
@@ -974,5 +976,93 @@ fn l_a_shallow_queue_does_not_start_a_keyframe_storm() {
         "{} intra forzados",
         sent.forced_keyframes
     );
+    drop(server);
+}
+
+/// Guarda el tamaño de cada fotograma presentado.
+struct SizeSink(Arc<Mutex<Vec<(u32, u32)>>>);
+
+impl FrameSink for SizeSink {
+    fn present(&mut self, frame: DecodedFrame) -> Result<(), SinkError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((frame.frame.width, frame.frame.height));
+        Ok(())
+    }
+}
+
+/// (m) Con la sala abierta y un invitado viendo: el anfitrión cambia lo que comparte (a una
+/// fuente de otro tamaño), luego el códec (de AV1 a H.264) y luego baja el bitrate máximo, y el
+/// invitado sigue presentando sin salir de la sala.
+#[test]
+fn m_the_host_changes_source_codec_and_quality_while_open() {
+    let _serial = serial();
+    let server = TestServer::start();
+    let mut host = host_with(server.config(), av1_and_h264());
+    let code = room_code(&host);
+    let sizes = Arc::new(Mutex::new(Vec::new()));
+    let mut guest = guest_with(
+        server.config(),
+        &code,
+        None,
+        av1_decoders(),
+        Box::new(SizeSink(Arc::clone(&sizes))),
+    );
+    wait_for_video(&guest, "AV1", Duration::from_secs(20));
+    let presented = |sizes: &Arc<Mutex<Vec<(u32, u32)>>>, size: (u32, u32)| {
+        sizes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|seen| **seen == size)
+            .count()
+    };
+    wait_until("fotogramas de 640×360", Duration::from_secs(20), || {
+        presented(&sizes, (640, 360)) >= 20
+    });
+
+    // Otra fuente, de otro tamaño: el codificador se reabre y el invitado la ve.
+    host.switch_capture(Box::new(SyntheticCapturer::new(320, 180, FPS)), None)
+        .expect("cambio de fuente");
+    wait_until("fotogramas de 320×180", Duration::from_secs(20), || {
+        assert!(!guest.is_finished(), "{:?}", guest.end_reason());
+        presented(&sizes, (320, 180)) >= 20
+    });
+
+    // Otro códec: se renegocia y los dos siguen.
+    host.set_video(coroom_session::remote::VideoChange {
+        encoders: Some(EncoderSet::openh264()),
+        max_kbps: None,
+    })
+    .expect("cambio de códec");
+    wait_for_video(&guest, "H.264", Duration::from_secs(20));
+    let before = guest.summary().frames_presented;
+    wait_until("fotogramas H.264", Duration::from_secs(20), || {
+        guest.summary().frames_presented >= before + 20
+    });
+    assert_eq!(host.summary().video.as_deref(), Some("H.264 · OpenH264"));
+
+    // Menos calidad: el objetivo de cada invitado baja al máximo nuevo.
+    host.set_video(coroom_session::remote::VideoChange {
+        encoders: None,
+        max_kbps: Some(300),
+    })
+    .expect("cambio de bitrate");
+    wait_until("objetivo ≤ 300 kbit/s", Duration::from_secs(10), || {
+        host.guests()
+            .iter()
+            .all(|status| status.target_kbps.is_some_and(|kbps| kbps <= 300))
+    });
+    let before = guest.summary().frames_presented;
+    wait_until(
+        "fotogramas con el bitrate nuevo",
+        Duration::from_secs(20),
+        || guest.summary().frames_presented >= before + 20,
+    );
+    assert_eq!(guest.end_reason(), None);
+    assert_eq!(host.end_reason(), None);
+    guest.close();
+    host.close();
     drop(server);
 }

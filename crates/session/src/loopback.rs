@@ -46,7 +46,7 @@ use coroom_codec::{
 };
 use coroom_transport::loopback::{UdpLoopback, UdpReceiver, UdpSender};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::latency::{LatencyLedger, LatencySummary, Stage};
 use crate::stats::{Counters, bump};
@@ -332,6 +332,46 @@ pub(crate) struct Shared {
     pub(crate) preview: Mutex<Option<Arc<crate::preview::PreviewTap>>>,
     /// Contadores de las etapas para el registro periódico ([`crate::stats`]).
     pub(crate) counters: Counters,
+    /// Captura nueva, ya arrancada, que el hilo `capture` adopta (cambio de fuente en marcha).
+    pub(crate) next_capturer: CapturerSlot,
+}
+
+/// Hueco para la captura que sustituye a la actual.
+#[derive(Default)]
+pub(crate) struct CapturerSlot(Mutex<Option<Box<dyn Capturer>>>);
+
+impl CapturerSlot {
+    /// Deja `capturer` para el hilo `capture`; si había otra esperando, se para.
+    pub(crate) fn put(&self, capturer: Box<dyn Capturer>) {
+        let old = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(capturer);
+        if let Some(mut old) = old {
+            old.stop();
+        }
+    }
+
+    fn take(&self) -> Option<Box<dyn Capturer>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
+}
+
+/// Una captura que se quedó esperando (la sesión terminó antes de adoptarla) suelta su sesión.
+impl Drop for CapturerSlot {
+    fn drop(&mut self) {
+        if let Some(mut capturer) = self.take() {
+            capturer.stop();
+        }
+    }
+}
+
+impl fmt::Debug for CapturerSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let waiting = self.0.lock().map(|slot| slot.is_some()).unwrap_or(false);
+        f.debug_tuple("CapturerSlot").field(&waiting).finish()
+    }
 }
 
 impl Shared {
@@ -861,6 +901,14 @@ pub(crate) fn capture_loop(
 ) -> Result<(), PipelineError> {
     let result = (|| {
         while !shared.stopping() {
+            if let Some(next) = shared.next_capturer.take() {
+                // Cambio de fuente: la de antes suelta su sesión (y en Linux su portal) y la
+                // nueva empieza con un intra, que con otro tamaño reabre el codificador.
+                capturer.stop();
+                capturer = next;
+                shared.request_keyframe();
+                debug!("captura sustituida");
+            }
             let Some(frame) = capturer
                 .next_frame_timeout(POLL)
                 .map_err(PipelineError::Capture)?
@@ -891,6 +939,9 @@ pub(crate) fn capture_loop(
         Ok(())
     })();
     capturer.stop();
+    if let Some(mut pending) = shared.next_capturer.take() {
+        pending.stop();
+    }
     result
 }
 

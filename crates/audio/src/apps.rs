@@ -154,7 +154,8 @@ impl Drop for Scanner {
 /// Mezcla del audio de las aplicaciones que elige un [`AppFilter`].
 pub struct AppMixSource {
     backend: Arc<dyn AppBackend>,
-    filter: AppFilter,
+    /// Compartido con el hilo que abre y cierra los flujos: se puede cambiar en marcha.
+    filter: Arc<Mutex<AppFilter>>,
     format: AudioFormat,
     taps: Taps,
     scanner: Option<Scanner>,
@@ -167,7 +168,7 @@ impl AppMixSource {
     pub(crate) fn new(backend: Arc<dyn AppBackend>, filter: AppFilter) -> Self {
         Self {
             backend,
-            filter,
+            filter: Arc::new(Mutex::new(filter)),
             format: AudioFormat::GAME,
             taps: Arc::default(),
             scanner: None,
@@ -175,6 +176,15 @@ impl AppMixSource {
             next_tick: None,
             scratch: Vec::new(),
         }
+    }
+}
+
+impl AppMixSource {
+    fn filter(&self) -> AppFilter {
+        self.filter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -236,12 +246,13 @@ impl AudioSource for AppMixSource {
         self.mixer = Mixer::new(config.format.channels);
         // La primera pasada, aquí: si el backend no responde, se dice al abrir.
         self.backend.playing()?;
-        sync_taps(self.backend.as_ref(), &self.filter, self.format, &self.taps);
+        let filter = self.filter();
+        sync_taps(self.backend.as_ref(), &filter, self.format, &self.taps);
         let quit = Arc::new(AtomicBool::new(false));
         let thread = {
             let quit = Arc::clone(&quit);
             let backend = Arc::clone(&self.backend);
-            let filter = self.filter.clone();
+            let filter = Arc::clone(&self.filter);
             let format = self.format;
             let taps = Arc::clone(&self.taps);
             thread::Builder::new()
@@ -252,6 +263,10 @@ impl AudioSource for AppMixSource {
                         if quit.load(Ordering::Relaxed) {
                             break;
                         }
+                        let filter = filter
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .clone();
                         sync_taps(backend.as_ref(), &filter, format, &taps);
                     }
                 })
@@ -319,8 +334,18 @@ impl AudioSource for AppMixSource {
         drop(taps);
     }
 
+    /// Cambia qué aplicaciones se envían; el hilo de los flujos lo aplica enseguida (abre las
+    /// nuevas y cierra las que ya no van) sin parar la mezcla.
+    fn set_app_filter(&mut self, filter: &AppFilter) -> bool {
+        *self.filter.lock().unwrap_or_else(PoisonError::into_inner) = filter.clone();
+        if let Some(thread) = self.scanner.as_ref().and_then(|s| s.thread.as_ref()) {
+            thread.thread().unpark();
+        }
+        true
+    }
+
     fn describe(&self) -> String {
-        match &self.filter {
+        match &self.filter() {
             AppFilter::AllExcept(excluded) if excluded.is_empty() => {
                 format!("todas las aplicaciones ({})", self.backend.label())
             }
@@ -439,5 +464,36 @@ mod tests {
         assert!(source.describe().contains("salvo voz"));
         source.stop();
         assert_eq!(source.read(&mut frame), Err(AudioError::Stopped));
+    }
+
+    #[test]
+    fn the_filter_changes_while_mixing() {
+        let fake = Arc::new(Fake {
+            loud: Mutex::new(None),
+        });
+        let mut source = AppMixSource::new(
+            Arc::clone(&fake) as Arc<dyn AppBackend>,
+            AppFilter::Only(vec!["juego".into()]),
+        );
+        source.start(&AudioConfig::game()).expect("start");
+        let open = |source: &AppMixSource| {
+            let mut streams: Vec<String> = source.taps.lock().unwrap().keys().cloned().collect();
+            streams.sort();
+            streams
+        };
+        assert_eq!(open(&source), ["a"]);
+        assert!(source.set_app_filter(&AppFilter::Only(vec!["voz".into()])));
+        let started = Instant::now();
+        while open(&source) != ["b"] {
+            assert!(
+                started.elapsed() < RESCAN / 2,
+                "sin esperar a la siguiente pasada: {:?}",
+                open(&source)
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(source.describe().contains("solo voz"));
+        let mut frame = Vec::new();
+        source.read(&mut frame).expect("la mezcla sigue");
     }
 }
