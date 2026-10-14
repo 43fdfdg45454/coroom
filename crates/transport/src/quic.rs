@@ -25,7 +25,8 @@
 //! **Datagramas por pista**: una tarea por conexión lee todos los datagramas y los separa
 //! por la pista de su cabecera: los de entrada ([`coroom_proto::input`], pista `Input`) van a
 //! [`PeerConnection::read_input_datagram`], los de audio ([`coroom_proto::audio`], pistas
-//! `Audio` y `Voice`) a [`PeerConnection::read_audio_datagram`] y el resto a
+//! `Audio` y `Voice`) a [`PeerConnection::read_audio_datagram`], los de control (pista `Control`)
+//! a [`PeerConnection::read_control_datagram`] y el resto a
 //! [`PeerConnection::read_datagram`] (vídeo); así ni la entrada ni el audio pasan por el
 //! reensamblador de medios con FEC y NACK. Cada cola guarda como mucho
 //! [`DATAGRAM_QUEUE`] datagramas y, si se llena, descarta el más antiguo (como hace `quinn`).
@@ -54,6 +55,12 @@ use crate::tls::{self, Admitted, IdentityKey, PublicKey, ServerTrust};
 
 /// Intervalo de `keep_alive` de todas las conexiones.
 pub const KEEP_ALIVE: Duration = Duration::from_secs(5);
+
+/// Retraso máximo de un ACK que se pide al par (extensión ACK frequency de QUIC). Sin ella el par
+/// puede esperar 25 ms antes de confirmar y el PTO los suma: un `Nack` o un `KeyframeRequest` que
+/// se pierde en el stream de control, con poco tráfico detrás que delate la pérdida, se reenviaba
+/// 60-70 ms después con un RTT de 20 ms. Con 5 ms, unos 40 ms.
+pub const MAX_ACK_DELAY: Duration = Duration::from_millis(5);
 
 /// Tiempo sin tráfico tras el que una conexión se da por muerta.
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -156,8 +163,8 @@ impl Default for EndpointOptions {
 }
 
 /// Configuración de transporte común (pares, relay y señalización; el servidor también la usa):
-/// `keep_alive`, `idle_timeout`, MTU inicial y mínimo, búferes de datagramas y controlador de
-/// congestión.
+/// `keep_alive`, `idle_timeout`, MTU inicial y mínimo, búferes de datagramas, controlador de
+/// congestión y [`MAX_ACK_DELAY`].
 pub fn transport_config(
     shared: &Arc<CongestionShared>,
     congestion: Congestion,
@@ -170,6 +177,9 @@ pub fn transport_config(
         .datagram_receive_buffer_size(Some(DATAGRAM_BUFFER))
         .datagram_send_buffer_size(DATAGRAM_BUFFER)
         .congestion_controller_factory(congestion.factory(shared));
+    let mut ack_frequency = quinn::AckFrequencyConfig::default();
+    ack_frequency.max_ack_delay(Some(MAX_ACK_DELAY));
+    config.ack_frequency_config(Some(ack_frequency));
     // 15 s caben de sobra en un `VarInt`.
     if let Ok(idle) = quinn::IdleTimeout::try_from(IDLE_TIMEOUT) {
         config.max_idle_timeout(Some(idle));
@@ -704,6 +714,7 @@ struct PeerInner {
     media_datagrams: Arc<DatagramQueue>,
     input_datagrams: Arc<DatagramQueue>,
     audio_datagrams: Arc<DatagramQueue>,
+    control_datagrams: Arc<DatagramQueue>,
     /// Tamaño de la cola de datagramas por enviar (el hueco libre al crearse, con nada en cola).
     send_queue_capacity: usize,
     streams_task: JoinHandle<()>,
@@ -723,12 +734,15 @@ async fn route_datagrams(
     media: Arc<DatagramQueue>,
     input: Arc<DatagramQueue>,
     audio: Arc<DatagramQueue>,
+    control: Arc<DatagramQueue>,
 ) {
     while let Ok(datagram) = conn.read_datagram().await {
         if coroom_proto::input::is_input_datagram(&datagram) {
             input.push(datagram);
         } else if coroom_proto::audio::is_audio_datagram(&datagram) {
             audio.push(datagram);
+        } else if coroom_proto::control::is_control_datagram(&datagram) {
+            control.push(datagram);
         } else {
             media.push(datagram);
         }
@@ -736,6 +750,7 @@ async fn route_datagrams(
     media.close();
     input.close();
     audio.close();
+    control.close();
 }
 
 /// Conexión QUIC con un par (directa) o con el relay.
@@ -766,11 +781,13 @@ impl PeerConnection {
         let media_datagrams = Arc::new(DatagramQueue::default());
         let input_datagrams = Arc::new(DatagramQueue::default());
         let audio_datagrams = Arc::new(DatagramQueue::default());
+        let control_datagrams = Arc::new(DatagramQueue::default());
         let datagrams_task = tokio::spawn(route_datagrams(
             conn.clone(),
             Arc::clone(&media_datagrams),
             Arc::clone(&input_datagrams),
             Arc::clone(&audio_datagrams),
+            Arc::clone(&control_datagrams),
         ));
         let send_queue_capacity = conn.datagram_send_buffer_space();
         Self {
@@ -785,6 +802,7 @@ impl PeerConnection {
                 media_datagrams,
                 input_datagrams,
                 audio_datagrams,
+                control_datagrams,
                 streams_task,
                 datagrams_task,
             }),
@@ -854,6 +872,15 @@ impl PeerConnection {
     /// Siguiente datagrama de entrada (pista `Input`). Un solo lector a la vez.
     pub async fn read_input_datagram(&self) -> Result<Bytes, TransportError> {
         match self.inner.input_datagrams.pop().await {
+            Some(datagram) => Ok(datagram),
+            None => Err(self.closed_error()),
+        }
+    }
+
+    /// Siguiente datagrama de control (pista `Control`: copias de `Nack` y `KeyframeRequest`, ver
+    /// [`coroom_proto::control::control_datagram`]). Un solo lector a la vez.
+    pub async fn read_control_datagram(&self) -> Result<Bytes, TransportError> {
+        match self.inner.control_datagrams.pop().await {
             Some(datagram) => Ok(datagram),
             None => Err(self.closed_error()),
         }

@@ -1227,6 +1227,11 @@ fn attach_direct(
     ctx.input
         .spawn_readers(&ctx.core, &connection, Some(guest), &sender);
     voice_reader(ctx, connection.clone(), Some(guest));
+    tokio::spawn(control_datagrams(
+        Arc::clone(ctx),
+        connection.clone(),
+        Arc::clone(&sender),
+    ));
     ctx.install_pending();
     sender.set_epoch_hint(ctx.core.epoch.load(Ordering::Acquire) as u16);
     lock(&ctx.links).direct.insert(
@@ -1275,6 +1280,11 @@ async fn ensure_relay(ctx: &Arc<HostCtx>) {
     ctx.input
         .spawn_readers(&ctx.core, &connection, None, &sender);
     voice_reader(ctx, connection.clone(), None);
+    tokio::spawn(control_datagrams(
+        Arc::clone(ctx),
+        connection.clone(),
+        Arc::clone(&sender),
+    ));
     lock(&ctx.links).relay = Some(RelayLink {
         sender: Arc::clone(&sender),
         guests: BTreeMap::new(),
@@ -1339,6 +1349,33 @@ async fn relay_accept_loop(
     drop(links);
     ctx.update_active();
     debug!("conexión con el relay cerrada");
+}
+
+/// Atiende las copias en datagrama de los `Nack` y `KeyframeRequest` de una conexión (directa o
+/// la del relay, que las trae de todos sus invitados): llegan antes que las del stream de control
+/// cuando este perdió un paquete. Las repetidas no reenvían nada (`MediaSender::on_nack`,
+/// `KeyframeGate`).
+async fn control_datagrams(
+    ctx: Arc<HostCtx>,
+    connection: PeerConnection,
+    sender: Arc<MediaSender>,
+) {
+    while let Ok(datagram) = connection.read_control_datagram().await {
+        match coroom_transport::proto::control::parse_control_datagram(&datagram) {
+            Ok(ControlMessage::Nack {
+                track,
+                group,
+                missing,
+            }) => {
+                sender.on_nack(track, group, &missing);
+            }
+            Ok(ControlMessage::KeyframeRequest { group }) => {
+                keyframe_request(&ctx, group, connection.rtt());
+            }
+            Ok(_) => {}
+            Err(err) => debug!(error = %err, "datagrama de control no válido"),
+        }
+    }
 }
 
 /// Lee el control de un invitado: `Feedback`, `Nack` y `Ping` los atiende el emisor; un

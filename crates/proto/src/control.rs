@@ -26,7 +26,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::media::Track;
+use crate::media::{ObjectHeader, ProtoError, Track};
 
 /// Frecuencia máxima de [`ControlMessage::Cursor`].
 pub const CURSOR_MAX_HZ: u32 = 125;
@@ -384,12 +384,104 @@ impl ControlMessage {
     pub fn members_within_limits(members: &[Member]) -> bool {
         members.len() <= MEMBERS_MAX && members.iter().all(|m| m.name.len() <= MEMBER_NAME_MAX)
     }
+
+    /// Si el mensaje puede viajar también en un datagrama de control ([`control_datagram`]): los
+    /// que corren prisa y se pueden repetir sin efecto (`Nack` y `KeyframeRequest`).
+    pub fn is_urgent(&self) -> bool {
+        matches!(
+            self,
+            ControlMessage::Nack { .. } | ControlMessage::KeyframeRequest { .. }
+        )
+    }
+}
+
+/// Copia de un mensaje urgente ([`ControlMessage::is_urgent`]) en un datagrama de la pista
+/// [`Track::Control`]: cabecera de medios de un solo objeto con el mensaje en `postcard` como
+/// carga. El mensaje sigue saliendo también por el stream de control; el datagrama solo evita que
+/// una pérdida lo retenga detrás del reenvío de QUIC (su PTO, 60-70 ms con un RTT de 20 ms). `None`
+/// si no es urgente o no cabe en un datagrama.
+pub fn control_datagram(message: &ControlMessage) -> Option<Vec<u8>> {
+    if !message.is_urgent() {
+        return None;
+    }
+    let mut out = vec![0; ObjectHeader::LEN];
+    out = postcard::to_extend(message, out).ok()?;
+    let len = u16::try_from(out.len() - ObjectHeader::LEN).ok()?;
+    if usize::from(len) > ObjectHeader::MAX_PAYLOAD {
+        return None;
+    }
+    let header = ObjectHeader {
+        track: Track::Control,
+        flags: ObjectHeader::LAST_OBJECT,
+        group: 0,
+        object: 0,
+        object_count: 1,
+        payload_len: len,
+        epoch_hint: 0,
+    };
+    if let Some(prefix) = out.first_chunk_mut::<{ ObjectHeader::LEN }>() {
+        header.write_to(prefix);
+    }
+    Some(out)
+}
+
+/// Indica si un datagrama es de control (sin validar el resto).
+pub fn is_control_datagram(bytes: &[u8]) -> bool {
+    bytes.len() >= 2 && bytes[0] == ObjectHeader::VERSION && bytes[1] == Track::Control.id()
+}
+
+/// Mensaje de un datagrama de control ([`control_datagram`]); solo se aceptan los urgentes.
+pub fn parse_control_datagram(bytes: &[u8]) -> Result<ControlMessage, ProtoError> {
+    let (header, payload) = ObjectHeader::parse_datagram(bytes)?;
+    if header.track != Track::Control || header.object_count != 1 {
+        return Err(ProtoError::Inconsistent("no es un datagrama de control"));
+    }
+    match crate::codec::decode::<ControlMessage>(payload) {
+        Ok(message) if message.is_urgent() => Ok(message),
+        Ok(_) => Err(ProtoError::Inconsistent(
+            "mensaje de control que no va en datagramas",
+        )),
+        Err(_) => Err(ProtoError::Inconsistent("mensaje de control no válido")),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::codec::{FrameBuffer, decode, encode};
+
+    #[test]
+    fn urgent_messages_round_trip_in_a_control_datagram() {
+        let nack = ControlMessage::Nack {
+            track: Track::Video,
+            group: 77,
+            missing: vec![0, 3, 9],
+        };
+        let datagram = control_datagram(&nack).expect("cabe");
+        assert!(is_control_datagram(&datagram));
+        assert!(!crate::input::is_input_datagram(&datagram));
+        assert!(!crate::audio::is_audio_datagram(&datagram));
+        assert_eq!(parse_control_datagram(&datagram), Ok(nack));
+        let request = ControlMessage::KeyframeRequest { group: 5 };
+        let datagram = control_datagram(&request).expect("cabe");
+        assert_eq!(parse_control_datagram(&datagram), Ok(request));
+        // Lo que no es urgente no va en datagramas, ni al enviar ni al recibir.
+        assert_eq!(control_datagram(&ControlMessage::Bye), None);
+        let mut forged = control_datagram(&ControlMessage::KeyframeRequest { group: 0 })
+            .expect("cabe")[..ObjectHeader::LEN]
+            .to_vec();
+        let body = postcard::to_allocvec(&ControlMessage::Bye).expect("bye");
+        forged[12..14].copy_from_slice(&(body.len() as u16).to_be_bytes());
+        forged.extend_from_slice(&body);
+        assert!(parse_control_datagram(&forged).is_err());
+        // Un Nack que no cabe en un datagrama solo va por el stream.
+        let huge = ControlMessage::Nack {
+            track: Track::Video,
+            group: 1,
+            missing: (0..1000).collect(),
+        };
+        assert_eq!(control_datagram(&huge), None);
+    }
     use proptest::prelude::*;
 
     fn track() -> impl Strategy<Value = Track> {

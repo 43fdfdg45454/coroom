@@ -184,14 +184,6 @@ const MAX_DEADLINE_INTERVALS: f64 = 4.0;
 /// `Nack` por grupo como mucho (el segundo, si el reenvío también se perdió).
 const MAX_NACKS: u8 = 2;
 
-/// Silencio de un grupo (ningún objeto suyo llega) tras el que lo que falta se da por perdido y
-/// se pide: una fracción del intervalo, acotada. Un grupo llega repartido por el pacing (hasta el
-/// 80 % del intervalo, dos intervalos si es un intra): contar desde el primer objeto pedía como
-/// perdido lo que aún no se había enviado.
-fn quiet_gap(interval: Duration) -> Duration {
-    (interval / 4).clamp(Duration::from_millis(3), Duration::from_millis(10))
-}
-
 /// Muestras del reloj para las medianas.
 const CLOCK_SAMPLES: usize = 8;
 
@@ -344,6 +336,9 @@ struct SentGroup {
     group: u32,
     sources: Vec<Bytes>,
     sent_us: u64,
+    /// Último `Nack` atendido: cuándo y qué pedía. El mismo `Nack` llega dos veces (por el stream
+    /// y en un datagrama de control) y la copia no se reenvía.
+    last_nack: Option<(Instant, Vec<u16>)>,
 }
 
 /// Estado del control de tasa de un receptor que informa a este emisor (uno en directo; uno por
@@ -659,6 +654,7 @@ impl MediaSender {
                 group,
                 sources: sources.clone(),
                 sent_us,
+                last_nack: None,
             });
             while state.history.len() > HISTORY_GROUPS {
                 state.history.pop_front();
@@ -683,18 +679,36 @@ impl MediaSender {
 
     /// Reenvía los objetos de origen que pide un `Nack` (todos si `missing` está vacío). Devuelve
     /// cuántos salen (los de un reenvío grande, en una tarea con pacing).
+    ///
+    /// El mismo `Nack` repetido antes de medio RTT es la copia del datagrama de control (o la del
+    /// stream) y no reenvía nada: el receptor no pide otra vez hasta pasado 1,25 RTT.
     pub fn on_nack(&self, track: Track, group: u32, missing: &[u16]) -> usize {
+        let now = Instant::now();
+        let window = self.conn.rtt() / 2;
         let packets: Vec<Bytes> = match self.state.lock() {
-            Ok(state) => match state
+            Ok(mut state) => match state
                 .history
-                .iter()
+                .iter_mut()
                 .find(|sent| sent.track == track && sent.group == group)
             {
-                Some(sent) if missing.is_empty() => sent.sources.clone(),
-                Some(sent) => missing
-                    .iter()
-                    .filter_map(|index| sent.sources.get(usize::from(*index)).cloned())
-                    .collect(),
+                Some(sent)
+                    if sent.last_nack.as_ref().is_some_and(|(at, previous)| {
+                        previous == missing && now.saturating_duration_since(*at) < window
+                    }) =>
+                {
+                    Vec::new()
+                }
+                Some(sent) => {
+                    sent.last_nack = Some((now, missing.to_vec()));
+                    if missing.is_empty() {
+                        sent.sources.clone()
+                    } else {
+                        missing
+                            .iter()
+                            .filter_map(|index| sent.sources.get(usize::from(*index)).cloned())
+                            .collect()
+                    }
+                }
                 None => Vec::new(),
             },
             Err(_) => Vec::new(),
@@ -939,6 +953,16 @@ struct GroupState {
     /// real y el control de tasa se hundía).
     nack_grace: Option<Instant>,
     nacks: u8,
+    /// Llegada del último objeto (de origen o reparación) y espaciado medio entre llegadas: el
+    /// pacing reparte el grupo y el silencio que lo da por terminado depende de ese ritmo.
+    last_arrival: Option<Instant>,
+    spacing: Option<Duration>,
+    /// Hasta cuándo lo que falta puede seguir en camino (último objeto más un silencio).
+    quiet_at: Option<Instant>,
+    /// Mayor índice de origen recibido y desde cuándo falta alguno por debajo: ese hueco es
+    /// pérdida en cuanto pasa la ventana de reordenación (como RACK en TCP).
+    highest: Option<u16>,
+    hole_at: Option<Instant>,
     done: Option<(Vec<u8>, Instant)>,
     expired: bool,
 }
@@ -960,6 +984,11 @@ impl GroupState {
             nacked: false,
             nack_grace: None,
             nacks: 0,
+            last_arrival: None,
+            spacing: None,
+            quiet_at: None,
+            highest: None,
+            hole_at: None,
             done: None,
             expired: false,
         }
@@ -977,6 +1006,61 @@ impl GroupState {
             .filter(|(_, source)| source.is_none())
             .map(|(index, _)| index as u16)
             .collect()
+    }
+
+    /// Lo que falta por debajo del mayor índice recibido (lo de más arriba puede seguir en camino).
+    fn missing_below_highest(&self) -> Vec<u16> {
+        let below = self.highest.map_or(0, usize::from);
+        self.sources[..below.min(self.sources.len())]
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| source.is_none())
+            .map(|(index, _)| index as u16)
+            .collect()
+    }
+
+    /// Que el grupo no venza antes de su primer `Nack` (un grupo que llega repartido hasta casi
+    /// el final de su plazo no tendría tiempo de pedir lo que le falta), sin pasar del máximo.
+    fn keep_until_nack(&mut self, interval: Duration) {
+        if !self.nacked {
+            let cap = self.first + interval.mul_f64(MAX_DEADLINE_INTERVALS);
+            self.deadline = self.deadline.max((self.nack_at + interval / 4).min(cap));
+        }
+    }
+
+    /// Anota una llegada en `now` y recalcula cuándo pedir lo que falta: tras un silencio de
+    /// unos tres espaciados (la cola del grupo) o, si hay un hueco por debajo de lo ya recibido,
+    /// tras la ventana de reordenación (dos espaciados).
+    fn note_arrival(&mut self, now: Instant, interval: Duration) {
+        if let Some(last) = self.last_arrival {
+            let gap = now.saturating_duration_since(last);
+            self.spacing = Some(match self.spacing {
+                Some(spacing) => (spacing * 3 + gap) / 4,
+                None => gap,
+            });
+        }
+        self.last_arrival = Some(now);
+        let holes = self.highest.is_some_and(|highest| {
+            self.sources[..usize::from(highest)]
+                .iter()
+                .any(Option::is_none)
+        });
+        if holes {
+            self.hole_at.get_or_insert(now);
+        } else {
+            self.hole_at = None;
+        }
+        if self.nacked {
+            return;
+        }
+        let spacing = self.spacing.unwrap_or(interval / 8);
+        let quiet = (spacing * 3).clamp(Duration::from_millis(3), interval / 2);
+        self.quiet_at = Some(now + quiet);
+        self.nack_at = self.nack_at.max(now + quiet);
+        if let Some(hole) = self.hole_at {
+            let reorder = (spacing * 2).clamp(Duration::from_millis(2), interval / 4);
+            self.nack_at = self.nack_at.min(hole + reorder);
+        }
     }
 }
 
@@ -1210,7 +1294,6 @@ impl ReceiverCore {
         // Mientras el grupo sigue llegando, lo que falta no está perdido: el `Nack` espera a un
         // silencio y el plazo da tiempo a la cola del grupo (sin pasar del máximo).
         if !state.nacked {
-            state.nack_at = state.nack_at.max(now + quiet_gap(interval));
             let cap = state.first + interval.mul_f64(MAX_DEADLINE_INTERVALS);
             state.deadline = state.deadline.max((now + interval / 2).min(cap));
         }
@@ -1226,6 +1309,9 @@ impl ReceiverCore {
             if state.arrives_directly(now) {
                 state.direct += 1;
             }
+            state.highest = state.highest.max(Some(header.object));
+            state.note_arrival(now, interval);
+            state.keep_until_nack(interval);
         } else {
             // Nunca hacen falta más símbolos de reparación que objetos de origen: el resto solo
             // gastaría memoria y CPU del decodificador.
@@ -1238,6 +1324,8 @@ impl ReceiverCore {
                 return;
             }
             state.repairs.push((header.object, payload.to_vec()));
+            state.note_arrival(now, interval);
+            state.keep_until_nack(interval);
         }
 
         if state.have == usize::from(count) {
@@ -1314,10 +1402,12 @@ impl ReceiverCore {
                 }
                 state.nacked = true;
                 state.nacks += 1;
-                let missing = if state.count.is_some() {
-                    state.missing()
-                } else {
-                    Vec::new()
+                // Mientras el grupo sigue llegando, solo se pide el hueco de abajo.
+                let arriving = state.quiet_at.is_some_and(|quiet| now < quiet);
+                let missing = match state.count {
+                    Some(_) if arriving => state.missing_below_highest(),
+                    Some(_) => state.missing(),
+                    None => Vec::new(),
                 };
                 self.outbox.push(ControlMessage::Nack {
                     track,
@@ -1730,8 +1820,20 @@ impl MediaReceiver {
     }
 
     fn send(&self, message: &ControlMessage) {
+        self.send_control(message);
+    }
+
+    /// Envía un mensaje por el stream de control y, si corre prisa (`Nack`, `KeyframeRequest`),
+    /// una copia en un datagrama de control: si el paquete del stream se pierde, QUIC no lo
+    /// reenvía hasta su PTO (60-70 ms con un RTT de 20 ms) y lo que viene detrás espera con él.
+    pub fn send_control(&self, message: &ControlMessage) {
         if let Err(err) = self.control.send(message) {
             debug!(error = %err, "no se pudo enviar un mensaje de control");
+        }
+        if let Some(datagram) = coroom_proto::control::control_datagram(message)
+            && let Err(err) = self.conn.send_datagram(Bytes::from(datagram))
+        {
+            debug!(error = %err, "no se pudo enviar un datagrama de control");
         }
     }
 }
@@ -1924,13 +2026,17 @@ mod tests {
         let mut core = ReceiverCore::new(INTERVAL);
         let start = Instant::now();
         let (sources, _) = packetize(5, &payload(5000, 4), 1184, 0);
+        // Llegan del 1 al 4 a la vez: falta el 0, por debajo de lo recibido (un hueco).
         for packet in sources.iter().skip(1) {
             core.push(packet, start, None);
         }
         let rtt = Duration::from_millis(10);
-        core.poll(start + Duration::from_millis(5), rtt);
-        assert!(core.take_messages().is_empty());
-        core.poll(start + Duration::from_millis(13), rtt);
+        core.poll(start + Duration::from_millis(1), rtt);
+        assert!(
+            core.take_messages().is_empty(),
+            "dentro de la ventana de reordenación"
+        );
+        core.poll(start + Duration::from_millis(3), rtt);
         assert_eq!(
             core.take_messages(),
             vec![ControlMessage::Nack {
@@ -1939,15 +2045,15 @@ mod tests {
                 missing: vec![0]
             }]
         );
-        // El plazo se amplió por el Nack (13 + 15 + 5 = 33 ms); a los 20 ms sigue vivo.
-        core.poll(start + Duration::from_millis(20), rtt);
+        // El plazo se amplió por el Nack (3 + 15 + 5 = 23 ms, y el de 25 ms sigue); el reenvío
+        // no llegó en 1,25 × RTT (17,5 ms): segundo Nack, y el plazo pasa a 18 + 15 + 5 = 38 ms.
+        core.poll(start + Duration::from_millis(10), rtt);
         assert!(core.take_messages().is_empty());
-        // El reenvío no llegó en 1,25 × RTT: segundo Nack, y el plazo pasa a 30 + 15 + 5 = 50 ms.
-        core.poll(start + Duration::from_millis(30), rtt);
+        core.poll(start + Duration::from_millis(18), rtt);
         assert_eq!(core.take_messages().len(), 1);
-        core.poll(start + Duration::from_millis(45), rtt);
+        core.poll(start + Duration::from_millis(30), rtt);
         assert!(core.take_messages().is_empty(), "no hay tercer Nack");
-        core.poll(start + Duration::from_millis(51), rtt);
+        core.poll(start + Duration::from_millis(38), rtt);
         assert_eq!(
             core.take_messages(),
             vec![ControlMessage::KeyframeRequest { group: 5 }]
@@ -1956,14 +2062,41 @@ mod tests {
         assert_eq!(core.stats().nacks, 2);
         assert!(core.next_timer().is_none());
         // Lo que llegue después del grupo descartado se ignora.
-        core.push(&sources[0], start + Duration::from_millis(52), None);
+        core.push(&sources[0], start + Duration::from_millis(39), None);
         assert!(core.pop_frame().is_none());
     }
 
-    /// Un corte de la red se lleva más de MAX_PLACEHOLDERS fotogramas enteros: los grupos de los
-    /// que no llegó nada se dan por perdidos, se pide un intra y lo que llega después se entrega
-    /// enseguida (antes, la pista se quedaba esperando un grupo que nadie iba a crear hasta el
-    /// reinicio de RESET_DISTANCE grupos: 17 s sin vídeo a 60 fps).
+    /// La cola de un grupo (los últimos objetos) no se pide mientras siguen llegando objetos:
+    /// solo tras un silencio de unos tres espaciados (como mucho medio intervalo).
+    #[test]
+    fn a_lost_tail_is_nacked_after_a_quiet_spell() {
+        let mut core = ReceiverCore::new(INTERVAL);
+        let start = Instant::now();
+        let (sources, _) = packetize(2, &payload(6000, 2), 1184, 0);
+        let rtt = Duration::from_millis(10);
+        let last = sources.len() - 1;
+        // Llegan cada 4 ms (el pacing a poco bitrate) y se pierde el último.
+        for (i, packet) in sources.iter().take(last).enumerate() {
+            let now = start + Duration::from_millis(4 * i as u64);
+            core.poll(now, rtt);
+            assert!(core.take_messages().is_empty(), "objeto {i}: aún llegando");
+            core.push(packet, now, None);
+        }
+        let arrived = start + Duration::from_millis(4 * (last as u64 - 1));
+        // Tres espaciados (12 ms), como mucho medio intervalo (8,3 ms).
+        core.poll(arrived + Duration::from_millis(8), rtt);
+        assert!(core.take_messages().is_empty(), "aún dentro del silencio");
+        core.poll(arrived + Duration::from_millis(9), rtt);
+        assert_eq!(
+            core.take_messages(),
+            vec![ControlMessage::Nack {
+                track: Track::Video,
+                group: 2,
+                missing: vec![last as u16]
+            }]
+        );
+    }
+
     #[test]
     fn a_burst_longer_than_the_placeholders_does_not_stall_the_track() {
         let mut core = ReceiverCore::new(INTERVAL);

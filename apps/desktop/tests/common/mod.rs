@@ -10,7 +10,8 @@
 use std::net::SocketAddr;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use coroom_server::{Config, Server};
 use coroom_session::remote::RemoteConfig;
@@ -81,6 +82,7 @@ impl TestServer {
     }
 
     fn launch(dev: bool) -> Self {
+        stall_watch();
         let dir = tempfile::tempdir().expect("directorio temporal");
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -266,4 +268,55 @@ pub fn encode_calibration() -> Duration {
         encoder.encode(frame).expect("codificar");
     }
     started.elapsed()
+}
+
+/// Paradas del sistema (no de coroom): un hilo duerme [`STALL_TICK`] en bucle y anota cuándo
+/// despierta más de [`STALL_MIN`] tarde. En la máquina virtual de los tests (y en los runners de la
+/// CI) todo el proceso se queda a veces parado cientos de milisegundos, captura del anfitrión
+/// incluida; los tests de cuelgues descuentan ese tiempo ([`stalled_between`]).
+pub struct StallWatch {
+    stalls: Mutex<Vec<(Instant, Instant)>>,
+}
+
+/// Lo que duerme el hilo vigilante en cada vuelta.
+const STALL_TICK: Duration = Duration::from_millis(2);
+
+/// Retraso del vigilante a partir del cual se anota una parada.
+const STALL_MIN: Duration = Duration::from_millis(20);
+
+/// Arranca el vigilante (una vez por proceso) y lo devuelve.
+pub fn stall_watch() -> &'static StallWatch {
+    static WATCH: OnceLock<&'static StallWatch> = OnceLock::new();
+    WATCH.get_or_init(|| {
+        let watch: &'static StallWatch = Box::leak(Box::new(StallWatch {
+            stalls: Mutex::new(Vec::new()),
+        }));
+        std::thread::Builder::new()
+            .name("stall-watch".into())
+            .spawn(move || {
+                loop {
+                    let before = Instant::now();
+                    std::thread::sleep(STALL_TICK);
+                    let after = Instant::now();
+                    if after - before > STALL_TICK + STALL_MIN
+                        && let Ok(mut stalls) = watch.stalls.lock()
+                    {
+                        stalls.push((before + STALL_TICK, after));
+                    }
+                }
+            })
+            .expect("hilo vigilante");
+        watch
+    })
+}
+
+/// Tiempo que el sistema estuvo parado entre `from` y `to`.
+pub fn stalled_between(from: Instant, to: Instant) -> Duration {
+    let Ok(stalls) = stall_watch().stalls.lock() else {
+        return Duration::ZERO;
+    };
+    stalls
+        .iter()
+        .map(|&(start, end)| end.min(to).saturating_duration_since(start.max(from)))
+        .sum()
 }

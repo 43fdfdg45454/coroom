@@ -184,7 +184,55 @@ fn delivered(summary: &LatencySummary) -> f64 {
     presented / (presented + summary.drops_total as f64)
 }
 
-/// Mayor hueco entre dos presentaciones seguidas.
+/// Cuenta los huecos de más de `over` entre presentaciones: cuándo llegó y se capturó el primer
+/// fotograma después de cada uno (para ver si esperaba a otro o no había nada que presentar).
+fn print_gaps(ledger: &LatencyLedger, over: Duration) {
+    let mut timelines = ledger.timelines();
+    timelines.retain(|t| t.at(Stage::Presented).is_some());
+    timelines.sort_by_key(|t| t.at(Stage::Presented));
+    for pair in timelines.windows(2) {
+        let (Some(before), Some(after)) =
+            (pair[0].at(Stage::Presented), pair[1].at(Stage::Presented))
+        else {
+            continue;
+        };
+        if after - before <= over {
+            continue;
+        }
+        let since = |stage: Stage| {
+            pair[1]
+                .at(stage)
+                .map(|at| at.saturating_duration_since(before))
+        };
+        println!(
+            "hueco {:?}: el siguiente se capturó a {:?}, se recibió a {:?} y se decodificó a {:?} \
+             del anterior presentado",
+            after - before,
+            since(Stage::Captured),
+            since(Stage::Received),
+            since(Stage::Decoded),
+        );
+        let (first, last) = (pair[0].frame_id, pair[1].frame_id);
+        for timeline in ledger.timelines() {
+            if timeline.frame_id <= first || timeline.frame_id >= last {
+                continue;
+            }
+            let marks: Vec<String> = Stage::ALL
+                .iter()
+                .map(|&stage| match timeline.at(stage) {
+                    Some(at) if at >= before => format!("{}+{:?}", stage.label(), at - before),
+                    Some(at) => format!("{}-{:?}", stage.label(), before - at),
+                    None => format!("{}:-", stage.label()),
+                })
+                .collect();
+            println!("  intermedio {}: {}", timeline.frame_id, marks.join(" "));
+        }
+        println!("  ids {first} → {last}");
+    }
+}
+
+/// Mayor hueco entre dos presentaciones seguidas, sin el tiempo que la máquina estuvo parada
+/// entre ellas ([`common::stalled_between`]).
 fn max_gap(ledger: &LatencyLedger) -> Duration {
     let mut presented: Vec<Instant> = ledger
         .timelines()
@@ -194,7 +242,16 @@ fn max_gap(ledger: &LatencyLedger) -> Duration {
     presented.sort_unstable();
     presented
         .windows(2)
-        .map(|pair| pair[1] - pair[0])
+        .map(|pair| {
+            let stalled = common::stalled_between(pair[0], pair[1]);
+            if !stalled.is_zero() && pair[1] - pair[0] > Duration::from_millis(100) {
+                println!(
+                    "hueco de {:?} con la máquina parada {stalled:?}",
+                    pair[1] - pair[0]
+                );
+            }
+            (pair[1] - pair[0]).saturating_sub(stalled)
+        })
         .max()
         .unwrap_or_default()
 }
@@ -306,6 +363,7 @@ fn netem_active() -> bool {
 /// tiempo de reloj del equipo de referencia (multiplicada por el factor de carga del entorno,
 /// `common::load_factor`, que es 1 en una máquina sin carga).
 fn check_no_freezes(summary: &LatencySummary, guest: &RemoteSession) {
+    print_gaps(guest.ledger(), Duration::from_millis(100));
     println!("{summary}");
     let gap = max_gap(guest.ledger());
     let bound = Duration::from_millis(200).mul_f64(common::load_factor());

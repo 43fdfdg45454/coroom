@@ -1290,7 +1290,7 @@ async fn media_loop(
                 shared.request_keyframe();
             }
             let rtt = receiver.clock_rtt().unwrap_or_default();
-            request_keyframe(control, last_group, shared, &mut last_request, rtt);
+            request_keyframe(receiver, last_group, shared, &mut last_request, rtt);
             continue;
         };
         let frame = frame.map_err(|err| {
@@ -1335,7 +1335,7 @@ async fn media_loop(
                     ledger.record_drop(Stage::Decrypted);
                     shared.request_keyframe();
                     let rtt = receiver.clock_rtt().unwrap_or_default();
-                    request_keyframe(control, frame.group, shared, &mut last_request, rtt);
+                    request_keyframe(receiver, frame.group, shared, &mut last_request, rtt);
                     continue;
                 }
             }
@@ -1362,7 +1362,7 @@ async fn media_loop(
             Err(()) => return Ok(()),
         }
         let rtt = receiver.clock_rtt().unwrap_or_default();
-        request_keyframe(control, frame.group, shared, &mut last_request, rtt);
+        request_keyframe(receiver, frame.group, shared, &mut last_request, rtt);
     }
 }
 
@@ -1370,7 +1370,7 @@ async fn media_loop(
 /// vigilante) y no se pidió otro hace menos de [`KEYFRAME_REQUEST_PERIOD`] o de dos RTT (lo que
 /// tarda en llegar el intra pedido).
 fn request_keyframe(
-    control: &ControlSender,
+    receiver: &MediaReceiver,
     group: u32,
     shared: &crate::loopback::Shared,
     last: &mut Option<Instant>,
@@ -1381,7 +1381,7 @@ fn request_keyframe(
         return;
     }
     if shared.take_keyframe_request() {
-        let _ = control.send(&ControlMessage::KeyframeRequest { group });
+        receiver.send_control(&ControlMessage::KeyframeRequest { group });
         bump(&shared.counters.keyframe_requests);
         *last = Some(Instant::now());
     }

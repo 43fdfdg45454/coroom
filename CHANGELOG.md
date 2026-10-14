@@ -63,6 +63,15 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **Cortes de 100-350 ms con pérdida de paquetes**: cuando se perdía un paquete del vídeo, el
+  aviso del invitado para pedirlo (`Nack`) y la petición de intra iban solo por el stream de
+  control de QUIC; si ese aviso también se perdía, QUIC no lo reenviaba hasta su temporizador
+  (60-70 ms con un RTT de 20 ms) y el fotograma vencía. Ahora salen además como datagrama
+  (pista `Control`, compatible con la 1.6.0: quien no lo entiende lo ignora) y el anfitrión y el
+  relay no reenvían dos veces lo mismo. QUIC pide además confirmaciones en 5 ms (extensión ACK
+  frequency) en vez de 25. El aviso se pide en cuanto falta un paquete por debajo del último
+  recibido (como RACK en TCP) o tras un silencio a la medida del ritmo del grupo, no al llegar a
+  medio plazo.
 - **Anfitrión Windows: los invitados se oían a sí mismos** en el audio del juego. Cada aplicación
   se capturaba con `new_application_loopback_client(pid, false)`, que en WASAPI no es «el proceso
   sin sus hijos» sino «todo el sistema salvo ese proceso»: cada captura traía todo lo demás,

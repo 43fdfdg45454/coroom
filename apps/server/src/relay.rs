@@ -9,7 +9,8 @@
 //!   conexión del anfitrión (con el `Hello` del invitado, cuya identidad fija el token);
 //! - el relay solo lee la [`ObjectHeader`] de los datagramas y guarda los objetos de origen de los
 //!   últimos 16 grupos de vídeo por sala para responder a los `Nack` de los invitados sin molestar
-//!   al anfitrión. Nunca ve el contenido: va cifrado con SFrame.
+//!   al anfitrión (los del stream de control y sus copias en datagramas de la pista `Control`).
+//!   Nunca ve el contenido: va cifrado con SFrame.
 //! - la voz de cada invitado sube al anfitrión como cualquier datagrama suyo; el
 //!   anfitrión la reenvía sin descifrar y el relay la abre en abanico a todos los invitados (el que
 //!   habló descarta la suya por el emisor de su SFrame).
@@ -31,7 +32,7 @@ use tracing::{debug, info, warn};
 use coroom_transport::connect::STREAM_RELAY_AUTH;
 use coroom_transport::proto::PROTOCOL_VERSION;
 use coroom_transport::proto::codec::{self, FrameBuffer};
-use coroom_transport::proto::control::{ControlMessage, Hello, Role};
+use coroom_transport::proto::control::{self, ControlMessage, Hello, Role};
 use coroom_transport::proto::media::{ObjectHeader, Track};
 use coroom_transport::proto::signal::PeerId;
 
@@ -489,6 +490,21 @@ impl Relay {
             tokio::spawn(async move {
                 while let Ok(datagram) = conn.read_datagram().await {
                     if !relay.admit(grant.room, datagram.len()) {
+                        continue;
+                    }
+                    // La copia en datagrama de un `Nack` se responde desde la caché como la del
+                    // stream; si no está, sigue hacia el anfitrión.
+                    if let Ok(ControlMessage::Nack {
+                        track,
+                        group,
+                        missing,
+                    }) = control::parse_control_datagram(&datagram)
+                        && let Some(cached) = relay.cached(grant.room, track, group, &missing)
+                    {
+                        relay.nack_hits.fetch_add(1, Ordering::Relaxed);
+                        for datagram in cached {
+                            let _ = conn.send_datagram(datagram);
+                        }
                         continue;
                     }
                     if let Some(host) = relay.host_of(grant.room) {
