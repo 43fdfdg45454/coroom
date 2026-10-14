@@ -83,6 +83,17 @@ mod tests {
             assert!((598..=601).contains(&got), "{hz} Hz: {got} en 10 s");
         }
         assert!((1198..=1201).contains(&accepted(120, 144.0, 10.0, Duration::ZERO)));
+        // 30, 60 y 120 con monitores de 144, 165, 170 y 240 Hz: siempre la cadencia pedida.
+        for hz in [144.0, 165.0, 170.0, 240.0] {
+            for fps in [30u32, 60, 120] {
+                let want = fps as usize * 10;
+                let got = accepted(fps, hz, 10.0, Duration::from_micros(300));
+                assert!(
+                    got.abs_diff(want) <= 2,
+                    "{fps} fps con {hz} Hz: {got} en 10 s"
+                );
+            }
+        }
     }
 
     #[test]

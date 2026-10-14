@@ -31,10 +31,19 @@ use std::time::{Duration, Instant};
 
 pub mod synthetic;
 
-#[cfg_attr(not(all(feature = "wgc", target_os = "windows")), allow(dead_code))]
+#[cfg_attr(
+    not(any(
+        all(feature = "wgc", target_os = "windows"),
+        all(feature = "pipewire", target_os = "linux")
+    )),
+    allow(dead_code)
+)]
 mod pacer;
 #[cfg_attr(
-    not(all(feature = "wgc", target_os = "windows")),
+    not(any(
+        all(feature = "wgc", target_os = "windows"),
+        all(feature = "pipewire", target_os = "linux")
+    )),
     allow(unused_imports)
 )]
 pub(crate) use pacer::FramePacer;

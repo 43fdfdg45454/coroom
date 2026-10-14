@@ -59,8 +59,8 @@ use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id};
 use crate::mailbox::Mailbox;
 use crate::{
     CURSOR_MAX_SIDE, CaptureError, CaptureOptions, CaptureTarget, CapturedFrame, Capturer,
-    CursorShape, CursorState, DmaBufFrame, DmaBufPlane, EisSocket, FramePixels, GpuFrames,
-    RemoteDesktopShare, SharedArea,
+    CursorShape, CursorState, DmaBufFrame, DmaBufPlane, EisSocket, FramePacer, FramePixels,
+    GpuFrames, RemoteDesktopShare, SharedArea,
 };
 
 /// Nombre del único objetivo: el selector lo muestra el portal.
@@ -514,6 +514,12 @@ struct StreamState {
     cursor_shape: Option<Arc<CursorShape>>,
     /// Canal por el que vuelven los búferes DMA-BUF retenidos.
     release: pw::channel::Sender<BufferPtr>,
+    /// Qué fotogramas del compositor se entregan para la cadencia pedida.
+    pacer: FramePacer,
+    /// Marcas de tiempo: las del compositor si las pone en el primer fotograma (`true`); si no,
+    /// la llegada desde `epoch`.
+    compositor_pts: Option<bool>,
+    epoch: Instant,
 }
 
 /// Puntero a un `pw_buffer` retenido, para devolverlo por el canal.
@@ -577,6 +583,30 @@ impl Dequeued {
             }
             std::slice::from_raw_parts((*buffer).datas as *const Data, (*buffer).n_datas as usize)
         }
+    }
+
+    /// Marca de tiempo de presentación del compositor (`spa_meta_header.pts`, en ns del reloj
+    /// monótono), si la pone.
+    fn pts(&self) -> Option<Duration> {
+        let buffer = self.spa_buffer();
+        if buffer.is_null() {
+            return None;
+        }
+        // SAFETY: `spa_buffer_find_meta_data` busca en los metadatos del búfer uno de tipo
+        // `SPA_META_Header` de al menos ese tamaño; si lo hay, apunta a un `spa_meta_header`
+        // válido mientras tengamos el búfer, y aquí solo se lee su `pts`.
+        let pts = unsafe {
+            let header = spa::sys::spa_buffer_find_meta_data(
+                buffer,
+                spa::sys::SPA_META_Header,
+                std::mem::size_of::<spa::sys::spa_meta_header>(),
+            ) as *const spa::sys::spa_meta_header;
+            header.as_ref()?.pts
+        };
+        u64::try_from(pts)
+            .ok()
+            .filter(|&pts| pts > 0)
+            .map(Duration::from_nanos)
     }
 
     /// Metadatos del cursor, si los hay.
@@ -831,13 +861,19 @@ fn video_format(formats: &[VideoFormat], modifiers: Option<&[u64]>, fps: u32) ->
             },
         ))),
     ));
-    // Con cadencia variable (`framerate` 0/1, lo que dan mutter y KWin) manda `maxFramerate`.
+    // Con cadencia variable (`framerate` 0/1, lo que dan mutter y KWin) manda `maxFramerate`, que
+    // el compositor aplica como intervalo mínimo entre fotogramas: pedido igual a `fps`, redondea
+    // al múltiplo del refresco (60 con un monitor de 170 Hz daban 56,7). Se pide holgado
+    // ([`delivery_cap`]) y la cadencia la elige `FramePacer` por la marca de tiempo.
     properties.push(Property::new(
         FormatProperties::VideoMaxFramerate.as_raw(),
         Value::Choice(ChoiceValue::Fraction(Choice(
             ChoiceFlags::empty(),
             ChoiceEnum::Range {
-                default: spa::utils::Fraction { num: fps, denom: 1 },
+                default: spa::utils::Fraction {
+                    num: delivery_cap(fps),
+                    denom: 1,
+                },
                 min: spa::utils::Fraction { num: 1, denom: 1 },
                 max: spa::utils::Fraction {
                     num: 1000,
@@ -851,6 +887,13 @@ fn video_format(formats: &[VideoFormat], modifiers: Option<&[u64]>, fps: u32) ->
         id: spa::sys::SPA_PARAM_EnumFormat,
         properties,
     }
+}
+
+/// Frecuencia máxima que se le pide al compositor para una cadencia de `fps`: holgada (4 veces y
+/// al menos 240), para que no redondee la cadencia al refresco del monitor; los fotogramas que
+/// sobran se descartan nada más llegar ([`process`]).
+fn delivery_cap(fps: u32) -> u32 {
+    fps.saturating_mul(4).clamp(240, 1000)
 }
 
 /// Parámetros `EnumFormat`, en orden de preferencia: con HDR, `RGBA_F16` en memoria compartida;
@@ -889,9 +932,12 @@ fn format_params(
     Ok(params)
 }
 
-/// `Buffers` (DMA-BUF o memoria compartida, de 4 a 16) y `Meta` (cursor) tras negociar el
-/// formato.
-fn buffer_params(dmabuf: bool) -> Result<(Vec<u8>, Vec<u8>), CaptureError> {
+/// `Buffers` (DMA-BUF o memoria compartida, de 4 a 16), `Meta` del cursor y `Meta` de la cabecera
+/// (la marca de tiempo de presentación del compositor) tras negociar el formato.
+/// Parámetros serializados de [`buffer_params`]: búferes, cursor y cabecera.
+type BufferParams = (Vec<u8>, Vec<u8>, Vec<u8>);
+
+fn buffer_params(dmabuf: bool) -> Result<BufferParams, CaptureError> {
     let data_type = if dmabuf {
         1 << spa::sys::SPA_DATA_DmaBuf
     } else {
@@ -935,7 +981,29 @@ fn buffer_params(dmabuf: bool) -> Result<(Vec<u8>, Vec<u8>), CaptureError> {
     Ok((
         serialize(Value::Object(buffers))?,
         serialize(Value::Object(meta))?,
+        serialize(Value::Object(header_meta()))?,
     ))
+}
+
+/// `Meta` de la cabecera de cada búfer (`spa_meta_header`: su `pts`).
+fn header_meta() -> Object {
+    Object {
+        type_: spa::sys::SPA_TYPE_OBJECT_ParamMeta,
+        id: spa::sys::SPA_PARAM_Meta,
+        properties: vec![
+            Property::new(
+                spa::sys::SPA_PARAM_META_type,
+                Value::Id(Id(spa::sys::SPA_META_Header)),
+            ),
+            Property::new(
+                spa::sys::SPA_PARAM_META_size,
+                Value::Int(
+                    i32::try_from(std::mem::size_of::<spa::sys::spa_meta_header>())
+                        .unwrap_or(i32::MAX),
+                ),
+            ),
+        ],
+    }
 }
 
 /// Si el formato negociado lleva la propiedad de modificador (búferes DMA-BUF).
@@ -978,6 +1046,17 @@ fn process(stream: &pw::stream::Stream, state: &mut StreamState) {
         return;
     };
     let captured_at = Instant::now();
+    // Cadencia pedida: los fotogramas que sobran vuelven al compositor sin copiar nada. Se usan
+    // siempre las mismas marcas (las del compositor o la llegada) para no mezclar relojes.
+    let pts = buffer.pts();
+    let compositor = *state.compositor_pts.get_or_insert(pts.is_some());
+    let at = match pts {
+        Some(pts) if compositor => pts,
+        _ => captured_at.saturating_duration_since(state.epoch),
+    };
+    if !state.pacer.accept(at) {
+        return;
+    }
     let meta = buffer.cursor().filter(|cursor| cursor.is_valid());
     if let Some(meta) = meta
         && let Some(bitmap) = meta.bitmap()
@@ -1124,6 +1203,9 @@ fn run_stream(
             mailbox: Arc::clone(&mailbox),
             cursor_shape: None,
             release: release_tx,
+            pacer: FramePacer::new(options.max_fps),
+            compositor_pts: None,
+            epoch: Instant::now(),
         };
         let errors = Arc::clone(&mailbox);
         let _listener = stream
@@ -1159,13 +1241,15 @@ fn run_stream(
                 }
                 state.dmabuf = has_modifier(param);
                 match buffer_params(state.dmabuf) {
-                    Ok((buffers, meta)) => {
-                        let (Some(buffers), Some(meta)) =
-                            (Pod::from_bytes(&buffers), Pod::from_bytes(&meta))
-                        else {
+                    Ok((buffers, meta, header)) => {
+                        let (Some(buffers), Some(meta), Some(header)) = (
+                            Pod::from_bytes(&buffers),
+                            Pod::from_bytes(&meta),
+                            Pod::from_bytes(&header),
+                        ) else {
                             return;
                         };
-                        if let Err(err) = stream.update_params(&mut [buffers, meta]) {
+                        if let Err(err) = stream.update_params(&mut [buffers, meta, header]) {
                             state.mailbox.fail(backend(err));
                         }
                     }
@@ -1509,10 +1593,20 @@ mod tests {
         let pod = Pod::from_bytes(&shm[0]).unwrap();
         assert!(!has_modifier(pod));
         for dmabuf in [false, true] {
-            let (buffers, meta) = buffer_params(dmabuf).unwrap();
+            let (buffers, meta, header) = buffer_params(dmabuf).unwrap();
             assert!(Pod::from_bytes(&buffers).is_some());
             assert!(Pod::from_bytes(&meta).is_some());
+            assert!(Pod::from_bytes(&header).is_some());
         }
+    }
+
+    /// El compositor no debe redondear la cadencia: se le pide holgada para 30, 60 y 120.
+    #[test]
+    fn the_compositor_is_asked_for_more_than_the_cadence() {
+        assert_eq!(delivery_cap(30), 240);
+        assert_eq!(delivery_cap(60), 240);
+        assert_eq!(delivery_cap(120), 480);
+        assert_eq!(delivery_cap(500), 1000);
     }
 
     #[test]

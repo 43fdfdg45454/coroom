@@ -54,11 +54,14 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
   vuelven a usar solos cuando el driver lo arregle. Se va la lista fija que dejaba AV1 por Vulkan
   Video solo a mano: en las NVIDIA RTX 50 (Blackwell), cuyo driver codifica mal AV1 por Vulkan
   (fallo conocido de NVIDIA), lo descarta la comprobación, y en las demás GPU se usa.
-- **Anfitrión Windows a 48 fps en lugar de 60 con un monitor de 144 Hz.** Se le pedía a WGC un
-  intervalo mínimo de `1 / fps` entre fotogramas, y eso redondea al múltiplo del refresco (tres
-  refrescos de 6,9 ms: 20,8 ms). Ahora WGC entrega cada refresco y la captura se queda con los de
-  la cadencia pedida por su marca de tiempo (`SystemRelativeTime`), alternando huecos de dos y
-  tres refrescos: 60 de media con cualquier monitor de 60 Hz o más.
+- **La cadencia pedida (30, 60 o 120 fps) sale igual en Windows y en Linux, con cualquier
+  monitor.** Se le pedía a la captura un intervalo mínimo de `1 / fps` (WGC en Windows,
+  `maxFramerate` de PipeWire en Linux), y eso redondea al múltiplo del refresco: 60 fps daban 48
+  con un monitor de 144 Hz y 56,7 con uno de 170. Ahora la captura recibe cada refresco (en Linux,
+  el compositor hasta 4 veces la cadencia y al menos 240) y se queda con los de la cadencia pedida
+  por su marca de tiempo (`SystemRelativeTime` en Windows, la de presentación del compositor en
+  Linux), alternando huecos de dos y tres refrescos; los que sobran se descartan antes de copiar
+  nada.
 - **Con anfitrión Linux y codificador por GPU, la captura se paraba a los pocos fotogramas**
   (invitados en «Entrando en la sala… Vídeo» con el audio sonando, o con un solo fotograma, en
   cualquier códec). Los filtros de Vulkan de FFmpeg sueltan su entrada al reutilizar su contexto
