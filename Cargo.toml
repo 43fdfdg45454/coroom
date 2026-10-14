@@ -63,7 +63,7 @@ quinn = { version = "=0.11.12", default-features = false, features = ["runtime-t
 quinn-proto = { version = "=0.11.19", default-features = false }
 h3 = { version = "=0.0.8", default-features = false }
 h3-quinn = { version = "=0.0.10", default-features = false }
-rustls = { version = "=0.23.45", default-features = false, features = ["aws_lc_rs", "std", "prefer-post-quantum"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["aws_lc_rs", "std", "prefer-post-quantum"] }
 # Raíces de confianza del sistema para el servidor de coroom en producción (`ServerTrust::system_roots`).
 rustls-native-certs = { version = "=0.8.4", default-features = false }
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
