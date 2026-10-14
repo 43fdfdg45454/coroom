@@ -87,11 +87,12 @@ modules:
       - --enable-libsvtav1
       - --enable-libdav1d
     sources:
-      # Repositorio git oficial con la etiqueta fijada a su commit (flatpak-builder lo comprueba).
+      # Espejo oficial de FFmpeg en GitHub (git.ffmpeg.org dejaba sin resolver el DNS en la CI) con
+      # la etiqueta fijada a su commit, que flatpak-builder comprueba.
       # Mismo código que el tarball oficial ffmpeg-8.1.3.tar.xz y que la build de desarrollo de
       # `tools/ffmpeg.lock`.
       - type: git
-        url: https://git.ffmpeg.org/ffmpeg.git
+        url: https://github.com/FFmpeg/FFmpeg.git
         tag: n8.1.3
         commit: 1041abdc962f4cc4f394aa8de9dc5236c0c3b9e7
 

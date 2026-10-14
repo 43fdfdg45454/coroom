@@ -193,6 +193,17 @@ opt-level = 3
 [profile.dev.package.blake2]
 opt-level = 3
 
+# SFrame (y aws-lc debajo) sin optimizar cuesta el doble por paquete y en el runner de Linux
+# sumaba 1 ms por fotograma al test que mide su coste.
+[profile.dev.package.sframe]
+opt-level = 3
+
+[profile.dev.package.aws-lc-rs]
+opt-level = 3
+
+[profile.dev.package.aws-lc-sys]
+opt-level = 3
+
 # Información de depuración solo con tablas de líneas: trazas legibles con una fracción del tamaño
 # en disco (el perfil completo supera los 20 GB con wgpu, openh264 y aws-lc).
 [profile.dev]
