@@ -11,3 +11,8 @@ packaging
 **/*.pem
 **/*.key
 **/*.crt
+
+# Paquetes que «Publicación» descarga en el repositorio (no son parte de la imagen).
+artifacts
+upload
+digests

@@ -2,8 +2,8 @@ name: Paquetes
 
 # Construye todo lo que se adjunta a una publicación, con la versión que calcula ci.yml: el
 # Flatpak (flatpak.yml), el MSIX firmado con el certificado de prueba y el .zip portátil de Windows,
-# la imagen multiarquitectura de coroom-server (solo se construye; «Publicación» la sube a GHCR
-# desde la caché) y el driver de mando virtual firmado con su certificado de un solo uso
+# la imagen de coroom-server por arquitectura (en GHCR solo por digest, sin etiqueta; «Publicación»
+# las une y las etiqueta) y el driver de mando virtual firmado con su certificado de un solo uso
 # (driver.yml). Lo llama ci.yml en cada push a main; a mano, desde la pestaña Actions.
 on:
   workflow_call:
@@ -89,9 +89,24 @@ jobs:
             dist/coroom-dev.cer
           if-no-files-found: error
 
+  # Una arquitectura por runner, las dos nativas: cada una tiene el runner entero y arm64 no se
+  # compila de forma cruzada. Cada imagen se sube a GHCR solo por digest, sin etiqueta (nadie la
+  # ve como versión ni la baja con `:latest`); «Publicación» las une en una imagen
+  # multiarquitectura y le pone las etiquetas cuando las comprobaciones han pasado, sin volver a
+  # compilar.
   docker:
-    name: Imagen del servidor
-    runs-on: ubuntu-latest
+    name: Imagen del servidor (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
 
@@ -99,18 +114,69 @@ jobs:
         with:
           version: ${{ inputs.version }}
 
-      - uses: docker/setup-qemu-action@v4
+      - name: Nombre de la imagen
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/coroom-server" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v4
+        id: buildx
 
-      # amd64 y arm64; deploy/Dockerfile compila de forma cruzada en la plataforma del runner. No se
-      # sube: queda en la caché de BuildKit de GitHub, de donde la toma «Publicación» una vez que
-      # las comprobaciones han pasado.
-      - uses: docker/build-push-action@v7
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.image.outputs.name }}
+          labels: |
+            org.opencontainers.image.title=coroom-server
+            org.opencontainers.image.description=Servidor autoalojado de coroom: API, señalización y relay
+            org.opencontainers.image.version=${{ inputs.version }}
+
+      # Registro de crates y target/ de las cachés de BuildKit del Dockerfile (las capas no hacen
+      # falta: lo que cuesta es cargo). Una entrada por commit y, al empezar, la más reciente; cargo
+      # recompila solo lo que cambió. Se declara antes que buildkit-cache-dance para que, al
+      # terminar, la caché se guarde después de sacar los datos de BuildKit.
+      - name: Caché de cargo
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: cargo-cache
+          key: docker-cargo-${{ matrix.arch }}-${{ github.sha }}
+          restore-keys: docker-cargo-${{ matrix.arch }}-
+
+      - uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          cache-map: |
+            {
+              "cargo-cache/registry": {"target": "/usr/local/cargo/registry", "id": "coroom-registry-${{ matrix.arch }}"},
+              "cargo-cache/target": {"target": "/src/target", "id": "coroom-target-${{ matrix.arch }}"}
+            }
+          skip-extraction: ${{ steps.cache.outputs.cache-hit }}
+
+      - id: build
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: deploy/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          platforms: linux/${{ matrix.arch }}
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.image.outputs.name }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Digest
+        run: |
+          mkdir -p digests
+          echo "${{ steps.build.outputs.digest }}" > "digests/${{ matrix.arch }}"
+          cat "digests/${{ matrix.arch }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 7

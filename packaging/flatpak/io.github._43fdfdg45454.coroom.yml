@@ -10,19 +10,26 @@
 # con `_` delante del usuario porque ningún componente puede empezar por un dígito.
 #
 # Runtime 26.08 (el más reciente de freedesktop-sdk). Ya trae, en la Platform, lo que coroom usa del
-# sistema: SVT-AV1 4.2, dav1d 1.5, libva 2.24, el cargador de Vulkan, PipeWire, Wayland, libopus
-# 1.6.1 y WebRTC Audio Processing 2.1; libei no hace falta (`reis` habla el protocolo EI en Rust).
-# Se compilan aparte:
+# sistema: FFmpeg 8.1.3, SVT-AV1 4.2, dav1d 1.5, libva 2.24, el cargador de Vulkan, PipeWire,
+# Wayland, libopus 1.6.1 y WebRTC Audio Processing 2.1; libei no hace falta (`reis` habla el
+# protocolo EI en Rust).
 #
-# - FFmpeg 8.1.3 en LGPL (sin GPL ni nonfree), con Vulkan Video, VA-API, NVENC/NVDEC (cabeceras
-#   ffnvcodec del SDK, la biblioteca la carga el driver), AMF, SVT-AV1 y dav1d del runtime. Sin
-#   QSV: el SDK no trae libvpl. El de la Platform no sirve: no tiene los codificadores de Vulkan ni
-#   el decodificador `hevc`.
+# - FFmpeg es el del runtime, sin compilar nada: coroom se enlaza con el del SDK (la misma etiqueta
+#   n8.1.3 y el mismo commit que `tools/ffmpeg.lock`) y, al ejecutarse, la extensión
+#   `org.freedesktop.Platform.codecs-extra` pone delante el suyo, con la misma configuración base
+#   (Vulkan Video, VA-API, NVENC/NVDEC, AMF, SVT-AV1, dav1d) y todos los códecs: el de la Platform
+#   sola no trae los codificadores de Vulkan ni el decodificador `hevc`. La extensión se instala
+#   sola con el runtime (sin `no-autodownload`). Es GPL (x264 y x265); coroom la usa, no la
+#   distribuye. Si alguien la bloquea (`flatpak mask`), queda el FFmpeg de la Platform y coroom elige
+#   otro codificador (VA-API, NVENC o el software).
 # - coroom con cargo sin red: `cargo-sources.json` (generado con `flatpak-cargo-generator.py` de
 #   flatpak-builder-tools desde `Cargo.lock`) vendoriza las crates de crates.io; las copias
 #   parcheadas de `vendor/` vienen con el propio código. libopus (`opusic-sys`) y el procesado de
 #   voz de WebRTC (`webrtc-audio-processing`, con meson) se compilan desde las crates; abseil-cpp
 #   llega como paquete de meson (los mismos ficheros que `tools/fetch-meson-wraps.sh`).
+# - Con `--ccache` (la CI), el `target/` de cargo vive en el directorio de ccache de
+#   flatpak-builder (/run/ccache), que se guarda entre ejecuciones: solo se recompila lo que cambió.
+#   `tools/prune-cargo-target.py` borra lo que esta compilación ya no usa para que no crezca.
 id: io.github._43fdfdg45454.coroom
 runtime: org.freedesktop.Platform
 runtime-version: '26.08'
@@ -58,44 +65,10 @@ build-options:
 cleanup:
   - /include
   - /lib/pkgconfig
-  - /share/ffmpeg
   - /share/doc
   - /share/man
   - '*.a'
 modules:
-  - name: ffmpeg
-    # LGPL 2.1 o posterior: --disable-gpl y --disable-nonfree (también son los valores por defecto,
-    # pero se dicen para que nadie los cambie sin verlo).
-    config-opts:
-      - --disable-static
-      - --enable-shared
-      - --disable-programs
-      - --disable-doc
-      - --disable-debug
-      - --disable-gpl
-      - --disable-nonfree
-      - --disable-indevs
-      - --disable-outdevs
-      - --enable-vulkan
-      - --enable-libshaderc
-      - --enable-libdrm
-      - --enable-vaapi
-      - --enable-ffnvcodec
-      - --enable-nvenc
-      - --enable-nvdec
-      - --enable-amf
-      - --enable-libsvtav1
-      - --enable-libdav1d
-    sources:
-      # Espejo oficial de FFmpeg en GitHub (git.ffmpeg.org dejaba sin resolver el DNS en la CI) con
-      # la etiqueta fijada a su commit, que flatpak-builder comprueba.
-      # Mismo código que el tarball oficial ffmpeg-8.1.3.tar.xz y que la build de desarrollo de
-      # `tools/ffmpeg.lock`.
-      - type: git
-        url: https://github.com/FFmpeg/FFmpeg.git
-        tag: n8.1.3
-        commit: 1041abdc962f4cc4f394aa8de9dc5236c0c3b9e7
-
   - name: coroom
     buildsystem: simple
     build-options:
@@ -107,11 +80,11 @@ modules:
       env:
         CARGO_HOME: /run/build/coroom/cargo
         CARGO_NET_OFFLINE: 'true'
-        # El FFmpeg de arriba (tienen prioridad sobre `.cargo/config.toml`).
-        FFMPEG_INCLUDE_DIR: /app/include
-        FFMPEG_LIBS_DIR: /app/lib
+        # El FFmpeg del SDK (tienen prioridad sobre `.cargo/config.toml`).
+        FFMPEG_INCLUDE_DIR: /usr/include
+        FFMPEG_LIBS_DIR: /usr/lib/x86_64-linux-gnu
         FFMPEG_LINK_MODE: dynamic
-        # Bindings de FFmpeg pregenerados (misma versión n8.1.3): con el libclang 22 del SDK,
+        # Bindings de FFmpeg pregenerados (la misma n8.1.3 del runtime): con el libclang 22 del SDK,
         # bindgen deja opacas las estructuras y rsmpeg no compila (ver la cabecera del fichero).
         FFMPEG_BINDING_PATH: /run/build/coroom/packaging/flatpak/ffmpeg-binding.rs
         LIBCLANG_PATH: /usr/lib/sdk/llvm22/lib
@@ -121,8 +94,15 @@ modules:
         MESON_PACKAGE_CACHE_DIR: /run/build/coroom/meson-packagecache
         PKG_CONFIG: /run/build/coroom/packaging/flatpak/pkg-config-sin-abseil
     build-commands:
-      - cargo --offline build --release --locked -p coroom
-      - install -Dm755 target/release/coroom /app/bin/coroom
+      # Un solo comando: cada uno corre en su propio shell y los tres usan el mismo `target`.
+      - |
+        set -eu
+        target=target
+        if [ -d /run/ccache ]; then target=/run/ccache/cargo-target; fi
+        cargo --offline build --release --locked -p coroom --target-dir "$target" \
+          --message-format=json-render-diagnostics > cargo-messages.json
+        python3 tools/prune-cargo-target.py "$target/release" cargo-messages.json
+        install -Dm755 "$target/release/coroom" /app/bin/coroom
       - install -Dm644 packaging/flatpak/io.github._43fdfdg45454.coroom.desktop
         /app/share/applications/io.github._43fdfdg45454.coroom.desktop
       - install -Dm644 packaging/flatpak/io.github._43fdfdg45454.coroom.metainfo.xml

@@ -9,6 +9,7 @@ on:
     paths:
       - "packaging/flatpak/**"
       - "packaging/icons/**"
+      - "tools/prune-cargo-target.py"
       - ".github/workflows/flatpak.yml"
   workflow_dispatch:
     inputs:
@@ -47,12 +48,31 @@ jobs:
       - name: Fuentes de cargo al día
         run: tools/check-locks.sh --flatpak-only
 
+      # Estado de flatpak-builder (.flatpak-builder): descargas, módulos ya construidos y el
+      # directorio de ccache, donde el manifiesto deja el `target/` de cargo. Una entrada por commit
+      # y, al empezar, la más reciente: cargo y ccache saben qué hay que recompilar, así que no hace
+      # falta que la clave cuadre. La caché propia de la acción no sirve para esto (con una clave
+      # fija no se vuelve a guardar; con una que cambia no recupera la anterior): se apaga y solo
+      # se le deja pasar `--ccache`.
+      - name: Caché de flatpak-builder
+        uses: actions/cache@v4
+        with:
+          path: .flatpak-builder
+          key: flatpak-builder-x86_64-${{ github.sha }}
+          restore-keys: flatpak-builder-x86_64-
+
       - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
           manifest-path: packaging/flatpak/io.github._43fdfdg45454.coroom.yml
           bundle: coroom-${{ inputs.version || '0.0.0' }}-x86_64.flatpak
-          cache-key: flatpak-builder-${{ hashFiles('packaging/flatpak/**', 'Cargo.lock') }}
+          cache: true
+          restore-cache: false
+          save-cache: false
           upload-artifact: false
+
+      # Tamaño de lo que se guarda (flatpak-builder ya poda sus módulos viejos al terminar).
+      - name: Tamaño del estado de flatpak-builder
+        run: du -sh .flatpak-builder/* .flatpak-builder
 
       - uses: actions/upload-artifact@v7
         with:

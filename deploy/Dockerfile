@@ -2,10 +2,10 @@
 # Imagen de coroom-server. Se construye desde la raíz del repositorio:
 #   docker build -f deploy/Dockerfile -t coroom-server .
 #
-# Multi-arquitectura (la CI publica amd64 y arm64): la etapa de compilación corre siempre en la
-# plataforma de quien construye y compila de forma cruzada para la de destino (amd64 o arm64), así
-# arm64 no pasa por QEMU:
+# Multi-arquitectura: la etapa de compilación corre siempre en la plataforma de quien construye y
+# compila de forma cruzada para la de destino (amd64 o arm64), así arm64 no pasa por QEMU:
 #   docker buildx build --platform linux/amd64,linux/arm64 -f deploy/Dockerfile .
+# La CI construye cada arquitectura en un runner nativo (amd64 y arm64) y las une en una imagen.
 
 FROM --platform=$BUILDPLATFORM rust:1-bookworm AS build
 ARG TARGETARCH
@@ -38,13 +38,17 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     AR_x86_64_unknown_linux_gnu=x86_64-linux-gnu-ar
 COPY . .
 # Las cachés de BuildKit guardan el registro de crates y target/ (una por arquitectura) entre
-# compilaciones; el binario se copia fuera de la caché en el mismo paso.
+# compilaciones; el binario se copia fuera de la caché en el mismo paso. En la CI, esas cachés se
+# guardan y se recuperan entre ejecuciones (buildkit-cache-dance, .github/workflows/packages.yml):
+# `tools/prune-cargo-target.py` borra lo que esta compilación ya no usa para que target/ no crezca.
 # Las dos arquitecturas se compilan a la vez: cada una con su registro de crates (si lo comparten,
 # las dos desempaquetan las mismas crates a la vez y cargo falla con «File exists»).
 RUN --mount=type=cache,id=coroom-registry-${TARGETARCH},target=/usr/local/cargo/registry \
     --mount=type=cache,id=coroom-target-${TARGETARCH},target=/src/target \
     triple="$(cat /triple)" \
     && cargo build --release --locked -p coroom-server --target "$triple" \
+         --message-format=json-render-diagnostics > /tmp/cargo-messages.json \
+    && python3 tools/prune-cargo-target.py "target/$triple/release" /tmp/cargo-messages.json \
     && install -D -m 0755 "target/$triple/release/coroom-server" /out/coroom-server \
     && install -d -m 0700 /out/data
 

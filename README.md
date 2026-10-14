@@ -600,10 +600,12 @@ Linux y Windows en cada push y pull request.
 ### Paquetes (Flatpak, MSIX, imagen)
 
 - **Flatpak**: `packaging/flatpak/io.github._43fdfdg45454.coroom.yml` sobre el runtime
-  `org.freedesktop.Platform` 26.08 con las extensiones `rust-stable` y `llvm22`; compila FFmpeg
-  8.1.3 en LGPL (Vulkan, VA-API, NVENC/NVDEC, AMF, SVT-AV1 y dav1d del runtime) y coroom con cargo
-  **sin red**. Las crates de crates.io van en `packaging/flatpak/cargo-sources.json`, que hay que
-  regenerar cada vez que cambia `Cargo.lock` (`tools/check-locks.sh` lo comprueba, también en la CI):
+  `org.freedesktop.Platform` 26.08 con las extensiones `rust-stable` y `llvm22`; compila coroom con
+  cargo **sin red** y usa el FFmpeg 8.1.3 del runtime: al ejecutarse, la extensión
+  `org.freedesktop.Platform.codecs-extra` (se instala sola con el runtime) le da los codificadores
+  de Vulkan Video y el decodificador HEVC, además de VA-API, NVENC/NVDEC, AMF, SVT-AV1 y dav1d.
+  Las crates de crates.io van en `packaging/flatpak/cargo-sources.json`, que hay que regenerar
+  cada vez que cambia `Cargo.lock` (`tools/check-locks.sh` lo comprueba, también en la CI):
 
   ```bash
   curl -LO https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
@@ -615,7 +617,8 @@ Linux y Windows en cada push y pull request.
   abseil-cpp de meson, como fuentes `file` del manifiesto (los de `tools/fetch-meson-wraps.sh`).
   `cargo vendor --locked` comprueba en local que `Cargo.lock` y las fuentes cuadran.
 - **MSIX y `.zip`**: `packaging/msix/build.ps1` (ver «Instalar»).
-- **Imagen del servidor**: `deploy/Dockerfile`, multi-arquitectura con compilación cruzada.
+- **Imagen del servidor**: `deploy/Dockerfile`, multi-arquitectura con compilación cruzada (la CI
+  construye cada arquitectura en un runner nativo y las une al publicar).
 
 ### Fuzzing, matriz de red y larga duración
 
@@ -640,8 +643,9 @@ publica una versión.
    repositorio): fmt, clippy, tests, `cargo deny` y las puertas E2EE en Linux y Windows; el Flatpak,
    el MSIX (firmado con el certificado de prueba) y el `.zip`, la imagen del servidor y el driver de
    mando (build de desarrollo, sin firmar).
-3. **Publicación**, solo si todo lo anterior pasó: sube la imagen
-   `ghcr.io/<propietario>/coroom-server:X.Y.Z` (y `:latest`), crea la etiqueta `vX.Y.Z` sobre el
+3. **Publicación**, solo si todo lo anterior pasó: une las imágenes de cada arquitectura (que
+   «Paquetes» deja en GHCR solo por digest, sin etiqueta) en
+   `ghcr.io/<propietario>/coroom-server:X.Y.Z` (y `:latest`), sin volver a compilar; crea la etiqueta `vX.Y.Z` sobre el
    commit y la release de GitHub con los paquetes, `SHA256SUMS` y las notas sacadas de los commits
    desde la versión anterior.
 
@@ -666,9 +670,10 @@ coroom se apoya en estos proyectos; sus licencias se respetan en cada distribuci
   ([`apps/desktop/assets/licenses/LUCIDE-ISC.txt`](apps/desktop/assets/licenses/LUCIDE-ISC.txt)).
 - **iced** (`iced_wgpu` y `cryoglyph` con los cambios de [`vendor/`](vendor/README.md)):
   MIT (cryoglyph, MIT o Apache-2.0 o Zlib).
-- **FFmpeg** (enlace dinámico con las builds LGPL compartidas de BtbN, sin
-  componentes GPL, que también van en el MSIX y el `.zip` de Windows; el Flatpak lo compila desde
-  el fuente con `--disable-gpl`): LGPL-2.1 o posterior, con SVT-AV1 (BSD-3-Clause-Clear y patentes AOM), dav1d
+- **FFmpeg** (enlace dinámico con las builds LGPL compartidas de BtbN, sin componentes GPL, que
+  también van en el MSIX y el `.zip` de Windows; el Flatpak usa el del runtime freedesktop, que con
+  la extensión `codecs-extra` es GPL por x264 y x265, y coroom no lo distribuye): LGPL-2.1 o
+  posterior, con SVT-AV1 (BSD-3-Clause-Clear y patentes AOM), dav1d
   (BSD-2-Clause), libvpl (MIT) y las cabeceras de NVIDIA (`nv-codec-headers`, MIT) y AMF (MIT).
   Los bindings `rsmpeg` y `rusty_ffmpeg` son MIT.
 - **PipeWire** y **libei** en Linux: MIT. libei se habla con `reis`

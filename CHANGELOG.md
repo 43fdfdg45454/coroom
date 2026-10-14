@@ -202,6 +202,16 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Cambiado
 
+- **El Flatpak usa el FFmpeg del runtime** (8.1.3, el mismo que antes se compilaba aparte) y, al
+  ejecutarse, el de la extensión `org.freedesktop.Platform.codecs-extra`, que se instala sola con
+  el runtime: los codificadores de Vulkan Video, el decodificador HEVC, VA-API, NVENC/NVDEC, AMF,
+  SVT-AV1 y dav1d. Con esa extensión, el FFmpeg que carga el Flatpak es GPL (x264 y x265); coroom
+  no lo distribuye.
+- CI más rápida: el Flatpak ya no compila FFmpeg y guarda entre ejecuciones el `target/` de cargo;
+  la imagen del servidor se construye en un runner nativo por arquitectura, con el `target/`
+  guardado, y «Publicación» une y etiqueta esas imágenes sin volver a compilar.
+  `tools/prune-cargo-target.py` borra lo que la última compilación no usó, para que esas cachés no
+  crezcan.
 - Audio con unos 13 ms menos de latencia en Linux (mediana del audio del juego en el test de
   extremo a extremo: de 46,7 a 33,4 ms; desfase A−V medio de 26 a 15 ms). La salida de PipeWire
   reproduce a demanda: su callback pide cada trama justo cuando el dispositivo la necesita, en vez
