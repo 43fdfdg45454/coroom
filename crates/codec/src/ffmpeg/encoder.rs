@@ -281,8 +281,10 @@ pub struct FfmpegEncoder {
     config: Option<EncoderConfig>,
     keyframe_requested: bool,
     next_pts: i64,
-    /// `(pts, frame_id)` de los fotogramas entregados cuyo paquete no ha salido.
-    in_flight: VecDeque<(i64, u64)>,
+    /// `(pts, frame_id, imagen)` de los fotogramas entregados cuyo paquete no ha salido. La imagen
+    /// de GPU de la captura (y el búfer de PipeWire que retiene) se suelta cuando sale el paquete:
+    /// entonces la GPU ya la leyó ([`import`](super::import), `drm_frame`).
+    in_flight: VecDeque<(i64, u64, Option<GpuImage>)>,
     unused_options: Vec<String>,
     reopened: u64,
     /// Paquetes que no correspondían a ningún fotograma pendiente (descartados).
@@ -507,7 +509,7 @@ impl FfmpegEncoder {
                     let (packet_pts, keyframe, data) = read_packet(&packet);
                     // El fotograma de un paquete se identifica por su pts.
                     let mut frame_id = None;
-                    while let Some(&(front_pts, id)) = self.in_flight.front() {
+                    while let Some(&(front_pts, id, _)) = self.in_flight.front() {
                         if front_pts > packet_pts {
                             break;
                         }
@@ -523,7 +525,10 @@ impl FfmpegEncoder {
                     }
                 }
                 Err(RsmpegError::EncoderDrainError) => {
-                    let done = self.in_flight.front().is_none_or(|&(front, _)| front > pts);
+                    let done = self
+                        .in_flight
+                        .front()
+                        .is_none_or(|(front, _, _)| *front > pts);
                     let now = Instant::now();
                     if done || now >= deadline {
                         break;
@@ -913,7 +918,7 @@ impl Encoder for FfmpegEncoder {
         Some(match session.ctx.send_frame(Some(&hw)) {
             Ok(()) | Err(RsmpegError::SendFrameAgainError) => {
                 self.copies = 0;
-                self.finish_frame(pts, frame_id, fps)
+                self.finish_frame(pts, frame_id, None, fps)
             }
             Err(err) => Err(backend_error("entregar el fotograma repetido", &err)),
         })
@@ -995,7 +1000,7 @@ impl FfmpegEncoder {
         let keyframe = std::mem::take(&mut self.keyframe_requested);
         let copies = self.send_cpu(frame, pts, keyframe)?;
         self.copies = copies;
-        self.finish_frame(pts, frame.frame_id, config.fps)
+        self.finish_frame(pts, frame.frame_id, None, config.fps)
     }
 
     /// Copia `frame` en el `AVFrame` de CPU de la sesión, lo sube a la GPU si hace falta y lo
@@ -1121,7 +1126,13 @@ impl FfmpegEncoder {
         if !sent {
             return Ok(Vec::new());
         }
-        self.finish_frame(pts, frame.frame_id, config.fps)
+        // Un DMA-BUF se retiene hasta su paquete (el mapeo de FFmpeg no lo retiene); una textura
+        // D3D11 ya se copió al pool propio.
+        #[cfg(unix)]
+        let held = matches!(image, GpuImage::DmaBuf(_)).then(|| image.clone());
+        #[cfg(not(unix))]
+        let held = None;
+        self.finish_frame(pts, frame.frame_id, held, config.fps)
     }
 
     /// Importador para `image`: sin copias si no falló antes; si no se puede, el de respaldo.
@@ -1173,9 +1184,10 @@ impl FfmpegEncoder {
         &mut self,
         pts: i64,
         frame_id: u64,
+        image: Option<GpuImage>,
         fps: u32,
     ) -> Result<Vec<EncodedSlice>, CodecError> {
-        self.in_flight.push_back((pts, frame_id));
+        self.in_flight.push_back((pts, frame_id, image));
         let period = Duration::from_secs(1) / fps.max(1);
         self.drain(pts, (period * OUTPUT_WAIT_FRAMES).max(OUTPUT_WAIT_MIN))
     }

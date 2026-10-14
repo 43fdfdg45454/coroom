@@ -46,6 +46,13 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **Con anfitrión Linux y codificador por GPU, la captura se paraba a los pocos fotogramas**
+  (invitados en «Entrando en la sala… Vídeo» con el audio sonando, o con un solo fotograma, en
+  cualquier códec). Los filtros de Vulkan de FFmpeg sueltan su entrada al reutilizar su contexto
+  de ejecución, decenas de fotogramas después, y el DMA-BUF mapeado retenía el búfer de PipeWire:
+  el compositor se quedaba sin búferes y dejaba de mandar fotogramas. Ahora FFmpeg recibe
+  duplicados de los descriptores y el búfer vuelve a PipeWire en cuanto sale el paquete del
+  fotograma. Con `COROOM_ZERO_COPY=0` no pasaba porque la captura iba por memoria de CPU.
 - **Invitado sin imagen con anfitrión Linux** cuando la ventana o la pantalla capturada deja de
   redibujarse (un juego en pausa al perder el foco, una ventana tapada o minimizada): con la
   captura de PipeWire por DMA-BUF no había nada que repetir y el invitado se quedaba en el primer

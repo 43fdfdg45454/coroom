@@ -563,7 +563,11 @@ fn object_size(fd: &std::os::fd::OwnedFd) -> usize {
 }
 
 /// `AVFrame` `AV_PIX_FMT_DRM_PRIME` que apunta a `image`: `data[0]` es su descriptor y `buf[0]` un
-/// búfer que mantiene vivos el descriptor y la imagen (sus fd) mientras FFmpeg use el fotograma.
+/// búfer que mantiene vivos el descriptor y duplicados de los fd de sus planos mientras FFmpeg use
+/// el fotograma. No retiene el búfer de PipeWire (`keepalive`): los filtros de Vulkan de FFmpeg
+/// sueltan su entrada al reutilizar su contexto de ejecución (decenas de fotogramas después), y
+/// con ella retenida la captura se quedaba sin búferes y se paraba a los pocos fotogramas. El búfer
+/// lo retiene el codificador hasta que sale el paquete del fotograma, cuando la GPU ya lo leyó.
 #[cfg(target_os = "linux")]
 fn drm_frame(image: &Arc<crate::gpu::DmaBufImage>) -> Result<AVFrame, String> {
     use super::hw::AVDRMFrameDescriptor;
@@ -571,7 +575,7 @@ fn drm_frame(image: &Arc<crate::gpu::DmaBufImage>) -> Result<AVFrame, String> {
     /// Dueño del descriptor y de la imagen.
     struct Owner {
         desc: AVDRMFrameDescriptor,
-        _image: Arc<crate::gpu::DmaBufImage>,
+        _fds: Vec<std::os::fd::OwnedFd>,
     }
 
     unsafe extern "C" fn free_owner(opaque: *mut std::ffi::c_void, _data: *mut u8) {
@@ -580,10 +584,32 @@ fn drm_frame(image: &Arc<crate::gpu::DmaBufImage>) -> Result<AVFrame, String> {
         unsafe { drop(Box::from_raw(opaque.cast::<Owner>())) };
     }
 
-    let desc = drm_descriptor(image)?;
+    let planes = image
+        .planes
+        .iter()
+        .map(|plane| {
+            Ok(crate::gpu::DmaBufPlane {
+                fd: plane
+                    .fd
+                    .try_clone()
+                    .map_err(|err| format!("no se pudo duplicar el DMA-BUF: {err}"))?,
+                offset: plane.offset,
+                stride: plane.stride,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let own = crate::gpu::DmaBufImage {
+        planes,
+        modifier: image.modifier,
+        fourcc: image.fourcc,
+        width: image.width,
+        height: image.height,
+        keepalive: None,
+    };
+    let desc = drm_descriptor(&own)?;
     let owner = Box::into_raw(Box::new(Owner {
         desc,
-        _image: Arc::clone(image),
+        _fds: own.planes.into_iter().map(|plane| plane.fd).collect(),
     }));
     let mut frame = AVFrame::new();
     frame.set_format(ffi::AV_PIX_FMT_DRM_PRIME);
@@ -886,6 +912,41 @@ mod tests {
             ..image
         };
         assert!(drm_descriptor(&empty).is_err());
+    }
+
+    /// El fotograma DRM que se da a FFmpeg no retiene el búfer de PipeWire: los filtros de Vulkan
+    /// sueltan su entrada decenas de fotogramas después, y la captura se quedaba sin búferes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_drm_frame_does_not_hold_the_capture_buffer() {
+        use std::os::fd::{AsRawFd, OwnedFd};
+
+        use crate::gpu::{DRM_FORMAT_XRGB8888, DmaBufImage, DmaBufPlane};
+
+        let keepalive: crate::gpu::KeepAlive = Arc::new(());
+        let fd: OwnedFd = tempfile_with(4096).into();
+        let raw = fd.as_raw_fd();
+        let image = Arc::new(DmaBufImage {
+            planes: vec![DmaBufPlane {
+                fd,
+                offset: 0,
+                stride: 256 * 4,
+            }],
+            modifier: 0,
+            fourcc: DRM_FORMAT_XRGB8888,
+            width: 256,
+            height: 4,
+            keepalive: Some(Arc::clone(&keepalive)),
+        });
+        let frame = drm_frame(&image).expect("fotograma DRM");
+        assert_eq!(Arc::strong_count(&keepalive), 2, "solo la imagen y el test");
+        drop(image);
+        assert_eq!(Arc::strong_count(&keepalive), 1, "se suelta con la imagen");
+        // El descriptor sigue apuntando a un fd abierto (un duplicado propio).
+        // SAFETY: `data[0]` de un fotograma de `drm_frame` es su `AVDRMFrameDescriptor`.
+        let desc = unsafe { &*(frame.data[0] as *const super::super::hw::AVDRMFrameDescriptor) };
+        assert_ne!(desc.objects[0].fd, raw);
+        assert_eq!(desc.objects[0].size, 4096, "el duplicado sigue abierto");
     }
 
     /// Fichero temporal de `len` bytes (hace de objeto DMA-BUF: lo que importa es el fd).
