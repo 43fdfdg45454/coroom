@@ -93,7 +93,7 @@ async fn health_and_version_over_http3_and_tcp() {
         json!({
             "name": "coroom-server",
             "version": env!("CARGO_PKG_VERSION"),
-            "protocol": 8,
+            "protocol": coroom_transport::proto::PROTOCOL_VERSION,
             "source": "https://github.com/43fdfdg45454/coroom",
         })
     );
@@ -123,7 +123,7 @@ async fn health_and_version_over_http3_and_tcp() {
         json!({
             "name": "coroom-server",
             "version": env!("CARGO_PKG_VERSION"),
-            "protocol": 8,
+            "protocol": coroom_transport::proto::PROTOCOL_VERSION,
             "source": "https://github.com/43fdfdg45454/coroom",
         })
     );

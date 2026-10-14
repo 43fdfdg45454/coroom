@@ -37,7 +37,7 @@ use super::negotiate::{GuestCapabilities, codec_from_wire, format_from_wire, sha
 use super::wire::{Payload, host_recipient, pairwise_info};
 use super::{
     Command, Core, GUEST_FRAME_INTERVAL, MAX_RECONNECT_ATTEMPTS, QUALITY_PING_PERIOD, QualityLevel,
-    REPLY_TIMEOUT, RemoteConfig, SessionEvent, Started, advertised_candidates, lock,
+    REPLY_TIMEOUT, RemoteConfig, RoomMember, SessionEvent, Started, advertised_candidates, lock,
     reconnect_delay,
 };
 use crate::latency::{AudioTrack, Stage};
@@ -1121,6 +1121,28 @@ async fn control_loop(
             }
             Some(ControlMessage::VoiceState { guest, speaking }) => {
                 core.audio.set_talker(guest, speaking);
+            }
+            Some(ControlMessage::Members { members }) => {
+                if ControlMessage::members_within_limits(&members) {
+                    let own = core.own_leaf.load(Ordering::Acquire);
+                    let host_name = lock(&core.link).host_name.clone();
+                    let members = members
+                        .into_iter()
+                        .map(|member| RoomMember {
+                            name: if member.guest == 0 && member.name.is_empty() {
+                                host_name.clone()
+                            } else {
+                                member.name
+                            },
+                            guest: member.guest,
+                            you: member.leaf == own,
+                            leaf: member.leaf,
+                        })
+                        .collect();
+                    core.emit(SessionEvent::Members(members));
+                } else {
+                    debug!("lista de miembros fuera de límites; se ignora");
+                }
             }
             Some(ControlMessage::GamepadMode { slot, raw }) => {
                 core.guest_input.set_pad_mode(slot, raw);

@@ -159,6 +159,15 @@ pantalla-guest-total-de-extremo-a-extremo = Total (de extremo a extremo)
 pantalla-guest-ver-ya = Ver ya
 pantalla-guest-video = Vídeo
 pantalla-guest-mandos = Mandos (Ctrl+Alt+{ $key })
+pantalla-guest-personas = Personas en la sala
+pantalla-guest-personas-en-la-sala = Personas en la sala
+pantalla-guest-anfitrion = anfitrión
+pantalla-guest-invitado = invitado
+pantalla-guest-tu-nombre = { $name } (tú)
+pantalla-guest-dejar-de-oir = Dejar de oír a { $name } (solo tú)
+pantalla-guest-volver-a-oir = Volver a oír a { $name }
+pantalla-guest-esperando-la-lista = Esperando la lista de la sala…
+pantalla-guest-solo-en-tu-equipo = Silenciar a alguien solo cambia lo que oyes tú: los demás le siguen oyendo.
 pantalla-guest-mando-que-envias = Mando que envías
 pantalla-guest-automatico = Automático
 pantalla-guest-el-ultimo-que-conectes = El último que conectes; si lo desconectas, el siguiente.
@@ -336,6 +345,8 @@ pantalla-host-tu-sala = Tu sala
 pantalla-host-un-patron-animado-sirve-para-probar = Un patrón animado: sirve para probar la conexión sin enseñar nada tuyo.
 pantalla-host-video = Vídeo
 pantalla-host-voz = Voz
+pantalla-host-dejar-de-oir = Dejar de oír a { $name } (solo en este equipo)
+pantalla-host-volver-a-oir = Volver a oír a { $name }
 
 ## pantalla-login
 

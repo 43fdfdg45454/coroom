@@ -383,6 +383,16 @@ pub enum Effect {
     SetAppAudio(coroom_session::audio::GameCapture),
     /// Aplicar a la sala abierta el códec, el codificador y el bitrate máximo de los ajustes.
     SetVideo,
+    /// Dejar de oír (o volver a oír) una voz en este equipo: en la sala propia (`host`, por id de
+    /// invitado) o en la que se está como invitado (por hoja MLS).
+    SetVoiceMuted {
+        /// Si es la sala que este equipo comparte.
+        host: bool,
+        /// Emisor de la voz.
+        source: u32,
+        /// Silenciada.
+        muted: bool,
+    },
     /// Permisos de un invitado.
     SetPermissions(GuestId, Permissions),
     /// Expulsar.

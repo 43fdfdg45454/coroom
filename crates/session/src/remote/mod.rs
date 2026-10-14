@@ -383,6 +383,8 @@ pub enum SessionEvent {
     RelayUnavailable(String),
     /// Algo no fue bien pero la sesión sigue.
     Warning(String),
+    /// Invitado: quién está en la sala (el anfitrión incluido), cada vez que cambia.
+    Members(Vec<RoomMember>),
     /// La sesión terminó (`None` = cierre normal).
     Ended(Option<SessionError>),
 }
@@ -437,6 +439,10 @@ impl fmt::Display for SessionEvent {
             ),
             SessionEvent::Connected { path, remote } => {
                 write!(f, "Conectado con el anfitrión ({path}, {remote}).")
+            }
+            SessionEvent::Members(members) => {
+                let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+                write!(f, "En la sala: {}.", names.join(", "))
             }
             SessionEvent::QualityEstimate { rtt_ms, level } => write!(
                 f,
@@ -562,6 +568,19 @@ pub struct GuestPad {
     pub raw: bool,
     /// Por qué no va tal cual, si se pidió y no se pudo.
     pub note: Option<String>,
+}
+
+/// Miembro de la sala visto desde un invitado ([`SessionEvent::Members`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoomMember {
+    /// Id del invitado (0 = el anfitrión), el de los avisos de quién habla.
+    pub guest: u32,
+    /// Hoja MLS: con ella se silencia su voz ([`AudioControl::set_voice_muted`]).
+    pub leaf: u32,
+    /// Nombre visible.
+    pub name: String,
+    /// Si es este mismo equipo.
+    pub you: bool,
 }
 
 /// Cambio de vídeo con la sala abierta ([`RemoteSession::set_video`]).

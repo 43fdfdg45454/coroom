@@ -29,8 +29,9 @@ pub mod signal;
 /// usuario y nombre en `Joined` y `PeerJoined`, `Invite`, `Invited`, `Presence`, `QuotaExceeded`
 /// y `RelayDisabled`); la 7, el formato del vídeo (espacio de color, croma y profundidad en
 /// `CodecSelected`, 4:4:4 y HDR10 en `Capabilities`); la 8, los mandos tal cual (`pads` en los
-/// paquetes y mensajes de entrada, `GamepadMode` y `GamepadOutput`).
-pub const PROTOCOL_VERSION: u16 = 8;
+/// paquetes y mensajes de entrada, `GamepadMode` y `GamepadOutput`); la 9, los miembros de la
+/// sala con su nombre (`Members`), para que cada uno silencie a quien quiera.
+pub const PROTOCOL_VERSION: u16 = 9;
 
 /// Identificadores ALPN (RFC 7301) que el socket QUIC usa para demultiplexar conexiones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

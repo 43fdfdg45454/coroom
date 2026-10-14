@@ -16,7 +16,7 @@ de la ficha de AppStream del Flatpak.
 
 ## Estado
 
-**Versión 1.0.0** (protocolo 8). Lo que incluye está en el [`CHANGELOG.md`](CHANGELOG.md); lo que
+**Versión 1.0.0** (protocolo 9). Lo que incluye está en el [`CHANGELOG.md`](CHANGELOG.md); lo que
 está implementado y probado en la CI pero falta validar en hardware real (GPU reales, Windows real,
 dos NAT distintas, pantallas HDR y de 120 Hz), en [`docs/ARQUITECTURA.md`](docs/ARQUITECTURA.md) §7.
 

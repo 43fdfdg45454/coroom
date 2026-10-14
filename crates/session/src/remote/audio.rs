@@ -149,6 +149,9 @@ struct ControlInner {
     voice_enabled: AtomicBool,
     speaking: AtomicBool,
     talkers: Mutex<BTreeSet<u32>>,
+    /// Voces que este equipo no quiere oír, por emisor (la hoja SFrame en el invitado, el id del
+    /// invitado en el anfitrión). Solo afecta a lo que se reproduce aquí.
+    muted_voices: Mutex<BTreeSet<u32>>,
 }
 
 /// Mandos del audio que la ventana y la consola tocan en caliente (atajos `Ctrl+Alt+M` y
@@ -229,6 +232,23 @@ impl AudioControl {
     /// Cambia el estado de «hablando»; devuelve si cambió.
     pub(crate) fn set_speaking(&self, speaking: bool) -> bool {
         self.inner.speaking.swap(speaking, Ordering::AcqRel) != speaking
+    }
+
+    /// Deja de oír (o vuelve a oír) la voz de `source`: la hoja SFrame de un miembro en el
+    /// invitado ([`super::RoomMember::leaf`]) o el id de un invitado en el anfitrión. Solo cambia lo
+    /// que suena en este equipo; los demás le siguen oyendo.
+    pub fn set_voice_muted(&self, source: u32, muted: bool) {
+        let mut set = lock(&self.inner.muted_voices);
+        if muted {
+            set.insert(source);
+        } else {
+            set.remove(&source);
+        }
+    }
+
+    /// Si la voz de `source` está silenciada aquí.
+    pub fn voice_muted(&self, source: u32) -> bool {
+        lock(&self.inner.muted_voices).contains(&source)
     }
 
     /// Quién habla en la sala (ids de invitado; 0 = el anfitrión), según `VoiceState`.
@@ -867,6 +887,10 @@ impl Playout {
         }
         for stream in &mut self.voices {
             if let Some((offset, info)) = stream.tick(now) {
+                if self.control.voice_muted(stream.source) {
+                    // Silenciada aquí: sigue su ritmo (para volver al instante), pero no suena.
+                    continue;
+                }
                 let len = stream.frame_len();
                 self.mixer.add(
                     stream.source,

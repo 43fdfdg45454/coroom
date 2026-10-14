@@ -176,6 +176,23 @@ pub struct Feedback {
     pub ecn_ce: u32,
 }
 
+/// Miembro de la sala en [`ControlMessage::Members`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Member {
+    /// Id del invitado (0 = el anfitrión): el de `VoiceState`.
+    pub guest: u32,
+    /// Hoja MLS: el emisor SFrame de su voz.
+    pub leaf: u32,
+    /// Nombre visible (como mucho [`MEMBER_NAME_MAX`] bytes).
+    pub name: String,
+}
+
+/// Miembros como mucho en [`ControlMessage::Members`].
+pub const MEMBERS_MAX: usize = 64;
+
+/// Bytes como mucho del nombre de un [`Member`].
+pub const MEMBER_NAME_MAX: usize = 128;
+
 /// Mensaje de control.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ControlMessage {
@@ -354,6 +371,19 @@ pub enum ControlMessage {
         /// Bytes del informe.
         data: Vec<u8>,
     },
+    /// Anfitrión → invitados: quién está en la sala (el anfitrión incluido), cada vez que alguien
+    /// entra o sale. Cada uno decide a quién oír; no cambia nada en el anfitrión.
+    Members {
+        /// Miembros (como mucho [`MEMBERS_MAX`]).
+        members: Vec<Member>,
+    },
+}
+
+impl ControlMessage {
+    /// `Members` dentro de sus límites (lo demás no se mira aquí).
+    pub fn members_within_limits(members: &[Member]) -> bool {
+        members.len() <= MEMBERS_MAX && members.iter().all(|m| m.name.len() <= MEMBER_NAME_MAX)
+    }
 }
 
 #[cfg(test)]
@@ -542,6 +572,14 @@ mod tests {
                 .prop_map(|(slot, raw)| ControlMessage::GamepadMode { slot, raw }),
             (1u8..=8, prop::collection::vec(any::<u8>(), 1..64))
                 .prop_map(|(slot, data)| ControlMessage::GamepadOutput { slot, data }),
+            prop::collection::vec((any::<u32>(), any::<u32>(), "[a-zñ ]{0,32}"), 0..8).prop_map(
+                |members| ControlMessage::Members {
+                    members: members
+                        .into_iter()
+                        .map(|(guest, leaf, name)| Member { guest, leaf, name })
+                        .collect(),
+                }
+            ),
         ]
     }
 

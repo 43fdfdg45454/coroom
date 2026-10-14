@@ -293,6 +293,22 @@ impl Backend {
                 }
             }
             Effect::SetVideo => self.set_video(&app.settings),
+            Effect::SetVoiceMuted {
+                host,
+                source,
+                muted,
+            } => {
+                let audio = if host {
+                    lock(&self.host)
+                        .clone()
+                        .map(|session| lock(&session).audio())
+                } else {
+                    self.guest_controls().map(|controls| controls.audio)
+                };
+                if let Some(audio) = audio {
+                    audio.set_voice_muted(source, muted);
+                }
+            }
             Effect::SetPermissions(guest, permissions) => {
                 if let Some(session) = lock(&self.host).clone()
                     && let Err(err) = lock(&session).set_permissions(guest, permissions)

@@ -153,6 +153,8 @@ pub struct Room {
     pub preview_unavailable: bool,
     /// Sin relay (cuota o servidor).
     pub relay: Option<String>,
+    /// Invitados cuya voz no se oye en este equipo (decisión del anfitrión, solo para él).
+    pub muted: std::collections::BTreeSet<GuestId>,
 }
 
 /// Estado.
@@ -434,6 +436,8 @@ pub enum Msg {
     Safety(GuestId),
     /// Ir a Ajustes → Vídeo.
     VideoSettings,
+    /// Oír o no la voz de un invitado en este equipo.
+    Hear(GuestId, bool),
     /// Con la sala abierta: compartir lo elegido en vez de lo de ahora.
     ApplySource,
 }
@@ -588,6 +592,20 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             return app.update(Message::Navigate(Page::Settings));
         }
         Msg::ApplySource => return apply_source(app),
+        Msg::Hear(id, hear) => {
+            if let Some(room) = app.host.room.as_mut() {
+                if hear {
+                    room.muted.remove(&id);
+                } else {
+                    room.muted.insert(id);
+                }
+                return vec![Effect::SetVoiceMuted {
+                    host: true,
+                    source: id.0,
+                    muted: !hear,
+                }];
+            }
+        }
     }
     Vec::new()
 }
@@ -727,6 +745,7 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                 preview,
                 preview_unavailable: false,
                 relay: None,
+                muted: std::collections::BTreeSet::new(),
             });
             app.page = Page::Host;
             // La sala lleva su propia señalización: la de espera ya sobra.
@@ -854,6 +873,7 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
                     |s| s.name.clone(),
                 );
             room.guests.retain(|status| status.guest != guest);
+            room.muted.remove(&guest);
             app.toast(
                 Tone::Neutral,
                 if kicked {
@@ -1338,6 +1358,14 @@ fn preview_card(room: &Room) -> Element<'_, Message> {
         .into()
 }
 
+/// Si el anfitrión silenció en su equipo la voz del invitado `id`.
+fn hears_muted(app: &App, id: GuestId) -> bool {
+    app.host
+        .room
+        .as_ref()
+        .is_some_and(|room| room.muted.contains(&id))
+}
+
 fn guest_card<'a>(app: &'a App, status: &'a GuestStatus) -> Element<'a, Message> {
     let id = status.guest;
     let connected = status.path.is_some();
@@ -1434,6 +1462,22 @@ fn guest_card<'a>(app: &'a App, status: &'a GuestStatus) -> Element<'a, Message>
         ]
         .spacing(space::XS)
         .align_y(Alignment::Center),
+        {
+            let muted = hears_muted(app, id);
+            ui::icon_button(
+                if muted {
+                    Icon::HeadphonesOff
+                } else {
+                    Icon::Headphones
+                },
+                if muted {
+                    t!("pantalla-host-volver-a-oir", name = status.name.as_str())
+                } else {
+                    t!("pantalla-host-dejar-de-oir", name = status.name.as_str())
+                },
+                Some(on(Msg::Hear(id, muted))),
+            )
+        },
     ]
     .spacing(space::L)
     .align_y(Alignment::Center);

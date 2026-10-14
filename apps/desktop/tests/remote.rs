@@ -1229,3 +1229,58 @@ fn n_video_recovers_within_half_a_second_after_each_outage() {
     );
     drop(server);
 }
+
+/// Espera un `Members` en `events` con `count` miembros.
+fn wait_members(
+    events: &crossbeam_channel::Receiver<SessionEvent>,
+    count: usize,
+) -> Vec<coroom_session::remote::RoomMember> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if let Ok(SessionEvent::Members(members)) = events.recv_timeout(Duration::from_millis(100))
+            && members.len() == count
+        {
+            return members;
+        }
+    }
+    panic!("no llegó la lista de {count} miembros");
+}
+
+/// (o) Cada invitado recibe quién está en la sala (con nombres, sabiendo cuál es él) para
+/// silenciar a quien quiera, y la lista se actualiza cuando alguien sale.
+#[test]
+fn o_guests_learn_who_is_in_the_room() {
+    let _serial = serial();
+    let server = TestServer::start();
+    let mut host = host(server.config());
+    let code = room_code(&host);
+    let mut first = guest(server.config(), &code, None);
+    let first_events = first.events();
+    let members = wait_members(&first_events, 2);
+    let names: Vec<(&str, bool)> = members.iter().map(|m| (m.name.as_str(), m.you)).collect();
+    assert_eq!(names, [("Jugador 1", false), ("Jugador 2", true)]);
+    assert_eq!(members[0].guest, 0, "el anfitrión es el 0 de VoiceState");
+
+    let mut second = guest(server.config(), &code, None);
+    let members = wait_members(&first_events, 3);
+    assert!(
+        members
+            .iter()
+            .any(|m| m.name == "Jugador 3" && !m.you && m.guest != 0)
+    );
+    let third = members
+        .iter()
+        .find(|m| m.name == "Jugador 3")
+        .expect("Jugador 3");
+    // Silenciarle es cosa de cada uno: solo cambia lo que suena aquí.
+    first.audio().set_voice_muted(third.leaf, true);
+    assert!(first.audio().voice_muted(third.leaf));
+    assert!(!second.audio().voice_muted(third.leaf));
+
+    second.close();
+    let members = wait_members(&first_events, 2);
+    assert!(members.iter().all(|m| m.name != "Jugador 3"));
+    first.close();
+    host.close();
+    drop(server);
+}

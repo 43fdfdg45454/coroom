@@ -23,7 +23,9 @@ use coroom_transport::crypto::sframe::MediaKey;
 use coroom_transport::crypto::{RoomGroup, SafetyNumber, sha256_fingerprint};
 use coroom_transport::media::{MediaSender, MediaSenderConfig, audio_datagram};
 use coroom_transport::proto::PROTOCOL_VERSION;
-use coroom_transport::proto::control::{ControlMessage, Hello, Role as WireRole};
+use coroom_transport::proto::control::{
+    ControlMessage, Hello, MEMBER_NAME_MAX, MEMBERS_MAX, Member as WireMember, Role as WireRole,
+};
 use coroom_transport::proto::media::{ObjectHeader, Track};
 use coroom_transport::proto::signal::{ErrorCode, SignalMessage};
 use coroom_transport::quic::{ControlReceiver, ControlSender, ControlStream};
@@ -869,6 +871,15 @@ struct HostCtx {
     audio_info: AudioInfo,
 }
 
+/// `name` en como mucho [`MEMBER_NAME_MAX`] bytes, sin cortar un carácter.
+fn truncate_name(name: &str) -> String {
+    let mut end = name.len().min(MEMBER_NAME_MAX);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].to_owned()
+}
+
 /// Aviso cuando el servidor no tiene relay.
 pub(crate) const RELAY_DISABLED: &str = "el servidor no tiene relay: la sala solo funciona en \
                                          directo";
@@ -1008,6 +1019,7 @@ impl HostCtx {
             path,
             remote,
         });
+        self.broadcast_members();
         let ctx = Arc::clone(self);
         tokio::spawn(async move {
             tokio::time::sleep(CAPABILITIES_TIMEOUT).await;
@@ -1057,6 +1069,27 @@ impl HostCtx {
 
     /// Envía a `guest` sus permisos de entrada y de voz actuales.
     /// Un mensaje de control solo para `guest`.
+    /// Manda a todos los invitados quién está en la sala (`Members`), para que cada uno silencie
+    /// a quien quiera. El anfitrión va sin nombre: el invitado ya lo tiene de la señalización.
+    fn broadcast_members(&self) {
+        let members: Vec<WireMember> = std::iter::once(WireMember {
+            guest: 0,
+            leaf: self.core.own_leaf.load(Ordering::Acquire),
+            name: String::new(),
+        })
+        .chain(lock(&self.core.guests).values().map(|status| WireMember {
+            guest: status.guest.0,
+            leaf: status.leaf,
+            name: truncate_name(&status.name),
+        }))
+        .take(MEMBERS_MAX)
+        .collect();
+        let message = ControlMessage::Members { members };
+        for (_, control) in lock(&self.links).guest_controls() {
+            let _ = control.send(&message);
+        }
+    }
+
     fn send_to_guest(&self, guest: GuestId, message: &ControlMessage) {
         let controls = lock(&self.links).guest_controls();
         for (id, control) in controls {
@@ -1962,6 +1995,7 @@ impl Room {
         lock(&self.ctx.core.guests).remove(&guest);
         lock(&self.ctx.core.input_keys).remove(&guest.0);
         self.ctx.update_active();
+        self.ctx.broadcast_members();
         self.ctx
             .core
             .emit(SessionEvent::GuestLeft { guest, kicked });

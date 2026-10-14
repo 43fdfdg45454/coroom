@@ -201,7 +201,7 @@ pub fn scenes() -> Vec<Scene> {
 
 type Builder = fn(&mut App);
 
-const BUILDERS: [(&str, Builder); 30] = [
+const BUILDERS: [(&str, Builder); 31] = [
     ("01-servidores", servers),
     ("01-servidores-cambiar", |app| {
         home(app);
@@ -229,6 +229,7 @@ const BUILDERS: [(&str, Builder); 30] = [
     ("13-video", guest_video),
     ("14-estadisticas", guest_stats),
     ("14-mandos", guest_pads),
+    ("14-personas", guest_people),
     ("15-reconectando", guest_reconnecting),
     ("16-ajustes-video", |app| {
         settings_page(app, SettingsPage::Video)
@@ -755,6 +756,24 @@ fn guest_pads(app: &mut App) {
         true,
     )));
     app.update(Message::Guest(guest::Msg::TogglePads));
+}
+
+fn guest_people(app: &mut App) {
+    use coroom_session::remote::RoomMember;
+    guest_video(app);
+    let member = |guest: u32, leaf: u32, name: &str, you: bool| RoomMember {
+        guest,
+        leaf,
+        name: name.to_owned(),
+        you,
+    };
+    app.update(Message::Event(Event::Guest(SessionEvent::Members(vec![
+        member(0, 0, "Bea", false),
+        member(1, 1, "Ana", true),
+        member(2, 2, "Carla", false),
+    ]))));
+    app.update(Message::Guest(guest::Msg::Hear(2, false)));
+    app.update(Message::Guest(guest::Msg::TogglePeople));
 }
 
 fn guest_reconnecting(app: &mut App) {

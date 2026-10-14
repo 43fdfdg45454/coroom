@@ -85,6 +85,10 @@ El anfitrión da y quita, a cada invitado y en cualquier momento:
   mandos de la barra (`Ctrl+Alt+J`).
 - **Voz**: el invitado habla y oye a la sala.
 
+Aparte de los permisos, cada uno elige a quién oye en su equipo: el invitado, en **Personas en la
+sala** (icono de personas en la barra), y el anfitrión, en la tarjeta de cada invitado, con el icono
+de auriculares (tachados: silenciado). No cambia nada para los demás.
+
 Además puede **pausar la entrada de todos** (se suelta todo lo pulsado) y **expulsar** a un
 invitado: sale al momento y las claves de la sala cambian, así que ya no puede ver nada aunque
 guarde lo que recibía.

@@ -9,6 +9,11 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Añadido
 
+- **Cada uno decide a quién oye** (protocolo 9: hay que actualizar también el servidor). El
+  anfitrión manda a los invitados quién está en la sala, con su nombre; el invitado los ve en el
+  panel «Personas en la sala» de la barra y silencia o vuelve a oír a cada uno con el icono de
+  auriculares. El anfitrión hace lo mismo desde la tarjeta de cada invitado. Solo cambia lo que suena
+  en ese equipo: los demás le siguen oyendo, y no depende de lo que elija el anfitrión.
 - **Dirección de la conexión**: la sala muestra por qué IP y puerto va cada invitado («directo
   192.0.2.24:50412») y el invitado ve la del anfitrión (o la del relay); también en el registro.
 - **Cambios con la sala abierta** (panel «Transmisión» de la sala): qué se comparte (pantalla o

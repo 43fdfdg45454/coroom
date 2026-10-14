@@ -54,6 +54,7 @@ icons! {
     Fingerprint => "fingerprint-pattern",
     Gamepad => "gamepad-2",
     Headphones => "headphones",
+    HeadphonesOff => "headphone-off",
     Hourglass => "hourglass",
     Home => "house",
     Info => "info",

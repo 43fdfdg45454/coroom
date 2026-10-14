@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use coroom_session::input::capture::Allowed;
 use coroom_session::input::gamepad::{ConnectedPad, PadChoice, PadKey, PadKind};
 use coroom_session::latency::LatencySummary;
-use coroom_session::remote::{QualityLevel, SessionEvent};
+use coroom_session::remote::{QualityLevel, RoomMember, SessionEvent, talker_label};
 use coroom_transport::Path;
 use coroom_ui::Element;
 use coroom_ui::icon::{Icon, icon_with};
@@ -118,6 +118,12 @@ pub struct State {
     pub stats_open: bool,
     /// Panel de mandos abierto.
     pub pads_open: bool,
+    /// Panel de las personas de la sala abierto.
+    pub people_open: bool,
+    /// Quién está en la sala (con el anfitrión), según el último `Members`.
+    pub members: Vec<RoomMember>,
+    /// Hojas MLS de las voces que este equipo no quiere oír.
+    pub muted: std::collections::BTreeSet<u32>,
     /// Mandos conectados a este equipo (`None`: aún no se sabe).
     pub pads: Option<Vec<ConnectedPad>>,
     /// Si el mando que se envía va tal cual.
@@ -189,6 +195,9 @@ impl State {
             stats: None,
             stats_open: false,
             pads_open: false,
+            people_open: false,
+            members: Vec::new(),
+            muted: std::collections::BTreeSet::new(),
             pads: None,
             pads_raw: false,
             bar_until: now,
@@ -246,6 +255,10 @@ pub enum Msg {
     ToggleStats,
     /// Panel de mandos.
     TogglePads,
+    /// Panel de las personas de la sala.
+    TogglePeople,
+    /// Oír o no a alguien (su hoja MLS) en este equipo.
+    Hear(u32, bool),
     /// Mandos conectados y si el que se envía va tal cual.
     Pads(Vec<ConnectedPad>, bool),
     /// Elegir qué mando enviar.
@@ -326,10 +339,29 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::ToggleStats => {
             state.stats_open = !state.stats_open;
             state.pads_open &= !state.stats_open;
+            state.people_open &= !state.stats_open;
         }
         Msg::TogglePads => {
             state.pads_open = !state.pads_open;
             state.stats_open &= !state.pads_open;
+            state.people_open &= !state.pads_open;
+        }
+        Msg::TogglePeople => {
+            state.people_open = !state.people_open;
+            state.stats_open &= !state.people_open;
+            state.pads_open &= !state.people_open;
+        }
+        Msg::Hear(leaf, hear) => {
+            if hear {
+                state.muted.remove(&leaf);
+            } else {
+                state.muted.insert(leaf);
+            }
+            return vec![Effect::SetVoiceMuted {
+                host: false,
+                source: leaf,
+                muted: !hear,
+            }];
         }
         Msg::Pads(pads, raw) => {
             let slot = state.stats.as_ref().and_then(|s| s.allowed.gamepad_slot);
@@ -610,6 +642,13 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
             );
         }
         SessionEvent::Warning(message) => app.toast(Tone::Warning, message),
+        SessionEvent::Members(members) => {
+            // Quien ya no está deja de contar como silenciado (su hoja puede volver a usarse).
+            state
+                .muted
+                .retain(|leaf| members.iter().any(|member| member.leaf == *leaf));
+            state.members = members;
+        }
         SessionEvent::Invited {
             from_user,
             from_name,
@@ -937,6 +976,12 @@ fn top_bar<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         ));
     }
     buttons = buttons.push(bar_button(
+        Icon::Users,
+        t!("pantalla-guest-personas"),
+        state.people_open,
+        on(Msg::TogglePeople),
+    ));
+    buttons = buttons.push(bar_button(
         Icon::Gamepad,
         t!("pantalla-guest-mandos", key = keys.pads),
         state.pads_open,
@@ -1056,6 +1101,81 @@ fn pad_option<'a>(
 }
 
 /// Panel de mandos: cuál se envía (automático o uno concreto) entre los conectados.
+/// Quién está en la sala y a quién se oye: cada uno decide en su equipo, sin que cambie nada para
+/// los demás.
+fn people_panel(state: &State) -> Element<'_, Message> {
+    let speaking: Vec<&str> = state
+        .stats
+        .as_ref()
+        .and_then(|stats| stats.summary.audio.as_ref())
+        .map(|audio| audio.speaking.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+    let mut rows: Vec<Element<'_, Message>> = Vec::new();
+    for member in &state.members {
+        let talks = speaking.contains(&talker_label(member.guest).as_str());
+        let role = if member.guest == 0 {
+            t!("pantalla-guest-anfitrion")
+        } else {
+            t!("pantalla-guest-invitado")
+        };
+        let detail = if talks {
+            format!("{role} · {}", t!("pantalla-guest-hablando"))
+        } else {
+            role.to_owned()
+        };
+        let label = column![
+            text(if member.you {
+                t!("pantalla-guest-tu-nombre", name = member.name.as_str())
+            } else {
+                member.name.clone()
+            })
+            .size(type_size::BODY)
+            .class(TextClass::Overlay),
+            overlay_text(detail).size(type_size::CAPTION),
+        ]
+        .spacing(2)
+        .width(Length::Fill);
+        let control: Element<'_, Message> = if member.you {
+            ui::gap(0.0)
+        } else {
+            let leaf = member.leaf;
+            let muted = state.muted.contains(&leaf);
+            bar_button(
+                if muted {
+                    Icon::HeadphonesOff
+                } else {
+                    Icon::Headphones
+                },
+                if muted {
+                    t!("pantalla-guest-volver-a-oir", name = member.name.as_str())
+                } else {
+                    t!("pantalla-guest-dejar-de-oir", name = member.name.as_str())
+                },
+                muted,
+                on(Msg::Hear(leaf, muted)),
+            )
+        };
+        rows.push(
+            row![label, control]
+                .spacing(space::S)
+                .align_y(Alignment::Center)
+                .into(),
+        );
+    }
+    let mut content = Column::new()
+        .spacing(space::S)
+        .push(stat_section(t!("pantalla-guest-personas-en-la-sala"), rows));
+    if state.members.is_empty() {
+        content = content.push(overlay_text(t!("pantalla-guest-esperando-la-lista")));
+    }
+    content = content.push(overlay_text(t!("pantalla-guest-solo-en-tu-equipo")));
+    container(content)
+        .padding(space::M)
+        .width(Length::Fixed(size::STATS_PANEL))
+        .class(ContainerClass::Overlay)
+        .into()
+}
+
 fn pads_panel<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     let choice = &app.settings.input.pad;
     let slot = state.stats.as_ref().and_then(|s| s.allowed.gamepad_slot);
@@ -1318,6 +1438,13 @@ fn video<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     if state.pads_open {
         overlay = overlay.push(
             container(pads_panel(app, state))
+                .width(Length::Fill)
+                .align_x(Horizontal::Right),
+        );
+    }
+    if state.people_open {
+        overlay = overlay.push(
+            container(people_panel(state))
                 .width(Length::Fill)
                 .align_x(Horizontal::Right),
         );
