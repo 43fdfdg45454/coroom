@@ -1553,11 +1553,18 @@ impl GroupState {
             return;
         }
         let spacing = self.spacing.unwrap_or(interval / 8);
-        let quiet = (spacing * 3).clamp(Duration::from_millis(3), interval / 2);
+        // Los mínimos (3 y 2 ms) ceden ante los máximos cuando el intervalo es corto: a 240 fps
+        // (4,17 ms) medio intervalo son 2,08 ms y un cuarto, 1,04 ms, y `clamp` con el mínimo por
+        // encima del máximo entra en pánico (desde 167 fps el silencio y desde 126 fps la
+        // reordenación, en cuanto faltaba un paquete).
+        let quiet_max = interval / 2;
+        let quiet = (spacing * 3).clamp(Duration::from_millis(3).min(quiet_max), quiet_max);
         self.quiet_at = Some(now + quiet);
         self.nack_at = self.nack_at.max(now + quiet);
         if let Some(hole) = self.hole_at {
-            let reorder = (spacing * 2).clamp(Duration::from_millis(2), interval / 4);
+            let reorder_max = interval / 4;
+            let reorder =
+                (spacing * 2).clamp(Duration::from_millis(2).min(reorder_max), reorder_max);
             self.nack_at = self.nack_at.min(hole + reorder);
         }
     }
@@ -2913,6 +2920,33 @@ mod tests {
         // Lo que llegue después del grupo descartado se ignora.
         core.push(&sources[0], start + Duration::from_millis(39), None);
         assert!(core.pop_frame().is_none());
+    }
+
+    /// A 240 fps (el intervalo mínimo de una pista) medio intervalo y un cuarto quedan por debajo
+    /// de los mínimos de silencio y de reordenación (3 y 2 ms): antes, `clamp` entraba en pánico
+    /// en el hilo de red del invitado en cuanto llegaba un paquete con un hueco por debajo.
+    #[test]
+    fn a_hole_at_240_fps_is_nacked_without_panicking() {
+        let mut core = ReceiverCore::new(MIN_TRACK_INTERVAL);
+        let start = Instant::now();
+        let (sources, _) = packetize(5, &payload(5000, 4), 1184, 0);
+        for (index, packet) in sources.iter().enumerate().skip(1) {
+            core.push(
+                packet,
+                start + Duration::from_micros(100 * index as u64),
+                None,
+            );
+        }
+        core.poll(start + Duration::from_millis(3), Duration::from_millis(1));
+        assert_eq!(
+            core.take_messages(),
+            vec![ControlMessage::Nack {
+                track: Track::Video,
+                group: 5,
+                missing: vec![0]
+            }],
+            "el hueco se pide antes del intervalo de 4,17 ms"
+        );
     }
 
     /// La cola de un grupo (los últimos objetos) no se pide mientras siguen llegando objetos:

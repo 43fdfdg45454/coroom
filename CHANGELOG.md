@@ -141,6 +141,14 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **El invitado se caía a más de 125 fps** (144, 165, 240 Hz): el hilo de red entraba en pánico
+  («min <= max» de `clamp`) al calcular cuándo pedir un paquete perdido, porque el cuarto de
+  intervalo (o, desde 167 fps, el medio) quedaba por debajo del mínimo de 2 ms (3 ms). A 144 y
+  165 fps pasaba en cuanto faltaba un paquete; a 240 fps, con el primero. Ahora el mínimo cede
+  ante el máximo. Lo encontró `tests/qa_stream.rs`, la batería de QA con los códecs reales de la
+  máquina (resoluciones de 64×64 a 8K y de 10 a 240 fps, cambios en caliente de fuente, códec y
+  bitrate, entradas y salidas, expulsiones, reconexiones y pérdida), que se lanza a mano porque
+  necesita GPU.
 - **Abrir la primera sala tardaba ~13 s tras arrancar** sin decir por qué: esperaba al sondeo de
   códecs, que se repetía en cada arranque y en una GPU NVIDIA con Linux crea unos 15 dispositivos
   Vulkan que el driver no deja crear en paralelo. Ahora el resultado se guarda en
