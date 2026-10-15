@@ -33,7 +33,10 @@ pub mod tls;
 mod webtransport;
 
 pub use api::ApiClient;
-pub use connect::{Connector, Established, RelayInfo};
+pub use connect::{
+    CandidateClass, CandidateOutcome, CandidateReport, Connector, DirectAttempt, Established,
+    RelayInfo,
+};
 pub use error::TransportError;
 pub use media::{
     CompleteFrame, MediaReceiver, MediaReceiverConfig, MediaSender, MediaSenderConfig,

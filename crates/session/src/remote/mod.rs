@@ -95,6 +95,7 @@ use coroom_transport::crypto::sframe::MediaKey;
 use coroom_transport::crypto::{Identity, MediaKeyRing, SafetyNumber, sha256_fingerprint};
 use coroom_transport::media::MediaReceiver;
 use coroom_transport::quic::ControlSender;
+pub use coroom_transport::{CandidateClass, CandidateOutcome, CandidateReport};
 use coroom_transport::{Endpoint, Path, PeerConnection, ServerTrust};
 use crossbeam_channel as channel;
 use tokio::sync::mpsc;
@@ -357,6 +358,29 @@ pub enum SessionEvent {
         /// Nivel con el pipeline típico.
         level: QualityLevel,
     },
+    /// Qué pasó con cada candidato de conexión directa y, si se usa el relay, por qué (el
+    /// invitado al conectar; el anfitrión por cada invitado).
+    Candidates {
+        /// El invitado del que se habla (`None` desde el invitado: el anfitrión).
+        guest: Option<GuestId>,
+        /// Cada dirección probada con su resultado.
+        candidates: Vec<CandidateReport>,
+        /// Por qué se va por el relay, si se va.
+        relay_reason: Option<String>,
+    },
+    /// Lo que el camino entrega según la sonda del enlace (trenes de datagramas antes del vídeo):
+    /// el anfitrión arranca el bitrate en una parte de esto. El anfitrión lo emite por invitado;
+    /// el invitado, lo que midió él.
+    LinkProbe {
+        /// El invitado medido (`None` desde el invitado).
+        guest: Option<GuestId>,
+        /// kbit/s entregados.
+        kbps: u32,
+        /// Datagramas del tren que no llegaron, de `sent`.
+        lost: u16,
+        /// Datagramas del tren.
+        sent: u16,
+    },
     /// Invitado: se perdió la conexión y se vuelve a entrar en la sala.
     Reconnecting {
         /// Intento (desde 1).
@@ -469,6 +493,43 @@ impl fmt::Display for SessionEvent {
                 "RTT con el anfitrión: {rtt_ms:.1} ms. Calidad esperada: {level} ({}).",
                 level.description()
             ),
+            SessionEvent::Candidates {
+                guest,
+                candidates,
+                relay_reason,
+            } => {
+                let who = guest.map_or_else(
+                    || "el anfitrión".to_owned(),
+                    |guest| format!("el invitado {}", guest.0),
+                );
+                write!(f, "Conexión directa con {who}:")?;
+                if candidates.is_empty() {
+                    write!(f, " sin direcciones que probar.")?;
+                }
+                for candidate in candidates {
+                    write!(f, "\n  {candidate}")?;
+                }
+                if let Some(reason) = relay_reason {
+                    write!(f, "\n  Se usa el relay: {reason}.")?;
+                }
+                Ok(())
+            }
+            SessionEvent::LinkProbe {
+                guest,
+                kbps,
+                lost,
+                sent,
+            } => {
+                let who = guest.map_or_else(String::new, |guest| {
+                    format!(" hacia el invitado {}", guest.0)
+                });
+                write!(
+                    f,
+                    "El enlace{who} entrega {:.1} Mbit/s ({lost} de {sent} datagramas de la sonda \
+                     perdidos).",
+                    f64::from(*kbps) / 1000.0
+                )
+            }
             SessionEvent::Reconnecting {
                 attempt,
                 of,
@@ -554,6 +615,10 @@ pub struct GuestStatus {
     pub rtt_ms: Option<f64>,
     /// Bitrate objetivo que pide su control de tasa, en kbit/s.
     pub target_kbps: Option<u32>,
+    /// Lo que la sonda del enlace midió hacia él al conectar, en kbit/s.
+    pub link_kbps: Option<u32>,
+    /// Qué pasó con cada candidato de conexión directa hacia él.
+    pub candidates: Vec<CandidateReport>,
     /// Si ya hay secreto pareja a pareja con él (sin él, su entrada se rechaza).
     pub input_key: bool,
     /// Latencia de su entrada y eventos aplicados y descartados.

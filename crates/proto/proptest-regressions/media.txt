@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 06c3cb776c9df9bed13f6ff50242a3a7607af911539e8c5bfdc3e219308b48de # shrinks to header = ObjectHeader { track: Video, flags: 2, group: 0, object: 0, object_count: 1, payload_len: 0, epoch_hint: 0 }, id = 5

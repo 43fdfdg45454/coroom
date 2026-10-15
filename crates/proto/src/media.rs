@@ -106,16 +106,20 @@ pub enum Track {
     Input = 3,
     /// Control en datagramas.
     Control = 4,
+    /// Sonda del enlace: trenes de datagramas de relleno con los que el receptor mide lo que el
+    /// camino entrega (`ControlMessage::ProbeResult`). No llevan contenido ni cuentan como medios.
+    Probe = 5,
 }
 
 impl Track {
     /// Todas las pistas, en orden de identificador.
-    pub const ALL: [Track; 5] = [
+    pub const ALL: [Track; 6] = [
         Track::Video,
         Track::Audio,
         Track::Voice,
         Track::Input,
         Track::Control,
+        Track::Probe,
     ];
 
     /// Identificador en la cabecera.
@@ -131,6 +135,7 @@ impl Track {
             2 => Some(Track::Voice),
             3 => Some(Track::Input),
             4 => Some(Track::Control),
+            5 => Some(Track::Probe),
             _ => None,
         }
     }
@@ -385,7 +390,7 @@ mod tests {
         }
 
         #[test]
-        fn unknown_tracks_are_rejected(header in source_header(), id in 5u8..) {
+        fn unknown_tracks_are_rejected(header in source_header(), id in 6u8..) {
             let mut bytes = header.to_bytes();
             bytes[1] = id;
             prop_assert_eq!(ObjectHeader::parse(&bytes), Err(ProtoError::UnknownTrack(id)));
@@ -440,11 +445,11 @@ mod tests {
     #[test]
     fn track_ids_match_the_contract() {
         let ids: Vec<u8> = Track::ALL.iter().map(|track| track.id()).collect();
-        assert_eq!(ids, [0, 1, 2, 3, 4]);
+        assert_eq!(ids, [0, 1, 2, 3, 4, 5]);
         for track in Track::ALL {
             assert_eq!(Track::from_id(track.id()), Some(track));
         }
-        assert_eq!(Track::from_id(5), None);
+        assert_eq!(Track::from_id(6), None);
     }
 
     #[test]

@@ -231,6 +231,23 @@ pub enum ControlMessage {
         /// kbit/s.
         kbps: u32,
     },
+    /// Receptor → emisor: lo que llegó de un tren de sonda ([`Track::Probe`]). El emisor manda el
+    /// tren más deprisa de lo que espera que pase el camino; la separación entre el primer y el
+    /// último datagrama recibidos la pone el cuello de botella (dispersión de un tren de paquetes),
+    /// así que `bytes / span_us` es lo que el camino entrega, medido y no supuesto. Si llegaron
+    /// menos de los enviados, también mide la pérdida de una ráfaga.
+    ProbeResult {
+        /// Identificador del tren (el `group` de sus cabeceras).
+        train: u32,
+        /// Datagramas del tren según su cabecera (`object_count`).
+        sent: u16,
+        /// Datagramas que llegaron.
+        received: u16,
+        /// Bytes recibidos (cabeceras incluidas).
+        bytes: u32,
+        /// Tiempo entre la llegada del primero y la del último, en µs del reloj del receptor.
+        span_us: u32,
+    },
     /// Cierre ordenado.
     Bye,
     /// Emisor → receptor: marcas de tiempo de las etapas del emisor de un fotograma ya enviado,
@@ -551,6 +568,15 @@ mod tests {
             any::<u64>().prop_map(|t| ControlMessage::Ping { t }),
             (any::<u64>(), any::<u64>()).prop_map(|(t, t_recv)| ControlMessage::Pong { t, t_recv }),
             any::<u32>().prop_map(|kbps| ControlMessage::TargetBitrate { kbps }),
+            (any::<u32>(), any::<[u16; 2]>(), any::<[u32; 2]>()).prop_map(
+                |(train, [sent, received], [bytes, span_us])| ControlMessage::ProbeResult {
+                    train,
+                    sent,
+                    received,
+                    bytes,
+                    span_us,
+                }
+            ),
             Just(ControlMessage::Bye),
             (track(), any::<u32>(), any::<[u64; 4]>()).prop_map(|(track, group, t)| {
                 ControlMessage::FrameTiming {

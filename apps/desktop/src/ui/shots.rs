@@ -545,6 +545,8 @@ fn guest_status(id: u32, name: &str, permissions: Permissions, rtt: f64) -> Gues
         }),
         rtt_ms: Some(rtt),
         target_kbps: Some(if id == 1 { 24_000 } else { 9_500 }),
+        link_kbps: Some(if id == 1 { 48_000 } else { 21_000 }),
+        candidates: Vec::new(),
         input_key: true,
         input: InputLatency::default(),
         gamepad: None,

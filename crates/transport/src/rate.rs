@@ -125,6 +125,11 @@ pub const DELIVERED_CUT: f64 = 0.90;
 /// probar.
 pub const HOLD_AFTER_CUT: Duration = Duration::from_secs(1);
 
+/// Parte de lo que midió la sonda del enlace ([`RateController::restart`]) con la que arranca el
+/// objetivo: lo que la sonda mide es el cuello del camino con una ráfaga corta; el resto lo deja al
+/// control de tasa, que sube un 5 % cada 100 ms si no hay cola.
+pub const PROBE_START_SHARE: f64 = 0.7;
+
 /// Pérdida por debajo de la cual se puede crecer (GCC).
 pub const LOSS_GROW: f64 = 0.02;
 
@@ -266,6 +271,16 @@ impl RateController {
         self.estimate = self.estimate.min(cap);
         self.loss_estimate = self.loss_estimate.min(cap);
         self.output = self.output.clamp(self.config.min_kbps, max);
+    }
+
+    /// Vuelve a arrancar en `kbps` (acotado a `[min, max]`), sin histéresis: con lo que midió la
+    /// sonda del enlace antes del primer fotograma, en lugar de `start_kbps`.
+    pub fn restart(&mut self, kbps: u32) {
+        let kbps = kbps.clamp(self.config.min_kbps, self.config.max_kbps);
+        self.estimate = f64::from(kbps);
+        self.loss_estimate = f64::from(kbps);
+        self.output = kbps;
+        self.last_output_change = None;
     }
 
     /// Bitrate objetivo para el codificador, con histéresis.
@@ -812,6 +827,18 @@ mod tests {
             0.0,
         );
         assert!(controller.estimate_kbps() > floor * 1.2);
+    }
+
+    #[test]
+    fn restart_moves_both_estimates_within_the_limits() {
+        let mut controller = RateController::new(RateConfig::default());
+        controller.restart(30_000);
+        assert_eq!(controller.target_kbps(), 30_000);
+        assert_eq!(controller.estimate_kbps(), 30_000.0);
+        controller.restart(90_000);
+        assert_eq!(controller.target_kbps(), 50_000, "no pasa del máximo");
+        controller.restart(10);
+        assert_eq!(controller.target_kbps(), 1_000, "ni baja del mínimo");
     }
 
     /// Las tasas de la ventana: lo enviado y lo recibido en kbit/s.

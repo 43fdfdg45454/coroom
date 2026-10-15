@@ -52,7 +52,7 @@ use coroom_proto::media::{ObjectHeader, Track};
 use crate::TransportError;
 use crate::fec::{self, GroupDecoder};
 use crate::quic::{ControlSender, PeerConnection};
-use crate::rate::{RateConfig, RateController, RateInput};
+use crate::rate::{PROBE_START_SHARE, RateConfig, RateController, RateInput};
 
 /// Datagrama de un objeto de audio: cabecera de medios de un solo objeto (`group` =
 /// `seq`) y la carga (el paquete SFrame del emisor). Sin FEC ni historia para `Nack`: la
@@ -76,6 +76,64 @@ pub const FEEDBACK_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Periodo de los `Ping` del receptor.
 pub const PING_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Datagramas de cada tren de la sonda del enlace ([`MediaSender::send_probe`]): 48 × 1200 B son
+/// ~58 KB, bastantes para que la dispersión del tren la ponga el cuello del camino y no el jitter
+/// de un par de paquetes, y pocos para que en un enlace de 10 Mbit/s no hagan más de 50 ms de cola
+/// (antes de que haya vídeo).
+pub const PROBE_PACKETS: u16 = 48;
+
+/// Trenes que se envían a cada receptor al conectar, separados [`PROBE_SPACING`]; vale el mejor
+/// (el tráfico ajeno solo puede hacer que un tren mida de menos).
+pub const PROBE_TRAINS: u32 = 2;
+
+/// Separación entre dos trenes de sonda.
+pub const PROBE_SPACING: Duration = Duration::from_millis(100);
+
+/// Ritmo máximo al que sale un tren: con el máximo del usuario por encima, el tren sale a este
+/// ritmo y la medida es «al menos esto» (la dispersión solo mide cuellos por debajo del ritmo de
+/// envío).
+pub const PROBE_MAX_PACE_KBPS: u32 = 200_000;
+
+/// Plazo del receptor para dar un tren por terminado desde su primer datagrama (lo que no llegó,
+/// se perdió).
+pub const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Trenes de sonda abiertos a la vez como mucho en el receptor.
+const MAX_OPEN_PROBES: usize = 8;
+
+/// Resultado de un tren de sonda ([`ControlMessage::ProbeResult`] ya interpretado).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeOutcome {
+    /// Identificador del tren.
+    pub train: u32,
+    /// Datagramas enviados.
+    pub sent: u16,
+    /// Datagramas recibidos.
+    pub received: u16,
+    /// Bytes recibidos.
+    pub bytes: u32,
+    /// Entre el primero y el último recibidos.
+    pub span: Duration,
+}
+
+impl ProbeOutcome {
+    /// Lo que el camino entregó, en kbit/s: los bytes de todos menos el primero (que marca el
+    /// instante inicial) sobre el tiempo entre el primero y el último. `None` con menos de dos
+    /// datagramas o sin separación medible.
+    pub fn kbps(&self) -> Option<u32> {
+        if self.received < 2 || self.span.is_zero() {
+            return None;
+        }
+        let bytes = f64::from(self.bytes) * f64::from(self.received - 1) / f64::from(self.received);
+        Some((bytes * 8.0 / 1000.0 / self.span.as_secs_f64()).round() as u32)
+    }
+
+    /// Datagramas del tren que no llegaron.
+    pub fn lost(&self) -> u16 {
+        self.sent.saturating_sub(self.received)
+    }
+}
 
 /// Ritmo del pacing sobre el bitrate objetivo: algo por encima, para que un fotograma algo mayor
 /// que la media no se retrase más de lo que tarda en salir.
@@ -356,6 +414,8 @@ struct FeedbackSource {
     last_received: u64,
     last_ecn: u64,
     last_feedback_ecn: u32,
+    /// Mejor tren de sonda que informó este receptor.
+    probe: Option<ProbeOutcome>,
 }
 
 impl FeedbackSource {
@@ -370,6 +430,7 @@ impl FeedbackSource {
             last_received: 0,
             last_ecn: 0,
             last_feedback_ecn: 0,
+            probe: None,
         }
     }
 }
@@ -415,6 +476,8 @@ pub struct MediaSender {
     config: MediaSenderConfig,
     /// Máximo de [`MediaSender::set_max_kbps`] (0: el de `config`).
     max_kbps: AtomicU32,
+    /// Identificador del siguiente tren de sonda.
+    next_train: AtomicU32,
     state: Mutex<SenderState>,
 }
 
@@ -437,6 +500,7 @@ impl MediaSender {
             conn,
             config,
             max_kbps: AtomicU32::new(0),
+            next_train: AtomicU32::new(1),
             state: Mutex::new(SenderState {
                 history: VecDeque::with_capacity(HISTORY_GROUPS + 1),
                 repair_ratio: INITIAL_REPAIR_RATIO,
@@ -527,6 +591,86 @@ impl MediaSender {
         let target = f64::from(self.target_kbps());
         let ratio = self.repair_ratio();
         ((target / (1.0 + ratio)).round() as u32).max(1)
+    }
+
+    /// Envía un tren de sonda ([`PROBE_PACKETS`] datagramas de relleno de la pista
+    /// [`Track::Probe`]) a `pace_kbps` (acotado a [`PROBE_MAX_PACE_KBPS`]) y devuelve su
+    /// identificador. El receptor contesta con `ProbeResult`, que atiende
+    /// [`MediaSender::handle_control`]. No cuenta como medios: ni en el historial de `Nack` ni en
+    /// lo enviado para el control de tasa.
+    pub async fn send_probe(&self, pace_kbps: u32) -> Result<u32, TransportError> {
+        let train = self.next_train.fetch_add(1, Ordering::Relaxed);
+        let max_packet = self.conn.max_packet();
+        if max_packet < ObjectHeader::LEN + 64 {
+            return Err(TransportError::Protocol(format!(
+                "el camino solo admite datagramas de {max_packet} bytes"
+            )));
+        }
+        let payload = vec![0u8; max_packet - ObjectHeader::LEN];
+        let packets: Vec<Bytes> = (0..PROBE_PACKETS)
+            .map(|index| {
+                let flags = if index + 1 == PROBE_PACKETS {
+                    ObjectHeader::LAST_OBJECT
+                } else {
+                    0
+                };
+                datagram(
+                    ObjectHeader {
+                        track: Track::Probe,
+                        flags,
+                        group: train,
+                        object: index,
+                        object_count: PROBE_PACKETS,
+                        payload_len: payload.len() as u16,
+                        epoch_hint: 0,
+                    },
+                    &payload,
+                )
+            })
+            .collect();
+        let bytes: usize = packets.iter().map(Bytes::len).sum();
+        let pace = f64::from(pace_kbps.clamp(1, PROBE_MAX_PACE_KBPS)) * 1000.0;
+        let pacing = Duration::from_secs_f64(bytes as f64 * 8.0 / pace);
+        send_paced(&self.conn, packets, pacing, train).await?;
+        Ok(train)
+    }
+
+    /// Anota el resultado de un tren de sonda del receptor `source` y, si es el mejor que ha
+    /// informado, arranca su control de tasa en [`PROBE_START_SHARE`] de lo medido (solo mientras
+    /// no haya llegado ningún `Feedback`: después manda la red en marcha). Devuelve lo medido en
+    /// kbit/s.
+    pub fn on_probe_result(&self, source: u64, outcome: ProbeOutcome) -> Option<u32> {
+        let kbps = outcome.kbps()?;
+        let mut state = self.state.lock().ok()?;
+        let index = match state.sources.iter().position(|s| s.id == source) {
+            Some(index) => index,
+            None => {
+                state
+                    .sources
+                    .push(FeedbackSource::new(source, self.rate_config()));
+                state.sources.len() - 1
+            }
+        };
+        let entry = &mut state.sources[index];
+        let best = entry.probe.and_then(|probe| probe.kbps()).unwrap_or(0);
+        if kbps > best {
+            entry.probe = Some(outcome);
+            if entry.last_sources == 0 {
+                let start = (f64::from(kbps) * PROBE_START_SHARE).round() as u32;
+                entry.rate.restart(start);
+            }
+        }
+        let target = state
+            .limiting()
+            .map_or(self.rate_config().start_kbps, |s| s.rate.target_kbps());
+        self.conn.set_target_kbps(target);
+        Some(kbps)
+    }
+
+    /// Mejor tren de sonda que informó el receptor `source`.
+    pub fn probe(&self, source: u64) -> Option<ProbeOutcome> {
+        let state = self.state.lock().ok()?;
+        state.sources.iter().find(|s| s.id == source)?.probe
     }
 
     /// Bitrate objetivo para el codificador: el mínimo de los receptores que informan (el inicial
@@ -899,6 +1043,32 @@ impl MediaSender {
                 None
             }
             ControlMessage::Pong { .. } => None,
+            ControlMessage::ProbeResult {
+                train,
+                sent,
+                received,
+                bytes,
+                span_us,
+            } => {
+                self.on_probe_result(
+                    source,
+                    ProbeOutcome {
+                        train,
+                        sent,
+                        received,
+                        bytes,
+                        span: Duration::from_micros(u64::from(span_us)),
+                    },
+                );
+                // Se devuelve para que la sesión lo anote (diagnóstico).
+                Some(ControlMessage::ProbeResult {
+                    train,
+                    sent,
+                    received,
+                    bytes,
+                    span_us,
+                })
+            }
             other => Some(other),
         }
     }
@@ -1132,6 +1302,20 @@ pub struct ReceiverCore {
     owd_pending: Vec<(u32, i32)>,
     /// Último `KeyframeRequest` de vídeo, mientras no llegue un intra (ver [`keyframe_hold`]).
     last_keyframe_request: Option<Instant>,
+    /// Trenes de sonda en curso, por identificador.
+    probes: BTreeMap<u32, ProbeState>,
+    /// Último tren de sonda informado.
+    last_probe: Option<ProbeOutcome>,
+}
+
+/// Tren de sonda del que ya llegó algo.
+#[derive(Debug)]
+struct ProbeState {
+    count: u16,
+    received: u16,
+    bytes: u32,
+    first: Instant,
+    last: Instant,
 }
 
 /// Tiempo tras un `KeyframeRequest` en que no se pide otro por perder un fotograma normal: lo que
@@ -1174,12 +1358,71 @@ impl ReceiverCore {
             highest_group: 0,
             owd_pending: Vec::new(),
             last_keyframe_request: None,
+            probes: BTreeMap::new(),
+            last_probe: None,
         }
     }
 
     /// Contadores.
     pub fn stats(&self) -> ReceiverStats {
         self.stats
+    }
+
+    /// Último tren de sonda que se informó al emisor.
+    pub fn last_probe(&self) -> Option<ProbeOutcome> {
+        self.last_probe
+    }
+
+    /// Datagrama de un tren de sonda: cuenta y, con el tren completo, lo informa.
+    fn probe_datagram(&mut self, header: &ObjectHeader, len: usize, now: Instant) {
+        if header.object_count == 0 || header.object >= header.object_count {
+            self.stats.invalid += 1;
+            return;
+        }
+        let count = header.object_count;
+        if !self.probes.contains_key(&header.group) && self.probes.len() >= MAX_OPEN_PROBES {
+            self.stats.invalid += 1;
+            return;
+        }
+        let state = self.probes.entry(header.group).or_insert(ProbeState {
+            count,
+            received: 0,
+            bytes: 0,
+            first: now,
+            last: now,
+        });
+        if state.count != count {
+            self.stats.invalid += 1;
+            return;
+        }
+        state.received = state.received.saturating_add(1);
+        state.bytes = state.bytes.saturating_add(len as u32);
+        state.last = now;
+        if state.received >= count {
+            self.report_probe(header.group);
+        }
+    }
+
+    /// Informa el tren `train` al emisor y lo olvida.
+    fn report_probe(&mut self, train: u32) {
+        let Some(state) = self.probes.remove(&train) else {
+            return;
+        };
+        let outcome = ProbeOutcome {
+            train,
+            sent: state.count,
+            received: state.received,
+            bytes: state.bytes,
+            span: state.last.saturating_duration_since(state.first),
+        };
+        self.outbox.push(ControlMessage::ProbeResult {
+            train,
+            sent: outcome.sent,
+            received: outcome.received,
+            bytes: outcome.bytes,
+            span_us: u32::try_from(outcome.span.as_micros()).unwrap_or(u32::MAX),
+        });
+        self.last_probe = Some(outcome);
     }
 
     /// Siguiente fotograma listo, en orden por pista.
@@ -1192,7 +1435,7 @@ impl ReceiverCore {
         std::mem::take(&mut self.outbox)
     }
 
-    /// Próximo instante en que vence un `Nack` o un plazo.
+    /// Próximo instante en que vence un `Nack`, un plazo o un tren de sonda.
     pub fn next_timer(&self) -> Option<Instant> {
         self.groups
             .values()
@@ -1204,6 +1447,11 @@ impl ReceiverCore {
                     group.nack_at.min(group.deadline)
                 }
             })
+            .chain(
+                self.probes
+                    .values()
+                    .map(|probe| probe.first + PROBE_TIMEOUT),
+            )
             .min()
     }
 
@@ -1225,6 +1473,11 @@ impl ReceiverCore {
             self.stats.invalid += 1;
             return;
         };
+        if header.track == Track::Probe {
+            // Relleno de la sonda: no es un medio ni cuenta en lo recibido.
+            self.probe_datagram(&header, datagram.len(), now);
+            return;
+        }
         self.stats.received_bytes += datagram.len() as u64;
         self.stats.received_objects += 1;
         let track = header.track;
@@ -1419,6 +1672,15 @@ impl ReceiverCore {
 
     /// Vence `Nack` y plazos a `now`; `rtt` amplía el plazo de los grupos con `Nack`.
     pub fn poll(&mut self, now: Instant, rtt: Duration) {
+        let expired: Vec<u32> = self
+            .probes
+            .iter()
+            .filter(|(_, probe)| now.saturating_duration_since(probe.first) >= PROBE_TIMEOUT)
+            .map(|(&train, _)| train)
+            .collect();
+        for train in expired {
+            self.report_probe(train);
+        }
         let mut tracks = Vec::new();
         for (&(track, group), state) in self.groups.iter_mut() {
             if state.done.is_some() || state.expired {
@@ -1784,6 +2046,14 @@ impl MediaReceiver {
         }
     }
 
+    /// Último tren de la sonda del enlace que se informó al emisor (lo que el camino entrega).
+    pub fn last_probe(&self) -> Option<ProbeOutcome> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.core.last_probe())
+    }
+
     /// Siguiente fotograma completo, en orden por pista.
     pub async fn recv_frame(&self) -> Result<CompleteFrame, TransportError> {
         loop {
@@ -1876,6 +2146,94 @@ impl MediaReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn probe_datagram(train: u32, index: u16, count: u16) -> Bytes {
+        datagram(
+            ObjectHeader {
+                track: Track::Probe,
+                flags: if index + 1 == count {
+                    ObjectHeader::LAST_OBJECT
+                } else {
+                    0
+                },
+                group: train,
+                object: index,
+                object_count: count,
+                payload_len: 1000,
+                epoch_hint: 0,
+            },
+            &[0u8; 1000],
+        )
+    }
+
+    /// Un tren completo se informa al llegar su último datagrama, con la dispersión medida, y no
+    /// cuenta como medios (ni bytes recibidos ni grupos abiertos).
+    #[test]
+    fn a_complete_probe_train_is_reported_and_is_not_media() {
+        let mut core = ReceiverCore::new(Duration::from_millis(16));
+        let start = Instant::now();
+        for index in 0..4u16 {
+            let at = start + Duration::from_millis(u64::from(index));
+            core.push(&probe_datagram(9, index, 4), at, None);
+        }
+        assert_eq!(
+            core.take_messages(),
+            vec![ControlMessage::ProbeResult {
+                train: 9,
+                sent: 4,
+                received: 4,
+                bytes: 4 * 1016,
+                span_us: 3_000,
+            }]
+        );
+        let outcome = core.last_probe().expect("tren informado");
+        // Tres datagramas de 1016 B (el primero solo marca el inicio) en 3 ms.
+        assert_eq!(outcome.kbps(), Some(8_128));
+        assert_eq!(outcome.lost(), 0);
+        assert_eq!(core.stats().received_bytes, 0);
+        assert_eq!(core.open_group_count(), 0);
+        assert_eq!(core.next_timer(), None, "el tren ya no está abierto");
+    }
+
+    /// Un tren al que le faltan datagramas se informa al vencer [`PROBE_TIMEOUT`], con lo que
+    /// llegó (la pérdida de la ráfaga).
+    #[test]
+    fn an_incomplete_probe_train_is_reported_on_timeout() {
+        let mut core = ReceiverCore::new(Duration::from_millis(16));
+        let start = Instant::now();
+        core.push(&probe_datagram(3, 0, 4), start, None);
+        core.push(
+            &probe_datagram(3, 2, 4),
+            start + Duration::from_millis(2),
+            None,
+        );
+        assert_eq!(core.next_timer(), Some(start + PROBE_TIMEOUT));
+        core.poll(
+            start + PROBE_TIMEOUT - Duration::from_millis(1),
+            Duration::ZERO,
+        );
+        assert!(core.take_messages().is_empty(), "aún no venció");
+        core.poll(start + PROBE_TIMEOUT, Duration::ZERO);
+        let messages = core.take_messages();
+        assert_eq!(messages.len(), 1);
+        let outcome = core.last_probe().expect("tren informado");
+        assert_eq!((outcome.received, outcome.sent, outcome.lost()), (2, 4, 2));
+        assert_eq!(outcome.kbps(), Some(4_064));
+    }
+
+    /// Con un solo datagrama no hay dispersión que medir.
+    #[test]
+    fn a_probe_with_one_datagram_measures_nothing() {
+        let outcome = ProbeOutcome {
+            train: 1,
+            sent: 48,
+            received: 1,
+            bytes: 1_200,
+            span: Duration::ZERO,
+        };
+        assert_eq!(outcome.kbps(), None);
+        assert_eq!(outcome.lost(), 47);
+    }
 
     const INTERVAL: Duration = Duration::from_micros(16_667);
 

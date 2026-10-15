@@ -897,6 +897,11 @@ async fn receive(
         path: established.path,
         remote: connection.remote_address(),
     });
+    core.emit(SessionEvent::Candidates {
+        guest: None,
+        candidates: established.candidates,
+        relay_reason: established.relay_reason,
+    });
     if core.reconnect_attempts.swap(0, Ordering::AcqRel) > 0 {
         core.emit(SessionEvent::Reconnected {
             path: established.path,
@@ -919,6 +924,17 @@ async fn receive(
         rtt_ms,
         level: QualityLevel::from_rtt_ms(rtt_ms),
     });
+    // La sonda del enlace que mandó el anfitrión mientras se medía el RTT.
+    if let Some(outcome) = receiver.last_probe()
+        && let Some(kbps) = outcome.kbps()
+    {
+        core.emit(SessionEvent::LinkProbe {
+            guest: None,
+            kbps,
+            lost: outcome.lost(),
+            sent: outcome.sent,
+        });
+    }
     if let Err(err) = reply.send(&caps.to_message()) {
         control_task.abort();
         if let Some(task) = &audio_task {

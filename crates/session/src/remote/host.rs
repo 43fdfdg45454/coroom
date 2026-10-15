@@ -21,7 +21,9 @@ use coroom_transport::connect::{self, Connector, RelayInfo};
 use coroom_transport::crypto::hpke::{self, PairwiseOffer};
 use coroom_transport::crypto::sframe::MediaKey;
 use coroom_transport::crypto::{RoomGroup, SafetyNumber, sha256_fingerprint};
-use coroom_transport::media::{MediaSender, MediaSenderConfig, audio_datagram};
+use coroom_transport::media::{
+    DEFAULT_SOURCE, MediaSender, MediaSenderConfig, PROBE_SPACING, PROBE_TRAINS, audio_datagram,
+};
 use coroom_transport::proto::PROTOCOL_VERSION;
 use coroom_transport::proto::control::{
     ControlMessage, Hello, MEMBER_NAME_MAX, MEMBERS_MAX, Member as WireMember, Role as WireRole,
@@ -1168,22 +1170,28 @@ async fn connect_guest(
         tokio::spawn(async move { ensure_relay(&relay_ctx).await });
     }
     let connector = Connector::new(ctx.endpoint.clone()).with_timeout(ctx.config.punch_timeout);
-    let established = match connector.connect(key, &addrs, None).await {
-        Ok(established) => established,
-        Err(err) => {
-            if lock(&ctx.relay_info).is_none() {
-                ctx.core.warn(format!(
-                    "el invitado {} no conecta en directo y la sala no tiene relay",
-                    guest.0
-                ));
-                return;
-            }
-            debug!(guest = guest.0, error = %err, "sin conexión directa; se usa el relay");
-            ensure_relay(&ctx).await;
+    let attempt = connector.try_direct(key, &addrs).await;
+    let relay_reason = attempt.connection.is_none().then(|| attempt.relay_reason());
+    if let Some(status) = lock(&ctx.core.guests).get_mut(&guest) {
+        status.candidates = attempt.candidates.clone();
+    }
+    ctx.core.emit(SessionEvent::Candidates {
+        guest: Some(guest),
+        candidates: attempt.candidates,
+        relay_reason: relay_reason.clone(),
+    });
+    let Some(connection) = attempt.connection else {
+        if lock(&ctx.relay_info).is_none() {
+            ctx.core.warn(format!(
+                "el invitado {} no conecta en directo y la sala no tiene relay",
+                guest.0
+            ));
             return;
         }
+        debug!(guest = guest.0, reason = ?relay_reason, "sin conexión directa; se usa el relay");
+        ensure_relay(&ctx).await;
+        return;
     };
-    let connection = established.connection;
     if lock(&ctx.links).contains(guest) || !ctx.is_member(guest) {
         connection.close("conexión duplicada");
         return;
@@ -1242,6 +1250,7 @@ fn attach_direct(
         },
     );
     ctx.after_attach(guest, Path::Direct, connection.remote_address(), &reply);
+    tokio::spawn(probe_link(Arc::clone(ctx), Arc::clone(&sender)));
     tokio::spawn(control_reader(
         Arc::clone(ctx),
         guest,
@@ -1250,6 +1259,22 @@ fn attach_direct(
         reply,
         None,
     ));
+}
+
+/// Sonda del enlace hacia un emisor recién conectado: [`PROBE_TRAINS`] trenes al máximo
+/// configurado (acotado en el emisor), antes de que el invitado pida el vídeo. Con lo que informe
+/// arranca su control de tasa ([`MediaSender::on_probe_result`]).
+async fn probe_link(ctx: Arc<HostCtx>, sender: Arc<MediaSender>) {
+    let pace = ctx.max_kbps.load(Ordering::Acquire).max(1);
+    for train in 0..PROBE_TRAINS {
+        if train > 0 {
+            tokio::time::sleep(PROBE_SPACING).await;
+        }
+        if let Err(err) = sender.send_probe(pace).await {
+            debug!(error = %err, "no se pudo enviar la sonda del enlace");
+            return;
+        }
+    }
 }
 
 /// Conecta con el relay una sola vez y atiende los controles que abre cada invitado por él.
@@ -1329,6 +1354,8 @@ async fn relay_accept_loop(
             sender.connection().remote_address(),
             &reply,
         );
+        // Por el relay el tren llega a todos los invitados; cada uno informa el suyo.
+        tokio::spawn(probe_link(Arc::clone(&ctx), Arc::clone(&sender)));
         tokio::spawn(control_reader(
             Arc::clone(&ctx),
             guest,
@@ -1421,6 +1448,30 @@ async fn control_reader(
                     .get(&guest)
                     .is_some_and(|status| status.permissions.voice);
                 ctx.voice_state(guest, speaking && allowed);
+            }
+            Some(ControlMessage::ProbeResult { .. }) => {
+                // Ya lo aplicó el emisor; se anota lo mejor medido hacia este invitado.
+                if let Some(outcome) = sender.probe(source.unwrap_or(DEFAULT_SOURCE))
+                    && let Some(kbps) = outcome.kbps()
+                {
+                    let changed = lock(&ctx.core.guests)
+                        .get_mut(&guest)
+                        .is_some_and(|status| status.link_kbps.replace(kbps) != Some(kbps));
+                    if changed {
+                        debug!(
+                            guest = guest.0,
+                            kbps,
+                            lost = outcome.lost(),
+                            "sonda del enlace"
+                        );
+                        ctx.core.emit(SessionEvent::LinkProbe {
+                            guest: Some(guest),
+                            kbps,
+                            lost: outcome.lost(),
+                            sent: outcome.sent,
+                        });
+                    }
+                }
             }
             Some(ControlMessage::Bye) => break,
             _ => {}
@@ -1918,6 +1969,8 @@ impl Room {
                 remote: None,
                 rtt_ms: None,
                 target_kbps: None,
+                link_kbps: None,
+                candidates: Vec::new(),
                 input_key: false,
                 input: Default::default(),
                 gamepad: None,

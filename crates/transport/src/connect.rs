@@ -13,6 +13,7 @@
 //! con `Hello` y el `RelayToken` de la señalización. Después los datagramas y el stream de control
 //! se usan igual que en directo.
 
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
@@ -54,6 +55,105 @@ pub struct RelayInfo {
     pub role: Role,
 }
 
+/// Clase de un candidato, en el orden en que se prueban.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateClass {
+    /// IPv6 global.
+    Ipv6Global,
+    /// IPv4 pública (normalmente la reflejada que vio el servidor).
+    Ipv4Public,
+    /// Privada, local o CGNAT (solo sirve en la misma red).
+    Private,
+}
+
+impl fmt::Display for CandidateClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            CandidateClass::Ipv6Global => "IPv6 global",
+            CandidateClass::Ipv4Public => "IPv4 pública",
+            CandidateClass::Private => "red local",
+        })
+    }
+}
+
+/// Qué pasó con un candidato durante la apertura simultánea.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CandidateOutcome {
+    /// Por esta dirección se estableció la conexión que se usa.
+    Connected,
+    /// Respondió y se estableció una conexión, pero se eligió otra (la del par de clave menor).
+    Duplicate,
+    /// El handshake falló (rechazo, identidad distinta, error de red).
+    Failed(String),
+    /// Nada en [`PUNCH_TIMEOUT`]: lo más común detrás de una NAT que no abre (CGNAT).
+    NoResponse,
+    /// La apertura terminó antes de que a este le tocara o respondiera.
+    Cancelled,
+}
+
+impl fmt::Display for CandidateOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CandidateOutcome::Connected => f.write_str("conectado"),
+            CandidateOutcome::Duplicate => f.write_str("respondió, se eligió otra"),
+            CandidateOutcome::Failed(err) => write!(f, "falló: {err}"),
+            CandidateOutcome::NoResponse => f.write_str("sin respuesta"),
+            CandidateOutcome::Cancelled => f.write_str("no se llegó a probar"),
+        }
+    }
+}
+
+/// Resultado de un candidato de conexión directa, para el diagnóstico de la ruta.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidateReport {
+    /// Dirección probada.
+    pub addr: SocketAddr,
+    /// Su clase.
+    pub class: CandidateClass,
+    /// Qué pasó.
+    pub outcome: CandidateOutcome,
+}
+
+impl fmt::Display for CandidateReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} ({}): {}", self.addr, self.class, self.outcome)
+    }
+}
+
+/// Intento de conexión directa: la conexión, si la hubo, y lo que pasó con cada candidato.
+#[derive(Debug)]
+pub struct DirectAttempt {
+    /// La conexión directa, si alguna se estableció.
+    pub connection: Option<PeerConnection>,
+    /// Cada candidato con su resultado, en el orden en que se probaron.
+    pub candidates: Vec<CandidateReport>,
+}
+
+impl DirectAttempt {
+    /// Por qué no hubo conexión directa, en una frase para el usuario.
+    pub fn relay_reason(&self) -> String {
+        if self.candidates.is_empty() {
+            return "el otro extremo no anunció direcciones".to_owned();
+        }
+        let failed = self
+            .candidates
+            .iter()
+            .filter(|c| matches!(c.outcome, CandidateOutcome::Failed(_)))
+            .count();
+        let public = self
+            .candidates
+            .iter()
+            .any(|c| c.class != CandidateClass::Private);
+        match (failed, public) {
+            (0, false) => "solo había direcciones de red local y ninguna respondió".to_owned(),
+            (0, true) => {
+                "ninguna dirección respondió: la NAT de uno de los dos no abre (CGNAT)".to_owned()
+            }
+            _ => format!("{failed} de {} direcciones fallaron", self.candidates.len()),
+        }
+    }
+}
+
 /// Conexión establecida y su ruta.
 #[derive(Debug, Clone)]
 pub struct Established {
@@ -61,6 +161,10 @@ pub struct Established {
     pub connection: PeerConnection,
     /// Directa o por el relay.
     pub path: Path,
+    /// Lo que pasó con cada candidato directo (vacío si se fue al relay sin probar).
+    pub candidates: Vec<CandidateReport>,
+    /// Por qué se usa el relay, si se usa.
+    pub relay_reason: Option<String>,
 }
 
 fn is_link_local(ip: IpAddr) -> bool {
@@ -107,13 +211,18 @@ pub fn local_candidates(endpoint: &Endpoint) -> Result<Vec<SocketAddr>, Transpor
     Ok(out)
 }
 
+/// Clase de un candidato ([`order_candidates`] las prueba en este orden).
+pub fn candidate_class(addr: SocketAddr) -> CandidateClass {
+    match addr.ip() {
+        IpAddr::V6(_) if !is_private(addr.ip()) => CandidateClass::Ipv6Global,
+        IpAddr::V4(_) if !is_private(addr.ip()) => CandidateClass::Ipv4Public,
+        _ => CandidateClass::Private,
+    }
+}
+
 /// Ordena candidatos: IPv6 global, IPv4 pública (reflejada), y después las privadas y locales.
 pub fn order_candidates(candidates: &[SocketAddr]) -> Vec<SocketAddr> {
-    let class = |addr: &SocketAddr| match addr.ip() {
-        IpAddr::V6(_) if !is_private(addr.ip()) => 0,
-        IpAddr::V4(_) if !is_private(addr.ip()) => 1,
-        _ => 2,
-    };
+    let class = |addr: &SocketAddr| candidate_class(*addr) as u8;
     let mut ordered: Vec<SocketAddr> = candidates
         .iter()
         .map(|addr| crate::quic::canonical(*addr))
@@ -168,14 +277,21 @@ impl Connector {
         relay: Option<&RelayInfo>,
     ) -> Result<Established, TransportError> {
         self.endpoint.admit(peer);
-        if !self.force_relay
-            && let Some(connection) = self.connect_direct(peer, candidates).await
-        {
-            return Ok(Established {
-                connection,
-                path: Path::Direct,
-            });
-        }
+        let (candidates, relay_reason) = if self.force_relay {
+            (Vec::new(), Some("se pidió usar el relay".to_owned()))
+        } else {
+            let attempt = self.try_direct(peer, candidates).await;
+            if let Some(connection) = attempt.connection {
+                return Ok(Established {
+                    connection,
+                    path: Path::Direct,
+                    candidates: attempt.candidates,
+                    relay_reason: None,
+                });
+            }
+            let reason = attempt.relay_reason();
+            (attempt.candidates, Some(reason))
+        };
         let Some(relay) = relay else {
             return Err(TransportError::Unreachable);
         };
@@ -183,40 +299,52 @@ impl Connector {
         Ok(Established {
             connection,
             path: Path::Relayed,
+            candidates,
+            relay_reason,
         })
     }
 
-    async fn connect_direct(
-        &self,
-        peer: PublicKey,
-        candidates: &[SocketAddr],
-    ) -> Option<PeerConnection> {
+    /// Solo la apertura simultánea, con el resultado de cada candidato (el anfitrión decide por
+    /// su cuenta qué hacer con el relay).
+    pub async fn try_direct(&self, peer: PublicKey, candidates: &[SocketAddr]) -> DirectAttempt {
         let endpoint = &self.endpoint;
         let mut incoming = endpoint.incoming_from(peer);
         // La conexión preferida es la que inicia el par de clave menor.
         let we_prefer_outgoing = endpoint.public_key() < peer;
 
+        let ordered = order_candidates(candidates);
         let (tx, mut outgoing) = mpsc::unbounded_channel();
-        let attempts: Vec<_> = order_candidates(candidates)
-            .into_iter()
+        let (result_tx, mut results) = mpsc::unbounded_channel::<(usize, CandidateOutcome)>();
+        let attempts: Vec<_> = ordered
+            .iter()
+            .copied()
             .enumerate()
             .map(|(i, addr)| {
                 let endpoint = endpoint.clone();
                 let tx = tx.clone();
+                let result_tx = result_tx.clone();
                 let timeout = self.timeout;
                 tokio::spawn(async move {
                     tokio::time::sleep(ATTEMPT_STAGGER * i as u32).await;
                     match tokio::time::timeout(timeout, endpoint.connect_peer(addr, peer)).await {
                         Ok(Ok(connection)) => {
+                            let _ = result_tx.send((i, CandidateOutcome::Duplicate));
                             let _ = tx.send(connection);
                         }
-                        Ok(Err(err)) => debug!(%addr, error = %err, "candidato fallido"),
-                        Err(_) => debug!(%addr, "candidato sin respuesta"),
+                        Ok(Err(err)) => {
+                            debug!(%addr, error = %err, "candidato fallido");
+                            let _ = result_tx.send((i, CandidateOutcome::Failed(err.to_string())));
+                        }
+                        Err(_) => {
+                            debug!(%addr, "candidato sin respuesta");
+                            let _ = result_tx.send((i, CandidateOutcome::NoResponse));
+                        }
                     }
                 })
             })
             .collect();
         drop(tx);
+        drop(result_tx);
 
         let mut deadline = tokio::time::Instant::now() + self.timeout;
         let mut held: Option<PeerConnection> = None;
@@ -245,6 +373,32 @@ impl Connector {
         for attempt in attempts {
             attempt.abort();
         }
+        let mut reports: Vec<CandidateReport> = ordered
+            .iter()
+            .map(|&addr| CandidateReport {
+                addr,
+                class: candidate_class(addr),
+                outcome: CandidateOutcome::Cancelled,
+            })
+            .collect();
+        while let Ok((index, outcome)) = results.try_recv() {
+            if let Some(report) = reports.get_mut(index) {
+                report.outcome = outcome;
+            }
+        }
+        if let Some(chosen) = &chosen {
+            let remote = crate::quic::canonical(chosen.remote_address());
+            let class = candidate_class(remote);
+            // Si entró por una dirección que no estaba en la lista (la NAT del par reescribió el
+            // puerto), se anota en la primera de su clase.
+            let index = reports
+                .iter()
+                .position(|r| r.addr == remote)
+                .or_else(|| reports.iter().position(|r| r.class == class));
+            if let Some(report) = index.and_then(|index| reports.get_mut(index)) {
+                report.outcome = CandidateOutcome::Connected;
+            }
+        }
         for connection in extra {
             connection.close("conexión duplicada");
         }
@@ -269,7 +423,10 @@ impl Connector {
             }
             endpoint.forget(&peer);
         });
-        chosen
+        DirectAttempt {
+            connection: chosen,
+            candidates: reports,
+        }
     }
 }
 
@@ -344,6 +501,54 @@ mod tests {
                 "[fd00::1]:5000",
                 "10.0.0.2:5000",
             ]
+        );
+    }
+
+    #[test]
+    fn the_relay_reason_explains_what_failed() {
+        let addr = |s: &str| s.parse::<SocketAddr>().expect("dirección");
+        let report = |addr: SocketAddr, outcome| CandidateReport {
+            addr,
+            class: candidate_class(addr),
+            outcome,
+        };
+        let attempt = |candidates| DirectAttempt {
+            connection: None,
+            candidates,
+        };
+        assert_eq!(
+            attempt(vec![]).relay_reason(),
+            "el otro extremo no anunció direcciones"
+        );
+        let cgnat = attempt(vec![
+            report(addr("203.0.113.7:6000"), CandidateOutcome::NoResponse),
+            report(addr("192.168.1.10:5000"), CandidateOutcome::NoResponse),
+        ]);
+        assert!(
+            cgnat.relay_reason().contains("CGNAT"),
+            "{}",
+            cgnat.relay_reason()
+        );
+        let local = attempt(vec![report(
+            addr("10.0.0.2:5000"),
+            CandidateOutcome::NoResponse,
+        )]);
+        assert!(
+            local.relay_reason().contains("red local"),
+            "{}",
+            local.relay_reason()
+        );
+        let failed = attempt(vec![
+            report(
+                addr("203.0.113.7:6000"),
+                CandidateOutcome::Failed("identidad".into()),
+            ),
+            report(addr("192.168.1.10:5000"), CandidateOutcome::NoResponse),
+        ]);
+        assert_eq!(failed.relay_reason(), "1 de 2 direcciones fallaron");
+        assert_eq!(
+            failed.candidates[0].to_string(),
+            "203.0.113.7:6000 (IPv4 pública): falló: identidad"
         );
     }
 

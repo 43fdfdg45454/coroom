@@ -1886,6 +1886,8 @@ mod tests {
             remote: None,
             rtt_ms: None,
             target_kbps: None,
+            link_kbps: None,
+            candidates: Vec::new(),
             input_key: true,
             input: Default::default(),
             gamepad: None,
