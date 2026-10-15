@@ -52,6 +52,9 @@ pub const HOST_STATUS_PERIOD: Duration = Duration::from_millis(500);
 /// Espera antes de reabrir la sala de espera si se cae.
 const LOBBY_RETRY: Duration = Duration::from_secs(5);
 
+/// Cada cuánto la sala de espera informa del RTT con el servidor (insignia de la cabecera).
+const SERVER_STATUS_EVERY: Duration = Duration::from_secs(5);
+
 /// Lo más que se espera a que la sala conecte con el servidor al abrirla; después se avisa y se
 /// vuelve a la sala de espera (si arranca tarde, se cierra sola).
 pub const HOST_START_TIMEOUT: Duration = Duration::from_secs(20);
@@ -306,7 +309,13 @@ impl Backend {
                     (self.notify)(Message::Event(Event::Failed(err.to_string())));
                 }
             }
-            Effect::SetVideo => self.set_video(&app.settings),
+            Effect::SetMaxBitrate(kbps) => self.set_video(VideoRequest::MaxBitrate(kbps)),
+            Effect::SetCodec => self.set_video(VideoRequest::Codec {
+                codec: codec_preference(app.settings.video.codec),
+                encoder: app.settings.video.encoder.backend(),
+            }),
+            Effect::SendChat(text) => self.send_chat(text),
+            Effect::ClearChat => self.clear_chat(),
             Effect::SetVoiceMuted {
                 host,
                 source,
@@ -539,36 +548,61 @@ impl Backend {
         });
     }
 
-    /// Códec, codificador y bitrate máximo de los ajustes a la sala abierta.
-    fn set_video(&self, settings: &Settings) {
+    /// Un cambio de vídeo a la sala abierta: solo el tope del bitrate (enseguida, sin
+    /// renegociar) o solo el códec y el codificador (renegocia con los invitados).
+    fn set_video(&self, request: VideoRequest) {
         let Some(session) = lock(&self.host).clone() else {
             tracing::warn!("cambio de vídeo sin sala abierta");
             return;
         };
-        let video = &settings.video;
-        let (codec, encoder) = (codec_preference(video.codec), video.encoder.backend());
-        let max_kbps = video.max_bitrate_kbps;
         let control = lock(&session).host_control();
         self.spawn("video", move |notify| {
-            // El sondeo de codificadores ya está hecho (se guarda): esto no abre nada.
-            let changed = host_encoders(codec, encoder).and_then(|encoders| {
-                control
+            let changed = match request {
+                VideoRequest::MaxBitrate(max_kbps) => control
                     .and_then(|control| {
                         control.set_video(coroom_session::remote::VideoChange {
-                            encoders: Some(encoders),
+                            encoders: None,
                             max_kbps: Some(max_kbps),
                         })
                     })
-                    .map_err(|err| err.to_string())
-            });
+                    .map(|()| Some(max_kbps))
+                    .map_err(|err| err.to_string()),
+                VideoRequest::Codec { codec, encoder } => {
+                    // El sondeo de codificadores ya está hecho (se guarda): esto no abre nada.
+                    host_encoders(codec, encoder).and_then(|encoders| {
+                        control
+                            .and_then(|control| {
+                                control.set_video(coroom_session::remote::VideoChange {
+                                    encoders: Some(encoders),
+                                    max_kbps: None,
+                                })
+                            })
+                            .map(|()| None)
+                            .map_err(|err| err.to_string())
+                    })
+                }
+            };
             match &changed {
-                Ok(()) => tracing::info!(?codec, ?encoder, max_kbps, "vídeo de la sala cambiado"),
+                Ok(_) => tracing::info!(?request, "vídeo de la sala cambiado"),
                 Err(err) => tracing::warn!(error = %err, "no se pudo cambiar el vídeo de la sala"),
             }
-            notify(Message::Event(Event::VideoChanged(
-                changed.map(|()| max_kbps),
-            )));
+            notify(Message::Event(Event::VideoChanged(changed)));
         });
+    }
+
+    /// Un mensaje al chat de la sala propia o de la que se está como invitado.
+    fn send_chat(&self, text: String) {
+        // Se conecta a la sesión cuando el chat llegue a `coroom_session` (misma tarea).
+        let len = text.chars().count();
+        tracing::warn!(len, "chat todavía sin sesión que lo lleve");
+        (self.notify)(Message::Event(Event::Failed(
+            t!("backend-el-chat-aun-no-esta-disponible").to_owned(),
+        )));
+    }
+
+    /// Vaciar el chat de la sala propia.
+    fn clear_chat(&self) {
+        tracing::warn!("vaciar el chat todavía sin sesión que lo lleve");
     }
 
     fn start_host(&mut self, options: AccountOptions, request: HostRequest, settings: &Settings) {
@@ -1212,6 +1246,12 @@ fn lobby(options: &AccountOptions, stop: &AtomicBool, notify: &Notify) {
     while !stop.load(Ordering::Acquire) {
         if let Err(err) = lobby_once(options, stop, notify) {
             tracing::debug!(error = %err, "sala de espera");
+            if !stop.load(Ordering::Acquire) {
+                notify(Message::Event(Event::ServerStatus {
+                    rtt_ms: None,
+                    online: false,
+                }));
+            }
         }
         let deadline = std::time::Instant::now() + LOBBY_RETRY;
         while std::time::Instant::now() < deadline {
@@ -1242,8 +1282,15 @@ fn lobby_once(options: &AccountOptions, stop: &AtomicBool, notify: &Notify) -> R
         .await
         .map_err(|err| err.to_string())?;
         let mut tick = tokio::time::interval(Duration::from_millis(200));
+        let mut status_tick = tokio::time::interval(SERVER_STATUS_EVERY);
         let result = loop {
             tokio::select! {
+                _ = status_tick.tick() => {
+                    notify(Message::Event(Event::ServerStatus {
+                        rtt_ms: Some(signal.rtt().as_secs_f64() * 1000.0),
+                        online: true,
+                    }));
+                }
                 event = signal.next_event() => match event {
                     Ok(Some(SignalMessage::Invited { from_user, from_name, code })) => {
                         notify(Message::Event(Event::Invited(Invitation {
@@ -1270,6 +1317,18 @@ fn lobby_once(options: &AccountOptions, stop: &AtomicBool, notify: &Notify) -> R
         endpoint.close();
         result
     })
+}
+
+/// Qué cambiar del vídeo de la sala abierta ([`Backend::set_video`]).
+#[derive(Debug, Clone, Copy)]
+enum VideoRequest {
+    /// Tope del bitrate en kbit/s.
+    MaxBitrate(u32),
+    /// Códec preferido (`None`: el mejor común) y codificador.
+    Codec {
+        codec: Option<coroom_session::codec::Codec>,
+        encoder: Option<coroom_session::codec::Backend>,
+    },
 }
 
 /// Captura que usa la sala para la fuente elegida en la pantalla.

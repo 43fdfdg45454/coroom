@@ -1,13 +1,16 @@
-//! Textos de la interfaz en catálogos Fluent: `locales/<idioma>/coroom.ftl`.
+//! Textos de la interfaz en catálogos Fluent: `locales/<idioma>/*.ftl`.
 //!
-//! El español (`locales/es/coroom.ftl`) es el único idioma completo y va embebido en el binario.
+//! El español (`locales/es/`) es el único idioma completo y va embebido en el binario, en un
+//! fichero por pantalla (`coroom.ftl` con lo común y lo que aún no se ha repartido, `home.ftl`,
+//! `host.ftl`, `room.ftl`, `chat.ftl`, `settings.ftl`, `diagnostics.ftl`); los identificadores
+//! son únicos en todo el idioma.
 //! La interfaz pide cada texto por su identificador con [`t!`](crate::t):
 //!
 //! - `t!("id")` → `&'static str` (los mensajes sin variables se formatean una vez y se guardan);
 //! - `t!("id", nombre = valor, …)` → `String`, con cada valor convertido con `to_string()` (los
 //!   números ya llegan formateados como los quiere la interfaz, con su coma decimal).
 //!
-//! Para traducir, se copia el catálogo a `locales/<idioma>/coroom.ftl` y se añade aquí con
+//! Para traducir, se copian los catálogos a `locales/<idioma>/` y se añaden aquí con
 //! [`CATALOGS`]; [`set_language`] elige el idioma antes de abrir la ventana (por defecto, el del
 //! sistema si hay catálogo, si no el español). Un identificador que falta en un catálogo cae al
 //! español, y si tampoco está ahí se muestra el identificador (los tests impiden que pase).
@@ -25,9 +28,19 @@ use unic_langid::LanguageIdentifier;
 /// Idioma de referencia, el único completo.
 pub const DEFAULT_LANGUAGE: &str = "es";
 
-/// Catálogos embebidos: (idioma, fuente FTL).
-pub const CATALOGS: &[(&str, &str)] =
-    &[(DEFAULT_LANGUAGE, include_str!("../locales/es/coroom.ftl"))];
+/// Catálogos embebidos: (idioma, fuentes FTL del idioma, una por pantalla).
+pub const CATALOGS: &[(&str, &[&str])] = &[(
+    DEFAULT_LANGUAGE,
+    &[
+        include_str!("../locales/es/coroom.ftl"),
+        include_str!("../locales/es/home.ftl"),
+        include_str!("../locales/es/host.ftl"),
+        include_str!("../locales/es/room.ftl"),
+        include_str!("../locales/es/chat.ftl"),
+        include_str!("../locales/es/settings.ftl"),
+        include_str!("../locales/es/diagnostics.ftl"),
+    ],
+)];
 
 /// Texto con `t!("id")` o `t!("id", nombre = valor, …)`; ver [`crate::l10n`].
 #[macro_export]
@@ -48,14 +61,17 @@ struct Catalog {
 static LANGUAGE: OnceLock<String> = OnceLock::new();
 static CATALOG: OnceLock<Catalog> = OnceLock::new();
 
-fn bundle(language: &str, source: &str) -> Option<FluentBundle<FluentResource>> {
+fn bundle(language: &str, sources: &[&str]) -> Option<FluentBundle<FluentResource>> {
     let id: LanguageIdentifier = language.parse().ok()?;
-    let resource = FluentResource::try_new(source.to_owned()).ok()?;
     let mut bundle = FluentBundle::new_concurrent(vec![id]);
     // Sin marcas de aislamiento bidireccional (FSI/PDI) alrededor de las variables: la interfaz
     // es de izquierda a derecha y las marcas se verían en algunas fuentes.
     bundle.set_use_isolating(false);
-    bundle.add_resource(resource).ok()?;
+    for source in sources {
+        let resource = FluentResource::try_new((*source).to_owned()).ok()?;
+        // Un identificador repetido entre ficheros es un error (lo vigilan los tests).
+        bundle.add_resource(resource).ok()?;
+    }
     Some(bundle)
 }
 
@@ -87,14 +103,14 @@ fn catalog() -> &'static Catalog {
             .unwrap_or_else(|| DEFAULT_LANGUAGE.to_owned());
         let mut bundles = Vec::new();
         // El idioma pedido primero y el español detrás, para lo que falte.
-        for (language, source) in CATALOGS {
+        for (language, sources) in CATALOGS {
             if *language == wanted && *language != DEFAULT_LANGUAGE {
-                bundles.extend(bundle(language, source));
+                bundles.extend(bundle(language, sources));
             }
         }
-        for (language, source) in CATALOGS {
+        for (language, sources) in CATALOGS {
             if *language == DEFAULT_LANGUAGE {
-                bundles.extend(bundle(language, source));
+                bundles.extend(bundle(language, sources));
             }
         }
         Catalog {
@@ -157,19 +173,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_spanish_catalog_parses_without_errors() {
-        for (language, source) in CATALOGS {
-            assert!(
-                FluentResource::try_new((*source).to_owned()).is_ok(),
-                "el catálogo {language} tiene errores de sintaxis"
-            );
-            assert!(bundle(language, source).is_some(), "{language}");
+    fn the_spanish_catalogs_parse_without_errors_or_repeated_ids() {
+        for (language, sources) in CATALOGS {
+            let mut seen = std::collections::HashSet::new();
+            for (n, source) in sources.iter().enumerate() {
+                assert!(
+                    FluentResource::try_new((*source).to_owned()).is_ok(),
+                    "el catálogo {language} nº {n} tiene errores de sintaxis"
+                );
+                for id in message_ids(source) {
+                    assert!(seen.insert(id.clone()), "{language}: `{id}` repetido");
+                }
+            }
+            assert!(bundle(language, sources).is_some(), "{language}");
         }
     }
 
     #[test]
     fn messages_are_formatted_without_isolation_marks() {
-        let ids = message_ids(CATALOGS[0].1);
+        let ids: Vec<String> = CATALOGS[0].1.iter().flat_map(|s| message_ids(s)).collect();
         assert!(ids.len() > 300, "{} mensajes", ids.len());
         for id in &ids {
             let text = render(id, Some(&FluentArgs::new()));

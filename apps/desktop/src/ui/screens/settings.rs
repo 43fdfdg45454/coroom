@@ -240,13 +240,24 @@ fn page_effects(app: &mut App, page: SettingsPage) -> Vec<Effect> {
 }
 
 /// Guarda y, con la sala abierta, le aplica el vídeo nuevo.
-fn live_video(app: &App) -> Vec<Effect> {
-    let mut effects = vec![Effect::SaveSettings];
+/// Guarda y, con la sala abierta, aplica el códec y el codificador (renegocia).
+fn live_codec(app: &mut App) -> Vec<Effect> {
+    let mut effects = app.settings_changed();
     if app.host.room.is_some() {
         let video = &app.settings.video;
-        let (codec, encoder, kbps) = (video.codec, video.encoder, video.max_bitrate_kbps);
-        tracing::info!(?codec, ?encoder, kbps, "vídeo pedido para la sala abierta");
-        effects.push(Effect::SetVideo);
+        tracing::info!(codec = ?video.codec, encoder = ?video.encoder, "códec para la sala abierta");
+        effects.push(Effect::SetCodec);
+    }
+    effects
+}
+
+/// Guarda y, con la sala abierta, aplica el tope del bitrate (sin renegociar nada).
+fn live_bitrate(app: &mut App) -> Vec<Effect> {
+    let mut effects = app.settings_changed();
+    if app.host.room.is_some() {
+        let kbps = app.settings.video.max_bitrate_kbps;
+        tracing::info!(kbps, "tope del bitrate para la sala abierta");
+        effects.push(Effect::SetMaxBitrate(kbps));
     }
     effects
 }
@@ -305,16 +316,16 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         // Con la sala abierta, el códec, el codificador y el bitrate se aplican también a ella.
         Msg::Codec(choice) => {
             settings.video.codec = choice.value;
-            return live_video(app);
+            return live_codec(app);
         }
         Msg::Encoder(choice) => {
             settings.video.encoder = choice.value;
-            return live_video(app);
+            return live_codec(app);
         }
         Msg::Decoder(choice) => settings.video.decoder = choice.value,
         Msg::Bitrate(choice) => {
             settings.video.max_bitrate_kbps = choice.value;
-            return live_video(app);
+            return live_bitrate(app);
         }
         Msg::Fps(fps) => settings.video.fps = fps,
         Msg::Resolution(choice) => settings.video.max_resolution = choice.value,
@@ -362,9 +373,10 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                     match index {
                         0 => shortcuts.immersive = letter,
                         1 => shortcuts.stats = letter,
-                        2 => shortcuts.leave = letter,
-                        3 => shortcuts.mic = letter,
-                        4 => shortcuts.game = letter,
+                        2 => shortcuts.chat = letter,
+                        3 => shortcuts.leave = letter,
+                        4 => shortcuts.mic = letter,
+                        5 => shortcuts.game = letter,
                         _ => shortcuts.pads = letter,
                     }
                     if !shortcuts.is_valid() {
@@ -875,6 +887,7 @@ fn input(app: &App) -> Element<'_, Message> {
     let names = [
         t!("pantalla-settings-modo-inmersivo-o-escritorio"),
         t!("pantalla-settings-panel-de-estadisticas"),
+        t!("pantalla-settings-chat-de-la-sala"),
         t!("pantalla-settings-salir-de-la-sala"),
         t!("pantalla-settings-silenciar-el-microfono"),
         t!("pantalla-settings-silenciar-el-audio-del-juego"),
@@ -1482,6 +1495,108 @@ fn diagnostics(app: &App) -> Element<'_, Message> {
     .width(Length::Fill)
     .max_width(size::CONTENT)
     .into()
+}
+
+/// Escenas de Ajustes para las capturas.
+pub(crate) mod shots {
+    use std::time::Duration;
+
+    use coroom_transport::proto::api::{Device, Devices};
+
+    use super::SettingsPage;
+    use crate::ui::app::{App, AudioDevice, Load, Page};
+    use crate::ui::shots::{Builder, sample_doctor, signed_in, unix_ago};
+    pub(crate) fn settings_page(app: &mut App, page: SettingsPage) {
+        signed_in(app, Page::Settings);
+        let day = Duration::from_secs(86_400);
+        app.settings_page.page = page;
+        app.settings_page.devices = Load::Loaded(Devices {
+            current: Some(1),
+            devices: vec![
+                Device {
+                    id: 1,
+                    name: "Portátil de Ana".to_owned(),
+                    fingerprint: "a1".repeat(32),
+                    created_at: unix_ago(day * 90),
+                    last_seen_at: unix_ago(Duration::from_secs(60)),
+                },
+                Device {
+                    id: 2,
+                    name: "Sobremesa del salón".to_owned(),
+                    fingerprint: "c4".repeat(32),
+                    created_at: unix_ago(day * 40),
+                    last_seen_at: unix_ago(day * 3),
+                },
+            ],
+        });
+        app.settings_page.audio_devices = Load::Loaded(vec![
+            AudioDevice {
+                name: "usb-mic".to_owned(),
+                description: "Micrófono USB".to_owned(),
+                input: true,
+                default: true,
+            },
+            AudioDevice {
+                name: "builtin-speakers".to_owned(),
+                description: "Altavoces integrados".to_owned(),
+                input: false,
+                default: true,
+            },
+            AudioDevice {
+                name: "headset".to_owned(),
+                description: "Auriculares".to_owned(),
+                input: false,
+                default: false,
+            },
+        ]);
+        app.settings_page.doctor = Load::Loaded(sample_doctor());
+        // Lo que hace un equipo con NVENC con 4:4:4 y HDR y una comprobación de versión.
+        use coroom_session::codec::Codec;
+        app.video_support = Some(crate::ui::app::VideoSupport {
+            yuv444: vec![
+                (Codec::Hevc, "HEVC (NVENC)".to_owned()),
+                (Codec::H264, "H.264 (NVENC)".to_owned()),
+            ],
+            hdr10: vec![
+                (Codec::Av1, "AV1 (NVENC)".to_owned()),
+                (Codec::Hevc, "HEVC (NVENC)".to_owned()),
+            ],
+            decode_yuv444: vec![Codec::Av1, Codec::Hevc],
+            decode_hdr10: vec![Codec::Av1, Codec::Hevc],
+            hdr_display: Some(true),
+        });
+        app.settings.video.chroma_444 = true;
+        app.settings.video.fps = 120;
+        app.settings.updates.last_check = Some(1_790_000_000);
+    }
+
+    /// Escenas de esta pantalla.
+    pub(crate) const BUILDERS: &[(&str, Builder)] = &[
+        ("16-ajustes-video", |app| {
+            settings_page(app, SettingsPage::Video)
+        }),
+        ("17-ajustes-audio", |app| {
+            settings_page(app, SettingsPage::Audio)
+        }),
+        ("18-ajustes-entrada", |app| {
+            settings_page(app, SettingsPage::Input)
+        }),
+        ("19-ajustes-red", |app| {
+            settings_page(app, SettingsPage::Network)
+        }),
+        ("20-ajustes-dispositivos", |app| {
+            settings_page(app, SettingsPage::Devices)
+        }),
+        ("21-ajustes-apariencia", |app| {
+            settings_page(app, SettingsPage::Appearance)
+        }),
+        ("22-ajustes-acerca", |app| {
+            settings_page(app, SettingsPage::About)
+        }),
+        ("23-diagnostico", |app| {
+            settings_page(app, SettingsPage::Diagnostics)
+        }),
+    ];
 }
 
 #[cfg(test)]

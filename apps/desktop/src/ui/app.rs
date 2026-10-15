@@ -21,7 +21,9 @@ use coroom_ui::{Element, Theme, font::Fonts};
 use iced_core::{Alignment, Length, Padding};
 use iced_widget::{column, container, row};
 
-use super::screens::{friends, guest, home, host, login, settings as settings_screen};
+use super::screens::{
+    chat, diagnostics, friends, guest, home, host, login, settings as settings_screen,
+};
 use super::settings::{ServerEntry, Settings, ThemeChoice};
 use super::system::SystemAppearance;
 use super::video::VideoFeed;
@@ -130,18 +132,25 @@ impl<T> Load<T> {
     }
 }
 
-/// Páginas con barra lateral.
+/// Páginas bajo la cabecera.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Page {
-    /// Inicio.
+    /// Inicio: compartir, entrar con código, invitaciones y amigos.
     #[default]
     Home,
-    /// Amigos.
-    Friends,
-    /// Compartir (anfitrión).
+    /// Compartir (anfitrión): preparar la sala y, abierta, la sala misma.
     Host,
     /// Ajustes.
     Settings,
+}
+
+/// Estado del servidor para la insignia de la cabecera (lo mide la sala de espera).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ServerStatus {
+    /// RTT con el servidor en ms (`None` hasta medirlo).
+    pub rtt_ms: Option<f64>,
+    /// Si la señalización responde (`None` hasta saberlo).
+    pub online: Option<bool>,
 }
 
 /// Pantalla.
@@ -149,7 +158,7 @@ pub enum Page {
 pub enum Screen {
     /// Servidor e inicio de sesión.
     Login,
-    /// Páginas con barra lateral.
+    /// Páginas bajo la cabecera.
     Main,
     /// Invitado: conexión y vídeo a toda la ventana.
     Guest,
@@ -203,6 +212,13 @@ pub enum Event {
         /// Si está conectado.
         online: bool,
     },
+    /// El servidor responde (o no) y con qué RTT.
+    ServerStatus {
+        /// RTT con el servidor en ms, si responde.
+        rtt_ms: Option<f64>,
+        /// Si la señalización responde.
+        online: bool,
+    },
     /// Salida de `coroom doctor`.
     Doctor(Vec<String>),
     /// Micrófonos y salidas.
@@ -219,9 +235,9 @@ pub enum Event {
     HostEnded(Option<String>),
     /// Anfitrión: se cambió lo que se comparte con la sala abierta, o no se pudo.
     SourceSwitched(Result<(), String>),
-    /// Anfitrión: el vídeo de la sala abierta ya usa el bitrate máximo (kbit/s) y el códec de los
-    /// ajustes, o no se pudo.
-    VideoChanged(Result<u32, String>),
+    /// Anfitrión: la sala abierta ya usa el tope del bitrate (kbit/s) o el códec de los ajustes
+    /// (`Ok(None)`), o no se pudo.
+    VideoChanged(Result<Option<u32>, String>),
     /// Invitado: la sesión arrancó (con la fuente del vídeo) o no pudo.
     GuestStarted(Result<Arc<VideoFeed>, String>),
     /// Invitado: un evento de la sesión.
@@ -306,6 +322,10 @@ pub enum Message {
     Guest(guest::Msg),
     /// Ajustes.
     Settings(settings_screen::Msg),
+    /// Diagnóstico (encima de cualquier pantalla).
+    Diagnostics(diagnostics::Msg),
+    /// Chat de la sala (anfitrión o invitado).
+    Chat(chat::Msg),
     /// Resultado de la red o de una sesión.
     Event(Event),
 }
@@ -383,8 +403,16 @@ pub enum Effect {
     SwitchSource(HostRequest),
     /// Cambiar qué aplicaciones suenan en la sala abierta.
     SetAppAudio(coroom_session::audio::GameCapture),
-    /// Aplicar a la sala abierta el códec, el codificador y el bitrate máximo de los ajustes.
-    SetVideo,
+    /// Aplicar a la sala abierta el tope del bitrate (kbit/s) de los ajustes: el control de tasa
+    /// lo usa enseguida, sin renegociar nada.
+    SetMaxBitrate(u32),
+    /// Aplicar a la sala abierta el códec y el codificador de los ajustes (renegocia con los
+    /// invitados; un intra si cambia).
+    SetCodec,
+    /// Enviar un mensaje al chat de la sala (anfitrión o invitado).
+    SendChat(String),
+    /// Anfitrión: vaciar el chat para todos.
+    ClearChat,
     /// Dejar de oír (o volver a oír) una voz en este equipo: en la sala propia (`host`, por id de
     /// invitado) o en la que se está como invitado (por hoja MLS).
     SetVoiceMuted {
@@ -539,9 +567,17 @@ pub struct App {
     pub guest: Option<guest::State>,
     /// Ajustes.
     pub settings_page: settings_screen::State,
+    /// Diagnóstico (se abre encima de cualquier pantalla).
+    pub diagnostics: diagnostics::State,
+    /// Chat de la sala abierta o en la que se está.
+    pub chat: chat::State,
+    /// Estado del servidor para la cabecera.
+    pub server_status: ServerStatus,
     /// Toasts.
     pub toasts: Vec<Toast>,
     next_toast: u64,
+    /// Desde cuándo hay ajustes sin guardar (se guardan al poco, no en cada pulsación).
+    settings_dirty: Option<Instant>,
     /// Diálogo abierto.
     pub dialog: Option<Dialog>,
     /// Menú de la cuenta abierto.
@@ -581,8 +617,12 @@ impl App {
             host: host::State::default(),
             guest: None,
             settings_page: settings_screen::State::default(),
+            diagnostics: diagnostics::State::default(),
+            chat: chat::State::default(),
+            server_status: ServerStatus::default(),
             toasts: Vec::new(),
             next_toast: 1,
+            settings_dirty: None,
             dialog: None,
             account_menu: false,
             fullscreen: false,
@@ -678,6 +718,12 @@ impl App {
         if let Some(at) = self.update.next_check {
             consider(at);
         }
+        if let Some(at) = self.settings_dirty {
+            consider(at + SETTINGS_SAVE_DELAY);
+        }
+        if let Some(at) = self.chat.next_tick(self.now) {
+            consider(at);
+        }
         if self.page == Page::Host
             && self.screen == Screen::Main
             && let Some(at) = self.host.next_refresh(self.now)
@@ -691,6 +737,19 @@ impl App {
             consider(at);
         }
         next
+    }
+
+    /// Los ajustes cambiaron: se guardan en el próximo [`Message::Tick`] pasado
+    /// [`SETTINGS_SAVE_DELAY`] (una ráfaga de cambios es una sola escritura). Devuelve los
+    /// efectos que hacen falta ahora (ninguno): las pantallas lo devuelven tal cual.
+    pub fn settings_changed(&mut self) -> Vec<Effect> {
+        self.settings_dirty.get_or_insert(self.now);
+        Vec::new()
+    }
+
+    /// Si hay ajustes sin guardar, el efecto de guardarlos ya (al salir o cerrar sesión).
+    pub fn flush_settings(&mut self) -> Option<Effect> {
+        self.settings_dirty.take().map(|_| Effect::SaveSettings)
     }
 
     /// Añade un toast.
@@ -724,6 +783,14 @@ impl App {
                     self.update.next_check = None;
                     effects.extend(self.check_updates(false));
                 }
+                if self
+                    .settings_dirty
+                    .is_some_and(|since| now.duration_since(since) >= SETTINGS_SAVE_DELAY)
+                {
+                    self.settings_dirty = None;
+                    effects.push(Effect::SaveSettings);
+                }
+                self.chat.tick(now);
                 if self.page == Page::Host
                     && self.screen == Screen::Main
                     && self.host.refresh_due(now)
@@ -791,6 +858,8 @@ impl App {
             Message::Host(msg) => host::update(self, msg),
             Message::Guest(msg) => guest::update(self, msg),
             Message::Settings(msg) => settings_screen::update(self, msg),
+            Message::Diagnostics(msg) => diagnostics::update(self, msg),
+            Message::Chat(msg) => chat::update(self, msg),
             Message::Event(event) => self.event(event),
         }
     }
@@ -855,7 +924,7 @@ impl App {
         self.page = page;
         let mut effects = Vec::new();
         match page {
-            Page::Friends | Page::Home if !self.friends.is_loading() => {
+            Page::Home if !self.friends.is_loading() => {
                 self.friends = match std::mem::take(&mut self.friends) {
                     Load::Loaded(friends) => Load::Loaded(friends),
                     _ => Load::Loading,
@@ -876,7 +945,10 @@ impl App {
                     self.dialog = Some(Dialog::QuitWhileHosting);
                     Vec::new()
                 } else {
-                    vec![Effect::Quit]
+                    let mut effects = Vec::new();
+                    effects.extend(self.flush_settings());
+                    effects.push(Effect::Quit);
+                    effects
                 }
             }
             Shortcut::Settings => {
@@ -891,9 +963,15 @@ impl App {
                 if self.dialog.take().is_some() {
                     return Vec::new();
                 }
+                if self.diagnostics.open {
+                    return diagnostics::update(self, diagnostics::Msg::Close);
+                }
                 if self.account_menu {
                     self.account_menu = false;
                     return Vec::new();
+                }
+                if self.chat.takes_escape() {
+                    return chat::update(self, chat::Msg::Escape);
                 }
                 if self.fullscreen {
                     return vec![Effect::SetFullscreen(false)];
@@ -926,10 +1004,16 @@ impl App {
                 if self.host.is_open() {
                     effects.push(Effect::StopHost);
                 }
+                effects.extend(self.flush_settings());
                 effects.push(Effect::SignOut);
                 effects
             }
-            Dialog::QuitWhileHosting => vec![Effect::StopHost, Effect::Quit],
+            Dialog::QuitWhileHosting => {
+                let mut effects = vec![Effect::StopHost];
+                effects.extend(self.flush_settings());
+                effects.push(Effect::Quit);
+                effects
+            }
             Dialog::RevokeDevice { device, .. } => vec![Effect::RevokeDevice(device)],
             Dialog::SessionEnded { .. } => guest::close(self),
             Dialog::SafetyNumber { .. } => Vec::new(),
@@ -984,6 +1068,17 @@ impl App {
                 }
                 Vec::new()
             }
+            Event::ServerStatus { rtt_ms, online } => {
+                self.server_status = ServerStatus {
+                    rtt_ms: if online {
+                        rtt_ms
+                    } else {
+                        self.server_status.rtt_ms
+                    },
+                    online: Some(online),
+                };
+                Vec::new()
+            }
             Event::Invited(invitation) => {
                 self.invitations
                     .retain(|known| known.from_user != invitation.from_user);
@@ -1002,21 +1097,36 @@ impl App {
                 self.usage = result.ok();
                 Vec::new()
             }
-            Event::Devices(_)
-            | Event::DeviceRevoked(_)
-            | Event::Doctor(_)
-            | Event::AudioDevices(_) => settings_screen::on_event(self, event),
+            Event::Doctor(_) => {
+                diagnostics::on_event(self, &event);
+                settings_screen::on_event(self, event)
+            }
+            Event::Devices(_) | Event::DeviceRevoked(_) | Event::AudioDevices(_) => {
+                settings_screen::on_event(self, event)
+            }
             Event::HostStarted(_)
             | Event::Host(_)
             | Event::HostGuests(_)
             | Event::PreviewUnavailable
             | Event::HostEnded(_)
             | Event::SourceSwitched(_)
-            | Event::VideoChanged(_) => host::on_event(self, event),
+            | Event::VideoChanged(_) => {
+                // El chat y el diagnóstico miran los eventos de la sesión antes que la pantalla
+                // (que puede cerrarla y consumir el evento).
+                let mut effects = chat::on_event(self, &event);
+                diagnostics::on_event(self, &event);
+                effects.extend(host::on_event(self, event));
+                effects
+            }
             Event::GuestStarted(_)
             | Event::Guest(_)
             | Event::GuestStats(_)
-            | Event::GuestEnded(_) => guest::on_event(self, event),
+            | Event::GuestEnded(_) => {
+                let mut effects = chat::on_event(self, &event);
+                diagnostics::on_event(self, &event);
+                effects.extend(guest::on_event(self, event));
+                effects
+            }
             Event::UpdateChecked { result, at } => self.update_checked(result, at),
             Event::ShareOptions(options) => {
                 host::on_share_options(self, options);
@@ -1071,61 +1181,139 @@ impl App {
             })
             .unwrap_or(0.0);
         let with_toasts = ui::with_toasts(content, toasts, offset);
-        ui::modal(
-            with_toasts,
-            self.dialog.as_ref().map(|dialog| self.dialog_view(dialog)),
-            Message::CloseDialog,
-        )
+        // El diagnóstico va encima de cualquier pantalla; un diálogo, encima de todo.
+        let (overlay, dismiss) = match &self.dialog {
+            Some(dialog) => (Some(self.dialog_view(dialog)), Message::CloseDialog),
+            None if self.diagnostics.open => (
+                Some(diagnostics::view(self)),
+                Message::Diagnostics(diagnostics::Msg::Close),
+            ),
+            None => (None, Message::CloseDialog),
+        };
+        ui::modal(with_toasts, overlay, dismiss)
     }
 
+    /// Cabecera y página; el menú de la cuenta, desplegado bajo la cabecera.
     fn shell(&self) -> Element<'_, Message> {
         let page: Element<'_, Message> = match self.page {
             Page::Home => home::view(self),
-            Page::Friends => friends::view(self),
             Page::Host => host::view(self),
             Page::Settings => settings_screen::view(self),
         };
-        row![self.sidebar(), page].height(Length::Fill).into()
-    }
-
-    fn sidebar(&self) -> Element<'_, Message> {
-        use coroom_ui::icon::Icon;
-        let pending = self
-            .friends
-            .loaded()
-            .map_or(0, |friends| friends.incoming.len());
-        let item = |icon, label: &str, page: Page| ui::NavItem {
-            icon,
-            label: label.to_owned(),
-            selected: self.page == page,
-            on_press: Message::Navigate(page),
-            badge: None,
-        };
-        let mut items = vec![item(Icon::Home, t!("app-inicio"), Page::Home)];
-        let mut friends_item = item(Icon::Users, t!("app-amigos"), Page::Friends);
-        if pending > 0 {
-            friends_item.badge = Some(pending.to_string());
+        let shell = column![self.headerbar(), page].height(Length::Fill);
+        if !self.account_menu {
+            return shell.into();
         }
-        items.push(friends_item);
-        if self.host.is_open() || self.page == Page::Host {
-            let mut sharing = item(Icon::ShareScreen, t!("app-compartir"), Page::Host);
-            if self.host.is_open() {
-                sharing.badge = Some(t!("app-en-vivo").to_owned());
-            }
-            items.push(sharing);
-        }
-        items.push(item(Icon::Settings, t!("app-ajustes"), Page::Settings));
-        let header = row![
-            coroom_ui::icon::icon_with(Icon::RadioTower, 22.0, coroom_ui::style::SvgClass::Accent),
-            ui::heading("coroom")
+        iced_widget::stack![
+            shell,
+            iced_widget::opaque(
+                iced_widget::mouse_area(
+                    container(iced_widget::opaque(self.account_menu_view()))
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .align_x(iced_core::alignment::Horizontal::Right)
+                        .align_y(iced_core::alignment::Vertical::Top)
+                        .padding(Padding {
+                            top: HEADERBAR_HEIGHT + 4.0,
+                            right: 12.0,
+                            bottom: 0.0,
+                            left: 0.0,
+                        })
+                )
+                .on_press(Message::ToggleAccountMenu)
+            )
         ]
-        .spacing(10)
-        .align_y(Alignment::Center)
-        .padding(Padding::from([8.0, 8.0]));
-        ui::sidebar(header.into(), items, self.account_footer())
+        .into()
     }
 
-    fn account_footer(&self) -> Element<'_, Message> {
+    /// Título de la página para la cabecera (`None` en Inicio: va la marca).
+    pub fn page_title(&self) -> Option<&'static str> {
+        match self.page {
+            Page::Home => None,
+            Page::Host => Some(t!("app-compartir")),
+            Page::Settings => Some(t!("app-ajustes")),
+        }
+    }
+
+    /// Insignia del servidor: host y RTT, o que no responde.
+    pub fn server_badge_text(&self) -> String {
+        let host = self
+            .account
+            .as_ref()
+            .map(AccountInfo::host)
+            .unwrap_or_default();
+        match (self.server_status.online, self.server_status.rtt_ms) {
+            (Some(false), _) => t!("app-host-sin-conexion", host = host),
+            (_, Some(rtt)) => t!("app-host-rtt-ms", host = host, rtt = rtt.round() as u64),
+            _ => host,
+        }
+    }
+
+    /// Cabecera: atrás y título (o la marca) a la izquierda; a la derecha la insignia del
+    /// servidor, «En vivo» si se comparte desde otra página, Ajustes y la cuenta.
+    fn headerbar(&self) -> Element<'_, Message> {
+        use coroom_ui::icon::{Icon, icon_with};
+        use coroom_ui::style::{ContainerClass, SvgClass};
+        use iced_widget::button;
+        let mut left = row![].spacing(8).align_y(Alignment::Center);
+        match self.page_title() {
+            None => {
+                left = left.push(icon_with(Icon::RadioTower, 22.0, SvgClass::Accent));
+                left = left.push(ui::heading("coroom"));
+            }
+            Some(title) => {
+                left = left.push(ui::icon_button(
+                    Icon::ArrowLeft,
+                    t!("app-inicio"),
+                    Some(Message::Navigate(Page::Home)),
+                ));
+                left = left.push(ui::heading(title));
+            }
+        }
+        let server_tone = match self.server_status.online {
+            Some(false) => Tone::Error,
+            Some(true) => Tone::Success,
+            None => Tone::Neutral,
+        };
+        let server = button(ui::status_badge(server_tone, self.server_badge_text()))
+            .padding(0)
+            .class(coroom_ui::style::ButtonClass::Flat)
+            .on_press(Message::Diagnostics(diagnostics::Msg::Open));
+        let mut right = row![server].spacing(8).align_y(Alignment::Center);
+        if self.host.is_open() && self.page != Page::Host {
+            right = right.push(
+                button(ui::status_badge(Tone::Success, t!("app-en-vivo")))
+                    .padding(0)
+                    .class(coroom_ui::style::ButtonClass::Flat)
+                    .on_press(Message::Navigate(Page::Host)),
+            );
+        }
+        right = right.push(ui::icon_button(
+            Icon::Settings,
+            t!("app-ajustes"),
+            (self.page != Page::Settings).then_some(Message::Navigate(Page::Settings)),
+        ));
+        if let Some(account) = &self.account {
+            right = right.push(
+                button(ui::avatar(&self.theme, &account.display_name, 28.0))
+                    .padding(2)
+                    .class(coroom_ui::style::ButtonClass::Flat)
+                    .on_press(Message::ToggleAccountMenu),
+            );
+        }
+        container(
+            row![left, ui::fill(), right]
+                .align_y(Alignment::Center)
+                .width(Length::Fill),
+        )
+        .height(Length::Fixed(HEADERBAR_HEIGHT))
+        .padding(Padding::from([0.0, 12.0]))
+        .class(ContainerClass::Sidebar)
+        .into()
+    }
+
+    /// Menú de la cuenta: quién eres y en qué servidor, cambiar de servidor y cerrar sesión.
+    fn account_menu_view(&self) -> Element<'_, Message> {
         use coroom_ui::icon::{Icon, icon_with};
         use coroom_ui::style::{ButtonClass, ContainerClass, SvgClass};
         use iced_core::text::Wrapping;
@@ -1140,19 +1328,9 @@ impl App {
                 ui::caption(account.host())
             ]
             .spacing(2)
-            .width(Length::Fill),
-            ui::icon_button(
-                Icon::Menu,
-                t!("app-cuenta"),
-                Some(Message::ToggleAccountMenu)
-            )
         ]
         .spacing(10)
         .align_y(Alignment::Center);
-        if !self.account_menu {
-            return container(who).padding(Padding::from([4.0, 4.0])).into();
-        }
-        // Filas de menú: una sola línea, sin el alto fijo de los botones (no cabe en la barra).
         let item = |label: &'static str, icon: Icon, destructive: bool, message: Message| {
             let (class, tint) = if destructive {
                 (ButtonClass::DestructiveFlat, SvgClass::Tone(Tone::Error))
@@ -1172,8 +1350,9 @@ impl App {
             .class(class)
             .on_press(message)
         };
-        let menu = container(
+        container(
             column![
+                container(who).padding(Padding::from([6.0, 10.0])),
                 item(
                     t!("app-cambiar-de-servidor"),
                     Icon::Server,
@@ -1190,11 +1369,9 @@ impl App {
             .spacing(2),
         )
         .padding(4)
-        .width(Length::Fill)
-        .class(ContainerClass::Card);
-        column![menu, container(who).padding(Padding::from([4.0, 4.0]))]
-            .spacing(8)
-            .into()
+        .width(Length::Fixed(260.0))
+        .class(ContainerClass::Dialog)
+        .into()
     }
 
     fn dialog_view<'a>(&'a self, dialog: &'a Dialog) -> Element<'a, Message> {
@@ -1286,6 +1463,12 @@ impl App {
         )
     }
 }
+
+/// Alto de la cabecera en píxeles lógicos.
+pub const HEADERBAR_HEIGHT: f32 = 48.0;
+
+/// Cuánto se espera tras el último cambio de ajustes para guardarlos.
+pub const SETTINGS_SAVE_DELAY: Duration = Duration::from_millis(600);
 
 /// Texto de la calidad para la interfaz.
 pub fn quality_tone(level: QualityLevel) -> Tone {
@@ -1402,6 +1585,59 @@ pub(crate) mod tests {
         app.schedule_update_check(true);
         assert_eq!(app.update.next_check, None);
         assert!(app.check_updates(false).is_empty());
+    }
+
+    #[test]
+    fn settings_are_saved_once_after_a_burst_of_changes() {
+        let mut app = app();
+        assert!(app.settings_changed().is_empty());
+        assert!(app.settings_changed().is_empty());
+        assert_eq!(app.next_tick(), Some(app.now + SETTINGS_SAVE_DELAY));
+        app.now += Duration::from_millis(100);
+        assert!(app.update(Message::Tick).is_empty(), "todavía no");
+        app.now += SETTINGS_SAVE_DELAY;
+        assert_eq!(app.update(Message::Tick), [Effect::SaveSettings]);
+        assert!(app.update(Message::Tick).is_empty(), "una sola vez");
+        // Al salir se guardan ya.
+        app.settings_changed();
+        assert_eq!(
+            app.update(Message::Shortcut(Shortcut::Quit)),
+            [Effect::SaveSettings, Effect::Quit]
+        );
+    }
+
+    #[test]
+    fn the_server_badge_shows_host_and_rtt() {
+        let mut app = app();
+        app.account = Some(AccountInfo {
+            server: ServerEntry {
+                url: "https://coroom.example.com".to_owned(),
+                fingerprint: None,
+                tcp_port: None,
+                username: None,
+            },
+            username: "ana".into(),
+            display_name: "Ana".into(),
+            user_id: 1,
+            device: "pc".into(),
+            fingerprint: String::new(),
+        });
+        assert_eq!(app.server_badge_text(), "coroom.example.com");
+        app.update(Message::Event(Event::ServerStatus {
+            rtt_ms: Some(12.4),
+            online: true,
+        }));
+        assert_eq!(app.server_badge_text(), "coroom.example.com · 12 ms");
+        app.update(Message::Event(Event::ServerStatus {
+            rtt_ms: None,
+            online: false,
+        }));
+        assert_eq!(app.server_badge_text(), "coroom.example.com · sin conexión");
+        assert_eq!(
+            app.server_status.rtt_ms,
+            Some(12.4),
+            "se recuerda el último RTT"
+        );
     }
 
     #[test]

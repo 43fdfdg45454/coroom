@@ -1475,6 +1475,242 @@ fn video<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     stack(layers).into()
 }
 
+/// Escenas del invitado para las capturas.
+pub(crate) mod shots {
+    use std::time::{Duration, Instant};
+
+    use coroom_session::input::gamepad::{ConnectedPad, PadChoice, PadKey, PadKind};
+    use coroom_session::latency::{InputLatency, LatencyLedger, LinkSummary, Stage};
+    use coroom_session::remote::{QualityLevel, SessionEvent};
+    use coroom_transport::quic::Path;
+
+    use super::{Msg, Phase, Stats};
+    use crate::ui::app::{App, Event, Message, Page};
+    use crate::ui::shots::{Builder, cursor, cursor_image, game_frame, safety, signed_in};
+    use crate::ui::video::VideoFeed;
+    /// Entra en la sala de Bea y llega hasta `until`.
+    pub(crate) fn joined(app: &mut App, estimate: bool, frame: bool) {
+        signed_in(app, Page::Home);
+        app.update(Message::Home(crate::ui::screens::home::Msg::Code(
+            "K7Q2MZ".to_owned(),
+        )));
+        app.update(Message::Home(crate::ui::screens::home::Msg::Join));
+        let feed = VideoFeed::detached();
+        if frame {
+            feed.push(
+                game_frame(2, 1280, 720),
+                Some(cursor()),
+                Some(cursor_image()),
+            );
+        }
+        app.update(Message::Event(Event::GuestStarted(Ok(feed))));
+        app.update(Message::Event(Event::Guest(SessionEvent::Joined {
+            host_name: "Bea".to_owned(),
+            host_fingerprint: "b7".repeat(32),
+            safety_number: safety(),
+        })));
+        app.update(Message::Event(Event::Guest(SessionEvent::EpochChanged {
+            epoch: 1,
+        })));
+        app.update(Message::Event(Event::Guest(SessionEvent::Connected {
+            path: Path::Direct,
+            remote: "192.0.2.10:4433".parse().expect("dirección"),
+        })));
+        if estimate {
+            app.update(Message::Event(Event::Guest(
+                SessionEvent::QualityEstimate {
+                    rtt_ms: 18.4,
+                    level: QualityLevel::from_rtt_ms(18.4),
+                },
+            )));
+        }
+        app.toasts.clear();
+    }
+
+    pub(crate) fn guest_connecting(app: &mut App) {
+        joined(app, false, false);
+        if let Some(state) = app.guest.as_mut() {
+            state.keys = false;
+            state.path = None;
+        }
+    }
+
+    pub(crate) fn guest_estimate(app: &mut App) {
+        joined(app, true, false);
+    }
+
+    /// Hasta el vídeo, con la barra visible.
+    pub(crate) fn video(app: &mut App) {
+        joined(app, true, true);
+        app.update(Message::Guest(Msg::Continue));
+        app.update(Message::Event(Event::Guest(SessionEvent::VideoCodec {
+            codec: coroom_session::codec::Codec::Av1,
+            detail: "decodifica Vulkan Video".to_owned(),
+        })));
+        app.update(Message::Event(Event::GuestStats(Box::new(sample_stats()))));
+        app.update(Message::PointerMoved);
+        app.toasts.clear();
+        if let Some(state) = app.guest.as_mut() {
+            state.phase = Phase::Video;
+            state.bar_until = app.now + Duration::from_secs(3);
+        }
+    }
+
+    pub(crate) fn guest_video(app: &mut App) {
+        video(app);
+    }
+
+    pub(crate) fn guest_stats(app: &mut App) {
+        video(app);
+        app.update(Message::Guest(Msg::ToggleStats));
+    }
+
+    pub(crate) fn sample_pad(
+        vendor: u16,
+        product: u16,
+        name: &str,
+        kind: PadKind,
+        active: bool,
+    ) -> ConnectedPad {
+        ConnectedPad {
+            key: PadKey {
+                vendor,
+                product,
+                name: name.to_owned(),
+            },
+            kind,
+            active,
+        }
+    }
+
+    pub(crate) fn guest_pads(app: &mut App) {
+        video(app);
+        if let Some(stats) = app.guest.as_mut().and_then(|state| state.stats.as_mut()) {
+            stats.allowed.gamepad_slot = Some(2);
+        }
+        let eightbitdo = sample_pad(
+            0x2dc8,
+            0x6012,
+            "8BitDo Ultimate 2 Wireless Controller",
+            PadKind::Hid,
+            true,
+        );
+        let xbox = sample_pad(
+            0x045e,
+            0x0b12,
+            "Xbox Wireless Controller",
+            PadKind::XInput,
+            false,
+        );
+        app.settings.input.pad = PadChoice::Pad(eightbitdo.key.clone());
+        app.update(Message::Guest(Msg::Pads(vec![eightbitdo.clone()], true)));
+        app.update(Message::Guest(Msg::Pads(vec![eightbitdo, xbox], true)));
+        app.update(Message::Guest(Msg::TogglePads));
+    }
+
+    pub(crate) fn guest_people(app: &mut App) {
+        use coroom_session::remote::RoomMember;
+        guest_video(app);
+        let member = |guest: u32, leaf: u32, name: &str, you: bool| RoomMember {
+            guest,
+            leaf,
+            name: name.to_owned(),
+            you,
+        };
+        app.update(Message::Event(Event::Guest(SessionEvent::Members(vec![
+            member(0, 0, "Bea", false),
+            member(1, 1, "Ana", true),
+            member(2, 2, "Carla", false),
+        ]))));
+        app.update(Message::Guest(Msg::Hear(2, false)));
+        app.update(Message::Guest(Msg::TogglePeople));
+    }
+
+    pub(crate) fn guest_reconnecting(app: &mut App) {
+        video(app);
+        app.update(Message::Event(Event::Guest(SessionEvent::Reconnecting {
+            attempt: 2,
+            of: 5,
+            retry_in: Duration::from_secs(2),
+            reason: "la red dejó de responder".to_owned(),
+        })));
+        app.toasts.clear();
+    }
+
+    /// Estadísticas de ejemplo: un registro de latencia con 120 fotogramas plausibles y el enlace.
+    pub(crate) fn sample_stats() -> Stats {
+        let ledger = LatencyLedger::new();
+        ledger.set_video("AV1 1920×1080 a 60 fps (Vulkan Video)");
+        let start = Instant::now();
+        // Microsegundos por etapa (captura → codificado → … → presentado), con algo de variación.
+        let steps = [2_600u64, 180, 40, 6_900, 60, 1_700, 3_100];
+        for frame in 1..=120u64 {
+            let jitter = (frame * 37) % 900;
+            let mut at = start + Duration::from_micros(frame * 16_667);
+            ledger.mark(frame, Stage::Captured, at);
+            for (stage, step) in Stage::ALL[1..].iter().zip(steps) {
+                let extra = if *stage == Stage::Received { jitter } else { 0 };
+                at += Duration::from_micros(step + extra);
+                ledger.mark(frame, *stage, at);
+            }
+            ledger.record_encoded_bytes_at(42_000, at);
+        }
+        let mut summary = ledger.summary();
+        summary.fps = 60.0;
+        summary.bitrate_kbps = 19_800.0;
+        summary.link = Some(LinkSummary {
+            path: "directo".to_owned(),
+            remote: Some("192.0.2.10:4433".to_owned()),
+            rtt_ms: 13.8,
+            target_kbps: 24_000,
+            loss_percent: 0.3,
+            groups_dropped: 2,
+            groups_recovered: 41,
+            epoch: 1,
+            safety_number: safety().to_string(),
+            peer_fingerprint: "b7".repeat(32),
+            peer_name: "Bea".to_owned(),
+            sframe: true,
+        });
+        summary.input = Some(InputLatency {
+            samples: 840,
+            p50_us: 9_200,
+            p95_us: 14_100,
+            p99_us: 18_000,
+            max_us: 22_500,
+            applied: 840,
+            dropped: 0,
+            queue_p50_us: 300,
+            network_p50_us: 8_100,
+            inject_p50_us: 800,
+            repaired: 2,
+        });
+        Stats {
+            summary,
+            allowed: coroom_session::input::capture::Allowed {
+                keyboard_mouse: true,
+                gamepad_slot: None,
+            },
+            mic_muted: false,
+            game_muted: false,
+            voice: true,
+            audio_status: "micrófono activo".to_owned(),
+            window_copies: 0,
+        }
+    }
+
+    /// Escenas de esta pantalla.
+    pub(crate) const BUILDERS: &[(&str, Builder)] = &[
+        ("11-conectando", guest_connecting),
+        ("12-estimacion", guest_estimate),
+        ("13-video", guest_video),
+        ("14-estadisticas", guest_stats),
+        ("14-mandos", guest_pads),
+        ("14-personas", guest_people),
+        ("15-reconectando", guest_reconnecting),
+    ];
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

@@ -15,7 +15,7 @@
 //! - **Rueda** en 1/120 de muesca: `LineDelta` × 120 y `PixelDelta` a [`WHEEL_PIXELS_PER_NOTCH`]
 //!   píxeles por muesca, guardando los restos.
 //! - **Atajos** (no se envían al anfitrión): `Ctrl+Alt+G` alterna inmersivo y escritorio y suelta
-//!   la captura; `Ctrl+Alt+O` muestra u oculta el overlay; `Ctrl+Alt+Q` sale;
+//!   la captura; `Ctrl+Alt+S` muestra u oculta el overlay; `Ctrl+Alt+C` el chat; `Ctrl+Alt+Q` sale;
 //!   `Ctrl+Alt+M` silencia o reactiva el micrófono, `Ctrl+Alt+V` el audio del juego y
 //!   `Ctrl+Alt+J` muestra u oculta el panel de mandos. Sin permiso
 //!   de teclado, `Esc` también sale.
@@ -82,8 +82,10 @@ impl CaptureMode {
 pub struct ShortcutKeys {
     /// Inmersivo / escritorio (`G`).
     pub immersive: KeyCode,
-    /// Overlay o panel de estadísticas (`O`).
+    /// Overlay o panel de conexión (`S`).
     pub overlay: KeyCode,
+    /// Chat de la sala (`C`).
+    pub chat: KeyCode,
     /// Salir (`Q`).
     pub quit: KeyCode,
     /// Micrófono (`M`).
@@ -98,7 +100,8 @@ impl Default for ShortcutKeys {
     fn default() -> Self {
         Self {
             immersive: KeyCode::KeyG,
-            overlay: KeyCode::KeyO,
+            overlay: KeyCode::KeyS,
+            chat: KeyCode::KeyC,
             quit: KeyCode::KeyQ,
             mic: KeyCode::KeyM,
             game: KeyCode::KeyV,
@@ -116,6 +119,8 @@ pub enum Action {
     Grab(bool),
     /// Mostrar u ocultar el overlay.
     ToggleOverlay,
+    /// Mostrar u ocultar el chat de la sala (`Ctrl+Alt+C`).
+    ToggleChat,
     /// Cerrar la ventana.
     Quit,
     /// Silenciar o reactivar el micrófono (`Ctrl+Alt+M`).
@@ -290,6 +295,8 @@ impl InputCapture {
             Some(self.toggle_mode())
         } else if code == keys.overlay {
             Some(vec![Action::ToggleOverlay])
+        } else if code == keys.chat {
+            Some(vec![Action::ToggleChat])
         } else if code == keys.mic {
             Some(vec![Action::ToggleMicMute])
         } else if code == keys.game {
@@ -542,7 +549,7 @@ mod tests {
         assert_eq!(capture.mode(), CaptureMode::Immersive);
         assert!(capture.set_immersive(true).is_empty(), "ya lo estaba");
         assert!(capture.set_immersive(false).contains(&Action::Grab(false)));
-        // Ctrl+Alt+K en lugar de Ctrl+Alt+O.
+        // Ctrl+Alt+K en lugar de Ctrl+Alt+S.
         capture.set_shortcuts(ShortcutKeys {
             overlay: KeyCode::KeyK,
             ..ShortcutKeys::default()
@@ -557,8 +564,12 @@ mod tests {
             vec![Action::ToggleOverlay]
         );
         assert!(
-            !key(&mut capture, KeyCode::KeyO, true).contains(&Action::ToggleOverlay),
-            "la O ya no es el atajo"
+            !key(&mut capture, KeyCode::KeyS, true).contains(&Action::ToggleOverlay),
+            "la S ya no es el atajo"
+        );
+        assert_eq!(
+            key(&mut capture, KeyCode::KeyC, true),
+            vec![Action::ToggleChat]
         );
     }
 
@@ -681,7 +692,7 @@ mod tests {
             "los restos se acumulan"
         );
         assert_eq!(
-            key(&mut capture, KeyCode::KeyO, true),
+            key(&mut capture, KeyCode::KeyS, true),
             vec![Action::ToggleOverlay]
         );
         let back = key(&mut capture, KeyCode::KeyG, true);

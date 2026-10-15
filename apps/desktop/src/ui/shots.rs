@@ -11,14 +11,9 @@ use std::time::{Duration, Instant};
 
 use coroom_render::wgpu::{GpuContext, create_instance};
 use coroom_render::{CursorImage, CursorOverlay, PresentFrame, PresentImage};
-use coroom_session::input::gamepad::{ConnectedPad, PadChoice, PadKey, PadKind};
-use coroom_session::latency::{InputLatency, LatencyLedger, LinkSummary, Stage};
-use coroom_session::remote::{GuestPad, GuestStatus, PadTransport, QualityLevel, SessionEvent};
-use coroom_session::{GuestId, Permissions};
 use coroom_transport::api::ServerProbe;
 use coroom_transport::crypto::SafetyNumber;
-use coroom_transport::proto::api::{Device, Devices, Friend, FriendRequest, Friends, Usage};
-use coroom_transport::quic::Path;
+use coroom_transport::proto::api::{Friend, FriendRequest, Friends, Usage};
 use coroom_ui::font::Fonts;
 use coroom_ui::theme::Mode;
 use iced_core::widget::operation::{self, Operation};
@@ -27,15 +22,11 @@ use iced_runtime::user_interface::{self, UserInterface};
 use iced_wgpu::graphics::{Shell, Viewport};
 use iced_wgpu::{Engine, Renderer, wgpu};
 
-use super::app::{
-    AccountInfo, App, AudioDevice, Dialog, Event, Invitation, Load, Message, Page, Screen,
-};
-use super::screens::guest::{self, Phase, Stats};
+use super::app::{AccountInfo, App, Event, Message, Page, Screen};
 use super::screens::login::{self, Probe, Step};
-use super::screens::settings::SettingsPage;
+use super::screens::{diagnostics, guest, home, host, settings};
 use super::settings::{KnownPeer, ServerEntry, Settings, ThemeChoice};
 use super::system::SystemAppearance;
-use super::video::VideoFeed;
 
 /// Tamaño lógico de las capturas (el de la ventana al abrirse).
 pub const SIZE: (u32, u32) = (1180, 780);
@@ -186,7 +177,7 @@ pub fn scenes() -> Vec<Scene> {
     let fonts = Fonts::detect(Some("Inter 11"));
     let mut scenes = Vec::new();
     for (mode, suffix) in [(Mode::Light, "claro"), (Mode::Dark, "oscuro")] {
-        for (name, build) in BUILDERS {
+        for (name, build) in builders() {
             let mut app = base(mode, fonts);
             build(&mut app);
             app.refresh_theme();
@@ -199,65 +190,35 @@ pub fn scenes() -> Vec<Scene> {
     scenes
 }
 
-type Builder = fn(&mut App);
+/// Monta una escena: deja la aplicación en el estado que se quiere ver.
+pub(crate) type Builder = fn(&mut App);
 
-const BUILDERS: [(&str, Builder); 31] = [
+/// Escenas de inicio de sesión (el resto, en el módulo `shots` de cada pantalla).
+const LOGIN_BUILDERS: &[(&str, Builder)] = &[
     ("01-servidores", servers),
     ("01-servidores-cambiar", |app| {
-        home(app);
+        home::shots::home(app);
         app.update(Message::SwitchServer);
     }),
     ("02-servidor-nuevo", new_server),
     ("03-entrar", sign_in),
     ("04-crear-cuenta", create_account),
-    ("05-inicio", home),
-    ("05-inicio-menu-cuenta", |app| {
-        home(app);
-        app.update(Message::ToggleAccountMenu);
-    }),
-    ("06-inicio-vacio", home_empty),
-    ("07-amigos", friends),
-    ("08-compartir", host_setup),
-    ("08-compartir-app", host_setup_app),
-    ("08-compartir-wayland", host_setup_wayland),
-    ("08-compartir-app-wayland", host_setup_app_wayland),
-    ("09-sala-abierta", host_room),
-    ("09-sala-cambiar-fuente", host_room_switch),
-    ("10-dejar-de-compartir", host_stop_dialog),
-    ("11-conectando", guest_connecting),
-    ("12-estimacion", guest_estimate),
-    ("13-video", guest_video),
-    ("14-estadisticas", guest_stats),
-    ("14-mandos", guest_pads),
-    ("14-personas", guest_people),
-    ("15-reconectando", guest_reconnecting),
-    ("16-ajustes-video", |app| {
-        settings_page(app, SettingsPage::Video)
-    }),
-    ("17-ajustes-audio", |app| {
-        settings_page(app, SettingsPage::Audio)
-    }),
-    ("18-ajustes-entrada", |app| {
-        settings_page(app, SettingsPage::Input)
-    }),
-    ("19-ajustes-red", |app| {
-        settings_page(app, SettingsPage::Network)
-    }),
-    ("20-ajustes-dispositivos", |app| {
-        settings_page(app, SettingsPage::Devices)
-    }),
-    ("21-ajustes-apariencia", |app| {
-        settings_page(app, SettingsPage::Appearance)
-    }),
-    ("22-ajustes-acerca", |app| {
-        settings_page(app, SettingsPage::About)
-    }),
-    ("23-diagnostico", |app| {
-        settings_page(app, SettingsPage::Diagnostics)
-    }),
 ];
 
-fn server_entry() -> ServerEntry {
+/// Todas las escenas, en el orden de las pantallas.
+fn builders() -> Vec<(&'static str, Builder)> {
+    LOGIN_BUILDERS
+        .iter()
+        .chain(home::shots::BUILDERS)
+        .chain(host::shots::BUILDERS)
+        .chain(guest::shots::BUILDERS)
+        .chain(settings::shots::BUILDERS)
+        .chain(diagnostics::shots::BUILDERS)
+        .copied()
+        .collect()
+}
+
+pub(crate) fn server_entry() -> ServerEntry {
     ServerEntry {
         url: SERVER.to_owned(),
         fingerprint: None,
@@ -266,7 +227,7 @@ fn server_entry() -> ServerEntry {
     }
 }
 
-fn base(mode: Mode, fonts: Fonts) -> App {
+pub(crate) fn base(mode: Mode, fonts: Fonts) -> App {
     let mut settings = Settings::default();
     settings.appearance.theme = match mode {
         Mode::Light => ThemeChoice::Light,
@@ -298,11 +259,11 @@ fn base(mode: Mode, fonts: Fonts) -> App {
     app
 }
 
-fn safety() -> SafetyNumber {
+pub(crate) fn safety() -> SafetyNumber {
     SafetyNumber::between(&[7; 32], &[11; 32])
 }
 
-fn friend(id: u64, username: &str, display_name: &str, online: bool) -> Friend {
+pub(crate) fn friend(id: u64, username: &str, display_name: &str, online: bool) -> Friend {
     Friend {
         id,
         username: username.to_owned(),
@@ -312,7 +273,7 @@ fn friend(id: u64, username: &str, display_name: &str, online: bool) -> Friend {
 }
 
 /// Entra con la cuenta de Ana y deja la barra lateral en `page`.
-fn signed_in(app: &mut App, page: Page) {
+pub(crate) fn signed_in(app: &mut App, page: Page) {
     app.update(Message::Event(Event::SignedIn(Ok(AccountInfo {
         server: server_entry(),
         username: "ana".to_owned(),
@@ -350,12 +311,12 @@ fn signed_in(app: &mut App, page: Page) {
     app.toasts.clear();
 }
 
-fn servers(app: &mut App) {
+pub(crate) fn servers(app: &mut App) {
     app.screen = Screen::Login;
     app.login.step = Step::Servers;
 }
 
-fn probe_result() -> ServerProbe {
+pub(crate) fn probe_result() -> ServerProbe {
     ServerProbe {
         name: "Sala de juegos".to_owned(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -367,7 +328,7 @@ fn probe_result() -> ServerProbe {
     }
 }
 
-fn new_server(app: &mut App) {
+pub(crate) fn new_server(app: &mut App) {
     app.screen = Screen::Login;
     app.login.step = Step::AddServer;
     app.login.url = "https://salon.example.net".to_owned();
@@ -377,7 +338,7 @@ fn new_server(app: &mut App) {
     };
 }
 
-fn sign_in(app: &mut App) {
+pub(crate) fn sign_in(app: &mut App) {
     app.screen = Screen::Login;
     app.login.step = Step::SignIn;
     app.login.server = Some(server_entry());
@@ -386,7 +347,7 @@ fn sign_in(app: &mut App) {
     app.login.device = "Portátil de Ana".to_owned();
 }
 
-fn create_account(app: &mut App) {
+pub(crate) fn create_account(app: &mut App) {
     sign_in(app);
     app.login.invitation = true;
     app.login.code = "QX7P-2M4K".to_owned();
@@ -395,474 +356,21 @@ fn create_account(app: &mut App) {
     app.login.errors.password2 = Some("Las contraseñas no coinciden".to_owned());
 }
 
-fn home(app: &mut App) {
-    signed_in(app, Page::Home);
-    app.invitations = vec![Invitation {
-        from_user: 2,
-        from_name: "Bea".to_owned(),
-        code: "K7Q2MZ".to_owned(),
-    }];
-    // Aviso de versión nueva.
-    app.update.available = Some(crate::update::Update {
-        version: "0.2.0".to_owned(),
-        url: format!("{}/tag/v0.2.0", crate::update::RELEASES_PAGE),
-    });
-}
-
-fn home_empty(app: &mut App) {
-    signed_in(app, Page::Home);
-    app.friends = Load::Loaded(Friends {
-        friends: Vec::new(),
-        incoming: Vec::new(),
-        outgoing: Vec::new(),
-    });
-    app.usage = None;
-}
-
-fn friends(app: &mut App) {
-    signed_in(app, Page::Friends);
-    app.friends_page.add_name = "hugo".to_owned();
-}
-
-fn playing(apps: &[(&str, &str)]) -> Vec<coroom_session::audio::apps::PlayingApp> {
+pub(crate) fn playing(apps: &[(&str, &str)]) -> Vec<coroom_session::audio::apps::PlayingApp> {
     apps.iter()
         .map(|(key, name)| coroom_session::audio::apps::PlayingApp::new(key, name, Vec::new()))
         .collect()
 }
 
-fn host_setup(app: &mut App) {
-    use super::screens::host::{ShareOptions, SourceChoice};
-    signed_in(app, Page::Host);
-    app.settings.audio.excluded_apps = vec![super::settings::RememberedApp {
-        key: "discord.exe".to_owned(),
-        name: "Discord".to_owned(),
-    }];
-    app.update(Message::Event(Event::ShareOptions(ShareOptions {
-        source: SourceChoice::Screen,
-        targets: vec![coroom_session::capture::CaptureTarget::Monitor {
-            id: 1,
-            name: "Monitor principal · 2560 × 1440".to_owned(),
-        }],
-        targets_error: None,
-        apps: Ok(playing(&[
-            ("juego.exe", "Juego"),
-            ("firefox.exe", "Firefox"),
-            ("discord.exe", "Discord"),
-        ])),
-    })));
-}
-
-fn host_setup_app(app: &mut App) {
-    use super::screens::host::{Msg, ShareOptions, SourceChoice};
-    signed_in(app, Page::Host);
-    app.update(Message::Host(Msg::Source(SourceChoice::App)));
-    app.update(Message::Event(Event::ShareOptions(ShareOptions {
-        source: SourceChoice::App,
-        targets: vec![
-            coroom_session::capture::CaptureTarget::Window {
-                id: 7,
-                title: "Juego".to_owned(),
-                app: Some("juego.exe".to_owned()),
-            },
-            coroom_session::capture::CaptureTarget::Window {
-                id: 8,
-                title: "Firefox".to_owned(),
-                app: Some("firefox.exe".to_owned()),
-            },
-        ],
-        targets_error: None,
-        apps: Ok(playing(&[
-            ("juego.exe", "Juego"),
-            ("firefox.exe", "Firefox"),
-            ("discord.exe", "Discord"),
-        ])),
-    })));
-}
-
-/// Como en Wayland: sin lista de monitores; lo elegido en el selector del sistema.
-fn host_setup_wayland(app: &mut App) {
-    use super::screens::host::{ShareOptions, SourceChoice};
-    signed_in(app, Page::Host);
-    app.settings.audio.excluded_apps = vec![super::settings::RememberedApp {
-        key: "discord".to_owned(),
-        name: "Discord".to_owned(),
-    }];
-    app.update(Message::Event(Event::ShareOptions(ShareOptions {
-        source: SourceChoice::Screen,
-        targets: Vec::new(),
-        targets_error: None,
-        apps: Ok(playing(&[
-            ("juego", "Juego"),
-            ("firefox", "Firefox"),
-            ("discord", "Discord"),
-        ])),
-    })));
-    app.update(Message::Event(Event::SharePicked(
-        SourceChoice::Screen,
-        Ok(Some(coroom_session::capture::PickedShare {
-            target: coroom_session::capture::CaptureTarget::Monitor {
-                id: 0,
-                name: "2560 × 1440".to_owned(),
-            },
-            restore_token: None,
-        })),
-    )));
-}
-
-/// Como en Wayland, transmitiendo una app todavía sin elegir.
-fn host_setup_app_wayland(app: &mut App) {
-    use super::screens::host::{Msg, ShareOptions, SourceChoice};
-    signed_in(app, Page::Host);
-    app.update(Message::Host(Msg::Source(SourceChoice::App)));
-    app.update(Message::Event(Event::ShareOptions(ShareOptions {
-        source: SourceChoice::App,
-        targets: Vec::new(),
-        targets_error: None,
-        apps: Ok(playing(&[
-            ("juego", "Juego"),
-            ("firefox", "Firefox"),
-            ("discord", "Discord"),
-        ])),
-    })));
-}
-
-fn guest_status(id: u32, name: &str, permissions: Permissions, rtt: f64) -> GuestStatus {
-    GuestStatus {
-        guest: GuestId(id),
-        user: u64::from(id) + 1,
-        name: name.to_owned(),
-        public_key: [id as u8; 32],
-        fingerprint: format!("{:02x}", id + 0xb0).repeat(32),
-        safety_number: safety(),
-        permissions,
-        leaf: id,
-        path: Some(if id == 1 { Path::Direct } else { Path::Relayed }),
-        // Direcciones de documentación (RFC 5737), no de nadie.
-        remote: Some(if id == 1 {
-            "192.0.2.24:50412".parse().expect("dirección")
-        } else {
-            "198.51.100.7:4433".parse().expect("dirección")
-        }),
-        rtt_ms: Some(rtt),
-        target_kbps: Some(if id == 1 { 24_000 } else { 9_500 }),
-        link_kbps: Some(if id == 1 { 48_000 } else { 21_000 }),
-        candidates: Vec::new(),
-        input_key: true,
-        input: InputLatency::default(),
-        gamepad: None,
-    }
-}
-
-fn with_pad(status: GuestStatus, pad: GuestPad) -> GuestStatus {
-    GuestStatus {
-        gamepad: Some(pad),
-        ..status
-    }
-}
-
-fn host_room(app: &mut App) {
-    host_setup(app);
-    let preview = VideoFeed::detached();
-    preview.push(game_frame(1, 640, 360), None, None);
-    app.update(Message::Host(super::screens::host::Msg::Start));
-    app.update(Message::Event(Event::HostStarted(Ok(preview))));
-    app.update(Message::Event(Event::Host(SessionEvent::RoomCreated {
-        code: "K7Q2MZ".to_owned(),
-        fingerprint: "a1".repeat(32),
-    })));
-    app.update(Message::Event(Event::Host(SessionEvent::VideoCodec {
-        codec: coroom_session::codec::Codec::Av1,
-        detail: "codifica SVT-AV1".to_owned(),
-    })));
-    app.update(Message::Event(Event::HostGuests(vec![
-        guest_status(
-            1,
-            "Bea",
-            Permissions {
-                keyboard_mouse: true,
-                gamepad_slot: None,
-                voice: true,
-                gamepad_raw: true,
-            },
-            14.2,
-        ),
-        with_pad(
-            guest_status(
-                2,
-                "Carla",
-                Permissions {
-                    keyboard_mouse: false,
-                    gamepad_slot: Some(1),
-                    voice: false,
-                    gamepad_raw: true,
-                },
-                38.6,
-            ),
-            GuestPad {
-                name: "8BitDo Ultimate 2 Wireless Controller".to_owned(),
-                vendor: 0x2dc8,
-                product: 0x6012,
-                transport: PadTransport::Hid,
-                raw: true,
-                note: None,
-            },
-        ),
-    ])));
-    app.toasts.clear();
-}
-
-/// Con la sala abierta, eligiendo una ventana en vez de la pantalla.
-fn host_room_switch(app: &mut App) {
-    use super::screens::host::{Msg, ShareOptions, SourceChoice, TargetOption};
-    host_room(app);
-    app.update(Message::Host(Msg::Source(SourceChoice::App)));
-    // Un título largo, como los de Windows: no debe aplastar el selector Pantalla/Aplicación.
-    let game = coroom_session::capture::CaptureTarget::Window {
-        id: 7,
-        title: "Fatal Fury: City of the Wolves — Edición especial (DirectX 12)".to_owned(),
-        app: Some("juego.exe".to_owned()),
-    };
-    app.update(Message::Event(Event::ShareOptions(ShareOptions {
-        source: SourceChoice::App,
-        targets: vec![game.clone()],
-        targets_error: None,
-        apps: Ok(playing(&[
-            ("juego.exe", "Juego"),
-            ("firefox.exe", "Firefox"),
-            ("discord.exe", "Discord"),
-        ])),
-    })));
-    app.update(Message::Host(Msg::Target(TargetOption(game))));
-    app.toasts.clear();
-}
-
-fn host_stop_dialog(app: &mut App) {
-    host_room(app);
-    app.dialog = Some(Dialog::StopSharing);
-}
-
-/// Entra en la sala de Bea y llega hasta `until`.
-fn joined(app: &mut App, estimate: bool, frame: bool) {
-    signed_in(app, Page::Home);
-    app.update(Message::Home(super::screens::home::Msg::Code(
-        "K7Q2MZ".to_owned(),
-    )));
-    app.update(Message::Home(super::screens::home::Msg::Join));
-    let feed = VideoFeed::detached();
-    if frame {
-        feed.push(
-            game_frame(2, 1280, 720),
-            Some(cursor()),
-            Some(cursor_image()),
-        );
-    }
-    app.update(Message::Event(Event::GuestStarted(Ok(feed))));
-    app.update(Message::Event(Event::Guest(SessionEvent::Joined {
-        host_name: "Bea".to_owned(),
-        host_fingerprint: "b7".repeat(32),
-        safety_number: safety(),
-    })));
-    app.update(Message::Event(Event::Guest(SessionEvent::EpochChanged {
-        epoch: 1,
-    })));
-    app.update(Message::Event(Event::Guest(SessionEvent::Connected {
-        path: Path::Direct,
-        remote: "192.0.2.10:4433".parse().expect("dirección"),
-    })));
-    if estimate {
-        app.update(Message::Event(Event::Guest(
-            SessionEvent::QualityEstimate {
-                rtt_ms: 18.4,
-                level: QualityLevel::from_rtt_ms(18.4),
-            },
-        )));
-    }
-    app.toasts.clear();
-}
-
-fn guest_connecting(app: &mut App) {
-    joined(app, false, false);
-    if let Some(state) = app.guest.as_mut() {
-        state.keys = false;
-        state.path = None;
-    }
-}
-
-fn guest_estimate(app: &mut App) {
-    joined(app, true, false);
-}
-
-/// Hasta el vídeo, con la barra visible.
-fn video(app: &mut App) {
-    joined(app, true, true);
-    app.update(Message::Guest(guest::Msg::Continue));
-    app.update(Message::Event(Event::Guest(SessionEvent::VideoCodec {
-        codec: coroom_session::codec::Codec::Av1,
-        detail: "decodifica Vulkan Video".to_owned(),
-    })));
-    app.update(Message::Event(Event::GuestStats(Box::new(sample_stats()))));
-    app.update(Message::PointerMoved);
-    app.toasts.clear();
-    if let Some(state) = app.guest.as_mut() {
-        state.phase = Phase::Video;
-        state.bar_until = app.now + Duration::from_secs(3);
-    }
-}
-
-fn guest_video(app: &mut App) {
-    video(app);
-}
-
-fn guest_stats(app: &mut App) {
-    video(app);
-    app.update(Message::Guest(guest::Msg::ToggleStats));
-}
-
-fn sample_pad(vendor: u16, product: u16, name: &str, kind: PadKind, active: bool) -> ConnectedPad {
-    ConnectedPad {
-        key: PadKey {
-            vendor,
-            product,
-            name: name.to_owned(),
-        },
-        kind,
-        active,
-    }
-}
-
-fn guest_pads(app: &mut App) {
-    video(app);
-    if let Some(stats) = app.guest.as_mut().and_then(|state| state.stats.as_mut()) {
-        stats.allowed.gamepad_slot = Some(2);
-    }
-    let eightbitdo = sample_pad(
-        0x2dc8,
-        0x6012,
-        "8BitDo Ultimate 2 Wireless Controller",
-        PadKind::Hid,
-        true,
-    );
-    let xbox = sample_pad(
-        0x045e,
-        0x0b12,
-        "Xbox Wireless Controller",
-        PadKind::XInput,
-        false,
-    );
-    app.settings.input.pad = PadChoice::Pad(eightbitdo.key.clone());
-    app.update(Message::Guest(guest::Msg::Pads(
-        vec![eightbitdo.clone()],
-        true,
-    )));
-    app.update(Message::Guest(guest::Msg::Pads(
-        vec![eightbitdo, xbox],
-        true,
-    )));
-    app.update(Message::Guest(guest::Msg::TogglePads));
-}
-
-fn guest_people(app: &mut App) {
-    use coroom_session::remote::RoomMember;
-    guest_video(app);
-    let member = |guest: u32, leaf: u32, name: &str, you: bool| RoomMember {
-        guest,
-        leaf,
-        name: name.to_owned(),
-        you,
-    };
-    app.update(Message::Event(Event::Guest(SessionEvent::Members(vec![
-        member(0, 0, "Bea", false),
-        member(1, 1, "Ana", true),
-        member(2, 2, "Carla", false),
-    ]))));
-    app.update(Message::Guest(guest::Msg::Hear(2, false)));
-    app.update(Message::Guest(guest::Msg::TogglePeople));
-}
-
-fn guest_reconnecting(app: &mut App) {
-    video(app);
-    app.update(Message::Event(Event::Guest(SessionEvent::Reconnecting {
-        attempt: 2,
-        of: 5,
-        retry_in: Duration::from_secs(2),
-        reason: "la red dejó de responder".to_owned(),
-    })));
-    app.toasts.clear();
-}
-
 /// Segundos Unix de hace `ago`.
-fn unix_ago(ago: Duration) -> i64 {
+pub(crate) fn unix_ago(ago: Duration) -> i64 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     i64::try_from(now.saturating_sub(ago).as_secs()).unwrap_or_default()
 }
 
-fn settings_page(app: &mut App, page: SettingsPage) {
-    signed_in(app, Page::Settings);
-    let day = Duration::from_secs(86_400);
-    app.settings_page.page = page;
-    app.settings_page.devices = Load::Loaded(Devices {
-        current: Some(1),
-        devices: vec![
-            Device {
-                id: 1,
-                name: "Portátil de Ana".to_owned(),
-                fingerprint: "a1".repeat(32),
-                created_at: unix_ago(day * 90),
-                last_seen_at: unix_ago(Duration::from_secs(60)),
-            },
-            Device {
-                id: 2,
-                name: "Sobremesa del salón".to_owned(),
-                fingerprint: "c4".repeat(32),
-                created_at: unix_ago(day * 40),
-                last_seen_at: unix_ago(day * 3),
-            },
-        ],
-    });
-    app.settings_page.audio_devices = Load::Loaded(vec![
-        AudioDevice {
-            name: "usb-mic".to_owned(),
-            description: "Micrófono USB".to_owned(),
-            input: true,
-            default: true,
-        },
-        AudioDevice {
-            name: "builtin-speakers".to_owned(),
-            description: "Altavoces integrados".to_owned(),
-            input: false,
-            default: true,
-        },
-        AudioDevice {
-            name: "headset".to_owned(),
-            description: "Auriculares".to_owned(),
-            input: false,
-            default: false,
-        },
-    ]);
-    app.settings_page.doctor = Load::Loaded(sample_doctor());
-    // Lo que hace un equipo con NVENC con 4:4:4 y HDR y una comprobación de versión.
-    use coroom_session::codec::Codec;
-    app.video_support = Some(crate::ui::app::VideoSupport {
-        yuv444: vec![
-            (Codec::Hevc, "HEVC (NVENC)".to_owned()),
-            (Codec::H264, "H.264 (NVENC)".to_owned()),
-        ],
-        hdr10: vec![
-            (Codec::Av1, "AV1 (NVENC)".to_owned()),
-            (Codec::Hevc, "HEVC (NVENC)".to_owned()),
-        ],
-        decode_yuv444: vec![Codec::Av1, Codec::Hevc],
-        decode_hdr10: vec![Codec::Av1, Codec::Hevc],
-        hdr_display: Some(true),
-    });
-    app.settings.video.chroma_444 = true;
-    app.settings.video.fps = 120;
-    app.settings.updates.last_check = Some(1_790_000_000);
-}
-
-fn sample_doctor() -> Vec<String> {
+pub(crate) fn sample_doctor() -> Vec<String> {
     let mut lines = vec![
         format!("coroom {}", env!("CARGO_PKG_VERSION")),
         "Sistema: Linux x86_64 (Wayland)".to_owned(),
@@ -894,68 +402,6 @@ fn sample_doctor() -> Vec<String> {
         .map(str::to_owned),
     );
     lines
-}
-
-/// Estadísticas de ejemplo: un registro de latencia con 120 fotogramas plausibles y el enlace.
-fn sample_stats() -> Stats {
-    let ledger = LatencyLedger::new();
-    ledger.set_video("AV1 1920×1080 a 60 fps (Vulkan Video)");
-    let start = Instant::now();
-    // Microsegundos por etapa (captura → codificado → … → presentado), con algo de variación.
-    let steps = [2_600u64, 180, 40, 6_900, 60, 1_700, 3_100];
-    for frame in 1..=120u64 {
-        let jitter = (frame * 37) % 900;
-        let mut at = start + Duration::from_micros(frame * 16_667);
-        ledger.mark(frame, Stage::Captured, at);
-        for (stage, step) in Stage::ALL[1..].iter().zip(steps) {
-            let extra = if *stage == Stage::Received { jitter } else { 0 };
-            at += Duration::from_micros(step + extra);
-            ledger.mark(frame, *stage, at);
-        }
-        ledger.record_encoded_bytes_at(42_000, at);
-    }
-    let mut summary = ledger.summary();
-    summary.fps = 60.0;
-    summary.bitrate_kbps = 19_800.0;
-    summary.link = Some(LinkSummary {
-        path: "directo".to_owned(),
-        remote: Some("192.0.2.10:4433".to_owned()),
-        rtt_ms: 13.8,
-        target_kbps: 24_000,
-        loss_percent: 0.3,
-        groups_dropped: 2,
-        groups_recovered: 41,
-        epoch: 1,
-        safety_number: safety().to_string(),
-        peer_fingerprint: "b7".repeat(32),
-        peer_name: "Bea".to_owned(),
-        sframe: true,
-    });
-    summary.input = Some(InputLatency {
-        samples: 840,
-        p50_us: 9_200,
-        p95_us: 14_100,
-        p99_us: 18_000,
-        max_us: 22_500,
-        applied: 840,
-        dropped: 0,
-        queue_p50_us: 300,
-        network_p50_us: 8_100,
-        inject_p50_us: 800,
-        repaired: 2,
-    });
-    Stats {
-        summary,
-        allowed: coroom_session::input::capture::Allowed {
-            keyboard_mouse: true,
-            gamepad_slot: None,
-        },
-        mic_muted: false,
-        game_muted: false,
-        voice: true,
-        audio_status: "micrófono activo".to_owned(),
-        window_copies: 0,
-    }
 }
 
 /// Un fotograma de juego de ejemplo (cielo, sol, colinas y suelo), en I420 BT.709 de rango
@@ -1021,7 +467,7 @@ pub fn game_frame(frame_id: u64, width: u32, height: u32) -> PresentFrame {
     }
 }
 
-fn cursor() -> CursorOverlay {
+pub(crate) fn cursor() -> CursorOverlay {
     CursorOverlay {
         x: 820,
         y: 430,
@@ -1030,7 +476,7 @@ fn cursor() -> CursorOverlay {
 }
 
 /// Flecha de 12×18 con borde.
-fn cursor_image() -> Arc<CursorImage> {
+pub(crate) fn cursor_image() -> Arc<CursorImage> {
     let (width, height) = (12u32, 18u32);
     let mut rgba = vec![0u8; (width * height * 4) as usize];
     for py in 0..height {

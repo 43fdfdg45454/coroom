@@ -186,6 +186,7 @@ fn shortcut_keys(shortcuts: &Shortcuts) -> ShortcutKeys {
     ShortcutKeys {
         immersive: letter_key(shortcuts.immersive).unwrap_or(default.immersive),
         overlay: letter_key(shortcuts.stats).unwrap_or(default.overlay),
+        chat: letter_key(shortcuts.chat).unwrap_or(default.chat),
         quit: letter_key(shortcuts.leave).unwrap_or(default.quit),
         mic: letter_key(shortcuts.mic).unwrap_or(default.mic),
         game: letter_key(shortcuts.game).unwrap_or(default.game),
@@ -500,6 +501,9 @@ impl Ready {
                 }
                 Action::TogglePads => {
                     self.dispatch(Message::Guest(guest::Msg::TogglePads));
+                }
+                Action::ToggleChat => {
+                    self.dispatch(Message::Chat(super::screens::chat::Msg::Toggle));
                 }
                 Action::Quit => {
                     let effects = guest::leave(&mut self.app);
@@ -1081,6 +1085,7 @@ mod tests {
             ..Shortcuts::default()
         });
         assert_eq!(keys.immersive, KeyCode::KeyK);
-        assert_eq!(keys.overlay, KeyCode::KeyO);
+        assert_eq!(keys.overlay, KeyCode::KeyS);
+        assert_eq!(keys.chat, KeyCode::KeyC);
     }
 }

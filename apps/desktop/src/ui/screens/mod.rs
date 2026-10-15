@@ -2,6 +2,8 @@
 //! (`update`, sin efectos: devuelve [`super::app::Effect`]), lo que hace con los resultados del
 //! backend (`on_event`) y su vista.
 
+pub mod chat;
+pub mod diagnostics;
 pub mod friends;
 pub mod guest;
 pub mod home;

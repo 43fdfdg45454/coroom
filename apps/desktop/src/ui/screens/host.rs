@@ -809,13 +809,16 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
         Event::VideoChanged(result) => {
             if app.host.room.is_some() {
                 match result {
-                    Ok(kbps) => app.toast(
+                    Ok(Some(kbps)) => app.toast(
                         Tone::Info,
                         t!(
                             "pantalla-host-video-de-la-sala-cambiado",
                             valor = settings_screen::bitrate_phrase(kbps)
                         ),
                     ),
+                    Ok(None) => {
+                        app.toast(Tone::Info, t!("pantalla-host-codec-de-la-sala-cambiado"))
+                    }
                     Err(err) => app.toast(
                         Tone::Warning,
                         t!("pantalla-host-no-se-pudo-cambiar-el-video", error = err),
@@ -1884,6 +1887,244 @@ fn invite_friends<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
         .into()
 }
 
+/// Escenas de Compartir para las capturas.
+pub(crate) mod shots {
+    use coroom_session::latency::InputLatency;
+    use coroom_session::remote::{GuestPad, GuestStatus, PadTransport, SessionEvent};
+    use coroom_session::{GuestId, Permissions};
+    use coroom_transport::quic::Path;
+
+    use crate::ui::app::{App, Dialog, Event, Message, Page};
+    use crate::ui::shots::{Builder, game_frame, playing, safety, signed_in};
+    use crate::ui::video::VideoFeed;
+    pub(crate) fn host_setup(app: &mut App) {
+        use super::{ShareOptions, SourceChoice};
+        signed_in(app, Page::Host);
+        app.settings.audio.excluded_apps = vec![crate::ui::settings::RememberedApp {
+            key: "discord.exe".to_owned(),
+            name: "Discord".to_owned(),
+        }];
+        app.update(Message::Event(Event::ShareOptions(ShareOptions {
+            source: SourceChoice::Screen,
+            targets: vec![coroom_session::capture::CaptureTarget::Monitor {
+                id: 1,
+                name: "Monitor principal · 2560 × 1440".to_owned(),
+            }],
+            targets_error: None,
+            apps: Ok(playing(&[
+                ("juego.exe", "Juego"),
+                ("firefox.exe", "Firefox"),
+                ("discord.exe", "Discord"),
+            ])),
+        })));
+    }
+
+    pub(crate) fn host_setup_app(app: &mut App) {
+        use super::{Msg, ShareOptions, SourceChoice};
+        signed_in(app, Page::Host);
+        app.update(Message::Host(Msg::Source(SourceChoice::App)));
+        app.update(Message::Event(Event::ShareOptions(ShareOptions {
+            source: SourceChoice::App,
+            targets: vec![
+                coroom_session::capture::CaptureTarget::Window {
+                    id: 7,
+                    title: "Juego".to_owned(),
+                    app: Some("juego.exe".to_owned()),
+                },
+                coroom_session::capture::CaptureTarget::Window {
+                    id: 8,
+                    title: "Firefox".to_owned(),
+                    app: Some("firefox.exe".to_owned()),
+                },
+            ],
+            targets_error: None,
+            apps: Ok(playing(&[
+                ("juego.exe", "Juego"),
+                ("firefox.exe", "Firefox"),
+                ("discord.exe", "Discord"),
+            ])),
+        })));
+    }
+
+    /// Como en Wayland: sin lista de monitores; lo elegido en el selector del sistema.
+    pub(crate) fn host_setup_wayland(app: &mut App) {
+        use super::{ShareOptions, SourceChoice};
+        signed_in(app, Page::Host);
+        app.settings.audio.excluded_apps = vec![crate::ui::settings::RememberedApp {
+            key: "discord".to_owned(),
+            name: "Discord".to_owned(),
+        }];
+        app.update(Message::Event(Event::ShareOptions(ShareOptions {
+            source: SourceChoice::Screen,
+            targets: Vec::new(),
+            targets_error: None,
+            apps: Ok(playing(&[
+                ("juego", "Juego"),
+                ("firefox", "Firefox"),
+                ("discord", "Discord"),
+            ])),
+        })));
+        app.update(Message::Event(Event::SharePicked(
+            SourceChoice::Screen,
+            Ok(Some(coroom_session::capture::PickedShare {
+                target: coroom_session::capture::CaptureTarget::Monitor {
+                    id: 0,
+                    name: "2560 × 1440".to_owned(),
+                },
+                restore_token: None,
+            })),
+        )));
+    }
+
+    /// Como en Wayland, transmitiendo una app todavía sin elegir.
+    pub(crate) fn host_setup_app_wayland(app: &mut App) {
+        use super::{Msg, ShareOptions, SourceChoice};
+        signed_in(app, Page::Host);
+        app.update(Message::Host(Msg::Source(SourceChoice::App)));
+        app.update(Message::Event(Event::ShareOptions(ShareOptions {
+            source: SourceChoice::App,
+            targets: Vec::new(),
+            targets_error: None,
+            apps: Ok(playing(&[
+                ("juego", "Juego"),
+                ("firefox", "Firefox"),
+                ("discord", "Discord"),
+            ])),
+        })));
+    }
+
+    pub(crate) fn guest_status(
+        id: u32,
+        name: &str,
+        permissions: Permissions,
+        rtt: f64,
+    ) -> GuestStatus {
+        GuestStatus {
+            guest: GuestId(id),
+            user: u64::from(id) + 1,
+            name: name.to_owned(),
+            public_key: [id as u8; 32],
+            fingerprint: format!("{:02x}", id + 0xb0).repeat(32),
+            safety_number: safety(),
+            permissions,
+            leaf: id,
+            path: Some(if id == 1 { Path::Direct } else { Path::Relayed }),
+            // Direcciones de documentación (RFC 5737), no de nadie.
+            remote: Some(if id == 1 {
+                "192.0.2.24:50412".parse().expect("dirección")
+            } else {
+                "198.51.100.7:4433".parse().expect("dirección")
+            }),
+            rtt_ms: Some(rtt),
+            target_kbps: Some(if id == 1 { 24_000 } else { 9_500 }),
+            link_kbps: Some(if id == 1 { 48_000 } else { 21_000 }),
+            candidates: Vec::new(),
+            input_key: true,
+            input: InputLatency::default(),
+            gamepad: None,
+        }
+    }
+
+    pub(crate) fn with_pad(status: GuestStatus, pad: GuestPad) -> GuestStatus {
+        GuestStatus {
+            gamepad: Some(pad),
+            ..status
+        }
+    }
+
+    pub(crate) fn host_room(app: &mut App) {
+        host_setup(app);
+        let preview = VideoFeed::detached();
+        preview.push(game_frame(1, 640, 360), None, None);
+        app.update(Message::Host(super::Msg::Start));
+        app.update(Message::Event(Event::HostStarted(Ok(preview))));
+        app.update(Message::Event(Event::Host(SessionEvent::RoomCreated {
+            code: "K7Q2MZ".to_owned(),
+            fingerprint: "a1".repeat(32),
+        })));
+        app.update(Message::Event(Event::Host(SessionEvent::VideoCodec {
+            codec: coroom_session::codec::Codec::Av1,
+            detail: "codifica SVT-AV1".to_owned(),
+        })));
+        app.update(Message::Event(Event::HostGuests(vec![
+            guest_status(
+                1,
+                "Bea",
+                Permissions {
+                    keyboard_mouse: true,
+                    gamepad_slot: None,
+                    voice: true,
+                    gamepad_raw: true,
+                },
+                14.2,
+            ),
+            with_pad(
+                guest_status(
+                    2,
+                    "Carla",
+                    Permissions {
+                        keyboard_mouse: false,
+                        gamepad_slot: Some(1),
+                        voice: false,
+                        gamepad_raw: true,
+                    },
+                    38.6,
+                ),
+                GuestPad {
+                    name: "8BitDo Ultimate 2 Wireless Controller".to_owned(),
+                    vendor: 0x2dc8,
+                    product: 0x6012,
+                    transport: PadTransport::Hid,
+                    raw: true,
+                    note: None,
+                },
+            ),
+        ])));
+        app.toasts.clear();
+    }
+
+    /// Con la sala abierta, eligiendo una ventana en vez de la pantalla.
+    pub(crate) fn host_room_switch(app: &mut App) {
+        use super::{Msg, ShareOptions, SourceChoice, TargetOption};
+        host_room(app);
+        app.update(Message::Host(Msg::Source(SourceChoice::App)));
+        // Un título largo, como los de Windows: no debe aplastar el selector Pantalla/Aplicación.
+        let game = coroom_session::capture::CaptureTarget::Window {
+            id: 7,
+            title: "Fatal Fury: City of the Wolves — Edición especial (DirectX 12)".to_owned(),
+            app: Some("juego.exe".to_owned()),
+        };
+        app.update(Message::Event(Event::ShareOptions(ShareOptions {
+            source: SourceChoice::App,
+            targets: vec![game.clone()],
+            targets_error: None,
+            apps: Ok(playing(&[
+                ("juego.exe", "Juego"),
+                ("firefox.exe", "Firefox"),
+                ("discord.exe", "Discord"),
+            ])),
+        })));
+        app.update(Message::Host(Msg::Target(TargetOption(game))));
+        app.toasts.clear();
+    }
+
+    pub(crate) fn host_stop_dialog(app: &mut App) {
+        host_room(app);
+        app.dialog = Some(Dialog::StopSharing);
+    }
+
+    /// Escenas de esta pantalla.
+    pub(crate) const BUILDERS: &[(&str, Builder)] = &[
+        ("08-compartir", host_setup),
+        ("08-compartir-app", host_setup_app),
+        ("08-compartir-wayland", host_setup_wayland),
+        ("08-compartir-app-wayland", host_setup_app_wayland),
+        ("09-sala-abierta", host_room),
+        ("09-sala-cambiar-fuente", host_room_switch),
+        ("10-dejar-de-compartir", host_stop_dialog),
+    ];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2439,9 +2680,10 @@ mod tests {
             "lo elegido sigue sin transmitirse"
         );
 
-        // Vídeo: el bitrate de la sala se aplica ya (y se guarda).
+        // Vídeo: el tope del bitrate de la sala se aplica ya (y se guarda al poco).
         let bitrate = settings_screen::bitrate_choices()[0].clone();
+        let kbps = bitrate.value;
         let effects = app.update(Message::Settings(settings_screen::Msg::Bitrate(bitrate)));
-        assert_eq!(effects, [Effect::SaveSettings, Effect::SetVideo]);
+        assert_eq!(effects, [Effect::SetMaxBitrate(kbps)]);
     }
 }

@@ -228,6 +228,11 @@ impl SignalClient {
         }
     }
 
+    /// RTT suavizado de la conexión QUIC con el servidor.
+    pub fn rtt(&self) -> std::time::Duration {
+        self.session.connection().rtt()
+    }
+
     /// Cierra la sesión.
     pub fn close(&self) {
         self.session

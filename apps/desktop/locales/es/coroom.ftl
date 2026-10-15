@@ -8,7 +8,6 @@
 ## app
 
 app-ajustes = Ajustes
-app-amigos = Amigos
 app-cambiar-de-servidor = Cambiar de servidor
 app-cancelar = Cancelar
 app-cerrar = Cerrar
@@ -20,7 +19,6 @@ app-cerrar-y-salir = Cerrar y salir
 app-compara-estos-numeros-con-name-por = Compara estos números con { $name } por otro medio (en persona o por una llamada). Si coinciden, nadie se ha puesto en medio.
 app-compartir = Compartir
 app-copiado-al-portapapeles = Copiado al portapapeles
-app-cuenta = Cuenta
 app-dejar-de-compartir = ¿Dejar de compartir?
 app-dejar-de-compartir-2 = Dejar de compartir
 app-dejaras-de-ver-y-controlar-la = Dejarás de ver y controlar la pantalla del anfitrión. Puedes volver a entrar con el mismo código mientras la sala siga abierta.
@@ -604,3 +602,8 @@ settings-no-se-pudo-crear-err = no se pudo crear { $display }: { $err }
 
 system-registro-de-windows = registro de Windows
 system-sin-datos-del-sistema = sin datos del sistema
+pantalla-settings-chat-de-la-sala = Chat de la sala
+app-host-sin-conexion = { $host } · sin conexión
+app-host-rtt-ms = { $host } · { $rtt } ms
+pantalla-host-codec-de-la-sala-cambiado = Códec de la sala cambiado.
+backend-el-chat-aun-no-esta-disponible = El chat aún no está disponible en esta sala.

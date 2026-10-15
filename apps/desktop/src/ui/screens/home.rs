@@ -96,7 +96,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             );
             vec![Effect::Invite(user)]
         }
-        Msg::AddFriends => app.update(Message::Navigate(Page::Friends)),
+        Msg::AddFriends => app.update(Message::Navigate(Page::Home)),
     }
 }
 
@@ -379,6 +379,52 @@ fn online_friends(app: &App) -> Element<'_, Message> {
         .into()
 }
 
+/// Escenas de Inicio para las capturas.
+pub(crate) mod shots {
+    use crate::ui::app::{App, Invitation, Load, Message, Page};
+    use crate::ui::shots::{Builder, signed_in};
+    use coroom_transport::proto::api::Friends;
+    pub(crate) fn home(app: &mut App) {
+        signed_in(app, Page::Home);
+        app.invitations = vec![Invitation {
+            from_user: 2,
+            from_name: "Bea".to_owned(),
+            code: "K7Q2MZ".to_owned(),
+        }];
+        // Aviso de versión nueva.
+        app.update.available = Some(crate::update::Update {
+            version: "0.2.0".to_owned(),
+            url: format!("{}/tag/v0.2.0", crate::update::RELEASES_PAGE),
+        });
+    }
+
+    pub(crate) fn home_empty(app: &mut App) {
+        signed_in(app, Page::Home);
+        app.friends = Load::Loaded(Friends {
+            friends: Vec::new(),
+            incoming: Vec::new(),
+            outgoing: Vec::new(),
+        });
+        app.usage = None;
+    }
+
+    pub(crate) fn friends_page(app: &mut App) {
+        signed_in(app, Page::Home);
+        app.friends_page.add_name = "hugo".to_owned();
+    }
+
+    /// Escenas de esta pantalla.
+    pub(crate) const BUILDERS: &[(&str, Builder)] = &[
+        ("05-inicio", home),
+        ("05-inicio-menu-cuenta", |app| {
+            home(app);
+            app.update(Message::ToggleAccountMenu);
+        }),
+        ("06-inicio-vacio", home_empty),
+        ("07-amigos", friends_page),
+    ];
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,7 +490,7 @@ mod tests {
         assert!(app.host.refreshing);
         app.page = Page::Home;
         let effects = app.update(Message::Home(Msg::AddFriends));
-        assert_eq!(app.page, Page::Friends);
+        assert_eq!(app.page, Page::Home);
         assert!(effects.contains(&Effect::LoadFriends), "{effects:?}");
     }
 }

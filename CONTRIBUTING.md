@@ -65,9 +65,9 @@ Según lo que toques:
 - **Nombres de código, módulos y endpoints en inglés; todo lo que ve el usuario en español**, con
   frases completas, la causa y lo que puede hacer («no se pudo abrir la sala: el servidor no
   responde; comprueba la dirección en Ajustes → Red»).
-- Los textos de la aplicación van en `apps/desktop/locales/es/coroom.ftl` y se usan con
+- Los textos de la aplicación van en `apps/desktop/locales/es/*.ftl` (uno por pantalla) y se usan con
   `t!("id")` o `t!("id", nombre = valor)`; el test `l10n` falla si queda un texto suelto o un
-  identificador sin usar. Para traducir coroom, copia el catálogo a `locales/<idioma>/` y añádelo
+  identificador sin usar. Para traducir coroom, copia los catálogos a `locales/<idioma>/` y añádelos
   en `apps/desktop/src/l10n.rs`.
 - Cada backend de plataforma va tras un trait y una `feature`; `cfg(target_os)` solo dentro del
   backend.

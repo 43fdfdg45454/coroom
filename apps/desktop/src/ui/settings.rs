@@ -144,6 +144,98 @@ impl Resolution {
     }
 }
 
+/// Calidad elegida al abrir la sala: tres perfiles cerrados y «Personalizado» cuando se toca
+/// algo en Avanzado ([`Video::preset`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum QualityPreset {
+    /// 1080p a 60 fps con tope de 10 Mbit/s.
+    MinLatency,
+    /// Resolución nativa (hasta 4K) a 60 fps con tope de 20 Mbit/s.
+    #[default]
+    Balanced,
+    /// Resolución nativa (hasta 4K) a 120 fps sin tope y 4:4:4.
+    MaxQuality,
+    /// Lo que haya en Avanzado.
+    Custom,
+}
+
+impl QualityPreset {
+    /// Los tres perfiles cerrados, en orden.
+    pub const PRESETS: [QualityPreset; 3] = [
+        QualityPreset::MinLatency,
+        QualityPreset::Balanced,
+        QualityPreset::MaxQuality,
+    ];
+
+    /// Aplica el perfil a las opciones de vídeo (`Custom` no toca nada).
+    pub fn apply(self, video: &mut Video) {
+        match self {
+            QualityPreset::MinLatency => {
+                video.max_resolution = Resolution::P1080;
+                video.fps = 60;
+                video.max_bitrate_kbps = 10_000;
+                video.chroma_444 = false;
+            }
+            QualityPreset::Balanced => {
+                video.max_resolution = Resolution::P2160;
+                video.fps = 60;
+                video.max_bitrate_kbps = 20_000;
+                video.chroma_444 = false;
+            }
+            QualityPreset::MaxQuality => {
+                video.max_resolution = Resolution::P2160;
+                video.fps = 120;
+                video.max_bitrate_kbps = coroom_session::remote::UNLIMITED_KBPS;
+                video.chroma_444 = true;
+            }
+            QualityPreset::Custom => {}
+        }
+        video.preset = self;
+    }
+
+    /// El perfil que corresponde a estas opciones (`Custom` si no coincide ninguno).
+    pub fn matching(video: &Video) -> QualityPreset {
+        Self::PRESETS
+            .into_iter()
+            .find(|preset| {
+                let mut probe = video.clone();
+                preset.apply(&mut probe);
+                probe.max_resolution == video.max_resolution
+                    && probe.fps == video.fps
+                    && probe.max_bitrate_kbps == video.max_bitrate_kbps
+                    && probe.chroma_444 == video.chroma_444
+            })
+            .unwrap_or(QualityPreset::Custom)
+    }
+}
+
+/// Cuándo surte efecto un ajuste de la sala: ya, con la sala abierta, o en la próxima.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum When {
+    /// Se aplica en vivo (etiqueta «En vivo»).
+    Live,
+    /// Se aplica al abrir la sala (etiqueta «Al abrir la sala»).
+    NextRoom,
+}
+
+/// Cada opción de vídeo de Avanzado, para saber cuándo se aplica ([`Video::when`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoOption {
+    /// Resolución máxima.
+    Resolution,
+    /// Fotogramas por segundo.
+    Fps,
+    /// Códec (y codificador).
+    Codec,
+    /// Tope del bitrate Auto.
+    Bitrate,
+    /// Croma 4:4:4.
+    Chroma444,
+    /// HDR10.
+    Hdr,
+}
+
 /// Vídeo del anfitrión.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -166,19 +258,58 @@ pub struct Video {
     pub encoder: EncoderChoice,
     /// Decodificador como invitado (avanzado).
     pub decoder: DecoderChoice,
+    /// Perfil de calidad elegido en Compartir.
+    pub preset: QualityPreset,
 }
 
 impl Default for Video {
     fn default() -> Self {
         Self {
             codec: CodecChoice::Auto,
-            max_bitrate_kbps: 10_000,
+            max_bitrate_kbps: 20_000,
             fps: 60,
-            max_resolution: Resolution::P1080,
+            max_resolution: Resolution::P2160,
             chroma_444: false,
             hdr: false,
             encoder: EncoderChoice::Auto,
             decoder: DecoderChoice::Auto,
+            preset: QualityPreset::Balanced,
+        }
+    }
+}
+
+impl Video {
+    /// Cuándo surte efecto cada opción: el códec y el tope del bitrate se cambian con la sala
+    /// abierta (el bitrate sin renegociar nada); el resto, al abrir la próxima.
+    pub fn when(option: VideoOption) -> When {
+        match option {
+            VideoOption::Codec | VideoOption::Bitrate => When::Live,
+            VideoOption::Resolution
+            | VideoOption::Fps
+            | VideoOption::Chroma444
+            | VideoOption::Hdr => When::NextRoom,
+        }
+    }
+}
+
+/// Chat y avisos dentro de la sala.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Room {
+    /// Sonido al llegar un mensaje del chat.
+    pub chat_sound: bool,
+    /// Notificación del escritorio con la ventana sin foco.
+    pub chat_notifications: bool,
+    /// Burbuja de 5 s sobre el vídeo con el panel cerrado.
+    pub chat_bubbles: bool,
+}
+
+impl Default for Room {
+    fn default() -> Self {
+        Self {
+            chat_sound: true,
+            chat_notifications: true,
+            chat_bubbles: true,
         }
     }
 }
@@ -243,8 +374,10 @@ impl Default for Audio {
 pub struct Shortcuts {
     /// Inmersivo / escritorio.
     pub immersive: char,
-    /// Panel de estadísticas.
+    /// Panel de conexión (estadísticas).
     pub stats: char,
+    /// Chat de la sala.
+    pub chat: char,
     /// Salir de la sala.
     pub leave: char,
     /// Silenciar el micrófono.
@@ -259,7 +392,8 @@ impl Default for Shortcuts {
     fn default() -> Self {
         Self {
             immersive: 'G',
-            stats: 'O',
+            stats: 'S',
+            chat: 'C',
             leave: 'Q',
             mic: 'M',
             game: 'V',
@@ -269,11 +403,12 @@ impl Default for Shortcuts {
 }
 
 impl Shortcuts {
-    /// Las seis letras, en orden.
-    pub fn letters(&self) -> [char; 6] {
+    /// Las siete letras, en orden.
+    pub fn letters(&self) -> [char; 7] {
         [
             self.immersive,
             self.stats,
+            self.chat,
             self.leave,
             self.mic,
             self.game,
@@ -389,6 +524,8 @@ pub struct Settings {
     pub input: Input,
     /// Red.
     pub network: Network,
+    /// Chat y avisos de la sala.
+    pub room: Room,
     /// Aviso de versión nueva.
     pub updates: Updates,
     /// Servidores conocidos (el primero, el último usado).
@@ -423,6 +560,13 @@ impl Settings {
             .video
             .max_bitrate_kbps
             .clamp(500, coroom_session::remote::UNLIMITED_KBPS);
+        if self.video.preset != QualityPreset::Custom
+            && QualityPreset::matching(&self.video) != self.video.preset
+        {
+            // El perfil guardado y las opciones no cuadran (ajustes de otra versión): manda lo
+            // que hay en las opciones.
+            self.video.preset = QualityPreset::matching(&self.video);
+        }
         if !self.input.shortcuts.is_valid() {
             self.input.shortcuts = Shortcuts::default();
         }
@@ -553,6 +697,8 @@ mod tests {
         settings.input.shortcuts.immersive = 'K';
         settings.video.chroma_444 = true;
         settings.video.hdr = true;
+        // Tocar Avanzado deja el perfil en «Personalizado» (al cargar se comprueba que cuadre).
+        settings.video.preset = QualityPreset::Custom;
         settings.updates = Updates {
             check: false,
             interval_hours: 168,
@@ -602,6 +748,32 @@ mod tests {
         let (loaded, warning) = Settings::load(&path);
         assert_eq!(loaded, Settings::default());
         assert!(warning.is_some_and(|w| w.contains("por defecto")));
+    }
+
+    #[test]
+    fn quality_presets_apply_and_are_recognised() {
+        let mut video = Video::default();
+        assert_eq!(QualityPreset::matching(&video), QualityPreset::Balanced);
+        QualityPreset::MinLatency.apply(&mut video);
+        assert_eq!(video.max_resolution, Resolution::P1080);
+        assert_eq!(video.max_bitrate_kbps, 10_000);
+        assert_eq!(video.preset, QualityPreset::MinLatency);
+        QualityPreset::MaxQuality.apply(&mut video);
+        assert_eq!(video.fps, 120);
+        assert!(video.chroma_444);
+        assert_eq!(
+            video.max_bitrate_kbps,
+            coroom_session::remote::UNLIMITED_KBPS
+        );
+        video.fps = 30;
+        assert_eq!(QualityPreset::matching(&video), QualityPreset::Custom);
+        // Un perfil guardado que no cuadra con las opciones se corrige al sanear.
+        let mut settings = Settings::default();
+        settings.video.fps = 30;
+        settings.video.preset = QualityPreset::Balanced;
+        assert_eq!(settings.sanitized().video.preset, QualityPreset::Custom);
+        assert_eq!(Video::when(VideoOption::Bitrate), When::Live);
+        assert_eq!(Video::when(VideoOption::Fps), When::NextRoom);
     }
 
     #[test]

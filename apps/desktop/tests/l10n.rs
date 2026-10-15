@@ -1,11 +1,12 @@
 //! Catálogos de textos: ningún texto visible de la interfaz queda fuera de
-//! `locales/es/coroom.ftl`, y código y catálogo se corresponden.
+//! `locales/es/*.ftl`, y código y catálogos se corresponden.
 //!
 //! - **Heurística de textos sueltos**: ningún literal con acentos, eñes o signos de apertura
 //!   (`áéíóúüñ¿¡`) en `src/ui` fuera de los tests, de los registros (`debug!`, `info!`, `warn!`,
 //!   `error!`, `trace!`: el registro no es interfaz) y de las comparaciones con errores de otras
-//!   crates (`.contains("…")`). `src/ui/shots.rs` queda fuera: son los datos de ejemplo de las
-//!   capturas (nombres, salas), no textos de la interfaz.
+//!   crates (`.contains("…")`). `src/ui/shots.rs` y el `mod shots` del final de cada pantalla
+//!   quedan fuera: son los datos de ejemplo de las capturas (nombres, salas), no textos de la
+//!   interfaz.
 //! - Todo `t!("id")` del código existe en el catálogo, con las mismas variables.
 //! - Todo mensaje del catálogo se usa en algún sitio.
 
@@ -32,10 +33,15 @@ fn read_source(path: &std::path::Path) -> String {
         .replace("\r\n", "\n")
 }
 
-/// El código sin el módulo de tests.
+/// El código sin el módulo de tests ni el de las escenas de las capturas (`mod shots`, al final
+/// de cada pantalla, antes de los tests: son datos de ejemplo, no textos de la interfaz).
 fn without_tests(source: &str) -> &str {
     let mut end = source.len();
-    for marker in ["\n#[cfg(test)]\nmod ", "\n#[cfg(test)]\npub(crate) mod "] {
+    for marker in [
+        "\n#[cfg(test)]\nmod ",
+        "\n#[cfg(test)]\npub(crate) mod ",
+        "\npub(crate) mod shots {",
+    ] {
         if let Some(at) = source.find(marker) {
             end = end.min(at);
         }
@@ -130,7 +136,7 @@ fn no_visible_text_is_left_outside_the_catalog() {
     }
     assert!(
         loose.is_empty(),
-        "textos de la interfaz fuera de locales/es/coroom.ftl:\n{}",
+        "textos de la interfaz fuera de locales/es/*.ftl:\n{}",
         loose.join("\n")
     );
 }
@@ -203,11 +209,18 @@ fn uses() -> BTreeMap<String, BTreeSet<String>> {
     out
 }
 
-/// Mensajes del catálogo: identificador → variables.
+/// Mensajes de los catálogos del español: identificador → variables.
 fn catalog() -> BTreeMap<String, BTreeSet<String>> {
-    let source = l10n::CATALOGS[0].1;
-    let ids = l10n::message_ids(source);
     let mut out = BTreeMap::new();
+    for source in l10n::CATALOGS[0].1 {
+        catalog_of(source, &mut out);
+    }
+    out
+}
+
+fn catalog_of(source: &str, out: &mut BTreeMap<String, BTreeSet<String>>) {
+    let ids = l10n::message_ids(source);
+    let before = out.len();
     for line in source.lines() {
         let Some((id, value)) = line.split_once(" = ") else {
             continue;
@@ -225,10 +238,16 @@ fn catalog() -> BTreeMap<String, BTreeSet<String>> {
             variables.insert(name);
             rest = &rest[at + 3..];
         }
-        out.insert(id.to_owned(), variables);
+        assert!(
+            out.insert(id.to_owned(), variables).is_none(),
+            "«{id}» repetido entre catálogos"
+        );
     }
-    assert_eq!(out.len(), ids.len(), "un mensaje por línea en el catálogo");
-    out
+    assert_eq!(
+        out.len() - before,
+        ids.len(),
+        "un mensaje por línea en el catálogo"
+    );
 }
 
 #[test]
