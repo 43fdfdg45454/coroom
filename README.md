@@ -145,6 +145,11 @@ trae `opusic-sys` y `meson` + `ninja` el módulo de procesado de voz de WebRTC
 el abseil-cpp que necesita, con sus SHA-256 fijados, para que meson no descargue nada al compilar.
 En Windows basta CMake, que trae Visual Studio: allí el procesado de voz es el respaldo propio.)
 
+Versiones mínimas comprobadas: **libpipewire 1.0.4** (la captura de audio usa `pw_stream_get_nsec`,
+que apareció en esa versión; Debian 12 trae 0.3.65 y necesita el paquete de *backports*) y
+**meson 1.3** (el 1.0.1 de Debian 12 falla al reconfigurar el módulo de WebRTC; Ubuntu 24.04 y
+Fedora traen versiones válidas).
+
 ### FFmpeg
 
 `coroom-codec` enlaza **FFmpeg 8 compartido (LGPL, sin componentes GPL)** con `rsmpeg`. La build

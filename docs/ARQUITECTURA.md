@@ -56,11 +56,19 @@ se usa *intra-refresh* en lugar de keyframes (un IDR pesa 3-5 fotogramas).
 | **Total** | **≈ 26** | **≈ 93** |
 | **Sobrecoste del streaming** | **≈ 6-7** | **≈ 53 (30 son RTT)** |
 
-Audio y voz: Opus en tramas de 10 ms, buffer de jitter adaptativo de 20-60 ms, sincronía A/V con
-|A−V| < 40 ms y voz boca-oído en LAN < 80 ms. La reproducción es **a demanda** en PipeWire: el
-callback del dispositivo pide cada trama justo cuando la necesita (sin cola intermedia, que añadía
-una trama), y el buffer de jitter se queda en su objetivo sin una trama de más. WASAPI sigue con la
-cola de una trama. Los hilos de audio propios (recepción y descifrado en `audio-net`, fuera del
+Audio y voz: Opus en tramas de 10 ms, buffer de jitter adaptativo de 10-60 ms (una trama más el
+p99 del jitter medido en los últimos 2 s, en tiempo y no en tramas; recorta el remanente de un
+parón de golpe y oculta la trama perdida con la cola vacía), sincronía A/V con |A−V| < 40 ms y voz
+boca-oído en LAN < 80 ms. Medido: banco aislado 30-31 ms de captura a altavoz (10 ms de trama +
+jitter p99 + 0-10 ms de fase + 10 ms de dispositivo), voz 25 ms. La reproducción es **a demanda**
+en PipeWire: el callback del dispositivo pide cada trama justo cuando la necesita (se escriben
+exactamente las muestras que pide el grafo, `requested`, con cuanto pedido de 128/48000) y el
+buffer de jitter se queda en su objetivo sin una trama de más. WASAPI usa `IAudioClient3` en modo
+compartido de baja latencia con el periodo mínimo del dispositivo y cae al modo clásico si no lo
+hay. Entrada: los mandos se leen por evento (`next_event_blocking`, ejes a 1 kHz como mucho), con
+repetición de mantenimiento a 100 ms mientras hay algo pulsado (500 ms en reposo) y liberación en
+el anfitrión tras 1 s sin paquetes; las estadísticas del anfitrión se publican cada 100 ms, fuera
+de la etapa de inyección. Los hilos de audio propios (recepción y descifrado en `audio-net`, fuera del
 runtime de la red; captura; reproducción con cola) piden prioridad de tiempo real: `SCHED_FIFO`,
 RealtimeKit o el portal Realtime en Linux, MMCSS «Pro Audio» en Windows. El cifrado no entra como etapa apreciable: con las dos
 capas (SFrame y QUIC) el peor caso queda por debajo de 0,2 ms por fotograma.

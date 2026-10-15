@@ -9,6 +9,26 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Añadido
 
+- **«Pedir entrar»** (protocolo 13; hay que actualizar también el servidor): la lista de amigos
+  de Inicio dice qué hace cada uno (Disponible, En sala, Jugando o Desconectado) al momento, y a
+  quien tiene una sala abierta se le puede pedir entrar con un botón; al anfitrión le aparece en
+  Compartir una tarjeta «X pide entrar» con «Dejar entrar» (que invita) y «Ahora no» (que avisa).
+  La petición caduca a los 60 s en los dos lados, el servidor solo la acepta entre amigos y una
+  vez cada 5 s, y la invitación del anfitrión al que pidió entrar se acepta sola. En la consola de
+  `join --headless`, `ask NOMBRE`.
+- **Sonido del chat en Windows** (`PlaySound`), con un tono propio sintetizado (sin ficheros con
+  derechos) cuando no hay tema de sonidos; **tono personalizado** en Ajustes → Sala (WAV en
+  Windows; WAV, OGG o FLAC en Linux) con «Probar», «Elegir…» por el portal de ficheros y «Quitar».
+  El sonido sigue pudiendo apagarse (ajuste local).
+- **El codificador «auto» se calibra midiendo** (decisión del propietario): al abrir la sala, si
+  hay más de un backend para el códec, se codifican 30 fotogramas con cada uno y se elige el de
+  menor p95 de latencia; el resultado se guarda en `calibration.json` por GPU, driver, códec,
+  resolución y formato, y solo se repite si cambian. En la RTX 5070 Ti del propietario NVENC tarda
+  2,1 ms y Vulkan Video 3,0 ms (H.264 y AV1) y «auto» elegía el segundo.
+- **Vigilante de medios** en el invitado: 3 s sin datagramas ni `Pong` con el códec ya acordado
+  y se pasa a reconectar, sin esperar al idle de QUIC (que baja de 15 a 8 s; keep-alive a 2,5 s).
+- `coroom doctor` dice la versión de libva que hay y si sirve, y alinea la tabla de códecs.
+
 - **Audio del juego con 30-45 ms de latencia propia** (medida de captura a altavoz, no
   estimada). PipeWire captura y reproduce en el hilo de tiempo real (`RT_PROCESS`) y cada trama
   lleva la hora real en que el dispositivo la capturó (`pw_stream_get_nsec` más el retardo del
@@ -120,6 +140,83 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
   pantalla muestra lo elegido y al empezar se repite sin volver a preguntar.
 
 ### Corregido
+
+- **El vídeo del invitado en ventana real se quedaba colgado**: el compositor tomaba su candado
+  mientras iced presentaba la interfaz y, dentro de esa presentación, el primitivo de vídeo volvía
+  a tomarlo desde el mismo hilo. Ahora el área del vídeo solo se anota y la interfaz se dibuja en
+  una textura doble fuera del candado, así que el hilo de presentación nunca espera al render de
+  la interfaz; un fotograma saltado por la cola cuenta como descarte, no como presentado.
+- **Audio con una trama menos de espera**: el buffer de jitter arranca en 1 trama (10 ms) en vez
+  de 2 y su margen es el p99 del jitter medido (en tiempo, no en tramas; dos colas aisladas no lo
+  mueven, tres sí), con ocultación de la trama perdida con la cola vacía. Un parón del propio
+  dispositivo de salida se detecta por la cadencia de sus peticiones y el remanente se recorta en
+  esa misma petición (antes costaba unos 200 ms a +50 ms de latencia); un parón de la red se
+  recorta de golpe tras 10 tramas de confirmación. Banco aislado 30-31 ms (antes 31-40; desfases 5
+  y 9 ms: 26 y 30 ms); juego de captura a altavoz mediana 29-34 ms y p95 40 (antes 37-39 y 56),
+  voz boca-oído 30 ms (antes 36), con pérdidas 48 ms (antes 51). El banco ya no es inestable:
+  descarta las pasadas con parones del planificador en vez de medirlos.
+- **PipeWire escribía 480 muestras fijas** por ciclo e ignoraba lo que pedía el grafo (que
+  redondea el cuanto a potencia de 2: 480 → 256): el reloj de reproducción se desviaba hasta
+  4,7 ms y bajar la latencia pedida no servía. Ahora escribe exactamente `requested`, `played_at`
+  sale de `pw_time.delay`, la captura vacía todos los búferes del ciclo y el cuanto pedido es
+  128/48000 (en el equipo del propietario el retardo del dispositivo baja de 16 a 13,3 ms; los
+  10,7 ms restantes son el `headroom` de 512 muestras del USB, ajeno a coroom). Windows usa
+  `IAudioClient3` en modo compartido de baja latencia con el periodo mínimo que informe el
+  dispositivo, o el actual si el motor lo tiene fijado (conversión propia al formato de mezcla si
+  hace falta).
+- **La sonda de enlace medía Gbit/s**: marcaba los datagramas al procesarlos, no al llegar, y se
+  leían de golpe tras el segundo de medición de RTT, así que el vídeo arrancaba al máximo del
+  usuario. Ahora cada datagrama guarda su llegada, los trenes imposibles se rechazan y la sonda va
+  en paralelo con el vídeo. El reloj remoto no se usa hasta tener 8 muestras de `Pong` (con una o
+  dos, el control de tasa partía de un retardo falso y bajaba a 5 fps).
+- **Primer fotograma 5-6 s antes con CGNAT y relay**: los candidatos locales se anuncian al
+  instante y la dirección WAN después, cuando el router responde; el relay se abre en paralelo
+  con la perforación y se cierra si gana la directa; las capacidades se envían al conectar.
+- **Entrada**: el anfitrión publicaba estadísticas tras cada datagrama (clonar y ordenar 4×2048
+  muestras hasta 1000 veces por segundo, dentro de la etapa de inyección): ahora cada 100 ms,
+  31 µs. Una pérdida que se comía un «soltar tecla» la dejaba pulsada hasta el idle de 15 s: hay
+  repetición de mantenimiento (100 ms con algo pulsado, 500 ms en reposo) y el anfitrión suelta
+  todo tras 1 s sin paquetes. Mantener una tecla en un anfitrión Windows ahora repite con el
+  retardo y la velocidad del sistema (`SendInput` no repite solo). Los eventos de un paquete se
+  inyectan por lotes (una trama `SYN` por lote en uinput: los dos ejes de la palanca llegan en la
+  misma muestra; un `SendInput` por paquete). El hilo de mandos espera en `next_event_blocking`
+  en vez de dormir 1 ms sin compensar, sin asignar memoria por vuelta; el emisor tampoco asigna
+  por datagrama.
+- **Interfaz del invitado con ratón de 1 kHz**: cada evento de ventana reconstruía la interfaz y
+  pedía redibujo, y la posición salía después con la marca de tiempo tardía. Ahora la marca se
+  toma al entrar el evento, los eventos se agrupan en una actualización por redibujo y la
+  posición se envía antes con una prueba de impacto barata. Sin redibujos a 60 fps mientras
+  conecta o reconecta ni en «Abriendo la sala…» (que ahora sí avanza); los ajustes se guardan en
+  un hilo aparte y los últimos cambios no se pierden al cerrar; el chat muestra las últimas 150
+  entradas con «Ver anteriores» y claves estables; la paleta oscura se calcula una vez; el cursor
+  remoto se mueve también entre fotogramas; el motivo del fin de sesión viaja como enum, no como
+  texto.
+- **Vídeo**: la salida de decodificación por CPU hacía tres copias y un relleno con ceros por
+  fotograma (todo Windows y todos los decodificadores por software): un búfer agrupado y
+  reciclado con los planos por desplazamiento; `wait_for_gpu` ya no bloquea el hilo de
+  decodificación (sondea el semáforo del fotograma anterior); las importaciones DMA-BUF se
+  cachean por identidad del búfer (PipeWire recicla 4-16); `encode_into` sin copias; la vista
+  previa fuera del hilo de captura; copias de PipeWire y WGC desde un pool; las marcas de captura
+  usan el `pts` del compositor y el QPC de WGC.
+- **Captura de pantalla en KDE con NVIDIA sin fotogramas**: faltaba la ronda de fijación del
+  modificador DMA-BUF (se pedían búferes con el modificador sin fijar). Ahora se fija el que
+  propone el compositor (con respaldo a memoria compartida), cada paso se registra a nivel
+  `info` y, si en 5 s no llega nada, la captura falla con un error que dice el estado del stream
+  y el formato negociado. Si el diálogo del portal caduca, la sesión del portal se cierra.
+- **`coroom doctor` se caía** con un cargador Vulkan viejo (SIGSEGV dentro de FFmpeg al abrir
+  `*_vulkan`) o una libva anterior a 2.21 (abort de los trampolines): los códecs Vulkan se
+  sondean en un proceso hijo y libva se comprueba con `dlopen` antes de usarla; en los dos casos
+  se dice «no disponible» y por qué.
+- **FEC a cero con el enlace limpio**: cada pérdida aislada costaba un RTT de NACK y frenaba los
+  grupos siguientes; con el RTT del invitado (medido, no el del relay) mayor que 2 intervalos de
+  fotograma, todo grupo de 4 paquetes o más lleva al menos un símbolo de reparación. `Feedback`
+  viaja también por datagrama (y se descarta el duplicado o viejo; el relay reescribe la etiqueta
+  del emisor con el id autenticado, así nadie puede firmar informes por otro), el cursor va en
+  datagramas «gana el último» con copia por stream cada 100 ms, el relay abre su socket con
+  búferes de 8 MB (sysctl en `deploy/README.md`) y su límite por sala solo recorta vídeo. El
+  pacing reparte el fotograma en 0,3 del intervalo según la capacidad medida (antes 0,8 fijo) y
+  las intras en 1 intervalo solo cuando lo medido deja el doble de holgura (si no, en 2). En una
+  LAN con conexión directa ya no queda abierta una conexión ociosa con el relay.
 
 - **El Flatpak 1.6.2 se cerraba al abrirlo** (fallo de segmentación dentro de FFmpeg al comprobar
   los codificadores): el `rpath` que se añade al compilar apuntaba a las bibliotecas del sistema
