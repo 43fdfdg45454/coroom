@@ -30,6 +30,7 @@ use coroom_session::codec::{Codec, DecoderBackend, DecoderSet, EncoderSet};
 use coroom_session::latency::{LatencyLedger, LatencySummary};
 use coroom_session::loopback::{DecodedFrame, FrameSink, LoopbackConfig, SinkError};
 use coroom_session::remote::{RemoteSession, VideoChange};
+use coroom_session::transport::proto::video::fit;
 use coroom_session::{GuestId, SessionState};
 use coroom_transport::lossy::{LossyConfig, UdpLossy};
 
@@ -362,7 +363,12 @@ fn qa_live_changes() {
                         &guest,
                         &seen,
                         u64::from(fps),
-                        Some((width & !1, height & !1)),
+                        Some({
+                            // La sala se abrió con tope 1920×1080: lo mayor se reduce con su
+                            // proporción (`proto::video::fit`) y todo sale con lados pares.
+                            let (w, h) = fit((width, height), (1920, 1080));
+                            (w & !1, h & !1)
+                        }),
                         step,
                     )
                 }),
@@ -628,8 +634,15 @@ fn qa_more() {
             let mut viewer = guest(server.config(), &code, None, DecoderSet::probe(), &seen);
             check(
                 &mut failures,
-                "abrir a 1001×701 (sale 1000×700)",
-                advance(&odd, &viewer, &seen, 50, Some((1000, 700)), step),
+                "abrir a 1001×701 (tope 1000×700: sale 998×700, con su proporción)",
+                advance(
+                    &odd,
+                    &viewer,
+                    &seen,
+                    50,
+                    Some(fit((1001, 701), (1000, 700))),
+                    step,
+                ),
             );
             viewer.close();
             odd.close();
