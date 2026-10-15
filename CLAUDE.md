@@ -36,6 +36,11 @@ commits ni issues: correos o nombres de personas reales; dominios, IP, puertos e
 servidores reales; contraseñas, claves, tokens, certificados o cadenas de conexión. Usar valores
 ficticios (`coroom.example.com`, `admin@example.com`, `change-me`) y mantenerlos en
 `deploy/.env.sample`. Los valores reales viven solo en `deploy/.env` (en `.gitignore`).
+Tampoco el equipo de nadie: ni modelos concretos de GPU o CPU ni las aplicaciones que corren en
+la máquina del propietario (las familias, «RTX 50», «Radeon», sirven para hablar de drivers; los
+ejemplos, ficticios: «GPU de ejemplo / driver 1.2.3», «juego.bin»). Lo vigilan el test
+`no_file_names_a_specific_gpu_or_cpu_model` de `apps/desktop/tests/repo.rs` y el gancho
+`commit-msg` de `.githooks/`.
 
 ## Estructura
 

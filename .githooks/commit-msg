@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Regla de privacidad: el mensaje de un commit no nombra un modelo concreto de GPU o CPU del
+# equipo de nadie («RTX 5090», «RX 7800», «Ryzen 7 9800X»); las familias («RTX 50») sí valen.
+# Se activa con: git config core.hooksPath .githooks
+if grep -nE '\b(RTX|GTX|RX) ?[0-9]{3,}|\bArc [AB][0-9]{3}|\bRyzen [0-9] [0-9]{3,}|\bCore i[0-9][ -][0-9]{3,}' "$1" >/dev/null; then
+  echo "commit-msg: el mensaje nombra un modelo concreto de GPU o CPU (regla de privacidad del CLAUDE.md):" >&2
+  grep -nE '\b(RTX|GTX|RX) ?[0-9]{3,}|\bArc [AB][0-9]{3}|\bRyzen [0-9] [0-9]{3,}|\bCore i[0-9][ -][0-9]{3,}' "$1" >&2
+  exit 1
+fi
