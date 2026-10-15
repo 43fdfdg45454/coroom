@@ -38,6 +38,7 @@ use openmls_traits::signatures::{Signer, SignerError};
 use openmls_traits::types::SignatureScheme;
 use zeroize::Zeroizing;
 
+use crate::chat::{CHAT_EXPORTER_LABEL, CHAT_KEY_LENGTH, ChatKey, chat_key_context};
 use crate::identity::{Identity, PUBLIC_KEY_LENGTH};
 use crate::sframe::{MEDIA_KEY_LENGTH, MediaKey, media_key_context};
 
@@ -559,6 +560,21 @@ impl RoomGroup {
                 Ok((member.leaf_index, key))
             })
             .collect()
+    }
+
+    /// Clave del chat de la época actual ([`crate::chat`]):
+    /// `export_secret("coroom chat v1", epoch (u64 BE), 32)`.
+    pub fn chat_key(&self) -> Result<ChatKey, MlsError> {
+        let epoch = self.epoch();
+        let secret = self.export_secret(
+            CHAT_EXPORTER_LABEL,
+            &chat_key_context(epoch),
+            CHAT_KEY_LENGTH,
+        )?;
+        let mut key = [0u8; CHAT_KEY_LENGTH];
+        key.copy_from_slice(&secret);
+        let key = ChatKey::new(epoch, key);
+        Ok(key)
     }
 
     fn ensure_active(&self) -> Result<(), MlsError> {

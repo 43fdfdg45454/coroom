@@ -154,6 +154,16 @@ Invitado ── HTTP/3 + WebTransport ──▶ Servidor (UDP) ◀── HTTP/3 
   invitados, se abre con un código corto temporal o con invitación a amigos, y es un grupo MLS.
   Permisos por invitado (ranura de mando, teclado y ratón, solo mirar), aprobación de entrada,
   pausa, expulsión (época MLS nueva) y voz activable.
+- **Chat de la sala**: texto plano (hasta 2 000 caracteres, con emoji del sistema) por el stream
+  de control, en estrella: el invitado manda su mensaje al anfitrión (`ControlMessage::Chat`) y
+  el anfitrión, que fija el orden, le pone autor y hora y lo reenvía a todos, el autor incluido
+  (así cada uno ve el mismo orden). Funciona desde que hay stream de control y claves, en la sala
+  de espera, antes del vídeo. El historial vive solo en la memoria del anfitrión mientras dure la
+  sala: quien entra recibe los últimos 50 en un `ChatHistory`; `ChatClear` lo vacía para todos;
+  expulsar a alguien no borra lo que escribió. Límite de 10 mensajes cada 10 s por persona: el
+  anfitrión descarta lo que lo supera y el cliente lo rechaza antes («Vas muy rápido»). Nada va
+  al disco ni al servidor; los avisos de sistema (entradas, salidas, permisos) no viajan por el
+  chat.
 
 ## 5. Estructura del repositorio
 
@@ -198,7 +208,10 @@ con secreto hacia delante; las claves SFrame de cada emisor se derivan del expor
 viaja en la cabecera, así que la rotación nunca bloquea el flujo; la entrada usa una clave pareja a
 pareja HPKE con X-Wing, de modo que ningún invitado puede leer ni falsificar la de otro. El relay ve
 y usa la cabecera de los medios, nunca su contenido, y la capa SFrame se mantiene también en directo
-para que las dos rutas se comporten igual.
+para que las dos rutas se comporten igual. El chat se sella con AES-256-GCM y una clave de grupo
+por época (exportador MLS `coroom chat v1`): el relay, que reenvía los streams de control, no lo
+lee, y quien sale de la sala deja de leer lo que se escribe después; la autoría la pone el
+anfitrión (§2.3 y §1 de `docs/seguridad.md`).
 
 El análisis de amenazas (servidor curioso o malicioso, invitado malicioso, red hostil), la revisión
 por capas, los hallazgos con su corrección y su test, el fuzzing de todo lo que parsea datos de la

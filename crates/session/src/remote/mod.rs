@@ -64,10 +64,19 @@
 //! el juego, pulsar para hablar) y quién habla. Todos los `MediaSender` del anfitrión comparten el
 //! origen de su reloj ([`Core::clock_origin`]): las marcas de captura del audio van en ese reloj.
 //!
+//! **Chat ([`chat`])**: texto plano por el stream de control, en estrella (el invitado escribe al
+//! anfitrión y el anfitrión, que fija el orden y la hora, lo reenvía a todos), cifrado de extremo a
+//! extremo con la clave de chat de la época MLS para que ni el servidor ni el relay lo lean.
+//! [`RemoteSession::send_chat`] y [`RemoteSession::clear_chat`] (anfitrión) envían;
+//! [`SessionEvent::ChatMessage`], [`SessionEvent::ChatHistory`], [`SessionEvent::ChatCleared`] y
+//! [`SessionEvent::ChatRejected`] cuentan lo que llega. Funciona en cuanto hay control y claves,
+//! antes del vídeo.
+//!
 //! No se debe llamar a [`Session::start`] ni a [`Session::close`] desde dentro de un runtime de
 //! `tokio` (la sesión tiene el suyo).
 
 pub mod audio;
+pub mod chat;
 mod guest;
 mod host;
 pub mod input;
@@ -75,6 +84,7 @@ pub mod negotiate;
 pub mod wire;
 
 pub use audio::{AudioControl, GuestAudio, HostAudio, TalkMode, VoiceInput, talker_label};
+pub use chat::{CHAT_RATE_MESSAGES, CHAT_RATE_WINDOW, ChatAuthor, ChatLine};
 pub use input::{GuestInput, eis_provider};
 pub use negotiate::{GuestCapabilities, choose_codec};
 
@@ -91,6 +101,7 @@ use coroom_capture::{CaptureOptions, Capturer, GpuFrames};
 use coroom_codec::{Codec, DecoderSet, EncoderSet};
 use coroom_input::InputSink;
 use coroom_input::inject::{EisProvider, SinkOptions, platform_sink};
+use coroom_transport::crypto::ChatKey;
 use coroom_transport::crypto::hpke::PairwiseSecret;
 use coroom_transport::crypto::sframe::MediaKey;
 use coroom_transport::crypto::{Identity, MediaKeyRing, SafetyNumber, sha256_fingerprint};
@@ -443,6 +454,23 @@ pub enum SessionEvent {
     Warning(String),
     /// Invitado: quién está en la sala (el anfitrión incluido), cada vez que cambia.
     Members(Vec<RoomMember>),
+    /// Un mensaje del chat, en el orden que fija el anfitrión (los propios llegan así también:
+    /// el anfitrión los devuelve con `own`).
+    ChatMessage(ChatLine),
+    /// Invitado, al entrar (o volver a entrar) en la sala: los últimos mensajes del chat. Sustituye
+    /// lo que hubiese.
+    ChatHistory {
+        /// Del más antiguo al más nuevo (como mucho `proto::control::CHAT_HISTORY_MAX`).
+        messages: Vec<ChatLine>,
+    },
+    /// El anfitrión vació el chat para todos.
+    ChatCleared,
+    /// Anfitrión: se descartó un mensaje de un invitado (ritmo, texto no válido o claves de una
+    /// época anterior). Lo que no deja enviar [`RemoteSession::send_chat`] vuelve como error.
+    ChatRejected {
+        /// Motivo, en español.
+        reason: String,
+    },
     /// La sesión terminó (`None` = cierre normal).
     Ended(Option<SessionError>),
 }
@@ -578,6 +606,21 @@ impl fmt::Display for SessionEvent {
                 write!(f, "Sin relay: {message}.")
             }
             SessionEvent::Warning(message) => write!(f, "Aviso: {message}"),
+            SessionEvent::ChatMessage(line) => write!(f, "{line}"),
+            SessionEvent::ChatHistory { messages } if messages.is_empty() => {
+                f.write_str("Historial del chat: vacío.")
+            }
+            SessionEvent::ChatHistory { messages } => {
+                write!(f, "Historial del chat ({} mensajes):", messages.len())?;
+                for line in messages {
+                    write!(f, "\n  {line}")?;
+                }
+                Ok(())
+            }
+            SessionEvent::ChatCleared => f.write_str("El anfitrión ha vaciado el chat."),
+            SessionEvent::ChatRejected { reason } => {
+                write!(f, "Mensaje del chat descartado: {reason}.")
+            }
             SessionEvent::Ended(None) => f.write_str("Sesión terminada."),
             SessionEvent::Ended(Some(err)) => write!(f, "Sesión terminada: {err}."),
         }
@@ -717,6 +760,10 @@ pub(crate) enum Command {
     Video(VideoChange),
     /// Invitado: volver a entrar en la sala ya.
     Reconnect,
+    /// Anfitrión: enviar a la sala un mensaje del chat ya validado y contado en el límite.
+    Chat(String),
+    /// Anfitrión: vaciar el chat para todos.
+    ChatClear,
     Close,
 }
 
@@ -785,6 +832,8 @@ pub(crate) struct Core {
     pub(crate) game_filter: Mutex<Option<AppFilter>>,
     /// Anfitrión: hay hilo `audio-cap` (la sala se abrió con audio del juego).
     pub(crate) game_audio: AtomicBool,
+    /// Chat: claves por época, límite de ritmo e historial (anfitrión).
+    pub(crate) chat: Mutex<chat::ChatState>,
 }
 
 /// Cerrojo que sobrevive a un pánico de otro hilo (el estado se sustituye entero).
@@ -823,6 +872,7 @@ impl Core {
             capture_setup: Mutex::new(None),
             game_filter: Mutex::new(None),
             game_audio: AtomicBool::new(false),
+            chat: Mutex::new(chat::ChatState::default()),
             joined_once: AtomicBool::new(false),
             reconnect_attempts: AtomicU32::new(0),
             port_mapping: Mutex::new(None),
@@ -1448,6 +1498,74 @@ impl RemoteSession {
             .as_ref()
             .and_then(|commands| commands.send(Command::Reconnect).ok())
             .ok_or(SessionError::Network("la sesión no está en marcha".into()))
+    }
+
+    /// Envía `text` al chat de la sala (anfitrión e invitado). Antes de enviarlo comprueba el
+    /// texto ([`chat::validate_text`]: ni vacío ni más de 2 000 caracteres, sin caracteres de
+    /// control), el límite de ritmo ([`CHAT_RATE_MESSAGES`] cada [`CHAT_RATE_WINDOW`]) y que haya
+    /// control y claves; si no, [`SessionError::Chat`] con el motivo en español. El mensaje
+    /// aparece como [`SessionEvent::ChatMessage`] con `own` cuando el anfitrión lo reparte (en el
+    /// anfitrión, enseguida).
+    pub fn send_chat(&self, text: &str) -> Result<(), SessionError> {
+        let text = chat::validate_text(text).map_err(SessionError::Chat)?;
+        if self.core.ended() {
+            return Err(SessionError::Chat("La sesión ha terminado.".to_owned()));
+        }
+        let not_ready = || {
+            SessionError::Chat("El chat aún no está disponible: la sala se está abriendo.".into())
+        };
+        match self.core.role {
+            Role::Host => {
+                let commands = self.commands.as_ref().ok_or_else(not_ready)?;
+                {
+                    let mut chat = lock(&self.core.chat);
+                    if chat.epoch().is_none() {
+                        return Err(not_ready());
+                    }
+                    chat.own_rate(Instant::now(), true)
+                        .map_err(SessionError::Chat)?;
+                }
+                commands
+                    .send(Command::Chat(text))
+                    .map_err(|_| SessionError::Chat("La sesión ha terminado.".to_owned()))
+            }
+            Role::Guest => {
+                let control = lock(&self.core.link).control.clone().ok_or_else(|| {
+                    SessionError::Chat(
+                        "El chat aún no está disponible: esperando la conexión con el anfitrión."
+                            .to_owned(),
+                    )
+                })?;
+                let own_leaf = self.core.own_leaf.load(Ordering::Acquire);
+                let message = lock(&self.core.chat)
+                    .seal_own(own_leaf, &text, Instant::now())
+                    .map_err(SessionError::Chat)?;
+                control.send(&message).map_err(|err| {
+                    SessionError::Chat(format!("No se pudo enviar el mensaje: {err}."))
+                })
+            }
+        }
+    }
+
+    /// Anfitrión: vacía el chat para todos (historial incluido; [`SessionEvent::ChatCleared`]
+    /// aquí y en cada invitado).
+    pub fn clear_chat(&self) -> Result<(), SessionError> {
+        self.require_host()?;
+        self.commands
+            .as_ref()
+            .and_then(|commands| commands.send(Command::ChatClear).ok())
+            .ok_or(SessionError::Network("la sesión no está en marcha".into()))
+    }
+
+    /// Época MLS de la clave del chat más nueva (`None` antes de tener claves).
+    pub fn chat_epoch(&self) -> Option<u64> {
+        lock(&self.core.chat).epoch()
+    }
+
+    /// Clave del chat de la época más nueva (para diagnóstico y tests: quien selle con ella debe
+    /// usar un nonce que la sesión no use).
+    pub fn chat_key(&self) -> Option<ChatKey> {
+        lock(&self.core.chat).newest_key()
     }
 
     /// Anfitrión: vista previa de lo que se captura ([`crate::preview::PreviewTap`]); `None` la

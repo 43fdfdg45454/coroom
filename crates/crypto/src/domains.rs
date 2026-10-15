@@ -13,7 +13,7 @@
 //! - los mensajes que firma la clave Ed25519 de la identidad pertenecen a dominios disjuntos
 //!   ([`SIGNATURE_DOMAINS`]): por su primer byte o, si coincide, por su longitud.
 
-use crate::{hpke, input, mls, safety, sealed};
+use crate::{chat, hpke, input, mls, safety, sealed};
 
 /// Para qué se usa una etiqueta.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +116,12 @@ pub fn labels() -> Vec<Label> {
             Use::MlsExporter,
             Some("exportador MLS"),
             mls::SFRAME_EXPORTER_LABEL.as_bytes(),
+        ),
+        label(
+            "chat::CHAT_EXPORTER_LABEL",
+            Use::MlsExporter,
+            Some("exportador MLS"),
+            chat::CHAT_EXPORTER_LABEL.as_bytes(),
         ),
         label("safety::LABEL", Use::Hash, None, safety::LABEL),
         label(

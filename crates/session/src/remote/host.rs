@@ -26,7 +26,8 @@ use coroom_transport::media::{
 };
 use coroom_transport::proto::PROTOCOL_VERSION;
 use coroom_transport::proto::control::{
-    ControlMessage, Hello, MEMBER_NAME_MAX, MEMBERS_MAX, Member as WireMember, Role as WireRole,
+    ChatEntry, ControlMessage, Hello, MEMBER_NAME_MAX, MEMBERS_MAX, Member as WireMember,
+    Role as WireRole, SealedChat,
 };
 use coroom_transport::proto::media::{ObjectHeader, Track};
 use coroom_transport::proto::signal::{ErrorCode, SignalMessage};
@@ -43,6 +44,7 @@ use super::audio::{
     AudioOut, AudioReader, HostAudio, Packet, Player, TalkMode, extend_us, game_capture_loop,
     packet_channel, play_loop, voice_capture_loop,
 };
+use super::chat::{ChatAuthor, ChatLine};
 use super::input::{HostInput, Job};
 use super::negotiate::{
     GuestCapabilities, choose_codec, choose_format, codec_to_wire, format_shortfall,
@@ -864,12 +866,26 @@ struct HostCtx {
 }
 
 /// `name` en como mucho [`MEMBER_NAME_MAX`] bytes, sin cortar un carácter.
-fn truncate_name(name: &str) -> String {
+pub(crate) fn truncate_name(name: &str) -> String {
     let mut end = name.len().min(MEMBER_NAME_MAX);
     while !name.is_char_boundary(end) {
         end -= 1;
     }
     name[..end].to_owned()
+}
+
+/// Chat: la línea que ve la interfaz a partir de la entrada del historial.
+fn chat_line(entry: ChatEntry, own: bool) -> ChatLine {
+    ChatLine {
+        author: ChatAuthor {
+            guest: entry.guest,
+            leaf: entry.leaf,
+            name: entry.name,
+        },
+        text: entry.text,
+        at_unix_ms: entry.at_unix_ms,
+        own,
+    }
 }
 
 /// Aviso cuando el servidor no tiene relay.
@@ -1006,6 +1022,8 @@ impl HostCtx {
                 });
             }
         }
+        // Chat: lo último que se escribió, recifrado con la época actual (la suya).
+        self.send_chat_history(guest, control);
         self.core.emit(SessionEvent::GuestConnected {
             guest,
             path,
@@ -1127,6 +1145,98 @@ impl HostCtx {
             if id != guest {
                 let _ = control.send(&message);
             }
+        }
+    }
+
+    /// Chat: un mensaje sellado a todos los invitados conectados (el autor incluido). Se llama con
+    /// el chat bloqueado, así salen en el orden de sus contadores.
+    fn chat_broadcast(&self, message: &ControlMessage) {
+        for (_, control) in lock(&self.links).guest_controls() {
+            let _ = control.send(message);
+        }
+    }
+
+    /// Chat: lo que escribe el anfitrión (ya validado y contado en `send_chat`). El evento local
+    /// sale con el chat bloqueado, como el reparto: así su orden es el del historial.
+    fn chat_from_host(&self, text: String) {
+        let leaf = self.core.own_leaf.load(Ordering::Acquire);
+        let entry = ChatEntry {
+            guest: 0,
+            leaf,
+            name: String::new(),
+            text,
+            at_unix_ms: 0,
+        };
+        let mut chat = lock(&self.core.chat);
+        match chat.post(entry, leaf) {
+            Ok((message, entry)) => {
+                self.chat_broadcast(&message);
+                self.core
+                    .emit(SessionEvent::ChatMessage(chat_line(entry, true)));
+            }
+            Err(err) => {
+                drop(chat);
+                self.core
+                    .warn(format!("no se pudo enviar el mensaje del chat: {err}"));
+            }
+        }
+    }
+
+    /// Chat: un mensaje del invitado `guest`: se abre, se valida (hoja, texto y ritmo), se le pone
+    /// autor y hora, se guarda y se reparte a todos.
+    fn chat_from_guest(&self, guest: GuestId, sealed: &SealedChat) {
+        let Some((leaf, name)) = lock(&self.core.guests)
+            .get(&guest)
+            .map(|status| (status.leaf, status.name.clone()))
+        else {
+            return;
+        };
+        let own_leaf = self.core.own_leaf.load(Ordering::Acquire);
+        let mut chat = lock(&self.core.chat);
+        let posted = chat
+            .accept_from_guest(guest.0, leaf, &name, sealed, Instant::now())
+            .and_then(|entry| chat.post(entry, own_leaf));
+        match posted {
+            Ok((message, entry)) => {
+                self.chat_broadcast(&message);
+                self.core
+                    .emit(SessionEvent::ChatMessage(chat_line(entry, false)));
+            }
+            Err(reason) => {
+                drop(chat);
+                debug!(guest = guest.0, %reason, "mensaje del chat descartado");
+                self.core.emit(SessionEvent::ChatRejected {
+                    reason: format!("el de {name} (invitado {}): {reason}", guest.0),
+                });
+            }
+        }
+    }
+
+    /// Chat: vaciar para todos.
+    fn chat_clear(&self) {
+        let own_leaf = self.core.own_leaf.load(Ordering::Acquire);
+        let mut chat = lock(&self.core.chat);
+        match chat.clear(own_leaf) {
+            Ok(message) => {
+                self.chat_broadcast(&message);
+                self.core.emit(SessionEvent::ChatCleared);
+            }
+            Err(err) => {
+                drop(chat);
+                self.core.warn(format!("no se pudo vaciar el chat: {err}"));
+            }
+        }
+    }
+
+    /// Chat: el historial al invitado que acaba de conectar.
+    fn send_chat_history(&self, guest: GuestId, control: &ControlSender) {
+        let own_leaf = self.core.own_leaf.load(Ordering::Acquire);
+        let mut chat = lock(&self.core.chat);
+        match chat.history_message(own_leaf) {
+            Ok(message) => {
+                let _ = control.send(&message);
+            }
+            Err(err) => debug!(guest = guest.0, %err, "historial del chat sin enviar"),
         }
     }
 
@@ -1463,6 +1573,7 @@ async fn control_reader(
                     }
                 }
             }
+            Some(ControlMessage::Chat(sealed)) => ctx.chat_from_guest(guest, &sealed),
             Some(ControlMessage::Bye) => break,
             _ => {}
         }
@@ -1903,6 +2014,7 @@ impl Room {
                 removal.epoch,
                 &self.group.media_keys().map_err(crypto("MLS"))?,
             );
+            self.install_chat_key(true);
             return send(&self.ctx.signal, SignalMessage::Kick { peer_id: guest.0 }).await;
         }
 
@@ -1936,6 +2048,9 @@ impl Room {
         )
         .await?;
 
+        // La clave del chat de la época nueva se usa ya (quien aún no procesó el commit guarda lo
+        // que llegue hasta tenerla); las anteriores se conservan: no ha salido nadie.
+        self.install_chat_key(false);
         // La época nueva se instala cuando el invitado conecte (ver el módulo).
         let keys = self.group.media_keys().map_err(crypto("MLS"))?;
         *lock(&self.ctx.pending) = Some((change.epoch, keys));
@@ -2042,6 +2157,8 @@ impl Room {
                 lock(&self.ctx.pending).take();
                 let keys = self.group.media_keys().map_err(crypto("MLS"))?;
                 self.ctx.install(change.epoch, &keys);
+                // El que sale conoce las claves del chat anteriores: se olvidan.
+                self.install_chat_key(true);
                 for other in recipients {
                     self.mls(other, commit.clone()).await?;
                 }
@@ -2079,12 +2196,28 @@ impl Room {
         self.ctx.voice_state(guest, false);
         lock(&self.ctx.core.guests).remove(&guest);
         lock(&self.ctx.core.input_keys).remove(&guest.0);
+        // Lo que escribió se queda en el historial; su límite de ritmo, no.
+        lock(&self.ctx.core.chat).forget_guest(guest.0);
         self.ctx.update_active();
         self.ctx.broadcast_members();
         self.ctx
             .core
             .emit(SessionEvent::GuestLeft { guest, kicked });
         Ok(())
+    }
+
+    /// Instala en el chat la clave de la época actual del grupo.
+    fn install_chat_key(&self, forget_older: bool) {
+        let installed = self
+            .group
+            .chat_key()
+            .map_err(|err| err.to_string())
+            .and_then(|key| lock(&self.ctx.core.chat).install(key, forget_older));
+        if let Err(err) = installed {
+            self.ctx
+                .core
+                .warn(format!("no se pudo preparar la clave del chat: {err}"));
+        }
     }
 
     async fn shutdown(&self) {
@@ -2211,6 +2344,9 @@ async fn run_host(
     core.host_leaf
         .store(group.own_leaf_index(), Ordering::Release);
     core.install_epoch(group.epoch(), &group.media_keys().map_err(crypto("MLS"))?);
+    lock(&core.chat)
+        .install(group.chat_key().map_err(crypto("MLS"))?, true)
+        .map_err(SessionError::Crypto)?;
     let candidates = if config.force_relay {
         Vec::new()
     } else {
@@ -2299,6 +2435,8 @@ async fn run_host(
                     ctx.send_to_guest(guest, &ControlMessage::GamepadOutput { slot, data });
                 }
                 Some(Command::Video(change)) => ctx.change_video(change),
+                Some(Command::Chat(text)) => ctx.chat_from_host(text),
+                Some(Command::ChatClear) => ctx.chat_clear(),
                 Some(Command::Reconnect) => {}
                 Some(Command::Invite(user)) => {
                     let invite = SignalMessage::Invite { to_user: user, code: room.code.clone() };

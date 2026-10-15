@@ -10,7 +10,6 @@
 use std::io::BufRead;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use coroom_desktop::account::{self, AccountOptions, FriendsAction, LoginOptions};
@@ -18,13 +17,12 @@ use coroom_desktop::probe::{ProbeOptions, Source, run_headless};
 use coroom_desktop::remote::{
     AutoAllow, CONSOLE_HELP, HostAudioOptions, HostOptions, JoinAudioOptions, JoinOptions,
     NetOptions, load_identity, parse_game_capture, print_events_forwarding, run_host_console,
-    run_join_headless, start_host, stdin_lines, wait_for_invitation,
+    run_join_console, run_join_headless, start_host, stdin_lines, wait_for_invitation,
 };
 use coroom_desktop::ui::{self, Launch};
 use coroom_session::codec::{Backend, Codec, DecoderBackend};
 use coroom_session::latency::LatencySummary;
 use coroom_session::loopback::{LoopbackConfig, LoopbackPipeline};
-use coroom_session::remote::RemoteSession;
 use coroom_session::{Session, SessionError};
 
 /// Juego remoto con amigos, con cifrado de extremo a extremo.
@@ -1023,24 +1021,6 @@ fn windowed(launch: Launch) -> Result<LatencySummary, String> {
     ui::run(launch)?.ok_or_else(|| "la ventana se cerró sin resumen".to_owned())
 }
 
-/// Espera a que la sesión termine o el usuario pulse Intro; si la entrada se cierra (por ejemplo,
-/// en segundo plano), sigue hasta que termine.
-fn wait_for_enter_remote(session: &RemoteSession) {
-    eprintln!("Pulsa Intro para terminar.");
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        if matches!(std::io::stdin().lock().read_line(&mut line), Ok(n) if n > 0) {
-            let _ = tx.send(());
-        }
-    });
-    while rx.try_recv().is_err() {
-        if session.wait(Duration::from_millis(100)) {
-            return;
-        }
-    }
-}
-
 fn end_code(reason: Option<SessionError>) -> ExitCode {
     match reason {
         None => ExitCode::SUCCESS,
@@ -1169,7 +1149,7 @@ fn join(args: &JoinArgs) -> ExitCode {
     );
     let result = if args.headless {
         run_join_headless(identity, &options, args.json, |session| {
-            wait_for_enter_remote(session)
+            run_join_console(session, &stdin_lines())
         })
     } else {
         windowed(Launch::Join {

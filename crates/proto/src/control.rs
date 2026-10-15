@@ -23,6 +23,15 @@
 //! Desde la versión 7 `CodecSelected` lleva el formato del flujo ([`Chroma`] y
 //! [`ColorSpace`]: BT.709 SDR o BT.2020 PQ, 4:2:0 o 4:4:4) y `Capabilities` dice con qué códecs el
 //! invitado acepta 4:4:4 y HDR10 ([`Capabilities::yuv444`], [`Capabilities::hdr10`]).
+//!
+//! Desde la versión 12 viaja el chat de la sala, en estrella: el invitado manda su mensaje al
+//! anfitrión ([`ControlMessage::Chat`]) y el anfitrión, que fija el orden y la hora, lo reenvía a
+//! todos (al autor también); a quien entra le manda los últimos [`CHAT_HISTORY_MAX`] en un solo
+//! [`ControlMessage::ChatHistory`] y puede vaciarlo para todos ([`ControlMessage::ChatClear`]).
+//! Los tres van sellados ([`SealedChat`]) con la clave de chat de la época MLS
+//! (`coroom_crypto::chat`): el relay, que reenvía el stream de control, solo ve la época, la hoja
+//! que sella, el contador y el tamaño. El texto en claro es un [`ChatEntry`] (o una lista, en el
+//! historial) codificado con `postcard`.
 
 use serde::{Deserialize, Serialize};
 
@@ -192,6 +201,80 @@ pub const MEMBERS_MAX: usize = 64;
 
 /// Bytes como mucho del nombre de un [`Member`].
 pub const MEMBER_NAME_MAX: usize = 128;
+
+/// Caracteres (`char`) como mucho del texto de un mensaje de chat.
+pub const CHAT_TEXT_MAX_CHARS: usize = 2000;
+
+/// Bytes UTF-8 como mucho del texto de un mensaje de chat (2 000 caracteres de 4 bytes): con
+/// [`CHAT_TEXT_MAX_CHARS`] siempre se cumple, pero permite descartar un texto enorme sin contar
+/// sus caracteres.
+pub const CHAT_TEXT_MAX_BYTES: usize = 8000;
+
+/// Mensajes que el anfitrión guarda y manda a quien entra en la sala.
+pub const CHAT_HISTORY_MAX: usize = 50;
+
+/// Etiqueta AES-GCM que añade el sellado de [`SealedChat`].
+pub const CHAT_TAG_LEN: usize = 16;
+
+/// Bytes como mucho de un [`ChatEntry`] codificado: texto, nombre y la cota de `postcard` para
+/// los enteros y las longitudes.
+pub const CHAT_ENTRY_MAX_BYTES: usize = CHAT_TEXT_MAX_BYTES + MEMBER_NAME_MAX + 32;
+
+/// Bytes como mucho del texto cifrado de un [`ControlMessage::Chat`].
+pub const CHAT_MESSAGE_SEALED_MAX: usize = CHAT_ENTRY_MAX_BYTES + CHAT_TAG_LEN;
+
+/// Bytes como mucho del texto cifrado de un [`ControlMessage::ChatHistory`].
+pub const CHAT_HISTORY_SEALED_MAX: usize =
+    CHAT_HISTORY_MAX * CHAT_ENTRY_MAX_BYTES + 8 + CHAT_TAG_LEN;
+
+/// Un mensaje del chat sellado con la clave de chat de una época MLS (AES-256-GCM): nonce =
+/// `sender_leaf (u32 BE) ‖ counter (u64 BE)` y datos asociados = `epoch (u64 BE) ‖ tipo`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SealedChat {
+    /// Época MLS de la clave.
+    pub epoch: u64,
+    /// Hoja MLS de quien sella (el invitado autor hacia el anfitrión; el anfitrión hacia los
+    /// invitados).
+    pub sender_leaf: u32,
+    /// Contador de quien sella en esa época (crece con cada sellado).
+    pub counter: u64,
+    /// Texto cifrado con la etiqueta.
+    pub ciphertext: Vec<u8>,
+}
+
+/// Texto en claro de un mensaje del chat (lo que va cifrado en [`SealedChat`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatEntry {
+    /// Id del invitado autor (0 = el anfitrión), el de [`Member::guest`]. Lo fija el anfitrión.
+    pub guest: u32,
+    /// Hoja MLS del autor. La fija el anfitrión.
+    pub leaf: u32,
+    /// Nombre visible del autor (como mucho [`MEMBER_NAME_MAX`] bytes; vacío si es el anfitrión:
+    /// el invitado ya lo tiene de la señalización). Lo fija el anfitrión.
+    pub name: String,
+    /// Texto plano (como mucho [`CHAT_TEXT_MAX_CHARS`] caracteres y [`CHAT_TEXT_MAX_BYTES`]
+    /// bytes).
+    pub text: String,
+    /// Hora Unix en ms: la pone el anfitrión al reenviar (o al escribir, si es suyo).
+    pub at_unix_ms: u64,
+}
+
+impl ChatEntry {
+    /// Texto y nombre dentro de sus límites.
+    pub fn within_limits(&self) -> bool {
+        self.name.len() <= MEMBER_NAME_MAX && chat_text_within_limits(&self.text)
+    }
+
+    /// Un historial dentro de sus límites.
+    pub fn history_within_limits(entries: &[ChatEntry]) -> bool {
+        entries.len() <= CHAT_HISTORY_MAX && entries.iter().all(ChatEntry::within_limits)
+    }
+}
+
+/// Texto de chat dentro de [`CHAT_TEXT_MAX_BYTES`] y [`CHAT_TEXT_MAX_CHARS`].
+pub fn chat_text_within_limits(text: &str) -> bool {
+    text.len() <= CHAT_TEXT_MAX_BYTES && text.chars().count() <= CHAT_TEXT_MAX_CHARS
+}
 
 /// Mensaje de control.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -402,6 +485,17 @@ pub enum ControlMessage {
         /// Miembros (como mucho [`MEMBERS_MAX`]).
         members: Vec<Member>,
     },
+    /// Mensaje del chat: invitado → anfitrión con un [`ChatEntry`] suyo (el anfitrión ignora lo
+    /// que diga de autor y hora) y anfitrión → invitados con el mensaje ya ordenado, con autor y
+    /// hora (también al autor).
+    Chat(SealedChat),
+    /// Anfitrión → invitado que entra (o vuelve a entrar): los últimos [`CHAT_HISTORY_MAX`]
+    /// mensajes, recifrados con la época actual; el texto en claro es una lista de
+    /// [`ChatEntry`]. Sustituye lo que el invitado tuviese.
+    ChatHistory(SealedChat),
+    /// Anfitrión → invitados: el chat se ha vaciado para todos (texto en claro vacío; va sellado
+    /// para que nadie más que el anfitrión pueda pedirlo).
+    ChatClear(SealedChat),
 }
 
 impl ControlMessage {
@@ -720,7 +814,84 @@ mod tests {
                         .collect(),
                 }
             ),
+            (0u8..3, sealed_chat()).prop_map(|(kind, sealed)| match kind {
+                0 => ControlMessage::Chat(sealed),
+                1 => ControlMessage::ChatHistory(sealed),
+                _ => ControlMessage::ChatClear(sealed),
+            }),
         ]
+    }
+
+    fn sealed_chat() -> impl Strategy<Value = SealedChat> {
+        (
+            any::<u64>(),
+            any::<u32>(),
+            any::<u64>(),
+            prop::collection::vec(any::<u8>(), 0..96),
+        )
+            .prop_map(|(epoch, sender_leaf, counter, ciphertext)| SealedChat {
+                epoch,
+                sender_leaf,
+                counter,
+                ciphertext,
+            })
+    }
+
+    fn chat_entry() -> impl Strategy<Value = ChatEntry> {
+        (
+            any::<[u32; 2]>(),
+            "[a-zA-Zñ ]{0,24}",
+            "\\PC{0,64}",
+            any::<u64>(),
+        )
+            .prop_map(|([guest, leaf], name, text, at_unix_ms)| ChatEntry {
+                guest,
+                leaf,
+                name,
+                text,
+                at_unix_ms,
+            })
+    }
+
+    /// El mensaje y el historial más grandes caben en sus topes y en un mensaje de control.
+    #[test]
+    fn the_largest_chat_messages_fit() {
+        let entry = ChatEntry {
+            guest: u32::MAX,
+            leaf: u32::MAX,
+            name: "ñ".repeat(MEMBER_NAME_MAX / 2),
+            text: "😀".repeat(CHAT_TEXT_MAX_BYTES / 4),
+            at_unix_ms: u64::MAX,
+        };
+        assert!(entry.within_limits());
+        assert_eq!(entry.text.chars().count(), CHAT_TEXT_MAX_CHARS);
+        let body = crate::codec::encode_body(&entry).expect("cabe");
+        assert!(body.len() <= CHAT_ENTRY_MAX_BYTES, "{}", body.len());
+        let history = vec![entry.clone(); CHAT_HISTORY_MAX];
+        assert!(ChatEntry::history_within_limits(&history));
+        let body = crate::codec::encode_body(&history).expect("cabe");
+        assert!(body.len() + CHAT_TAG_LEN <= CHAT_HISTORY_SEALED_MAX);
+        let message = ControlMessage::ChatHistory(SealedChat {
+            epoch: u64::MAX,
+            sender_leaf: u32::MAX,
+            counter: u64::MAX,
+            ciphertext: vec![0xa5; CHAT_HISTORY_SEALED_MAX],
+        });
+        let framed = encode(&message).expect("cabe");
+        assert!(framed.len() <= crate::codec::MAX_MESSAGE_LEN + crate::codec::PREFIX_LEN);
+        // Uno más de la cuenta, en caracteres o en bytes, ya no está dentro de los límites.
+        let too_long = ChatEntry {
+            text: "a".repeat(CHAT_TEXT_MAX_CHARS + 1),
+            ..entry.clone()
+        };
+        assert!(!too_long.within_limits());
+        assert!(!chat_text_within_limits(
+            &"a".repeat(CHAT_TEXT_MAX_BYTES + 1)
+        ));
+        assert!(!ChatEntry::history_within_limits(&vec![
+            entry;
+            CHAT_HISTORY_MAX + 1
+        ]));
     }
 
     #[test]
@@ -750,6 +921,20 @@ mod tests {
         #[test]
         fn garbage_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..128)) {
             let _ = decode::<ControlMessage>(&bytes);
+            let _ = decode::<ChatEntry>(&bytes);
+            let _ = decode::<Vec<ChatEntry>>(&bytes);
+        }
+
+        #[test]
+        fn chat_entries_and_histories_round_trip(
+            entries in prop::collection::vec(chat_entry(), 0..8)
+        ) {
+            for entry in &entries {
+                let body = crate::codec::encode_body(entry).expect("codificar");
+                prop_assert_eq!(&decode::<ChatEntry>(&body).expect("decodificar"), entry);
+            }
+            let body = crate::codec::encode_body(&entries).expect("codificar");
+            prop_assert_eq!(decode::<Vec<ChatEntry>>(&body).expect("decodificar"), entries);
         }
 
         #[test]

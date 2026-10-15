@@ -20,6 +20,9 @@
 //!   [--mic NOMBRE]` y `coroom join [--mute-game] [--voice] [--ptt TECLA] [--mic] [--speaker]`
 //!   ([`HostAudioOptions`], [`JoinAudioOptions`]). Sin ventana (`--headless`) los dispositivos son
 //!   sintéticos: tonos en lugar del juego y del micrófono y salidas que no suenan (para los tests).
+//! - **Chat**: `say TEXTO` en la consola de `coroom host` y en la de `coroom join --headless`
+//!   ([`JoinCommand`]), `clear-chat` en la del anfitrión; los mensajes se imprimen como
+//!   `[21:05] Nombre: texto` con la hora local ([`chat_line`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,8 +41,8 @@ use coroom_session::input::script::{InputScript, ScriptReport};
 use coroom_session::latency::{LatencyLedger, LatencySummary};
 use coroom_session::loopback::{FrameSink, LoopbackConfig};
 use coroom_session::remote::{
-    GuestAudio, GuestInput, GuestStatus, HostAudio, RemoteConfig, RemoteSession, SessionEvent,
-    TalkMode, VoiceInput, eis_provider, permissions_label,
+    ChatLine, GuestAudio, GuestInput, GuestStatus, HostAudio, RemoteConfig, RemoteSession,
+    SessionEvent, TalkMode, VoiceInput, eis_provider, permissions_label,
 };
 use coroom_session::{GuestId, Permissions, Session};
 use coroom_transport::crypto::{FileStore, Identity, IdentityStore, KeyringStore};
@@ -205,10 +208,11 @@ pub fn print_events_forwarding(
     let events = session.events();
     thread::spawn(move || {
         while let Ok(event) = events.recv() {
+            let text = describe_event(&event);
             if stderr {
-                eprintln!("{event}");
+                eprintln!("{text}");
             } else {
-                println!("{event}");
+                println!("{text}");
             }
             if let (SessionEvent::GuestJoined { guest, .. }, Some(joined)) = (&event, &joined) {
                 let _ = joined.send(*guest);
@@ -218,6 +222,28 @@ pub fn print_events_forwarding(
             }
         }
     })
+}
+
+/// Un mensaje del chat como lo imprime la consola: `[21:05] Bruno: texto`, con la hora local.
+pub fn chat_line(line: &ChatLine) -> String {
+    format!("[{}] {line}", crate::localtime::clock_hhmm(line.at_unix_ms))
+}
+
+/// Un evento como lo imprime la consola: el chat con su hora local ([`chat_line`]); el resto,
+/// con su `Display`.
+pub fn describe_event(event: &SessionEvent) -> String {
+    match event {
+        SessionEvent::ChatMessage(line) => chat_line(line),
+        SessionEvent::ChatHistory { messages } if !messages.is_empty() => {
+            let mut text = format!("Historial del chat ({} mensajes):", messages.len());
+            for line in messages {
+                text.push_str("\n  ");
+                text.push_str(&chat_line(line));
+            }
+            text
+        }
+        other => other.to_string(),
+    }
 }
 
 /// Permisos que `--auto-allow` concede a cada invitado al entrar.
@@ -302,6 +328,10 @@ pub enum ConsoleCommand {
     Resume,
     /// Expulsar.
     Kick(u32),
+    /// Escribir en el chat de la sala.
+    Say(String),
+    /// Vaciar el chat para todos.
+    ClearChat,
     /// Cerrar la sala.
     Quit,
 }
@@ -318,6 +348,8 @@ pub const CONSOLE_HELP: &str = "Órdenes (escribe una y pulsa Intro):
   pause / resume           pausar o reanudar la entrada de todos (en pausa se suelta todo)
   kick N                   expulsar al invitado N (rota las claves de la sala)
   invite NOMBRE            invitar a un amigo conectado a la sala
+  say TEXTO                escribir en el chat de la sala
+  clear-chat               vaciar el chat para todos
   quit                     cerrar la sala y salir
   help                     esta ayuda";
 
@@ -327,8 +359,25 @@ fn guest_number(text: Option<&str>) -> Result<u32, String> {
         .map_err(|_| format!("«{text}» no es un número de invitado"))
 }
 
+/// El texto de `say TEXTO` (todo lo que sigue a la orden, tal cual), si la línea es esa orden.
+fn say_text(line: &str) -> Result<Option<String>, String> {
+    let line = line.trim_start();
+    let (command, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    if !matches!(command.to_lowercase().as_str(), "say" | "di") {
+        return Ok(None);
+    }
+    let text = rest.trim();
+    if text.is_empty() {
+        return Err("falta el texto: say TEXTO".to_owned());
+    }
+    Ok(Some(text.to_owned()))
+}
+
 /// Lee una orden de la consola; `Ok(None)` si la línea está vacía.
 pub fn parse_console(line: &str) -> Result<Option<ConsoleCommand>, String> {
+    if let Some(text) = say_text(line)? {
+        return Ok(Some(ConsoleCommand::Say(text)));
+    }
     let mut words = line.split_whitespace();
     let Some(command) = words.next() else {
         return Ok(None);
@@ -340,6 +389,7 @@ pub fn parse_console(line: &str) -> Result<Option<ConsoleCommand>, String> {
         "resume" => ConsoleCommand::Resume,
         "quit" | "exit" => ConsoleCommand::Quit,
         "kick" => ConsoleCommand::Kick(guest_number(words.next())?),
+        "clear-chat" => ConsoleCommand::ClearChat,
         "invite" | "invitar" => ConsoleCommand::Invite(
             words
                 .next()
@@ -533,7 +583,85 @@ pub fn apply_console(
             .map(|()| format!("Expulsando al invitado {guest}…"))
             .map_err(|err| err.to_string()),
         ConsoleCommand::Invite(name) => invite_friend(session, resolve, &name),
+        // El mensaje se imprime cuando la sesión lo reparte (`ChatMessage`).
+        ConsoleCommand::Say(text) => session
+            .send_chat(&text)
+            .map(|()| String::new())
+            .map_err(|err| err.to_string()),
+        ConsoleCommand::ClearChat => session
+            .clear_chat()
+            .map(|()| "Vaciando el chat para todos…".to_owned())
+            .map_err(|err| err.to_string()),
         ConsoleCommand::Quit => Ok("Cerrando la sala.".to_owned()),
+    }
+}
+
+/// Orden de la consola de `coroom join --headless`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JoinCommand {
+    /// Escribir en el chat de la sala.
+    Say(String),
+    /// Ayuda.
+    Help,
+    /// Salir de la sala.
+    Quit,
+}
+
+/// Ayuda de la consola de `coroom join --headless`.
+pub const JOIN_CONSOLE_HELP: &str = "Órdenes (escribe una y pulsa Intro):
+  say TEXTO                escribir en el chat de la sala
+  quit                     salir de la sala (también Intro en una línea vacía)
+  help                     esta ayuda";
+
+/// Lee una orden de la consola del invitado; una línea vacía es salir.
+pub fn parse_join_console(line: &str) -> Result<JoinCommand, String> {
+    if let Some(text) = say_text(line)? {
+        return Ok(JoinCommand::Say(text));
+    }
+    let mut words = line.split_whitespace();
+    let command = match words.next().map(str::to_ascii_lowercase).as_deref() {
+        None | Some("quit" | "exit") => JoinCommand::Quit,
+        Some("help" | "ayuda" | "?") => JoinCommand::Help,
+        Some(other) => {
+            return Err(format!(
+                "orden desconocida: «{other}». Escribe `help` para ver las órdenes."
+            ));
+        }
+    };
+    if let Some(extra) = words.next() {
+        return Err(format!("sobra «{extra}» en la orden"));
+    }
+    Ok(command)
+}
+
+/// Consola de `coroom join --headless`: `say` escribe en el chat, hasta `quit` (o una línea
+/// vacía), el final de la entrada o el de la sesión.
+pub fn run_join_console(session: &RemoteSession, lines: &Receiver<String>) {
+    eprintln!("{JOIN_CONSOLE_HELP}");
+    loop {
+        if session.wait(Duration::from_millis(50)) {
+            return;
+        }
+        loop {
+            match lines.try_recv() {
+                Ok(line) => match parse_join_console(&line) {
+                    Ok(JoinCommand::Quit) => return,
+                    Ok(JoinCommand::Help) => eprintln!("{JOIN_CONSOLE_HELP}"),
+                    Ok(JoinCommand::Say(text)) => {
+                        if let Err(err) = session.send_chat(&text) {
+                            eprintln!("error: {err}");
+                        }
+                    }
+                    Err(err) => eprintln!("error: {err}"),
+                },
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                // Sin consola (en segundo plano): se sigue hasta que la sesión termine.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    while !session.wait(Duration::from_millis(250)) {}
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -633,6 +761,7 @@ pub fn run_host_console(
                         return;
                     }
                     Ok(Some(command)) => match apply_console(session, command, resolve) {
+                        Ok(message) if message.is_empty() => {}
                         Ok(message) => eprintln!("{message}"),
                         Err(err) => eprintln!("error: {err}"),
                     },
@@ -1360,6 +1489,79 @@ mod tests {
         );
         assert!(err("invite").contains("NOMBRE"));
         assert!(CONSOLE_HELP.contains("allow N pad RANURA"));
+        // El chat: todo lo que sigue a `say`, con sus espacios y emoji.
+        assert_eq!(
+            parse_console("say  hola,   ¿empezamos? 🎮 "),
+            Ok(Some(ConsoleCommand::Say(
+                "hola,   ¿empezamos? 🎮".to_owned()
+            )))
+        );
+        assert_eq!(
+            parse_console("SAY kick 3"),
+            Ok(Some(ConsoleCommand::Say("kick 3".to_owned())))
+        );
+        assert!(err("say").contains("say TEXTO"));
+        assert!(err("say    ").contains("falta el texto"));
+        assert_eq!(
+            parse_console("clear-chat"),
+            Ok(Some(ConsoleCommand::ClearChat))
+        );
+        assert!(err("clear-chat ya").contains("sobra"));
+        assert!(CONSOLE_HELP.contains("say TEXTO") && CONSOLE_HELP.contains("clear-chat"));
+    }
+
+    #[test]
+    fn the_join_console_says_and_quits() {
+        assert_eq!(
+            parse_join_console("say buenas noches"),
+            Ok(JoinCommand::Say("buenas noches".to_owned()))
+        );
+        assert_eq!(parse_join_console(""), Ok(JoinCommand::Quit));
+        assert_eq!(parse_join_console("  quit "), Ok(JoinCommand::Quit));
+        assert_eq!(parse_join_console("help"), Ok(JoinCommand::Help));
+        assert!(
+            parse_join_console("kick 2")
+                .unwrap_err()
+                .contains("orden desconocida")
+        );
+        assert!(parse_join_console("say").unwrap_err().contains("say TEXTO"));
+        assert!(JOIN_CONSOLE_HELP.contains("say TEXTO"));
+    }
+
+    #[test]
+    fn chat_lines_carry_the_local_time() {
+        use coroom_session::remote::ChatAuthor;
+        let line = ChatLine {
+            author: ChatAuthor {
+                guest: 3,
+                leaf: 2,
+                name: "Bruno".to_owned(),
+            },
+            text: "texto".to_owned(),
+            at_unix_ms: 1_782_907_200_000,
+            own: false,
+        };
+        let offset = crate::localtime::utc_offset(1_782_907_200);
+        let expected = format!(
+            "[{}] Bruno: texto",
+            crate::localtime::hhmm(1_782_907_200, offset)
+        );
+        assert_eq!(chat_line(&line), expected);
+        assert_eq!(
+            describe_event(&SessionEvent::ChatMessage(line.clone())),
+            expected
+        );
+        let history = describe_event(&SessionEvent::ChatHistory {
+            messages: vec![line.clone(), line],
+        });
+        assert_eq!(
+            history,
+            format!("Historial del chat (2 mensajes):\n  {expected}\n  {expected}")
+        );
+        assert_eq!(
+            describe_event(&SessionEvent::ChatCleared),
+            "El anfitrión ha vaciado el chat."
+        );
     }
 
     #[test]

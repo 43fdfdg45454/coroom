@@ -354,6 +354,8 @@ corre escribiendo órdenes en la consola de `coroom host` (`help` las lista):
 | `deny N kbm\|pad\|voice` | quitar ese permiso (lo pulsado se suelta y el mando se destruye) |
 | `pause` / `resume` | pausar o reanudar la entrada de todos (en pausa se suelta todo y se descarta lo que llegue) |
 | `kick N` | expulsar (se suelta lo suyo, se libera su ranura y rotan las claves) |
+| `say TEXTO` | escribir en el chat de la sala (también en la consola de `coroom join --headless`) |
+| `clear-chat` | vaciar el chat para todos |
 | `quit` | cerrar la sala |
 
 `--auto-allow kbm,pad` concede teclado y ratón y la primera ranura libre a cada invitado que entra

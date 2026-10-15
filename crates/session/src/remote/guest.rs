@@ -493,6 +493,14 @@ impl Room {
                     .media_keys()
                     .map_err(|err| SessionError::Crypto(err.to_string()))?;
                 self.core.install_epoch(group.epoch(), &keys);
+                // Grupo recién estrenado (también al volver a entrar): las claves del chat
+                // anteriores ya no sirven.
+                match group.chat_key() {
+                    Ok(key) => super::chat::install_guest_key(&self.core, key, true),
+                    Err(err) => self
+                        .core
+                        .warn(format!("no se pudo preparar la clave del chat: {err}")),
+                }
                 self.group = Some(group);
                 Ok(())
             }
@@ -502,11 +510,20 @@ impl Room {
                     return Ok(());
                 };
                 match group.process(commit) {
-                    Ok(Processed::Commit { epoch, .. }) => {
+                    Ok(Processed::Commit { epoch, removed, .. }) => {
                         let keys = group
                             .media_keys()
                             .map_err(|err| SessionError::Crypto(err.to_string()))?;
                         self.core.install_epoch(epoch, &keys);
+                        // Si salió alguien, las claves del chat anteriores se olvidan.
+                        match group.chat_key() {
+                            Ok(key) => {
+                                super::chat::install_guest_key(&self.core, key, !removed.is_empty())
+                            }
+                            Err(err) => self
+                                .core
+                                .warn(format!("no se pudo preparar la clave del chat: {err}")),
+                        }
                         Ok(())
                     }
                     Ok(Processed::Removed { .. }) => {
@@ -651,8 +668,15 @@ async fn run_guest(
             .map_err(network("señalización"))?;
         match message {
             Some(SignalMessage::Joined {
-                host_pk, host_name, ..
-            }) => break (host_pk, host_name),
+                host_pk,
+                host_name,
+                your_peer_id,
+                ..
+            }) => {
+                // Para reconocer los mensajes propios del chat (un id nuevo cada vez que entra).
+                lock(&core.chat).add_own_guest(your_peer_id);
+                break (host_pk, host_name);
+            }
             Some(SignalMessage::Error { message, .. }) => {
                 return Err(SessionError::Rejected(message));
             }
@@ -754,7 +778,9 @@ async fn run_guest(
                         | Command::Invite(_)
                         | Command::GamepadMode { .. }
                         | Command::GamepadOutput { .. }
-                        | Command::Video(_),
+                        | Command::Video(_)
+                        | Command::Chat(_)
+                        | Command::ChatClear,
                     ) => {}
                 },
                 Some(end) = disconnected.recv() => match end {
@@ -1172,6 +1198,15 @@ async fn control_loop(
             }
             Some(ControlMessage::GamepadOutput { slot, data }) => {
                 core.guest_input.push_pad_output(slot, data);
+            }
+            Some(
+                message @ (ControlMessage::Chat(_)
+                | ControlMessage::ChatHistory(_)
+                | ControlMessage::ChatClear(_)),
+            ) => {
+                if let Some((kind, sealed)) = super::chat::kind_of(&message) {
+                    super::chat::on_host_message(&core, kind, sealed);
+                }
             }
             Some(ControlMessage::Bye) => break,
             _ => {}

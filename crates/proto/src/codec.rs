@@ -51,6 +51,17 @@ pub fn encode<T: Serialize>(message: &T) -> Result<Vec<u8>, CodecError> {
     Ok(out)
 }
 
+/// Serializa `message` sin prefijo de longitud (el cuerpo de un mensaje, o un texto en claro que
+/// luego se cifra), con el mismo tope de [`MAX_MESSAGE_LEN`].
+pub fn encode_body<T: Serialize>(message: &T) -> Result<Vec<u8>, CodecError> {
+    let out =
+        postcard::to_allocvec(message).map_err(|err| CodecError::Postcard(err.to_string()))?;
+    if out.len() > MAX_MESSAGE_LEN {
+        return Err(CodecError::TooLarge(out.len()));
+    }
+    Ok(out)
+}
+
 /// Lee el cuerpo de un mensaje (sin prefijo). Los bytes sobrantes son un error.
 pub fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, CodecError> {
     let (message, rest) =

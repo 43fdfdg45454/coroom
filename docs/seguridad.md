@@ -25,11 +25,11 @@ Resumen de los hallazgos (detalle en §4):
 
 | Actor | Qué puede | Qué no puede |
 |---|---|---|
-| **Servidor honesto pero curioso** (el operador mira la base de datos, el registro y el tráfico que pasa por el relay) | Ver cuentas, amigos, salas abiertas, quién entra en qué sala y cuándo, direcciones IP, volumen y ritmo del tráfico, y las cabeceras en claro de los medios (pista, grupo, objeto, marca de intra, 16 bits bajos de la época SFrame) | Leer vídeo, audio, voz o entrada (SFrame y HPKE con claves que nunca tiene); saber qué se escribe o se juega |
-| **Servidor malicioso** (o comprometido) | Todo lo anterior; negar el servicio; cortar o reordenar mensajes; presentar una clave de identidad falsa en el primer contacto (I-1); suplantar la oferta de clave pareja a pareja **no** (va firmada); degradar a X25519 **ya no** (C-1) | Descifrar ni falsificar medios o entrada de una sala cuyos números de seguridad se comprobaron; hacer commits MLS (solo vale el del anfitrión, firmado) |
-| **Invitado malicioso** (miembro de la sala) | Ver y oír lo que el anfitrión comparte mientras esté dentro; enviar entrada si tiene permiso; intentar agotar recursos del anfitrión o de otros invitados con paquetes hostiles (acotado: M-1) | Leer o falsificar la entrada de otro invitado (clave pareja a pareja); seguir leyendo tras la expulsión (época MLS nueva); hacer commits MLS |
+| **Servidor honesto pero curioso** (el operador mira la base de datos, el registro y el tráfico que pasa por el relay) | Ver cuentas, amigos, salas abiertas, quién entra en qué sala y cuándo, direcciones IP, volumen y ritmo del tráfico, y las cabeceras en claro de los medios (pista, grupo, objeto, marca de intra, 16 bits bajos de la época SFrame) | Leer vídeo, audio, voz, entrada o chat (SFrame, HPKE y la clave de chat de la época, que nunca tiene); saber qué se escribe o se juega. Del chat solo ve el tamaño y el ritmo de los mensajes de control |
+| **Servidor malicioso** (o comprometido) | Todo lo anterior; negar el servicio; cortar o reordenar mensajes; presentar una clave de identidad falsa en el primer contacto (I-1); suplantar la oferta de clave pareja a pareja **no** (va firmada); degradar a X25519 **ya no** (C-1) | Descifrar ni falsificar medios, entrada o chat de una sala cuyos números de seguridad se comprobaron; hacer commits MLS (solo vale el del anfitrión, firmado) |
+| **Invitado malicioso** (miembro de la sala) | Ver y oír lo que el anfitrión comparte mientras esté dentro; enviar entrada si tiene permiso; leer el chat mientras esté dentro y los últimos 50 mensajes al entrar; escribir en él (10 cada 10 s); intentar agotar recursos del anfitrión o de otros invitados con paquetes hostiles (acotado: M-1) | Leer o falsificar la entrada de otro invitado (clave pareja a pareja); escribir en el chat con el nombre de otro (el autor lo pone el anfitrión según el stream por el que llega); seguir leyendo la entrada, los medios o el chat tras la expulsión (época MLS nueva); hacer commits MLS |
 | **Red hostil** (en el camino, sin el servidor) | Ver direcciones, tamaños y tiempos; tirar o retrasar paquetes | Leer o modificar nada: QUIC con TLS 1.3 (X25519MLKEM768) en cada salto, claves crudas fijadas entre pares y certificado del servidor fijado o validado |
-| **Anfitrión** | Es de confianza para su sala: ve y decide todo, y la entrada se inyecta en su equipo | — |
+| **Anfitrión** | Es de confianza para su sala: ve y decide todo, y la entrada se inyecta en su equipo; pone autor y hora a cada mensaje del chat y guarda el historial (en memoria, mientras dure la sala) | — |
 
 **Qué protege cada capa y qué no**:
 
@@ -39,7 +39,20 @@ Resumen de los hallazgos (detalle en §4):
 | MLS (RFC 9420, `openmls`) | Pertenencia a la sala, secreto hacia delante y recuperación tras compromiso al entrar o salir alguien | Los mensajes de control MLS van como `PublicMessage` (firmados, no cifrados): el servidor ve quién entra y sale (ya lo sabe por la señalización) |
 | SFrame (RFC 9605) | Contenido de vídeo, audio y voz frente al servidor y el relay; repeticiones | Metadatos: tamaños, ritmo, pista, marca de intra |
 | HPKE (RFC 9180) con X-Wing | La entrada de cada invitado frente al resto de invitados y al servidor; poscuántica | — |
+| Chat (exportador MLS por época, AES-256-GCM) | Texto, autor y hora frente al servidor y el relay; quien sale deja de leer lo que se escribe después; repeticiones; que un historial o una orden de vaciar pasen por un mensaje | Autenticación de cada miembro: la clave es de grupo (ver más abajo); el tamaño y el ritmo de los mensajes; nada frente al anfitrión |
 | Cuentas | Que solo los dispositivos vinculados abran la señalización y el relay | Que el servidor no mienta sobre las claves (I-1) |
+
+**El chat y la clave de grupo.** El chat va por el stream de control de cada invitado con el
+anfitrión (estrella): el invitado sella su mensaje para el anfitrión, el anfitrión lo abre,
+comprueba que lo selló la hoja MLS de **ese** invitado, le pone autor (id del invitado y hoja,
+nombre de la señalización) y hora, lo guarda y lo vuelve a sellar para todos, el autor incluido.
+El invitado solo acepta lo que sella la hoja del anfitrión. Como la clave es de grupo, un
+sellado prueba que lo hizo un miembro de la época, no cuál: la autoría la garantiza el anfitrión,
+que sabe por qué stream llegó cada mensaje. El límite es la **connivencia**: un invitado de la
+sala junto con quien controle el relay (que termina TLS y reenvía los streams de control) puede
+sellar un mensaje como si fuera del anfitrión, con cualquier autor, y meterlo en el stream de otro
+invitado. Sin el relay (en directo) o sin un miembro de la sala, no. Firmar cada mensaje con la
+clave de la hoja lo cerraría; queda como propuesta.
 
 ## 2. Revisión por capas
 
@@ -77,6 +90,7 @@ de la crate está registrado** (`every_label_is_unique`,
 | `coroom ml-dsa-65 v1` (sal, `pq-sign`) | Semilla ML-DSA desde la semilla Ed25519 | Semilla Ed25519 |
 | `coroom` / `coroom/portal-secret/seal/v1` | Sal e `info` de la clave de sellado de Flatpak | Secreto del portal |
 | `coroom safety number v1` | Prefijo del SHA-512 del número de seguridad | — |
+| `coroom chat v1` | Exportador MLS, contexto `época (u64 BE)`, 32 bytes: clave AES-256-GCM del chat | Grupo MLS |
 
 **Nonces**, por construcción y con test:
 
@@ -87,6 +101,11 @@ de la crate está registrado** (`every_label_is_unique`,
   distancia) tienen claves base distintas (el exportador lleva la época en el contexto).
 - Entrada: `dirección ‖ canal ‖ secuencia`, con clave distinta por dirección; `InputCipher::seal`
   rechaza una secuencia que no crece (`SequenceReused`).
+- Chat: `hoja (u32 BE) ‖ contador (u64 BE)` con un contador por época en `ChatRing::seal`, que
+  vuelve a 0 con la clave nueva (cada época tiene la suya); los datos asociados llevan
+  `época (u64 BE) ‖ tipo` (mensaje, historial o vaciar), así un sellado no vale en otra época ni
+  como otro tipo (`nonces_are_unique_per_sender_and_counter`,
+  `sealed_messages_open_with_the_same_kind_leaf_counter_and_epoch`).
 - HPKE: un `enc` nuevo en cada sellado (modo base, un solo mensaje).
 - MLS: los de `openmls`.
 
@@ -101,6 +120,19 @@ momento con la época nueva (`d_kicked_guest_stops_presenting_and_cannot_decrypt
 extremo). El anillo SFrame conserva las dos últimas épocas para que la rotación no corte el flujo:
 lo que ya estaba en vuelo cifrado con la anterior se sigue descifrando, nada nuevo se cifra con ella.
 
+El chat sigue la misma época con su propio anillo (`ChatRing`, 4 épocas como mucho): al **entrar**
+alguien se conservan las anteriores, porque todos sus miembros siguen dentro, y lo que estaba en
+vuelo se abre; al **salir** o ser expulsado alguien se olvidan todas, porque el que salió las conoce.
+El anfitrión sella siempre con la más nueva. Desde el commit de expulsión, el expulsado no recibe
+nada más y, aunque lo recibiera (por ejemplo, a través del relay), no podría abrirlo
+(`a_removed_member_cannot_read_what_is_written_after` en `crypto` y
+`c_a_kicked_guest_cannot_read_what_comes_after` de extremo a extremo). Lo que escribió antes se
+queda en el historial. El invitado guarda hasta 64 mensajes de una época que aún no ha procesado
+(el anfitrión puede sellar con ella antes de que llegue el commit) y los abre al instalarla. Un
+mensaje que un invitado selló con una época que el anfitrión acaba de olvidar (se escribió
+mientras alguien salía) se descarta: el anfitrión lo dice en un `ChatRejected` y el invitado, al no
+recibir el eco, recupera su hueco del límite a los 20 s.
+
 ### 2.4 Ventanas anti-repetición
 
 - SFrame: 128 contadores por KID (`REPLAY_WINDOW`); el contador solo se anota cuando el paquete se
@@ -109,6 +141,9 @@ lo que ya estaba en vuelo cifrado con la anterior se sigue descifrando, nada nue
   está acotado por los emisores instalados (`replays_are_rejected`).
 - Entrada: 256 secuencias por canal (stream y datagramas aparte) con mapa de bits
   (`crypto::input`, tests de ventana).
+- Chat: por época y hoja, solo contadores mayores que el último abierto (el stream de control es
+  fiable y ordenado); el contador se anota tras autenticar; las épocas olvidadas se llevan su
+  tabla (`replays_and_unknown_epochs_are_rejected`).
 - Desafíos de dispositivo: un solo uso, 60 s, como mucho 4 096 pendientes.
 
 ### 2.5 Ligado de identidad en TLS y número de seguridad
@@ -160,6 +195,7 @@ suba el protocolo, el desafío pasará a `"coroom device challenge v1\0" ‖ len
 | Mensajes entre pares (control) | 1 MiB (cursor con su imagen) |
 | Medios (receptor) | 64 grupos abiertos por pista y 131 072 objetos reservados en total; reparaciones por grupo ≤ objetos (**M-1**) |
 | Entrada | 64 eventos por mensaje; tramas de stream acotadas |
+| Chat | 2 000 caracteres y 8 000 bytes por mensaje, sin caracteres de control salvo salto de línea y tabulador; 10 mensajes cada 10 s por persona (el anfitrión descarta el resto; el cliente avisa antes con «Vas muy rápido»); 50 mensajes de historial, solo en la memoria del anfitrión; 64 mensajes en espera de una época nueva en el invitado |
 | Relay | Cuotas mensuales por cuenta, límite por sala, invitados por sala |
 
 ### 2.8 Administración (`/admin`) y cabeceras HTTP

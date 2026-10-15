@@ -25,7 +25,7 @@ use coroom_session::transport::proto::api::{
 };
 use coroom_session::transport::proto::audio::AudioHeader;
 use coroom_session::transport::proto::codec;
-use coroom_session::transport::proto::control::ControlMessage;
+use coroom_session::transport::proto::control::{ControlMessage, SealedChat};
 use coroom_session::transport::proto::input::{
     GamepadDevice, GamepadTransport, InputEvent, InputMessage, InputPacket, InputState,
     MouseButton, PadData, datagram_header, stream_frame,
@@ -379,6 +379,24 @@ fn fuzz_seeds() {
             width: 1920,
             height: 1080,
         },
+        ControlMessage::Chat(SealedChat {
+            epoch: 2,
+            sender_leaf: 1,
+            counter: 0,
+            ciphertext: vec![0x5a; 40],
+        }),
+        ControlMessage::ChatHistory(SealedChat {
+            epoch: 2,
+            sender_leaf: 0,
+            counter: 1,
+            ciphertext: vec![0xa5; 120],
+        }),
+        ControlMessage::ChatClear(SealedChat {
+            epoch: 3,
+            sender_leaf: 0,
+            counter: 2,
+            ciphertext: vec![0x3c; 16],
+        }),
         ControlMessage::Bye,
     ];
     let frames: Vec<Vec<u8>> = control.iter().map(frame).collect();

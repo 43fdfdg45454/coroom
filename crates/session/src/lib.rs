@@ -144,6 +144,9 @@ pub enum SessionError {
     RoomClosed,
     /// Permisos que no se pueden conceder (ranura fuera de rango o ya ocupada).
     InvalidPermissions(String),
+    /// El mensaje del chat no se envió: el texto es el motivo, para enseñarlo tal cual
+    /// («Vas muy rápido…», «El mensaje está vacío.»).
+    Chat(String),
 }
 
 impl fmt::Display for SessionError {
@@ -162,6 +165,7 @@ impl fmt::Display for SessionError {
             SessionError::Removed => f.write_str("el anfitrión te ha expulsado de la sala"),
             SessionError::RoomClosed => f.write_str("el anfitrión ha cerrado la sala"),
             SessionError::InvalidPermissions(what) => write!(f, "permisos no válidos: {what}"),
+            SessionError::Chat(why) => f.write_str(why),
         }
     }
 }
