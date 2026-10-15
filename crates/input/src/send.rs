@@ -476,12 +476,66 @@ impl std::fmt::Debug for InputSender {
     }
 }
 
+/// Pide al sistema temporizadores de 1 ms, una vez por proceso. Los plazos de [`REPEATS`] son de
+/// 3, 8 y 20 ms y en Windows el reloj del planificador va por defecto a 15,6 ms: sin esto, la
+/// espera del hilo de entrada (`recv_timeout`) se alargaba hasta ahí y la repetición de 8 ms
+/// salía a los 23. Windows 11 ignora la petición si el proceso no tiene ventana (o está oculta),
+/// salvo que se exima de esa regulación con `ProcessPowerThrottling`. El transporte pide lo
+/// mismo al abrir su socket; aquí se pide igual para no depender de que se haya abierto antes (y
+/// para que los tests del crate midan lo real).
+// Únicas llamadas `unsafe` de este módulo: la API de Windows, con su invariante en el `SAFETY`.
+#[allow(unsafe_code)]
+fn fine_timers() {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::System::Threading::{
+            GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
+            ProcessPowerThrottling, SetProcessInformation,
+        };
+
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let state = PROCESS_POWER_THROTTLING_STATE {
+                Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+                StateMask: 0,
+            };
+            // SAFETY: `GetCurrentProcess` devuelve un pseudo-identificador que no hay que cerrar;
+            // `state` es un `PROCESS_POWER_THROTTLING_STATE` válido que vive durante la llamada y
+            // su tamaño es el que se pasa. Los Windows anteriores a 11 rechazan el bit con un
+            // error, que solo se anota.
+            let throttling = unsafe {
+                SetProcessInformation(
+                    GetCurrentProcess(),
+                    ProcessPowerThrottling,
+                    std::ptr::from_ref(&state).cast(),
+                    std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+                )
+            };
+            if let Err(err) = throttling {
+                debug!(error = %err, "sin exención de la regulación de temporizadores");
+            }
+            // SAFETY: `timeBeginPeriod` solo recibe el periodo en milisegundos y no toca memoria
+            // nuestra; el periodo queda pedido hasta que el proceso termina.
+            let result = unsafe { windows::Win32::Media::timeBeginPeriod(1) };
+            if result != 0 {
+                tracing::warn!(
+                    result,
+                    "no se pudo pedir resolución de 1 ms a los temporizadores"
+                );
+            }
+        });
+    }
+}
+
 impl InputSender {
     /// Arranca el hilo `entrada` sobre `link` con las claves de `cipher` (del lado del invitado).
     pub fn spawn(
         link: Arc<dyn InputLink>,
         cipher: Arc<Mutex<InputCipher>>,
     ) -> Result<InputSender, InputError> {
+        fine_timers();
         let (tx, rx) = unbounded();
         let stats = Arc::new(SenderStats::default());
         let worker = Worker {

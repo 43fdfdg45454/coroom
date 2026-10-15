@@ -179,6 +179,9 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
   ese momento aparecía o se iba un toast, y también al abrir o cerrar el menú de la cuenta o el
   diagnóstico: la raíz de la interfaz cambiaba de forma e iced tiraba el desplazamiento. Ahora la
   forma es siempre la misma.
+- El hilo de entrada pide por sí mismo temporizadores de 1 ms en Windows (y la exención de la
+  regulación de Windows 11 sin ventana): las repeticiones de estado a 3, 8 y 20 ms dependían de
+  que el transporte ya lo hubiera pedido y, sin eso, el planificador de 15,6 ms las retrasaba.
 - **La caché del sondeo de códecs (`codecs.json`) funciona también en Windows**: la huella de la
   máquina recoge la versión del sistema, los adaptadores de DXGI con la versión de su driver, los
   drivers de Vulkan del registro y las DLL de NVENC/NVDEC, AMF, QSV y Direct3D, sin abrir la GPU;
