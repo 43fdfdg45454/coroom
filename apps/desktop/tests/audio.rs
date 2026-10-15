@@ -197,6 +197,7 @@ fn allow_voice(host: &mut RemoteSession, count: usize, voice: bool) {
         host.guests().iter().filter(|g| g.path.is_some()).count() >= count
     });
     for status in host.guests() {
+        assert!(status.permissions.voice, "entra con la voz permitida");
         let permissions = Permissions {
             voice,
             ..status.permissions

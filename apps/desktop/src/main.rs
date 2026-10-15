@@ -370,6 +370,11 @@ struct HostArgs {
     #[arg(long, value_name = "PERMISOS", value_parser = AutoAllow::parse)]
     auto_allow: Option<AutoAllow>,
 
+    /// Los invitados entran callados: sin permiso de voz hasta que se lo des (`allow N voice`).
+    /// Por defecto entran hablando.
+    #[arg(long)]
+    guests_muted: bool,
+
     /// Windows: los mandos de los invitados se convierten en teclas (perfil fijo) en vez de usar
     /// el driver de mando virtual (drivers/windows-vhid).
     #[arg(long)]
@@ -380,7 +385,7 @@ struct HostArgs {
     #[arg(long, num_args = 1..=2, value_names = ["MODO", "NOMBRE"])]
     audio: Option<Vec<String>>,
 
-    /// Habla por la sala con el micrófono (los invitados necesitan el permiso `voice`).
+    /// Habla por la sala con el micrófono (los invitados te oyen siempre).
     #[arg(long)]
     voice: bool,
 
@@ -628,6 +633,7 @@ impl HostArgs {
             codec: self.codec.codec(),
             encoder: self.encoder.backend(),
             auto_allow: self.auto_allow.unwrap_or_default(),
+            guests_muted: self.guests_muted,
             gamepad_to_keys: self.gamepad_to_keys,
             audio: HostAudioOptions {
                 game,
@@ -1507,6 +1513,7 @@ mod tests {
             coroom_session::audio::GameCapture::System
         );
         assert!(!options.audio.voice);
+        assert!(!options.guests_muted, "por defecto entran hablando");
         assert_eq!(options.audio.frame_ms, 10);
         let options =
             host(&["--audio", "app", "Juego", "--voice", "--mic", "Micro"]).expect("app y voz");
@@ -1516,6 +1523,7 @@ mod tests {
         );
         assert!(options.audio.voice);
         assert_eq!(options.audio.mic.as_deref(), Some("Micro"));
+        assert!(host(&["--guests-muted"]).expect("callados").guests_muted);
         let options = host(&["--audio", "process", "77", "--audio-frame-ms", "20"]).expect("pid");
         assert_eq!(
             options.audio.game,

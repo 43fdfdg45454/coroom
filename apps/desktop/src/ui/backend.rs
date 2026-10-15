@@ -572,6 +572,7 @@ impl Backend {
             codec: codec_preference(video.codec),
             encoder: video.encoder.backend(),
             auto_allow: AutoAllow::default(),
+            guests_muted: request.guests_muted,
             gamepad_to_keys: false,
             audio: HostAudioOptions {
                 game: request.audio,

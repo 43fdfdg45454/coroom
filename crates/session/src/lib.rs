@@ -95,14 +95,23 @@ impl Default for Permissions {
 }
 
 impl Permissions {
-    /// Solo mirar: sin entrada ni voz. Es el permiso con el que entra un invitado (con el mando
-    /// tal cual para cuando se le dé ranura).
+    /// Solo mirar: sin entrada ni voz (con el mando tal cual para cuando se le dé ranura). Es con
+    /// lo que entra un invitado si la sala pide que entren callados ([`Permissions::on_entry`]).
     pub const VIEW_ONLY: Permissions = Permissions {
         keyboard_mouse: false,
         gamepad_slot: None,
         voice: false,
         gamepad_raw: true,
     };
+
+    /// Con lo que entra un invitado: mirar y hablar, salvo que la sala pida que los invitados
+    /// entren callados (`muted`); entonces solo mirar, y el anfitrión da la voz a quien quiera.
+    pub const fn on_entry(muted: bool) -> Permissions {
+        Permissions {
+            voice: !muted,
+            ..Self::VIEW_ONLY
+        }
+    }
 }
 
 /// Error de la sesión.
@@ -401,8 +410,11 @@ mod tests {
     }
 
     #[test]
-    fn guests_join_view_only() {
+    fn guests_join_with_voice_unless_the_room_mutes_them() {
         assert_eq!(Permissions::VIEW_ONLY, Permissions::default());
+        let entry = Permissions::on_entry(false);
+        assert!(entry.voice && !entry.keyboard_mouse && entry.gamepad_slot.is_none());
+        assert_eq!(Permissions::on_entry(true), Permissions::VIEW_ONLY);
     }
 
     fn local_session(frames: u64) -> LocalSession {

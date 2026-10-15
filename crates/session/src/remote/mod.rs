@@ -7,8 +7,9 @@
 //!   ([`RoomGroup`](coroom_transport::crypto::RoomGroup)). Por cada invitado que entra (`PeerJoined`)
 //!   lo añade al grupo (commit a los que ya estaban, `Welcome` al nuevo, los dos por `Mls`), le
 //!   publica su clave X-Wing firmada, intercambia candidatos y conecta (`Connector`; si la apertura
-//!   de NAT falla o se fuerza, por el relay). Los invitados entran aprobados con permisos de solo
-//!   mirar ([`Permissions::VIEW_ONLY`]). El pipeline local se reutiliza: captura →
+//!   de NAT falla o se fuerza, por el relay). Los invitados entran aprobados con permiso de mirar y
+//!   hablar, o solo de mirar si la sala los quiere callados ([`Permissions::on_entry`]). El
+//!   pipeline local se reutiliza: captura →
 //!   codificación → **SFrame** (una vez por fotograma) → `MediaSender` (uno por invitado directo y,
 //!   como mucho, uno hacia el relay, que abre en abanico). El bitrate del codificador es el
 //!   **mínimo** de los objetivos de todos los invitados (cada `RateController` ya aplica su
@@ -243,6 +244,8 @@ pub struct RemoteConfig {
     pub advertise_candidates: Option<Vec<SocketAddr>>,
     /// Nombre visible de la sala (solo anfitrión).
     pub room_name: String,
+    /// Anfitrión: los invitados entran callados (solo mirar) en vez de con la voz permitida.
+    pub guests_muted: bool,
     /// Invitado: cuánto se mide el RTT con el anfitrión antes de pedir el vídeo
     /// ([`QUALITY_PROBE`]; cero para no esperar).
     pub quality_probe: Duration,
@@ -272,6 +275,7 @@ impl RemoteConfig {
             punch_timeout: coroom_transport::connect::PUNCH_TIMEOUT,
             advertise_candidates: None,
             room_name: "Sala de coroom".to_owned(),
+            guests_muted: false,
             quality_probe: QUALITY_PROBE,
             accept_yuv444: false,
             accept_hdr: false,

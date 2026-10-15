@@ -309,7 +309,7 @@ pub const CONSOLE_HELP: &str = "Órdenes (escribe una y pulsa Intro):
   allow N kbm              teclado y ratón para el invitado N
   allow N pad RANURA       mando en esa ranura (de 1 a COROOM_MAX_GAMEPADS, 4 por defecto)
   allow N raw              su mando tal cual, con su VID/PID y su descriptor (por defecto)
-  allow N voice            voz: habla y oye a la sala (sin ella no recibe ninguna voz)
+  allow N voice            voz: habla a la sala (la oye siempre; la trae al entrar salvo --guests-muted)
   deny N kbm|pad|voice     quitar ese permiso
   deny N raw               su mando, convertido a Xbox 360
   pause / resume           pausar o reanudar la entrada de todos (en pausa se suelta todo)
@@ -819,6 +819,8 @@ pub struct HostOptions {
     pub encoder: Option<Backend>,
     /// Permisos para cada invitado que entra.
     pub auto_allow: AutoAllow,
+    /// Los invitados entran callados: sin permiso de voz hasta que se les dé.
+    pub guests_muted: bool,
     /// Windows: mandos como teclas en vez del driver de mando virtual.
     pub gamepad_to_keys: bool,
     /// Audio del juego y voz.
@@ -864,7 +866,8 @@ pub fn start_prepared_host(session: &mut RemoteSession) -> Result<(), String> {
 /// Prepara la sesión del anfitrión sin arrancarla: codificadores, captura (en Linux, el diálogo
 /// del portal si no hay token), entrada y audio.
 pub fn prepare_host(identity: Identity, options: &HostOptions) -> Result<RemoteSession, String> {
-    let config = remote_config(&options.net)?;
+    let mut config = remote_config(&options.net)?;
+    config.guests_muted = options.guests_muted;
     let encoders = host_encoders(options.codec, options.encoder)?;
     let (capturer, share) = share_source(options.source, &options.share, options.video)?;
     let sink = platform_sink(SinkOptions {

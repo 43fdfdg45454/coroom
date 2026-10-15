@@ -1948,6 +1948,7 @@ impl Room {
         );
         let safety_number = SafetyNumber::between(&own, &identity_pk);
         let fingerprint = sha256_fingerprint(&identity_pk);
+        let permissions = Permissions::on_entry(self.ctx.config.guests_muted);
         lock(&self.ctx.core.guests).insert(
             guest,
             GuestStatus {
@@ -1957,7 +1958,7 @@ impl Room {
                 public_key: identity_pk,
                 fingerprint: fingerprint.clone(),
                 safety_number,
-                permissions: Permissions::VIEW_ONLY,
+                permissions,
                 leaf: added.leaf_index,
                 path: None,
                 remote: None,
@@ -1976,7 +1977,7 @@ impl Room {
             name,
             fingerprint,
             safety_number,
-            permissions: Permissions::VIEW_ONLY,
+            permissions,
         });
         if self.ctx.config.force_relay {
             let ctx = Arc::clone(&self.ctx);

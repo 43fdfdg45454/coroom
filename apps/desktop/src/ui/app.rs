@@ -321,6 +321,8 @@ pub struct HostRequest {
     pub audio: coroom_session::audio::GameCapture,
     /// Voz del anfitrión.
     pub voice: bool,
+    /// Los invitados entran callados.
+    pub guests_muted: bool,
 }
 
 /// Lo que la aplicación pide hacer.

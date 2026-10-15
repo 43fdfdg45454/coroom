@@ -189,6 +189,8 @@ pub struct State {
     pub only_chosen: bool,
     /// Voz.
     pub voice: bool,
+    /// Los invitados entran callados.
+    pub guests_muted: bool,
     /// Abriendo.
     pub starting: bool,
     /// Cerrando.
@@ -416,6 +418,8 @@ pub enum Msg {
     AppAudio(String, String, bool),
     /// Voz.
     Voice(bool),
+    /// Los invitados entran callados.
+    GuestsMuted(bool),
     /// Abrir el selector del sistema para elegir el monitor o la ventana.
     Pick,
     /// Volver a Inicio sin abrir la sala.
@@ -519,6 +523,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             return effects;
         }
         Msg::Voice(voice) => app.host.voice = voice,
+        Msg::GuestsMuted(muted) => app.host.guests_muted = muted,
         Msg::Pick => {
             if app.host.picking || app.host.starting || app.host.switching.is_some() {
                 return Vec::new();
@@ -543,6 +548,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 share: app.host.share_choice(),
                 audio,
                 voice: app.host.voice,
+                guests_muted: app.host.guests_muted,
             })];
         }
         Msg::CopyCode => {
@@ -630,6 +636,7 @@ fn apply_source(app: &mut App) -> Vec<Effect> {
         share: host.share_choice(),
         audio: host.game_capture(&app.settings.audio.excluded_apps),
         voice: host.voice,
+        guests_muted: host.guests_muted,
     })]
 }
 
@@ -1023,11 +1030,21 @@ fn setup(app: &App) -> Element<'_, Message> {
     let voice = ui::section(
         t!("pantalla-host-voz"),
         None,
-        vec![ui::pref_row(
-            t!("pantalla-host-hablar-por-la-sala-con-el"),
-            Some(t!("pantalla-host-los-invitados-te-oyen-y-hablan").to_owned()),
-            ui::switch(state.voice, Some(|on_off| on(Msg::Voice(on_off)))),
-        )],
+        vec![
+            ui::pref_row(
+                t!("pantalla-host-hablar-por-la-sala-con-el"),
+                Some(t!("pantalla-host-los-invitados-te-oyen-y-hablan").to_owned()),
+                ui::switch(state.voice, Some(|on_off| on(Msg::Voice(on_off)))),
+            ),
+            ui::pref_row(
+                t!("pantalla-host-los-invitados-entran-callados"),
+                Some(t!("pantalla-host-entran-sin-permiso-de-voz").to_owned()),
+                ui::switch(
+                    state.guests_muted,
+                    Some(|on_off| on(Msg::GuestsMuted(on_off))),
+                ),
+            ),
+        ],
     );
     let quality = ui::section(
         t!("pantalla-host-calidad"),
@@ -1968,6 +1985,7 @@ mod tests {
                 share: ShareChoice::default(),
                 audio: GameCapture::Apps(AppFilter::AllExcept(vec!["discord.exe".into()])),
                 voice: true,
+                guests_muted: false,
             })],
             "la sala de espera sigue hasta que la sala abra"
         );
@@ -2031,8 +2049,28 @@ mod tests {
                     "discord.exe".into()
                 ])),
                 voice: app.host.voice,
+                guests_muted: app.host.guests_muted,
             })
         );
+    }
+
+    #[test]
+    fn guests_enter_talking_unless_the_host_mutes_them() {
+        let mut app = app();
+        app.screen = crate::ui::app::Screen::Main;
+        app.update(Message::Navigate(Page::Host));
+        app.update(Message::Event(Event::ShareOptions(ShareOptions {
+            source: SourceChoice::Screen,
+            targets: Vec::new(),
+            targets_error: None,
+            apps: Ok(Vec::new()),
+        })));
+        assert!(!app.host.guests_muted, "por defecto entran hablando");
+        app.update(Message::Host(Msg::GuestsMuted(true)));
+        match app.update(Message::Host(Msg::Start)).as_slice() {
+            [Effect::StartHost(request)] => assert!(request.guests_muted),
+            other => panic!("se esperaba abrir la sala: {other:?}"),
+        }
     }
 
     #[test]

@@ -39,7 +39,8 @@ sesión de uno que ya no uses.
    coroom nunca se envía a sí misma, así que la voz de la sala no vuelve como eco. Si el equipo no
    puede separar el audio por aplicación (Windows anterior a 10 20348), se envía todo lo que suena,
    también las voces de la sala que reproduce coroom.
-3. Activa la **voz** si quieres hablar con el micrófono.
+3. Activa la **voz** si quieres hablar con el micrófono. Los invitados entran hablando; si
+   prefieres darles la voz uno a uno, marca **Los invitados entran callados**.
 4. Pulsa **Abrir la sala**. Aparece el **código de la sala** (6 letras y números, sin `0`, `1`, `I`
    ni `O`): dáselo a tus invitados, o pulsa **Invitar** junto a un amigo conectado.
 
@@ -83,8 +84,9 @@ El anfitrión da y quita, a cada invitado y en cualquier momento:
   llega **tal cual** (el juego y Steam lo ven como ese mando, con sus botones) o **convertido a
   Xbox 360**, como decida el anfitrión. Si tienes varios mandos, eliges cuál envías en el panel de
   mandos de la barra (`Ctrl+Alt+J`).
-- **Voz**: el invitado habla a la sala. Oír al anfitrión y a los demás no necesita permiso: todo
-  invitado oye la voz de la sala desde que entra.
+- **Voz**: el invitado habla a la sala. Lo trae al entrar, salvo que la sala se abriera con **Los
+  invitados entran callados**; entonces se lo da el anfitrión. Oír al anfitrión y a los demás no
+  necesita permiso: todo invitado oye la voz de la sala desde que entra.
 
 Aparte de los permisos, cada uno elige a quién oye en su equipo: el invitado, en **Personas en la
 sala** (icono de personas en la barra), y el anfitrión, en la tarjeta de cada invitado, con el icono

@@ -467,18 +467,19 @@ con él.
 | `--audio apps-only A,B` | solo esas aplicaciones |
 | `--audio none` | sin audio del juego |
 | `--voice [--mic NOMBRE]` | el anfitrión habla por la sala (activación por voz) |
+| `--guests-muted` | los invitados entran sin permiso de voz, hasta `allow N voice` |
 | `--speaker NOMBRE` | dónde suena la voz de los invitados (por defecto, la salida del sistema) |
 | `--audio-frame-ms 20` | paquetes de 20 ms en lugar de 10 si la tasa de paquetes aprieta |
 
-La voz es un permiso más: `allow N voice` / `deny N voice` en la consola. Sin él, el anfitrión
-descarta la voz del invitado y no le reenvía la de nadie (en una conexión por el relay, el abanico
-del relay le hace llegar los paquetes, cifrados para la sala, y es su cliente el que los descarta).
+La voz es un permiso más: los invitados entran con él (con `--guests-muted`, sin él) y se cambia
+con `allow N voice` / `deny N voice` en la consola. Sin él, el anfitrión descarta la voz del
+invitado; oír a la sala no necesita permiso.
 
 **Invitado** (`coroom join`):
 
 | Opción o atajo | Qué hace |
 |---|---|
-| `--voice` | habla por la sala si el anfitrión le da el permiso de voz (activación por voz) |
+| `--voice` | habla por la sala (activación por voz); el permiso lo trae al entrar, salvo que el anfitrión abra con `--guests-muted` |
 | `--ptt TECLA` | pulsar para hablar con esa tecla (`F12`, `CapsLock`, `v`…; no llega al juego) |
 | `--mic NOMBRE` / `--speaker NOMBRE` | micrófono y salida por su nombre (por defecto, los del sistema) |
 | `--mute-game` | empieza con el audio del juego silenciado |
