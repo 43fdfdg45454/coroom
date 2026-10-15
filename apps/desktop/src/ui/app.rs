@@ -1386,10 +1386,17 @@ impl App {
             Page::Host => host::view(self),
             Page::Settings => settings_screen::view(self),
         };
-        // Una línea bajo la cabecera: con la barra de título del sistema (KDE) encima, del mismo
-        // gris, las dos se leían como una sola barra gruesa con el título pegado arriba.
-        let shell =
-            column![self.headerbar(), iced_widget::rule::horizontal(1), page].height(Length::Fill);
+        // Una línea fina por encima y por debajo de la cabecera, que además lleva el tono de las
+        // tarjetas y más aire vertical: con la barra de título del sistema (KDE) encima, del mismo
+        // gris que la barra lateral, las dos se leían como una sola barra gruesa con el título
+        // pegado arriba.
+        let shell = column![
+            iced_widget::rule::horizontal(1),
+            self.headerbar(),
+            iced_widget::rule::horizontal(1),
+            page
+        ]
+        .height(Length::Fill);
         // Siempre una pila de dos capas, con el menú o sin él: si la raíz cambiara de tipo, iced
         // tiraría el estado de la página (su desplazamiento, el foco) al abrir o cerrar el menú.
         let menu: Element<'_, Message> = if self.account_menu {
@@ -1401,7 +1408,7 @@ impl App {
                         .align_x(iced_core::alignment::Horizontal::Right)
                         .align_y(iced_core::alignment::Vertical::Top)
                         .padding(Padding {
-                            top: HEADERBAR_HEIGHT + 4.0,
+                            top: HEADERBAR_HEIGHT + 5.0,
                             right: 12.0,
                             bottom: 0.0,
                             left: 0.0,
@@ -1509,7 +1516,7 @@ impl App {
         )
         .height(Length::Fixed(HEADERBAR_HEIGHT))
         .padding(Padding::from([0.0, 12.0]))
-        .class(ContainerClass::Sidebar)
+        .class(ContainerClass::Headerbar)
         .into()
     }
 
@@ -1666,7 +1673,7 @@ impl App {
 }
 
 /// Alto de la cabecera en píxeles lógicos.
-pub const HEADERBAR_HEIGHT: f32 = 48.0;
+pub const HEADERBAR_HEIGHT: f32 = 56.0;
 
 /// Cuánto se espera tras el último cambio de ajustes para guardarlos.
 pub const SETTINGS_SAVE_DELAY: Duration = Duration::from_millis(600);

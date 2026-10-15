@@ -304,6 +304,9 @@ pub enum ContainerClass {
     Window,
     /// Barra lateral.
     Sidebar,
+    /// Cabecera de la ventana: el tono de las tarjetas, para que no se funda con la barra de
+    /// título del sistema (KDE la pinta del mismo gris que la barra lateral).
+    Headerbar,
     /// Tarjeta.
     Card,
     /// Tarjeta destacada con el borde del acento (una invitación que llega).
@@ -381,6 +384,11 @@ impl container::Catalog for Theme {
             },
             ContainerClass::Sidebar => container::Style {
                 background: fill(p.sidebar.color()),
+                text_color: Some(p.text.color()),
+                ..none
+            },
+            ContainerClass::Headerbar => container::Style {
+                background: fill(p.card.color()),
                 text_color: Some(p.text.color()),
                 ..none
             },

@@ -174,7 +174,9 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
   ese momento aparecía o se iba un toast, y también al abrir o cerrar el menú de la cuenta o el
   diagnóstico: la raíz de la interfaz cambiaba de forma e iced tiraba el desplazamiento. Ahora la
   forma es siempre la misma.
-- **Cabecera pegada a la barra de título** del sistema (KDE): una línea la separa.
+- **Cabecera pegada a la barra de título** del sistema (KDE): la cabecera (también la de la
+  sala del invitado) lleva ahora el tono de las tarjetas, 56 px de alto con el título centrado y
+  una línea fina por encima y por debajo, así no se funde con la barra gris de KDE.
 - En la sala del anfitrión, **aire entre la barra de desplazamiento y el chat**, y el **botón de
   enviar** del chat mide lo mismo que la caja de texto con una línea.
 - **El vídeo del invitado en ventana real se quedaba colgado**: el compositor tomaba su candado

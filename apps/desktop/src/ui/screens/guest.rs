@@ -1058,7 +1058,7 @@ fn waiting_header<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     .height(Length::Fixed(HEADERBAR_HEIGHT))
     .padding(Padding::from([0.0, space::S]))
     .center_y(Length::Fixed(HEADERBAR_HEIGHT))
-    .class(ContainerClass::Sidebar)
+    .class(ContainerClass::Headerbar)
     .into()
 }
 
