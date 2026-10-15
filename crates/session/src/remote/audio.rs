@@ -30,13 +30,14 @@
 //! (preparados de antemano) y los olvidados van y vienen por canales acotados a un hilo de
 //! contadores: el propio `audio-play` a demanda, `audio-stats` con la cola del sumidero), ni el de
 //! las voces silenciadas ni el de sus volúmenes (huecos atómicos, [`ControlInner::muted_voices`]
-//! y [`ControlInner::voice_gains`]), ni el del reloj de la sesión más que una vez cada
+//! y [`ControlInner::voice_gains`]; el del juego, un atómico, [`ControlInner::game_gain`]), ni el
+//! del reloj de la sesión más que una vez cada
 //! [`SYNC_TICKS`] tramas para renovar el ancla con la que convierte las marcas de captura
 //! ([`Playout::local_capture`]). Lo único que ordena es la copia de 200 tránsitos del buffer de
 //! jitter, en su propia memoria.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -96,8 +97,8 @@ const GAIN_SLOTS: usize = 2 * MAX_VOICES;
 /// en los 32 bits altos, donde van los bits del `f32`; el emisor va en los 32 bits bajos.
 const GAIN_USED: u64 = 1 << 63;
 
-/// Ganancia máxima de una voz (lineal: 2 es el doble de volumen; el limitador del mezclador evita
-/// que recorte).
+/// Ganancia máxima de una voz, y del juego (lineal: 2 es el doble de volumen; el limitador del
+/// mezclador evita que recorte).
 pub const MAX_VOICE_GAIN: f32 = 2.0;
 
 /// Fuente del juego en el mezclador.
@@ -190,6 +191,20 @@ struct ControlInner {
     /// atómicos ([`GAIN_USED`] | bits de la ganancia << 32 | emisor, o 0 si está libre), por lo
     /// mismo que [`ControlInner::muted_voices`]. Una voz sin hueco suena a 1.0.
     voice_gains: [AtomicU64; GAIN_SLOTS],
+    /// Volumen del audio del juego en este equipo, aparte de su silencio
+    /// ([`ControlInner::game_muted`], que manda).
+    game_gain: GameGain,
+}
+
+/// Ganancia del juego: los bits del `f32` en un atómico, para que la reproducción la lea sin
+/// cerrojo por cada trama; 1.0 (lo normal) de partida.
+#[derive(Debug)]
+struct GameGain(AtomicU32);
+
+impl Default for GameGain {
+    fn default() -> Self {
+        Self(AtomicU32::new(1.0f32.to_bits()))
+    }
 }
 
 /// Hueco de [`ControlInner::voice_gains`] del emisor `source` con la ganancia `gain` (acotada).
@@ -243,6 +258,28 @@ impl AudioControl {
     /// Si el juego está silenciado.
     pub fn game_muted(&self) -> bool {
         self.inner.game_muted.load(Ordering::Acquire)
+    }
+
+    /// Volumen del audio del juego en este equipo: ganancia lineal entre 0.0 y
+    /// [`MAX_VOICE_GAIN`] (fuera del rango se acota; no finita cuenta como 1.0). Aparte del
+    /// silencio ([`AudioControl::set_game_muted`]), que manda: silenciado no suena sea cual sea
+    /// la ganancia, y la conserva para cuando vuelva a oírse.
+    pub fn set_game_gain(&self, gain: f32) {
+        let gain = if gain.is_finite() {
+            gain.clamp(0.0, MAX_VOICE_GAIN)
+        } else {
+            1.0
+        };
+        self.inner
+            .game_gain
+            .0
+            .store(gain.to_bits(), Ordering::Release);
+    }
+
+    /// Ganancia lineal del juego aquí (1.0 si no se tocó). Sin cerrojo: la mezcla la consulta en
+    /// el hilo del dispositivo por cada trama.
+    pub fn game_gain(&self) -> f32 {
+        f32::from_bits(self.inner.game_gain.0.load(Ordering::Relaxed))
     }
 
     /// Tecla de pulsar para hablar pulsada o soltada.
@@ -1068,6 +1105,12 @@ impl Playout {
             && let Some((offset, info)) = stream.tick(now)
         {
             if !game_muted {
+                // Su volumen en este equipo (el mezclador lo aplica al sumar; solo se le anota
+                // cuando cambia).
+                let gain = self.control.game_gain();
+                if self.mixer.gain(GAME_SOURCE) != gain {
+                    self.mixer.set_gain(GAME_SOURCE, gain);
+                }
                 let len = stream.frame_len();
                 self.mixer.add(
                     GAME_SOURCE,
@@ -1702,12 +1745,67 @@ mod tests {
         assert_eq!(control.voice_gain(999), 0.75);
     }
 
+    #[test]
+    fn the_game_gain_lives_in_an_atomic_apart_from_its_mute() {
+        let control = AudioControl::default();
+        assert_eq!(control.game_gain(), 1.0, "sin tocar, volumen normal");
+        control.set_game_gain(0.5);
+        assert_eq!(control.game_gain(), 0.5);
+        control.set_game_gain(0.0);
+        assert_eq!(
+            control.game_gain(),
+            0.0,
+            "el cero no se confunde con el normal"
+        );
+        // Acotada a 0.0..=2.0; lo que no es un número cuenta como 1.0.
+        control.set_game_gain(5.0);
+        assert_eq!(control.game_gain(), MAX_VOICE_GAIN);
+        control.set_game_gain(-1.0);
+        assert_eq!(control.game_gain(), 0.0);
+        control.set_game_gain(f32::NAN);
+        assert_eq!(control.game_gain(), 1.0);
+        control.set_game_gain(f32::INFINITY);
+        assert_eq!(control.game_gain(), 1.0);
+        // Silenciar no borra la ganancia guardada, ni la ganancia toca el silencio.
+        control.set_game_gain(1.5);
+        assert!(control.toggle_game());
+        assert!(control.game_muted());
+        assert_eq!(control.game_gain(), 1.5);
+        control.set_game_muted(false);
+        assert_eq!(control.game_gain(), 1.5);
+        control.set_game_gain(0.0);
+        assert!(!control.game_muted(), "a cero sigue sin estar silenciado");
+        // Las voces no se enteran.
+        assert_eq!(control.voice_gain(GAME_SOURCE), 1.0);
+    }
+
     /// Mezcla una voz (un tono de `amplitude`) con la ganancia `gain` y devuelve el pico que suena.
     fn mixed_peak(gain: f32, amplitude: f64) -> i16 {
-        let mut encoder = OpusEncoder::new(Profile::Voice).expect("codificador");
-        let mut stream = Stream::new(AudioTrack::Voice, 3).expect("emisor");
+        let control = AudioControl::default();
+        control.set_voice_gain(3, gain);
+        mixed_peak_of(AudioTrack::Voice, &control, amplitude)
+    }
+
+    /// Mezcla el juego (un tono de `amplitude`) con `control` y devuelve el pico que suena.
+    fn game_peak(control: &AudioControl, amplitude: f64) -> i16 {
+        mixed_peak_of(AudioTrack::Game, control, amplitude)
+    }
+
+    /// Reproduce un solo emisor de `track` (un tono de `amplitude`, en todos sus canales) con los
+    /// mandos de `control` y devuelve el pico que suena en la mezcla.
+    fn mixed_peak_of(track: AudioTrack, control: &AudioControl, amplitude: f64) -> i16 {
+        let profile = match track {
+            AudioTrack::Game => Profile::Game,
+            AudioTrack::Voice => Profile::Voice,
+        };
+        let channels = usize::from(profile.format().channels);
+        let mut encoder = OpusEncoder::new(profile).expect("codificador");
+        let mut stream = Stream::new(track, 3).expect("emisor");
         let pcm: Vec<i16> = (0..960)
-            .map(|n| ((n as f64 * 0.04).sin() * amplitude) as i16)
+            .flat_map(|n| {
+                let sample = ((n as f64 * 0.04).sin() * amplitude) as i16;
+                std::iter::repeat_n(sample, channels)
+            })
             .collect();
         let mut packet = [0u8; coroom_audio::codec::MAX_PACKET];
         let base = Instant::now();
@@ -1722,20 +1820,22 @@ mod tests {
                 base + Duration::from_millis(u64::from(seq) * 20),
             );
         }
-        let control = AudioControl::default();
-        control.set_voice_gain(3, gain);
+        let (game, voices) = match track {
+            AudioTrack::Game => (Some(stream), Vec::new()),
+            AudioTrack::Voice => (None, vec![stream]),
+        };
         let (_packets_tx, packets) = crossbeam_channel::bounded::<Packet>(1);
         let (links, _housekeeper) = links();
         let mut playout = Playout {
-            control,
+            control: control.clone(),
             render: None,
             packets,
             to_local: Box::new(|_| None),
             anchor: None,
             channels: 1,
             mixer: Mixer::new(1),
-            game: None,
-            voices: vec![stream],
+            game,
+            voices,
             heard: Vec::with_capacity(MAX_VOICES + 1),
             av: None,
             ticks: 0,
@@ -1774,6 +1874,50 @@ mod tests {
         let loud = mixed_peak(2.0, 20_000.0);
         assert!(loud > knee && loud < i16::MAX, "{loud}");
         assert_eq!(mixed_peak(0.0, 20_000.0), 0, "a cero no suena");
+    }
+
+    #[test]
+    fn the_game_gain_scales_the_game_and_leaves_the_voices_alone() {
+        let control = AudioControl::default();
+        let normal = game_peak(&control, 8_000.0);
+        assert!((6_000..=10_000).contains(&normal), "{normal}");
+        control.set_game_gain(2.0);
+        let double = game_peak(&control, 8_000.0);
+        let ratio = f64::from(double) / f64::from(normal);
+        assert!(
+            (1.9..=2.1).contains(&ratio),
+            "al doble: {normal} → {double}"
+        );
+        control.set_game_gain(0.5);
+        let half = game_peak(&control, 8_000.0);
+        let ratio = f64::from(half) / f64::from(normal);
+        assert!(
+            (0.45..=0.55).contains(&ratio),
+            "a la mitad: {normal} → {half}"
+        );
+        control.set_game_gain(0.0);
+        assert_eq!(game_peak(&control, 8_000.0), 0, "a cero no suena");
+        // El silencio manda sobre la ganancia, y al quitarlo vuelve la ganancia guardada.
+        control.set_game_gain(2.0);
+        control.set_game_muted(true);
+        assert_eq!(game_peak(&control, 8_000.0), 0, "silenciado no suena");
+        control.set_game_muted(false);
+        let again = game_peak(&control, 8_000.0);
+        assert!(
+            (f64::from(again) / f64::from(normal) - 2.0).abs() <= 0.1,
+            "{again}"
+        );
+        // Una voz al volumen normal suena igual con el juego a la mitad o al doble.
+        let voice = mixed_peak_of(AudioTrack::Voice, &AudioControl::default(), 8_000.0);
+        control.set_game_gain(0.5);
+        let with_quiet_game = mixed_peak_of(AudioTrack::Voice, &control, 8_000.0);
+        control.set_game_gain(2.0);
+        let with_loud_game = mixed_peak_of(AudioTrack::Voice, &control, 8_000.0);
+        assert_eq!(
+            (with_quiet_game, with_loud_game),
+            (voice, voice),
+            "las voces no cambian"
+        );
     }
 
     #[test]

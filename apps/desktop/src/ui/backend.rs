@@ -408,6 +408,11 @@ impl Backend {
                     audio.set_voice_gain(source, gain);
                 }
             }
+            Effect::SetGameGain { gain } => {
+                if let Some(controls) = self.guest_controls() {
+                    controls.audio.set_game_gain(gain);
+                }
+            }
             Effect::SetPermissions(guest, permissions) => {
                 if let Some(session) = lock(&self.host).clone()
                     && let Err(err) = lock(&session).set_permissions(guest, permissions)

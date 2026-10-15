@@ -364,6 +364,9 @@ pub struct Audio {
     /// sala, se comparta o se esté de invitado.
     #[serde(default)]
     pub voice_volumes: BTreeMap<String, u8>,
+    /// Volumen del audio del juego como invitado, en porcentaje (0-200; 100 lo normal), aparte
+    /// del de cada voz y de silenciarlo. Se aplica al entrar en una sala.
+    pub game_volume: u8,
 }
 
 /// Volumen normal de una voz (porcentaje).
@@ -418,6 +421,7 @@ impl Default for Audio {
             excluded_apps: Vec::new(),
             host_voice: true,
             voice_volumes: BTreeMap::new(),
+            game_volume: DEFAULT_VOICE_VOLUME,
         }
     }
 }
@@ -635,6 +639,7 @@ impl Settings {
         self.audio
             .voice_volumes
             .retain(|_, volume| *volume != DEFAULT_VOICE_VOLUME);
+        self.audio.game_volume = self.audio.game_volume.min(MAX_VOICE_VOLUME);
         let mut seen = std::collections::BTreeSet::new();
         self.servers
             .retain(|server| seen.insert(server.url.clone()));
@@ -896,6 +901,31 @@ mod tests {
         let sane = edited.sanitized();
         assert_eq!(sane.audio.voice_volumes.get("Ana"), None);
         assert_eq!(sane.audio.voice_volumes.get("Bea"), Some(&200));
+    }
+
+    #[test]
+    fn the_game_volume_is_normal_by_default_and_bounded() {
+        let audio = Audio::default();
+        assert_eq!(audio.game_volume, DEFAULT_VOICE_VOLUME);
+        // Ida y vuelta por TOML, y sin la clave (ajustes de antes) queda al normal.
+        let settings = Settings {
+            audio: Audio {
+                game_volume: 60,
+                ..Audio::default()
+            },
+            ..Settings::default()
+        };
+        let text = toml::to_string_pretty(&settings).expect("escribir");
+        assert!(text.contains("game_volume = 60"), "{text}");
+        let loaded: Settings = toml::from_str(&text).expect("leer");
+        assert_eq!(loaded, settings);
+        let old: Settings = toml::from_str("[audio]\nvoice = true\n").expect("leer");
+        assert_eq!(old.audio.game_volume, DEFAULT_VOICE_VOLUME);
+        // Un fichero editado a mano se sanea: lo que pasa de 200 se acota.
+        let edited: Settings = toml::from_str("[audio]\ngame_volume = 230\n").expect("leer");
+        assert_eq!(edited.sanitized().audio.game_volume, MAX_VOICE_VOLUME);
+        let zero: Settings = toml::from_str("[audio]\ngame_volume = 0\n").expect("leer");
+        assert_eq!(zero.sanitized().audio.game_volume, 0, "a cero se respeta");
     }
 
     #[test]

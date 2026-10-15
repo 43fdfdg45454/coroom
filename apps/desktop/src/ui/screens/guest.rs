@@ -157,6 +157,8 @@ pub struct State {
     pub muted: std::collections::BTreeSet<u32>,
     /// Volumen de cada voz en este equipo, por hoja MLS (porcentaje; sin entrada, 100).
     pub volumes: std::collections::BTreeMap<u32, u8>,
+    /// Volumen del audio del juego en este equipo (porcentaje), aparte de silenciarlo.
+    pub game_volume: u8,
     /// Mandos conectados a este equipo (`None`: aún no se sabe).
     pub pads: Option<Vec<ConnectedPad>>,
     /// Si el mando que se envía va tal cual.
@@ -246,6 +248,7 @@ impl State {
             members: Vec::new(),
             muted: std::collections::BTreeSet::new(),
             volumes: std::collections::BTreeMap::new(),
+            game_volume: DEFAULT_VOICE_VOLUME,
             pads: None,
             pads_raw: false,
             bar_until: now,
@@ -499,6 +502,10 @@ pub enum Msg {
     Volume(u32, u8),
     /// Al soltar el deslizador: recordar el volumen por el nombre del miembro.
     VolumeDone(u32),
+    /// Volumen del audio del juego en este equipo, mientras se arrastra.
+    GameVolume(u8),
+    /// Al soltar el deslizador del juego: recordarlo en los ajustes.
+    GameVolumeDone,
     /// Mandos conectados y si el que se envía va tal cual.
     Pads(Vec<ConnectedPad>, bool),
     /// Elegir qué mando enviar.
@@ -674,6 +681,17 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 return app.settings_changed();
             }
         }
+        Msg::GameVolume(percent) => {
+            let percent = percent.min(MAX_VOICE_VOLUME);
+            state.game_volume = percent;
+            return vec![Effect::SetGameGain {
+                gain: voice_gain(percent),
+            }];
+        }
+        Msg::GameVolumeDone => {
+            app.settings.audio.game_volume = state.game_volume;
+            return app.settings_changed();
+        }
         Msg::Pads(pads, raw) => {
             let slot = state.stats.as_ref().and_then(|s| s.allowed.gamepad_slot);
             let notice = state
@@ -812,6 +830,13 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
         Event::GuestStarted(Ok(feed)) => {
             if let Some(state) = app.guest.as_mut() {
                 state.feed = feed;
+                // La sesión arranca con el juego al volumen normal: se le aplica el recordado.
+                state.game_volume = app.settings.audio.game_volume;
+                if state.game_volume != DEFAULT_VOICE_VOLUME {
+                    return vec![Effect::SetGameGain {
+                        gain: voice_gain(state.game_volume),
+                    }];
+                }
             }
         }
         Event::GuestStarted(Err(err)) => {
@@ -1645,8 +1670,23 @@ fn pad_option<'a>(
     .into()
 }
 
+/// Botón de silenciar lo que regula un deslizador, delante de su raíl: altavoz (suena) o altavoz
+/// tachado (silenciado), con «Silenciar» / «Activar sonido».
+fn mute_button<'a>(muted: bool, message: Message) -> Element<'a, Message> {
+    bar_button(
+        if muted { Icon::VolumeOff } else { Icon::Volume },
+        if muted {
+            t!("room-activar-sonido")
+        } else {
+            t!("room-silenciar")
+        },
+        muted,
+        message,
+    )
+}
+
 /// Quién está en la sala y a quién se oye: cada uno decide en su equipo, sin que cambie nada para
-/// los demás.
+/// los demás (el altavoz de cada deslizador silencia a esa persona aquí).
 fn people_section(state: &State) -> Element<'_, Message> {
     let speaking: Vec<&str> = state
         .stats
@@ -1667,43 +1707,20 @@ fn people_section(state: &State) -> Element<'_, Message> {
         } else {
             role.to_owned()
         };
-        let label = column![
-            text(if member.you {
-                t!("room-tu-nombre", name = member.name.as_str())
-            } else {
-                member.name.clone()
-            })
-            .size(type_size::BODY)
-            .class(TextClass::Overlay),
-            overlay_text(detail).size(type_size::CAPTION),
-        ]
-        .spacing(2)
-        .width(Length::Fill);
-        let control: Element<'_, Message> = if member.you {
-            ui::gap(0.0)
-        } else {
-            let leaf = member.leaf;
-            let muted = state.muted.contains(&leaf);
-            bar_button(
-                if muted {
-                    Icon::HeadphonesOff
-                } else {
-                    Icon::Headphones
-                },
-                if muted {
-                    t!("room-volver-a-oir", name = member.name.as_str())
-                } else {
-                    t!("room-dejar-de-oir", name = member.name.as_str())
-                },
-                muted,
-                on(Msg::Hear(leaf, muted)),
-            )
-        };
         rows.push(
-            row![label, control]
-                .spacing(space::S)
-                .align_y(Alignment::Center)
-                .into(),
+            column![
+                text(if member.you {
+                    t!("room-tu-nombre", name = member.name.as_str())
+                } else {
+                    member.name.clone()
+                })
+                .size(type_size::BODY)
+                .class(TextClass::Overlay),
+                overlay_text(detail).size(type_size::CAPTION),
+            ]
+            .spacing(2)
+            .width(Length::Fill)
+            .into(),
         );
         if let Some(volume) = volume_row(state, member) {
             rows.push(volume);
@@ -1724,20 +1741,21 @@ fn people_section(state: &State) -> Element<'_, Message> {
 }
 
 /// Volumen de la voz de `member` en este equipo, bajo su nombre: de 0 a 200 % de 5 en 5
-/// (Ctrl+clic, 100 %). Mientras se arrastra ya suena así; al soltar se recuerda por su nombre.
-/// La propia voz no se oye aquí: sin deslizador.
+/// (Ctrl+clic, 100 %), con el botón de dejar de oírle delante. Mientras se arrastra ya suena así;
+/// al soltar se recuerda por su nombre. La propia voz no se oye aquí: sin deslizador.
 fn volume_row<'a>(state: &State, member: &RoomMember) -> Option<Element<'a, Message>> {
     if member.you {
         return None;
     }
     let leaf = member.leaf;
     let percent = state.volume(leaf);
-    Some(ui::slider(
+    let muted = state.muted.contains(&leaf);
+    Some(ui::slider_with(
         0..=MAX_VOICE_VOLUME,
         percent,
         5,
         DEFAULT_VOICE_VOLUME,
-        Some(Icon::Volume),
+        Some(mute_button(muted, on(Msg::Hear(leaf, muted)))),
         t!("room-volumen-porcentaje", percent = percent),
         SliderClass::Overlay,
         move |value| on(Msg::Volume(leaf, value)),
@@ -1813,12 +1831,39 @@ fn pads_section<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     content.into()
 }
 
-/// Pestaña «Sala»: personas (oír o no) y mandos.
+/// Volumen del audio del juego en este equipo, encima de las personas: de 0 a 200 % de 5 en 5
+/// (Ctrl+clic, 100 %), con el botón de silenciarlo delante (el mismo que el de la barra y
+/// `Ctrl+Alt+V`; va aparte del volumen y manda). Mientras se arrastra ya suena así; al soltar se
+/// recuerda en los ajustes.
+fn game_volume_section(state: &State) -> Element<'_, Message> {
+    let percent = state.game_volume;
+    let muted = state.stats.as_ref().is_some_and(|s| s.game_muted);
+    stat_section(
+        t!("room-volumen-del-juego"),
+        vec![ui::slider_with(
+            0..=MAX_VOICE_VOLUME,
+            percent,
+            5,
+            DEFAULT_VOICE_VOLUME,
+            Some(mute_button(muted, on(Msg::ToggleGame))),
+            t!("room-volumen-porcentaje", percent = percent),
+            SliderClass::Overlay,
+            |value| on(Msg::GameVolume(value)),
+            Some(on(Msg::GameVolumeDone)),
+        )],
+    )
+}
+
+/// Pestaña «Sala»: volumen del juego, personas (oír o no) y mandos.
 fn room_tab<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     scrollable(
-        column![people_section(state), pads_section(app, state)]
-            .spacing(space::L)
-            .padding(Padding::from([space::S, space::M])),
+        column![
+            game_volume_section(state),
+            people_section(state),
+            pads_section(app, state)
+        ]
+        .spacing(space::L)
+        .padding(Padding::from([space::S, space::M])),
     )
     .height(Length::Fill)
     .into()
@@ -2439,6 +2484,7 @@ pub(crate) mod shots {
         ]))));
         app.update(Message::Guest(Msg::Hear(2, false)));
         app.update(Message::Guest(Msg::Volume(0, 150)));
+        app.update(Message::Guest(Msg::GameVolume(70)));
         let eightbitdo = sample_pad(
             0x2dc8,
             0x6012,
@@ -2960,6 +3006,48 @@ mod tests {
         let state = app.guest.as_ref().expect("invitado");
         assert!(!state.volumes.contains_key(&2));
         assert_eq!(state.volume(0), 150);
+    }
+
+    #[test]
+    fn the_game_volume_is_applied_on_entering_and_remembered_on_release() {
+        let mut app = app();
+        app.settings.audio.game_volume = 60;
+        start(&mut app, "K7Q2MZ".into());
+        assert_eq!(
+            app.guest.as_ref().expect("invitado").game_volume,
+            DEFAULT_VOICE_VOLUME,
+            "hasta que arranca la sesión, el normal"
+        );
+        // Al arrancar la sesión se le aplica el recordado (la sesión nueva está al normal).
+        let effects = app.update(Message::Event(Event::GuestStarted(Ok(
+            VideoFeed::detached(),
+        ))));
+        assert_eq!(effects, [Effect::SetGameGain { gain: 0.6 }]);
+        assert_eq!(app.guest.as_ref().expect("invitado").game_volume, 60);
+        // Arrastrar cambia el volumen en caliente; soltar lo recuerda en los ajustes.
+        let effects = app.update(Message::Guest(Msg::GameVolume(150)));
+        assert_eq!(effects, [Effect::SetGameGain { gain: 1.5 }]);
+        assert_eq!(app.settings.audio.game_volume, 60, "aún no se soltó");
+        assert!(app.update(Message::Guest(Msg::GameVolumeDone)).is_empty());
+        assert_eq!(app.settings.audio.game_volume, 150);
+        assert_eq!(app.flush_settings(), Some(Effect::SaveSettings));
+        // Acotado al doble; el volumen normal no manda ningún efecto al arrancar.
+        let effects = app.update(Message::Guest(Msg::GameVolume(250)));
+        assert_eq!(effects, [Effect::SetGameGain { gain: 2.0 }]);
+        assert_eq!(app.guest.as_ref().expect("invitado").game_volume, 200);
+        app.settings.audio.game_volume = DEFAULT_VOICE_VOLUME;
+        assert!(
+            app.update(Message::Event(Event::GuestStarted(Ok(
+                VideoFeed::detached()
+            ))))
+            .is_empty()
+        );
+        assert_eq!(
+            app.guest.as_ref().expect("invitado").game_volume,
+            DEFAULT_VOICE_VOLUME
+        );
+        // Las voces no se tocan.
+        assert!(app.guest.as_ref().expect("invitado").volumes.is_empty());
     }
 
     #[test]

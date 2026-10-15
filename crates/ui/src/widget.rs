@@ -361,6 +361,30 @@ pub fn slider<'a, M: Clone + 'a>(
     on_change: impl Fn(u8) -> M + 'a,
     on_release: Option<M>,
 ) -> Element<'a, M> {
+    let icon_class = match class {
+        SliderClass::Accent => SvgClass::Secondary,
+        SliderClass::Overlay => SvgClass::Overlay,
+    };
+    let leading = icon.map(|glyph| icon_with(glyph, size::ICON, icon_class));
+    slider_with(
+        range, value, step, default, leading, label, class, on_change, on_release,
+    )
+}
+
+/// [`slider`] con lo que se quiera delante del raíl en vez de un icono fijo (por ejemplo, un
+/// botón que silencia lo que el deslizador regula).
+#[allow(clippy::too_many_arguments)]
+pub fn slider_with<'a, M: Clone + 'a>(
+    range: std::ops::RangeInclusive<u8>,
+    value: u8,
+    step: u8,
+    default: u8,
+    leading: Option<Element<'a, M>>,
+    label: impl text::IntoFragment<'a>,
+    class: SliderClass,
+    on_change: impl Fn(u8) -> M + 'a,
+    on_release: Option<M>,
+) -> Element<'a, M> {
     let mut control: Slider<'a, M> = iced_widget::Slider::new(range, value, on_change)
         .step(step)
         .shift_step(1)
@@ -370,13 +394,13 @@ pub fn slider<'a, M: Clone + 'a>(
     if let Some(on_release) = on_release {
         control = control.on_release(on_release);
     }
-    let (icon_class, text_class) = match class {
-        SliderClass::Accent => (SvgClass::Secondary, TextClass::Secondary),
-        SliderClass::Overlay => (SvgClass::Overlay, TextClass::OverlaySecondary),
+    let text_class = match class {
+        SliderClass::Accent => TextClass::Secondary,
+        SliderClass::Overlay => TextClass::OverlaySecondary,
     };
     let mut line = Row::new().spacing(gap::XS).align_y(Alignment::Center);
-    if let Some(glyph) = icon {
-        line = line.push(icon_with(glyph, size::ICON, icon_class));
+    if let Some(leading) = leading {
+        line = line.push(leading);
     }
     line.push(control.width(Length::Fill))
         .push(

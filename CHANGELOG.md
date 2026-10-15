@@ -9,6 +9,9 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Añadido
 
+- Volumen del audio del juego en el invitado, aparte del de cada participante (0-200 %, recordado):
+  deslizador «Volumen del juego» encima de «Personas en la sala», con el botón de silenciarlo
+  delante.
 - **Volumen por participante**: junto al botón de oír o no a cada persona (la tarjeta de cada
   invitado en Compartir y «Personas en la sala» del invitado) hay un deslizador de 0 a 200 % (de
   5 en 5, Ctrl+clic vuelve al 100 %) que sube o baja su voz solo en este equipo; a más del 100 %
@@ -441,6 +444,9 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Cambiado
 
+- En «Personas en la sala» del invitado, el icono de altavoz delante del deslizador de cada
+  persona es el botón de dejar de oírla o volver a oírla («Silenciar» / «Activar sonido»); el
+  botón de auriculares desaparece. El del juego hace lo mismo que el de la barra y `Ctrl+Alt+V`.
 - **El pacing reparte cada fotograma al ritmo que midió el enlace, no al bitrate máximo**: la
   sonda del enlace sale a diez veces el máximo configurado (hasta 100 Mbit/s) para medir lo que
   sobra por encima de él, y el emisor reparte cada fotograma al 70 % de lo medido (o 1,25 × el

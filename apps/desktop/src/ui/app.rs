@@ -486,6 +486,14 @@ pub enum Effect {
         /// Ganancia.
         gain: f32,
     },
+    /// Volumen del audio del juego en este equipo, como invitado (el anfitrión no lo oye por
+    /// coroom): ganancia lineal, 1.0 lo normal y 2.0 el doble
+    /// ([`coroom_session::remote::audio::MAX_VOICE_GAIN`]). Aparte de silenciarlo
+    /// ([`Effect::ToggleGameAudio`]), que manda.
+    SetGameGain {
+        /// Ganancia.
+        gain: f32,
+    },
     /// Permisos de un invitado.
     SetPermissions(GuestId, Permissions),
     /// Expulsar.
