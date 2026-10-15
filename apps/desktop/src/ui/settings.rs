@@ -305,13 +305,25 @@ pub struct Input {
 }
 
 /// Red.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Network {
     /// Usar siempre el relay del servidor.
     pub force_relay: bool,
     /// Puerto UDP local (`0`: cualquiera).
     pub local_port: u16,
+    /// Pedir al router que abra el puerto UDP (UPnP, NAT-PMP o PCP) para la conexión directa.
+    pub port_mapping: bool,
+}
+
+impl Default for Network {
+    fn default() -> Self {
+        Self {
+            force_relay: false,
+            local_port: 0,
+            port_mapping: true,
+        }
+    }
 }
 
 /// Aviso de versión nueva ([`crate::update`]).

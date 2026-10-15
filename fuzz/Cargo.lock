@@ -826,6 +826,7 @@ dependencies = [
  "bytes",
  "coroom-crypto",
  "coroom-proto",
+ "getrandom 0.4.3",
  "h3",
  "h3-quinn",
  "http",

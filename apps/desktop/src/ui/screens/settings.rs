@@ -162,6 +162,8 @@ pub enum Msg {
     PreferredSlot(Choice<u8>),
     /// Forzar relay.
     ForceRelay(bool),
+    /// Pedir al router que abra el puerto.
+    PortMapping(bool),
     /// Puerto local.
     Port(String),
     /// Tema.
@@ -380,6 +382,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::ResetShortcuts => settings.input.shortcuts = Shortcuts::default(),
         Msg::PreferredSlot(choice) => settings.input.preferred_slot = choice.value,
         Msg::ForceRelay(on) => settings.network.force_relay = on,
+        Msg::PortMapping(on) => settings.network.port_mapping = on,
         Msg::Port(text) => {
             let digits: String = text.chars().filter(char::is_ascii_digit).take(5).collect();
             app.settings_page.port_error = None;
@@ -989,6 +992,14 @@ fn network(app: &App) -> Element<'_, Message> {
                 ui::switch(net.force_relay, Some(|on_off| on(Msg::ForceRelay(on_off)))),
             ),
             ui::pref_row(
+                t!("pantalla-settings-abrir-el-puerto-en-el-router"),
+                Some(t!("pantalla-settings-pide-al-router-que-deje-entrar").to_owned()),
+                ui::switch(
+                    net.port_mapping,
+                    Some(|on_off| on(Msg::PortMapping(on_off)))
+                ),
+            ),
+            ui::pref_row(
                 t!("pantalla-settings-puerto-local"),
                 Some(t!("pantalla-settings-fijalo-si-tu-router-reenvia-un").to_owned()),
                 port,
@@ -1540,6 +1551,12 @@ mod tests {
         assert!(saves(&mut app, Msg::Fps(120)));
         assert_eq!(app.settings.video.fps, 120);
         assert!(saves(&mut app, Msg::ForceRelay(true)));
+        assert!(
+            app.settings.network.port_mapping,
+            "abrir el puerto viene activado"
+        );
+        assert!(saves(&mut app, Msg::PortMapping(false)));
+        assert!(!app.settings.network.port_mapping);
         assert!(saves(&mut app, Msg::Theme(ThemeChoice::Dark)));
         assert_eq!(
             app.theme.mode(),

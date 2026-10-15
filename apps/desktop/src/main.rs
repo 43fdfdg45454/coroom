@@ -260,6 +260,10 @@ struct NetArgs {
     #[arg(long)]
     force_relay: bool,
 
+    /// No pedir al router que abra el puerto UDP (UPnP, NAT-PMP o PCP) para la conexión directa.
+    #[arg(long)]
+    no_port_mapping: bool,
+
     /// Huella SHA-256 del certificado autofirmado del servidor (la que imprime al arrancar).
     #[arg(long, value_name = "SHA256")]
     trust_fingerprint: Option<String>,
@@ -286,6 +290,7 @@ impl NetArgs {
             dev_token: self.dev_token.clone().filter(|token| !token.is_empty()),
             trust_fingerprint: self.trust_fingerprint.clone(),
             force_relay: self.force_relay,
+            port_mapping: !self.no_port_mapping,
             data_dir: self.data_dir.clone(),
             headless,
             local_port: None,
@@ -1319,6 +1324,10 @@ mod tests {
         let options = args.options().expect("opciones");
         assert_eq!(options.source, Source::Synthetic);
         assert!(options.net.force_relay && options.net.headless);
+        assert!(
+            options.net.port_mapping,
+            "se pide abrir el puerto salvo que se diga"
+        );
         assert_eq!(options.net.dev_token.as_deref(), Some("change-me"));
         assert_eq!((options.video.width, options.video.fps), (640, 30));
         assert_eq!(options.video.frames, Some(90));
@@ -1364,6 +1373,12 @@ mod tests {
         assert_eq!(options.frames, Some(600), "sin ventana, 600 por defecto");
         assert_eq!(options.decoder, None);
         assert!(!options.net.force_relay);
+        let cli = Cli::try_parse_from(["coroom", "join", "--no-port-mapping", "ABC234"])
+            .expect("join sin abrir el puerto");
+        let Some(Command::Join(args)) = cli.command else {
+            panic!("se esperaba join");
+        };
+        assert!(!args.options().net.port_mapping);
 
         // Sin --server se usa el último; sin código, se esperan invitaciones.
         let cli = Cli::try_parse_from(["coroom", "join", "--first"]).expect("join sin código");

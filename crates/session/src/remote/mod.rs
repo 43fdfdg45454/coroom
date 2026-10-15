@@ -95,6 +95,7 @@ use coroom_transport::crypto::hpke::PairwiseSecret;
 use coroom_transport::crypto::sframe::MediaKey;
 use coroom_transport::crypto::{Identity, MediaKeyRing, SafetyNumber, sha256_fingerprint};
 use coroom_transport::media::MediaReceiver;
+use coroom_transport::nat::{MAPPING_TIMEOUT, Mapper, MappingReport, PortMapping};
 use coroom_transport::quic::ControlSender;
 pub use coroom_transport::{CandidateClass, CandidateOutcome, CandidateReport};
 use coroom_transport::{Endpoint, Path, PeerConnection, ServerTrust};
@@ -235,6 +236,9 @@ pub struct RemoteConfig {
     pub trust: ServerTrust,
     /// Salta la conexión directa y usa siempre el relay del servidor.
     pub force_relay: bool,
+    /// Pedir al router de la red local que abra el puerto UDP del `Endpoint` (PCP, NAT-PMP o UPnP)
+    /// y anunciar su dirección WAN como candidato ([`coroom_transport::nat`]).
+    pub port_mapping: bool,
     /// Dirección del socket UDP local; `None` = `[::]:0` (o `0.0.0.0:0` sin IPv6).
     pub bind: Option<SocketAddr>,
     /// Tiempo de la apertura simultánea de NAT antes de recurrir al relay.
@@ -271,6 +275,7 @@ impl RemoteConfig {
             token: token.into(),
             trust,
             force_relay: false,
+            port_mapping: true,
             bind: None,
             punch_timeout: coroom_transport::connect::PUNCH_TIMEOUT,
             advertise_candidates: None,
@@ -361,6 +366,11 @@ pub enum SessionEvent {
         rtt_ms: f64,
         /// Nivel con el pipeline típico.
         level: QualityLevel,
+    },
+    /// Qué respondió el router al pedirle que abra el puerto UDP (al abrir la sala o al entrar).
+    PortMapping {
+        /// El informe.
+        report: MappingReport,
     },
     /// Qué pasó con cada candidato de conexión directa y, si se usa el relay, por qué (el
     /// invitado al conectar; el anfitrión por cada invitado).
@@ -497,6 +507,7 @@ impl fmt::Display for SessionEvent {
                 "RTT con el anfitrión: {rtt_ms:.1} ms. Calidad esperada: {level} ({}).",
                 level.description()
             ),
+            SessionEvent::PortMapping { report } => write!(f, "Puerto en el router: {report}."),
             SessionEvent::Candidates {
                 guest,
                 candidates,
@@ -748,6 +759,8 @@ pub(crate) struct Core {
     pub(crate) removed: AtomicBool,
     pub(crate) guests: Mutex<BTreeMap<GuestId, GuestStatus>>,
     pub(crate) link: Mutex<GuestLink>,
+    /// El puerto abierto en el router (se renueva solo y se borra al terminar), o su informe.
+    pub(crate) port_mapping: Mutex<Option<PortMapping>>,
     pub(crate) input_keys: Mutex<BTreeMap<u32, PairwiseSecret>>,
     /// Anfitrión: la entrada de los invitados (desde que arranca la sesión).
     pub(crate) host_input: Mutex<Option<Arc<input::HostInput>>>,
@@ -812,6 +825,7 @@ impl Core {
             game_audio: AtomicBool::new(false),
             joined_once: AtomicBool::new(false),
             reconnect_attempts: AtomicU32::new(0),
+            port_mapping: Mutex::new(None),
         }
     }
 
@@ -865,6 +879,7 @@ impl Core {
         self.shared.finish(None);
         self.guest_input.stop();
         lock(&self.audio_tx).take();
+        lock(&self.port_mapping).take();
     }
 
     pub(crate) fn ended(&self) -> bool {
@@ -948,20 +963,87 @@ pub fn input_key_check(secret: &PairwiseSecret) -> String {
     check
 }
 
-/// Candidatos que se anuncian: los configurados o los locales del socket más el reflejado.
+/// Candidatos que se anuncian: los configurados o los locales del socket más el reflejado y, si
+/// el router respondió, su dirección WAN ([`wan_candidate`]).
 pub(crate) fn advertised_candidates(
     config: &RemoteConfig,
     endpoint: &Endpoint,
     observed: SocketAddr,
+    mapping: Option<&MappingReport>,
 ) -> Vec<SocketAddr> {
     if let Some(list) = &config.advertise_candidates {
         return list.clone();
     }
     let mut out = coroom_transport::connect::local_candidates(endpoint).unwrap_or_default();
     out.push(observed);
+    out.extend(mapping.and_then(|report| wan_candidate(config, report)));
     out.sort();
     out.dedup();
     out
+}
+
+/// La dirección WAN del router con el puerto que abrió; si dijo su dirección pero no abrió nada
+/// y el socket está en un puerto fijo (`bind`), la WAN con ese puerto: un reenvío hecho a mano en
+/// el router.
+fn wan_candidate(config: &RemoteConfig, report: &MappingReport) -> Option<SocketAddr> {
+    if let Some(mapping) = report.mapping() {
+        return Some(SocketAddr::V4(mapping.external));
+    }
+    let external = report.external_ip()?;
+    let port = config
+        .bind
+        .map(|bind| bind.port())
+        .filter(|port| *port != 0)?;
+    Some(SocketAddr::new(std::net::IpAddr::V4(external), port))
+}
+
+/// Pide al router que abra el puerto del `Endpoint`, en segundo plano, si la configuración lo
+/// quiere y no se fuerza el relay.
+pub(crate) fn start_port_mapping(
+    config: &RemoteConfig,
+    endpoint: &Endpoint,
+) -> Option<tokio::task::JoinHandle<PortMapping>> {
+    if !config.port_mapping || config.force_relay {
+        return None;
+    }
+    let port = endpoint.local_addr().ok()?.port();
+    let mapper = Mapper::new();
+    Some(tokio::spawn(async move { mapper.map(port).await }))
+}
+
+/// Espera lo que quede de [`MAPPING_TIMEOUT`] desde `started` a la petición al router, la guarda
+/// en `core` (se renueva sola y se borra con la sesión) y la cuenta. Si el router aún no
+/// respondió, se sigue sin ella y se guarda en cuanto termine.
+pub(crate) async fn await_port_mapping(
+    core: &Arc<Core>,
+    task: Option<tokio::task::JoinHandle<PortMapping>>,
+    started: Instant,
+) -> Option<MappingReport> {
+    let mut task = task?;
+    let deadline =
+        tokio::time::Instant::from_std(started + MAPPING_TIMEOUT + Duration::from_millis(200));
+    match tokio::time::timeout_at(deadline, &mut task).await {
+        Ok(Ok(mapping)) => Some(store_port_mapping(core, mapping)),
+        Ok(Err(_)) => None,
+        Err(_) => {
+            let core = Arc::clone(core);
+            tokio::spawn(async move {
+                if let Ok(mapping) = task.await {
+                    store_port_mapping(&core, mapping);
+                }
+            });
+            None
+        }
+    }
+}
+
+fn store_port_mapping(core: &Arc<Core>, mapping: PortMapping) -> MappingReport {
+    let report = mapping.report().clone();
+    core.emit(SessionEvent::PortMapping {
+        report: report.clone(),
+    });
+    *lock(&core.port_mapping) = Some(mapping);
+    report
 }
 
 enum Parts {
@@ -1610,11 +1692,53 @@ mod tests {
     }
 
     fn config() -> RemoteConfig {
-        RemoteConfig::new(
+        let mut config = RemoteConfig::new(
             "https://coroom.example.com",
             "change-me",
             ServerTrust::Fingerprint("00".repeat(32)),
-        )
+        );
+        config.port_mapping = false;
+        config
+    }
+
+    #[test]
+    fn the_wan_candidate_is_the_open_port_or_a_manual_forward() {
+        use coroom_transport::nat::{Mapping, MappingOutcome, MappingProtocol};
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        let report = |outcome| MappingReport {
+            gateway: Some(Ipv4Addr::new(192, 168, 1, 1)),
+            internal: Some(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 10), 47_000)),
+            outcome,
+        };
+        let mut config = config();
+        let mapped = report(MappingOutcome::Mapped(Mapping {
+            external: SocketAddrV4::new(Ipv4Addr::new(100, 64, 3, 4), 47_001),
+            protocol: MappingProtocol::Pcp,
+            lifetime: Some(Duration::from_secs(7200)),
+        }));
+        assert_eq!(
+            wan_candidate(&config, &mapped),
+            Some("100.64.3.4:47001".parse().unwrap())
+        );
+        let external_only = report(MappingOutcome::ExternalOnly {
+            external: Ipv4Addr::new(203, 0, 113, 9),
+            protocol: MappingProtocol::Upnp,
+            error: "no permite abrir puertos".to_owned(),
+        });
+        assert_eq!(
+            wan_candidate(&config, &external_only),
+            None,
+            "sin puerto fijo no vale"
+        );
+        config.bind = Some("[::]:47000".parse().unwrap());
+        assert_eq!(
+            wan_candidate(&config, &external_only),
+            Some("203.0.113.9:47000".parse().unwrap())
+        );
+        assert_eq!(
+            wan_candidate(&config, &report(MappingOutcome::NoResponse)),
+            None
+        );
     }
 
     fn host(video: LoopbackConfig) -> RemoteSession {

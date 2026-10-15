@@ -1076,6 +1076,7 @@ fn net_options(options: &AccountOptions, settings: &Settings) -> NetOptions {
         dev_token: None,
         trust_fingerprint: options.trust_fingerprint.clone(),
         force_relay: settings.network.force_relay,
+        port_mapping: settings.network.port_mapping,
         data_dir: options.data_dir.clone(),
         headless: false,
         local_port: Some(settings.network.local_port).filter(|port| *port != 0),

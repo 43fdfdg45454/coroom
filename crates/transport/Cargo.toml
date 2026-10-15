@@ -23,6 +23,7 @@ serde_json.workspace = true
 tokio-rustls.workspace = true
 coroom-crypto.workspace = true
 coroom-proto.workspace = true
+getrandom.workspace = true
 if-addrs.workspace = true
 quinn.workspace = true
 quinn-proto.workspace = true
@@ -37,7 +38,15 @@ wtransport-proto.workspace = true
 [target.'cfg(windows)'.dependencies]
 # `timeBeginPeriod` y `SetProcessInformation`: resolución de 1 ms para el pacer de QUIC y los
 # temporizadores, también con la ventana oculta o minimizada (ver quic.rs).
-windows = { workspace = true, features = ["Win32_Media", "Win32_System_Threading"] }
+# `GetIpForwardTable2`: la puerta de enlace por defecto para abrir el puerto en el router (nat.rs).
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Media",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 bytes.workspace = true

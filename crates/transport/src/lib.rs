@@ -10,6 +10,8 @@
 //!   y reloj por `Ping`/`Pong`).
 //! - [`rate`]: [`RateController`] tipo SCReAM y el controlador de congestión de `quinn` para medios.
 //! - [`connect`]: [`Connector`] (apertura simultánea de NAT con candidatos y relay de respaldo).
+//! - [`nat`]: [`Mapper`](nat::Mapper) (abre el puerto del `Endpoint` en el router por PCP, NAT-PMP o
+//!   UPnP para que lleguen en directo).
 //! - [`signal`]: [`SignalClient`] (señalización por WebTransport desde el mismo socket).
 //! - [`api`]: [`ApiClient`] (API de cuentas, amigos y uso por HTTP/3 con respaldo HTTP/2 por TCP).
 //! - [`loopback`]: el bucle UDP de la prueba de latencia local.
@@ -26,6 +28,7 @@ pub mod loopback;
 #[cfg(feature = "test-util")]
 pub mod lossy;
 pub mod media;
+pub mod nat;
 pub mod quic;
 pub mod rate;
 pub mod signal;

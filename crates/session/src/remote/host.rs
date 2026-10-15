@@ -2148,6 +2148,8 @@ async fn run_host(
         },
     )
     .map_err(network("no se pudo abrir el socket UDP"))?;
+    let mapping_task = super::start_port_mapping(&config, &endpoint);
+    let mapping_started = std::time::Instant::now();
     let mut signal = tokio::time::timeout(
         REPLY_TIMEOUT,
         SignalClient::connect(&config.server_url, &config.token, &endpoint, &config.trust),
@@ -2212,7 +2214,8 @@ async fn run_host(
     let candidates = if config.force_relay {
         Vec::new()
     } else {
-        advertised_candidates(&config, &endpoint, signal.observed())
+        let mapping = super::await_port_mapping(&core, mapping_task, mapping_started).await;
+        advertised_candidates(&config, &endpoint, signal.observed(), mapping.as_ref())
     };
     *lock(&core.room_code) = Some(code.clone());
 

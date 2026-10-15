@@ -61,6 +61,8 @@ pub struct NetOptions {
     pub trust_fingerprint: Option<String>,
     /// Forzar el relay.
     pub force_relay: bool,
+    /// Pedir al router que abra el puerto UDP (UPnP, NAT-PMP o PCP) para la conexión directa.
+    pub port_mapping: bool,
     /// Directorio de datos (identidad); `None` = llavero o el del usuario.
     pub data_dir: Option<PathBuf>,
     /// Sin ventana (la identidad va a fichero).
@@ -176,6 +178,7 @@ pub fn remote_config(net: &NetOptions) -> Result<RemoteConfig, String> {
     };
     let mut config = RemoteConfig::new(server, token, trust);
     config.force_relay = net.force_relay;
+    config.port_mapping = net.port_mapping;
     config.bind = net
         .local_port
         .filter(|port| *port != 0)
@@ -1277,6 +1280,7 @@ mod tests {
             dev_token: Some("change-me".to_owned()),
             trust_fingerprint: Some("AB:".repeat(31) + "AB"),
             force_relay: true,
+            port_mapping: true,
             data_dir: None,
             headless: true,
             local_port: None,

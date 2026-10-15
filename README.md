@@ -312,7 +312,10 @@ anfitrión y el invitado, cada uno con su cuenta y la sesión iniciada (`coroom 
    cargo run --release -p coroom -- join ABC234
    ```
 
-   Para probar el relay, `--force-relay` en el invitado (o en los dos). Sin ventana,
+   Al abrir la sala y al entrar, coroom pide al router por PCP, NAT-PMP o UPnP que abra su puerto
+   UDP y anuncia la dirección WAN del router como candidato (también detrás de la NAT de la
+   operadora, entre clientes de la misma); `--no-port-mapping` lo evita y `coroom doctor` dice qué
+   respondió el router. Para probar el relay, `--force-relay` en el invitado (o en los dos). Sin ventana,
    `--headless --frames 600 [--json]` imprime al terminar el desglose por etapa y el resumen del
    enlace. `--data-dir` cambia dónde se guardan la identidad y las credenciales (sin él, el
    llavero del sistema, o `~/.local/share/coroom` sin llavero o con `--headless`); si se prueban

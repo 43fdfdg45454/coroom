@@ -96,7 +96,7 @@ y un respaldo declarado cuando dependa de drivers o de borradores.
 | Señalización y API | **HTTP/3** (`h3`) y **WebTransport** en el mismo puerto UDP; sin WebSocket | HTTP/2 con TLS por TCP con `Alt-Svc`; streams QUIC propios con los mismos mensajes si WebTransport no casa |
 | Protocolo de medios | Propio y mínimo con el esquema de **Media over QUIC** (pistas, grupos, objetos) y cabecera binaria fija; control con `postcard` | Es ya el respaldo: se adoptará `moq-transport` cuando el IETF lo cierre |
 | FEC, NACK y control de tasa | FEC **RaptorQ** (RFC 6330) adaptativa a la pérdida, NACK con caché, cargas de 1200 B; control tipo **SCReAM** (RFC 8298) con controlador de congestión propio en `quinn`, informe cada 50 ms, cola medida con el mínimo del OWD de 500 ms (y vía rápida con un informe para colas ≥ 50 ms), crecimiento acotado a 1,25 × lo que el receptor recibe, espera de 1 s tras cada recorte, umbrales de pérdida de GCC; arranque en el 70 % de lo que mide la **sonda del enlace** (dos trenes de 48 datagramas por invitado al conectar, dispersión medida por el receptor; 8 Mbit/s si no llega) ; FEC descontada del bitrate del codificador; VBV de un fotograma que sigue al bitrate | Sin ECN, la cola se estima por OWD; escalera de resolución/fps bajo el suelo del modo |
-| NAT y relay | Candidatos (IPv6 primero, reflejado, locales) y apertura simultánea QUIC desde un solo socket | Relay QUIC en el servidor, transparente para los medios |
+| NAT y relay | Candidatos (IPv6 primero, reflejado, WAN del router abierta por PCP/NAT-PMP/UPnP, CGNAT, locales) y apertura simultánea QUIC desde un solo socket | Relay QUIC en el servidor, transparente para los medios |
 | Criptografía | **MLS** (RFC 9420, `openmls`) para la sala, **SFrame** (RFC 9605, AES-256-GCM) por fotograma y trama, **HPKE** (RFC 9180) con **X-Wing** (X25519 + ML-KEM-768) para la entrada; identidad Ed25519; firma híbrida Ed25519 + **ML-DSA-65** tras la `feature` `pq-sign` (desactivada por defecto) | ChaCha20-Poly1305 si la CPU no acelera AES; X-Wing **sin** respaldo a X25519 (la oferta manipulada se rechaza) |
 | Captura Linux | **PipeWire** por el portal `ScreenCast` (`ashpd`), DMA-BUF con modificadores explícitos, *restore token*; sin XShm | Copia a CPU si la importación sin copias falla |
 | Captura Windows | **Windows.Graphics.Capture** con las mejoras de Windows 11 24H2 (regiones sucias, sin borde); sin DXGI Desktop Duplication | WGC básico en versiones anteriores |
@@ -128,8 +128,13 @@ Invitado ── HTTP/3 + WebTransport ──▶ Servidor (UDP) ◀── HTTP/3 
   públicas y mensajes MLS/HPKE cifrados para sus destinatarios; el servidor solo enruta y nunca
   interpreta MLS ni medios.
 - **Conexión directa**: la señalización sale del mismo `quinn::Endpoint` que los medios, así el
-  servidor devuelve la dirección reflejada (`Observed`) del socket real. Cada par intercambia
-  candidatos y lanza en paralelo conexiones a todos (IPv6 primero, luego reflejado, luego locales)
+  servidor devuelve la dirección reflejada (`Observed`) del socket real. Al arrancar, cada par pide
+  además a su router (la puerta de enlace de la tabla de rutas) que abra el puerto del socket, por
+  PCP (RFC 6887), NAT-PMP (RFC 6886) y UPnP IGD a la vez, y anuncia la dirección WAN del router
+  con el puerto abierto: detrás de la NAT de una operadora la reflejada no sirve, pero la WAN
+  (100.64.0.0/10) llega desde los demás clientes de la misma operadora. La asignación se renueva a
+  la mitad de su vida y se borra al cerrar. Cada par intercambia candidatos y lanza en paralelo
+  conexiones a todos (IPv6 primero, luego reflejado, luego la WAN de operadora, luego locales)
   mientras acepta entrantes, con un tiempo de apertura de 3 s; gana la primera conexión con la
   identidad verificada.
 - **Relay de respaldo**: si ninguna llega, el par se conecta al relay con un `RelayToken`. El relay

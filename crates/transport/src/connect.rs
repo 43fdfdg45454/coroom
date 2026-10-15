@@ -62,7 +62,10 @@ pub enum CandidateClass {
     Ipv6Global,
     /// IPv4 pública (normalmente la reflejada que vio el servidor).
     Ipv4Public,
-    /// Privada, local o CGNAT (solo sirve en la misma red).
+    /// IPv4 de la NAT de una operadora (100.64.0.0/10): la WAN de un router detrás de CGNAT con
+    /// su puerto abierto, que llega desde los demás clientes de la misma operadora.
+    CarrierNat,
+    /// Privada o local (solo sirve en la misma red).
     Private,
 }
 
@@ -71,6 +74,7 @@ impl fmt::Display for CandidateClass {
         f.write_str(match self {
             CandidateClass::Ipv6Global => "IPv6 global",
             CandidateClass::Ipv4Public => "IPv4 pública",
+            CandidateClass::CarrierNat => "IPv4 de la operadora (CGNAT)",
             CandidateClass::Private => "red local",
         })
     }
@@ -140,13 +144,25 @@ impl DirectAttempt {
             .iter()
             .filter(|c| matches!(c.outcome, CandidateOutcome::Failed(_)))
             .count();
-        let public = self
+        let public = self.candidates.iter().any(|c| {
+            matches!(
+                c.class,
+                CandidateClass::Ipv6Global | CandidateClass::Ipv4Public
+            )
+        });
+        let carrier = self
             .candidates
             .iter()
-            .any(|c| c.class != CandidateClass::Private);
-        match (failed, public) {
-            (0, false) => "solo había direcciones de red local y ninguna respondió".to_owned(),
-            (0, true) => {
+            .any(|c| c.class == CandidateClass::CarrierNat);
+        match (failed, public, carrier) {
+            (0, false, false) => {
+                "solo había direcciones de red local y ninguna respondió".to_owned()
+            }
+            (0, _, true) => "ninguna dirección respondió, tampoco la del router abierta detrás de \
+                             la NAT de la operadora (CGNAT): la operadora no pasa tráfico entre \
+                             sus clientes"
+                .to_owned(),
+            (0, true, false) => {
                 "ninguna dirección respondió: la NAT de uno de los dos no abre (CGNAT)".to_owned()
             }
             _ => format!("{failed} de {} direcciones fallaron", self.candidates.len()),
@@ -174,14 +190,15 @@ fn is_link_local(ip: IpAddr) -> bool {
     }
 }
 
+/// 100.64.0.0/10: el espacio compartido de las NAT de operadora (RFC 6598).
+fn is_carrier_nat(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V4(v4) if v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
+}
+
 fn is_private(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                // 100.64.0.0/10 (CGNAT).
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
+            v4.is_private() || v4.is_loopback() || v4.is_link_local() || is_carrier_nat(ip)
         }
         IpAddr::V6(v6) => {
             v6.is_loopback() || is_link_local(ip) || (v6.segments()[0] & 0xfe00) == 0xfc00
@@ -215,12 +232,14 @@ pub fn local_candidates(endpoint: &Endpoint) -> Result<Vec<SocketAddr>, Transpor
 pub fn candidate_class(addr: SocketAddr) -> CandidateClass {
     match addr.ip() {
         IpAddr::V6(_) if !is_private(addr.ip()) => CandidateClass::Ipv6Global,
+        ip @ IpAddr::V4(_) if is_carrier_nat(ip) => CandidateClass::CarrierNat,
         IpAddr::V4(_) if !is_private(addr.ip()) => CandidateClass::Ipv4Public,
         _ => CandidateClass::Private,
     }
 }
 
-/// Ordena candidatos: IPv6 global, IPv4 pública (reflejada), y después las privadas y locales.
+/// Ordena candidatos: IPv6 global, IPv4 pública (reflejada), la de la operadora (CGNAT) y después
+/// las privadas y locales.
 pub fn order_candidates(candidates: &[SocketAddr]) -> Vec<SocketAddr> {
     let class = |addr: &SocketAddr| candidate_class(*addr) as u8;
     let mut ordered: Vec<SocketAddr> = candidates
@@ -482,6 +501,7 @@ mod tests {
             "[2001:db8::1]:5000",
             "10.0.0.2:5000",
             "203.0.113.7:6000",
+            "100.64.3.4:4000",
             "[::ffff:198.51.100.2]:7000",
         ]
         .iter()
@@ -497,6 +517,7 @@ mod tests {
                 "[2001:db8::1]:5000",
                 "203.0.113.7:6000",
                 "198.51.100.2:7000",
+                "100.64.3.4:4000",
                 "192.168.1.10:5000",
                 "[fd00::1]:5000",
                 "10.0.0.2:5000",
@@ -537,6 +558,19 @@ mod tests {
             local.relay_reason().contains("red local"),
             "{}",
             local.relay_reason()
+        );
+        let carrier = attempt(vec![
+            report(addr("203.0.113.7:6000"), CandidateOutcome::NoResponse),
+            report(addr("100.64.3.4:4000"), CandidateOutcome::NoResponse),
+        ]);
+        assert!(
+            carrier.relay_reason().contains("operadora"),
+            "{}",
+            carrier.relay_reason()
+        );
+        assert_eq!(
+            carrier.candidates[1].to_string(),
+            "100.64.3.4:4000 (IPv4 de la operadora (CGNAT)): sin respuesta"
         );
         let failed = attempt(vec![
             report(

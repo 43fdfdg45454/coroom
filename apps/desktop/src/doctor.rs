@@ -9,6 +9,7 @@ use coroom_session::codec::gpu::{GpuInput, zero_copy_disabled};
 use coroom_session::codec::select::gpu_input_for;
 use coroom_session::codec::{Backend, Capabilities};
 use coroom_transport::crypto::{FileStore, KeyringStore};
+use coroom_transport::nat::{Mapper, default_gateway};
 use coroom_transport::proto::PROTOCOL_VERSION;
 
 /// Las líneas del diagnóstico (tarda unos segundos: sondea los códecs de verdad).
@@ -51,6 +52,10 @@ pub fn report() -> Result<Vec<String>, String> {
     match probe_adapter() {
         Ok(adapter) => out.push(format!("Adaptador gráfico: {adapter}")),
         Err(err) => out.push(format!("Adaptador gráfico: ninguno ({err})")),
+    }
+    out.push("Router (abrir el puerto UDP para la conexión directa):".to_owned());
+    for line in router_report() {
+        out.push(format!("  {line}"));
     }
     out.push("Entrada del anfitrión:".to_owned());
     for line in coroom_session::input::inject::status() {
@@ -132,6 +137,32 @@ pub fn report() -> Result<Vec<String>, String> {
 
 /// Qué parte de la ruta sin copias hay en este equipo: captura, codificadores de GPU y
 /// presentación.
+/// Pide al router que abra un puerto UDP de prueba y lo cierra: dice si hay UPnP, NAT-PMP o PCP y
+/// qué dirección externa da (la WAN del router; si empieza por 100.64-100.127, hay CGNAT).
+fn router_report() -> Vec<String> {
+    let gateway = match default_gateway() {
+        Ok(ip) => format!("puerta de enlace: {ip}"),
+        Err(err) => return vec![format!("puerta de enlace: no se encontró ({err})")],
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => return vec![gateway, format!("prueba no hecha: {err}")],
+    };
+    let port = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|socket| socket.local_addr())
+        .map_or(0, |addr| addr.port());
+    let report = runtime.block_on(async {
+        let mapping = Mapper::new().map(port).await;
+        mapping.report().clone()
+    });
+    // El borrado de la asignación de prueba va en un hilo aparte: se le da un momento.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    vec![gateway, report.to_string()]
+}
+
 fn zero_copy_report(caps: &Capabilities) -> Vec<String> {
     if zero_copy_disabled() {
         return vec!["desactivada con COROOM_ZERO_COPY=0: todo pasa por memoria de CPU".to_owned()];

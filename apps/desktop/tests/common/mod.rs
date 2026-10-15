@@ -139,6 +139,8 @@ impl TestServer {
     fn remote_config(&self, token: &str) -> RemoteConfig {
         let mut config = RemoteConfig::new(&self.url, token, self.trust.clone());
         config.bind = Some("127.0.0.1:0".parse().expect("dirección"));
+        // Nada de pedirle al router del entorno de pruebas que abra puertos.
+        config.port_mapping = false;
         config
     }
 

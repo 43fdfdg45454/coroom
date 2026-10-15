@@ -137,7 +137,10 @@ Las letras de `Ctrl+Alt` se cambian en Ajustes → Entrada (no pueden coincidir 
   aplicación lo avisa.
 - **Audio**: dispositivos, voz por actividad o pulsar para hablar.
 - **Entrada**: atajos y mandos.
-- **Red**: puerto local y **Usar siempre el relay** (para redes que bloquean el UDP entre equipos).
+- **Red**: **Abrir el puerto en el router** (activado: coroom pide al router por UPnP, NAT-PMP o
+  PCP que deje entrar la conexión directa y anuncia la dirección WAN del router; sirve también
+  detrás de la NAT de la operadora, entre clientes de la misma), puerto local y **Usar siempre el
+  relay** (para redes que bloquean el UDP entre equipos).
 - **Dispositivos**: tus equipos y los números de seguridad recordados.
 - **Apariencia**: tema (el del sistema, claro u oscuro), acento y fuente.
 - **Acerca de**: versión, protocolo y aviso de versión nueva (una consulta al día a GitHub, sin
@@ -149,7 +152,7 @@ Las letras de `Ctrl+Alt` se cambian en Ajustes → Entrada (no pueden coincidir 
 | Qué pasa | Qué hacer |
 |---|---|
 | «No se pudo conectar con el servidor» | Comprueba la dirección y tu red. El servidor necesita su puerto **UDP** abierto (HTTP/3); si solo funciona por TCP, avisa al administrador (`/health` dice si el UDP se alcanza desde fuera). |
-| La conexión siempre va «por el relay» | Alguna de las dos redes no deja la conexión directa (NAT simétrica, cortafuegos). Funciona igual, con algo más de latencia y gastando la cuota del relay del anfitrión. |
+| La conexión siempre va «por el relay» | Alguna de las dos redes no deja la conexión directa (NAT simétrica, NAT de la operadora, cortafuegos). Activa UPnP (o NAT-PMP/PCP) en el router de los dos y deja marcado **Abrir el puerto en el router** en Ajustes → Red; `coroom doctor` dice si el router respondió. Funciona igual por el relay, con algo más de latencia y gastando la cuota del relay del anfitrión. |
 | «El anfitrión agotó su cuota del relay» | Este mes solo funciona la conexión directa; el administrador puede subir la cuota. |
 | El vídeo va a saltos o con poca calidad | Abre las estadísticas (`Ctrl+Alt+O`): pérdida, RTT y bitrate. coroom baja el bitrate solo si hay cola en la red; con wifi, prueba con cable. Por encima de 50 ms de RTT la experiencia ya no es buena para juegos rápidos. |
 | No se oye el juego | Mira el audio elegido al abrir la sala y, en Linux, el nombre de la aplicación en Ajustes → Diagnóstico. El invitado puede haber silenciado el juego (`Ctrl+Alt+V`). |
