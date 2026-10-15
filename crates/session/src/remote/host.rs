@@ -23,6 +23,7 @@ use coroom_transport::crypto::sframe::MediaKey;
 use coroom_transport::crypto::{RoomGroup, SafetyNumber, sha256_fingerprint};
 use coroom_transport::media::{
     DEFAULT_SOURCE, MediaSender, MediaSenderConfig, PROBE_SPACING, PROBE_TRAINS, audio_datagram,
+    probe_pace_kbps,
 };
 use coroom_transport::proto::PROTOCOL_VERSION;
 use coroom_transport::proto::control::{
@@ -1486,11 +1487,14 @@ fn attach_direct(
     ));
 }
 
-/// Sonda del enlace hacia un emisor recién conectado: [`PROBE_TRAINS`] trenes al máximo
-/// configurado (acotado en el emisor), antes de que el invitado pida el vídeo. Con lo que informe
-/// arranca su control de tasa ([`MediaSender::on_probe_result`]).
+/// Sonda del enlace hacia un emisor recién conectado: [`PROBE_TRAINS`] trenes a
+/// [`probe_pace_kbps`] del máximo configurado (varias veces el máximo, hasta el techo del emisor:
+/// la dispersión solo mide cuellos por debajo del ritmo de salida, y el pacing necesita saber
+/// cuánto sobra por encima del máximo), antes de que el invitado pida el vídeo. Con lo que informe
+/// arranca su control de tasa ([`MediaSender::on_probe_result`], acotado al máximo) y se fija el
+/// ritmo del pacing ([`MediaSender::pacing_plan`], que no se acota al máximo).
 async fn probe_link(ctx: Arc<HostCtx>, sender: Arc<MediaSender>) {
-    let pace = ctx.max_kbps.load(Ordering::Acquire).max(1);
+    let pace = probe_pace_kbps(ctx.max_kbps.load(Ordering::Acquire));
     for train in 0..PROBE_TRAINS {
         if train > 0 {
             tokio::time::sleep(PROBE_SPACING).await;

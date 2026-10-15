@@ -14,6 +14,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use coroom_server::{Config, Server};
+use coroom_session::capture::synthetic::SyntheticCapturer;
+use coroom_session::capture::{CaptureError, CaptureTarget, CapturedFrame, Capturer, FramePixels};
 use coroom_session::remote::RemoteConfig;
 use coroom_transport::ServerTrust;
 use coroom_transport::api::ApiClient;
@@ -321,4 +323,68 @@ pub fn stalled_between(from: Instant, to: Instant) -> Duration {
         .iter()
         .map(|&(start, end)| end.min(to).saturating_duration_since(start.max(from)))
         .sum()
+}
+
+/// Fuente sintética con ruido en cada fotograma: el patrón liso comprime tanto que no llega a
+/// ningún bitrate alto. El ruido se calcula una vez y cada fotograma lo usa desplazado.
+pub struct NoisyCapturer {
+    inner: SyntheticCapturer,
+    noise: Vec<u64>,
+}
+
+impl NoisyCapturer {
+    pub fn new(inner: SyntheticCapturer) -> Self {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let noise = (0..(1 << 16))
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state & 0x0f0f_0f0f_0f0f_0f0f
+            })
+            .collect();
+        Self { inner, noise }
+    }
+
+    fn add_noise(&self, frame: &mut CapturedFrame) {
+        if let FramePixels::Bgra { data, .. } = &mut frame.pixels {
+            let offset = (frame.frame_id as usize).wrapping_mul(7919);
+            let (words, _) = data.as_chunks_mut::<8>();
+            for (i, word) in words.iter_mut().enumerate() {
+                let noise = self.noise[(i + offset) % self.noise.len()];
+                *word = (u64::from_ne_bytes(*word) ^ noise).to_ne_bytes();
+            }
+        }
+    }
+}
+
+impl Capturer for NoisyCapturer {
+    fn targets(&self) -> Result<Vec<CaptureTarget>, CaptureError> {
+        self.inner.targets()
+    }
+
+    fn start(&mut self, target: &CaptureTarget) -> Result<(), CaptureError> {
+        self.inner.start(target)
+    }
+
+    fn next_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+        let mut frame = self.inner.next_frame()?;
+        self.add_noise(&mut frame);
+        Ok(frame)
+    }
+
+    fn next_frame_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<CapturedFrame>, CaptureError> {
+        let mut frame = self.inner.next_frame_timeout(timeout)?;
+        if let Some(frame) = frame.as_mut() {
+            self.add_noise(frame);
+        }
+        Ok(frame)
+    }
+
+    fn stop(&mut self) {
+        self.inner.stop();
+    }
 }

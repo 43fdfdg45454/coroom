@@ -7,7 +7,11 @@
 //! actualizada con cada `Feedback`; 10 % hasta el primero, cuando la pérdida aún no se conoce).
 //! Todo sale con **pacing** ([`pacing_duration`]): el fotograma se reparte en lo que tardaría al
 //! ritmo medido del enlace ([`MediaSender::pacing_plan`]: 1,25 veces el bitrate objetivo o, si es
-//! más, el 70 % de lo que midió la sonda del enlace o la estimación del control de tasa), como
+//! más, el 70 % de lo que midió la sonda del enlace o la estimación del control de tasa, con el
+//! techo [`PROBE_MAX_PACE_KBPS`] y **sin** acotar al bitrate máximo del usuario: ese máximo es un
+//! promedio, no la capacidad del enlace, y acotar el ritmo a él estiraba cada fotograma de un
+//! enlace con holgura hasta el recorte del `share`, 5 ms a 60 fps y 10 ms a 30 fps con 10 Mbit/s,
+//! dos tercios de la latencia de captura a presentación medida en LAN), como
 //! mucho [`PacingConfig::share`] del intervalo (0,3). Un intra ocupa como mucho
 //! [`PacingConfig::keyframe_intervals`] (2) y, solo si el enlace **midió** al menos
 //! [`KEYFRAME_HEADROOM`] veces lo que ese ritmo necesita, [`PacingConfig::keyframe_intervals_measured`]
@@ -90,7 +94,8 @@ pub const PING_INTERVAL: Duration = Duration::from_secs(1);
 /// ~77 KB, bastantes para que la dispersión del tren la ponga el cuello del camino y no el jitter
 /// de un par de paquetes (un tren entero dura al menos ~6 ms a [`PROBE_MAX_PACE_KBPS`], varias
 /// veces la resolución de los temporizadores), y pocos para que en un enlace de 10 Mbit/s no hagan
-/// más de ~60 ms de cola (antes de que haya vídeo).
+/// más de ~60 ms de cola (antes de que haya vídeo): el tren tarda 62 ms en vaciarse por ese
+/// enlace y sale en 6 ms a [`PROBE_MAX_PACE_KBPS`], así que deja ~55 ms de cola.
 pub const PROBE_PACKETS: u16 = 64;
 
 /// Trenes que se envían a cada receptor al conectar, separados [`PROBE_SPACING`]; vale el mejor
@@ -100,10 +105,44 @@ pub const PROBE_TRAINS: u32 = 2;
 /// Separación entre dos trenes de sonda.
 pub const PROBE_SPACING: Duration = Duration::from_millis(100);
 
-/// Ritmo máximo al que sale un tren: con el máximo del usuario por encima, el tren sale a este
-/// ritmo y la medida es «al menos esto» (la dispersión solo mide cuellos por debajo del ritmo de
-/// envío).
+/// Ritmo máximo al que sale un tren y techo del ritmo del pacing ([`pacing_pace`]): la medida de
+/// un tren es «al menos esto» (la dispersión solo mide cuellos por debajo del ritmo de envío), así
+/// que el pacing nunca puede apoyarse en más de lo que un tren pudo demostrar; además acota las
+/// ráfagas que recibe el otro extremo (si el sistema no concede los 8 MB de búfer de socket que se
+/// le piden y deja los 64 KB por defecto de Windows, a 100 Mbit/s se llenan si el lector se para
+/// 5 ms).
 pub const PROBE_MAX_PACE_KBPS: u32 = 100_000;
+
+/// Veces el bitrate máximo del usuario a las que salen los trenes de la sonda
+/// ([`probe_pace_kbps`]). El pacing toma [`PROBE_START_SHARE`] (0,7) de lo medido y la dispersión
+/// solo mide hasta el ritmo de envío, así que con los trenes al máximo del usuario (lo que se hacía
+/// antes) un fotograma del tamaño medio a ese máximo (máximo / fps) se repartía en 1 / 0,7 = 1,4
+/// intervalos y el [`FRAME_PACING_SHARE`] (0,3) lo recortaba siempre: 5 ms a 60 fps y 10 ms a
+/// 30 fps, fuese el enlace de 10 Mbit/s o de 1 Gbit/s. Con los trenes a `k` veces el máximo, ese
+/// fotograma se reparte en `1 / (0,7 k)` del intervalo; para que quede en la mitad del `share`
+/// (0,15 del intervalo: 2,5 ms a 60 fps, 5 ms a 30 fps) hace falta `k ≥ 1 / (0,7 × 0,15) = 9,5`
+/// (lo comprueba un test). Con 4× quedaría en 0,36 del intervalo y el `share` seguiría recortando
+/// igual que antes. No se envía siempre a [`PROBE_MAX_PACE_KBPS`] porque un cuello que **descarta**
+/// en vez de encolar (un limitador de ISP con poco cubo, 4G) deja pasar parte del tren con la
+/// dispersión del ritmo de salida y mide de más; acotar el tren a `k` veces el máximo acota ese
+/// error, y con él las ráfagas que luego haría el pacing, a `0,7 k` veces el máximo. Con el máximo
+/// de referencia de 1080p60 (10 Mbit/s) `k = 10` es justo el techo; por debajo (720p, 4-6 Mbit/s)
+/// los trenes y las ráfagas quedan proporcionales. La cola que deja el tren en un enlace justo al
+/// máximo apenas depende de `k` (el tren sale en `1 / k` de lo que tarda en vaciarse: 55 ms a
+/// 10 Mbit/s con `k = 10`, 46 ms con `k = 4`), dentro de lo que admite [`PROBE_PACKETS`].
+pub const PROBE_PACE_GAIN: u32 = 10;
+
+/// Ritmo, en kbit/s, al que salen los trenes de la sonda para un bitrate máximo del usuario
+/// `max_kbps`: [`PROBE_PACE_GAIN`] veces ese máximo, como mucho [`PROBE_MAX_PACE_KBPS`] (y nunca
+/// menos que el propio máximo, que `PROBE_PACE_GAIN ≥ 1` garantiza). Así la dispersión mide los
+/// cuellos por encima del máximo del usuario, que es lo que el pacing necesita saber
+/// ([`pacing_pace`]).
+pub fn probe_pace_kbps(max_kbps: u32) -> u32 {
+    max_kbps
+        .max(1)
+        .saturating_mul(PROBE_PACE_GAIN)
+        .min(PROBE_MAX_PACE_KBPS)
+}
 
 /// Un tren que mide más de este múltiplo del ritmo al que salió no midió el camino: sus
 /// datagramas esperaron en una cola del receptor y salieron de golpe (o el reloj del receptor no
@@ -255,6 +294,29 @@ impl PacingConfig {
             ..defaults
         }
     }
+}
+
+/// Ritmo al que se reparte un fotograma, en kbit/s, y si el enlace midió holgura para los intras
+/// (lo que calcula [`MediaSender::pacing_plan`] con los datos del receptor que limita):
+/// `gain` veces el objetivo del control de tasa (`target_kbps`) o, si el enlace demostró más,
+/// [`PROBE_START_SHARE`] de lo que midió la sonda (`probe_kbps`) o la estimación del control de
+/// tasa (`estimate_kbps`), lo mayor de los dos; techo [`PROBE_MAX_PACE_KBPS`]. El bitrate máximo
+/// del usuario **no** acota el ritmo: es un promedio para el codificador, y el control de tasa ya
+/// lo respeta en `target_kbps`; la capacidad del enlace la dicen la sonda y la estimación. Sin
+/// sonda ni estimación (`None` y 0), el ritmo es `gain × objetivo`, como siempre fue. La holgura
+/// es que lo medido llegue a [`KEYFRAME_HEADROOM`] veces `gain × objetivo`.
+pub fn pacing_pace(
+    target_kbps: u32,
+    probe_kbps: Option<u32>,
+    estimate_kbps: f64,
+    gain: f64,
+) -> (u32, bool) {
+    let target = f64::from(target_kbps) * gain;
+    let probe = probe_kbps.map_or(0.0, |kbps| f64::from(kbps) * PROBE_START_SHARE);
+    let measured = probe.max(estimate_kbps);
+    let pace = target.max(measured).min(f64::from(PROBE_MAX_PACE_KBPS));
+    let headroom = measured >= target * KEYFRAME_HEADROOM;
+    (pace.round().max(1.0) as u32, headroom)
 }
 
 /// Tiempo en que se reparten los `bytes` de un fotograma: lo que tardan a `pace_kbps` (el ritmo
@@ -799,26 +861,20 @@ impl MediaSender {
     }
 
     /// Ritmo al que se reparte un fotograma, en kbit/s, y si el enlace midió holgura para los
-    /// intras: [`PacingConfig::gain`] veces el objetivo o, si el enlace demostró más,
-    /// [`PROBE_START_SHARE`] de lo que midió la sonda del receptor que limita o la estimación de su
-    /// control de tasa (repartir al objetivo cuando el enlace da varias veces más solo retrasa el
-    /// fotograma). La holgura es que lo medido llegue a [`KEYFRAME_HEADROOM`] veces
-    /// `gain × objetivo`; sin ella, los intras se reparten en [`PacingConfig::keyframe_intervals`].
+    /// intras ([`pacing_pace`] con el objetivo actual y lo que midió la sonda del receptor que
+    /// limita o la estimación de su control de tasa: repartir al objetivo cuando el enlace da
+    /// varias veces más solo retrasa el fotograma). Sin ella, los intras se reparten en
+    /// [`PacingConfig::keyframe_intervals`]. El objetivo ya lleva el máximo de
+    /// [`MediaSender::set_max_kbps`]: bajarlo en marcha baja el ritmo mínimo del pacing al momento.
     pub fn pacing_plan(&self) -> (u32, bool) {
-        let target = f64::from(self.target_kbps()) * self.config.pacing.gain;
+        let target = self.target_kbps();
         let measured = self.state.lock().ok().and_then(|state| {
             let limiting = state.limiting()?;
-            let probe = limiting
-                .probe
-                .and_then(|probe| probe.kbps())
-                .map_or(0.0, |kbps| f64::from(kbps) * PROBE_START_SHARE);
-            Some(probe.max(limiting.rate.estimate_kbps()))
+            let probe = limiting.probe.and_then(|probe| probe.kbps());
+            Some((probe, limiting.rate.estimate_kbps()))
         });
-        let measured = measured.unwrap_or(0.0);
-        let max = f64::from(self.rate_config().max_kbps).max(target);
-        let pace = target.max(measured).min(max);
-        let headroom = measured >= target * KEYFRAME_HEADROOM;
-        (pace.round().max(1.0) as u32, headroom)
+        let (probe, estimate) = measured.unwrap_or((None, 0.0));
+        pacing_pace(target, probe, estimate, self.config.pacing.gain)
     }
 
     /// El ritmo de [`MediaSender::pacing_plan`].
@@ -2716,6 +2772,117 @@ mod tests {
         // El receptor tolera hasta KEYFRAME_PACING_INTERVALS: el emisor nunca configura más.
         assert!(pacing.keyframe_intervals <= f64::from(KEYFRAME_PACING_INTERVALS));
         assert!(pacing.keyframe_intervals_measured <= pacing.keyframe_intervals);
+    }
+
+    /// El ritmo del pacing sigue a lo que midió la sonda aunque supere el bitrate máximo del
+    /// usuario (10 Mbit/s en todos los casos): con la sonda a 100 Mbit/s, 70 Mbit/s; sin sonda ni
+    /// estimación, `gain × objetivo` como siempre; con una medida por encima del techo, el techo.
+    /// Con esos ritmos, un fotograma del tamaño medio al máximo deja de recortarse al `share`.
+    #[test]
+    fn the_pacing_pace_follows_the_probe_above_the_bitrate_cap() {
+        let gain = PACING_GAIN;
+        // Lo medido en la PC de referencia: 1080p60 y 720p30 con 10 Mbit/s de máximo, sonda y
+        // objetivo acotados al máximo → 12,5 Mbit/s, y cada fotograma recortado al `share`.
+        assert_eq!(pacing_pace(10_000, None, 0.0, gain), (12_500, false));
+        assert_eq!(pacing_pace(10_000, None, 10_000.0, gain), (12_500, false));
+        assert_eq!(
+            pacing_pace(10_000, Some(10_000), 10_000.0, gain),
+            (12_500, false)
+        );
+        // Con la sonda a 100 Mbit/s (bucle local, LAN), el 70 %: 70 Mbit/s, y holgura para los
+        // intras (70 ≥ 2 × 12,5).
+        assert_eq!(
+            pacing_pace(10_000, Some(100_000), 0.0, gain),
+            (70_000, true)
+        );
+        // Una medida por encima del techo no pasa de él (la sonda nunca sale más rápido, así que
+        // solo puede venir de la estimación o de un tren que midió de más).
+        assert_eq!(
+            pacing_pace(10_000, Some(200_000), 0.0, gain).0,
+            PROBE_MAX_PACE_KBPS
+        );
+        assert_eq!(
+            pacing_pace(10_000, None, 150_000.0, gain).0,
+            PROBE_MAX_PACE_KBPS
+        );
+        // La estimación del control de tasa cuenta igual que la sonda.
+        assert_eq!(pacing_pace(10_000, None, 30_000.0, gain), (30_000, true));
+        assert_eq!(pacing_pace(10_000, None, 20_000.0, gain), (20_000, false));
+        // Máximo cambiado en caliente: el objetivo baja a 4 Mbit/s. Sin medida, el ritmo lo
+        // sigue (5 Mbit/s); con la sonda, manda la sonda (el enlace no cambió).
+        assert_eq!(pacing_pace(4_000, None, 0.0, gain), (5_000, false));
+        assert_eq!(pacing_pace(4_000, Some(100_000), 0.0, gain), (70_000, true));
+
+        let pacing = PacingConfig::default();
+        // 1080p60 a 10 Mbit/s: ~21 KB por fotograma. A 12,5 Mbit/s tardaría 13 ms y se recorta
+        // al 30 % del intervalo (5 ms, lo medido); a 70 Mbit/s, 2,4 ms, por debajo del recorte.
+        let interval_60 = INTERVAL;
+        assert_eq!(
+            pacing_duration(21_000, 12_500, interval_60, false, false, &pacing),
+            interval_60.mul_f64(FRAME_PACING_SHARE)
+        );
+        let spread = pacing_duration(21_000, 70_000, interval_60, false, false, &pacing);
+        assert!((spread.as_micros() as i64 - 2_400).abs() < 20, "{spread:?}");
+        assert!(spread < interval_60.mul_f64(FRAME_PACING_SHARE));
+        // 720p30 a 10 Mbit/s: ~42 KB por fotograma en un intervalo de 33 ms. A 12,5 Mbit/s,
+        // 27 ms recortados al 30 % (10 ms, lo medido con el paquete 1.6.15); a 70 Mbit/s, 4,8 ms.
+        let interval_30 = Duration::from_micros(33_333);
+        let clipped = pacing_duration(42_000, 12_500, interval_30, false, false, &pacing);
+        assert_eq!(clipped, interval_30.mul_f64(FRAME_PACING_SHARE));
+        assert!(
+            (clipped.as_micros() as i64 - 10_000).abs() < 20,
+            "{clipped:?}"
+        );
+        let spread = pacing_duration(42_000, 70_000, interval_30, false, false, &pacing);
+        assert!((spread.as_micros() as i64 - 4_800).abs() < 20, "{spread:?}");
+        // Un intra con holgura: si cabe en un intervalo al ritmo medido sale a ese ritmo (nunca
+        // por encima del techo); si no cabe, en un intervalo, como antes.
+        let spread = pacing_duration(120_000, 70_000, interval_60, true, true, &pacing);
+        assert!(
+            (spread.as_micros() as i64 - 13_714).abs() < 20,
+            "{spread:?}"
+        );
+        assert_eq!(
+            pacing_duration(
+                300_000,
+                PROBE_MAX_PACE_KBPS,
+                interval_60,
+                true,
+                true,
+                &pacing
+            ),
+            interval_60
+        );
+    }
+
+    /// Los trenes de la sonda salen a [`PROBE_PACE_GAIN`] veces el máximo del usuario, hasta el
+    /// techo, y el factor es el que hace falta para que un fotograma al máximo quede en la mitad
+    /// del `share`; la comprobación del resultado contra el ritmo de salida sigue acotando.
+    #[test]
+    fn probe_trains_leave_at_a_multiple_of_the_cap_up_to_the_ceiling() {
+        assert_eq!(probe_pace_kbps(10_000), 100_000);
+        assert_eq!(probe_pace_kbps(5_000), 50_000);
+        assert_eq!(probe_pace_kbps(50_000), PROBE_MAX_PACE_KBPS);
+        assert_eq!(probe_pace_kbps(200_000), PROBE_MAX_PACE_KBPS);
+        assert_eq!(probe_pace_kbps(0), PROBE_PACE_GAIN);
+        assert_eq!(probe_pace_kbps(u32::MAX), PROBE_MAX_PACE_KBPS);
+        // El porqué del factor: 1 / (PROBE_START_SHARE × FRAME_PACING_SHARE / 2) = 9,5.
+        let needed = 1.0 / (PROBE_START_SHARE * FRAME_PACING_SHARE / 2.0);
+        assert!(f64::from(PROBE_PACE_GAIN) >= needed, "{needed}");
+        assert!(f64::from(PROBE_PACE_GAIN) < needed + 1.0, "{needed}");
+        // El tren a 100 Mbit/s: medir 110 Mbit/s (jitter de los temporizadores) vale 100; medir
+        // más del doble no vale.
+        let outcome = |kbps: u32| ProbeOutcome {
+            train: 1,
+            sent: PROBE_PACKETS,
+            received: PROBE_PACKETS,
+            bytes: 76_800,
+            span: Duration::from_secs_f64(75_600.0 * 8.0 / 1000.0 / f64::from(kbps)),
+        };
+        let pace = Some(probe_pace_kbps(10_000));
+        assert_eq!(outcome(110_000).checked_kbps(pace), Some(100_000));
+        assert_eq!(outcome(60_000).checked_kbps(pace), Some(60_000));
+        assert_eq!(outcome(250_000).checked_kbps(pace), None);
     }
 
     /// El piso de FEC añade un símbolo solo a los grupos con objetos de sobra para que no pase de

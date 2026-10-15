@@ -284,3 +284,70 @@ async fn eighty_megabits_flow_at_lan_and_internet_rtt() {
         );
     }
 }
+
+/// El ritmo del pacing sigue a lo que midió la sonda aunque supere el bitrate máximo del usuario:
+/// con un tren a `probe_pace_kbps` (100 Mbit/s para 10 Mbit/s de máximo) que midió el bucle local,
+/// el control de tasa arranca acotado al máximo (10 Mbit/s) pero el pacing va al 70 % de lo medido
+/// (70 Mbit/s), con holgura para los intras. Sin sonda, `gain × objetivo`; y al bajar el máximo en
+/// marcha el objetivo lo sigue mientras la sonda sigue mandando en el ritmo.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_pacing_follows_the_probe_above_the_bitrate_cap() {
+    let _serial = SERIAL.lock().await;
+    use coroom_transport::media::{
+        DEFAULT_SOURCE, MediaSender, MediaSenderConfig, PROBE_MAX_PACE_KBPS, PROBE_PACKETS,
+        ProbeOutcome, probe_pace_kbps,
+    };
+    use coroom_transport::rate::RateConfig;
+
+    let (_host, host_conn, _guest, _guest_conn) =
+        connected_pair(EndpointOptions::default(), None).await;
+    let sender = MediaSender::new(
+        host_conn,
+        MediaSenderConfig {
+            frame_interval: Duration::from_micros(16_667),
+            rate: RateConfig {
+                min_kbps: 1_000,
+                max_kbps: 10_000,
+                start_kbps: 8_000,
+            },
+            pacing: Default::default(),
+        },
+    );
+    // Sin sonda ni estimación: 1,25 × 8 Mbit/s de arranque.
+    assert_eq!(sender.pacing_plan(), (10_000, false));
+
+    let pace = probe_pace_kbps(10_000);
+    assert_eq!(pace, PROBE_MAX_PACE_KBPS);
+    let train = sender.send_probe(pace).await.expect("tren de sonda");
+    // Lo que informaría el receptor de un tren entero que llegó a 100 Mbit/s: 64 × 1200 B,
+    // 63 de ellos en 6,048 ms.
+    let outcome = ProbeOutcome {
+        train,
+        sent: PROBE_PACKETS,
+        received: PROBE_PACKETS,
+        bytes: 76_800,
+        span: Duration::from_micros(6_048),
+    };
+    assert_eq!(outcome.kbps(), Some(100_000));
+    assert_eq!(
+        sender.on_probe_result(DEFAULT_SOURCE, outcome),
+        Some(100_000)
+    );
+    assert_eq!(
+        sender.target_kbps(),
+        10_000,
+        "el objetivo respeta el máximo"
+    );
+    assert_eq!(sender.pacing_plan(), (70_000, true), "el pacing, lo medido");
+
+    sender.set_max_kbps(4_000);
+    assert_eq!(sender.target_kbps(), 4_000);
+    assert_eq!(sender.pacing_plan(), (70_000, true));
+    sender.set_max_kbps(20_000);
+    assert_eq!(
+        sender.target_kbps(),
+        4_000,
+        "subir el máximo no sube el objetivo de golpe"
+    );
+    assert_eq!(sender.pacing_plan(), (70_000, true));
+}

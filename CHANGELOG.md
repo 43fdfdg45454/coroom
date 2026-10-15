@@ -425,6 +425,14 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Cambiado
 
+- **El pacing reparte cada fotograma al ritmo que midió el enlace, no al bitrate máximo**: la
+  sonda del enlace sale a diez veces el máximo configurado (hasta 100 Mbit/s) para medir lo que
+  sobra por encima de él, y el emisor reparte cada fotograma al 70 % de lo medido (o 1,25 × el
+  objetivo si es más, con techo de 100 Mbit/s), como mucho el 30 % del intervalo, igual que hasta
+  ahora. Con 10 Mbit/s de máximo en LAN, el tramo «cifrado → enviado» baja de 5 ms a ~2,4 ms a
+  60 fps y de 10 ms a ~4,8 ms a 30 fps; sin sonda ni estimación (o en un enlace que solo da el
+  máximo) todo sigue igual. El indicador del enlace enseña ahora lo que midió la sonda, no el
+  máximo.
 - **Resolución máxima y fps con la sala abierta**: ya no esperan a la próxima sala. La captura
   adopta la cadencia y el tamaño nuevos, el codificador se reabre con un intra y los invitados
   siguen viendo sin cortes; 4:4:4 y HDR siguen aplicándose al abrir la sala, porque deciden cómo
