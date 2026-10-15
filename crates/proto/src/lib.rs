@@ -5,8 +5,9 @@
 //! servidor y los pares (`docs/ARQUITECTURA.md` §4), la cabecera de medios v2 con el modelo de Media over
 //! QUIC ([`media::ObjectHeader`]) y los mensajes `postcard` de control ([`control`]) y de
 //! señalización ([`signal`]), enmarcados por longitud con [`codec`], los eventos de entrada del
-//! invitado ([`input`]), la cabecera de los paquetes de audio ([`audio`]) y los
-//! tipos JSON de la API de cuentas del servidor ([`api`], con [`hex`]).
+//! invitado ([`input`]), la cabecera de los paquetes de audio ([`audio`]), los
+//! tipos JSON de la API de cuentas del servidor ([`api`], con [`hex`]) y la geometría del flujo
+//! de vídeo que comparten captura, codificador y sesión ([`video::fit`]).
 
 pub mod api;
 pub mod audio;
@@ -17,6 +18,7 @@ pub mod hid;
 pub mod input;
 pub mod media;
 pub mod signal;
+pub mod video;
 
 /// Versión del protocolo de coroom que hablan cliente y servidor.
 ///

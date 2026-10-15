@@ -10,6 +10,7 @@ use coroom_codec::{
     Backend, Codec, Decoder, DecoderBackend, EncodedSlice, Encoder, EncoderConfig, PixelFormat,
     RawFrame,
 };
+use std::time::Duration;
 
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 360;
@@ -203,6 +204,148 @@ fn ffmpeg_encoders_accept_i420_and_new_sizes() {
     let mut decoder = FfmpegDecoder::new(Codec::Av1, DecoderBackend::Software).unwrap();
     let decoded = decoder.decode(&slices).unwrap().expect("imagen");
     assert_eq!((decoded.width, decoded.height), (320, 180));
+}
+
+/// Patrón de `width × height` (como [`pattern`], con un cuadrado blanco fijo).
+fn pattern_of(frame_id: u64, width: u32, height: u32) -> RawFrame {
+    let (w, h) = (width as usize, height as usize);
+    let mut data = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let at = (y * w + x) * 4;
+            let r = (x * 255 / w) as u8;
+            let g = (y * 255 / h) as u8;
+            let b = (((x + y) / 4) % 256) as u8;
+            data[at..at + 4].copy_from_slice(&[b, g, r, 255]);
+        }
+    }
+    for y in h / 4..h / 2 {
+        for x in w / 4..w / 2 {
+            let at = (y * w + x) * 4;
+            data[at..at + 4].copy_from_slice(&[255, 255, 255, 255]);
+        }
+    }
+    RawFrame::cpu(
+        frame_id,
+        (width, height),
+        PixelFormat::Bgra,
+        width * 4,
+        data,
+    )
+}
+
+/// Luma del patrón reducido a la mitad por media de 2 × 2 (la referencia de la reducción).
+fn halved_luma(frame: &RawFrame) -> Vec<u8> {
+    let i420 = bgra_to_i420(frame).expect("conversión");
+    let (y, _, _) = i420.i420_planes().expect("planos");
+    let (w, h) = (frame.width as usize, frame.height as usize);
+    let mut out = Vec::with_capacity(w * h / 4);
+    for row in 0..h / 2 {
+        for col in 0..w / 2 {
+            let at = |dy: usize, dx: usize| u32::from(y[(2 * row + dy) * w + 2 * col + dx]);
+            out.push(((at(0, 0) + at(0, 1) + at(1, 0) + at(1, 1) + 2) / 4) as u8);
+        }
+    }
+    out
+}
+
+/// El tope de resolución de `EncoderConfig` es un máximo: un fotograma BGRA de 1280 × 720 con un
+/// tope de 640 × 360 sale reducido (el primero decodificado mide 640 × 360 y se parece a la
+/// reducción de referencia), y uno de 320 × 180 con el mismo tope sale tal cual. Con SVT-AV1 (la
+/// ruta de CPU de FFmpeg: libswscale reduce y convierte en un paso) y con OpenH264.
+#[test]
+fn the_cpu_encoders_reduce_frames_larger_than_the_cap() {
+    type Case = (Box<dyn Encoder>, Box<dyn Decoder>, &'static str);
+    let cases: Vec<Case> = vec![
+        (
+            Box::new(FfmpegEncoder::new(Codec::Av1, Backend::Software).unwrap()),
+            Box::new(FfmpegDecoder::new(Codec::Av1, DecoderBackend::Software).unwrap()),
+            "SVT-AV1",
+        ),
+        (
+            Box::new(OpenH264Encoder::new()),
+            Box::new(OpenH264Decoder::new().unwrap()),
+            "OpenH264",
+        ),
+    ];
+    for (mut encoder, mut decoder, name) in cases {
+        encoder.configure(&config(encoder.codec())).unwrap();
+        assert_eq!(encoder.output_size(), None, "{name}: aún sin fotogramas");
+        let big = pattern_of(0, 1280, 720);
+        let slices = encoder.encode(&big).expect("codificación");
+        assert!(!slices.is_empty(), "{name}: el primer fotograma sale");
+        assert!(slices.iter().any(|slice| slice.keyframe), "{name}: intra");
+        let decoded = decoder.decode(&slices).unwrap().expect("imagen");
+        assert_eq!((decoded.width, decoded.height), (640, 360), "{name}");
+        assert_eq!(encoder.output_size(), Some((640, 360)), "{name}");
+        let scale = encoder
+            .cpu_scale()
+            .unwrap_or_else(|| panic!("{name}: reducción medida"));
+        assert_eq!((scale.from, scale.to), ((1280, 720), (640, 360)), "{name}");
+        assert!(
+            scale.took > Duration::ZERO && scale.took < Duration::from_secs(1),
+            "{name}"
+        );
+        println!("{name}: reducción en CPU {scale}");
+        let reference = halved_luma(&big);
+        let worst = psnr(decoded.luma().expect("luma"), &reference);
+        println!("{name}: PSNR Y del fotograma reducido frente a la media 2 × 2: {worst:.2} dB");
+        assert!(worst > 28.0, "{name}: {worst:.2} dB");
+        // Unos cuantos más, con el coste medido en cada uno (ya sin configurar el contexto).
+        let mut steady = Vec::new();
+        for id in 1..6 {
+            let slices = encoder.encode(&pattern_of(id, 1280, 720)).unwrap();
+            assert!(
+                decoder.decode(&slices).unwrap().is_some(),
+                "{name}: fotograma {id}"
+            );
+            let scale = encoder
+                .cpu_scale()
+                .unwrap_or_else(|| panic!("{name}: reducción medida"));
+            steady.push(scale.took.as_secs_f64() * 1000.0);
+        }
+        println!("{name}: reducción en CPU de los siguientes, en ms: {steady:.2?}");
+        // Lo que ya cabe no se toca (ni se reduce ni se amplía).
+        let small = pattern_of(6, 320, 180);
+        let slices = encoder.encode(&small).unwrap();
+        assert!(
+            slices.iter().any(|slice| slice.keyframe),
+            "{name}: tamaño nuevo, intra"
+        );
+        decoder.reset();
+        let decoded = decoder.decode(&slices).unwrap().expect("imagen");
+        assert_eq!((decoded.width, decoded.height), (320, 180), "{name}");
+        assert_eq!(encoder.output_size(), Some((320, 180)), "{name}");
+        assert_eq!(encoder.cpu_scale(), None, "{name}: sin reducción");
+        // Y el tope sigue valiendo después: otro fotograma grande vuelve a reducirse (el tope no se
+        // pierde al reabrir con el tamaño de la fuente).
+        let slices = encoder.encode(&pattern_of(7, 1280, 720)).unwrap();
+        decoder.reset();
+        let decoded = decoder.decode(&slices).unwrap().expect("imagen");
+        assert_eq!((decoded.width, decoded.height), (640, 360), "{name}");
+    }
+}
+
+/// El cambio de bitrate reabre con el tamaño del flujo, no con el tope.
+#[test]
+fn bitrate_changes_keep_the_reduced_stream_size() {
+    let mut encoder = FfmpegEncoder::new(Codec::Av1, Backend::Software).unwrap();
+    encoder.configure(&config(Codec::Av1)).unwrap();
+    let mut decoder = FfmpegDecoder::new(Codec::Av1, DecoderBackend::Software).unwrap();
+    let slices = encoder.encode(&pattern_of(0, 1280, 720)).unwrap();
+    assert!(decoder.decode(&slices).unwrap().is_some());
+    let reopened = encoder.reopened();
+    encoder.set_bitrate(1_500).unwrap();
+    assert_eq!(encoder.reopened(), reopened + 1);
+    let slices = encoder.encode(&pattern_of(1, 1280, 720)).unwrap();
+    assert_eq!(
+        encoder.reopened(),
+        reopened + 1,
+        "el tamaño no cambió: no reabre otra vez"
+    );
+    decoder.reset();
+    let decoded = decoder.decode(&slices).unwrap().expect("imagen");
+    assert_eq!((decoded.width, decoded.height), (640, 360));
 }
 
 /// HDR10 de extremo a extremo por software: SVT-AV1 a 10 bits con BT.2020 PQ → dav1d,

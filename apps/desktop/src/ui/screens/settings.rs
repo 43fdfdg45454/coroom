@@ -14,6 +14,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use coroom_session::capture::ShareKind;
 use coroom_session::input::gamepad::PadChoice;
 use coroom_transport::proto::PROTOCOL_VERSION;
 use coroom_transport::proto::api::Devices;
@@ -28,6 +29,7 @@ use iced_core::text::Wrapping;
 use iced_core::{Alignment, Length, Padding};
 use iced_widget::{Column, Row, button, column, container, row, text};
 
+use crate::portal::{REMEMBERS_SHARE_PERMISSION, RestoreTokens};
 use crate::ui::app::{App, AudioDevice, Dialog, Effect, Event, Load, Message, Page, Screen};
 use crate::ui::screens::diagnostics;
 use crate::ui::settings::{Shortcuts, ThemeChoice, VoiceMode};
@@ -175,6 +177,8 @@ pub enum Msg {
     TestChatSound,
     /// Volver al tono de por defecto.
     ClearChatSound,
+    /// Olvidar el permiso de pantalla del portal: el diálogo del sistema volverá a salir.
+    ForgetSharePermission,
     /// Notificación del escritorio con la ventana sin foco.
     ChatNotifications(bool),
     /// Burbuja sobre el vídeo.
@@ -395,6 +399,11 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::ClearChatSound => {
             app.settings_page.chat_sound_error = None;
             settings.room.chat_sound_file = None;
+        }
+        Msg::ForgetSharePermission => {
+            // No es un ajuste: va a `portal.json`, y borrarlo ahí es borrar el fichero.
+            app.host.restore_tokens = RestoreTokens::default();
+            return vec![Effect::SaveRestoreTokens(RestoreTokens::default())];
         }
         Msg::ChatNotifications(on) => settings.room.chat_notifications = on,
         Msg::ChatBubbles(on) => settings.room.chat_bubbles = on,
@@ -1056,20 +1065,20 @@ const DEVICE_SELECT_WIDTH: f32 = 280.0;
 
 fn room(app: &App) -> Element<'_, Message> {
     let room = &app.settings.room;
-    column![
-        ui::section(
-            t!("settings-como-anfitrion"),
-            None,
-            vec![tagged_row(
-                t!("settings-los-invitados-entran-callados"),
-                Some(t!("settings-los-invitados-entran-callados-ayuda").to_owned()),
-                Some(tag::When::Later),
-                ui::switch(
-                    room.guests_muted,
-                    Some(|on_off| on(Msg::GuestsMuted(on_off)))
-                ),
-            )],
+    let mut as_host = vec![tagged_row(
+        t!("settings-los-invitados-entran-callados"),
+        Some(t!("settings-los-invitados-entran-callados-ayuda").to_owned()),
+        Some(tag::When::Later),
+        ui::switch(
+            room.guests_muted,
+            Some(|on_off| on(Msg::GuestsMuted(on_off))),
         ),
+    )];
+    if REMEMBERS_SHARE_PERMISSION {
+        as_host.push(share_permission_row(app));
+    }
+    column![
+        ui::section(t!("settings-como-anfitrion"), None, as_host),
         ui::section(
             t!("settings-chat-de-la-sala"),
             Some(t!("settings-chat-de-la-sala-ayuda").to_owned()),
@@ -1157,6 +1166,35 @@ fn tone_row(app: &App) -> Element<'_, Message> {
         ));
     }
     row![texts.width(Length::Fill), buttons]
+        .spacing(space::M)
+        .align_y(Alignment::Center)
+        .padding(Padding::from([10.0, 16.0]))
+        .into()
+}
+
+/// Fila del permiso de pantalla del portal (Linux): para qué fuentes se recuerda y «Olvidar el
+/// permiso de pantalla», que borra `portal.json`; el diálogo del sistema volverá a salir una vez.
+fn share_permission_row(app: &App) -> Element<'_, Message> {
+    let tokens = &app.host.restore_tokens;
+    let screen = tokens.get(ShareKind::Screen).is_some();
+    let window = tokens.get(ShareKind::App).is_some();
+    let current = match (screen, window) {
+        (true, true) => t!("settings-permiso-recordado-pantalla-y-ventana"),
+        (true, false) => t!("settings-permiso-recordado-pantalla"),
+        (false, true) => t!("settings-permiso-recordado-ventana"),
+        (false, false) => t!("settings-permiso-sin-recordar"),
+    };
+    let texts = column![
+        ui::body(t!("settings-permiso-de-pantalla")),
+        ui::secondary(current).wrapping(Wrapping::WordOrGlyph),
+        ui::caption(t!("settings-permiso-de-pantalla-ayuda")).wrapping(Wrapping::WordOrGlyph),
+    ]
+    .spacing(2);
+    let forget = ui::flat(
+        t!("settings-olvidar-el-permiso-de-pantalla"),
+        (!tokens.is_empty()).then(|| on(Msg::ForgetSharePermission)),
+    );
+    row![texts.width(Length::Fill), forget]
         .spacing(space::M)
         .align_y(Alignment::Center)
         .padding(Padding::from([10.0, 16.0]))
@@ -1694,6 +1732,26 @@ mod tests {
         app.page = Page::Settings;
         app.settings_page.page = page;
         app
+    }
+
+    #[test]
+    fn forgetting_the_share_permission_clears_the_tokens_file() {
+        use coroom_session::capture::ShareKind;
+
+        let mut app = open(SettingsPage::Room);
+        app.host
+            .restore_tokens
+            .set(ShareKind::App, Some("ventana".to_owned()));
+        let effects = app.update(Message::Settings(Msg::ForgetSharePermission));
+        assert!(
+            matches!(&effects[..], [Effect::SaveRestoreTokens(tokens)] if tokens.is_empty()),
+            "sin tokens, guardar borra el fichero: {effects:?}"
+        );
+        assert!(app.host.restore_tokens.is_empty());
+        assert!(
+            app.flush_settings().is_none(),
+            "no es un ajuste: settings.toml no se toca"
+        );
     }
 
     /// Cada interruptor cambia el modelo y no guarda en el acto: se guarda en el próximo

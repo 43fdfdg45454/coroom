@@ -10,6 +10,13 @@
 //! - Por el pipeline ([`Encoder::encode_into`]) el paquete se copia una sola vez, entero, al búfer
 //!   del llamante; [`Encoder::encode`] lo reparte además en sus slices reales ([`crate::slices`]).
 //! - [`intra_refresh`] dice cómo se refresca cada backend sin IDR grandes.
+//!
+//! Tope de resolución: `EncoderConfig.width × height` es un máximo ([`crate::EncoderConfig`]). La
+//! captura de pantalla trae su propio tamaño y el codificador se reabre al de cada fotograma
+//! **reducido a lo que cabe** ([`coroom_proto::video::fit`]): en la ruta sin copias, la reducción
+//! va en el mismo filtro de la GPU que la conversión de formato ([`super::import`]); en la de CPU,
+//! libswscale reduce y convierte en un solo paso ([`super::scale`]). El tope se guarda aparte del
+//! tamaño abierto, así que vale para la fuente que venga después.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -20,7 +27,10 @@ use rsmpeg::avutil::{AVFrame, AVHWDeviceContext, AVHWFramesContext};
 use rsmpeg::error::RsmpegError;
 use rsmpeg::ffi;
 
+use coroom_proto::video::fit;
+
 use super::import::{GpuImporter, ImportMode, Prepared};
+use super::scale::{Scaler, tag_color};
 use super::{backend_error, create_device, encoder_device, encoder_name, hw_pixel_format};
 use crate::color::{Chroma, VideoFormat};
 use crate::convert::{
@@ -29,8 +39,8 @@ use crate::convert::{
 };
 use crate::gpu::GpuImage;
 use crate::{
-    Backend, Codec, CodecError, EncodedFrame, EncodedSlice, Encoder, EncoderConfig, GpuInput,
-    PixelFormat, RawFrame,
+    Backend, Codec, CodecError, CpuScale, EncodedFrame, EncodedSlice, Encoder, EncoderConfig,
+    GpuInput, PixelFormat, RawFrame,
 };
 
 /// Periodo de GOP «infinito»: solo hay intra al pedirlo (o al empezar). Cabe en los 16 bits de
@@ -292,7 +302,7 @@ pub fn intra_refresh(codec: Codec, backend: Backend) -> IntraRefresh {
     }
 }
 
-/// Codificador abierto con un tamaño concreto.
+/// Codificador abierto con un tamaño concreto (el del flujo: la captura reducida al tope).
 struct Session {
     ctx: AVCodecContext,
     frames: Option<AVHWFramesContext>,
@@ -300,10 +310,16 @@ struct Session {
     sw_format: ffi::AVPixelFormat,
     width: u32,
     height: u32,
+    /// Flujo HDR (BT.2020 PQ de 10 bits).
+    hdr: bool,
     /// Con *hw frames* de la importación: identidad de su contexto.
     imported: Option<usize>,
     /// Control de tasa leído del contexto ya abierto ([`RateControl`]).
     rate_control: RateControl,
+    /// Reducción en CPU de los fotogramas más grandes que la sesión (se crea con el primero).
+    scaler: Option<Scaler>,
+    /// HDR desde RGB: la conversión propia al tamaño de la captura, antes de reducir.
+    converted: Option<AVFrame>,
 }
 
 /// Lo que el contexto de FFmpeg dice de su control de tasa **después** de abrirse: `bit_rate`,
@@ -561,6 +577,8 @@ impl FfmpegEncoder {
         sw.set_height(i32::try_from(height).unwrap_or(i32::MAX));
         sw.alloc_buffer()
             .map_err(|err| fail("búfer del fotograma", &err))?;
+        // Lo que lleva el VUI: libswscale toma de aquí la matriz y el rango al reducir.
+        tag_color(&mut sw, config.format.is_hdr(), false);
         self.in_flight.clear();
         self.next_pts = 0;
         Ok(Session {
@@ -570,8 +588,11 @@ impl FfmpegEncoder {
             sw_format,
             width,
             height,
+            hdr: config.format.is_hdr(),
             imported: imported_key,
             rate_control,
+            scaler: None,
+            converted: None,
         })
     }
 
@@ -580,18 +601,29 @@ impl FfmpegEncoder {
         self.session.as_ref().map(|session| &session.rate_control)
     }
 
-    /// Reabre con `config` conservando el modo de entrada (CPU o *hw frames* importados).
+    /// Reabre con `config` (bitrate nuevo) conservando el tamaño abierto y el modo de entrada
+    /// (CPU o *hw frames* importados).
     fn reopen(&mut self, config: EncoderConfig) -> Result<(), CodecError> {
-        let imported = match (&self.session, &self.importer) {
-            (Some(session), Some(importer)) if session.imported.is_some() => {
-                importer.encoder_frames()
+        let (imported, config) = match &self.session {
+            Some(session) => {
+                let imported = match &self.importer {
+                    Some(importer) if session.imported.is_some() => importer.encoder_frames(),
+                    _ => None,
+                };
+                let open = EncoderConfig {
+                    width: session.width,
+                    height: session.height,
+                    ..config
+                };
+                (imported, open)
             }
-            _ => None,
+            None => (None, config),
         };
         self.reopen_as(config, imported)
     }
 
-    /// Reabre con `config`, sobre los *hw frames* `imported` o con entrada en CPU.
+    /// Reabre con `config` (con el tamaño del flujo), sobre los *hw frames* `imported` o con
+    /// entrada en CPU. El tope de resolución configurado no cambia: solo lo demás de `config`.
     fn reopen_as(
         &mut self,
         config: EncoderConfig,
@@ -601,7 +633,14 @@ impl FfmpegEncoder {
         self.last_hw = None;
         let session = self.open_with(&config, imported)?;
         self.session = Some(session);
-        self.config = Some(config);
+        let (width, height) = self
+            .config
+            .map_or((config.width, config.height), |cap| (cap.width, cap.height));
+        self.config = Some(EncoderConfig {
+            width,
+            height,
+            ..config
+        });
         self.reopened += 1;
         Ok(())
     }
@@ -744,13 +783,81 @@ fn frame_planes(frame: &mut AVFrame, rows: [usize; 3]) -> Vec<(&mut [u8], u32)> 
     planes
 }
 
-/// Copia un fotograma (BGRA, RGBA de coma flotante, I420, NV12, I444, NV24 o P010) en el
-/// `AVFrame` de CPU del codificador, convirtiendo al formato de la sesión.
-fn fill(session: &mut Session, frame: &RawFrame) -> Result<(), CodecError> {
+/// Deja `frame` en el `AVFrame` de CPU del codificador, en el formato de la sesión y a su tamaño:
+/// si mide lo mismo, la conversión de color propia ([`convert_into`]); si es más grande (la
+/// captura por encima del tope), libswscale lo reduce y convierte en un solo paso
+/// ([`Scaler`]), salvo en HDR desde RGB, donde la conversión propia va primero (al tamaño de la
+/// captura) y la reducción después. Devuelve las pasadas por la imagen que hizo (1 o 2).
+fn fill(session: &mut Session, frame: &RawFrame) -> Result<u32, CodecError> {
     session
         .sw
         .make_writable()
         .map_err(|err| backend_error("fotograma escribible", &err))?;
+    if frame.format == PixelFormat::Gpu {
+        return Err(gpu_in_cpu_path());
+    }
+    let sw_format = session.sw_format;
+    if (frame.width, frame.height) == (session.width, session.height) {
+        if let Some(scaler) = session.scaler.as_mut() {
+            scaler.clear_last();
+        }
+        convert_into(&mut session.sw, sw_format, frame)?;
+        return Ok(1);
+    }
+    if frame.width < session.width || frame.height < session.height {
+        return Err(CodecError::Unsupported(format!(
+            "el fotograma de {}×{} es más pequeño que la sesión de {}×{}",
+            frame.width, frame.height, session.width, session.height
+        )));
+    }
+    let scaler = match session.scaler.as_mut() {
+        Some(scaler) => scaler,
+        None => session.scaler.insert(Scaler::new()?),
+    };
+    let from_rgb = matches!(frame.format, PixelFormat::Bgra | PixelFormat::Rgba16F);
+    if session.hdr && from_rgb {
+        // BT.2020 PQ de 10 bits desde RGB: lo hace la conversión propia (libswscale no), al
+        // tamaño de la captura; después se reduce de 10 bits a 10 bits.
+        let size = (
+            i32::try_from(frame.width).unwrap_or(i32::MAX),
+            i32::try_from(frame.height).unwrap_or(i32::MAX),
+        );
+        let stale = session
+            .converted
+            .as_ref()
+            .is_none_or(|c| (c.width, c.height) != size || c.format != sw_format);
+        if stale {
+            let mut converted = AVFrame::new();
+            converted.set_format(sw_format);
+            converted.set_width(size.0);
+            converted.set_height(size.1);
+            converted
+                .alloc_buffer()
+                .map_err(|err| backend_error("búfer de la conversión HDR", &err))?;
+            tag_color(&mut converted, true, false);
+            session.converted = Some(converted);
+        }
+        let Some(converted) = session.converted.as_mut() else {
+            return Err(CodecError::Backend("sin búfer de la conversión HDR".into()));
+        };
+        converted
+            .make_writable()
+            .map_err(|err| backend_error("fotograma escribible", &err))?;
+        convert_into(converted, sw_format, frame)?;
+        scaler.scale_frame(converted, &mut session.sw)?;
+        return Ok(2);
+    }
+    scaler.scale(frame, &mut session.sw)?;
+    Ok(1)
+}
+
+/// Copia un fotograma (BGRA, RGBA de coma flotante, I420, NV12, I444, NV24 o P010) en `dst`, un
+/// `AVFrame` de CPU de su mismo tamaño, convirtiendo al formato `sw_format`.
+fn convert_into(
+    dst: &mut AVFrame,
+    sw_format: ffi::AVPixelFormat,
+    frame: &RawFrame,
+) -> Result<(), CodecError> {
     let (w, h) = (frame.width as usize, frame.height as usize);
     let (cw, ch) = RawFrame::chroma_size(frame.width, frame.height);
     let (cw, ch) = (cw as usize, ch as usize);
@@ -759,18 +866,17 @@ fn fill(session: &mut Session, frame: &RawFrame) -> Result<(), CodecError> {
         CodecError::Unsupported(format!(
             "el codificador no convierte {:?} a {}",
             frame.format,
-            rsmpeg::avutil::get_pix_fmt_name(session.sw_format).map_or_else(
+            rsmpeg::avutil::get_pix_fmt_name(sw_format).map_or_else(
                 || "?".to_owned(),
                 |name| name.to_string_lossy().into_owned()
             )
         ))
     };
-    let sw_format = session.sw_format;
     if frame.format == PixelFormat::Gpu {
         return Err(gpu_in_cpu_path());
     }
     if sw_format == ffi::AV_PIX_FMT_YUV420P {
-        let mut planes = frame_planes(&mut session.sw, [h, ch, ch]);
+        let mut planes = frame_planes(dst, [h, ch, ch]);
         let [y, u, v] = planes.as_mut_slice() else {
             return Err(CodecError::Backend(
                 "el fotograma no tiene tres planos".into(),
@@ -806,7 +912,7 @@ fn fill(session: &mut Session, frame: &RawFrame) -> Result<(), CodecError> {
             _ => Err(mismatch()),
         }
     } else if sw_format == ffi::AV_PIX_FMT_NV12 {
-        let mut planes = frame_planes(&mut session.sw, [h, ch, 0]);
+        let mut planes = frame_planes(dst, [h, ch, 0]);
         let [y, uv] = planes.as_mut_slice() else {
             return Err(CodecError::Backend(
                 "el fotograma no tiene dos planos".into(),
@@ -823,7 +929,7 @@ fn fill(session: &mut Session, frame: &RawFrame) -> Result<(), CodecError> {
             _ => Err(mismatch()),
         }
     } else if sw_format == ffi::AV_PIX_FMT_YUV444P {
-        let mut planes = frame_planes(&mut session.sw, [h, h, h]);
+        let mut planes = frame_planes(dst, [h, h, h]);
         let [y, u, v] = planes.as_mut_slice() else {
             return Err(CodecError::Backend(
                 "el fotograma no tiene tres planos".into(),
@@ -843,7 +949,7 @@ fn fill(session: &mut Session, frame: &RawFrame) -> Result<(), CodecError> {
             _ => Err(mismatch()),
         }
     } else if sw_format == ffi::AV_PIX_FMT_NV24 {
-        let mut planes = frame_planes(&mut session.sw, [h, h, 0]);
+        let mut planes = frame_planes(dst, [h, h, 0]);
         let [y, uv] = planes.as_mut_slice() else {
             return Err(CodecError::Backend(
                 "el fotograma no tiene dos planos".into(),
@@ -859,7 +965,7 @@ fn fill(session: &mut Session, frame: &RawFrame) -> Result<(), CodecError> {
             _ => Err(mismatch()),
         }
     } else if sw_format == ffi::AV_PIX_FMT_P010LE {
-        let mut planes = frame_planes(&mut session.sw, [h, ch, 0]);
+        let mut planes = frame_planes(dst, [h, ch, 0]);
         let [y, uv] = planes.as_mut_slice() else {
             return Err(CodecError::Backend(
                 "el fotograma no tiene dos planos".into(),
@@ -881,7 +987,7 @@ fn fill(session: &mut Session, frame: &RawFrame) -> Result<(), CodecError> {
             _ => Err(mismatch()),
         }
     } else if sw_format == ffi::AV_PIX_FMT_YUV420P10LE {
-        let mut planes = frame_planes(&mut session.sw, [h, ch, ch]);
+        let mut planes = frame_planes(dst, [h, ch, ch]);
         let [y, u, v] = planes.as_mut_slice() else {
             return Err(CodecError::Backend(
                 "el fotograma no tiene tres planos".into(),
@@ -1109,6 +1215,22 @@ impl Encoder for FfmpegEncoder {
     fn cpu_copies(&self) -> u32 {
         self.copies
     }
+
+    fn output_size(&self) -> Option<(u32, u32)> {
+        self.session
+            .as_ref()
+            .filter(|_| self.next_pts > 0)
+            .map(|session| (session.width, session.height))
+    }
+
+    fn cpu_scale(&self) -> Option<CpuScale> {
+        // Solo cuenta si el último fotograma pasó por la ruta de CPU con reducción: el escalador
+        // guarda la última y la olvida con cada fotograma que no la necesita ([`fill`]).
+        self.session
+            .as_ref()
+            .and_then(|session| session.scaler.as_ref())
+            .and_then(Scaler::last)
+    }
 }
 
 /// Fotograma entregado al codificador, pendiente de su paquete.
@@ -1135,10 +1257,12 @@ impl FfmpegEncoder {
                 frame.width, frame.height
             )));
         }
-        // La captura de pantalla puede traer otro tamaño que el configurado: se reabre a ese.
+        // La captura de pantalla puede traer otro tamaño que el configurado: se reabre al del
+        // fotograma reducido a lo que cabe en el tope (lo que ya cabe, tal cual).
+        let (width, height) = fit((frame.width, frame.height), (config.width, config.height));
         let config = EncoderConfig {
-            width: frame.width,
-            height: frame.height,
+            width,
+            height,
             ..config
         };
         match frame.gpu.clone() {
@@ -1189,13 +1313,13 @@ impl FfmpegEncoder {
         })
     }
 
-    /// Copia `frame` en el `AVFrame` de CPU de la sesión, lo sube a la GPU si hace falta y lo
-    /// entrega. Devuelve las copias a CPU que hizo.
+    /// Copia `frame` en el `AVFrame` de CPU de la sesión (convertido y, si es más grande,
+    /// reducido), lo sube a la GPU si hace falta y lo entrega. Devuelve las copias a CPU que hizo.
     fn send_cpu(&mut self, frame: &RawFrame, pts: i64, keyframe: bool) -> Result<u32, CodecError> {
         let Some(session) = self.session.as_mut() else {
             return Err(CodecError::Backend("sin sesión del codificador".into()));
         };
-        fill(session, frame)?;
+        let passes = fill(session, frame)?;
         let pict_type = picture_type(keyframe);
         session.sw.set_pts(pts);
         session.sw.set_pict_type(pict_type);
@@ -1208,9 +1332,9 @@ impl FfmpegEncoder {
                     .map_err(|err| backend_error("subida a la GPU", &err))?;
                 hw.set_pts(pts);
                 hw.set_pict_type(pict_type);
-                (session.ctx.send_frame(Some(&hw)), 2)
+                (session.ctx.send_frame(Some(&hw)), passes + 1)
             }
-            None => (session.ctx.send_frame(Some(&session.sw)), 1),
+            None => (session.ctx.send_frame(Some(&session.sw)), passes),
         };
         match sent {
             Ok(()) | Err(RsmpegError::SendFrameAgainError) => Ok(copies),
@@ -1226,13 +1350,15 @@ impl FfmpegEncoder {
         config: EncoderConfig,
     ) -> Result<Option<Submitted>, CodecError> {
         let size = (frame.width, frame.height);
+        // Lo que sale de la importación: la captura reducida al tope si no cabe.
+        let output = (config.width, config.height);
         if self
             .importer
             .as_ref()
-            .is_none_or(|importer| !importer.matches(image, size))
+            .is_none_or(|importer| !importer.matches(image, size, output))
         {
             self.importer = None;
-            let importer = self.build_importer(image, size)?;
+            let importer = self.build_importer(image, size, output)?;
             self.importer = Some(importer);
         }
         let wanted = self.importer.as_ref().and_then(GpuImporter::encoder_frames);
@@ -1252,7 +1378,7 @@ impl FfmpegEncoder {
                     ));
                     self.zero_copy_failed = true;
                     self.importer = None;
-                    let importer = self.build_importer(image, size)?;
+                    let importer = self.build_importer(image, size, output)?;
                     self.importer = Some(importer);
                     self.ensure_cpu_session(config)?;
                 }
@@ -1326,11 +1452,13 @@ impl FfmpegEncoder {
         }))
     }
 
-    /// Importador para `image`: sin copias si no falló antes; si no se puede, el de respaldo.
+    /// Importador para `image` de `size`, que entrega `output` (la imagen reducida al tope si no
+    /// cabe): sin copias si no falló antes; si no se puede, el de respaldo.
     fn build_importer(
         &mut self,
         image: &GpuImage,
         size: (u32, u32),
+        output: (u32, u32),
     ) -> Result<GpuImporter, CodecError> {
         if !self.zero_copy_failed {
             match GpuImporter::new(
@@ -1338,6 +1466,7 @@ impl FfmpegEncoder {
                 self.device.as_ref(),
                 image,
                 size,
+                output,
                 ImportMode::Zero,
             ) {
                 Ok(importer) => return Ok(importer),
@@ -1352,6 +1481,7 @@ impl FfmpegEncoder {
             self.device.as_ref(),
             image,
             size,
+            output,
             ImportMode::Download,
         )
         .map_err(|err| {

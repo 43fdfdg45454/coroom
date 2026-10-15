@@ -815,6 +815,10 @@ impl FrameCopier {
             .ok()
             .and_then(|time| u64::try_from(time.Duration).ok())
             .map(|ticks| Duration::from_nanos(ticks.saturating_mul(100)));
+        if let Some(fps) = self.mailbox.take_max_fps() {
+            // Cadencia cambiada en marcha: se eligen otros refrescos de los que llegan.
+            self.pacer = FramePacer::new(fps);
+        }
         if let Some(relative) = relative
             && !self.pacer.accept(relative)
         {
@@ -1313,8 +1317,15 @@ impl Capturer for WgcCapturer {
         }
     }
 
-    /// Intervalo mínimo entre fotogramas y, con `hdr`, captura en `R16G16B16A16Float`.
+    /// Intervalo mínimo entre fotogramas y, con `hdr`, captura en `R16G16B16A16Float`. Con la
+    /// captura en marcha, la cadencia cambia ya (entre los refrescos que llegan); el HDR, en la
+    /// próxima.
     fn set_options(&mut self, options: CaptureOptions) -> CaptureOptions {
+        if let Some(running) = &self.running
+            && options.max_fps != self.options.max_fps
+        {
+            running.mailbox.set_max_fps(options.max_fps);
+        }
         self.options = options;
         options
     }

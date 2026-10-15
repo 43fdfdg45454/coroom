@@ -1046,13 +1046,16 @@ fn end_code(reason: Option<SessionError>) -> ExitCode {
 }
 
 fn host(args: &HostArgs) -> ExitCode {
-    let options = match args.options() {
+    let mut options = match args.options() {
         Ok(options) => options,
         Err(err) => {
             eprintln!("error: {err}\n\nPrueba `coroom host --help` para ver las opciones.");
             return ExitCode::from(2);
         }
     };
+    // El permiso del portal recordado de otra vez: el diálogo del sistema sale una sola vez, no
+    // en cada ejecución (ver `coroom_desktop::portal`).
+    options.share.restore_token = coroom_desktop::portal::saved_restore_token(options.share.kind);
     let (identity, place) = match load_identity(options.net.data_dir.as_deref(), args.headless) {
         Ok(found) => found,
         Err(err) => {

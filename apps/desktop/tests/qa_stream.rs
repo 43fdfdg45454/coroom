@@ -374,6 +374,7 @@ fn qa_live_changes() {
         let changed = host.set_video(VideoChange {
             encoders: Some(EncoderSet::probe().only_codec(codec)),
             max_kbps: None,
+            ..Default::default()
         });
         check(
             &mut failures,
@@ -393,6 +394,7 @@ fn qa_live_changes() {
         let changed = host.set_video(VideoChange {
             encoders: None,
             max_kbps: Some(kbps),
+            ..Default::default()
         });
         check(
             &mut failures,
@@ -418,6 +420,7 @@ fn qa_live_changes() {
             host.set_video(VideoChange {
                 encoders: Some(EncoderSet::probe().only_codec(codec)),
                 max_kbps: Some(5_000 + i * 1_000),
+                ..Default::default()
             })
         };
         if let Err(err) = result {

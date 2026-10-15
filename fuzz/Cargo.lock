@@ -741,6 +741,7 @@ dependencies = [
 name = "coroom-codec"
 version = "1.0.0"
 dependencies = [
+ "coroom-proto",
  "libc",
  "openh264",
  "serde",

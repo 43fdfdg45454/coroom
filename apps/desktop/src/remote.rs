@@ -989,7 +989,10 @@ pub fn host_encoders(codec: Option<Codec>, encoder: Option<Backend>) -> Result<E
 /// Prepara y arranca la sesión del anfitrión. Con la pantalla, la captura y la inyección de
 /// teclado y ratón comparten una sola sesión del portal (un diálogo y un token en Linux).
 pub fn start_host(identity: Identity, options: &HostOptions) -> Result<RemoteSession, String> {
-    let mut session = prepare_host(identity, options)?;
+    // La consola guarda en el directorio de datos el token que devuelva el portal, para que la
+    // próxima vez no pregunte.
+    let on_token = crate::portal::restore_token_sink(options.share.kind);
+    let mut session = prepare_host(identity, options, on_token)?;
     start_prepared_host(&mut session)?;
     Ok(session)
 }
@@ -1002,12 +1005,17 @@ pub fn start_prepared_host(session: &mut RemoteSession) -> Result<(), String> {
 }
 
 /// Prepara la sesión del anfitrión sin arrancarla: codificadores, captura (en Linux, el diálogo
-/// del portal si no hay token), entrada y audio.
-pub fn prepare_host(identity: Identity, options: &HostOptions) -> Result<RemoteSession, String> {
+/// del portal si no hay token; `on_token` recibe el que dé el portal, ver
+/// [`coroom_session::capture::RestoreTokenSink`]), entrada y audio.
+pub fn prepare_host(
+    identity: Identity,
+    options: &HostOptions,
+    on_token: Option<coroom_session::capture::RestoreTokenSink>,
+) -> Result<RemoteSession, String> {
     let mut config = remote_config(&options.net)?;
     config.guests_muted = options.guests_muted;
     let encoders = host_encoders(options.codec, options.encoder)?;
-    let (capturer, share) = share_source(options.source, &options.share, options.video)?;
+    let (capturer, share) = share_source(options.source, &options.share, options.video, on_token)?;
     let sink = platform_sink(SinkOptions {
         gamepad_to_keys: options.gamepad_to_keys,
         eis: share.map(eis_provider),
@@ -1026,11 +1034,13 @@ pub fn prepare_host(identity: Identity, options: &HostOptions) -> Result<RemoteS
 }
 
 /// Captura de lo elegido (al abrir la sala o al cambiar de fuente con ella abierta) y, en Linux, la
-/// conexión EIS de su sesión del portal para el teclado y el ratón.
+/// conexión EIS de su sesión del portal para el teclado y el ratón. `on_token` recibe el token de
+/// restauración que dé el portal ([`coroom_session::capture::RestoreTokenSink`]).
 pub fn share_source(
     source: Source,
     share: &coroom_session::capture::ShareChoice,
     video: LoopbackConfig,
+    on_token: Option<coroom_session::capture::RestoreTokenSink>,
 ) -> Result<
     (
         Box<dyn coroom_session::capture::Capturer>,
@@ -1039,7 +1049,7 @@ pub fn share_source(
     String,
 > {
     match source {
-        Source::Screen => coroom_session::capture::share_capturer(share)
+        Source::Screen => coroom_session::capture::share_capturer(share, on_token)
             .map_err(|err| format!("no se puede capturar la pantalla: {err}")),
         Source::Synthetic => Ok((make_capturer(&ProbeOptions::h264(source, video))?, None)),
     }

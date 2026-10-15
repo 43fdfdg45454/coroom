@@ -1238,6 +1238,7 @@ name = "coroom-capture"
 version = "1.0.0"
 dependencies = [
  "ashpd",
+ "coroom-proto",
  "pipewire",
  "rustix 1.1.5",
  "tokio",
@@ -1250,6 +1251,7 @@ name = "coroom-codec"
 version = "1.0.0"
 dependencies = [
  "ash",
+ "coroom-proto",
  "libc",
  "openh264",
  "rsmpeg",

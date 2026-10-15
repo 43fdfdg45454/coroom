@@ -262,8 +262,8 @@ pub enum Event {
     HostEnded(Option<String>),
     /// Anfitrión: se cambió lo que se comparte con la sala abierta, o no se pudo.
     SourceSwitched(Result<(), String>),
-    /// Anfitrión: la sala abierta ya usa el tope del bitrate (kbit/s) o el códec de los ajustes
-    /// (`Ok(None)`), o no se pudo.
+    /// Anfitrión: la sala abierta ya usa el tope del bitrate (kbit/s) o la codificación de los
+    /// ajustes (códec, codificador, resolución máxima y fps; `Ok(None)`), o no se pudo.
     VideoChanged(Result<Option<u32>, String>),
     /// Invitado: la sesión arrancó (con la fuente del vídeo) o no pudo.
     GuestStarted(Result<Arc<VideoFeed>, String>),
@@ -289,6 +289,9 @@ pub enum Event {
         host::SourceChoice,
         Result<Option<coroom_session::capture::PickedShare>, String>,
     ),
+    /// Anfitrión: al arrancar la captura, el portal dio un token de restauración nuevo para esa
+    /// fuente (`Some`) o rechazó el guardado (`None`).
+    ShareRestoreToken(coroom_session::capture::ShareKind, Option<String>),
     /// Un efecto no pudo hacerse (aviso para el usuario).
     Failed(String),
     /// El mensaje del chat no salió: el motivo, para enseñarlo bajo el campo.
@@ -441,9 +444,10 @@ pub enum Effect {
     SetMaxBitrate(u32),
     /// Anfitrión: si la vista previa de la sala está a la vista (página Compartir, ventana sin ocultar).
     PreviewVisible(bool),
-    /// Aplicar a la sala abierta el códec y el codificador de los ajustes (renegocia con los
-    /// invitados; un intra si cambia).
-    SetCodec,
+    /// Aplicar a la sala abierta la codificación de los ajustes: códec, codificador, resolución
+    /// máxima y fps (la captura adopta la cadencia y el tamaño, el codificador se reabre con un
+    /// intra y se renegocia con los invitados).
+    SetEncoding,
     /// Enviar un mensaje al chat de la sala (anfitrión o invitado).
     SendChat(String),
     /// Anfitrión: vaciar el chat para todos.
@@ -500,6 +504,9 @@ pub enum Effect {
     SetPadChoice(PadChoice),
     /// Guardar los ajustes.
     SaveSettings,
+    /// Guardar en `portal.json` los tokens con los que el portal de captura recuerda el permiso de
+    /// pantalla (o borrarlo, si no queda ninguno).
+    SaveRestoreTokens(crate::portal::RestoreTokens),
     /// Copiar al portapapeles.
     Copy(String),
     /// Pantalla completa.
@@ -1318,6 +1325,7 @@ impl App {
                 Vec::new()
             }
             Event::SharePicked(source, picked) => host::on_share_picked(self, source, picked),
+            Event::ShareRestoreToken(kind, token) => host::on_restore_token(self, kind, token),
             Event::VideoSupport(support) => {
                 self.video_support = Some(support);
                 Vec::new()

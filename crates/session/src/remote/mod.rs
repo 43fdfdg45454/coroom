@@ -792,7 +792,8 @@ pub struct RoomMember {
     pub you: bool,
 }
 
-/// Cambio de vídeo con la sala abierta ([`RemoteSession::set_video`]).
+/// Cambio de vídeo con la sala abierta ([`RemoteSession::set_video`]). Lo que no sea `None` se
+/// aplica sin cerrar la sala ni cortar a los invitados.
 #[derive(Debug, Clone, Default)]
 pub struct VideoChange {
     /// Codificadores entre los que elegir ahora (`EncoderSet::probe().only_codec(…)…`): se
@@ -800,6 +801,46 @@ pub struct VideoChange {
     pub encoders: Option<EncoderSet>,
     /// Bitrate máximo nuevo en kbit/s: el control de tasa de cada invitado lo usa enseguida.
     pub max_kbps: Option<u32>,
+    /// Resolución máxima nueva (ancho × alto, pares y no nulos): la captura que elige su tamaño
+    /// (la sintética) lo reduce ya, el codificador se reabre con un intra y los invitados reciben
+    /// el tamaño nuevo en el flujo (`CodecSelected` y `HostFrameSize` les anuncian el cambio).
+    /// La captura de pantalla sigue entregando el tamaño de la fuente.
+    pub max_size: Option<(u32, u32)>,
+    /// Fotogramas por segundo nuevos (no nulos): la cadencia de la captura en marcha, el ritmo
+    /// del emisor a cada invitado, el codificador (reabierto, un intra) y los plazos del invitado.
+    pub fps: Option<u32>,
+}
+
+impl VideoChange {
+    /// El cambio con la resolución máxima redondeada a lados pares (hacia abajo), como hace
+    /// la sala al abrirse: el códec necesita croma 4:2:0 entero y una ventana de 1199×808 no es
+    /// motivo para rechazar nada.
+    pub fn normalized(mut self) -> Self {
+        if let Some(size) = self.max_size.as_mut() {
+            *size = even(*size);
+        }
+        self
+    }
+
+    /// Por qué el cambio no vale, si no vale: tamaño nulo (menor que 2×2) o fps nulos.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some((width, height)) = self.max_size
+            && (width < 2 || height < 2)
+        {
+            return Err(format!(
+                "la resolución máxima necesita al menos 2×2 píxeles, no {width}×{height}"
+            ));
+        }
+        if self.fps == Some(0) {
+            return Err("los fps no pueden ser 0".into());
+        }
+        Ok(())
+    }
+}
+
+/// `size` con los dos lados redondeados hacia abajo a par (lo que exige el croma 4:2:0).
+pub(crate) fn even((width, height): (u32, u32)) -> (u32, u32) {
+    (width & !1, height & !1)
 }
 
 /// Órdenes de la interfaz a la tarea de red.
@@ -824,7 +865,8 @@ pub(crate) enum Command {
         slot: u8,
         data: Vec<u8>,
     },
-    /// Anfitrión: otros codificadores (otro códec o backend preferido) o bitrate máximo.
+    /// Anfitrión: otros codificadores (otro códec o backend preferido), bitrate máximo,
+    /// resolución máxima o fps.
     Video(VideoChange),
     /// Invitado: volver a entrar en la sala ya.
     Reconnect,
@@ -1269,14 +1311,16 @@ impl HostControl {
         Ok(())
     }
 
-    /// Anfitrión: cambia el códec o el backend preferidos y el bitrate máximo con la sala
-    /// abierta ([`VideoChange`]).
+    /// Anfitrión: cambia el códec o el backend preferidos, el bitrate máximo, la resolución
+    /// máxima o los fps con la sala abierta ([`VideoChange`]).
     pub fn set_video(&self, change: VideoChange) -> Result<(), SessionError> {
         if change.encoders.as_ref().is_some_and(EncoderSet::is_empty) {
             return Err(SessionError::Media(
                 "no hay ningún codificador disponible con las opciones dadas".into(),
             ));
         }
+        let change = change.normalized();
+        change.validate().map_err(SessionError::Media)?;
         self.commands
             .send(Command::Video(change))
             .map_err(|_| SessionError::Network("la sesión terminó".into()))
@@ -1905,6 +1949,41 @@ mod tests {
     use super::*;
     use crate::loopback::NullSink;
     use coroom_capture::synthetic::SyntheticCapturer;
+
+    /// Un cambio de vídeo con tamaño impar o nulo, o fps nulos, no vale; el vacío sí.
+    #[test]
+    fn a_video_change_rounds_odd_sizes_down_and_rejects_empty_ones() {
+        assert_eq!(VideoChange::default().validate(), Ok(()));
+        let ok = VideoChange {
+            max_size: Some((1280, 720)),
+            fps: Some(120),
+            ..VideoChange::default()
+        };
+        assert_eq!(ok.validate(), Ok(()));
+        for (odd, rounded) in [((1281, 720), (1280, 720)), ((1199, 808), (1198, 808))] {
+            let change = VideoChange {
+                max_size: Some(odd),
+                ..VideoChange::default()
+            }
+            .normalized();
+            assert_eq!(change.max_size, Some(rounded));
+            assert_eq!(change.validate(), Ok(()));
+        }
+        for size in [(0, 720), (1280, 0), (1, 1)] {
+            let change = VideoChange {
+                max_size: Some(size),
+                ..VideoChange::default()
+            }
+            .normalized();
+            let err = change.validate().expect_err("tamaño inválido");
+            assert!(err.contains("2×2"), "{err}");
+        }
+        let change = VideoChange {
+            fps: Some(0),
+            ..VideoChange::default()
+        };
+        assert!(change.validate().is_err());
+    }
 
     #[test]
     fn rate_limits_keep_the_usual_maxima_and_tame_unlimited() {

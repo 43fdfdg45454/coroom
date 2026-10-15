@@ -51,7 +51,7 @@ use coroom_transport::loopback::{UdpLoopback, UdpReceiver, UdpSender};
 use crossbeam_channel::{
     Receiver, RecvTimeoutError, SendTimeoutError, Sender, TrySendError, bounded,
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::latency::{LatencyLedger, LatencySummary, Stage};
 use crate::preview::{PreviewTap, PreviewWorker};
@@ -66,9 +66,10 @@ const POLL: Duration = Duration::from_millis(50);
 /// Parámetros del pipeline local.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoopbackConfig {
-    /// Ancho pedido al codificador (la captura de pantalla puede traer su propio tamaño).
+    /// Ancho máximo del flujo: la captura de pantalla trae su propio tamaño y el codificador lo
+    /// reduce si no cabe ([`LoopbackConfig::stream_size`]).
     pub width: u32,
-    /// Alto pedido al codificador.
+    /// Alto máximo del flujo.
     pub height: u32,
     /// Fotogramas por segundo objetivo.
     pub fps: u32,
@@ -119,11 +120,22 @@ impl LoopbackConfig {
             .unwrap_or(VideoFormat::SDR_420)
     }
 
-    /// Lo que se le pide a la captura: los fps y, con HDR, imágenes en coma flotante.
+    /// Tamaño del flujo cuando la captura entrega `captured`: lo mismo si cabe en el tope
+    /// (`width × height`), y si no, reducido a lo que cabe con su proporción y lados pares
+    /// ([`coroom_transport::proto::video::fit`], la regla que aplican el codificador y la captura
+    /// sintética).
+    pub fn stream_size(&self, captured: (u32, u32)) -> (u32, u32) {
+        coroom_transport::proto::video::fit(captured, (self.width, self.height))
+    }
+
+    /// Lo que se le pide a la captura: los fps, el tamaño máximo (lo aplica la fuente que elige
+    /// el suyo, la sintética; la pantalla llega con el de la fuente y el codificador lo reduce) y,
+    /// con HDR, imágenes en coma flotante.
     pub fn capture_options(&self) -> CaptureOptions {
         CaptureOptions {
             max_fps: self.fps,
             hdr: self.hdr,
+            max_size: Some((self.width, self.height)),
         }
     }
 
@@ -361,6 +373,14 @@ pub(crate) struct Shared {
     pub(crate) counters: Counters,
     /// Captura nueva, ya arrancada, que el hilo `capture` adopta (cambio de fuente en marcha).
     pub(crate) next_capturer: CapturerSlot,
+    /// Opciones nuevas para la captura en marcha (fps o tamaño máximo cambiados con la sala
+    /// abierta): el hilo `capture` se las pasa a la suya y a la que adopte después.
+    capture_options: Mutex<Option<CaptureOptions>>,
+    capture_options_pending: AtomicBool,
+    /// Tamaño del último fotograma que entregó la captura (lo anota el hilo `encode`): con él y
+    /// el tope, la sesión sabe el tamaño del flujo antes de anunciarlo
+    /// ([`LoopbackConfig::stream_size`]).
+    captured_size: Mutex<Option<(u32, u32)>>,
     /// A quién avisar del cursor entre fotogramas (lo pone el hilo `present` con su sumidero).
     cursor_sink: CursorSinkSlot,
 }
@@ -430,6 +450,52 @@ impl fmt::Debug for CapturerSlot {
 impl Shared {
     pub(crate) fn stopping(&self) -> bool {
         self.stop.load(Ordering::Acquire)
+    }
+
+    /// Deja opciones nuevas para la captura en marcha (gana la última).
+    pub(crate) fn set_capture_options(&self, options: CaptureOptions) {
+        *self
+            .capture_options
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(options);
+        self.capture_options_pending.store(true, Ordering::Release);
+    }
+
+    /// Las opciones nuevas aún sin aplicar, una vez.
+    pub(crate) fn take_capture_options(&self) -> Option<CaptureOptions> {
+        if !self.capture_options_pending.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        self.latest_capture_options()
+    }
+
+    /// Las últimas opciones cambiadas en marcha, si las hubo (para la captura que se adopta).
+    pub(crate) fn latest_capture_options(&self) -> Option<CaptureOptions> {
+        *self
+            .capture_options
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Anota el tamaño del fotograma que acaba de entregar la captura; `true` si cambió.
+    pub(crate) fn note_captured_size(&self, size: (u32, u32)) -> bool {
+        let mut known = self
+            .captured_size
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if *known == Some(size) {
+            return false;
+        }
+        *known = Some(size);
+        true
+    }
+
+    /// Tamaño del último fotograma de la captura, si ya llegó alguno.
+    pub(crate) fn captured_size(&self) -> Option<(u32, u32)> {
+        *self
+            .captured_size
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Termina el pipeline; guarda el primer error, si lo hay.
@@ -622,7 +688,13 @@ pub(crate) struct EncodeControl {
     /// Codificador ya configurado que el hilo `encode` adopta antes del siguiente fotograma (su
     /// primer fotograma es intra).
     pub(crate) next: Mutex<Option<Box<dyn Encoder>>>,
+    /// A quién avisar cuando cambia el tamaño del flujo que produce el codificador (la captura
+    /// trae otro tamaño, o el tope lo reduce): el anfitrión reenvía `HostFrameSize`.
+    size_listener: Mutex<Option<SizeListener>>,
 }
+
+/// Aviso del tamaño nuevo del flujo ([`EncodeControl::set_size_listener`]).
+pub(crate) type SizeListener = Box<dyn Fn((u32, u32)) + Send + Sync>;
 
 impl EncodeControl {
     pub(crate) fn new(bitrate_kbps: u32) -> Self {
@@ -630,12 +702,32 @@ impl EncodeControl {
             bitrate_kbps: AtomicU32::new(bitrate_kbps),
             active: AtomicBool::new(false),
             next: Mutex::new(None),
+            size_listener: Mutex::new(None),
         }
     }
 
     /// Entrega un codificador nuevo al hilo `encode`.
     pub(crate) fn replace(&self, encoder: Box<dyn Encoder>) {
         *self.next.lock().unwrap_or_else(PoisonError::into_inner) = Some(encoder);
+    }
+
+    /// A quién avisar cuando cambie el tamaño del flujo.
+    pub(crate) fn set_size_listener(&self, listener: SizeListener) {
+        *self
+            .size_listener
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(listener);
+    }
+
+    fn output_size_changed(&self, size: (u32, u32)) {
+        if let Some(listener) = self
+            .size_listener
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            listener(size);
+        }
     }
 
     fn take_next(&self) -> Option<Box<dyn Encoder>> {
@@ -963,13 +1055,22 @@ pub(crate) fn capture_loop(
 ) -> Result<(), PipelineError> {
     let result = (|| {
         while !shared.stopping() {
-            if let Some(next) = shared.next_capturer.take() {
+            if let Some(mut next) = shared.next_capturer.take() {
                 // Cambio de fuente: la de antes suelta su sesión (y en Linux su portal) y la
-                // nueva empieza con un intra, que con otro tamaño reabre el codificador.
+                // nueva empieza con un intra, que con otro tamaño reabre el codificador. Si los
+                // fps o el tamaño cambiaron en marcha, la nueva los lleva también.
                 capturer.stop();
+                if let Some(options) = shared.latest_capture_options() {
+                    next.set_options(options);
+                }
                 capturer = next;
                 shared.request_keyframe();
                 debug!("captura sustituida");
+            }
+            if let Some(options) = shared.take_capture_options() {
+                // fps o tamaño máximo cambiados con la sala abierta.
+                let applied = capturer.set_options(options);
+                debug!(?applied, "opciones de la captura en marcha");
             }
             let Some(frame) = capturer
                 .next_frame_timeout(POLL)
@@ -1108,6 +1209,54 @@ fn stash(
     }
 }
 
+/// Una reducción en marcha: tamaño de la captura y tamaño del flujo.
+type ScalePair = ((u32, u32), (u32, u32));
+
+/// Tras codificar: si el flujo cambió de tamaño (otra captura, o el tope que la reduce), lo dice
+/// una vez por el registro y avisa al anfitrión ([`EncodeControl::set_size_listener`]); si el
+/// codificador redujo en CPU, anota el coste ([`Counters::record_scale`]) y lo dice una vez por
+/// cada par de tamaños.
+fn note_output_size(
+    encoder: &dyn Encoder,
+    control: Option<&EncodeControl>,
+    output_size: &mut Option<(u32, u32)>,
+    scaling: &mut Option<ScalePair>,
+    shared: &Shared,
+) {
+    if let Some(size) = encoder.output_size()
+        && *output_size != Some(size)
+    {
+        *output_size = Some(size);
+        match shared.captured_size() {
+            Some(captured) if captured != size => info!(
+                width = size.0,
+                height = size.1,
+                captured_width = captured.0,
+                captured_height = captured.1,
+                "flujo reducido al tope de resolución"
+            ),
+            _ => debug!(width = size.0, height = size.1, "tamaño del flujo"),
+        }
+        if let Some(control) = control {
+            control.output_size_changed(size);
+        }
+    }
+    match encoder.cpu_scale() {
+        Some(scale) => {
+            shared.counters.record_scale(scale.took);
+            if *scaling != Some((scale.from, scale.to)) {
+                *scaling = Some((scale.from, scale.to));
+                info!(
+                    %scale,
+                    "reducción en CPU al tope de resolución (libswscale); el coste va en la línea \
+                     periódica del anfitrión"
+                );
+            }
+        }
+        None => *scaling = None,
+    }
+}
+
 /// Deja los slices de un fotograma seguidos en `out` (la ruta de [`Encoder::repeat_last`]).
 fn concat_slices(slices: Vec<EncodedSlice>, out: &mut Vec<u8>) -> Option<EncodedFrame> {
     out.clear();
@@ -1145,6 +1294,10 @@ pub(crate) fn encode_loop(
     let mut preview = PreviewWorker::new();
     // Tamaño del último fotograma comprimido, para reservar el siguiente de una vez.
     let mut expected_len = 0usize;
+    // Tamaño del flujo que produce el codificador (la captura reducida al tope si no cabe) y la
+    // reducción en CPU en marcha, para anunciarlos una vez cuando cambian.
+    let mut output_size: Option<(u32, u32)> = None;
+    let mut scaling: Option<ScalePair> = None;
     loop {
         if shared.stopping() {
             break;
@@ -1187,6 +1340,13 @@ pub(crate) fn encode_loop(
                     ledger.record_drop(Stage::Encoded);
                     recycle(raw);
                     continue;
+                }
+                if shared.note_captured_size((raw.width, raw.height)) {
+                    debug!(
+                        width = raw.width,
+                        height = raw.height,
+                        "tamaño de la captura"
+                    );
                 }
                 Some(raw)
             }
@@ -1254,6 +1414,13 @@ pub(crate) fn encode_loop(
         }
         let encoded_at = Instant::now();
         shared.counters.record_encode(encoded_at - started);
+        note_output_size(
+            encoder.as_ref(),
+            control,
+            &mut output_size,
+            &mut scaling,
+            shared,
+        );
         // El fotograma repetido conserva su id: sus marcas de captura son las del original.
         let Some(frame_id) = raw
             .as_ref()
@@ -1652,6 +1819,79 @@ mod tests {
     use super::*;
     use coroom_capture::synthetic::SyntheticCapturer;
     use coroom_codec::openh264::{OpenH264Decoder, OpenH264Encoder};
+
+    /// Las opciones nuevas de la captura se recogen una vez (gana la última) y la que se adopte
+    /// después las encuentra.
+    #[test]
+    fn live_capture_options_are_taken_once_and_kept_for_the_next_capturer() {
+        let shared = Shared::default();
+        assert_eq!(shared.take_capture_options(), None);
+        assert_eq!(shared.latest_capture_options(), None);
+        let first = CaptureOptions {
+            max_fps: 30,
+            hdr: false,
+            max_size: Some((640, 360)),
+        };
+        let second = CaptureOptions {
+            max_fps: 15,
+            ..first
+        };
+        shared.set_capture_options(first);
+        shared.set_capture_options(second);
+        assert_eq!(shared.take_capture_options(), Some(second));
+        assert_eq!(shared.take_capture_options(), None, "ya aplicadas");
+        assert_eq!(shared.latest_capture_options(), Some(second));
+    }
+
+    /// El tamaño del flujo es el de la captura reducido al tope, con la misma regla en todas
+    /// partes.
+    #[test]
+    fn the_stream_size_is_the_capture_fitted_into_the_maximum() {
+        let video = LoopbackConfig {
+            width: 1920,
+            height: 1080,
+            ..LoopbackConfig::default()
+        };
+        assert_eq!(video.stream_size((3840, 2160)), (1920, 1080));
+        assert_eq!(video.stream_size((2560, 1080)), (1920, 810));
+        assert_eq!(
+            video.stream_size((1366, 768)),
+            (1366, 768),
+            "lo que cabe no se toca"
+        );
+        assert_eq!(
+            video.stream_size((3840, 2160)),
+            coroom_capture::synthetic::fit((3840, 2160), (1920, 1080))
+        );
+        let shared = Shared::default();
+        assert_eq!(shared.captured_size(), None);
+        assert!(shared.note_captured_size((3840, 2160)));
+        assert!(
+            !shared.note_captured_size((3840, 2160)),
+            "sin cambio no avisa"
+        );
+        assert!(shared.note_captured_size((1280, 720)));
+        assert_eq!(shared.captured_size(), Some((1280, 720)));
+    }
+
+    /// Lo que se pide a la captura lleva el tamaño máximo del vídeo.
+    #[test]
+    fn capture_options_carry_the_maximum_size() {
+        let video = LoopbackConfig {
+            width: 1280,
+            height: 720,
+            fps: 90,
+            ..LoopbackConfig::default()
+        };
+        assert_eq!(
+            video.capture_options(),
+            CaptureOptions {
+                max_fps: 90,
+                hdr: false,
+                max_size: Some((1280, 720)),
+            }
+        );
+    }
 
     #[test]
     fn frame_ids_survive_the_32_bit_wrap() {

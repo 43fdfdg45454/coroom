@@ -43,6 +43,8 @@ pub(crate) struct Counters {
     pub(crate) stalled_sends: AtomicU64,
     encode_us: Mutex<Vec<u32>>,
     decode_us: Mutex<Vec<u32>>,
+    /// Reducciones en CPU al tope de resolución (solo cuando la captura no cabe).
+    scale_us: Mutex<Vec<u32>>,
 }
 
 /// Suma uno a un contador.
@@ -120,6 +122,11 @@ impl Counters {
     /// Anota lo que tardó una llamada al decodificador.
     pub(crate) fn record_decode(&self, took: Duration) {
         push_sample(&self.decode_us, took);
+    }
+
+    /// Anota lo que tardó reducir un fotograma en CPU al tope de resolución.
+    pub(crate) fn record_scale(&self, took: Duration) {
+        push_sample(&self.scale_us, took);
     }
 
     fn snapshot(&self) -> [u64; 14] {
@@ -268,15 +275,26 @@ impl StatsWindow {
     ) -> String {
         let (seconds, d, dropped) = self.advance(counters, ledger);
         let (p50, p95) = take_percentiles(&counters.encode_us);
+        let scaled = counters
+            .scale_us
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        let scale = if scaled == 0 {
+            String::new()
+        } else {
+            let (p50, p95) = take_percentiles(&counters.scale_us);
+            format!(" de los que reduce en CPU {scaled} ({p50:.1}/{p95:.1} ms p50/p95)")
+        };
         let fps = |n: u64| n as f64 / seconds;
         let now = coroom_capture::source_counters();
         let source = now.since(std::mem::replace(&mut self.source, now));
         format!(
             "anfitrión: captura {:.1} fps (la fuente da {:.1}: fuera de cadencia {:.1}, solo \
-             cursor {:.1}, repetidos {:.1}), codifica {:.1} fps ({p50:.1}/{p95:.1} ms p50/p95), \
-             envía {:.1} fps, objetivo {target_kbps} kbit/s, real {:.0} kbit/s, intra forzados {} \
-             (agrupados {}), cambios de bitrate {}, sin enviar por enlace atascado {}, descartes \
-             {dropped}",
+             cursor {:.1}, repetidos {:.1}), codifica {:.1} fps ({p50:.1}/{p95:.1} ms \
+             p50/p95){scale}, envía {:.1} fps, objetivo {target_kbps} kbit/s, real {:.0} kbit/s, \
+             intra forzados {} (agrupados {}), cambios de bitrate {}, sin enviar por enlace \
+             atascado {}, descartes {dropped}",
             fps(d[0]),
             fps(source.arrived),
             fps(source.paced_out),

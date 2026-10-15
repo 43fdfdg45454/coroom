@@ -13,6 +13,8 @@ ffmpeg = ["dep:rsmpeg", "dep:ash"]
 
 [dependencies]
 ash = { workspace = true, optional = true }
+# `fit`: el tope de resolución del codificador con la misma regla que la captura y la sesión.
+coroom-proto.workspace = true
 openh264.workspace = true
 rsmpeg = { workspace = true, optional = true }
 # Caché JSON de la calibración de codificadores (`calibrate`).
@@ -25,7 +27,8 @@ yuv.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 
-# Texturas D3D11 de la captura y su importación en los *hw frames* de FFmpeg.
+# Texturas D3D11 de la captura y su importación en los *hw frames* de FFmpeg; la huella del
+# sondeo (`ffmpeg::fingerprint`) enumera los adaptadores por DXGI y lee el registro.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true, features = [
     "Win32_Foundation",
@@ -33,6 +36,7 @@ windows = { workspace = true, features = [
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Registry",
 ] }
 
 [lints]

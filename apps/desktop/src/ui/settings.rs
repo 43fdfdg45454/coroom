@@ -283,15 +283,17 @@ impl Default for Video {
 }
 
 impl Video {
-    /// Cuándo surte efecto cada opción: el códec y el tope del bitrate se cambian con la sala
-    /// abierta (el bitrate sin renegociar nada); el resto, al abrir la próxima.
+    /// Cuándo surte efecto cada opción: el códec, la resolución máxima y los fps se cambian con
+    /// la sala abierta (se reabre el codificador con un intra) y el tope del bitrate también (sin
+    /// renegociar nada); 4:4:4 y HDR, al abrir la próxima (cambian cómo se pide la captura, en
+    /// GPU o en CPU, y eso solo se decide al arrancarla).
     pub fn when(option: VideoOption) -> When {
         match option {
-            VideoOption::Codec | VideoOption::Bitrate => When::Live,
-            VideoOption::Resolution
-            | VideoOption::Fps
-            | VideoOption::Chroma444
-            | VideoOption::Hdr => When::NextRoom,
+            VideoOption::Codec
+            | VideoOption::Bitrate
+            | VideoOption::Resolution
+            | VideoOption::Fps => When::Live,
+            VideoOption::Chroma444 | VideoOption::Hdr => When::NextRoom,
         }
     }
 }
@@ -840,7 +842,10 @@ mod tests {
         settings.video.preset = QualityPreset::Balanced;
         assert_eq!(settings.sanitized().video.preset, QualityPreset::Custom);
         assert_eq!(Video::when(VideoOption::Bitrate), When::Live);
-        assert_eq!(Video::when(VideoOption::Fps), When::NextRoom);
+        assert_eq!(Video::when(VideoOption::Resolution), When::Live);
+        assert_eq!(Video::when(VideoOption::Fps), When::Live);
+        assert_eq!(Video::when(VideoOption::Chroma444), When::NextRoom);
+        assert_eq!(Video::when(VideoOption::Hdr), When::NextRoom);
     }
 
     #[test]

@@ -15,6 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use coroom_render::wgpu::VideoImporter;
+use coroom_session::capture::{RestoreTokenSink, ShareKind};
 use coroom_session::codec::DecodeOutput;
 use coroom_session::latency::{LatencyLedger, LatencySummary};
 use coroom_session::loopback::LoopbackPipeline;
@@ -356,9 +357,11 @@ impl Backend {
             }
             Effect::SetMaxBitrate(kbps) => self.set_video(VideoRequest::MaxBitrate(kbps)),
             Effect::PreviewVisible(visible) => self.set_preview_visible(visible),
-            Effect::SetCodec => self.set_video(VideoRequest::Codec {
+            Effect::SetEncoding => self.set_video(VideoRequest::Encoding {
                 codec: codec_preference(app.settings.video.codec),
                 encoder: app.settings.video.encoder.backend(),
+                max_size: app.settings.video.max_resolution.size(),
+                fps: app.settings.video.fps,
             }),
             Effect::SendChat(text) => self.send_chat(text),
             Effect::ClearChat => self.clear_chat(),
@@ -478,6 +481,14 @@ impl Backend {
                 }
             }
             Effect::SaveSettings => self.save_settings(app, false),
+            Effect::SaveRestoreTokens(tokens) => {
+                let path = crate::portal::restore_tokens_path();
+                self.spawn("portal", move |notify| {
+                    if let Err(err) = tokens.save(&path) {
+                        notify(Message::Event(Event::Failed(err)));
+                    }
+                });
+            }
             Effect::RunDoctor => self.spawn("diagnostico", |notify| {
                 let lines = crate::doctor::report().unwrap_or_else(|err| vec![err]);
                 notify(Message::Event(Event::Doctor(lines)));
@@ -614,12 +625,14 @@ impl Backend {
         let video = host_video(settings);
         tracing::info!(source = ?request.source, share = ?request.share.kind, "cambiando la fuente");
         self.spawn("fuente", move |notify| {
-            let switched =
-                share_source(source, &request.share, video).and_then(|(capturer, share)| {
+            let on_token = restore_token_sink(request.share.kind, Arc::clone(&notify));
+            let switched = share_source(source, &request.share, video, on_token).and_then(
+                |(capturer, share)| {
                     control
                         .switch_capture(capturer, share.map(coroom_session::remote::eis_provider))
                         .map_err(|err| err.to_string())
-                });
+                },
+            );
             if switched.is_ok()
                 && let coroom_session::audio::GameCapture::Apps(filter) = request.audio
                 && let Err(err) = control.set_app_audio(filter)
@@ -634,8 +647,6 @@ impl Backend {
         });
     }
 
-    /// Un cambio de vídeo a la sala abierta: solo el tope del bitrate (enseguida, sin
-    /// renegociar) o solo el códec y el codificador (renegocia con los invitados).
     /// La vista previa está (o no) a la vista: con la sala abierta, se lo dice a la toma.
     fn set_preview_visible(&self, visible: bool) {
         if let Some(session) = lock(&self.host).clone() {
@@ -643,6 +654,9 @@ impl Backend {
         }
     }
 
+    /// Un cambio de vídeo a la sala abierta: solo el tope del bitrate (enseguida, sin
+    /// renegociar) o el códec, el codificador, la resolución máxima y los fps de los ajustes
+    /// (renegocia con los invitados y reabre el codificador con un intra).
     fn set_video(&self, request: VideoRequest) {
         let Some(session) = lock(&self.host).clone() else {
             tracing::warn!("cambio de vídeo sin sala abierta");
@@ -654,13 +668,18 @@ impl Backend {
                 VideoRequest::MaxBitrate(max_kbps) => control
                     .and_then(|control| {
                         control.set_video(coroom_session::remote::VideoChange {
-                            encoders: None,
                             max_kbps: Some(max_kbps),
+                            ..Default::default()
                         })
                     })
                     .map(|()| Some(max_kbps))
                     .map_err(|err| err.to_string()),
-                VideoRequest::Codec { codec, encoder } => {
+                VideoRequest::Encoding {
+                    codec,
+                    encoder,
+                    max_size,
+                    fps,
+                } => {
                     // El sondeo de codificadores ya está hecho (se guarda): esto no abre nada.
                     host_encoders(codec, encoder).and_then(|encoders| {
                         control
@@ -668,6 +687,8 @@ impl Backend {
                                 control.set_video(coroom_session::remote::VideoChange {
                                     encoders: Some(encoders),
                                     max_kbps: None,
+                                    max_size: Some(max_size),
+                                    fps: Some(fps),
                                 })
                             })
                             .map(|()| None)
@@ -765,9 +786,10 @@ impl Backend {
         let preview = VideoFeed::new(None, Arc::clone(&self.wake), None);
         let on_panic: fn(String) -> Event = |reason| Event::HostEnded(Some(reason));
         self.spawn_or("sala", on_panic, move |notify| {
+            let on_token = restore_token_sink(host.share.kind, Arc::clone(&notify));
             let prepared =
                 load_identity(crate::ui::settings::explicit_data_dir().as_deref(), false)
-                    .and_then(|(identity, _)| prepare_host(identity, &host));
+                    .and_then(|(identity, _)| prepare_host(identity, &host, on_token));
             let mut session = match prepared {
                 Ok(session) => session,
                 Err(err) => {
@@ -1584,14 +1606,25 @@ fn lobby_once(
 enum VideoRequest {
     /// Tope del bitrate en kbit/s.
     MaxBitrate(u32),
-    /// Códec preferido (`None`: el mejor común) y codificador.
-    Codec {
+    /// Lo que reabre el codificador: códec preferido (`None`: el mejor común), codificador,
+    /// resolución máxima (ancho × alto) y fps.
+    Encoding {
         codec: Option<coroom_session::codec::Codec>,
         encoder: Option<coroom_session::codec::Backend>,
+        max_size: (u32, u32),
+        fps: u32,
     },
 }
 
 /// Captura que usa la sala para la fuente elegida en la pantalla.
+/// Aviso del backend de captura sobre el token de restauración del portal, hacia la pantalla del
+/// anfitrión (que lo guarda en `portal.json` y lo enseña en Ajustes). En Windows no se llama nunca.
+fn restore_token_sink(kind: ShareKind, notify: Notify) -> Option<RestoreTokenSink> {
+    Some(Box::new(move |token| {
+        notify(Message::Event(Event::ShareRestoreToken(kind, token)));
+    }))
+}
+
 fn host_source(source: SourceChoice) -> Source {
     match source {
         SourceChoice::Screen | SourceChoice::App => Source::Screen,

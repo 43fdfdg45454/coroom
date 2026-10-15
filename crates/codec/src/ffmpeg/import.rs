@@ -27,6 +27,25 @@
 //! de `scale_vulkan` no llevan el uso `VIDEO_ENCODE_SRC` en ese driver), el importador pasa al modo
 //! de respaldo: la misma cadena termina en `hwdownload` y el codificador recibe NV12 en CPU (con
 //! las copias contadas).
+//!
+//! **Tope de resolución**: si la imagen capturada es más grande que lo que cabe en el tope
+//! ([`coroom_proto::video::fit`]), el mismo filtro de conversión la reduce (`w=…:h=…` en
+//! `scale_vulkan`, `scale_vaapi` o `scale_qsv`), sin ningún paso ni copia de más. Lo que ve el
+//! codificador es ya el tamaño reducido. En Windows, por ruta:
+//!
+//! - **QSV**: `scale_qsv=format=nv12:w=…:h=…` tras el `hwmap`; **Vulkan Video**:
+//!   `scale_vulkan=…:w=…:h=…` tras el `hwmap` (ambas, el mismo paso que la conversión).
+//! - **NVENC y AMF**, que toman las texturas BGRA de la captura tal cual (sin filtro): solo cuando
+//!   hay que reducir entra `scale_d3d11` (FFmpeg 8: el procesador de vídeo D3D11,
+//!   `ID3D11VideoProcessor`, en la GPU; opciones `width`/`height` por posición y `format=nv12`
+//!   obligatorio, porque sin él rechaza la salida; `vf_scale_d3d11.c` del commit fijado en
+//!   `tools/ffmpeg.lock`). El codificador recibe entonces NV12 ya reducido. Si la build no trae el
+//!   filtro (depende de `d3d11va` al compilar FFmpeg) o el grafo no abre, se baja la textura BGRA
+//!   a CPU sin reducir (`hwdownload`, una copia) y la ruta de CPU del codificador la reduce con
+//!   libswscale al convertir ([`super::scale`]), con el coste medido en
+//!   [`crate::Encoder::cpu_scale`] y la nota en el registro.
+//! - **Captura en memoria de CPU** (4:4:4, HDR o `COROOM_ZERO_COPY=0`): ruta de CPU común a todos
+//!   los sistemas, libswscale reduce y convierte en un paso antes de subir a la GPU.
 
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
@@ -123,43 +142,59 @@ pub(crate) fn pix_fmt_for_fourcc(fourcc: u32) -> Option<ffi::AVPixelFormat> {
 }
 
 /// Cadena de conversión de color en la GPU de cada codificador (sin el `hwdownload` del respaldo).
-pub(crate) fn conversion_chain(backend: Backend, source: SourceKind) -> Option<&'static str> {
-    match (source, backend) {
+/// Con `scale`, el mismo filtro reduce la imagen a ese tamaño (`w=…:h=…`); sin él, solo convierte.
+pub(crate) fn conversion_chain(
+    backend: Backend,
+    source: SourceKind,
+    scale: Option<(u32, u32)>,
+) -> Option<String> {
+    let size = scale.map_or_else(String::new, |(w, h)| format!(":w={w}:h={h}"));
+    Some(match (source, backend) {
         (SourceKind::DmaBuf, Backend::VulkanVideo) => {
-            Some("scale_vulkan=format=nv12:out_range=limited")
+            format!("scale_vulkan=format=nv12:out_range=limited{size}")
         }
         (SourceKind::DmaBuf, Backend::Vaapi) => {
-            Some("scale_vaapi=format=nv12:out_color_matrix=bt709:out_range=limited")
+            format!("scale_vaapi=format=nv12:out_color_matrix=bt709:out_range=limited{size}")
         }
-        (SourceKind::DmaBuf, Backend::Qsv) => Some(
-            "scale_vaapi=format=nv12:out_color_matrix=bt709:out_range=limited,\
-             hwmap=derive_device=qsv,format=qsv",
+        (SourceKind::DmaBuf, Backend::Qsv) => format!(
+            "scale_vaapi=format=nv12:out_color_matrix=bt709:out_range=limited{size},\
+             hwmap=derive_device=qsv,format=qsv"
         ),
-        (SourceKind::D3D11, Backend::Qsv) => Some("hwmap=derive_device=qsv,scale_qsv=format=nv12"),
-        (SourceKind::D3D11, Backend::VulkanVideo) => {
-            Some("hwmap=derive_device=vulkan,scale_vulkan=format=nv12:out_range=limited")
+        (SourceKind::D3D11, Backend::Qsv) => {
+            format!("hwmap=derive_device=qsv,scale_qsv=format=nv12{size}")
         }
-        // NVENC y AMF aceptan las texturas BGRA de D3D11 sin conversión.
-        (SourceKind::D3D11, Backend::Nvenc | Backend::Amf) => Some(""),
-        _ => None,
-    }
+        (SourceKind::D3D11, Backend::VulkanVideo) => {
+            format!("hwmap=derive_device=vulkan,scale_vulkan=format=nv12:out_range=limited{size}")
+        }
+        // NVENC y AMF aceptan las texturas BGRA de D3D11 sin conversión; solo si hay que reducir
+        // entra `scale_d3d11` (FFmpeg 8). Sus opciones son `width` y `height` (sin alias `w`/`h`:
+        // van por posición) y `format`, que hay que dar porque sin él no acepta ninguna salida
+        // (solo NV12 o P010).
+        (SourceKind::D3D11, Backend::Nvenc | Backend::Amf) => match scale {
+            Some((w, h)) => format!("scale_d3d11={w}:{h}:format=nv12"),
+            None => String::new(),
+        },
+        _ => return None,
+    })
 }
 
-/// Cadena completa para el modo `mode` (en el de respaldo, con `hwdownload` a NV12).
+/// Cadena completa para el modo `mode` (en el de respaldo, con `hwdownload` a NV12), con la
+/// reducción a `scale` si hace falta.
 pub(crate) fn filter_chain(
     backend: Backend,
     source: SourceKind,
     mode: ImportMode,
+    scale: Option<(u32, u32)>,
 ) -> Option<String> {
-    let conversion = conversion_chain(backend, source)?;
+    let conversion = conversion_chain(backend, source, scale)?;
     Some(match (mode, conversion.is_empty()) {
-        (ImportMode::Zero, _) => conversion.to_owned(),
+        (ImportMode::Zero, _) => conversion,
         // La parte QSV no hace falta para bajar: se baja desde VA-API.
         (ImportMode::Download, false) => {
             let base = conversion
                 .split(",hwmap=derive_device=qsv")
                 .next()
-                .unwrap_or(conversion);
+                .unwrap_or(conversion.as_str());
             format!("{base},hwdownload,format=nv12")
         }
         (ImportMode::Download, true) => "hwdownload,format=bgra".to_owned(),
@@ -190,10 +225,12 @@ impl SourceKind {
     }
 }
 
-/// Importador de un tamaño y un tipo de imagen.
+/// Importador de un tamaño y un tipo de imagen, que entrega imágenes de `output` (las capturadas
+/// reducidas al tope si no caben).
 pub(crate) struct GpuImporter {
     source: SourceKind,
     size: (u32, u32),
+    output: (u32, u32),
     mode: ImportMode,
     /// Contexto donde aterrizan las imágenes (mapeadas o copiadas en la GPU).
     landing: AVHWFramesContext,
@@ -216,6 +253,7 @@ impl std::fmt::Debug for GpuImporter {
         f.debug_struct("GpuImporter")
             .field("source", &self.source)
             .field("size", &self.size)
+            .field("output", &self.output)
             .field("mode", &self.mode)
             .field("filter", &self.filter)
             .finish_non_exhaustive()
@@ -232,20 +270,22 @@ fn check(what: &str, ret: i32) -> Result<(), String> {
 }
 
 impl GpuImporter {
-    /// Prepara la importación de imágenes como `image` para el codificador `backend`, cuyo
-    /// dispositivo es `device`.
+    /// Prepara la importación de imágenes como `image`, de `size`, para el codificador `backend`,
+    /// cuyo dispositivo es `device`; lo que sale mide `output` (igual a `size`, o menor si la
+    /// captura no cabe en el tope: la reducción va en el filtro de conversión).
     pub(crate) fn new(
         backend: Backend,
         device: Option<&AVHWDeviceContext>,
         image: &GpuImage,
         size: (u32, u32),
+        output: (u32, u32),
         mode: ImportMode,
     ) -> Result<Self, String> {
         let source = SourceKind::of(image)
             .ok_or_else(|| format!("las imágenes {} no se importan", image.kind()))?;
         match source {
-            SourceKind::DmaBuf => Self::new_dmabuf(backend, device, image, size, mode),
-            SourceKind::D3D11 => Self::new_d3d11(backend, image, size, mode),
+            SourceKind::DmaBuf => Self::new_dmabuf(backend, device, image, size, output, mode),
+            SourceKind::D3D11 => Self::new_d3d11(backend, image, size, output, mode),
         }
     }
 
@@ -255,6 +295,7 @@ impl GpuImporter {
         device: Option<&AVHWDeviceContext>,
         image: &GpuImage,
         size: (u32, u32),
+        output: (u32, u32),
         mode: ImportMode,
     ) -> Result<Self, String> {
         let GpuImage::DmaBuf(dmabuf) = image else {
@@ -266,7 +307,8 @@ impl GpuImporter {
                 crate::gpu::fourcc_name(dmabuf.fourcc)
             )
         })?;
-        let chain = filter_chain(backend, SourceKind::DmaBuf, mode)
+        let scale = (output != size).then_some(output);
+        let chain = filter_chain(backend, SourceKind::DmaBuf, mode, scale)
             .ok_or_else(|| format!("{backend} no importa DMA-BUF en FFmpeg 8.1"))?;
         let device =
             device.ok_or_else(|| format!("el codificador {backend} no tiene dispositivo"))?;
@@ -314,6 +356,7 @@ impl GpuImporter {
         Ok(Self {
             source: SourceKind::DmaBuf,
             size,
+            output,
             mode,
             landing,
             landing_format,
@@ -330,6 +373,7 @@ impl GpuImporter {
         _device: Option<&AVHWDeviceContext>,
         _image: &GpuImage,
         _size: (u32, u32),
+        _output: (u32, u32),
         _mode: ImportMode,
     ) -> Result<Self, String> {
         Err(format!("{backend}: los DMA-BUF solo se importan en Linux"))
@@ -340,13 +384,31 @@ impl GpuImporter {
         backend: Backend,
         image: &GpuImage,
         size: (u32, u32),
+        output: (u32, u32),
         mode: ImportMode,
     ) -> Result<Self, String> {
         let GpuImage::D3D11(texture) = image else {
             return Err("se esperaba una textura D3D11".to_owned());
         };
-        let chain = filter_chain(backend, SourceKind::D3D11, mode)
+        let scale = (output != size).then_some(output);
+        let mut chain = filter_chain(backend, SourceKind::D3D11, mode, scale)
             .ok_or_else(|| format!("{backend} no recibe texturas D3D11"))?;
+        if chain.contains("scale_d3d11") && !super::filter::exists(c"scale_d3d11") {
+            match mode {
+                // Sin el filtro no hay reducción en la GPU: el codificador baja a CPU y reduce ahí.
+                ImportMode::Zero => {
+                    return Err(format!(
+                        "esta build de FFmpeg no trae scale_d3d11: {backend} no reduce las texturas \
+                         D3D11 de {}×{} a {}×{} en la GPU; se bajan a CPU y se reducen allí",
+                        size.0, size.1, output.0, output.1
+                    ));
+                }
+                ImportMode::Download => {
+                    chain = filter_chain(backend, SourceKind::D3D11, mode, None)
+                        .ok_or_else(|| format!("{backend} no recibe texturas D3D11"))?;
+                }
+            }
+        }
         let d3d11 = d3d11::Device::new(&texture.device)?;
         let landing = d3d11.pool(size)?;
         let filter = if chain.is_empty() {
@@ -362,6 +424,7 @@ impl GpuImporter {
         Ok(Self {
             source: SourceKind::D3D11,
             size,
+            output,
             mode,
             landing,
             landing_format: ffi::AV_PIX_FMT_D3D11,
@@ -377,6 +440,7 @@ impl GpuImporter {
         backend: Backend,
         _image: &GpuImage,
         _size: (u32, u32),
+        _output: (u32, u32),
         _mode: ImportMode,
     ) -> Result<Self, String> {
         Err(format!(
@@ -389,9 +453,9 @@ impl GpuImporter {
         self.mode
     }
 
-    /// Si sirve para `image` de `size`.
-    pub(crate) fn matches(&self, image: &GpuImage, size: (u32, u32)) -> bool {
-        SourceKind::of(image) == Some(self.source) && self.size == size
+    /// Si sirve para `image` de `size` con salida de `output` (un tope nuevo rehace la cadena).
+    pub(crate) fn matches(&self, image: &GpuImage, size: (u32, u32), output: (u32, u32)) -> bool {
+        SourceKind::of(image) == Some(self.source) && self.size == size && self.output == output
     }
 
     /// Contexto de *hw frames* con el que hay que abrir el codificador (modo
@@ -968,27 +1032,33 @@ mod tests {
     #[test]
     fn every_import_path_has_its_chain() {
         assert_eq!(
-            filter_chain(Backend::VulkanVideo, SourceKind::DmaBuf, ImportMode::Zero).as_deref(),
+            filter_chain(
+                Backend::VulkanVideo,
+                SourceKind::DmaBuf,
+                ImportMode::Zero,
+                None
+            )
+            .as_deref(),
             Some("scale_vulkan=format=nv12:out_range=limited")
         );
         assert_eq!(
-            filter_chain(Backend::Qsv, SourceKind::DmaBuf, ImportMode::Download).as_deref(),
+            filter_chain(Backend::Qsv, SourceKind::DmaBuf, ImportMode::Download, None).as_deref(),
             Some(
                 "scale_vaapi=format=nv12:out_color_matrix=bt709:out_range=limited,hwdownload,\
                  format=nv12"
             )
         );
         assert_eq!(
-            filter_chain(Backend::Nvenc, SourceKind::D3D11, ImportMode::Zero).as_deref(),
+            filter_chain(Backend::Nvenc, SourceKind::D3D11, ImportMode::Zero, None).as_deref(),
             Some("")
         );
         assert_eq!(
-            filter_chain(Backend::Nvenc, SourceKind::DmaBuf, ImportMode::Zero),
+            filter_chain(Backend::Nvenc, SourceKind::DmaBuf, ImportMode::Zero, None),
             None,
             "FFmpeg 8.1 no importa DMA-BUF en NVENC"
         );
         assert_eq!(
-            filter_chain(Backend::Software, SourceKind::D3D11, ImportMode::Zero),
+            filter_chain(Backend::Software, SourceKind::D3D11, ImportMode::Zero, None),
             None
         );
         assert_eq!(
@@ -998,9 +1068,77 @@ mod tests {
         assert_eq!(pix_fmt_for_fourcc(0), None);
     }
 
-    /// Los filtros de las cadenas existen en la build de FFmpeg (los de Windows, solo allí).
+    /// La reducción al tope va en el propio filtro de conversión (`w=…:h=…`), y solo cuando hay
+    /// que reducir: sin tope que apriete, la cadena es la de siempre.
+    #[test]
+    fn the_conversion_filter_scales_only_when_the_frame_exceeds_the_cap() {
+        let scaled =
+            |backend, source, mode| filter_chain(backend, source, mode, Some((1920, 1080)));
+        assert_eq!(
+            scaled(Backend::VulkanVideo, SourceKind::DmaBuf, ImportMode::Zero).as_deref(),
+            Some("scale_vulkan=format=nv12:out_range=limited:w=1920:h=1080")
+        );
+        assert_eq!(
+            scaled(Backend::Vaapi, SourceKind::DmaBuf, ImportMode::Zero).as_deref(),
+            Some("scale_vaapi=format=nv12:out_color_matrix=bt709:out_range=limited:w=1920:h=1080")
+        );
+        assert_eq!(
+            scaled(Backend::Qsv, SourceKind::DmaBuf, ImportMode::Zero).as_deref(),
+            Some(
+                "scale_vaapi=format=nv12:out_color_matrix=bt709:out_range=limited:w=1920:h=1080,\
+                 hwmap=derive_device=qsv,format=qsv"
+            )
+        );
+        assert_eq!(
+            scaled(Backend::Qsv, SourceKind::DmaBuf, ImportMode::Download).as_deref(),
+            Some(
+                "scale_vaapi=format=nv12:out_color_matrix=bt709:out_range=limited:w=1920:h=1080,\
+                 hwdownload,format=nv12"
+            ),
+            "el respaldo baja ya reducido"
+        );
+        assert_eq!(
+            scaled(Backend::Qsv, SourceKind::D3D11, ImportMode::Zero).as_deref(),
+            Some("hwmap=derive_device=qsv,scale_qsv=format=nv12:w=1920:h=1080")
+        );
+        assert_eq!(
+            scaled(Backend::Nvenc, SourceKind::D3D11, ImportMode::Zero).as_deref(),
+            Some("scale_d3d11=1920:1080:format=nv12"),
+            "NVENC y AMF solo filtran si hay que reducir; `format` es obligatorio en scale_d3d11"
+        );
+        assert_eq!(
+            scaled(Backend::Amf, SourceKind::D3D11, ImportMode::Download).as_deref(),
+            Some("scale_d3d11=1920:1080:format=nv12,hwdownload,format=nv12")
+        );
+        // Sin reducción no aparece ningún `w=`/`h=` en ninguna cadena.
+        for backend in Backend::ALL {
+            for source in [SourceKind::DmaBuf, SourceKind::D3D11] {
+                for mode in [ImportMode::Zero, ImportMode::Download] {
+                    if let Some(chain) = filter_chain(backend, source, mode, None) {
+                        assert!(
+                            !chain.contains("w="),
+                            "{backend} {source:?} {mode:?}: {chain}"
+                        );
+                        assert!(!chain.contains("scale_d3d11"), "{chain}");
+                    }
+                    if let Some(chain) = filter_chain(backend, source, mode, Some((1280, 720))) {
+                        assert!(
+                            chain.contains("w=1280:h=720")
+                                || chain.contains("scale_d3d11=1280:720:format=nv12"),
+                            "{backend} {source:?} {mode:?}: {chain}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Los filtros de las cadenas existen en la build de FFmpeg (los de Windows, solo allí; si
+    /// `scale_d3d11` faltara, `new_d3d11` lo detecta y la reducción pasa a la ruta de CPU).
     #[test]
     fn the_conversion_filters_exist() {
+        assert!(super::super::filter::exists(c"scale"));
+        assert!(!super::super::filter::exists(c"scale_coroom_inexistente"));
         let mut names = vec![
             "scale_vulkan",
             "scale_vaapi",
@@ -1010,6 +1148,7 @@ mod tests {
         ];
         if cfg!(windows) {
             names.push("scale_qsv");
+            names.push("scale_d3d11");
         }
         for name in names {
             let name = std::ffi::CString::new(name).unwrap_or_default();

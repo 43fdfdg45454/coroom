@@ -9,6 +9,11 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Añadido
 
+- **El permiso de compartir la pantalla se recuerda** (Linux): el diálogo del portal sale una
+  vez; el token de restauración se guarda en `portal.json` del directorio de datos (solo legible
+  por el usuario), por separado para pantalla y ventana, y lo usan la aplicación, `coroom host`
+  y `coroom probe`. Si deja de valer (revocado desde Ajustes del sistema, sesión caducada) se
+  pregunta de nuevo una sola vez. Ajustes → Sala tiene «Olvidar el permiso de pantalla».
 - **«Pedir entrar»** (protocolo 13; hay que actualizar también el servidor): la lista de amigos
   de Inicio dice qué hace cada uno (Disponible, En sala, Jugando o Desconectado) al momento, y a
   quien tiene una sala abierta se le puede pedir entrar con un botón; al anfitrión le aparece en
@@ -174,6 +179,10 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
   ese momento aparecía o se iba un toast, y también al abrir o cerrar el menú de la cuenta o el
   diagnóstico: la raíz de la interfaz cambiaba de forma e iced tiraba el desplazamiento. Ahora la
   forma es siempre la misma.
+- **La caché del sondeo de códecs (`codecs.json`) funciona también en Windows**: la huella de la
+  máquina recoge la versión del sistema, los adaptadores de DXGI con la versión de su driver, los
+  drivers de Vulkan del registro y las DLL de NVENC/NVDEC, AMF, QSV y Direct3D, sin abrir la GPU;
+  antes el sondeo se repetía en cada arranque, como en Linux.
 - El aviso «Los invitados entran con la voz permitida» de Compartir va en tono neutro: el tono
   de información lleva el color de acento del sistema y con un acento rojo se leía como error.
 - «Audio que se envía» muestra el nombre del ejecutable («kodi») cuando PipeWire solo da el
@@ -413,6 +422,20 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Cambiado
 
+- **Resolución máxima y fps con la sala abierta**: ya no esperan a la próxima sala. La captura
+  adopta la cadencia y el tamaño nuevos, el codificador se reabre con un intra y los invitados
+  siguen viendo sin cortes; 4:4:4 y HDR siguen aplicándose al abrir la sala, porque deciden cómo
+  arranca la captura. En pantalla, la captura solo puede bajar fps en marcha; subirlos por encima
+  de lo negociado espera a la próxima captura.
+- **La resolución máxima es un tope real** también para la captura de pantalla y de ventana, en
+  Linux y Windows: lo que la captura trae por encima se reduce con su proporción (en el mismo
+  filtro de la GPU que la conversión de formato en la ruta sin copias, `scale_vulkan`,
+  `scale_vaapi` y `scale_qsv`, y `scale_d3d11` para NVENC y AMF; con libswscale en un solo paso
+  en la ruta de CPU, con el coste medido en el registro), y `HostFrameSize` y `CodecSelected`
+  anuncian el tamaño que de verdad se envía. Antes el codificador se reabría al tamaño que
+  entregaba la captura y una pantalla 4K iba a 4K aunque se pidiera 1080p.
+- Un tope de resolución impar con la sala abierta (321×181) se redondea a par hacia abajo, como
+  al abrir la sala, en vez de rechazarse.
 - El control de tasa del vídeo sigue al enlace medido: VBV de un fotograma que acompaña al
   bitrate (SVT-AV1 exige al menos 20 ms), tope en 1,25 × lo recibido, un segundo de espera tras
   cada recorte, vía rápida con dos informes seguidos de 50 ms o más de cola, la FEC descontada

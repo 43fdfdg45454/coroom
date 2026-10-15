@@ -121,6 +121,9 @@ fn bounce(step: u64, span: usize) -> usize {
 /// Capturador de un patrón sintético en movimiento.
 #[derive(Debug)]
 pub struct SyntheticCapturer {
+    /// Tamaño propio (el del constructor); el entregado es este reducido a
+    /// [`CaptureOptions::max_size`] si no cabe.
+    native: (u32, u32),
     width: u32,
     height: u32,
     period: Duration,
@@ -145,24 +148,12 @@ impl SyntheticCapturer {
         let width = width.max(1);
         let height = height.max(1);
         let fps = fps.max(1);
-        let row_len = width as usize + PERIOD;
-        let band_rows = (0..BANDS)
-            .map(|band| {
-                let mut row = Vec::with_capacity(row_len * 4);
-                for x in 0..row_len {
-                    let t = (x % PERIOD) as u8;
-                    let tint = (band * 255 / (BANDS - 1)) as u8;
-                    // B, G, R, A.
-                    row.extend_from_slice(&[tint, 255 - t, t, 255]);
-                }
-                row
-            })
-            .collect();
         Self {
+            native: (width, height),
             width,
             height,
             period: Duration::from_secs(1) / fps,
-            band_rows,
+            band_rows: band_rows(width),
             white_row: [255u8, 255, 255, 255].repeat(width as usize),
             black_row: [0u8, 0, 0, 255].repeat(width as usize),
             next_tick: None,
@@ -171,6 +162,18 @@ impl SyntheticCapturer {
             cursor_shape: Arc::new(cursor_shape()),
             hdr: None,
         }
+    }
+
+    /// Cambia el tamaño entregado (las filas base se rehacen para el ancho nuevo).
+    fn set_size(&mut self, (width, height): (u32, u32)) {
+        if (width, height) == (self.width, self.height) {
+            return;
+        }
+        self.width = width;
+        self.height = height;
+        self.band_rows = band_rows(width);
+        self.white_row = [255u8, 255, 255, 255].repeat(width as usize);
+        self.black_row = [0u8, 0, 0, 255].repeat(width as usize);
     }
 
     /// Pasa el patrón SDR (BGRA) a RGBA de medio flotante en scRGB, con el bloque a
@@ -369,12 +372,46 @@ impl Capturer for SyntheticCapturer {
         self.next_tick = None;
     }
 
-    /// Con `hdr`, el patrón sale en scRGB de medio flotante. La cadencia es la del constructor.
+    /// Con `hdr`, el patrón sale en scRGB de medio flotante. La cadencia pasa a `max_fps` (también
+    /// en marcha: el siguiente fotograma ya va al ritmo nuevo) y el tamaño, al propio reducido a
+    /// `max_size` si no cabe ([`fit`]).
     fn set_options(&mut self, options: CaptureOptions) -> CaptureOptions {
         self.hdr = options.hdr.then(|| Box::new(hdr_table()));
+        let period = Duration::from_secs(1) / options.max_fps.max(1);
+        if period != self.period {
+            self.period = period;
+            if self.next_tick.is_some() {
+                self.next_tick = Some(Instant::now() + period);
+            }
+        }
+        self.set_size(match options.max_size {
+            Some(max) => fit(self.native, max),
+            None => self.native,
+        });
         options
     }
 }
+
+/// Filas base de cada banda para `width`: `width + PERIOD` píxeles BGRA.
+fn band_rows(width: u32) -> Vec<Vec<u8>> {
+    let row_len = width as usize + PERIOD;
+    (0..BANDS)
+        .map(|band| {
+            let mut row = Vec::with_capacity(row_len * 4);
+            for x in 0..row_len {
+                let t = (x % PERIOD) as u8;
+                let tint = (band * 255 / (BANDS - 1)) as u8;
+                // B, G, R, A.
+                row.extend_from_slice(&[tint, 255 - t, t, 255]);
+            }
+            row
+        })
+        .collect()
+}
+
+/// Reducción al tamaño máximo con la misma regla que el codificador y la sesión
+/// ([`coroom_proto::video::fit`]): proporción, lados pares, nunca ampliado.
+pub use coroom_proto::video::fit;
 
 #[cfg(test)]
 mod tests {
@@ -391,6 +428,7 @@ mod tests {
         let options = CaptureOptions {
             max_fps: 120,
             hdr: true,
+            max_size: None,
         };
         assert_eq!(capturer.set_options(options), options);
         let target = capturer.targets().unwrap().remove(0);
@@ -423,6 +461,53 @@ mod tests {
                 name: "Sintético".into()
             }]
         );
+    }
+
+    /// Con la captura en marcha, `set_options` cambia la cadencia y reduce el tamaño al máximo
+    /// pedido (con la proporción y lados pares); sin máximo, vuelve al propio.
+    #[test]
+    fn options_change_the_cadence_and_the_size_while_running() {
+        let mut capturer = SyntheticCapturer::new(640, 360, 100);
+        let target = capturer.targets().unwrap().remove(0);
+        capturer.start(&target).unwrap();
+        let first = capturer.next_frame().unwrap();
+        assert_eq!((first.width, first.height), (640, 360));
+        capturer.set_options(CaptureOptions {
+            max_fps: 50,
+            hdr: false,
+            max_size: Some((320, 180)),
+        });
+        assert_eq!(capturer.period(), Duration::from_millis(20));
+        let frame = capturer.next_frame().unwrap();
+        assert_eq!((frame.width, frame.height), (320, 180));
+        let FramePixels::Bgra { data, stride } = &frame.pixels else {
+            panic!("se esperaba BGRA en CPU");
+        };
+        assert_eq!(*stride, 320 * 4);
+        assert_eq!(data.len(), 320 * 4 * 180);
+        let next = capturer.next_frame().unwrap();
+        assert!(
+            next.captured_at - frame.captured_at >= Duration::from_millis(19),
+            "cadencia de 20 ms"
+        );
+        // Un máximo mayor que el propio no amplía; sin máximo, el propio.
+        capturer.set_options(CaptureOptions {
+            max_fps: 50,
+            hdr: false,
+            max_size: Some((1920, 1080)),
+        });
+        let frame = capturer.next_frame().unwrap();
+        assert_eq!((frame.width, frame.height), (640, 360));
+        capturer.set_options(CaptureOptions {
+            max_fps: 50,
+            hdr: false,
+            max_size: Some((300, 300)),
+        });
+        let frame = capturer.next_frame().unwrap();
+        assert_eq!((frame.width, frame.height), (300, 168));
+        capturer.set_options(CaptureOptions::default());
+        let frame = capturer.next_frame().unwrap();
+        assert_eq!((frame.width, frame.height), (640, 360));
     }
 
     #[test]

@@ -344,6 +344,7 @@ impl Runner {
         }));
 
         let mut app = App::new(settings, appearance, fonts, Instant::now());
+        app.host.restore_tokens = crate::portal::load_restore_tokens();
         if let Some(warning) = warning {
             app.toast(coroom_ui::theme::Tone::Warning, warning);
         }

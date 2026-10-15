@@ -47,6 +47,7 @@
 #![allow(unsafe_code)]
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -163,6 +164,71 @@ struct PortalStream {
     restore_token: Option<String>,
     /// Token de la sesión `RemoteDesktop` de la entrada.
     input_token: Option<String>,
+    /// El token de restauración que se pasó no sirvió y hubo que preguntar sin él.
+    token_rejected: bool,
+}
+
+/// Por qué no arrancó la sesión del portal y si, antes, el token de restauración se rechazó (hay
+/// que olvidarlo aunque el intento sin él tampoco haya salido).
+struct PortalFailed {
+    error: CaptureError,
+    token_rejected: bool,
+}
+
+/// Por qué no se abrió la sesión `ScreenCast`, según si el usuario ya tuvo delante un diálogo.
+#[derive(Debug)]
+enum PortalFailure {
+    /// El usuario cerró el diálogo o nadie lo contestó a tiempo: volver a pedir sería un segundo
+    /// diálogo.
+    Dialog(CaptureError),
+    /// El portal falló por su cuenta: sin portal, sesión que no vale, socket que no se abre.
+    Portal(CaptureError),
+}
+
+impl PortalFailure {
+    fn into_error(self) -> CaptureError {
+        match self {
+            Self::Dialog(err) | Self::Portal(err) => err,
+        }
+    }
+
+    fn error(&self) -> &CaptureError {
+        match self {
+            Self::Dialog(err) | Self::Portal(err) => err,
+        }
+    }
+
+    /// Si, tras fallar con un token de restauración, merece la pena pedir otra vez sin él: solo
+    /// cuando falló el portal con la sesión (un token caducado o revocado de otra forma), no si el
+    /// usuario ya contestó al diálogo ni si no hay portal con el que hablar.
+    fn worth_asking_again(&self) -> bool {
+        matches!(self, Self::Portal(CaptureError::Backend(_)))
+    }
+}
+
+/// Abre la sesión del portal con el token de restauración guardado y, si el portal no la pudo
+/// restaurar sin que el usuario haya visto ya un diálogo, otra vez sin token: así el diálogo sale
+/// una vez como mucho por arranque. Devuelve el resultado y si el token guardado se rechazó.
+async fn open_restoring<T, F, Fut>(
+    restore_token: Option<String>,
+    mut open: F,
+) -> (Result<T, PortalFailure>, bool)
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: Future<Output = Result<T, PortalFailure>>,
+{
+    let had_token = restore_token.is_some();
+    let first = open(restore_token).await;
+    match first {
+        Err(failure) if had_token && failure.worth_asking_again() => {
+            tracing::warn!(
+                error = %failure.error(),
+                "el portal no restauró la elección guardada; se pregunta de nuevo"
+            );
+            (open(None).await, true)
+        }
+        other => (other, false),
+    }
 }
 
 /// Socket de EI que se entrega a la inyección (o por qué no lo hay).
@@ -286,12 +352,12 @@ async fn screencast_with_timeout(
     cursor_mode: CursorMode,
     restore_token: Option<&str>,
     sources: Sources,
-) -> Result<ScreenCastOpen, CaptureError> {
+) -> Result<ScreenCastOpen, PortalFailure> {
     tracing::debug!("portal ScreenCast: abriendo sesión y diálogo");
     let session = proxy
         .create_session(Default::default())
         .await
-        .map_err(portal_error)?;
+        .map_err(|err| PortalFailure::Portal(portal_error(err)))?;
     let started = tokio::time::timeout(
         DIALOG_TIMEOUT,
         open_screencast(proxy, &session, cursor_mode, restore_token, sources),
@@ -301,7 +367,11 @@ async fn screencast_with_timeout(
         Ok(Ok(started)) => started,
         Ok(Err(err)) => {
             let _ = tokio::time::timeout(PORTAL_TIMEOUT, session.close()).await;
-            return Err(err);
+            return Err(match err {
+                // El usuario cerró el selector (o no eligió nada).
+                CaptureError::PermissionDenied => PortalFailure::Dialog(err),
+                other => PortalFailure::Portal(other),
+            });
         }
         Err(_) => {
             tracing::warn!(
@@ -309,10 +379,10 @@ async fn screencast_with_timeout(
                 DIALOG_TIMEOUT.as_secs()
             );
             let _ = tokio::time::timeout(PORTAL_TIMEOUT, session.close()).await;
-            return Err(backend(format!(
+            return Err(PortalFailure::Dialog(backend(format!(
                 "el diálogo del portal ScreenCast no terminó en {} s (¿no se mostró?)",
                 DIALOG_TIMEOUT.as_secs()
-            )));
+            ))));
         }
     };
     let fd = match tokio::time::timeout(
@@ -324,14 +394,14 @@ async fn screencast_with_timeout(
         Ok(Ok(fd)) => fd,
         Ok(Err(err)) => {
             let _ = tokio::time::timeout(PORTAL_TIMEOUT, session.close()).await;
-            return Err(portal_error(err));
+            return Err(PortalFailure::Portal(portal_error(err)));
         }
         Err(_) => {
             let _ = tokio::time::timeout(PORTAL_TIMEOUT, session.close()).await;
-            return Err(backend(format!(
+            return Err(PortalFailure::Portal(backend(format!(
                 "el portal no abrió el socket de PipeWire en {} s",
                 PORTAL_TIMEOUT.as_secs()
-            )));
+            ))));
         }
     };
     Ok(ScreenCastOpen {
@@ -371,7 +441,9 @@ pub fn pick(kind: crate::ShareKind) -> Result<crate::PickedShare, CaptureError> 
             .and_then(Result::ok)
             .filter(|modes| modes.contains(CursorMode::Metadata))
             .map_or(CursorMode::Hidden, |_| CursorMode::Metadata);
-        let screen = screencast_with_timeout(&proxy, cursor_mode, None, sources(kind)).await?;
+        let screen = screencast_with_timeout(&proxy, cursor_mode, None, sources(kind))
+            .await
+            .map_err(PortalFailure::into_error)?;
         let _ = screen.session.close().await;
         Ok(crate::PickedShare {
             target: picked_target(screen.area, screen.size),
@@ -434,7 +506,9 @@ async fn open_input(
 }
 
 /// Abre la sesión del portal en un hilo propio y la mantiene viva hasta recibir `stop`. Con `eis`,
-/// abre después la sesión `RemoteDesktop` de la entrada y el socket de EI sale por ahí.
+/// abre después la sesión `RemoteDesktop` de la entrada y el socket de EI sale por ahí. Con
+/// `restore_token`, intenta restaurar la elección guardada y, si el portal no puede, pregunta una
+/// vez sin él ([`open_restoring`]).
 fn spawn_portal(
     restore_token: Option<String>,
     input_token: Option<String>,
@@ -446,10 +520,14 @@ fn spawn_portal(
         tokio::sync::oneshot::Sender<()>,
         JoinHandle<()>,
     ),
-    CaptureError,
+    PortalFailed,
 > {
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<PortalStream, PortalFailed>>();
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let failed = |error: CaptureError| PortalFailed {
+        error,
+        token_rejected: false,
+    };
     let handle =
         thread::Builder::new()
             .name("portal".into())
@@ -457,7 +535,7 @@ fn spawn_portal(
                 let rt = match runtime() {
                     Ok(rt) => rt,
                     Err(err) => {
-                        let _ = ready_tx.send(Err(err));
+                        let _ = ready_tx.send(Err(failed(err)));
                         return;
                     }
                 };
@@ -467,12 +545,12 @@ fn spawn_portal(
                     let proxy = tokio::time::timeout(PORTAL_TIMEOUT, Screencast::new())
                         .await
                         .map_err(|_| {
-                            backend(format!(
+                            failed(backend(format!(
                                 "el portal ScreenCast no respondió en {} s",
                                 PORTAL_TIMEOUT.as_secs()
-                            ))
+                            )))
                         })?
-                        .map_err(portal_error)?;
+                        .map_err(|err| failed(portal_error(err)))?;
                     tracing::debug!(version = proxy.version(), "portal ScreenCast conectado");
                     let cursor_modes =
                         tokio::time::timeout(PORTAL_TIMEOUT, proxy.available_cursor_modes())
@@ -485,13 +563,18 @@ fn spawn_portal(
                     } else {
                         CursorMode::Hidden
                     };
-                    let screen = screencast_with_timeout(
-                        &proxy,
-                        cursor_mode,
-                        restore_token.as_deref(),
-                        sources,
-                    )
-                    .await?;
+                    let (screen, token_rejected) = open_restoring(restore_token, |token| {
+                        let proxy = &proxy;
+                        async move {
+                            screencast_with_timeout(proxy, cursor_mode, token.as_deref(), sources)
+                                .await
+                        }
+                    })
+                    .await;
+                    let screen = screen.map_err(|failure| PortalFailed {
+                        error: failure.into_error(),
+                        token_rejected,
+                    })?;
                     tracing::debug!(node_id = screen.node_id, area = ?screen.area, "portal: captura abierta");
                     let mut input = None;
                     let mut new_input_token = None;
@@ -521,12 +604,13 @@ fn spawn_portal(
                             }
                         }
                     }
-                    Ok((
+                    Ok::<_, PortalFailed>((
                         PortalStream {
                             fd: screen.fd,
                             node_id: screen.node_id,
                             restore_token: screen.restore_token,
                             input_token: new_input_token,
+                            token_rejected,
                         },
                         (proxy, screen.session, input),
                     ))
@@ -544,14 +628,14 @@ fn spawn_portal(
                     }
                     Err(err) => {
                         if let Some(eis) = &eis {
-                            let _ = eis.send(Err(format!("no se abrió la captura: {err}")));
+                            let _ = eis.send(Err(format!("no se abrió la captura: {}", err.error)));
                         }
                         let _ = ready_tx.send(Err(err));
                     }
                 }
             });
             })
-            .map_err(|err| backend(format!("no se pudo crear el hilo del portal: {err}")))?;
+            .map_err(|err| failed(backend(format!("no se pudo crear el hilo del portal: {err}"))))?;
     match ready_rx.recv() {
         Ok(Ok(stream)) => Ok((stream, stop_tx, handle)),
         Ok(Err(err)) => {
@@ -560,7 +644,7 @@ fn spawn_portal(
         }
         Err(_) => {
             let _ = handle.join();
-            Err(backend("el hilo del portal terminó sin responder"))
+            Err(failed(backend("el hilo del portal terminó sin responder")))
         }
     }
 }
@@ -1391,6 +1475,11 @@ fn process(stream: &pw::stream::Stream, state: &mut StreamState) {
     let captured_at = pts
         .and_then(|pts| instant_from_monotonic(pts, arrived))
         .unwrap_or(arrived);
+    if let Some(fps) = state.mailbox.take_max_fps() {
+        // Cadencia cambiada en marcha: se eligen otros fotogramas de los que llegan (sin pasar
+        // de los que se negociaron con el compositor al arrancar).
+        state.pacer = FramePacer::new(fps);
+    }
     if !state.pacer.accept(at) {
         crate::counters::record_paced_out();
         return;
@@ -1798,6 +1887,8 @@ pub struct PipeWireCapturer {
     gpu: GpuFrames,
     options: CaptureOptions,
     eis: Option<EisSender>,
+    /// A quién avisar de los cambios del token de restauración ([`crate::RestoreTokenSink`]).
+    on_token: Option<crate::RestoreTokenSink>,
 }
 
 impl PipeWireCapturer {
@@ -1816,6 +1907,7 @@ impl PipeWireCapturer {
             gpu: GpuFrames::Off,
             options: CaptureOptions::default(),
             eis: None,
+            on_token: None,
         }
     }
 
@@ -1840,9 +1932,35 @@ impl PipeWireCapturer {
         self
     }
 
+    /// A quién avisar al arrancar de que el portal dio un token nuevo o rechazó el que se pasó
+    /// ([`crate::RestoreTokenSink`]); quien lo guarda entre ejecuciones lo tiene así al día.
+    pub fn reporting_token(mut self, sink: Option<crate::RestoreTokenSink>) -> Self {
+        self.on_token = sink;
+        self
+    }
+
     /// Token que devolvió el portal para restaurar esta selección la próxima vez.
     pub fn restore_token(&self) -> Option<&str> {
         self.restore_token.as_deref()
+    }
+
+    /// Lo que el portal dijo del token: se olvida el rechazado y se adopta el nuevo, y se avisa a
+    /// quien lo guarda solo de lo que cambia.
+    fn adopt_token(&mut self, token_rejected: bool, fresh: Option<String>) {
+        if token_rejected && self.restore_token.take().is_some() {
+            tracing::info!("el token de restauración guardado ya no vale; se olvida");
+            if let Some(sink) = &mut self.on_token {
+                sink(None);
+            }
+        }
+        if let Some(fresh) = fresh
+            && self.restore_token.as_deref() != Some(fresh.as_str())
+        {
+            if let Some(sink) = &mut self.on_token {
+                sink(Some(fresh.clone()));
+            }
+            self.restore_token = Some(fresh);
+        }
     }
 }
 
@@ -1856,15 +1974,19 @@ impl Capturer for PipeWireCapturer {
 
     fn start(&mut self, _target: &CaptureTarget) -> Result<(), CaptureError> {
         self.stop();
-        let (portal, portal_stop, portal_thread) = spawn_portal(
+        let (portal, portal_stop, portal_thread) = match spawn_portal(
             self.restore_token.clone(),
             self.input_token.clone(),
             self.eis.clone(),
             sources(self.kind),
-        )?;
-        if portal.restore_token.is_some() {
-            self.restore_token = portal.restore_token;
-        }
+        ) {
+            Ok(opened) => opened,
+            Err(failed) => {
+                self.adopt_token(failed.token_rejected, None);
+                return Err(failed.error);
+            }
+        };
+        self.adopt_token(portal.token_rejected, portal.restore_token);
         if portal.input_token.is_some() {
             self.input_token = portal.input_token;
         }
@@ -1982,8 +2104,15 @@ impl Capturer for PipeWireCapturer {
     /// Cadencia que se propone al compositor y, con `hdr`, `RGBA_F16` antes que los formatos de 8
     /// bits (si el compositor no lo ofrece, la captura sigue en SDR). SPA aún no lleva la función
     /// de transferencia: el `RGBA_F16` se interpreta como scRGB lineal (1,0 = 80 nits), la
-    /// convención de coma flotante de KWin y de Windows.
+    /// convención de coma flotante de KWin y de Windows. Con la captura en marcha, la cadencia
+    /// cambia ya (entre los fotogramas que el compositor entrega); el HDR y el tamaño, en la
+    /// próxima.
     fn set_options(&mut self, options: CaptureOptions) -> CaptureOptions {
+        if let Some(running) = &self.running
+            && options.max_fps != self.options.max_fps
+        {
+            running.mailbox.set_max_fps(options.max_fps);
+        }
         self.options = options;
         options
     }
@@ -2054,6 +2183,159 @@ mod tests {
         );
     }
 
+    /// Lo que contesta el portal falso en cada llamada.
+    type Scripted = Result<&'static str, PortalFailure>;
+    /// Tokens con los que se llamó al portal falso.
+    type Calls = Arc<Mutex<Vec<Option<String>>>>;
+
+    /// Portal falso para [`open_restoring`]: apunta los tokens con los que se le llama y contesta
+    /// según el guion (un resultado por llamada).
+    fn fake_portal(
+        script: Vec<Scripted>,
+    ) -> (
+        impl FnMut(Option<String>) -> std::future::Ready<Scripted>,
+        Calls,
+    ) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&calls);
+        let mut script = script.into_iter();
+        let portal = move |token: Option<String>| {
+            seen.lock().unwrap().push(token);
+            std::future::ready(script.next().expect("el guion se quedó corto"))
+        };
+        (portal, calls)
+    }
+
+    fn restoring(
+        token: Option<&str>,
+        script: Vec<Scripted>,
+    ) -> (
+        Result<&'static str, CaptureError>,
+        bool,
+        Vec<Option<String>>,
+    ) {
+        let (portal, calls) = fake_portal(script);
+        let (result, rejected) = runtime()
+            .unwrap()
+            .block_on(open_restoring(token.map(str::to_owned), portal));
+        let calls = calls.lock().unwrap().clone();
+        (result.map_err(PortalFailure::into_error), rejected, calls)
+    }
+
+    #[test]
+    fn a_valid_token_restores_without_asking() {
+        let (result, rejected, calls) = restoring(Some("viejo"), vec![Ok("abierto")]);
+        assert_eq!(result.unwrap(), "abierto");
+        assert!(!rejected);
+        assert_eq!(
+            calls,
+            vec![Some("viejo".to_owned())],
+            "ninguna petición sin token"
+        );
+    }
+
+    #[test]
+    fn a_rejected_token_asks_once_without_it() {
+        let (result, rejected, calls) = restoring(
+            Some("caducado"),
+            vec![
+                Err(PortalFailure::Portal(backend(
+                    "portal ScreenCast: sesión no válida",
+                ))),
+                Ok("nuevo"),
+            ],
+        );
+        assert_eq!(result.unwrap(), "nuevo");
+        assert!(rejected, "el token guardado hay que olvidarlo");
+        assert_eq!(calls, vec![Some("caducado".to_owned()), None]);
+    }
+
+    #[test]
+    fn a_rejected_token_is_forgotten_even_if_the_dialog_is_then_cancelled() {
+        let (result, rejected, calls) = restoring(
+            Some("caducado"),
+            vec![
+                Err(PortalFailure::Portal(backend(
+                    "portal ScreenCast: sesión no válida",
+                ))),
+                Err(PortalFailure::Dialog(CaptureError::PermissionDenied)),
+            ],
+        );
+        assert_eq!(result.unwrap_err(), CaptureError::PermissionDenied);
+        assert!(rejected);
+        assert_eq!(calls.len(), 2, "un solo diálogo: no se insiste");
+    }
+
+    #[test]
+    fn a_cancelled_dialog_or_a_missing_portal_never_asks_twice() {
+        // El portal rechazó el token en silencio, mostró el diálogo y el usuario lo cerró.
+        let (result, rejected, calls) = restoring(
+            Some("viejo"),
+            vec![Err(PortalFailure::Dialog(CaptureError::PermissionDenied))],
+        );
+        assert_eq!(result.unwrap_err(), CaptureError::PermissionDenied);
+        assert!(!rejected, "cerrar el diálogo no invalida el token");
+        assert_eq!(calls.len(), 1);
+        // El diálogo no se contestó a tiempo: otro tardaría lo mismo.
+        let (_, rejected, calls) = restoring(
+            Some("viejo"),
+            vec![Err(PortalFailure::Dialog(backend("el diálogo no terminó")))],
+        );
+        assert!(!rejected);
+        assert_eq!(calls.len(), 1);
+        // Sin portal, pedir de nuevo no arregla nada.
+        let (result, rejected, calls) = restoring(
+            Some("viejo"),
+            vec![Err(PortalFailure::Portal(CaptureError::Unsupported(
+                "no hay portal".into(),
+            )))],
+        );
+        assert!(matches!(result, Err(CaptureError::Unsupported(_))));
+        assert!(!rejected);
+        assert_eq!(calls.len(), 1);
+        // Sin token no hay nada que reintentar.
+        let (_, rejected, calls) = restoring(
+            None,
+            vec![Err(PortalFailure::Portal(backend(
+                "portal ScreenCast: error",
+            )))],
+        );
+        assert!(!rejected);
+        assert_eq!(calls, vec![None]);
+    }
+
+    #[test]
+    fn the_token_sink_hears_only_what_changes() {
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&heard);
+        let mut capturer = PipeWireCapturer::with_restore_token("guardado").reporting_token(Some(
+            Box::new(move |token| sink.lock().unwrap().push(token)),
+        ));
+        // Restaurado con el mismo token: nada que guardar.
+        capturer.adopt_token(false, Some("guardado".to_owned()));
+        assert!(heard.lock().unwrap().is_empty());
+        // El portal lo renovó.
+        capturer.adopt_token(false, Some("renovado".to_owned()));
+        assert_eq!(capturer.restore_token(), Some("renovado"));
+        // Rechazado y, tras el diálogo, uno nuevo.
+        capturer.adopt_token(true, Some("nuevo".to_owned()));
+        assert_eq!(capturer.restore_token(), Some("nuevo"));
+        // Rechazado y el usuario cerró el diálogo: se olvida igual.
+        capturer.adopt_token(true, None);
+        assert_eq!(capturer.restore_token(), None);
+        // Sin token guardado, un rechazo no avisa de nada.
+        capturer.adopt_token(true, None);
+        assert_eq!(
+            *heard.lock().unwrap(),
+            vec![
+                Some("renovado".to_owned()),
+                None,
+                Some("nuevo".to_owned()),
+                None,
+            ]
+        );
+    }
+
     #[test]
     fn frames_are_copied_to_compact_bgra() {
         // 2×2 en RGBx con 4 bytes de relleno por fila.
@@ -2087,6 +2369,7 @@ mod tests {
         let hdr = CaptureOptions {
             max_fps: 120,
             hdr: true,
+            max_size: None,
         };
         let params = format_params(Some(&[0]), hdr).unwrap();
         assert_eq!(params.len(), 2, "RGBA_F16 y los de 8 bits, sin DMA-BUF");

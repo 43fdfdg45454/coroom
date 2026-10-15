@@ -83,6 +83,14 @@ pub struct OpenH264Encoder {
     keyframe_requested: bool,
     scratch: Vec<u8>,
     output: Vec<u8>,
+    /// Tamaño del último fotograma entregado (reducido al tope si no cabía).
+    output_size: Option<(u32, u32)>,
+    /// Reducción al tope con libswscale (BGRA o I420 → I420 más pequeño en un paso). Sin la
+    /// `feature` `ffmpeg` no hay con qué reducir y el tope no se aplica.
+    #[cfg(feature = "ffmpeg")]
+    reducer: Option<crate::ffmpeg::scale::I420Reducer>,
+    #[cfg(feature = "ffmpeg")]
+    last_scale: Option<crate::CpuScale>,
 }
 
 impl Default for OpenH264Encoder {
@@ -101,6 +109,11 @@ impl OpenH264Encoder {
             keyframe_requested: false,
             scratch: Vec::new(),
             output: Vec::new(),
+            output_size: None,
+            #[cfg(feature = "ffmpeg")]
+            reducer: None,
+            #[cfg(feature = "ffmpeg")]
+            last_scale: None,
         }
     }
 
@@ -136,9 +149,52 @@ impl OpenH264Encoder {
     }
 }
 
+/// Vista I420 de `frame` (BGRA convertido en `scratch`, o sus propios planos).
+fn i420_view<'a>(
+    frame: &'a RawFrame,
+    scratch: &'a mut Vec<u8>,
+    (cw, ch): (usize, usize),
+) -> Result<I420View<'a>, CodecError> {
+    let (y_stride, data): (usize, &[u8]) = match frame.format {
+        PixelFormat::Bgra => {
+            bgra_to_i420_into(frame, scratch)?;
+            (frame.width as usize, scratch.as_slice())
+        }
+        _ => (frame.stride as usize, frame.data.as_slice()),
+    };
+    let y_len = y_stride * frame.height as usize;
+    let c_len = cw * ch;
+    if y_stride < frame.width as usize || data.len() < y_len + 2 * c_len {
+        return Err(CodecError::Unsupported(format!(
+            "búfer I420 de {} bytes demasiado corto para {}×{}",
+            data.len(),
+            frame.width,
+            frame.height
+        )));
+    }
+    Ok(I420View {
+        width: frame.width as usize,
+        height: frame.height as usize,
+        y_stride,
+        chroma_stride: cw,
+        y: &data[..y_len],
+        u: &data[y_len..y_len + c_len],
+        v: &data[y_len + c_len..y_len + 2 * c_len],
+    })
+}
+
 impl Encoder for OpenH264Encoder {
     fn codec(&self) -> Codec {
         Codec::H264
+    }
+
+    fn output_size(&self) -> Option<(u32, u32)> {
+        self.output_size
+    }
+
+    #[cfg(feature = "ffmpeg")]
+    fn cpu_scale(&self) -> Option<crate::CpuScale> {
+        self.last_scale
     }
 
     fn backend(&self) -> Backend {
@@ -215,7 +271,7 @@ impl Encoder for OpenH264Encoder {
     }
 
     fn encode(&mut self, frame: &RawFrame) -> Result<Vec<EncodedSlice>, CodecError> {
-        let Some(encoder) = self.encoder.as_mut() else {
+        let (Some(encoder), Some(config)) = (self.encoder.as_mut(), self.config) else {
             return Err(CodecError::Unsupported(
                 "el codificador no está configurado".into(),
             ));
@@ -226,55 +282,54 @@ impl Encoder for OpenH264Encoder {
                 frame.width, frame.height
             )));
         }
-        let (y_stride, data) = match frame.format {
-            PixelFormat::Bgra => {
-                bgra_to_i420_into(frame, &mut self.scratch)?;
-                (frame.width as usize, self.scratch.as_slice())
-            }
-            PixelFormat::I420 => (frame.stride as usize, frame.data.as_slice()),
-            PixelFormat::Nv12
-            | PixelFormat::I444
-            | PixelFormat::Nv24
-            | PixelFormat::P010
-            | PixelFormat::Rgba16F
-            | PixelFormat::Gpu => {
-                return Err(CodecError::Unsupported(format!(
-                    "OpenH264 no acepta {:?}; entrega BGRA o I420 en memoria de CPU",
-                    frame.format
-                )));
-            }
-        };
-        let i420 = RawFrame {
-            frame_id: frame.frame_id,
-            width: frame.width,
-            height: frame.height,
-            format: PixelFormat::I420,
-            stride: y_stride as u32,
-            data: Vec::new(),
-            gpu: None,
-            color: crate::ColorSpace::SDR,
-            pool: None,
-        };
-        let (cw, ch) = RawFrame::chroma_size(frame.width, frame.height);
-        let y_len = y_stride * frame.height as usize;
-        let c_len = cw as usize * ch as usize;
-        if y_stride < frame.width as usize || data.len() < y_len + 2 * c_len {
+        if !matches!(frame.format, PixelFormat::Bgra | PixelFormat::I420) {
             return Err(CodecError::Unsupported(format!(
-                "búfer I420 de {} bytes demasiado corto para {}×{}",
-                data.len(),
-                i420.width,
-                i420.height
+                "OpenH264 no acepta {:?}; entrega BGRA o I420 en memoria de CPU",
+                frame.format
             )));
         }
-        let view = I420View {
-            width: frame.width as usize,
-            height: frame.height as usize,
-            y_stride,
-            chroma_stride: cw as usize,
-            y: &data[..y_len],
-            u: &data[y_len..y_len + c_len],
-            v: &data[y_len + c_len..y_len + 2 * c_len],
+        // El tope de resolución: lo que no cabe se reduce (con libswscale, si está FFmpeg).
+        #[allow(unused_mut)]
+        let mut size = (frame.width, frame.height);
+        #[cfg(feature = "ffmpeg")]
+        let reduced = {
+            let wanted = coroom_proto::video::fit(size, (config.width, config.height));
+            if wanted != size {
+                let reducer = match self.reducer.as_mut() {
+                    Some(reducer) => reducer,
+                    None => self
+                        .reducer
+                        .insert(crate::ffmpeg::scale::I420Reducer::new()?),
+                };
+                let planes = reducer.reduce(frame, wanted)?;
+                size = wanted;
+                self.last_scale = Some(planes.scale);
+                Some(planes)
+            } else {
+                self.last_scale = None;
+                None
+            }
         };
+        let _ = config;
+        let (cw, ch) = RawFrame::chroma_size(size.0, size.1);
+        let (cw, ch) = (cw as usize, ch as usize);
+        #[cfg(feature = "ffmpeg")]
+        let view = if let Some(planes) = &reduced {
+            I420View {
+                width: size.0 as usize,
+                height: size.1 as usize,
+                y_stride: planes.y_stride,
+                chroma_stride: planes.chroma_stride,
+                y: planes.y,
+                u: planes.u,
+                v: planes.v,
+            }
+        } else {
+            i420_view(frame, &mut self.scratch, (cw, ch))?
+        };
+        #[cfg(not(feature = "ffmpeg"))]
+        let view = i420_view(frame, &mut self.scratch, (cw, ch))?;
+        self.output_size = Some(size);
 
         if std::mem::take(&mut self.keyframe_requested) {
             encoder.force_intra_frame();

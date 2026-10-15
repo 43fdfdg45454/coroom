@@ -118,6 +118,13 @@ pub struct PickedShare {
     pub restore_token: Option<String>,
 }
 
+/// A quién avisa el backend del token de restauración del portal (Linux) al arrancar la captura,
+/// para que quien lo guarda entre ejecuciones lo tenga al día: `Some(token)` es el que vale para la
+/// próxima vez (el portal da uno nuevo en cada arranque, también al restaurar); `None`, que el
+/// guardado ya no sirvió (el portal no pudo restaurarlo y hubo que preguntar) y hay que olvidarlo.
+/// Los backends sin portal no avisan nunca.
+pub type RestoreTokenSink = Box<dyn FnMut(Option<String>) + Send>;
+
 /// Abre el selector del sistema para elegir ya qué compartir (el portal `ScreenCast` en Linux).
 /// `Ok(None)` donde la interfaz lista los destinos ella misma ([`share_targets`]).
 pub fn pick_share(kind: ShareKind) -> Result<Option<PickedShare>, CaptureError> {
@@ -131,11 +138,14 @@ pub fn share_targets(kind: ShareKind) -> Result<Vec<CaptureTarget>, CaptureError
 }
 
 /// Capturador de lo elegido en `choice`, con la sesión del portal compartida con la entrada donde
-/// la hay (como [`screen_capturer_sharing_input`]).
+/// la hay (como [`screen_capturer_sharing_input`]). `on_token` recibe los cambios del token de
+/// restauración (ver [`RestoreTokenSink`]); con el token de `choice` y ese aviso, el diálogo del
+/// portal sale una vez y no en cada ejecución.
 pub fn share_capturer(
     choice: &ShareChoice,
+    on_token: Option<RestoreTokenSink>,
 ) -> Result<(Box<dyn Capturer>, Option<RemoteDesktopShare>), CaptureError> {
-    platform::share_capturer(choice)
+    platform::share_capturer(choice, on_token)
 }
 
 /// Capturador con un destino fijo: [`Capturer::targets`] devuelve solo ese, así la sesión (que
@@ -384,6 +394,10 @@ pub struct CaptureOptions {
     /// Captura HDR en coma flotante ([`FramePixels::Rgba16F`]) si el backend y la pantalla la
     /// dan; si no, la de siempre.
     pub hdr: bool,
+    /// Tamaño máximo que se quiere (ancho × alto). Lo aplican los backends que eligen el tamaño
+    /// de la imagen (el sintético: la suya, reducida a este si no cabe); la captura de pantalla
+    /// entrega el tamaño de la fuente (el codificador se abre con el que llegue).
+    pub max_size: Option<(u32, u32)>,
 }
 
 impl Default for CaptureOptions {
@@ -391,6 +405,7 @@ impl Default for CaptureOptions {
         Self {
             max_fps: 60,
             hdr: false,
+            max_size: None,
         }
     }
 }
@@ -492,6 +507,16 @@ pub fn screen_capturer() -> Result<Box<dyn Capturer>, CaptureError> {
     platform::screen_capturer()
 }
 
+/// Como [`screen_capturer`], restaurando en Linux la elección de un monitor con `restore_token` y
+/// avisando por `on_token` del token nuevo (ver [`RestoreTokenSink`]); sin entrada. En Windows los
+/// dos se ignoran.
+pub fn screen_capturer_restoring(
+    restore_token: Option<String>,
+    on_token: Option<RestoreTokenSink>,
+) -> Result<Box<dyn Capturer>, CaptureError> {
+    platform::screen_capturer_restoring(restore_token, on_token)
+}
+
 /// Socket del protocolo EI (libei) de la sesión del portal `RemoteDesktop` que abre la captura
 /// (solo existe en Linux).
 #[derive(Debug)]
@@ -585,12 +610,25 @@ mod platform {
         Ok(Vec::new())
     }
 
+    pub fn screen_capturer_restoring(
+        restore_token: Option<String>,
+        on_token: Option<super::RestoreTokenSink>,
+    ) -> Result<Box<dyn Capturer>, CaptureError> {
+        Ok(Box::new(
+            crate::pipewire::PipeWireCapturer::new()
+                .restoring(restore_token)
+                .reporting_token(on_token),
+        ))
+    }
+
     pub fn share_capturer(
         choice: &super::ShareChoice,
+        on_token: Option<super::RestoreTokenSink>,
     ) -> Result<(Box<dyn Capturer>, Option<super::RemoteDesktopShare>), CaptureError> {
         let mut capturer = crate::pipewire::PipeWireCapturer::new()
             .with_kind(choice.kind)
-            .restoring(choice.restore_token.clone());
+            .restoring(choice.restore_token.clone())
+            .reporting_token(on_token);
         let share = capturer.share_remote_desktop();
         Ok((Box::new(capturer), Some(share)))
     }
@@ -629,8 +667,16 @@ mod platform {
         }
     }
 
+    pub fn screen_capturer_restoring(
+        _restore_token: Option<String>,
+        _on_token: Option<super::RestoreTokenSink>,
+    ) -> Result<Box<dyn Capturer>, CaptureError> {
+        screen_capturer()
+    }
+
     pub fn share_capturer(
         choice: &super::ShareChoice,
+        _on_token: Option<super::RestoreTokenSink>,
     ) -> Result<(Box<dyn Capturer>, Option<super::RemoteDesktopShare>), CaptureError> {
         let capturer: Box<dyn Capturer> = Box::new(crate::wgc::WgcCapturer::new());
         Ok((super::chosen(capturer, choice.target.as_ref()), None))
@@ -671,8 +717,16 @@ mod platform {
         Ok(Vec::new())
     }
 
+    pub fn screen_capturer_restoring(
+        _restore_token: Option<String>,
+        _on_token: Option<super::RestoreTokenSink>,
+    ) -> Result<Box<dyn Capturer>, CaptureError> {
+        screen_capturer()
+    }
+
     pub fn share_capturer(
         _choice: &super::ShareChoice,
+        _on_token: Option<super::RestoreTokenSink>,
     ) -> Result<(Box<dyn Capturer>, Option<super::RemoteDesktopShare>), CaptureError> {
         Ok((screen_capturer()?, None))
     }
@@ -722,8 +776,10 @@ pub trait Capturer: Send {
         GpuFrames::Off
     }
 
-    /// Opciones de las próximas capturas que se arranquen. Devuelve lo que el backend
-    /// va a intentar: por defecto, sin HDR.
+    /// Opciones de las próximas capturas que se arranquen y, en lo que el backend pueda, de la
+    /// que está en marcha (la cadencia: el sintético cambia la suya, PipeWire y WGC eligen otros
+    /// fotogramas de los que llegan, sin pasar de los que negociaron al arrancar; el tamaño
+    /// máximo: solo el sintético). Devuelve lo que el backend va a intentar: por defecto, sin HDR.
     fn set_options(&mut self, options: CaptureOptions) -> CaptureOptions {
         CaptureOptions {
             hdr: false,
@@ -766,12 +822,14 @@ mod tests {
         let asked = CaptureOptions {
             max_fps: 120,
             hdr: true,
+            max_size: None,
         };
         assert_eq!(
             capturer.set_options(asked),
             CaptureOptions {
                 max_fps: 120,
-                hdr: false
+                hdr: false,
+                max_size: None,
             },
             "sin HDR por defecto"
         );

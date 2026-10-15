@@ -49,7 +49,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -514,6 +514,13 @@ impl Default for MediaSenderConfig {
     }
 }
 
+/// `interval` en microsegundos, al menos 1 (un intervalo nulo anularía el pacing).
+fn interval_us(interval: Duration) -> u64 {
+    u64::try_from(interval.as_micros())
+        .unwrap_or(u64::MAX)
+        .max(1)
+}
+
 /// Resumen del envío de un fotograma.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SendReport {
@@ -623,6 +630,9 @@ pub struct MediaSender {
     config: MediaSenderConfig,
     /// Máximo de [`MediaSender::set_max_kbps`] (0: el de `config`).
     max_kbps: AtomicU32,
+    /// Intervalo entre fotogramas en microsegundos ([`MediaSender::set_frame_interval`]; al
+    /// crear, el de `config`).
+    frame_interval_us: AtomicU64,
     /// Identificador del siguiente tren de sonda.
     next_train: AtomicU32,
     state: Mutex<SenderState>,
@@ -645,6 +655,7 @@ impl MediaSender {
         conn.set_target_kbps(rate.target_kbps());
         Self {
             conn,
+            frame_interval_us: AtomicU64::new(interval_us(config.frame_interval)),
             config,
             max_kbps: AtomicU32::new(0),
             next_train: AtomicU32::new(1),
@@ -683,6 +694,19 @@ impl MediaSender {
                 source.rate.set_max_kbps(max_kbps);
             }
         }
+    }
+
+    /// Cambia el intervalo entre fotogramas (1/fps) en marcha: el pacing de cada fotograma y el
+    /// suelo de la FEC lo usan desde el siguiente.
+    pub fn set_frame_interval(&self, interval: Duration) {
+        self.frame_interval_us
+            .store(interval_us(interval), Ordering::Release);
+    }
+
+    /// Intervalo entre fotogramas en uso (el de la configuración o el último de
+    /// [`MediaSender::set_frame_interval`]).
+    pub fn frame_interval(&self) -> Duration {
+        Duration::from_micros(self.frame_interval_us.load(Ordering::Acquire))
     }
 
     /// Límites del control de tasa, con el máximo de [`MediaSender::set_max_kbps`] si lo hay.
@@ -756,7 +780,7 @@ impl MediaSender {
     /// tiempo y la FEC solo gastaría bitrate). Sin medida, no.
     pub fn fec_floor(&self) -> bool {
         self.guest_rtt()
-            .is_some_and(|rtt| rtt > self.config.frame_interval.mul_f64(FEC_FLOOR_RTT_INTERVALS))
+            .is_some_and(|rtt| rtt > self.frame_interval().mul_f64(FEC_FLOOR_RTT_INTERVALS))
     }
 
     /// RTT con el invitado que limita: en una conexión directa, el de QUIC; por el relay, el doble
@@ -1087,7 +1111,7 @@ impl MediaSender {
         let pacing = pacing_duration(
             report.bytes,
             pace_kbps,
-            self.config.frame_interval,
+            self.frame_interval(),
             keyframe,
             headroom,
             &self.config.pacing,
@@ -1144,7 +1168,7 @@ impl MediaSender {
             let pacing = pacing_duration(
                 bytes,
                 pace_kbps,
-                self.config.frame_interval,
+                self.frame_interval(),
                 true,
                 headroom,
                 &self.config.pacing,
@@ -2497,6 +2521,15 @@ impl MediaReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// El intervalo entre fotogramas arranca con el de la configuración y cambia en marcha;
+    /// nunca queda en cero.
+    #[test]
+    fn the_frame_interval_changes_while_running() {
+        assert_eq!(interval_us(Duration::from_micros(16_667)), 16_667);
+        assert_eq!(interval_us(Duration::ZERO), 1, "nunca cero");
+        assert_eq!(interval_us(Duration::from_secs(1) / 15), 66_666);
+    }
 
     fn probe_datagram(train: u32, index: u16, count: u16) -> Bytes {
         datagram(

@@ -122,6 +122,11 @@ pantalla-login-usuario = Usuario
 pantalla-login-volver = Volver
 pantalla-login-ya-tengo-cuenta = Ya tengo cuenta
 
+## portal
+
+portal-no-se-pudo-guardar-el-permiso = no se pudo guardar el permiso de pantalla recordado: { $err }
+portal-no-se-pudo-olvidar-el-permiso = no se pudo olvidar el permiso de pantalla: { $err }
+
 ## runner
 
 runner-error-del-bucle-de-la-ventana = error del bucle de la ventana: { $err }

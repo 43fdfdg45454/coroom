@@ -42,6 +42,7 @@ use iced_core::{Alignment, Length, Padding};
 use iced_widget::{Column, Row, button, checkbox, column, container, row, rule};
 
 use super::chat;
+use crate::portal::RestoreTokens;
 use crate::ui::app::{
     App, Dialog, Effect, Event, HostRequest, JOIN_REQUEST_TTL, Load, Message, Page, Screen,
     quality_tone,
@@ -275,6 +276,10 @@ pub struct State {
     pub target: Option<CaptureTarget>,
     /// Lo elegido en el selector del sistema (Wayland), para la fuente actual.
     pub picked: Option<PickedShare>,
+    /// Tokens con los que el portal de captura repite la elección sin preguntar, por tipo de
+    /// fuente (`portal.json`; los carga la ventana al arrancar y los guarda
+    /// [`Effect::SaveRestoreTokens`]).
+    pub restore_tokens: RestoreTokens,
     /// Esperando al selector del sistema.
     pub picking: bool,
     /// Lo que se puede compartir (`None`: aún no se ha mirado).
@@ -393,10 +398,17 @@ impl State {
                 .as_ref()
                 .map(|picked| picked.target.clone())
                 .or_else(|| self.target.clone()),
+            // El último token que dio el portal para esta fuente (lo renueva en cada arranque) y,
+            // si no hay ninguno guardado, el del selector.
             restore_token: self
-                .picked
-                .as_ref()
-                .and_then(|picked| picked.restore_token.clone()),
+                .restore_tokens
+                .get(self.source().kind())
+                .map(str::to_owned)
+                .or_else(|| {
+                    self.picked
+                        .as_ref()
+                        .and_then(|picked| picked.restore_token.clone())
+                }),
         }
     }
 
@@ -599,8 +611,9 @@ fn changed_options(before: &Video, after: &Video) -> Vec<VideoOption> {
 }
 
 /// Cambia el vídeo de los ajustes y lo guarda; con la sala abierta, aplica lo que va en vivo
-/// ([`Video::when`]) y avisa de lo que espera a la próxima sala. `custom`: el cambio viene de
-/// «Avanzado» y el perfil pasa a «Personalizado».
+/// ([`Video::when`]: el tope del bitrate por su cuenta; el códec, la resolución máxima y los fps
+/// juntos, con un solo [`Effect::SetEncoding`] que reabre el codificador) y avisa de lo que espera a
+/// la próxima sala. `custom`: el cambio viene de «Avanzado» y el perfil pasa a «Personalizado».
 fn change_video(app: &mut App, custom: bool, change: impl FnOnce(&mut Video)) -> Vec<Effect> {
     let before = app.settings.video.clone();
     change(&mut app.settings.video);
@@ -615,10 +628,18 @@ fn change_video(app: &mut App, custom: bool, change: impl FnOnce(&mut Video)) ->
     let mut next_room = false;
     for option in changed {
         match (Video::when(option), option) {
-            (When::Live, VideoOption::Codec) => {
-                let video = &app.settings.video;
-                tracing::info!(codec = ?video.codec, encoder = ?video.encoder, "códec para la sala abierta");
-                effects.push(Effect::SetCodec);
+            (When::Live, VideoOption::Codec | VideoOption::Resolution | VideoOption::Fps) => {
+                if !effects.contains(&Effect::SetEncoding) {
+                    let video = &app.settings.video;
+                    tracing::info!(
+                        codec = ?video.codec,
+                        encoder = ?video.encoder,
+                        resolution = ?video.max_resolution,
+                        fps = video.fps,
+                        "codec, resolucion y fps para la sala abierta"
+                    );
+                    effects.push(Effect::SetEncoding);
+                }
             }
             (When::Live, VideoOption::Bitrate) => {
                 let kbps = app.settings.video.max_bitrate_kbps;
@@ -1019,10 +1040,17 @@ pub fn on_share_picked(
     }
     match picked {
         Ok(Some(picked)) => {
+            // El token del selector vale para abrir la sala sin volver a preguntar, también en
+            // la próxima ejecución.
+            let mut effects = match &picked.restore_token {
+                Some(token) => on_restore_token(app, source.kind(), Some(token.clone())),
+                None => Vec::new(),
+            };
             app.host.picked = Some(picked);
             if app.host.room.is_some() {
-                return apply_source(app);
+                effects.extend(apply_source(app));
             }
+            return effects;
         }
         Ok(None) => {}
         Err(err) => app.toast(
@@ -1031,6 +1059,18 @@ pub fn on_share_picked(
         ),
     }
     Vec::new()
+}
+
+/// El portal de captura dio un token de restauración para `kind` (al elegir en su selector o al
+/// arrancar la captura, que lo renueva) o rechazó el guardado (`None`): el estado y `portal.json`
+/// se ponen al día. Con el token guardado, el diálogo del sistema no vuelve a salir; sin él, sale
+/// una vez en la próxima sala y lo que conteste se guarda.
+pub fn on_restore_token(app: &mut App, kind: ShareKind, token: Option<String>) -> Vec<Effect> {
+    if app.host.restore_tokens.get(kind) == token.as_deref() {
+        return Vec::new();
+    }
+    app.host.restore_tokens.set(kind, token);
+    vec![Effect::SaveRestoreTokens(app.host.restore_tokens.clone())]
 }
 
 /// Si dos destinos son el mismo monitor o ventana.
@@ -1129,7 +1169,13 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                             valor = bitrate_phrase(kbps)
                         ),
                     ),
-                    Ok(None) => app.toast(Tone::Info, t!("host-codec-de-la-sala-cambiado")),
+                    Ok(None) => app.toast(
+                        Tone::Info,
+                        t!(
+                            "host-video-de-la-sala-cambiado",
+                            valor = encoding_phrase(&app.settings.video)
+                        ),
+                    ),
                     Err(err) => app.toast(
                         Tone::Warning,
                         t!("host-no-se-pudo-cambiar-el-video", error = err),
@@ -1320,6 +1366,19 @@ fn resolution_label(resolution: Resolution) -> String {
             format!("{height}p ({width} × {height})")
         }
     }
+}
+
+/// Lo que reabre el codificador con la sala abierta: «1080p · 60 fps · AV1».
+fn encoding_phrase(video: &Video) -> String {
+    let codec = codec_choices()
+        .into_iter()
+        .find(|c| c.value == video.codec)
+        .map_or_else(|| t!("host-automatico").to_owned(), |c| c.label);
+    format!(
+        "{} · {} · {codec}",
+        resolution_short(video.max_resolution),
+        t!("host-fps", fps = video.fps)
+    )
 }
 
 /// Lo que fija un perfil: «1080p · 60 fps · Auto hasta 10 Mbit/s».
@@ -2939,8 +2998,10 @@ fn room_view<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
     page = page
         .push(room_source_card(app, room))
         .push(guests_section(app, room))
+        // Solo informa: en tono neutro, porque el tono de información lleva el color de acento
+        // del sistema y con un acento rojo se leía como un error.
         .push(ui::banner(
-            Tone::Info,
+            Tone::Neutral,
             if room.guests_muted {
                 t!("host-voz-entran-callados")
             } else {
@@ -3594,6 +3655,117 @@ mod tests {
     }
 
     #[test]
+    fn the_saved_portal_permission_goes_with_the_request_and_is_kept_up_to_date() {
+        let mut app = app();
+        app.update(Message::Navigate(Page::Host));
+        // Lo que `portal.json` tenía al arrancar la aplicación.
+        app.host
+            .restore_tokens
+            .set(ShareKind::Screen, Some("guardado".to_owned()));
+        let effects = app.update(Message::Host(Msg::Start));
+        let Effect::StartHost(request) = &effects[0] else {
+            panic!("se esperaba abrir la sala: {effects:?}");
+        };
+        assert_eq!(request.share.kind, ShareKind::Screen);
+        assert_eq!(
+            request.share.restore_token.as_deref(),
+            Some("guardado"),
+            "sin selector, va el token guardado: el portal no pregunta"
+        );
+        // Al arrancar, el portal renovó el token: se persiste el nuevo.
+        let effects = app.update(Message::Event(Event::ShareRestoreToken(
+            ShareKind::Screen,
+            Some("renovado".to_owned()),
+        )));
+        assert!(
+            matches!(&effects[..], [Effect::SaveRestoreTokens(tokens)]
+                if tokens.get(ShareKind::Screen) == Some("renovado")
+                    && tokens.get(ShareKind::App).is_none()),
+            "{effects:?}"
+        );
+        assert_eq!(
+            app.host.share_choice().restore_token.as_deref(),
+            Some("renovado")
+        );
+        // El mismo token otra vez no escribe nada.
+        assert!(
+            app.update(Message::Event(Event::ShareRestoreToken(
+                ShareKind::Screen,
+                Some("renovado".to_owned()),
+            )))
+            .is_empty()
+        );
+        // La ventana tiene su propio token: no toca el de la pantalla.
+        let effects = app.update(Message::Event(Event::ShareRestoreToken(
+            ShareKind::App,
+            Some("ventana".to_owned()),
+        )));
+        assert!(
+            matches!(&effects[..], [Effect::SaveRestoreTokens(tokens)]
+                if tokens.get(ShareKind::Screen) == Some("renovado")
+                    && tokens.get(ShareKind::App) == Some("ventana")),
+            "{effects:?}"
+        );
+        // El portal rechazó el guardado: se olvida y la próxima petición va sin token (el
+        // diálogo saldrá una vez).
+        let effects = app.update(Message::Event(Event::ShareRestoreToken(
+            ShareKind::Screen,
+            None,
+        )));
+        assert!(
+            matches!(&effects[..], [Effect::SaveRestoreTokens(tokens)]
+                if tokens.get(ShareKind::Screen).is_none()
+                    && tokens.get(ShareKind::App) == Some("ventana")),
+            "{effects:?}"
+        );
+        assert_eq!(app.host.share_choice().restore_token, None);
+    }
+
+    #[test]
+    fn the_token_of_the_picker_is_saved_and_the_latest_one_wins() {
+        let mut app = app();
+        app.update(Message::Navigate(Page::Host));
+        let monitor = CaptureTarget::Monitor {
+            id: 0,
+            name: "2560 × 1440".to_owned(),
+        };
+        let effects = app.update(Message::Event(Event::SharePicked(
+            SourceChoice::Screen,
+            Ok(Some(PickedShare {
+                target: monitor,
+                restore_token: Some("elegido".to_owned()),
+            })),
+        )));
+        assert!(
+            matches!(&effects[..], [Effect::SaveRestoreTokens(tokens)]
+                if tokens.get(ShareKind::Screen) == Some("elegido")),
+            "lo elegido en el selector se recuerda para la próxima ejecución: {effects:?}"
+        );
+        assert_eq!(
+            app.host.share_choice().restore_token.as_deref(),
+            Some("elegido")
+        );
+        // Al abrir la sala el portal lo renovó: la próxima sala lleva el renovado, no el del
+        // selector (el portal solo acepta el último que dio).
+        app.update(Message::Event(Event::ShareRestoreToken(
+            ShareKind::Screen,
+            Some("renovado".to_owned()),
+        )));
+        assert_eq!(
+            app.host.share_choice().restore_token.as_deref(),
+            Some("renovado")
+        );
+        assert_eq!(
+            app.host
+                .picked
+                .as_ref()
+                .and_then(|picked| picked.restore_token.as_deref()),
+            Some("elegido"),
+            "lo elegido en pantalla no cambia"
+        );
+    }
+
+    #[test]
     fn permissions_are_toggles_and_slots_are_exclusive() {
         let mut app = app();
         open_room(&mut app);
@@ -3865,8 +4037,9 @@ mod tests {
         assert_eq!(app.settings.video.max_bitrate_kbps, 30_000);
     }
 
-    /// Con la sala abierta, lo «En vivo» se aplica ya y lo «Al abrir la sala» solo se guarda con
-    /// un aviso.
+    /// Con la sala abierta, lo «En vivo» se aplica ya (la resolución máxima y los fps también,
+    /// con el efecto que reabre el codificador) y lo «Al abrir la sala» solo se guarda con un
+    /// aviso.
     #[test]
     fn with_the_room_open_live_options_apply_and_the_rest_wait() {
         let mut app = app();
@@ -3874,27 +4047,66 @@ mod tests {
         app.toasts.clear();
         assert_eq!(
             app.update(Message::Host(Msg::Codec(pick(CodecChoice::Av1, "AV1")))),
-            [Effect::SetCodec]
+            [Effect::SetEncoding]
         );
         assert_eq!(
             app.update(Message::Host(Msg::Cap(pick(10_000, "10")))),
             [Effect::SetMaxBitrate(10_000)]
         );
+        assert_eq!(
+            app.update(Message::Host(Msg::Fps(30))),
+            [Effect::SetEncoding],
+            "los fps van en vivo"
+        );
+        assert_eq!(
+            app.update(Message::Host(Msg::Resolution(pick(
+                Resolution::P720,
+                "720p"
+            )))),
+            [Effect::SetEncoding],
+            "la resolución va en vivo"
+        );
         assert!(app.toasts.is_empty(), "lo en vivo no avisa de nada");
-        assert!(app.update(Message::Host(Msg::Fps(30))).is_empty());
+        assert!(app.update(Message::Host(Msg::Chroma444(true))).is_empty());
         assert!(
             app.toasts
                 .iter()
                 .any(|t| t.text == "Guardado para la próxima sala")
         );
-        // Un perfil mezcla las dos cosas: el tope va ya, el resto espera.
+        // Un perfil mezcla las dos cosas: el tope va ya y la resolución y los fps juntos, en un
+        // solo efecto; 4:4:4 espera.
+        app.toasts.clear();
+        app.update(Message::Host(Msg::Chroma444(false)));
         app.toasts.clear();
         assert_eq!(
             app.update(Message::Host(Msg::Preset(QualityPreset::MaxQuality))),
-            [Effect::SetMaxBitrate(UNLIMITED_KBPS)]
+            [Effect::SetEncoding, Effect::SetMaxBitrate(UNLIMITED_KBPS)]
         );
-        assert_eq!(app.toasts.len(), 1);
+        assert_eq!(app.toasts.len(), 1, "{:?}", app.toasts);
         assert_eq!(app.flush_settings(), Some(Effect::SaveSettings));
+        // Repetir el valor no toca nada.
+        app.toasts.clear();
+        assert!(app.update(Message::Host(Msg::Fps(120))).is_empty());
+        assert!(app.toasts.is_empty());
+    }
+
+    /// Cuando la sala aplicó el cambio, el aviso dice lo que codifica ahora.
+    #[test]
+    fn the_room_confirms_the_encoding_it_applied() {
+        let mut app = app();
+        open_room(&mut app);
+        app.update(Message::Host(Msg::Resolution(pick(
+            Resolution::P1080,
+            "1080p",
+        ))));
+        app.update(Message::Host(Msg::Fps(30)));
+        app.toasts.clear();
+        app.update(Message::Event(Event::VideoChanged(Ok(None))));
+        assert_eq!(app.toasts.len(), 1);
+        assert_eq!(
+            app.toasts[0].text,
+            "Vídeo de la sala cambiado: 1080p · 30 fps · Automático."
+        );
     }
 
     /// Las etiquetas salen de [`Video::when`].

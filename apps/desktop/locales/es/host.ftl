@@ -74,7 +74,6 @@ host-opcion-codec = códec
 host-opcion-bitrate = bitrate
 host-guardado-para-la-proxima-sala = Guardado para la próxima sala
 host-video-de-la-sala-cambiado = Vídeo de la sala cambiado: { $valor }.
-host-codec-de-la-sala-cambiado = Códec de la sala cambiado.
 host-no-se-pudo-cambiar-el-video = No se pudo cambiar el vídeo de la sala: { $error }
 
 ## Avanzado

@@ -13,6 +13,10 @@ pipewire = ["dep:pipewire", "dep:ashpd", "dep:tokio", "dep:tracing", "dep:rustix
 # `windows` no es opcional en Windows: `FramePixels::D3D11` existe aunque falte `wgc`.
 wgc = ["dep:tracing"]
 
+[dependencies]
+# `fit`: el tamaño máximo de la captura sintética con la misma regla que el codificador y la sesión.
+coroom-proto.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { workspace = true, optional = true }
 pipewire = { workspace = true, optional = true }

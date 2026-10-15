@@ -42,6 +42,13 @@ fn check(what: &str, ret: i32) -> Result<(), String> {
     }
 }
 
+/// Si esta build de FFmpeg trae el filtro `name` (los de GPU dependen de cómo se compiló).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn exists(name: &CStr) -> bool {
+    // SAFETY: `avfilter_get_by_name` solo lee la tabla estática de filtros con una cadena válida.
+    unsafe { !ffi::avfilter_get_by_name(name.as_ptr()).is_null() }
+}
+
 /// Filtro de FFmpeg por nombre.
 fn filter(name: &CStr) -> Result<*const ffi::AVFilter, String> {
     // SAFETY: `avfilter_get_by_name` solo lee la tabla estática de filtros con una cadena válida.

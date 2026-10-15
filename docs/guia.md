@@ -36,7 +36,13 @@ sesión de uno que ya no uses.
    desmarca las que no quieras (por ejemplo, el programa con el que hablas). Las que quitas se
    recuerdan, y las que empiezan a sonar después entran solas.
 
-   Si el sistema elige el monitor o la ventana con su propio diálogo, lo eliges al abrir la sala.
+   Si el sistema elige el monitor o la ventana con su propio diálogo, lo eliges al abrir la sala,
+   y solo la primera vez: en Linux coroom recuerda el permiso (por separado para pantalla y
+   ventana) y el diálogo no vuelve a salir en las siguientes ejecuciones, tampoco con
+   `coroom host` ni `coroom probe`. Para que pregunte de nuevo, pulsa **Olvidar el permiso de
+   pantalla** en Ajustes → Sala, o revócalo desde Ajustes del sistema → Aplicaciones → Compartir
+   pantalla (KDE y GNOME).
+
    coroom nunca se envía a sí misma, así que la voz de la sala no vuelve como eco. Si el equipo no
    puede separar el audio por aplicación (Windows anterior a 10 20348), se envía todo lo que suena,
    también las voces de la sala que reproduce coroom.

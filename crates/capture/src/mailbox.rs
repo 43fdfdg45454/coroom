@@ -1,6 +1,7 @@
 //! Buzón de un solo hueco entre el hilo de un backend y `Capturer::next_frame`: si llega un
 //! fotograma antes de que se recoja el anterior, gana el último.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,9 @@ use crate::{CaptureError, CapturedFrame};
 pub(crate) struct Mailbox {
     slot: Mutex<MailboxState>,
     changed: Condvar,
+    /// Cadencia nueva para la captura en marcha (0: ninguna pendiente); el hilo del backend la
+    /// recoge con [`Mailbox::take_max_fps`] y rehace su selector de fotogramas.
+    max_fps: AtomicU32,
 }
 
 #[derive(Default)]
@@ -20,6 +24,19 @@ struct MailboxState {
 }
 
 impl Mailbox {
+    /// Deja una cadencia nueva para el hilo del backend (`Capturer::set_options` en marcha).
+    pub(crate) fn set_max_fps(&self, max_fps: u32) {
+        self.max_fps.store(max_fps.max(1), Ordering::Release);
+    }
+
+    /// Recoge la cadencia nueva, si la hay.
+    pub(crate) fn take_max_fps(&self) -> Option<u32> {
+        match self.max_fps.swap(0, Ordering::AcqRel) {
+            0 => None,
+            fps => Some(fps),
+        }
+    }
+
     pub(crate) fn put(&self, frame: CapturedFrame) {
         let mut state = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(evicted) = state.frame.replace(frame) {
@@ -72,6 +89,18 @@ impl Mailbox {
 mod tests {
     use super::*;
     use crate::FramePixels;
+
+    #[test]
+    fn a_new_cadence_is_taken_once() {
+        let mailbox = Mailbox::default();
+        assert_eq!(mailbox.take_max_fps(), None);
+        mailbox.set_max_fps(0);
+        assert_eq!(mailbox.take_max_fps(), Some(1), "al menos 1");
+        mailbox.set_max_fps(30);
+        mailbox.set_max_fps(60);
+        assert_eq!(mailbox.take_max_fps(), Some(60), "gana la última");
+        assert_eq!(mailbox.take_max_fps(), None);
+    }
 
     fn frame(frame_id: u64) -> CapturedFrame {
         CapturedFrame {

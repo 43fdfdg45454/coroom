@@ -197,7 +197,8 @@ Invitado ── HTTP/3 + WebTransport ──▶ Servidor (UDP) ◀── HTTP/3 
 Reglas de capas:
 
 - `proto` y `crypto` no dependen de ninguna crate del workspace; `ui` tampoco.
-- `transport` solo depende de `proto` y `crypto`.
+- `transport` solo depende de `proto` y `crypto`; `capture` y `codec`, de `proto` (la regla común
+  `fit` del tamaño máximo del vídeo).
 - `session` orquesta `capture`, `codec`, `audio`, `input` y `transport` (además de `proto` y `crypto`).
 - `apps/*` solo dependen de `session`, `render`, `transport` y `ui`.
 - Cada backend de plataforma va detrás de un trait y una `feature` de Cargo; `cfg(target_os)` solo

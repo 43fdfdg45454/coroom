@@ -354,8 +354,13 @@ pub fn make_capturer(options: &ProbeOptions) -> Result<Box<dyn Capturer>, String
             options.config.height,
             options.config.fps,
         ))),
-        Source::Screen => capture::screen_capturer()
-            .map_err(|err| format!("no se puede capturar la pantalla: {err}")),
+        // Con el permiso del portal recordado de otra vez (y guardando el que dé ahora), el
+        // diálogo del sistema no sale en cada prueba.
+        Source::Screen => capture::screen_capturer_restoring(
+            crate::portal::saved_restore_token(capture::ShareKind::Screen),
+            crate::portal::restore_token_sink(capture::ShareKind::Screen),
+        )
+        .map_err(|err| format!("no se puede capturar la pantalla: {err}")),
     }
 }
 

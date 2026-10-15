@@ -28,7 +28,9 @@
 //! - (m) con la sala abierta, el anfitrión cambia de fuente (a otro tamaño), de códec y de bitrate
 //!   máximo y el invitado sigue presentando sin salir;
 //! - (n) cortes de red de 600 ms cada 3 s con 1 % de pérdida y 10 Mbit/s: el vídeo vuelve como
-//!   mucho 500 ms después de cada corte.
+//!   mucho 500 ms después de cada corte;
+//! - (p) con la sala abierta, el anfitrión baja la resolución máxima y los fps (y luego los
+//!   sube) y el invitado sigue presentando, con el tamaño y la cadencia nuevos.
 //!
 //! Los tests (a)–(e) usan OpenH264 en los dos extremos, para que sus cotas de
 //! tiempo sigan siendo comparables.
@@ -1049,6 +1051,142 @@ fn l_a_shallow_queue_does_not_start_a_keyframe_storm() {
 /// Guarda el tamaño de cada fotograma presentado.
 struct SizeSink(Arc<Mutex<Vec<(u32, u32)>>>);
 
+/// Cuándo se presentó cada fotograma y su tamaño.
+type Presented = Arc<Mutex<Vec<(Instant, (u32, u32))>>>;
+
+/// Guarda cuándo se presentó cada fotograma y su tamaño.
+struct TimedSizeSink(Presented);
+
+impl FrameSink for TimedSizeSink {
+    fn present(&mut self, frame: DecodedFrame) -> Result<(), SinkError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((Instant::now(), (frame.frame.width, frame.frame.height)));
+        Ok(())
+    }
+}
+
+/// Mediana del tiempo entre presentaciones consecutivas de los últimos `last` fotogramas de
+/// tamaño `size`.
+fn median_gap(presented: &Presented, size: (u32, u32), last: usize) -> Duration {
+    let presented = presented.lock().unwrap_or_else(|p| p.into_inner());
+    let at: Vec<Instant> = presented
+        .iter()
+        .filter(|(_, seen)| *seen == size)
+        .map(|(at, _)| *at)
+        .collect();
+    let at = &at[at.len().saturating_sub(last)..];
+    let mut gaps: Vec<Duration> = at.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(gaps.len() >= 2, "hacen falta fotogramas de {size:?}");
+    gaps.sort();
+    gaps[gaps.len() / 2]
+}
+
+/// (p) Con la sala abierta y un invitado viendo: el anfitrión baja la resolución máxima (de
+/// 640×360 a 320×180) y los fps (de 30 a 15) sin cambiar de fuente ni de códec, y el invitado
+/// sigue presentando sin salir de la sala, ya con el tamaño nuevo (el intra con el que se reabre
+/// el codificador se lo trae) y a la cadencia nueva; al subirlos, vuelve al tamaño de la fuente
+/// y a 30 fps.
+#[test]
+fn p_the_host_changes_resolution_and_fps_while_open() {
+    let _serial = serial();
+    let server = TestServer::start();
+    let mut host = host(server.config());
+    let code = room_code(&host);
+    let presented: Presented = Arc::default();
+    let mut guest = guest_with(
+        server.config(),
+        &code,
+        None,
+        DecoderSet::openh264(),
+        Box::new(TimedSizeSink(Arc::clone(&presented))),
+    );
+    wait_for_video(&guest, "H.264", Duration::from_secs(20));
+    let count = |size: (u32, u32)| {
+        presented
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(_, seen)| *seen == size)
+            .count()
+    };
+    wait_until("fotogramas de 640×360", Duration::from_secs(20), || {
+        count((640, 360)) >= 30
+    });
+    let gap = median_gap(&presented, (640, 360), 20);
+    assert!(
+        (Duration::from_millis(25)..=Duration::from_millis(45)).contains(&gap),
+        "a 30 fps la mediana entre fotogramas es de unos 33 ms, no {gap:?}"
+    );
+
+    // Menos resolución y fps: la captura reduce el tamaño y la cadencia, el codificador se reabre
+    // y el invitado ve el tamaño nuevo sin cortarse.
+    host.set_video(coroom_session::remote::VideoChange {
+        max_size: Some((320, 180)),
+        fps: Some(FPS / 2),
+        ..Default::default()
+    })
+    .expect("cambio de resolución y fps");
+    wait_until("fotogramas de 320×180", Duration::from_secs(20), || {
+        assert!(!guest.is_finished(), "{:?}", guest.end_reason());
+        count((320, 180)) >= 40
+    });
+    let gap = median_gap(&presented, (320, 180), 20);
+    assert!(
+        (Duration::from_millis(50)..=Duration::from_millis(90)).contains(&gap),
+        "a 15 fps la mediana entre fotogramas es de unos 67 ms, no {gap:?}"
+    );
+    assert_eq!(host.summary().video.as_deref(), Some("H.264 · OpenH264"));
+
+    // De vuelta: el tamaño de la fuente y 30 fps.
+    let before = count((640, 360));
+    host.set_video(coroom_session::remote::VideoChange {
+        max_size: Some((640, 360)),
+        fps: Some(FPS),
+        ..Default::default()
+    })
+    .expect("vuelta a la resolución y los fps de antes");
+    wait_until(
+        "fotogramas de 640×360 otra vez",
+        Duration::from_secs(20),
+        || {
+            assert!(!guest.is_finished(), "{:?}", guest.end_reason());
+            count((640, 360)) >= before + 40
+        },
+    );
+    let gap = median_gap(&presented, (640, 360), 20);
+    assert!(
+        (Duration::from_millis(25)..=Duration::from_millis(45)).contains(&gap),
+        "de vuelta a 30 fps: unos 33 ms, no {gap:?}"
+    );
+    // Un tope impar se redondea a par (como una ventana de 1199×808); lo nulo se rechaza sin
+    // tocar la sala.
+    let before = count((320, 180));
+    host.set_video(coroom_session::remote::VideoChange {
+        max_size: Some((321, 181)),
+        ..Default::default()
+    })
+    .expect("un tope impar se redondea, no se rechaza");
+    wait_until(
+        "el invitado ve el tope impar redondeado a 320×180",
+        Duration::from_secs(10),
+        || count((320, 180)) > before,
+    );
+    assert!(
+        host.set_video(coroom_session::remote::VideoChange {
+            max_size: Some((0, 180)),
+            ..Default::default()
+        })
+        .is_err()
+    );
+    assert_eq!(guest.end_reason(), None);
+    assert_eq!(host.end_reason(), None);
+    guest.close();
+    host.close();
+    drop(server);
+}
+
 impl FrameSink for SizeSink {
     fn present(&mut self, frame: DecodedFrame) -> Result<(), SinkError> {
         self.0
@@ -1100,7 +1238,7 @@ fn m_the_host_changes_source_codec_and_quality_while_open() {
     // Otro códec: se renegocia y los dos siguen.
     host.set_video(coroom_session::remote::VideoChange {
         encoders: Some(EncoderSet::openh264()),
-        max_kbps: None,
+        ..Default::default()
     })
     .expect("cambio de códec");
     wait_for_video(&guest, "H.264", Duration::from_secs(20));
@@ -1112,8 +1250,8 @@ fn m_the_host_changes_source_codec_and_quality_while_open() {
 
     // Menos calidad: el objetivo de cada invitado baja al máximo nuevo.
     host.set_video(coroom_session::remote::VideoChange {
-        encoders: None,
         max_kbps: Some(300),
+        ..Default::default()
     })
     .expect("cambio de bitrate");
     wait_until("objetivo ≤ 300 kbit/s", Duration::from_secs(10), || {

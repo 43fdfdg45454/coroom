@@ -263,13 +263,19 @@ pub fn decoder_label(codec: Codec, backend: DecoderBackend) -> String {
 }
 
 /// Parámetros del codificador.
+///
+/// `width × height` es el **tope** de resolución (la «resolución máxima» de los ajustes), no un
+/// tamaño fijo: el codificador se abre con él y, cuando la captura entrega un fotograma de otro
+/// tamaño, se reabre al de ese fotograma reducido para que quepa en el tope
+/// ([`coroom_proto::video::fit`]: misma proporción, lados pares, nunca ampliado). Lo que ya cabe
+/// se codifica tal cual.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncoderConfig {
     /// Códec que se usa.
     pub codec: Codec,
-    /// Ancho en píxeles.
+    /// Ancho máximo en píxeles (par).
     pub width: u32,
-    /// Alto en píxeles.
+    /// Alto máximo en píxeles (par).
     pub height: u32,
     /// Fotogramas por segundo objetivo.
     pub fps: u32,
@@ -640,6 +646,45 @@ pub trait Encoder: Send {
     /// decir.
     fn rate_control(&self) -> Option<String> {
         None
+    }
+
+    /// Tamaño del flujo que produce ahora: el del último fotograma entregado, reducido al tope de
+    /// [`EncoderConfig`] si no cabía ([`coroom_proto::video::fit`]). `None` antes del primer
+    /// fotograma, o si el backend no lo sabe decir.
+    fn output_size(&self) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// Reducción en CPU que hizo el último fotograma para caber en el tope, con su coste medido.
+    /// `None` si no hubo que reducir, o si la reducción fue en la GPU (en la ruta sin copias va en
+    /// el mismo paso que la conversión de formato y no se mide aparte).
+    fn cpu_scale(&self) -> Option<CpuScale> {
+        None
+    }
+}
+
+/// Reducción en CPU de un fotograma al tope de resolución ([`Encoder::cpu_scale`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuScale {
+    /// Tamaño que trajo la captura.
+    pub from: (u32, u32),
+    /// Tamaño al que se redujo (el del flujo).
+    pub to: (u32, u32),
+    /// Lo que tardó la reducción (con la conversión de formato, si fue en el mismo paso).
+    pub took: std::time::Duration,
+}
+
+impl std::fmt::Display for CpuScale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}×{} → {}×{} en {:.2} ms",
+            self.from.0,
+            self.from.1,
+            self.to.0,
+            self.to.1,
+            self.took.as_secs_f64() * 1000.0
+        )
     }
 }
 

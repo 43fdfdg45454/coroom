@@ -3,8 +3,10 @@
 //! - [`FfmpegEncoder`]: SVT-AV1 por software y los codificadores por hardware de FFmpeg (Vulkan
 //!   Video, NVENC, AMF, QSV, VA-API) con opciones de baja latencia por backend
 //!   ([`encoder::low_latency_options`]). La imagen se convierte en CPU (BGRA → I420 o NV12 con la
-//!   crate `yuv`) y, en los backends con *hw frames*, se sube a la GPU con
-//!   `av_hwframe_transfer_data`; la importación sin copias está en [`import`].
+//!   crate `yuv`; si la captura es más grande que el tope de resolución, libswscale la reduce y
+//!   convierte en un solo paso, [`scale`]) y, en los backends con *hw frames*, se sube a la GPU con
+//!   `av_hwframe_transfer_data`; la importación sin copias está en [`import`], donde la reducción
+//!   va en el mismo filtro de la GPU que la conversión de formato.
 //! - [`FfmpegDecoder`]: dav1d, `h264` y `hevc` de FFmpeg por software, y los mismos `h264`, `hevc`
 //!   y `av1` con `hwaccel` (Vulkan, NVDEC, D3D12VA, D3D11VA, VA-API). La salida de la GPU se baja a
 //!   CPU (normalmente NV12, que `coroom-render` dibuja sin convertir).
@@ -31,6 +33,7 @@ pub(crate) mod hw;
 pub(crate) mod import;
 pub(crate) mod probe;
 pub mod probe_child;
+pub(crate) mod scale;
 pub(crate) mod vulkan;
 
 use std::ffi::{CStr, CString};

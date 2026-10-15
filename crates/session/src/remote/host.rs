@@ -855,7 +855,8 @@ fn send_loop(
 struct HostCtx {
     core: Arc<Core>,
     config: RemoteConfig,
-    video: LoopbackConfig,
+    /// Vídeo de la sala; la resolución máxima y los fps cambian con [`Command::Video`].
+    video: std::sync::Mutex<LoopbackConfig>,
     endpoint: Endpoint,
     signal: SignalSender,
     links: Arc<std::sync::Mutex<Links>>,
@@ -917,10 +918,34 @@ impl HostCtx {
         self.core.emit(SessionEvent::RelayUnavailable(message));
     }
 
+    /// El vídeo de ahora (resolución máxima y fps incluidos).
+    fn video(&self) -> LoopbackConfig {
+        *lock(&self.video)
+    }
+
+    /// Tamaño del flujo que se envía (lo que anuncian `HostFrameSize` y `CodecSelected`): el de la
+    /// captura reducido al tope si no cabe ([`LoopbackConfig::stream_size`]); antes del primer
+    /// fotograma, el tope.
+    fn stream_size(&self) -> (u32, u32) {
+        let video = self.video();
+        match self.core.shared.captured_size() {
+            Some(captured) => video.stream_size(captured),
+            None => (video.width, video.height),
+        }
+    }
+
+    /// Anuncia el tamaño del flujo a todos los invitados conectados.
+    fn announce_frame_size(&self, (width, height): (u32, u32)) {
+        let message = ControlMessage::HostFrameSize { width, height };
+        for (_, control) in lock(&self.links).guest_controls() {
+            let _ = control.send(&message);
+        }
+    }
+
     fn sender_config(&self) -> MediaSenderConfig {
         let max = self.max_kbps.load(Ordering::Acquire).max(1);
         MediaSenderConfig {
-            frame_interval: Duration::from_secs_f64(1.0 / f64::from(self.video.fps.max(1))),
+            frame_interval: frame_interval(self.video().fps),
             rate: RateConfig {
                 min_kbps: super::min_kbps(max),
                 max_kbps: max,
@@ -933,7 +958,10 @@ impl HostCtx {
         }
     }
 
-    /// Otros codificadores o bitrate máximo con la sala abierta.
+    /// Otros codificadores, bitrate máximo, resolución máxima o fps con la sala abierta. El
+    /// bitrate va derecho al control de tasa; lo demás reabre el codificador (un intra) con
+    /// [`renegotiate`], y los invitados siguen: el tamaño nuevo les llega en el flujo (su
+    /// decodificador lo toma del intra) y en `CodecSelected`, y los fps nuevos ajustan sus plazos.
     fn change_video(self: &Arc<Self>, change: VideoChange) {
         if let Some(max) = change.max_kbps {
             let max = max.max(1);
@@ -943,15 +971,89 @@ impl HostCtx {
             }
             debug!(kbps = max, "bitrate máximo");
         }
+        let mut reopen = false;
+        if change.max_size.is_some() || change.fps.is_some() {
+            let captured = self.core.shared.captured_size();
+            let (before, video) = {
+                let mut video = lock(&self.video);
+                let before = *video;
+                if let Some((width, height)) = change.max_size {
+                    video.width = width;
+                    video.height = height;
+                }
+                if let Some(fps) = change.fps {
+                    video.fps = fps.max(1);
+                }
+                (before, *video)
+            };
+            if video != before {
+                reopen = true;
+                debug!(
+                    width = video.width,
+                    height = video.height,
+                    fps = video.fps,
+                    "resolución máxima y fps"
+                );
+                // La captura en marcha (y la que se adopte después con `switch_capture`).
+                let options = video.capture_options();
+                if let Some(setup) = lock(&self.core.capture_setup).as_mut() {
+                    setup.1 = options;
+                }
+                self.core.shared.set_capture_options(options);
+                let links = lock(&self.links);
+                if video.fps != before.fps {
+                    let interval = frame_interval(video.fps);
+                    for sender in links.senders() {
+                        sender.set_frame_interval(interval);
+                    }
+                }
+                // El tamaño que ven los invitados es el de la captura reducida al tope nuevo (el
+                // hilo `encode` vuelve a avisar si la captura cambia después, p. ej. la sintética).
+                let stream = |video: &LoopbackConfig| match captured {
+                    Some(captured) => video.stream_size(captured),
+                    None => (video.width, video.height),
+                };
+                let (width, height) = stream(&video);
+                if (width, height) != stream(&before) {
+                    let message = ControlMessage::HostFrameSize { width, height };
+                    for (_, control) in links.guest_controls() {
+                        let _ = control.send(&message);
+                    }
+                }
+                drop(links);
+                self.warn_over_capabilities(video);
+            }
+        }
         if let Some(encoders) = change.encoders {
             *lock(&self.encoders) = encoders;
+            reopen = true;
+        }
+        if reopen {
             let ctx = Arc::clone(self);
             tokio::spawn(async move {
                 // Sin códec actual, la negociación vuelve a abrir aunque salga el mismo códec:
-                // así un cambio solo de backend también se aplica.
+                // así un cambio solo de backend, de tamaño o de fps también se aplica.
                 ctx.current.lock().await.take();
                 renegotiate(&ctx, None).await;
             });
+        }
+    }
+
+    /// Avisa de los invitados que admiten menos que lo que se envía.
+    fn warn_over_capabilities(&self, video: LoopbackConfig) {
+        let (w, h, fps) = (video.width, video.height, video.fps);
+        let over: Vec<String> = lock(&self.guest_caps)
+            .iter()
+            .filter(|(_, caps)| w > caps.max_width || h > caps.max_height || fps > caps.max_fps)
+            .map(|(guest, caps)| {
+                format!(
+                    "el invitado {} admite hasta {}×{} a {} fps",
+                    guest.0, caps.max_width, caps.max_height, caps.max_fps
+                )
+            })
+            .collect();
+        for note in over {
+            self.core.warn(format!("{note} y se envía {w}×{h} a {fps}"));
         }
     }
 
@@ -1000,10 +1102,8 @@ impl HostCtx {
             self.input.job(Job::Permissions { guest, permissions });
             let _ = control.send(&permissions_message(permissions));
         }
-        let _ = control.send(&ControlMessage::HostFrameSize {
-            width: self.video.width,
-            height: self.video.height,
-        });
+        let (width, height) = self.stream_size();
+        let _ = control.send(&ControlMessage::HostFrameSize { width, height });
         // Audio: formato de cada pista y permiso de voz.
         for (track, format, config) in [
             (
@@ -1604,7 +1704,8 @@ async fn control_reader(
             Some(ControlMessage::Capabilities(caps)) => {
                 let caps = GuestCapabilities::from_wire(&caps);
                 debug!(guest = guest.0, ?caps, "capacidades del invitado");
-                let (w, h, fps) = (ctx.video.width, ctx.video.height, ctx.video.fps);
+                let video = ctx.video();
+                let (w, h, fps) = (video.width, video.height, video.fps);
                 if w > caps.max_width || h > caps.max_height || fps > caps.max_fps {
                     ctx.core.warn(format!(
                         "el invitado {} admite hasta {}×{} a {} fps y se envía {w}×{h} a {fps}",
@@ -1682,7 +1783,8 @@ async fn renegotiate(ctx: &Arc<HostCtx>, guest: Option<GuestId>) {
     let decoders: Vec<_> = guests.iter().map(|caps| caps.decoders.clone()).collect();
     let encoders = lock(&ctx.encoders).clone();
     let mut available = encoders.available().to_vec();
-    let candidates = ctx.video.format_candidates();
+    let video = ctx.video();
+    let candidates = video.format_candidates();
     loop {
         let Some(codec) = choose_codec(&available, &decoders) else {
             if !guests.is_empty() {
@@ -1722,9 +1824,9 @@ async fn renegotiate(ctx: &Arc<HostCtx>, guest: Option<GuestId>) {
         for format in formats {
             let config = EncoderConfig {
                 codec,
-                width: ctx.video.width,
-                height: ctx.video.height,
-                fps: ctx.video.fps,
+                width: video.width,
+                height: video.height,
+                fps: video.fps,
                 bitrate_kbps: ctx.encode.bitrate_kbps.load(Ordering::Acquire),
                 slices: DEFAULT_SLICES,
                 format,
@@ -1794,9 +1896,14 @@ async fn renegotiate(ctx: &Arc<HostCtx>, guest: Option<GuestId>) {
     }
 }
 
+/// Intervalo entre fotogramas a `fps` (al menos 1).
+fn frame_interval(fps: u32) -> Duration {
+    Duration::from_secs_f64(1.0 / f64::from(fps.max(1)))
+}
+
 /// Atiende un `KeyframeRequest` del grupo `group` de un invitado con este RTT ([`KeyframeGate`]).
 fn keyframe_request(ctx: &Arc<HostCtx>, group: u32, rtt: Duration) {
-    let interval = Duration::from_secs_f64(1.0 / f64::from(ctx.video.fps.max(1)));
+    let interval = frame_interval(ctx.video().fps);
     match ctx.gate.on_request(group, rtt, interval, Instant::now()) {
         KeyframeDecision::Now => ctx.core.shared.request_keyframe(),
         KeyframeDecision::Later(wait) => {
@@ -1815,11 +1922,13 @@ fn keyframe_request(ctx: &Arc<HostCtx>, group: u32, rtt: Duration) {
 /// Envía `CodecSelected` a `guest` o, con `None`, a todos los conectados.
 fn announce(ctx: &HostCtx, codec: Codec, format: VideoFormat, guest: Option<GuestId>) {
     let (chroma, color) = format_to_wire(format);
+    let video = ctx.video();
+    let (width, height) = ctx.stream_size();
     let message = ControlMessage::CodecSelected {
         codec: codec_to_wire(codec),
-        width: ctx.video.width,
-        height: ctx.video.height,
-        fps: ctx.video.fps,
+        width,
+        height,
+        fps: video.fps,
         chroma,
         color,
     };
@@ -2583,7 +2692,7 @@ async fn run_host(
             role: WireRole::Host,
         })),
         config,
-        video,
+        video: std::sync::Mutex::new(video),
         endpoint,
         signal: signal.sender(),
         links,
@@ -2605,6 +2714,16 @@ async fn run_host(
         input,
         audio_info,
     });
+    // Cuando el flujo cambia de tamaño (otra captura, o el tope que la reduce), los invitados se
+    // enteran por `HostFrameSize`, además de por el propio flujo.
+    ctx.encode.set_size_listener(Box::new({
+        let ctx = Arc::downgrade(&ctx);
+        move |size| {
+            if let Some(ctx) = ctx.upgrade() {
+                ctx.announce_frame_size(size);
+            }
+        }
+    }));
     let mut room = Room {
         ctx: Arc::clone(&ctx),
         group,
