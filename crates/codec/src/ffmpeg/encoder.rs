@@ -52,12 +52,34 @@ const OUTPUT_POLL: Duration = Duration::from_micros(200);
 /// (un codificador lento, como SVT-AV1 en un equipo justo) se duerme para no gastar un núcleo.
 const OUTPUT_SPIN: Duration = Duration::from_millis(4);
 
+/// Tamaño del búfer VBV en bits para `bitrate_kbps` a `fps`: lo que entra en **un** intervalo de
+/// fotograma. Se fija al abrir y se vuelve a fijar con cada cambio de bitrate
+/// ([`Encoder::set_bitrate`]): un búfer calculado con el bitrate de arranque dejaba al intra ese
+/// tamaño aunque el objetivo hubiera bajado a la cuarta parte. SVT-AV1 no admite un búfer menor
+/// de [`SVT_MIN_VBV_MS`] (lo rechaza al abrir): con él, el mayor de los dos.
+pub fn vbv_buffer_bits(bitrate_kbps: u32, fps: u32, backend: Backend) -> u64 {
+    let frame = u64::from(bitrate_kbps) * 1000 / u64::from(fps.max(1));
+    let floor = if backend == Backend::Software {
+        u64::from(bitrate_kbps) * SVT_MIN_VBV_MS
+    } else {
+        0
+    };
+    frame.max(floor).max(1)
+}
+
+/// Búfer VBV mínimo que acepta SVT-AV1, en milisegundos («The maximum buffer size must be between
+/// [20, 10000]»).
+pub const SVT_MIN_VBV_MS: u64 = 20;
+
 /// Opciones de baja latencia de cada backend, tal como las acepta `avcodec_open2` (genéricas de
 /// `AVCodecContext` y privadas del codificador). Comprobadas contra la ayuda de cada codificador de
 /// FFmpeg 8.1 (`ffmpeg -h encoder=…`) y, en los que no hay en la build de desarrollo (AMF), contra su
 /// fuente; el test `low_latency_options_exist` lo vuelve a mirar con `av_opt_find`.
 ///
-/// Comunes: CBR (`b` = `maxrate`) con un búfer de tres fotogramas, sin B-frames, una referencia,
+/// Comunes: CBR (`b` = `maxrate`) con un búfer VBV de **un fotograma** ([`vbv_buffer_bits`]: así
+/// ningún fotograma, intra incluido, pesa mucho más que lo que el enlace pasa en un intervalo; con
+/// tres, un intra tras un cambio de escena salía con tres fotogramas de bits y llenaba la cola del
+/// camino), sin B-frames, una referencia,
 /// GOP muy largo (intra solo al pedirlo), el espacio de color del flujo en el VUI (BT.709
 /// en rango limitado, o BT.2020 con PQ en HDR; ver [`color_options`]), el perfil de 4:4:4 o de
 /// 10 bits si hace falta ([`profile_option`]) y `slices` si se piden varios.
@@ -88,7 +110,10 @@ pub fn low_latency_options(
     let mut options: Vec<(&'static str, String)> = vec![
         ("b", bitrate.to_string()),
         ("maxrate", bitrate.to_string()),
-        ("bufsize", (bitrate * 3 / u64::from(fps)).max(1).to_string()),
+        (
+            "bufsize",
+            vbv_buffer_bits(config.bitrate_kbps, fps, backend).to_string(),
+        ),
         ("bf", "0".into()),
         ("refs", "1".into()),
         ("g", LONG_GOP.to_string()),
@@ -890,11 +915,18 @@ impl Encoder for FfmpegEncoder {
             && let Some(session) = self.session.as_mut()
         {
             let bitrate = i64::from(bitrate_kbps) * 1000;
+            let vbv = i32::try_from(vbv_buffer_bits(bitrate_kbps, config.fps, self.backend))
+                .unwrap_or(i32::MAX);
             session.ctx.set_bit_rate(bitrate);
             // SAFETY: `as_mut_ptr` apunta al `AVCodecContext` abierto que posee `session.ctx`;
-            // `rc_max_rate` es un entero que el codificador lee al reconfigurarse en el siguiente
-            // `avcodec_send_frame`, y nadie más usa el contexto ahora (`&mut self`).
-            unsafe { (*session.ctx.as_mut_ptr()).rc_max_rate = bitrate };
+            // `rc_max_rate` y `rc_buffer_size` son enteros que el codificador lee al
+            // reconfigurarse en el siguiente `avcodec_send_frame`, y nadie más usa el contexto
+            // ahora (`&mut self`). El VBV sigue al bitrate: un fotograma al objetivo nuevo.
+            unsafe {
+                let ctx = session.ctx.as_mut_ptr();
+                (*ctx).rc_max_rate = bitrate;
+                (*ctx).rc_buffer_size = vbv;
+            }
             self.config = Some(config);
             return Ok(());
         }
@@ -1274,6 +1306,37 @@ mod tests {
             checked.iter().any(|name| name == "libsvtav1"),
             "{checked:?}"
         );
+    }
+
+    /// El VBV es de un fotograma al bitrate configurado, en todos los backends.
+    #[test]
+    fn the_vbv_buffer_holds_one_frame() {
+        assert_eq!(vbv_buffer_bits(10_000, 60, Backend::Nvenc), 166_666);
+        assert_eq!(vbv_buffer_bits(10_000, 120, Backend::Vaapi), 83_333);
+        assert_eq!(
+            vbv_buffer_bits(10_000, 0, Backend::Nvenc),
+            10_000_000,
+            "sin fps, un segundo"
+        );
+        assert_eq!(vbv_buffer_bits(0, 60, Backend::Nvenc), 1);
+        // SVT-AV1 no baja de 20 ms: a 60 fps son 1,2 fotogramas; a 30, un fotograma.
+        assert_eq!(vbv_buffer_bits(10_000, 60, Backend::Software), 200_000);
+        assert_eq!(vbv_buffer_bits(10_000, 30, Backend::Software), 333_333);
+        for codec in Codec::PREFERENCE {
+            for backend in Backend::ALL {
+                let options = low_latency_options(codec, backend, &config(codec));
+                let bufsize = options
+                    .iter()
+                    .find(|(key, _)| *key == "bufsize")
+                    .map(|(_, value)| value.as_str());
+                let expected = if backend == Backend::Software {
+                    "200000"
+                } else {
+                    "166666"
+                };
+                assert_eq!(bufsize, Some(expected), "{codec:?} {backend:?}");
+            }
+        }
     }
 
     #[test]

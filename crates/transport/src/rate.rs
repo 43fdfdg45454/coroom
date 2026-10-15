@@ -1,17 +1,25 @@
 //! Control de tasa de los medios y controlador de congestión de `quinn`.
 //!
 //! [`RateController`] está inspirado en **SCReAM** (RFC 8298): el receptor envía un `Feedback`
-//! cada 50 ms con sus marcas de llegada, los objetos perdidos y las marcas ECN-CE; el emisor estima
-//! la cola del camino como el retardo de ida (OWD) por encima de su mínimo de los últimos 10 s y
-//! ajusta el bitrate objetivo:
+//! cada 50 ms con sus marcas de llegada, los bytes recibidos, los objetos perdidos y las marcas
+//! ECN-CE; el emisor estima la cola del camino como el retardo de ida (OWD) por encima de su mínimo
+//! de los últimos 10 s y ajusta el bitrate objetivo:
 //!
 //! - **por retardo**: sin cola, crecimiento multiplicativo suave, +5 % cada 100 ms, hasta
-//!   `max_kbps`; cola por encima de [`QUEUE_THRESHOLD`] y creciendo: reducción proporcional al
-//!   exceso; marcas ECN-CE sin cola: reducción del 10 % (reacción tipo L4S);
+//!   `max_kbps`, pero nunca por encima de [`DELIVERED_HEADROOM`] veces lo que el receptor dice haber
+//!   **recibido** en los últimos [`RATE_WINDOW`]: lo que llega es la única medida del enlace, y
+//!   también de si el emisor usa el objetivo (con la pantalla quieta el codificador manda poco y el
+//!   objetivo se queda donde está; antes crecía sin tope y el primer intra tras un cambio de escena
+//!   salía a un bitrate que el camino no pasaba). Cola por encima de [`QUEUE_THRESHOLD`] y
+//!   creciendo: reducción proporcional al exceso y, si el emisor usaba el objetivo
+//!   ([`UTILIZATION`]), hasta por debajo de lo recibido ([`DELIVERED_CUT`]); tras un recorte no se
+//!   vuelve a crecer hasta que la cola se vacía y pasa [`HOLD_AFTER_CUT`] (antes la subida empezaba
+//!   100 ms después del recorte, con la cola aún llena, y se encadenaban los recortes). Marcas
+//!   ECN-CE sin cola: reducción del 10 % (reacción tipo L4S);
 //! - **por pérdida**, una segunda estimación como la del controlador GCC
 //!   (`draft-ietf-rmcat-gcc`, §6): con la pérdida de los informes del último segundo
-//!   ([`LOSS_WINDOW`]) por debajo del 2 % crece, entre el 2 y el 10 % se mantiene y por encima del
-//!   10 % se recorta en `pérdida / 2` cada 300 ms;
+//!   ([`LOSS_WINDOW`]) por debajo del 2 % crece (con el mismo tope de lo recibido), entre el 2 y
+//!   el 10 % se mantiene y por encima del 10 % se recorta en `pérdida / 2` cada 300 ms;
 //! - el objetivo es el **mínimo** de las dos. La pérdida aleatoria de un enlace malo (sin cola) la
 //!   cubren la FEC y el `Nack`: con una sola estimación, recortar con cada 2 % la hundía hasta el
 //!   mínimo, y con el 5 % de pérdida del perfil `mala` ya no se recuperaba de ningún recorte por
@@ -22,7 +30,11 @@
 //! (con 60 ± 20 ms y ~15 muestras en la ventana, el mínimo pasa de los 10 ms del umbral con una
 //! probabilidad del 1 %; una cola que crece se detecta con 500 ms de retraso como mucho).
 //! (Antes era la mediana de cada informe, y con 30 ± 10 ms de jitter la «cola» rondaba
-//! los 10 ms del umbral sin que hubiera ninguna: el bitrate caía al mínimo.)
+//! los 10 ms del umbral sin que hubiera ninguna: el bitrate caía al mínimo.) Además, dos informes
+//! seguidos cuyo mínimo supere en [`FAST_QUEUE`] el retardo base son una cola segura (con ± 30 ms
+//! de jitter y tres muestras por informe, un informe solo lo hace por azar cada ~10 s; dos
+//! seguidos, cada ~40 min) y recortan sin esperar a la ventana: una cola grande, la de un intra que
+//! no cabe, se detecta en 100 ms y no en 500.
 //!
 //! La salida [`RateController::target_kbps`] lleva histéresis: si la variación es < 10 % no cambia
 //! más de una vez por segundo, para no reconfigurar el codificador a cada informe.
@@ -75,11 +87,43 @@ pub fn controller_window(target_kbps: u32, rtt: Duration) -> u64 {
 /// Cola a partir de la cual el emisor reduce el bitrate.
 pub const QUEUE_THRESHOLD: Duration = Duration::from_millis(10);
 
+/// Cola que dos informes seguidos bastan para dar por segura ([`RateController::queue_delay_now`]):
+/// recorta sin esperar a [`QUEUE_WINDOW`]. Cinco veces el umbral: el jitter de los perfiles de la
+/// matriz de red (hasta ± 20 ms) no la alcanza ni en un informe.
+pub const FAST_QUEUE: Duration = Duration::from_millis(50);
+
 /// Ventana del mínimo de OWD (retardo base del camino).
 const BASE_WINDOW: Duration = Duration::from_secs(10);
 
 /// Ventana corta del mínimo de OWD con la que se estima la cola (filtra el jitter).
 pub const QUEUE_WINDOW: Duration = Duration::from_millis(500);
+
+/// Ventana en la que se miden lo enviado y lo recibido ([`RateController::delivered_kbps`]).
+pub const RATE_WINDOW: Duration = Duration::from_millis(500);
+
+/// Tiempo mínimo que tiene que cubrir [`RATE_WINDOW`] para que sus tasas valgan (con menos, un
+/// informe adelantado o retrasado por el jitter las desvía a la mitad o al doble).
+const MIN_RATE_SPAN: Duration = Duration::from_millis(200);
+
+/// Tope del crecimiento sobre lo recibido: la estimación por retardo no pasa de este factor por lo
+/// que el receptor recibió en [`RATE_WINDOW`]. Con el objetivo en uso y sin pérdida, lo recibido
+/// en la ventana queda algo por debajo del objetivo (que ya subió mientras tanto) y el tope deja
+/// pasar el +5 %; con el codificador mandando menos del ~80 % del objetivo, lo frena.
+pub const DELIVERED_HEADROOM: f64 = 1.25;
+
+/// Parte del objetivo que tiene que estar enviando el emisor para que un recorte por cola baje
+/// también por debajo de lo recibido: si mandaba mucho menos (pantalla quieta), lo recibido no
+/// dice nada del enlace y solo vale el recorte proporcional.
+pub const UTILIZATION: f64 = 0.75;
+
+/// Al recortar por cola con el objetivo en uso, la estimación baja al menos hasta esta parte de lo
+/// recibido: lo que llegaba ya era más de lo que el camino pasaba sin hacer cola.
+pub const DELIVERED_CUT: f64 = 0.90;
+
+/// Tras un recorte por cola o ECN no se crece durante este tiempo (y, además, hasta que la cola
+/// medida baje de la mitad del umbral): lo recortado tiene que vaciar la cola antes de volver a
+/// probar.
+pub const HOLD_AFTER_CUT: Duration = Duration::from_secs(1);
 
 /// Pérdida por debajo de la cual se puede crecer (GCC).
 pub const LOSS_GROW: f64 = 0.02;
@@ -98,7 +142,7 @@ const LOSS_PERIOD: Duration = Duration::from_millis(300);
 /// pérdida, uno perdido ya es un 10 %, y decidir con eso recortaba al azar.
 pub const LOSS_WINDOW: Duration = Duration::from_secs(1);
 
-/// Informes en [`LOSS_WINDOW`] como mucho.
+/// Informes en [`LOSS_WINDOW`] (y en [`RATE_WINDOW`]) como mucho.
 const MAX_LOSS_REPORTS: usize = 256;
 
 /// Histéresis de la salida.
@@ -139,6 +183,11 @@ pub struct RateInput<'a> {
     pub sent_objects: u64,
     /// Marcas ECN-CE nuevas desde el último informe.
     pub ecn_ce: u32,
+    /// Bytes de medios que el receptor recibió desde el informe anterior (cabeceras y reparación
+    /// incluidas).
+    pub received_bytes: u64,
+    /// Bytes de medios que el emisor envió entre lo que cubría el informe anterior y este.
+    pub sent_bytes: u64,
 }
 
 /// Control de tasa tipo SCReAM del emisor.
@@ -151,16 +200,23 @@ pub struct RateController {
     loss_estimate: f64,
     /// Informes de [`LOSS_WINDOW`]: instante, objetos perdidos y objetos enviados.
     loss_window: VecDeque<(Instant, f64, u64)>,
+    /// Informes de [`RATE_WINDOW`]: instante, bytes recibidos y bytes enviados desde el anterior.
+    throughput: VecDeque<(Instant, u64, u64)>,
     output: u32,
     last_output_change: Option<Instant>,
     base: VecDeque<(Instant, i64)>,
     recent: VecDeque<(Instant, i64)>,
     queue_ms: f64,
     previous_queue_ms: f64,
+    /// Cola del último informe sin filtrar (su mínimo sobre el retardo base) y la del anterior.
+    instant_queue_ms: f64,
+    previous_instant_queue_ms: f64,
     loss: f64,
     last_adjust: Option<Instant>,
     last_loss_cut: Option<Instant>,
     last_loss_grow: Option<Instant>,
+    /// Hasta cuándo no se crece tras un recorte ([`HOLD_AFTER_CUT`]).
+    hold_until: Option<Instant>,
 }
 
 impl RateController {
@@ -177,16 +233,20 @@ impl RateController {
             estimate: f64::from(config.start_kbps),
             loss_estimate: f64::from(config.start_kbps),
             loss_window: VecDeque::new(),
+            throughput: VecDeque::new(),
             output: config.start_kbps,
             last_output_change: None,
             base: VecDeque::new(),
             recent: VecDeque::new(),
             queue_ms: 0.0,
             previous_queue_ms: 0.0,
+            instant_queue_ms: 0.0,
+            previous_instant_queue_ms: 0.0,
             loss: 0.0,
             last_adjust: None,
             last_loss_cut: None,
             last_loss_grow: None,
+            hold_until: None,
         }
     }
 
@@ -223,38 +283,107 @@ impl RateController {
         Duration::from_secs_f64(self.queue_ms.max(0.0) / 1000.0)
     }
 
+    /// Cola del último informe, sin filtrar: lo que su OWD mínimo supera al retardo base. Sube en
+    /// cuanto el camino hace cola; con jitter puede marcar unos milisegundos que no son cola.
+    pub fn queue_delay_now(&self) -> Duration {
+        Duration::from_secs_f64(self.instant_queue_ms.max(0.0) / 1000.0)
+    }
+
     /// Pérdida de [`LOSS_WINDOW`] (0..1).
     pub fn loss(&self) -> f64 {
         self.loss
+    }
+
+    /// Lo que el receptor recibió en los últimos [`RATE_WINDOW`], en kbit/s; `None` hasta que la
+    /// ventana cubre [`MIN_RATE_SPAN`].
+    pub fn delivered_kbps(&self) -> Option<f64> {
+        self.window_rates().map(|(_, delivered)| delivered)
+    }
+
+    /// Lo que el emisor envió en los últimos [`RATE_WINDOW`], en kbit/s; `None` como
+    /// [`RateController::delivered_kbps`].
+    pub fn sent_kbps(&self) -> Option<f64> {
+        self.window_rates().map(|(sent, _)| sent)
+    }
+
+    /// `(enviado, recibido)` en kbit/s sobre [`RATE_WINDOW`]. Cada informe trae lo que pasó desde
+    /// el anterior, así que el primero de la ventana solo pone el instante inicial.
+    fn window_rates(&self) -> Option<(f64, f64)> {
+        let (&(first, _, _), &(last, _, _)) = (self.throughput.front()?, self.throughput.back()?);
+        let span = last.saturating_duration_since(first);
+        if span < MIN_RATE_SPAN {
+            return None;
+        }
+        let (received, sent) = self
+            .throughput
+            .iter()
+            .skip(1)
+            .fold((0u64, 0u64), |(r, s), &(_, received, sent)| {
+                (r + received, s + sent)
+            });
+        let kbps = |bytes: u64| bytes as f64 * 8.0 / 1000.0 / span.as_secs_f64();
+        Some((kbps(sent), kbps(received)))
     }
 
     /// Procesa un informe y devuelve el bitrate objetivo resultante.
     pub fn update(&mut self, now: Instant, input: RateInput<'_>) -> u32 {
         self.update_queue(now, input.owd_us);
         self.update_loss(now, input.loss_fraction, input.sent_objects);
+        self.update_throughput(now, input.received_bytes, input.sent_bytes);
 
         let threshold = QUEUE_THRESHOLD.as_secs_f64() * 1000.0;
+        let fast_ms = FAST_QUEUE.as_secs_f64() * 1000.0;
+        let fast = self.instant_queue_ms > fast_ms && self.previous_instant_queue_ms > fast_ms;
         let growing = self.queue_ms > self.previous_queue_ms;
-        let queue = self.queue_ms > threshold && (growing || self.queue_ms > 2.0 * threshold);
+        let queue =
+            fast || (self.queue_ms > threshold && (growing || self.queue_ms > 2.0 * threshold));
         let due = |last: Option<Instant>, period: Duration| {
             last.is_none_or(|at| now.saturating_duration_since(at) >= period)
         };
+        let rates = self.window_rates();
+        let delivered = rates.map(|(_, delivered)| delivered);
+        // Con el objetivo en uso, lo recibido mide el enlace; si no, solo mide al codificador.
+        let utilized = |target: f64| rates.is_none_or(|(sent, _)| sent >= UTILIZATION * target);
+        // Lo más alto a lo que se puede subir `from`: [`DELIVERED_HEADROOM`] veces lo recibido, sin
+        // bajar por ello de donde está.
+        let grow_cap = |from: f64| {
+            delivered.map_or(f64::INFINITY, |delivered| {
+                (delivered * DELIVERED_HEADROOM).max(from)
+            })
+        };
+        let held = self.hold_until.is_some_and(|until| now < until);
 
-        // Retardo: la cola y ECN recortan; sin cola, crece.
+        // Retardo: la cola y ECN recortan; sin cola (y pasada la espera tras un recorte), crece.
         if queue {
             if due(self.last_adjust, ADJUST_PERIOD) {
-                let excess = (self.queue_ms - threshold) / threshold;
+                let queue_ms = if fast {
+                    self.queue_ms
+                        .max(self.instant_queue_ms.min(self.previous_instant_queue_ms))
+                } else {
+                    self.queue_ms
+                };
+                let excess = (queue_ms - threshold) / threshold;
                 let cut = (0.05 + 0.10 * excess).clamp(0.05, 0.40);
-                self.estimate *= 1.0 - cut;
+                let mut next = self.estimate * (1.0 - cut);
+                if utilized(self.estimate)
+                    && let Some(delivered) = delivered
+                {
+                    next = next.min(delivered * DELIVERED_CUT);
+                }
+                self.estimate = next;
                 self.last_adjust = Some(now);
+                self.hold_until = Some(now + HOLD_AFTER_CUT);
             }
         } else if input.ecn_ce > 0 {
             if due(self.last_adjust, ADJUST_PERIOD) {
                 self.estimate *= 0.90;
                 self.last_adjust = Some(now);
+                self.hold_until = Some(now + HOLD_AFTER_CUT);
             }
         } else if self.queue_ms < threshold / 2.0 && due(self.last_adjust, ADJUST_PERIOD) {
-            self.estimate *= 1.05;
+            if !held {
+                self.estimate = (self.estimate * 1.05).min(grow_cap(self.estimate));
+            }
             self.last_adjust = Some(now);
         }
         // Pérdida (GCC): por encima del 10 %, recorte desde el objetivo actual; por debajo del
@@ -266,7 +395,7 @@ impl RateController {
                 self.last_loss_cut = Some(now);
             }
         } else if self.loss < LOSS_GROW && due(self.last_loss_grow, ADJUST_PERIOD) {
-            self.loss_estimate *= 1.05;
+            self.loss_estimate = (self.loss_estimate * 1.05).min(grow_cap(self.loss_estimate));
             self.last_loss_grow = Some(now);
         }
         let (min, max) = (
@@ -305,6 +434,23 @@ impl RateController {
         }
     }
 
+    fn update_throughput(&mut self, now: Instant, received: u64, sent: u64) {
+        self.throughput.push_back((now, received, sent));
+        while self.throughput.len() > MAX_LOSS_REPORTS {
+            self.throughput.pop_front();
+        }
+        // Se conserva el primero fuera de la ventana: pone el instante inicial del intervalo que
+        // cubre el siguiente.
+        while self.throughput.len() > 1
+            && self
+                .throughput
+                .get(1)
+                .is_some_and(|&(at, _, _)| now.saturating_duration_since(at) > RATE_WINDOW)
+        {
+            self.throughput.pop_front();
+        }
+    }
+
     fn update_queue(&mut self, now: Instant, owd_us: &[i64]) {
         let Some(minimum) = owd_us.iter().copied().min() else {
             return;
@@ -324,8 +470,11 @@ impl RateController {
         let floor = |window: &VecDeque<(Instant, i64)>| {
             window.iter().map(|(_, owd)| *owd).min().unwrap_or(minimum)
         };
-        let queue_ms = (floor(&self.recent) - floor(&self.base)).max(0) as f64 / 1000.0;
+        let base = floor(&self.base);
+        let queue_ms = (floor(&self.recent) - base).max(0) as f64 / 1000.0;
         self.queue_ms = 0.7 * self.queue_ms + 0.3 * queue_ms;
+        self.previous_instant_queue_ms = self.instant_queue_ms;
+        self.instant_queue_ms = (minimum - base).max(0) as f64 / 1000.0;
     }
 
     fn update_output(&mut self, now: Instant) {
@@ -525,16 +674,26 @@ mod tests {
 
     const TICK: Duration = Duration::from_millis(50);
 
-    fn run(
+    /// Bytes que salen en un `TICK` a `kbps`.
+    fn bytes_per_tick(kbps: u32) -> u64 {
+        u64::from(kbps) * 1000 / 8 * TICK.as_millis() as u64 / 1000
+    }
+
+    /// Un informe por `TICK` con el emisor usando el objetivo: envía `usage` veces lo que marca
+    /// el objetivo y el receptor recibe lo enviado menos la pérdida.
+    fn run_with_usage(
         controller: &mut RateController,
         start: Instant,
         ticks: std::ops::Range<u32>,
         owd_ms: impl Fn(u32) -> i64,
         loss: f64,
+        usage: f64,
     ) -> Vec<u32> {
         ticks
             .map(|tick| {
                 let owd = owd_ms(tick) * 1000;
+                let sent = (bytes_per_tick(controller.target_kbps()) as f64 * usage) as u64;
+                let received = (sent as f64 * (1.0 - loss)) as u64;
                 controller.update(
                     start + TICK * tick,
                     RateInput {
@@ -542,10 +701,142 @@ mod tests {
                         loss_fraction: loss,
                         sent_objects: 10,
                         ecn_ce: 0,
+                        received_bytes: received,
+                        sent_bytes: sent,
                     },
                 )
             })
             .collect()
+    }
+
+    fn run(
+        controller: &mut RateController,
+        start: Instant,
+        ticks: std::ops::Range<u32>,
+        owd_ms: impl Fn(u32) -> i64,
+        loss: f64,
+    ) -> Vec<u32> {
+        run_with_usage(controller, start, ticks, owd_ms, loss, 1.0)
+    }
+
+    /// Con la pantalla quieta el codificador manda una fracción del objetivo: el objetivo no
+    /// crece (antes subía sin tope y el primer intra salía a un bitrate que el camino no pasaba).
+    #[test]
+    fn the_target_does_not_grow_while_the_sender_barely_uses_it() {
+        let start = Instant::now();
+        let mut controller = RateController::new(RateConfig {
+            min_kbps: 1_000,
+            max_kbps: 50_000,
+            start_kbps: 8_000,
+        });
+        let idle = run_with_usage(&mut controller, start, 0..100, |_| 20, 0.0, 0.2);
+        // Los dos primeros ajustes, antes de tener ventana, crecen a ciegas; después, nada.
+        let blind = (8_000.0 * 1.05 * 1.05) as u32 + 1;
+        assert!(
+            idle.iter().all(|&kbps| kbps <= blind),
+            "sin usar el objetivo no se crece: {idle:?}"
+        );
+        assert_eq!(idle[20], idle[99], "{idle:?}");
+        // Vuelve el movimiento: se usa el objetivo y crece.
+        let busy = run(&mut controller, start, 100..160, |_| 20, 0.0);
+        assert!(*busy.last().expect("muestras") > 10_000, "{busy:?}");
+    }
+
+    /// El crecimiento no pasa de [`DELIVERED_HEADROOM`] veces lo que el receptor recibe aunque la
+    /// pérdida esté entre los umbrales de GCC (mantener).
+    #[test]
+    fn growth_is_bounded_by_what_the_receiver_gets() {
+        let start = Instant::now();
+        let mut controller = RateController::new(RateConfig {
+            min_kbps: 1_000,
+            max_kbps: 50_000,
+            start_kbps: 8_000,
+        });
+        // Llega el 60 % de lo enviado sin que la pérdida medida llegue al 10 % que recorta.
+        let mut peak = 0;
+        for tick in 0..100u32 {
+            let sent = bytes_per_tick(controller.target_kbps());
+            let kbps = controller.update(
+                start + TICK * tick,
+                RateInput {
+                    owd_us: &[20_000],
+                    loss_fraction: 0.05,
+                    sent_objects: 10,
+                    ecn_ce: 0,
+                    received_bytes: sent * 6 / 10,
+                    sent_bytes: sent,
+                },
+            );
+            peak = peak.max(kbps);
+        }
+        let delivered = controller.delivered_kbps().expect("hay ventana");
+        assert!(
+            f64::from(peak) <= 8_000.0 * 1.06,
+            "no crece por encima de 1,25 × lo recibido: {peak} (recibido {delivered:.0})"
+        );
+        assert!((delivered - 0.6 * f64::from(controller.target_kbps())).abs() < 500.0);
+    }
+
+    /// Tras un recorte por cola no se vuelve a crecer hasta pasado [`HOLD_AFTER_CUT`], aunque la
+    /// cola ya no se vea (lo recortado tiene que vaciarla).
+    #[test]
+    fn after_a_cut_the_target_holds_before_growing_again() {
+        let start = Instant::now();
+        let mut controller = RateController::new(RateConfig {
+            min_kbps: 1_000,
+            max_kbps: 50_000,
+            start_kbps: 10_000,
+        });
+        run(&mut controller, start, 0..19, |_| 20, 0.0);
+        // Dos informes con 60 ms de cola: recorta en el segundo (vía rápida), sin esperar a los
+        // 500 ms de la ventana.
+        let before = controller.target_kbps();
+        let cut = run(&mut controller, start, 19..21, |_| 80, 0.0);
+        assert_eq!(cut[0], before, "un informe solo no basta");
+        assert!(cut[1] < before, "recorta al segundo: {before} → {}", cut[1]);
+        let floor = controller.estimate_kbps();
+        // Sin cola durante HOLD_AFTER_CUT: no sube.
+        let hold_ticks = (HOLD_AFTER_CUT.as_millis() / TICK.as_millis()) as u32;
+        run(&mut controller, start, 21..20 + hold_ticks, |_| 20, 0.0);
+        assert!(
+            controller.estimate_kbps() <= floor + 1.0,
+            "no crece durante la espera: {floor} → {}",
+            controller.estimate_kbps()
+        );
+        // Pasada la espera, crece.
+        run(
+            &mut controller,
+            start,
+            20 + hold_ticks..40 + hold_ticks,
+            |_| 20,
+            0.0,
+        );
+        assert!(controller.estimate_kbps() > floor * 1.2);
+    }
+
+    /// Las tasas de la ventana: lo enviado y lo recibido en kbit/s.
+    #[test]
+    fn the_rate_window_measures_sent_and_delivered() {
+        let start = Instant::now();
+        let mut controller = RateController::new(RateConfig::default());
+        assert_eq!(controller.delivered_kbps(), None, "sin ventana aún");
+        for tick in 0..10u32 {
+            controller.update(
+                start + TICK * tick,
+                RateInput {
+                    owd_us: &[20_000],
+                    sent_objects: 10,
+                    // 50 ms × 8 Mbit/s = 50 000 B enviados; llegan 40 000.
+                    received_bytes: 40_000,
+                    sent_bytes: 50_000,
+                    ..RateInput::default()
+                },
+            );
+        }
+        let sent = controller.sent_kbps().expect("ventana");
+        let delivered = controller.delivered_kbps().expect("ventana");
+        assert!((sent - 8_000.0).abs() < 1.0, "{sent}");
+        assert!((delivered - 6_400.0).abs() < 1.0, "{delivered}");
     }
 
     #[test]
@@ -672,6 +963,8 @@ mod tests {
                         loss_fraction: lost as f64 / 10.0,
                         sent_objects: 10,
                         ecn_ce: 0,
+                        received_bytes: 10_000,
+                        sent_bytes: 10_000,
                     },
                 );
                 if tick == 199 {
@@ -706,7 +999,7 @@ mod tests {
                     owd_us: &[20_000],
                     loss_fraction: lost,
                     sent_objects: 10,
-                    ecn_ce: 0,
+                    ..RateInput::default()
                 },
             );
         }
@@ -721,9 +1014,8 @@ mod tests {
             start + TICK * 40,
             RateInput {
                 owd_us: &[20_000],
-                loss_fraction: 0.0,
                 sent_objects: 10,
-                ecn_ce: 0,
+                ..RateInput::default()
             },
         );
         assert_eq!(controller.loss(), 0.0);

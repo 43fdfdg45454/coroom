@@ -350,6 +350,10 @@ struct FeedbackSource {
     repair_ratio: f64,
     last_lost: u32,
     last_sources: u64,
+    /// Bytes enviados hasta el grupo que cubría el último informe.
+    last_sent_bytes: u64,
+    /// `received_bytes` del último informe.
+    last_received: u64,
     last_ecn: u64,
     last_feedback_ecn: u32,
 }
@@ -362,6 +366,8 @@ impl FeedbackSource {
             repair_ratio: INITIAL_REPAIR_RATIO,
             last_lost: 0,
             last_sources: 0,
+            last_sent_bytes: 0,
+            last_received: 0,
             last_ecn: 0,
             last_feedback_ecn: 0,
         }
@@ -377,7 +383,9 @@ struct SenderState {
     epoch_hint: u16,
     clock: Clock,
     sources_sent: u64,
-    cumulative: VecDeque<(u32, u64)>,
+    bytes_sent: u64,
+    /// Por grupo enviado: objetos de origen y bytes (cabeceras y reparación) acumulados hasta él.
+    cumulative: VecDeque<(u32, u64, u64)>,
 }
 
 impl SenderState {
@@ -436,6 +444,7 @@ impl MediaSender {
                 epoch_hint: 0,
                 clock: Clock::with_origin(origin),
                 sources_sent: 0,
+                bytes_sent: 0,
                 cumulative: VecDeque::new(),
             }),
         }
@@ -499,10 +508,25 @@ impl MediaSender {
         Duration::from_secs_f64(queued / rate)
     }
 
-    /// Si la cola de QUIC lleva más de [`STALE_QUEUE`]: el enlace está atascado y lo que se envíe
-    /// ahora llegaría tarde.
+    /// Si el enlace está atascado y lo que se envíe ahora llegaría tarde: la cola de QUIC lleva
+    /// más de [`STALE_QUEUE`] (nada sale) o el último `Feedback` del receptor que limita midió más
+    /// de [`STALE_QUEUE`] de cola en el camino (sale, pero se acumula por delante).
     pub fn stalled(&self) -> bool {
         self.send_queue_delay() > STALE_QUEUE
+            || self.state.lock().is_ok_and(|state| {
+                state
+                    .limiting()
+                    .is_some_and(|source| source.rate.queue_delay_now() > STALE_QUEUE)
+            })
+    }
+
+    /// Bitrate para el codificador: el objetivo ([`MediaSender::target_kbps`]) menos la parte que
+    /// se lleva la reparación, para que vídeo más FEC sumen el objetivo y no lo pasen (con un 30 %
+    /// de FEC el camino recibía un 30 % más de lo que el control de tasa había decidido).
+    pub fn encoder_target_kbps(&self) -> u32 {
+        let target = f64::from(self.target_kbps());
+        let ratio = self.repair_ratio();
+        ((target / (1.0 + ratio)).round() as u32).max(1)
     }
 
     /// Bitrate objetivo para el codificador: el mínimo de los receptores que informan (el inicial
@@ -641,11 +665,15 @@ impl MediaSender {
             }
         }
 
+        let bytes: usize = sources.iter().chain(&repairs).map(Bytes::len).sum();
         if let Ok(mut state) = self.state.lock() {
             let sent_us = state.clock.now_us();
             state.sources_sent += count as u64;
-            let cumulative = state.sources_sent;
-            state.cumulative.push_back((group, cumulative));
+            state.bytes_sent += bytes as u64;
+            let (cumulative, cumulative_bytes) = (state.sources_sent, state.bytes_sent);
+            state
+                .cumulative
+                .push_back((group, cumulative, cumulative_bytes));
             while state.cumulative.len() > 512 {
                 state.cumulative.pop_front();
             }
@@ -664,7 +692,7 @@ impl MediaSender {
         let report = SendReport {
             sources: sources.len(),
             repairs: repairs.len(),
-            bytes: sources.iter().chain(&repairs).map(Bytes::len).sum(),
+            bytes,
         };
         let pacing = pacing_duration(
             report.bytes,
@@ -765,12 +793,12 @@ impl MediaSender {
                 ))
             })
             .collect();
-        let sources = state
+        let covered = state
             .cumulative
             .iter()
             .rev()
-            .find(|(group, _)| *group <= feedback.highest_group)
-            .map(|(_, cumulative)| *cumulative);
+            .find(|(group, _, _)| *group <= feedback.highest_group)
+            .map(|(_, objects, bytes)| (*objects, *bytes));
 
         let index = match state.sources.iter().position(|s| s.id == source) {
             Some(index) => index,
@@ -782,9 +810,12 @@ impl MediaSender {
             }
         };
         let entry = &mut state.sources[index];
-        let sources = sources.unwrap_or(entry.last_sources);
+        let (sources, sent_bytes_total) =
+            covered.unwrap_or((entry.last_sources, entry.last_sent_bytes));
         let lost = feedback.lost_objects.saturating_sub(entry.last_lost);
         let sent = sources.saturating_sub(entry.last_sources);
+        let sent_bytes = sent_bytes_total.saturating_sub(entry.last_sent_bytes);
+        let received_bytes = feedback.received_bytes.saturating_sub(entry.last_received);
         let loss_fraction = if sent > 0 {
             (f64::from(lost) / sent as f64).min(1.0)
         } else {
@@ -793,7 +824,9 @@ impl MediaSender {
         if sent > 0 {
             entry.last_sources = sources;
             entry.last_lost = feedback.lost_objects;
+            entry.last_sent_bytes = sent_bytes_total;
         }
+        entry.last_received = feedback.received_bytes;
         let ecn_ce = (ecn_events.saturating_sub(entry.last_ecn)
             + u64::from(feedback.ecn_ce.saturating_sub(entry.last_feedback_ecn)))
         .min(u64::from(u32::MAX)) as u32;
@@ -807,6 +840,8 @@ impl MediaSender {
                 loss_fraction,
                 sent_objects: sent,
                 ecn_ce,
+                received_bytes,
+                sent_bytes,
             },
         );
         entry.repair_ratio = repair_ratio_for_loss(entry.rate.loss().max(loss_fraction * 0.5));

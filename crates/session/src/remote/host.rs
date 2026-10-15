@@ -276,11 +276,12 @@ impl Links {
         out
     }
 
-    /// Mínimo de los objetivos de todos los emisores con invitados.
+    /// Bitrate para el codificador: el mínimo de los objetivos de todos los emisores con
+    /// invitados, descontada la FEC de cada uno ([`MediaSender::encoder_target_kbps`]).
     fn min_target(&self) -> Option<u32> {
         self.targets()
             .iter()
-            .map(|target| target.sender.target_kbps())
+            .map(|target| target.sender.encoder_target_kbps())
             .min()
     }
 
@@ -405,14 +406,13 @@ pub(crate) fn start(
         threads.push(("capture", handle));
     }
     {
-        let (shared, ledger, evict, encode) = (
+        let (shared, ledger, encode) = (
             Arc::clone(&shared),
             Arc::clone(&core.ledger),
-            enc_rx.clone(),
             Arc::clone(&encode),
         );
         let handle = spawn_stage(&core.shared, "encode", move || {
-            encode_loop(None, raw_rx, enc_tx, evict, &shared, &ledger, Some(&encode))
+            encode_loop(None, raw_rx, enc_tx, &shared, &ledger, Some(&encode))
         })
         .map_err(spawn_error)?;
         threads.push(("encode", handle));
@@ -898,8 +898,9 @@ impl HostCtx {
             rate: RateConfig {
                 min_kbps: super::min_kbps(max),
                 max_kbps: max,
-                // Arrancar en el máximo llenaba la cola de un enlace más lento con el primer intra,
-                // el más grande ([`super::start_kbps`]).
+                // 8 Mbit/s hasta que el primer `Feedback` mida el enlace: arrancar en el máximo (o
+                // en su mitad) llenaba la cola de un enlace más lento con el primer intra, el más
+                // grande ([`super::start_kbps`]).
                 start_kbps: super::start_kbps(max),
             },
         }

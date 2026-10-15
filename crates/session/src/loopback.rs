@@ -4,8 +4,10 @@
 //! Cada etapa vive en su hilo (`capture`, `encode`, `send`, `recv`, `decode`, `present`) y se
 //! comunica con la siguiente por un canal acotado de capacidad [`CHANNEL_CAPACITY`] con política
 //! **gana el último**: si el canal está lleno se saca el fotograma más antiguo, se anota como
-//! descarte en el [`LatencyLedger`] y se mete el nuevo. Entre `send` y `recv` van datagramas reales
-//! por `127.0.0.1` ([`coroom_transport::loopback`]).
+//! descarte en el [`LatencyLedger`] y se mete el nuevo. La excepción es el canal de `encode` a
+//! `send`: un fotograma codificado es referencia del siguiente y no se tira, `encode` espera
+//! ([`send_or_stop`]) y lo que se desaloja es captura sin codificar. Entre `send` y `recv` van
+//! datagramas reales por `127.0.0.1` ([`coroom_transport::loopback`]).
 //!
 //! En los dos canales de imagen sin comprimir (`capture → encode` y `decode → present`) el
 //! consumidor también aplica la política al leer: si hay varios fotogramas esperando, toma el más
@@ -45,7 +47,9 @@ use coroom_codec::{
     EncoderConfig, GpuInput, PixelFormat, RawFrame, VideoFormat, decoder_label, encoder_label,
 };
 use coroom_transport::loopback::{UdpLoopback, UdpReceiver, UdpSender};
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
+use crossbeam_channel::{
+    Receiver, RecvTimeoutError, SendTimeoutError, Sender, TrySendError, bounded,
+};
 use tracing::{debug, warn};
 
 use crate::latency::{LatencyLedger, LatencySummary, Stage};
@@ -795,13 +799,12 @@ impl LoopbackPipeline {
             )?;
         }
         {
-            let (shared, ledger, evict) =
-                (Arc::clone(&shared), Arc::clone(&ledger), enc_rx.clone());
+            let (shared, ledger) = (Arc::clone(&shared), Arc::clone(&ledger));
             spawn(
                 &mut pipeline,
                 "encode",
                 Box::new(move || {
-                    encode_loop(Some(encoder), raw_rx, enc_tx, evict, &shared, &ledger, None)
+                    encode_loop(Some(encoder), raw_rx, enc_tx, &shared, &ledger, None)
                 }),
             )?;
         }
@@ -1019,7 +1022,6 @@ pub(crate) fn encode_loop(
     mut encoder: Option<Box<dyn Encoder>>,
     rx: Receiver<CapturedFrame>,
     tx: Sender<Compressed>,
-    evict: Receiver<Compressed>,
     shared: &Shared,
     ledger: &LatencyLedger,
     control: Option<&EncodeControl>,
@@ -1168,13 +1170,32 @@ pub(crate) fn encode_loop(
             keyframe,
             data,
         };
-        match send_latest(&tx, &evict, compressed, ledger, Stage::Sent) {
-            Ok(true) => shared.request_keyframe(),
-            Ok(false) => {}
-            Err(()) => break,
+        // Contrapresión, no desalojo: un fotograma ya codificado es referencia del siguiente, y
+        // tirarlo obligaba a pedir un intra (el más grande, justo cuando el envío iba justo). Si el
+        // hilo `send` no da abasto, se espera: lo que se acumula es captura sin codificar, que se
+        // desaloja gratis en el canal anterior.
+        if send_or_stop(&tx, compressed, shared).is_err() {
+            break;
         }
     }
     Ok(())
+}
+
+/// Mete `item` en el canal esperando a que haya sitio; `Err` si hay que parar o el consumidor ya no
+/// existe.
+pub(crate) fn send_or_stop<T>(tx: &Sender<T>, mut item: T, shared: &Shared) -> Result<(), ()> {
+    loop {
+        match tx.send_timeout(item, POLL) {
+            Ok(()) => return Ok(()),
+            Err(SendTimeoutError::Timeout(back)) => {
+                if shared.stopping() {
+                    return Err(());
+                }
+                item = back;
+            }
+            Err(SendTimeoutError::Disconnected(_)) => return Err(()),
+        }
+    }
 }
 
 fn send_loop(
@@ -1928,15 +1949,13 @@ mod tests {
             let (frames, rx) = bounded::<CapturedFrame>(CHANNEL_CAPACITY);
             let (tx, out) = bounded::<Compressed>(4096);
             let thread = {
-                let (shared, control, evict) =
-                    (Arc::clone(&shared), Arc::clone(&control), out.clone());
+                let (shared, control) = (Arc::clone(&shared), Arc::clone(&control));
                 thread::spawn(move || {
                     let ledger = LatencyLedger::new();
                     encode_loop(
                         Some(Box::new(encoder)),
                         rx,
                         tx,
-                        evict,
                         &shared,
                         &ledger,
                         Some(&control),

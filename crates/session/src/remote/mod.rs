@@ -139,11 +139,13 @@ pub const RECONNECT_BASE_DELAY: Duration = Duration::from_millis(500);
 /// por hardware a 4K60 casi sin pérdidas se queda por debajo.
 pub const UNLIMITED_KBPS: u32 = 500_000;
 
-/// Bitrate con el que arranca el control de tasa para un máximo `max_kbps`: la mitad, sin pasar de
-/// 40 Mbit/s (sube un 5 % cada 100 ms sin cola, así que el máximo de siempre llega en ~1,5 s y
-/// «sin límite» no empieza llenando el enlace con el primer intra, el más grande).
+/// Bitrate con el que arranca el control de tasa para un máximo `max_kbps`: 8 Mbit/s (la
+/// 1080p60 «buena» de `docs/ARQUITECTURA.md` §2.1), o el máximo si es menor. Es la única cifra que
+/// no sale de una medida: con el primer `Feedback` el control de tasa sube un 5 % cada 100 ms hasta
+/// lo que el enlace entrega. Arrancar en la mitad del máximo (40 Mbit/s con «sin límite») mandaba el
+/// primer intra, el más grande, a un bitrate que nadie había comprobado.
 pub fn start_kbps(max_kbps: u32) -> u32 {
-    (max_kbps / 2).clamp(1, 40_000)
+    max_kbps.clamp(1, 8_000)
 }
 
 /// Bitrate mínimo del control de tasa para un máximo `max_kbps`: una décima parte, entre 0,1 y
@@ -1529,12 +1531,12 @@ mod tests {
 
     #[test]
     fn rate_limits_keep_the_usual_maxima_and_tame_unlimited() {
-        // Los máximos de siempre: arranque en la mitad y mínimo en la décima parte.
-        assert_eq!((start_kbps(10_000), min_kbps(10_000)), (5_000, 1_000));
-        assert_eq!((start_kbps(80_000), min_kbps(80_000)), (40_000, 8_000));
-        assert_eq!((start_kbps(500), min_kbps(500)), (250, 100));
-        // Sin límite no arranca en 250 Mbit/s ni se queda con un mínimo de 50.
-        assert_eq!(start_kbps(UNLIMITED_KBPS), 40_000);
+        // Arranque en 8 Mbit/s (o el máximo si es menor) y mínimo en la décima parte.
+        assert_eq!((start_kbps(10_000), min_kbps(10_000)), (8_000, 1_000));
+        assert_eq!((start_kbps(80_000), min_kbps(80_000)), (8_000, 8_000));
+        assert_eq!((start_kbps(500), min_kbps(500)), (500, 100));
+        // Sin límite arranca igual y no se queda con un mínimo de 50 kbit/s.
+        assert_eq!(start_kbps(UNLIMITED_KBPS), 8_000);
         assert_eq!(min_kbps(UNLIMITED_KBPS), 8_000);
     }
 
