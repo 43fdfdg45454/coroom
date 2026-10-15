@@ -11,6 +11,7 @@
 //! reducir: la retrollamada recibe `None` una vez para que la interfaz explique por qué no hay
 //! vista previa.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -34,6 +35,8 @@ pub struct PreviewTap {
     max_width: u32,
     callback: PreviewCallback,
     state: Mutex<TapState>,
+    /// Si la interfaz tiene la vista previa a la vista; si no, no se reduce nada ni se despierta.
+    enabled: AtomicBool,
 }
 
 #[derive(Default)]
@@ -65,7 +68,20 @@ impl PreviewTap {
             max_width: max_width.max(2),
             callback,
             state: Mutex::new(TapState::default()),
+            enabled: AtomicBool::new(true),
         }
+    }
+
+    /// La interfaz dice si la vista previa está a la vista (página de Compartir, ventana sin
+    /// ocultar): mientras no lo esté, [`PreviewTap::wants`] no pide ninguna imagen, así no se
+    /// reduce ningún fotograma ni se despierta la interfaz para nada.
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Si la vista previa está a la vista.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
     }
 
     /// Periodo entre imágenes.
@@ -82,6 +98,9 @@ impl PreviewTap {
     /// entonces hay que pasárselo a [`PreviewTap::render`] (en el [`PreviewWorker`]). Con una
     /// imagen de GPU avisa `None` una vez y devuelve `false`. Barato: va en el hilo `encode`.
     pub fn wants(&self, frame: &RawFrame) -> bool {
+        if !self.is_enabled() {
+            return false;
+        }
         let now = Instant::now();
         let gpu = frame.gpu.is_some();
         {
@@ -260,6 +279,19 @@ pub fn downscale_bgra(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hidden_preview_asks_for_nothing() {
+        let tap = PreviewTap::new(Box::new(|_| {}));
+        let frame = RawFrame::cpu(1, (2, 2), PixelFormat::Bgra, 8, vec![0; 16]);
+        assert!(tap.wants(&frame));
+        tap.set_enabled(false);
+        let later = RawFrame::cpu(2, (2, 2), PixelFormat::Bgra, 8, vec![0; 16]);
+        assert!(!tap.wants(&later), "oculta: ni se mira el periodo");
+        tap.set_enabled(true);
+        std::thread::sleep(PREVIEW_PERIOD + Duration::from_millis(5));
+        assert!(tap.wants(&later), "a la vista otra vez");
+    }
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

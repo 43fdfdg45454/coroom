@@ -1672,6 +1672,21 @@ impl RemoteSession {
             .unwrap_or_else(PoisonError::into_inner) = tap.map(Arc::new);
     }
 
+    /// Anfitrión: la interfaz dice si la vista previa está a la vista; oculta, la toma no reduce
+    /// nada ([`crate::preview::PreviewTap::set_enabled`]).
+    pub fn set_preview_enabled(&self, enabled: bool) {
+        if let Some(tap) = self
+            .core
+            .shared
+            .preview
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            tap.set_enabled(enabled);
+        }
+    }
+
     fn require_host(&self) -> Result<(), SessionError> {
         if self.core.role == Role::Host {
             Ok(())

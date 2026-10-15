@@ -355,6 +355,7 @@ impl Backend {
                 }
             }
             Effect::SetMaxBitrate(kbps) => self.set_video(VideoRequest::MaxBitrate(kbps)),
+            Effect::PreviewVisible(visible) => self.set_preview_visible(visible),
             Effect::SetCodec => self.set_video(VideoRequest::Codec {
                 codec: codec_preference(app.settings.video.codec),
                 encoder: app.settings.video.encoder.backend(),
@@ -635,6 +636,13 @@ impl Backend {
 
     /// Un cambio de vídeo a la sala abierta: solo el tope del bitrate (enseguida, sin
     /// renegociar) o solo el códec y el codificador (renegocia con los invitados).
+    /// La vista previa está (o no) a la vista: con la sala abierta, se lo dice a la toma.
+    fn set_preview_visible(&self, visible: bool) {
+        if let Some(session) = lock(&self.host).clone() {
+            lock(&session).set_preview_enabled(visible);
+        }
+    }
+
     fn set_video(&self, request: VideoRequest) {
         let Some(session) = lock(&self.host).clone() else {
             tracing::warn!("cambio de vídeo sin sala abierta");

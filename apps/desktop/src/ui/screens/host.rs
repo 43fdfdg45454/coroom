@@ -1072,7 +1072,9 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
             });
             app.page = Page::Host;
             // La sala lleva su propia señalización: la de espera ya sobra.
-            return vec![Effect::StopLobby];
+            let mut effects = vec![Effect::StopLobby];
+            effects.extend(app.preview_visibility());
+            return effects;
         }
         Event::HostStarted(Err(err)) => {
             app.host.starting = false;
@@ -3435,6 +3437,26 @@ mod tests {
     /// Sin audio por aplicación en el equipo (o cuando el sistema elige la ventana), la ventana
     /// manda lo mismo que la pantalla.
     #[test]
+    fn the_preview_only_works_while_it_is_on_screen() {
+        use crate::ui::app::Message;
+        let mut app = app();
+        super::shots::host_room(&mut app);
+        assert!(app.preview_visible());
+        let away = app.update(Message::Navigate(Page::Home));
+        assert!(away.contains(&Effect::PreviewVisible(false)), "{away:?}");
+        let back = app.update(Message::Navigate(Page::Host));
+        assert!(back.contains(&Effect::PreviewVisible(true)), "{back:?}");
+        assert_eq!(
+            app.update(Message::WindowOccluded(true)),
+            [Effect::PreviewVisible(false)]
+        );
+        assert_eq!(
+            app.update(Message::WindowOccluded(false)),
+            [Effect::PreviewVisible(true)]
+        );
+    }
+
+    #[test]
     fn a_window_without_per_app_audio_sends_the_system_mix() {
         let mut app = app();
         app.update(Message::Host(Msg::Mode(ShareMode::Window)));
@@ -3986,11 +4008,13 @@ mod tests {
         let mut app = app();
         let effects = app.update(Message::Host(Msg::Start));
         assert!(!effects.contains(&Effect::StopLobby), "{effects:?}");
-        assert_eq!(
-            app.update(Message::Event(Event::HostStarted(
-                Ok(VideoFeed::detached())
-            ))),
-            [Effect::StopLobby]
+        let started = app.update(Message::Event(Event::HostStarted(
+            Ok(VideoFeed::detached()),
+        )));
+        assert_eq!(started[0], Effect::StopLobby, "{started:?}");
+        assert!(
+            started.contains(&Effect::PreviewVisible(app.preview_visible())),
+            "{started:?}"
         );
     }
 

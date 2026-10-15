@@ -141,6 +141,9 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **La vista previa de la sala no trabaja si no se ve**: en otra página o con la ventana tapada
+  o minimizada, la toma no reduce ningún fotograma ni despierta la interfaz (antes, cada 500 ms
+  estuvieras donde estuvieras). Al volver a Compartir aparece en medio segundo como mucho.
 - **La vista previa de la sala se veía negra** en el equipo del anfitrión: iba por el compositor,
   que pone el vídeo debajo de toda la interfaz, y la página opaca la tapaba. Ahora se sube como
   capa del propio recuadro.

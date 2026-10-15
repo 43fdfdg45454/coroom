@@ -854,6 +854,7 @@ impl Ready {
             }
             WindowEvent::ScaleFactorChanged { .. } => self.resized = true,
             WindowEvent::Focused(focused) => self.dispatch(Message::WindowFocused(*focused)),
+            WindowEvent::Occluded(hidden) => self.dispatch(Message::WindowOccluded(*hidden)),
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
                 // La captura sigue Ctrl y Alt por sus teclas; al volver el foco (o si una

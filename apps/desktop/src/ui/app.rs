@@ -357,6 +357,8 @@ pub enum Message {
     Chat(chat::Msg),
     /// La ventana ganó o perdió el foco del escritorio.
     WindowFocused(bool),
+    /// El sistema dice si la ventana está tapada u oculta del todo (minimizada).
+    WindowOccluded(bool),
     /// Resultado de la red o de una sesión.
     Event(Event),
 }
@@ -437,6 +439,8 @@ pub enum Effect {
     /// Aplicar a la sala abierta el tope del bitrate (kbit/s) de los ajustes: el control de tasa
     /// lo usa enseguida, sin renegociar nada.
     SetMaxBitrate(u32),
+    /// Anfitrión: si la vista previa de la sala está a la vista (página Compartir, ventana sin ocultar).
+    PreviewVisible(bool),
     /// Aplicar a la sala abierta el códec y el codificador de los ajustes (renegocia con los
     /// invitados; un intra si cambia).
     SetCodec,
@@ -683,6 +687,8 @@ pub struct App {
     pub account_menu: bool,
     /// A pantalla completa.
     pub fullscreen: bool,
+    /// La ventana está tapada u oculta del todo ([`Message::WindowOccluded`]).
+    pub window_hidden: bool,
     /// Ahora (lo mueve [`Message::Tick`]).
     pub now: Instant,
     /// Prueba local (`coroom probe` con ventana): solo el vídeo.
@@ -726,6 +732,7 @@ impl App {
             dialog: None,
             account_menu: false,
             fullscreen: false,
+            window_hidden: false,
             now,
             probe: false,
             version: env!("CARGO_PKG_VERSION"),
@@ -976,6 +983,10 @@ impl App {
             Message::WindowFocused(focused) => {
                 chat::update(self, chat::Msg::WindowFocused(focused))
             }
+            Message::WindowOccluded(hidden) => {
+                self.window_hidden = hidden;
+                self.preview_visibility().into_iter().collect()
+            }
             Message::Event(event) => self.event(event),
         }
     }
@@ -1051,7 +1062,21 @@ impl App {
             Page::Host if !self.host.refreshing => effects.extend(host::refresh(self)),
             _ => {}
         }
+        effects.extend(self.preview_visibility());
         effects
+    }
+
+    /// Si la vista previa de la sala está a la vista: en Compartir, con la ventana sin ocultar.
+    pub fn preview_visible(&self) -> bool {
+        self.screen == Screen::Main && self.page == Page::Host && !self.window_hidden
+    }
+
+    /// Con la sala abierta, el efecto que le dice a la sesión si la vista previa está a la vista
+    /// (oculta, no se reduce ningún fotograma ni se despierta la interfaz).
+    pub fn preview_visibility(&self) -> Option<Effect> {
+        self.host
+            .is_open()
+            .then(|| Effect::PreviewVisible(self.preview_visible()))
     }
 
     fn shortcut(&mut self, shortcut: Shortcut) -> Vec<Effect> {
