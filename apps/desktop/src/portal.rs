@@ -247,16 +247,20 @@ mod share {
 
     use super::RestoreTokens;
 
+    /// Nunca hay tokens guardados.
     pub fn load_restore_tokens() -> RestoreTokens {
         RestoreTokens::default()
     }
 
+    /// Nunca hay token para `kind`.
     pub fn saved_restore_token(_kind: ShareKind) -> Option<String> {
         None
     }
 
+    /// No hay nada que guardar.
     pub fn remember_restore_token(_kind: ShareKind, _token: Option<String>) {}
 
+    /// Sin portal, el backend no avisa de ningún token.
     pub fn restore_token_sink(_kind: ShareKind) -> Option<RestoreTokenSink> {
         None
     }
