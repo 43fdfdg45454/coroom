@@ -9,6 +9,14 @@
 //! - **Formato**: `SPA_AUDIO_FORMAT_S16LE` a 48 kHz con los canales pedidos (FL, FR o MONO); el
 //!   adaptador de PipeWire convierte si el dispositivo usa otro. Latencia pedida
 //!   `node.latency = 480/48000` (10 ms).
+//! - **Tiempo real**: los flujos se conectan con `PW_STREAM_FLAG_RT_PROCESS`, así `process` corre
+//!   en el hilo de datos de PipeWire, que ya tiene prioridad de tiempo real (`module-rt`, con
+//!   RealtimeKit o el portal), en vez de en el bucle principal de este hilo, que competía con el
+//!   resto del sistema y añadía jitter. El callback no asigna ni espera: copia entre el búfer y el
+//!   anillo (o pide la trama a la reproducción a demanda) y lee los tiempos del grafo.
+//! - **Marcas de captura**: cada búfer capturado se fecha con los tiempos del grafo
+//!   (`pw_time.now` del ciclo y `pw_time.delay` hasta el dispositivo, comparados con
+//!   `pw_stream_get_nsec`), no con la llegada al anillo.
 //! - [`MonitorSource::system`]: captura (`media.category = Capture`) con
 //!   `stream.capture.sink = true`: el monitor del *sink* por defecto, lo que suena.
 //! - [`MonitorSource::app`]: el nodo de reproducción (`Stream/Output/Audio`) de una aplicación,
@@ -93,10 +101,13 @@ impl Drop for Running {
     }
 }
 
-/// Lo que el callback necesita.
+/// Lo que el callback necesita. `process` corre en el hilo de datos de PipeWire
+/// (`RT_PROCESS`) y los demás eventos en el bucle principal: `param_changed` solo toca `info`, que
+/// `process` no lee, y el anillo compartido (como en los ejemplos de `pipewire-rs`).
 struct StreamData {
     shared: Arc<Shared>,
     kind: Kind,
+    format: AudioFormat,
     channels: usize,
     info: AudioInfoRaw,
     /// Una trama de reproducción (se reutiliza).
@@ -131,7 +142,31 @@ fn format_param(format: AudioFormat) -> Result<Vec<u8>, AudioError> {
     .map_err(|err| backend(format!("no se pudo serializar el formato: {err:?}")))
 }
 
+/// Tiempos del ciclo actual del grafo: cuánto hace que se calcularon (`pw_time.now` frente a
+/// `pw_stream_get_nsec`, los dos del reloj monótono) y el retardo hasta el dispositivo
+/// (`pw_time.delay`; negativo cuenta como cero). `None` si el grafo aún no los dio.
+#[allow(unsafe_code)] // `pw_stream_get_nsec` no tiene envoltorio en `pipewire-rs`.
+fn cycle_timing(stream: &pw::stream::Stream) -> Option<(Duration, Duration)> {
+    let time = stream.time().ok()?;
+    let rate = time.rate();
+    let computed = u64::try_from(time.now()).ok().filter(|ns| *ns > 0)?;
+    if rate.denom == 0 {
+        return None;
+    }
+    // SAFETY: `stream` es el flujo de este callback, vivo durante la llamada; la función solo lee
+    // el reloj monótono del sistema (la propia documentación de `pw_time` la indica para comparar
+    // con `pw_time.now`) y es segura en el hilo de tiempo real.
+    let nsec = unsafe { pw::sys::pw_stream_get_nsec(stream.as_raw_ptr()) };
+    let age = Duration::from_nanos(nsec.saturating_sub(computed));
+    let ticks = u64::try_from(time.delay()).unwrap_or(0);
+    let delay = Duration::from_nanos(
+        ticks.saturating_mul(1_000_000_000) * u64::from(rate.num) / u64::from(rate.denom),
+    );
+    Some((age, delay))
+}
+
 fn process(stream: &pw::stream::Stream, data: &mut StreamData) {
+    let timing = cycle_timing(stream);
     let Some(mut buffer) = stream.dequeue_buffer() else {
         return;
     };
@@ -150,12 +185,17 @@ fn process(stream: &pw::stream::Stream, data: &mut StreamData) {
             let Some(bytes) = bytes.get(offset..offset + size) else {
                 return;
             };
+            let samples = bytes.as_chunks::<2>().0;
+            // Lo último del búfer se capturó `delay` antes del instante del ciclo; lo primero,
+            // además lo que dura el búfer.
+            let captured_at = timing.and_then(|(age, delay)| {
+                std::time::Instant::now()
+                    .checked_sub(age + delay + data.format.duration_of(samples.len()))
+            });
             data.shared.push(
-                bytes
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|&pair| i16::from_le_bytes(pair)),
+                data.format,
+                samples.iter().map(|&pair| i16::from_le_bytes(pair)),
+                captured_at,
             );
         }
         Kind::Playback => {
@@ -165,23 +205,19 @@ fn process(stream: &pw::stream::Stream, data: &mut StreamData) {
             // Un cuanto (10 ms con `node.latency`): llenar el búfer entero añadiría latencia.
             let frames = (bytes.len() / stride).min(crate::SAMPLES_PER_CHANNEL);
             let wanted = frames * data.channels;
-            if let Ok(time) = stream.time() {
-                let rate = time.rate();
-                if rate.denom > 0 && time.delay() > 0 {
-                    let us = time.delay() as u64 * 1_000_000 * u64::from(rate.num)
-                        / u64::from(rate.denom);
-                    data.shared.delay_us.store(us, Ordering::Relaxed);
-                }
-            }
+            // Lo que se escribe ahora sonará tras el retardo del grafo hasta el dispositivo,
+            // descontado lo que ya pasó desde que se midió. Sin medida aún (los primeros ciclos),
+            // el cuanto que pide el grafo.
+            let delay = match timing {
+                Some((age, delay)) if !delay.is_zero() => delay.saturating_sub(age),
+                _ => data.format.duration_of(wanted),
+            };
+            data.shared
+                .delay_us
+                .store(delay.as_micros() as u64, Ordering::Relaxed);
             let scratch = &mut data.scratch[..wanted];
             match &mut data.pull {
-                Some(pull) => {
-                    let delay = match data.shared.delay_us.load(Ordering::Relaxed) {
-                        0 => crate::DEVICE_LATENCY,
-                        us => Duration::from_micros(us),
-                    };
-                    pull.fill(scratch, data.channels, delay);
-                }
+                Some(pull) => pull.fill(scratch, data.channels, delay),
                 None => data.shared.pop_into(scratch),
             }
             for (chunk, sample) in bytes[..wanted * 2]
@@ -240,6 +276,7 @@ fn run_stream(
         let data = StreamData {
             shared: Arc::clone(&shared),
             kind: kind.clone(),
+            format,
             channels: usize::from(format.channels),
             info: AudioInfoRaw::default(),
             scratch: [0; crate::MAX_FRAME_SAMPLES],
@@ -293,7 +330,10 @@ fn run_stream(
             .connect(
                 direction,
                 None,
-                pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+                // `process` en el hilo de datos de PipeWire, con prioridad de tiempo real.
+                pw::stream::StreamFlags::AUTOCONNECT
+                    | pw::stream::StreamFlags::MAP_BUFFERS
+                    | pw::stream::StreamFlags::RT_PROCESS,
                 &mut [pod],
             )
             .map_err(backend)?;

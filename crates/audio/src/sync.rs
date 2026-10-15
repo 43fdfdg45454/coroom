@@ -9,10 +9,16 @@
 //! `A − V = (suena − capturado)_audio − (presentado − capturado)_vídeo`
 //!
 //! (positivo: el audio va tarde). Con la media móvil de esas muestras recomienda cuánto retardo
-//! extra dar al buffer de jitter del audio ([`AvSync::recommend`]): si el audio va adelantado, más
-//! retardo (se estira); si va retrasado, menos (se recorta, hasta el mínimo del buffer). El vídeo no
-//! se retrasa nunca. Cada recomendación mueve el ajuste como mucho una trama (10 ms) y solo si el
-//! desfase supera media trama, para no oscilar.
+//! extra dar al buffer de jitter del audio ([`AvSync::recommend`], cada [`RECOMMEND_PERIOD`]): si
+//! el audio va adelantado, más retardo (se estira); si va retrasado, menos (se recorta, hasta el
+//! mínimo del buffer). El vídeo no se retrasa nunca, y el audio tampoco más de
+//! [`DEFAULT_MAX_DELAY`] (o lo que diga [`AvSync::set_max_delay`]) para cuadrar con él: jugando
+//! vale más el audio a tiempo que la sincronía perfecta. Cada recomendación mueve el ajuste como
+//! mucho una trama (10 ms) y solo si el desfase supera media trama, para no oscilar.
+//!
+//! Nada de esto asigna memoria ni ordena en caliente: las ventanas son arrays fijos y los
+//! percentiles ([`AvSync::stats`]) se calculan sobre una copia en la pila, fuera del callback del
+//! dispositivo (la reproducción los pide desde su hilo de contadores).
 
 use std::time::{Duration, Instant};
 
@@ -27,8 +33,16 @@ pub const OFFSET_WINDOW: usize = 512;
 /// Distancia máxima entre capturas de audio y vídeo para emparejarlas.
 pub const MAX_PAIR_DISTANCE: Duration = Duration::from_millis(100);
 
-/// Ajuste máximo que recomienda, en ms (en los dos sentidos).
+/// Ajuste máximo que recomienda, en ms, al recortar (adelantar el audio); al retrasarlo manda
+/// [`DEFAULT_MAX_DELAY`].
 pub const MAX_ADJUST_MS: i32 = 200;
+
+/// Lo que más se retrasa el audio para cuadrar con el vídeo, por defecto: si el vídeo va más tarde,
+/// el audio no lo espera más.
+pub const DEFAULT_MAX_DELAY: Duration = Duration::from_millis(60);
+
+/// Cada cuánto conviene llamar a [`AvSync::recommend`].
+pub const RECOMMEND_PERIOD: Duration = Duration::from_millis(100);
 
 /// Peso de cada muestra nueva en la media móvil.
 const SMOOTHING: f64 = 0.05;
@@ -63,6 +77,8 @@ pub struct AvSync {
     smoothed: Option<f64>,
     adjust_ms: i32,
     limits: (i32, i32),
+    /// Retraso máximo del audio para la sincronía, en ms.
+    max_delay_ms: i32,
 }
 
 impl Default for AvSync {
@@ -84,15 +100,33 @@ impl AvSync {
             offsets_pos: 0,
             smoothed: None,
             adjust_ms: 0,
-            limits: (-MAX_ADJUST_MS, MAX_ADJUST_MS),
+            limits: (-MAX_ADJUST_MS, Self::delay_ms(DEFAULT_MAX_DELAY)),
+            max_delay_ms: Self::delay_ms(DEFAULT_MAX_DELAY),
         }
     }
 
+    fn delay_ms(delay: Duration) -> i32 {
+        i32::try_from(delay.as_millis()).unwrap_or(i32::MAX)
+    }
+
+    /// Cambia lo que más se puede retrasar el audio para cuadrar con el vídeo
+    /// ([`DEFAULT_MAX_DELAY`] por defecto; cero: nunca se retrasa).
+    pub fn set_max_delay(&mut self, max_delay: Duration) {
+        self.max_delay_ms = Self::delay_ms(max_delay);
+        let (min, max) = self.limits;
+        self.set_limits(min, max.max(self.max_delay_ms));
+    }
+
+    /// Lo que más se puede retrasar el audio para la sincronía.
+    pub fn max_delay(&self) -> Duration {
+        Duration::from_millis(self.max_delay_ms.max(0) as u64)
+    }
+
     /// Lo que el buffer de audio puede ajustar de verdad, en ms (el recorte acaba en su mínimo):
-    /// la recomendación no pasa de ahí.
+    /// la recomendación no pasa de ahí, ni del retraso máximo ([`AvSync::set_max_delay`]).
     pub fn set_limits(&mut self, min_ms: i32, max_ms: i32) {
         let min = min_ms.clamp(-MAX_ADJUST_MS, 0);
-        let max = max_ms.clamp(0, MAX_ADJUST_MS);
+        let max = max_ms.clamp(0, self.max_delay_ms.max(0));
         self.limits = (min, max);
         self.adjust_ms = self.adjust_ms.clamp(min, max);
     }
@@ -142,8 +176,8 @@ impl AvSync {
         self.smoothed.map(|us| us / 1000.0)
     }
 
-    /// Retardo extra recomendado para el buffer de audio, en ms. Llamar cada 100 ms o así:
-    /// cada llamada lo mueve como mucho una trama. El llamante aplica el ajuste y, como el
+    /// Retardo extra recomendado para el buffer de audio, en ms. Llamar cada
+    /// [`RECOMMEND_PERIOD`]: cada llamada lo mueve como mucho una trama. El llamante aplica el ajuste y, como el
     /// audio cambia de latencia en esa cantidad, la media se corrige con ella.
     pub fn recommend(&mut self) -> i32 {
         let Some(offset) = self.smoothed else {
@@ -172,12 +206,14 @@ impl AvSync {
         self.adjust_ms
     }
 
-    /// Percentiles de |A−V| de la ventana.
+    /// Percentiles de |A−V| de la ventana. Ordena una copia en la pila (sin asignar): llamarlo
+    /// fuera del callback del dispositivo.
     pub fn stats(&self) -> AvStats {
-        let mut samples: Vec<u64> = self.offsets[..self.offsets_len]
-            .iter()
-            .map(|us| us.unsigned_abs())
-            .collect();
+        let mut window = [0u64; OFFSET_WINDOW];
+        let samples = &mut window[..self.offsets_len];
+        for (out, us) in samples.iter_mut().zip(&self.offsets[..self.offsets_len]) {
+            *out = us.unsigned_abs();
+        }
         samples.sort_unstable();
         let rank = |p: f64| -> f64 {
             if samples.is_empty() {
@@ -256,6 +292,34 @@ mod tests {
             sync.offset_ms().is_some_and(|ms| ms > 40.0),
             "la media sigue siendo real"
         );
+    }
+
+    #[test]
+    fn the_audio_waits_for_the_video_at_most_the_maximum_delay() {
+        // El vídeo va 150 ms detrás del audio: se retrasa el audio solo hasta el tope por
+        // defecto (60 ms), no hasta cuadrar.
+        let mut sync = AvSync::new();
+        sync.set_limits(-10, 200);
+        let base = Instant::now();
+        sync.on_video(base, base + Duration::from_millis(170));
+        let mut adjust = 0;
+        for _ in 0..40 {
+            let latency = Duration::from_millis(20 + adjust as u64);
+            sync.on_audio(base, base + latency);
+            adjust = sync.recommend();
+        }
+        assert_eq!(
+            Duration::from_millis(adjust as u64),
+            DEFAULT_MAX_DELAY,
+            "{:?}",
+            sync.stats()
+        );
+        // Con otro tope (el parámetro con nombre), ese.
+        sync.set_max_delay(Duration::from_millis(30));
+        assert_eq!(sync.recommend(), 30);
+        assert_eq!(sync.max_delay(), Duration::from_millis(30));
+        sync.set_max_delay(Duration::ZERO);
+        assert_eq!(sync.recommend(), 0, "sin retrasar nunca el audio");
     }
 
     #[test]

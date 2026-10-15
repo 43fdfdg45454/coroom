@@ -20,15 +20,20 @@ pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(2);
 /// mientras no suena nada; un dispositivo suspendido, tampoco).
 pub(crate) const SILENCE_AFTER: Duration = Duration::from_millis(40);
 
-/// Si la captura acumula más de esto, se descarta lo más antiguo (la latencia no crece).
-const MAX_CAPTURE_FRAMES: usize = 6;
+/// Si la captura acumula más de esto, se descarta lo más antiguo (la latencia no crece): como
+/// mucho dos tramas esperando detrás de la que se lee.
+const MAX_CAPTURE_FRAMES: usize = 3;
 
 #[derive(Debug)]
 pub(crate) struct Ring {
     pub(crate) samples: VecDeque<i16>,
     pub(crate) capacity: usize,
-    /// Cuándo llegó (captura) o se encoló (reproducción) la muestra más reciente.
+    /// Captura: instante (reloj monótono local) que sigue a la muestra más reciente, es decir,
+    /// cuándo se capturó el final de lo último que llegó, con la marca del dispositivo si la dio
+    /// o, si no, la llegada. Reproducción: cuándo se encoló lo último.
     pub(crate) last_push: Option<Instant>,
+    /// Captura: muestras intercaladas de lo último que llegó de una vez (el cuanto del flujo).
+    pub(crate) last_chunk: usize,
     pub(crate) failure: Option<AudioError>,
     pub(crate) overruns: u64,
     pub(crate) underruns: u64,
@@ -50,6 +55,7 @@ impl Shared {
                 samples: VecDeque::with_capacity(capacity),
                 capacity,
                 last_push: None,
+                last_chunk: 0,
                 failure: None,
                 overruns: 0,
                 underruns: 0,
@@ -93,8 +99,20 @@ impl Shared {
     }
 
     /// Captura: añade muestras llegadas ahora (si no caben, se pierden las más antiguas).
-    pub(crate) fn push(&self, samples: impl Iterator<Item = i16>) {
-        let now = Instant::now();
+    /// `captured_at` es cuándo se capturó la **primera** de ellas según el dispositivo (la marca
+    /// de PipeWire o de WASAPI para ese búfer); sin ella (`None`), se toma la llegada como el
+    /// final de lo capturado.
+    pub(crate) fn push(
+        &self,
+        format: AudioFormat,
+        samples: impl ExactSizeIterator<Item = i16>,
+        captured_at: Option<Instant>,
+    ) {
+        let len = samples.len();
+        let end = match captured_at {
+            Some(first) => first + format.duration_of(len),
+            None => Instant::now(),
+        };
         let mut ring = self.lock();
         for sample in samples {
             if ring.samples.len() >= ring.capacity {
@@ -103,9 +121,20 @@ impl Shared {
             }
             ring.samples.push_back(sample);
         }
-        ring.last_push = Some(now);
+        ring.last_push = Some(end);
+        ring.last_chunk = len;
         drop(ring);
         self.cond.notify_all();
+    }
+
+    /// Cuándo se capturó la muestra más antigua de la cola: el final de lo último que llegó
+    /// menos lo que hay en cola (las muestras de un flujo de captura son seguidas).
+    fn head_captured_at(ring: &Ring, format: AudioFormat) -> Option<Instant> {
+        let last = ring.last_push?;
+        Some(
+            last.checked_sub(format.duration_of(ring.samples.len()))
+                .unwrap_or(last),
+        )
     }
 
     /// Reproducción: saca `out.len()` muestras (silencio si faltan) para el dispositivo.
@@ -162,11 +191,10 @@ impl Shared {
                     drop(ring);
                     out.clear();
                     out.resize(needed, 0);
+                    // No se capturó nada: el silencio lleva la hora en que se decide.
                     return Ok(Captured {
                         samples: needed,
-                        captured_at: Instant::now()
-                            .checked_sub(crate::FRAME_DURATION)
-                            .unwrap_or_else(Instant::now),
+                        captured_at: Instant::now(),
                         channels: format.channels,
                     });
                 }
@@ -182,11 +210,7 @@ impl Shared {
             ring.samples.drain(..drop_to.min(keep));
             ring.overruns += 1;
         }
-        // La muestra más antigua se capturó «llegada de la última − lo que hay en cola».
-        let queued = format.duration_of(ring.samples.len());
-        let captured_at = ring.last_push.map_or_else(Instant::now, |last| {
-            last.checked_sub(queued).unwrap_or(last)
-        });
+        let captured_at = Self::head_captured_at(&ring, format).unwrap_or_else(Instant::now);
         out.clear();
         out.extend(ring.samples.drain(..needed));
         Ok(Captured {
@@ -196,25 +220,27 @@ impl Shared {
         })
     }
 
-    /// Captura sin esperar: si hay una trama de `format`, la deja en `out` y devuelve `true`. Si
-    /// se acumulan más de [`MAX_CAPTURE_FRAMES`], descarta lo más antiguo, como `read_frame`.
-    pub(crate) fn try_take(&self, format: AudioFormat, out: &mut Vec<i16>) -> bool {
+    /// Captura sin esperar: si hay una trama de `format`, la deja en `out` y devuelve cuándo se
+    /// capturó su primera muestra. Lo que quede en cola detrás no pasa de una trama (10 ms) o,
+    /// si el flujo entrega cuantos mayores, de lo que trajo la última llegada: lo más antiguo se
+    /// descarta. Así una mezcla con su propio reloj ([`crate::apps::AppMixSource`]) no acumula
+    /// cola oculta.
+    pub(crate) fn try_take(&self, format: AudioFormat, out: &mut Vec<i16>) -> Option<Instant> {
         let needed = format.samples_per_frame();
         let mut ring = self.lock();
         if ring.failure.is_some() || ring.samples.len() < needed {
-            return false;
+            return None;
         }
-        let excess = ring
-            .samples
-            .len()
-            .saturating_sub(needed * MAX_CAPTURE_FRAMES);
+        let keep = needed + needed.max(ring.last_chunk);
+        let excess = ring.samples.len().saturating_sub(keep);
         if excess > 0 {
             ring.samples.drain(..excess);
             ring.overruns += 1;
         }
+        let captured_at = Self::head_captured_at(&ring, format);
         out.clear();
         out.extend(ring.samples.drain(..needed));
-        true
+        captured_at
     }
 
     /// Reproducción: espera a que en cola quede como mucho una trama (de las dos que se admiten).
@@ -319,7 +345,7 @@ mod tests {
     #[test]
     fn frames_flow_through_the_ring() {
         let shared = Shared::new(AudioFormat::VOICE);
-        shared.push((0..1000).map(|i| i as i16));
+        shared.push(AudioFormat::VOICE, (0..1000).map(|i| i as i16), None);
         let mut out = Vec::new();
         let captured = shared
             .read_frame(AudioFormat::VOICE, &mut out)
@@ -362,11 +388,85 @@ mod tests {
     fn overruns_and_underruns_are_counted() {
         let shared = Shared::new(AudioFormat::VOICE);
         // 500 ms de capacidad: lo que no cabe desplaza a lo más antiguo.
-        shared.push(std::iter::repeat_n(1, 24_000 + 10));
+        shared.push(
+            AudioFormat::VOICE,
+            std::iter::repeat_n(1, 24_000 + 10),
+            None,
+        );
         assert_eq!(shared.counters().overruns, 10);
         shared.note_underrun();
         assert_eq!(shared.counters().underruns, 1);
     }
+
+    #[test]
+    fn capture_times_come_from_the_device_not_the_arrival() {
+        let shared = Shared::new(AudioFormat::VOICE);
+        // El dispositivo dice que el primer búfer (5 ms) se capturó hace 50 ms; llega otro
+        // seguido (los flujos de captura son continuos).
+        let device = Instant::now() - Duration::from_millis(50);
+        shared.push(
+            AudioFormat::VOICE,
+            std::iter::repeat_n(1, 240),
+            Some(device),
+        );
+        shared.push(
+            AudioFormat::VOICE,
+            std::iter::repeat_n(2, 240),
+            Some(device + Duration::from_millis(5)),
+        );
+        let mut out = Vec::new();
+        let frame = shared
+            .read_frame(AudioFormat::VOICE, &mut out)
+            .expect("trama");
+        assert_eq!(
+            frame.captured_at, device,
+            "la marca del dispositivo, no la llegada"
+        );
+        // Sin marca: el final de lo que llega es la llegada.
+        let before = Instant::now();
+        shared.push(AudioFormat::VOICE, std::iter::repeat_n(3, 480), None);
+        let frame = shared
+            .read_frame(AudioFormat::VOICE, &mut out)
+            .expect("trama");
+        assert!(frame.captured_at + Duration::from_millis(10) >= before);
+        assert!(frame.captured_at + Duration::from_millis(10) <= Instant::now());
+    }
+
+    #[test]
+    fn taking_without_waiting_leaves_at_most_one_frame_behind() {
+        let format = AudioFormat::VOICE;
+        let shared = Shared::new(format);
+        let start = Instant::now() - Duration::from_millis(100);
+        // Cinco tramas de 10 ms seguidas, de una en una (el cuanto del flujo es una trama).
+        for frame in 0..5u32 {
+            shared.push(
+                format,
+                std::iter::repeat_n(frame as i16, 480),
+                Some(start + FRAME * frame),
+            );
+        }
+        let mut out = Vec::new();
+        let captured = shared.try_take(format, &mut out).expect("trama");
+        // Se descartan las tres más antiguas: suena la cuarta y queda solo la quinta (10 ms).
+        assert_eq!(out[0], 3);
+        assert_eq!(captured, start + FRAME * 3, "con su hora real de captura");
+        assert_eq!(shared.lock().samples.len(), 480);
+        assert_eq!(shared.counters().overruns, 1);
+        assert!(shared.try_take(format, &mut out).is_some());
+        assert!(
+            shared.try_take(format, &mut out).is_none(),
+            "sin nada, no espera"
+        );
+        // Con cuantos de 20 ms la cola que se deja es la de un cuanto, no menos (no se tira
+        // audio que el flujo entrega de dos en dos).
+        shared.push(format, std::iter::repeat_n(7, 960), Some(start));
+        shared.push(format, std::iter::repeat_n(8, 960), Some(start + FRAME * 2));
+        assert!(shared.try_take(format, &mut out).is_some());
+        assert_eq!(out[0], 7);
+        assert_eq!(shared.lock().samples.len(), 960);
+    }
+
+    const FRAME: Duration = crate::FRAME_DURATION;
 
     #[test]
     fn on_demand_playback_splits_frames_across_small_quanta() {

@@ -2,8 +2,12 @@
 //!
 //! Guarda los paquetes Opus de un emisor por número de secuencia (`seq` de la cabecera de audio,
 //! que cuenta los paquetes **enviados**, sin huecos aunque el emisor calle) en [`SLOTS`] huecos
-//! reservados al crearlo: no asigna nada después. La reproducción pide una trama cada 10 ms con
-//! [`JitterBuffer::pop`]:
+//! reservados al crearlo: no asigna nada después. Cada paquete lleva una o dos **tramas** de
+//! 10 ms (`frames` de la cabecera, [`JitterBuffer::push_frames`]); todo se mide y se dimensiona en
+//! tramas, no en paquetes: la cola, el objetivo, el jitter (una muestra por trama: la ventana son
+//! [`JITTER_WINDOW`] tramas, 2 s, tenga el paquete 10 o 20 ms) y los periodos de ajuste. La
+//! reproducción pide lo siguiente con [`JitterBuffer::pop`] cuando acaba de sonar lo anterior (una
+//! trama, o las dos de un paquete de 20 ms):
 //!
 //! - [`Pop::Frame`]: el paquete que toca.
 //! - [`Pop::Plc`]: el que toca no llegó pero hay alguno posterior (o se acabó la cola en mitad de
@@ -15,9 +19,10 @@
 //!
 //! **Objetivo adaptativo**: el retardo de tránsito relativo de cada paquete es
 //! `llegada − captura` (en relojes distintos: solo importan sus diferencias); su jitter, lo que
-//! excede al mínimo de los últimos [`JITTER_WINDOW`] paquetes. El objetivo es
-//! `p95 del jitter + 1 trama`, entre [`MIN_TARGET`] y [`MAX_TARGET`], más el ajuste que pida la
-//! sincronía A/V ([`JitterBuffer::set_extra_delay`]). El nivel (tramas en cola, suavizado) se
+//! excede al mínimo de las últimas [`JITTER_WINDOW`] tramas. El objetivo es
+//! `p95 del jitter (en tramas, redondeando hacia arriba) + las tramas de un paquete`, entre
+//! [`MIN_TARGET`] y [`MAX_TARGET`], más el ajuste que pida la sincronía A/V
+//! ([`JitterBuffer::set_extra_delay`]). El nivel (tramas en cola, suavizado) se
 //! lleva al objetivo **recortando** una trama cuando sobra o **estirando** con una de PLC cuando
 //! falta (como mucho una cada [`ADJUST_PERIOD_FRAMES`] tramas).
 
@@ -37,8 +42,11 @@ pub const MIN_TARGET: Duration = Duration::from_millis(20);
 /// Objetivo máximo (sin contar el ajuste de la sincronía A/V).
 pub const MAX_TARGET: Duration = Duration::from_millis(60);
 
-/// Paquetes con los que se estima el jitter.
+/// Tramas de 10 ms con las que se estima el jitter (2 s): una muestra de tránsito por trama.
 pub const JITTER_WINDOW: usize = 200;
+
+/// Tramas de 10 ms que lleva como mucho un paquete (20 ms, como la cabecera de audio).
+pub const MAX_PACKET_FRAMES: u8 = 2;
 
 /// Tramas entre dos recortes o estiramientos.
 pub const ADJUST_PERIOD_FRAMES: u32 = 10;
@@ -69,6 +77,8 @@ struct Slot {
     seq: u32,
     capture_us: u32,
     flags: u8,
+    /// Tramas de 10 ms del paquete.
+    frames: u8,
     len: u16,
     arrived: Instant,
     data: [u8; MAX_PACKET],
@@ -83,6 +93,8 @@ pub struct FrameRef<'a> {
     pub capture_us: u32,
     /// Banderas de la cabecera de audio.
     pub flags: u8,
+    /// Tramas de 10 ms que lleva (1 o 2).
+    pub frames: u8,
     /// Cuándo llegó.
     pub arrived: Instant,
     /// Paquete Opus.
@@ -100,6 +112,8 @@ pub struct Lost<'a> {
     pub next: Option<(&'a [u8], u8)>,
     /// Es una trama insertada para alargar el buffer, no una pérdida.
     pub stretch: bool,
+    /// Tramas de 10 ms que hay que ocultar (las del paquete perdido; una al estirar).
+    pub frames: u8,
 }
 
 /// Lo que devuelve [`JitterBuffer::pop`].
@@ -157,6 +171,11 @@ pub struct JitterBuffer {
     prime_from: Option<Instant>,
     last_played: Option<(u32, u8)>,
     last_capture: Option<(u32, u32)>,
+    /// Tramas por paquete del emisor (las del último que llegó).
+    packet_frames: u8,
+    /// Tramas que duró lo último que devolvió [`JitterBuffer::pop`]: lo que avanzó el reloj de
+    /// la reproducción hasta esta llamada.
+    elapsed: u8,
     target_frames: i32,
     extra_frames: i32,
     level: f64,
@@ -204,6 +223,7 @@ impl JitterBuffer {
             seq: 0,
             capture_us: 0,
             flags: 0,
+            frames: 1,
             len: 0,
             arrived: Instant::now(),
             data: [0; MAX_PACKET],
@@ -218,6 +238,8 @@ impl JitterBuffer {
             prime_from: None,
             last_played: None,
             last_capture: None,
+            packet_frames: 1,
+            elapsed: 1,
             target_frames: frames_for(MIN_TARGET),
             extra_frames: 0,
             level: 0.0,
@@ -310,8 +332,8 @@ impl JitterBuffer {
         self.level = 0.0;
     }
 
-    /// Guarda el paquete `seq` (con su marca de captura en µs del reloj del emisor y sus banderas)
-    /// que llegó en `arrived`. Devuelve si se aceptó.
+    /// Guarda el paquete `seq` de una trama de 10 ms (con su marca de captura en µs del reloj del
+    /// emisor y sus banderas) que llegó en `arrived`. Devuelve si se aceptó.
     pub fn push(
         &mut self,
         seq: u32,
@@ -320,6 +342,21 @@ impl JitterBuffer {
         packet: &[u8],
         arrived: Instant,
     ) -> bool {
+        self.push_frames(seq, capture_us, flags, 1, packet, arrived)
+    }
+
+    /// Como [`JitterBuffer::push`], con las tramas de 10 ms que lleva el paquete (`frames` de la
+    /// cabecera; entre 1 y [`MAX_PACKET_FRAMES`]).
+    pub fn push_frames(
+        &mut self,
+        seq: u32,
+        capture_us: u32,
+        flags: u8,
+        frames: u8,
+        packet: &[u8],
+        arrived: Instant,
+    ) -> bool {
+        let frames = frames.clamp(1, MAX_PACKET_FRAMES);
         if packet.is_empty() || packet.len() > MAX_PACKET {
             return false;
         }
@@ -342,10 +379,12 @@ impl JitterBuffer {
         slot.seq = seq;
         slot.capture_us = capture_us;
         slot.flags = flags;
+        slot.frames = frames;
         slot.len = packet.len() as u16;
         slot.arrived = arrived;
         slot.data[..packet.len()].copy_from_slice(packet);
         self.stats.received += 1;
+        self.packet_frames = frames;
         if self.next.is_none() {
             self.next = Some(seq);
         }
@@ -355,12 +394,15 @@ impl JitterBuffer {
         if !self.primed && self.prime_from.is_none() {
             self.prime_from = Some(arrived);
         }
-        // Tránsito relativo: llegada (reloj local) − captura (reloj del emisor), en 32 bits.
+        // Tránsito relativo: llegada (reloj local) − captura (reloj del emisor), en 32 bits. Una
+        // muestra por trama: la ventana cubre el mismo tiempo de audio con paquetes de 10 o 20 ms.
         let arrived_us = arrived.saturating_duration_since(self.origin).as_micros() as u32;
         let transit = i64::from(arrived_us.wrapping_sub(capture_us) as i32);
-        self.transit[self.transit_pos] = transit;
-        self.transit_pos = (self.transit_pos + 1) % JITTER_WINDOW;
-        self.transit_len = (self.transit_len + 1).min(JITTER_WINDOW);
+        for _ in 0..frames {
+            self.transit[self.transit_pos] = transit;
+            self.transit_pos = (self.transit_pos + 1) % JITTER_WINDOW;
+        }
+        self.transit_len = (self.transit_len + usize::from(frames)).min(JITTER_WINDOW);
         true
     }
 
@@ -380,24 +422,36 @@ impl JitterBuffer {
         let rank = ((0.95 * n as f64).ceil() as usize).clamp(1, n) - 1;
         let p95 = window[rank].max(0);
         self.stats.jitter_p95_ms = p95 as f64 / 1000.0;
-        let target = Duration::from_micros((p95 + FRAME_US) as u64).clamp(MIN_TARGET, MAX_TARGET);
-        self.target_frames = frames_for(target);
+        // El jitter en tramas (hacia arriba) más el paquete que suena.
+        let jitter_frames = (p95 as u64).div_ceil(FRAME_US as u64) as i32;
+        self.target_frames = (jitter_frames + i32::from(self.packet_frames))
+            .clamp(frames_for(MIN_TARGET), frames_for(MAX_TARGET));
         self.stats.target_ms = self.target().as_secs_f64() * 1000.0;
     }
 
-    /// Tramas en cola desde la que toca hasta la más alta recibida (con huecos).
+    /// Tramas de 10 ms en cola desde la que toca hasta el paquete más alto recibido: las de cada
+    /// paquete que está y, por cada hueco, las de un paquete del emisor.
     fn queued(&self) -> i32 {
         match (self.next, self.highest) {
             (Some(next), Some(highest)) if !seq_after(next, highest) => {
-                highest.wrapping_sub(next) as i32 + 1
+                let packets = highest.wrapping_sub(next) as usize + 1;
+                (0..packets as u32)
+                    .map(|i| {
+                        let seq = next.wrapping_add(i);
+                        i32::from(
+                            self.slot(seq)
+                                .map_or(self.packet_frames, |slot| slot.frames),
+                        )
+                    })
+                    .sum()
             }
             _ => 0,
         }
     }
 
-    fn note_gap(&mut self) {
+    fn note_gap(&mut self, frames: u8) {
         if self.started {
-            self.run += 1;
+            self.run += u32::from(frames);
             self.stats.max_gap_frames = self.stats.max_gap_frames.max(self.run);
         }
     }
@@ -411,16 +465,20 @@ impl JitterBuffer {
         }
     }
 
-    /// La trama que toca reproducir ahora.
+    /// Lo que toca reproducir ahora (una trama de 10 ms, o las dos de un paquete de 20 ms): se
+    /// llama cuando acaba de sonar lo que devolvió la llamada anterior.
     pub fn pop(&mut self, now: Instant) -> Pop<'_> {
-        self.since_target += 1;
+        // Lo que sonó desde la llamada anterior, en tramas: el reloj de todos los periodos.
+        let elapsed = u32::from(self.elapsed.max(1));
+        self.elapsed = 1;
+        self.since_target += elapsed;
         if self.since_target >= 25 {
             self.since_target = 0;
             self.update_target();
         }
         let Some(next) = self.next else {
             if self.started && self.last_played.is_none_or(|(_, flags)| flags & DTX == 0) {
-                self.note_gap();
+                self.note_gap(1);
             }
             return Pop::Wait;
         };
@@ -432,7 +490,7 @@ impl JitterBuffer {
                 || queued >= self.desired_frames();
             if !ready {
                 if self.started && self.last_played.is_none_or(|(_, flags)| flags & DTX == 0) {
-                    self.note_gap();
+                    self.note_gap(1);
                 }
                 return Pop::Wait;
             }
@@ -444,45 +502,52 @@ impl JitterBuffer {
             self.recent = 0;
             self.since_adjust = 0;
         }
-        self.level = self.level * 0.9 + f64::from(queued) * 0.1;
+        for _ in 0..elapsed {
+            self.level = self.level * 0.9 + f64::from(queued) * 0.1;
+        }
         self.stats.level_frames = self.level;
         // La ventana es la de las últimas tramas: un vacío de hace segundos no frena el recorte.
         if self.window >= TRIM_WINDOW_FRAMES {
             self.window = 0;
             self.min_queued = i32::MAX;
         }
-        self.window += 1;
+        self.window += elapsed;
         self.min_queued = self.min_queued.min(queued);
         if self.recent >= ADJUST_PERIOD_FRAMES {
             self.recent = 0;
             self.min_recent = i32::MAX;
         }
-        self.recent += 1;
+        self.recent += elapsed;
         self.min_recent = self.min_recent.min(queued);
-        self.since_adjust = self.since_adjust.saturating_add(1);
+        self.since_adjust = self.since_adjust.saturating_add(elapsed);
         let desired = f64::from(self.desired_frames());
         let adjust = self.since_adjust >= ADJUST_PERIOD_FRAMES;
 
-        // Sobra cola: se recorta la trama que toca si está (y hay más detrás). Sobran dos o más si
-        // en las últimas [`ADJUST_PERIOD_FRAMES`] tramas la cola no bajó de objetivo + 2 (una ráfaga
-        // tras un parón): se recorta una cada periodo hasta quedar en objetivo + 1. Sobra una sola
-        // si en todo un [`TRIM_WINDOW_FRAMES`] la cola no bajó nunca del objetivo: así no se
-        // recorta la que hace falta cuando las llegadas caen a un lado u otro de la reproducción, y
-        // la cola no se queda una trama por encima (lo que pasaba con `nivel > objetivo + 1`).
+        // Sobra cola: se recorta el paquete que toca si está (y hay más detrás). Sobran dos o más
+        // tramas si en las últimas [`ADJUST_PERIOD_FRAMES`] la cola no bajó de objetivo + el
+        // paquete + 1 (una ráfaga tras un parón): se recorta uno cada periodo hasta quedar en
+        // objetivo + 1. Sobra un paquete si en todo un [`TRIM_WINDOW_FRAMES`] la cola no bajó
+        // nunca de objetivo + el paquete: así no se recorta el que hace falta cuando las llegadas
+        // caen a un lado u otro de la reproducción, y la cola no se queda una trama por encima.
         let desired_frames = self.desired_frames();
-        let burst = self.recent >= ADJUST_PERIOD_FRAMES && self.min_recent > desired_frames + 1;
-        let one_extra = self.window >= TRIM_WINDOW_FRAMES && self.min_queued > desired_frames;
-        if adjust && (burst || one_extra) && queued > 1 && self.slot(next).is_some() {
-            self.take(next);
-            self.next = Some(next.wrapping_add(1));
-            self.stats.trimmed += 1;
-            self.level -= 1.0;
-            self.min_queued = i32::MAX;
-            self.window = 0;
-            self.min_recent = i32::MAX;
-            self.recent = 0;
-            self.since_adjust = 0;
-            return self.pop_inner();
+        let head = self.slot(next).map(|slot| i32::from(slot.frames));
+        if let Some(head) = head {
+            let burst =
+                self.recent >= ADJUST_PERIOD_FRAMES && self.min_recent > desired_frames + head;
+            let one_extra =
+                self.window >= TRIM_WINDOW_FRAMES && self.min_queued >= desired_frames + head;
+            if adjust && (burst || one_extra) && queued > head {
+                self.take(next);
+                self.next = Some(next.wrapping_add(1));
+                self.stats.trimmed += 1;
+                self.level -= f64::from(head);
+                self.min_queued = i32::MAX;
+                self.window = 0;
+                self.min_recent = i32::MAX;
+                self.recent = 0;
+                self.since_adjust = 0;
+                return self.pop_inner();
+            }
         }
         // Falta cola: una trama de PLC sin avanzar.
         if adjust && self.level < desired - 1.5 && queued > 0 {
@@ -498,6 +563,7 @@ impl JitterBuffer {
                 capture_us: None,
                 next: None,
                 stretch: true,
+                frames: 1,
             });
         }
         self.pop_inner()
@@ -518,23 +584,28 @@ impl JitterBuffer {
             let slot = &self.slots[next as usize % SLOTS];
             self.last_played = Some((next, slot.flags));
             self.last_capture = Some((next, slot.capture_us));
+            self.elapsed = slot.frames;
             return Pop::Frame(FrameRef {
                 seq: next,
                 capture_us: slot.capture_us,
                 flags: slot.flags,
+                frames: slot.frames,
                 arrived: slot.arrived,
                 data: &slot.data[..usize::from(slot.len)],
             });
         }
+        let packet_us = u32::from(self.packet_frames) * FRAME_US as u32;
         let estimate = self.last_capture.map(|(seq, capture)| {
-            capture.wrapping_add(next.wrapping_sub(seq).wrapping_mul(FRAME_US as u32))
+            capture.wrapping_add(next.wrapping_sub(seq).wrapping_mul(packet_us))
         });
         if queued > 0 {
-            // Hueco con algo detrás: pérdida.
+            // Hueco con algo detrás: pérdida (las tramas de un paquete del emisor).
+            let frames = self.packet_frames;
             self.next = Some(next.wrapping_add(1));
             self.stats.concealed += 1;
             self.underrun_run = 0;
-            self.note_gap();
+            self.note_gap(frames);
+            self.elapsed = frames;
             let following = next.wrapping_add(1);
             let slot = &self.slots[following as usize % SLOTS];
             let next_packet = (slot.used && slot.seq == following)
@@ -544,6 +615,7 @@ impl JitterBuffer {
                 capture_us: estimate,
                 next: next_packet,
                 stretch: false,
+                frames,
             });
         }
         // Cola vacía.
@@ -553,16 +625,17 @@ impl JitterBuffer {
                 self.stats.underruns += 1;
             }
             self.underrun_run += 1;
-            self.note_gap();
+            self.note_gap(1);
             return Pop::Plc(Lost {
                 seq: next,
                 capture_us: estimate,
                 next: None,
                 stretch: true,
+                frames: 1,
             });
         }
         if spoke_last {
-            self.note_gap();
+            self.note_gap(1);
         }
         // El emisor calló (DTX) o la cola lleva vacía demasiado: se vuelve a cebar.
         self.primed = false;
@@ -855,6 +928,74 @@ mod tests {
         let (wait, stats) = hold(3 * MS, late, 0);
         assert!((wait - 15.0).abs() < 0.5, "{wait} ms {stats:?}");
         assert!(stats.trimmed >= 1, "{stats:?}");
+    }
+
+    #[test]
+    fn twenty_millisecond_packets_are_measured_in_frames() {
+        // Paquetes de 20 ms (dos tramas) que llegan 3 ms después de completarse; la reproducción
+        // pide cada 10 ms salvo cuando aún suena la segunda trama del paquete anterior (como
+        // `Stream::tick`). La cola y el objetivo cuentan tramas: un paquete en cola son 20 ms y
+        // no hace falta estirar ni recortar (contando paquetes, la cola parecía la mitad).
+        let mut buffer = JitterBuffer::new();
+        let base = Instant::now();
+        let (mut seq, mut pending, mut played) = (0u32, false, Vec::new());
+        for tick in 0..400u32 {
+            let now = base + FRAME_DURATION * tick + 5 * MS;
+            loop {
+                let at = base + FRAME_DURATION * (2 * seq + 2) + 3 * MS;
+                if at > now {
+                    break;
+                }
+                buffer.push_frames(seq, seq * 20_000, 0, 2, &packet(seq), at);
+                seq += 1;
+            }
+            if pending {
+                pending = false;
+                continue;
+            }
+            match buffer.pop(now) {
+                Pop::Frame(frame) => {
+                    assert_eq!(frame.frames, 2);
+                    pending = true;
+                    played.push(frame.seq);
+                }
+                Pop::Plc(lost) => pending = lost.frames == 2,
+                Pop::Wait => {}
+            }
+        }
+        let stats = buffer.stats();
+        assert_eq!((stats.trimmed, stats.stretched), (0, 0), "{stats:?}");
+        assert_eq!(stats.concealed + stats.underruns, 0, "{stats:?}");
+        assert!(played.windows(2).all(|w| w[1] == w[0] + 1), "{played:?}");
+        assert!(played.len() >= 190, "{}", played.len());
+        assert!((stats.target_ms - 20.0).abs() < 1e-6, "{stats:?}");
+        assert!(
+            stats.level_frames >= 2.0,
+            "un paquete son dos tramas: {stats:?}"
+        );
+        // Un paquete de 20 ms perdido se oculta con sus dos tramas.
+        let mut buffer = JitterBuffer::new();
+        for seq in [0u32, 1, 3] {
+            buffer.push_frames(seq, seq * 20_000, 0, 2, &packet(seq), base);
+        }
+        let later = base + Duration::from_secs(1);
+        assert!(matches!(
+            buffer.pop(later),
+            Pop::Frame(FrameRef {
+                seq: 0,
+                frames: 2,
+                ..
+            })
+        ));
+        assert!(matches!(
+            buffer.pop(later),
+            Pop::Frame(FrameRef { seq: 1, .. })
+        ));
+        match buffer.pop(later) {
+            Pop::Plc(lost) => assert_eq!((lost.seq, lost.frames, lost.stretch), (2, 2, false)),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(buffer.stats().max_gap_frames, 2);
     }
 
     #[test]

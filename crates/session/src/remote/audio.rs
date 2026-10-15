@@ -16,13 +16,19 @@
 //! **Reproducción** (hilo `audio-play`): un [`JitterBuffer`] y un [`OpusDecoder`] por emisor y pista
 //! (PLC, FEC en banda o DRED en las pérdidas), mezcla ([`Mixer`], con el juego silenciable) y el
 //! sumidero, que marca el ritmo. En el invitado, [`AvSync`] compara cada trama del juego con el
-//! fotograma de captura más cercana y ajusta el buffer del juego. Cada trama deja sus marcas en el
-//! [`LatencyLedger`] ([`AudioStage`]) y los contadores se publican cada medio segundo.
+//! fotograma de captura más cercana y ajusta el buffer del juego cada [`RECOMMEND_PERIOD`]
+//! (100 ms), sin retrasar el audio más de su tope ([`coroom_audio::sync::DEFAULT_MAX_DELAY`]).
+//! Cada trama deja sus marcas en el [`LatencyLedger`] ([`AudioStage`]) y los contadores se
+//! publican cada medio segundo.
 //!
 //! Sin asignaciones en caliente: los búferes PCM, Opus, SFrame y de paquetes se reservan al
 //! arrancar (los paquetes viajan por el canal por valor, con su carga en un array). La única
 //! asignación por trama es el `Bytes` del datagrama que se entrega a `quinn`, que se queda con él
-//! hasta enviarlo (y que se comparte entre todos los destinos).
+//! hasta enviarlo (y que se comparte entre todos los destinos). La reproducción, que a demanda
+//! corre en el hilo de tiempo real del dispositivo, tampoco asigna, ordena ni toma los cerrojos
+//! del registro: las marcas, los contadores, los percentiles de la sincronía, los emisores nuevos
+//! (preparados de antemano) y los olvidados van y vienen por canales acotados a un hilo de
+//! contadores (el propio `audio-play` a demanda, `audio-stats` con la cola del sumidero).
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -31,10 +37,10 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use coroom_audio::codec::{OpusDecoder, OpusEncoder, Profile, Recovery, is_silk_or_hybrid};
-use coroom_audio::jitter::{JitterBuffer, Pop};
+use coroom_audio::jitter::{JitterBuffer, JitterStats, Pop};
 use coroom_audio::mix::Mixer;
 use coroom_audio::processing::{ProcessingOptions, RenderFeed, VoiceProcessor};
-use coroom_audio::sync::AvSync;
+use coroom_audio::sync::{AvSync, RECOMMEND_PERIOD};
 use coroom_audio::{
     AudioConfig, AudioSink, AudioSource, DeviceCounters, MAX_FRAME_SAMPLES, Render,
 };
@@ -56,8 +62,12 @@ pub const MAX_PACKET: usize = coroom_audio::jitter::MAX_PACKET;
 /// Paquetes en vuelo entre la red y la reproducción.
 const PACKET_QUEUE: usize = 512;
 
-/// Cada cuántas tramas de reproducción se publican contadores y se reajusta la sincronía.
+/// Cada cuántas tramas de reproducción se publican los contadores (medio segundo).
 const PUBLISH_TICKS: u32 = 50;
+
+/// Cada cuántas tramas de reproducción se reajusta la sincronía A/V ([`RECOMMEND_PERIOD`], 100 ms).
+const SYNC_TICKS: u32 =
+    (RECOMMEND_PERIOD.as_millis() / coroom_audio::FRAME_DURATION.as_millis()) as u32;
 
 /// Un emisor que no envía en este tiempo se olvida (su buffer y su decodificador).
 const IDLE_SOURCE: Duration = Duration::from_secs(60);
@@ -723,6 +733,7 @@ impl Stream {
                 }
             }
             Pop::Plc(lost) => {
+                let lost_frames = lost.frames;
                 let (next, fec, dred) = match lost.next {
                     Some((data, flags)) => (
                         Some(data),
@@ -736,6 +747,11 @@ impl Stream {
                     .unwrap_or(Recovery::Plc);
                 if !lost.stretch {
                     self.jitter.note_recovery(recovery);
+                }
+                // Un paquete de 20 ms perdido son dos tramas: la segunda, también ocultada.
+                if lost_frames >= 2 && decoder.decode(None, &mut pcm[frame..]).is_ok() {
+                    self.pending = frame;
+                    self.pending_capture = None;
                 }
                 Some((
                     0,
@@ -786,18 +802,95 @@ impl DeviceStats {
 /// Convierte la `capture_us` (32 bits, reloj del anfitrión) de una trama a un instante local.
 pub(crate) type ToLocal = dyn Fn(u32) -> Option<Instant> + Send + Sync;
 
-/// Guarda un paquete en el buffer de su emisor (lo crea si es nuevo).
-fn accept(core: &Core, packet: Packet, game: &mut Option<Stream>, voices: &mut Vec<Stream>) {
+/// Lo que la reproducción deja cada [`PUBLISH_TICKS`] tramas para publicarlo fuera del tiempo
+/// real: los contadores de cada buffer y, en el invitado, la sincronía (para sus percentiles).
+/// Por valor y de tamaño fijo, como todo lo que cruza los canales de [`Links`].
+#[derive(Clone)]
+struct Snapshot {
+    streams: [(AudioTrack, JitterStats); MAX_VOICES + 1],
+    len: usize,
+    av: Option<AvSync>,
+}
+
+impl Snapshot {
+    fn streams(&self) -> impl Iterator<Item = (AudioTrack, JitterStats)> + '_ {
+        self.streams[..self.len].iter().copied()
+    }
+}
+
+/// Canales entre la reproducción (que a demanda corre en el hilo de tiempo real del dispositivo)
+/// y el hilo de contadores ([`Housekeeper`]): acotados y reservados al crearlos, y la reproducción
+/// solo usa `try_send`/`try_recv`, así no asigna, no espera y no toma los cerrojos del registro.
+struct Links {
+    /// Marcas de cada trama que sonó, hacia el registro.
+    heard: Sender<(AudioTrack, AudioTimeline)>,
+    /// Contadores y sincronía, cada [`PUBLISH_TICKS`].
+    snapshots: Sender<Snapshot>,
+    /// Pares captura/presentación de los fotogramas, desde el registro (sincronía A/V).
+    video: Receiver<(Instant, Instant)>,
+    /// Emisores preparados (buffer y decodificador ya reservados) para el primero que llegue.
+    spare_game: Receiver<Stream>,
+    spare_voices: Receiver<Stream>,
+    /// Emisores olvidados, para soltarlos fuera del tiempo real.
+    retired: Sender<Stream>,
+}
+
+/// Los otros extremos de [`Links`], en el hilo de contadores.
+struct HousekeeperLinks {
+    heard: Receiver<(AudioTrack, AudioTimeline)>,
+    snapshots: Receiver<Snapshot>,
+    video: Sender<(Instant, Instant)>,
+    spare_game: Sender<Stream>,
+    spare_voices: Sender<Stream>,
+    retired: Receiver<Stream>,
+}
+
+/// Marcas en vuelo hacia el registro (17 emisores × 2 tramas de holgura y de sobra para un
+/// parón del hilo de contadores).
+const HEARD_QUEUE: usize = 512;
+
+/// Emisores de voz preparados de antemano: los que pueden empezar a hablar entre dos pasadas del
+/// hilo de contadores.
+const SPARE_VOICES: usize = 2;
+
+fn links() -> (Links, HousekeeperLinks) {
+    let (heard_tx, heard_rx) = crossbeam_channel::bounded(HEARD_QUEUE);
+    let (snapshots_tx, snapshots_rx) = crossbeam_channel::bounded(2);
+    let (video_tx, video_rx) = crossbeam_channel::bounded(coroom_audio::sync::VIDEO_WINDOW);
+    let (spare_game_tx, spare_game_rx) = crossbeam_channel::bounded(1);
+    let (spare_voices_tx, spare_voices_rx) = crossbeam_channel::bounded(SPARE_VOICES);
+    let (retired_tx, retired_rx) = crossbeam_channel::bounded(MAX_VOICES + 1);
+    (
+        Links {
+            heard: heard_tx,
+            snapshots: snapshots_tx,
+            video: video_rx,
+            spare_game: spare_game_rx,
+            spare_voices: spare_voices_rx,
+            retired: retired_tx,
+        },
+        HousekeeperLinks {
+            heard: heard_rx,
+            snapshots: snapshots_rx,
+            video: video_tx,
+            spare_game: spare_game_tx,
+            spare_voices: spare_voices_tx,
+            retired: retired_rx,
+        },
+    )
+}
+
+/// Guarda un paquete en el buffer de su emisor. Un emisor nuevo toma uno de los preparados por el
+/// hilo de contadores (si no queda ninguno, el paquete se pierde hasta la pasada siguiente).
+fn accept(links: &Links, packet: Packet, game: &mut Option<Stream>, voices: &mut Vec<Stream>) {
     let stream = match packet.track {
         AudioTrack::Game => {
             if game.is_none() {
-                match Stream::new(AudioTrack::Game, packet.source) {
-                    Ok(stream) => *game = Some(stream),
-                    Err(err) => {
-                        core.warn(format!("audio del juego: {err}"));
-                        return;
-                    }
-                }
+                let Ok(mut stream) = links.spare_game.try_recv() else {
+                    return;
+                };
+                stream.source = packet.source;
+                *game = Some(stream);
             }
             game.as_mut()
         }
@@ -806,33 +899,33 @@ fn accept(core: &Core, packet: Packet, game: &mut Option<Stream>, voices: &mut V
                 if voices.len() >= MAX_VOICES {
                     return;
                 }
-                match Stream::new(AudioTrack::Voice, packet.source) {
-                    Ok(stream) => voices.push(stream),
-                    Err(err) => {
-                        core.warn(format!("voz: {err}"));
-                        return;
-                    }
-                }
+                let Ok(mut stream) = links.spare_voices.try_recv() else {
+                    return;
+                };
+                stream.source = packet.source;
+                voices.push(stream);
             }
             voices.iter_mut().find(|v| v.source == packet.source)
         }
     };
     if let Some(stream) = stream {
         stream.last_packet = packet.arrived;
-        stream.jitter.push(
+        stream.jitter.push_frames(
             packet.header.seq,
             packet.header.capture_us,
             packet.header.flags,
+            packet.header.frames,
             &packet.data[..usize::from(packet.len)],
             packet.arrived,
         );
     }
 }
 
-/// La reproducción trama a trama: buffers, decodificación, mezcla, marcas y contadores. La mueve
-/// el hilo `audio-play` con la cola del sumidero o, a demanda, el propio dispositivo.
+/// La reproducción trama a trama: buffers, decodificación, mezcla, marcas y sincronía. La mueve
+/// el hilo `audio-play` con la cola del sumidero o, a demanda, el propio dispositivo desde su
+/// hilo de tiempo real: nada de lo que hace asigna memoria, ordena ni toma los cerrojos del
+/// registro (todo eso va por [`Links`] al [`Housekeeper`]).
 struct Playout {
-    core: Arc<Core>,
     control: AudioControl,
     render: Option<RenderFeed>,
     packets: Receiver<Packet>,
@@ -843,12 +936,10 @@ struct Playout {
     voices: Vec<Stream>,
     heard: Vec<Heard>,
     av: Option<AvSync>,
-    last_video: u64,
     ticks: u32,
+    links: Links,
     /// Se cerró el canal de paquetes: la sesión termina.
     closed: Arc<AtomicBool>,
-    /// Faltas y sobras de la salida.
-    device: Arc<DeviceStats>,
 }
 
 impl Playout {
@@ -857,7 +948,7 @@ impl Playout {
     fn fill(&mut self, out: &mut [i16], now: Instant) -> bool {
         loop {
             match self.packets.try_recv() {
-                Ok(packet) => accept(&self.core, packet, &mut self.game, &mut self.voices),
+                Ok(packet) => accept(&self.links, packet, &mut self.game, &mut self.voices),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.closed.store(true, Ordering::Release);
@@ -901,9 +992,8 @@ impl Playout {
     }
 
     /// `out`, que [`Playout::fill`] llenó en `decided`, sonará en `played_at`: marcas, sincronía
-    /// y, cada [`PUBLISH_TICKS`] tramas, contadores.
+    /// (cada [`SYNC_TICKS`] tramas) y, cada [`PUBLISH_TICKS`], la foto de los contadores.
     fn played(&mut self, out: &[i16], decided: Instant, played_at: Instant) {
-        let ledger = &self.core.ledger;
         if let Some(render) = &mut self.render {
             render.feed_render(out, self.channels);
         }
@@ -920,7 +1010,8 @@ impl Playout {
             }
             timeline.mark(AudioStage::Decoded, decided);
             timeline.mark(AudioStage::Played, played_at);
-            ledger.record_audio(info.track, AudioSide::Receiver, timeline);
+            // Lleno solo si el hilo de contadores lleva parado un rato: se pierde la marca.
+            let _ = self.links.heard.try_send((info.track, timeline));
             if info.track == AudioTrack::Game
                 && let Some(av) = &mut self.av
             {
@@ -929,32 +1020,104 @@ impl Playout {
         }
 
         self.ticks = self.ticks.wrapping_add(1);
-        if let Some(av) = &mut self.av
-            && self.ticks.is_multiple_of(10)
+        if self.ticks.is_multiple_of(SYNC_TICKS)
+            && let Some(av) = &mut self.av
         {
-            ledger.video_pairs_since(&mut self.last_video, |captured, presented| {
+            while let Ok((captured, presented)) = self.links.video.try_recv() {
                 av.on_video(captured, presented);
-            });
-        }
-        if self.ticks.is_multiple_of(PUBLISH_TICKS) {
-            if let (Some(av), Some(stream)) = (&mut self.av, &mut self.game) {
+            }
+            if let Some(stream) = &mut self.game {
                 let (min, max) = stream.jitter.extra_delay_range_ms();
                 av.set_limits(min, max);
                 let adjust = av.recommend();
                 stream.jitter.set_extra_delay(adjust);
-                let stats = av.stats();
-                ledger.set_av(AvSummary {
-                    samples: stats.samples,
-                    p50_ms: stats.p50_abs_ms,
-                    p95_ms: stats.p95_abs_ms,
-                    offset_ms: stats.offset_ms,
-                    adjust_ms: stats.adjust_ms,
-                });
             }
-            self.publish();
-            self.voices.retain(|stream| {
-                decided.saturating_duration_since(stream.last_packet) < IDLE_SOURCE
+        }
+        if self.ticks.is_multiple_of(PUBLISH_TICKS) {
+            // Si el hilo de contadores no recogió la anterior, esta se pierde (la siguiente sí).
+            let _ = self.links.snapshots.try_send(self.snapshot());
+            self.retire_idle(decided);
+        }
+    }
+
+    /// Contadores de los buffers y copia de la sincronía, sin asignar.
+    fn snapshot(&self) -> Snapshot {
+        let mut snapshot = Snapshot {
+            streams: [(AudioTrack::Game, JitterStats::default()); MAX_VOICES + 1],
+            len: 0,
+            av: self.av.clone(),
+        };
+        for stream in self.game.iter().chain(self.voices.iter()) {
+            if snapshot.len < snapshot.streams.len() {
+                snapshot.streams[snapshot.len] = (stream.track, stream.jitter.stats());
+                snapshot.len += 1;
+            }
+        }
+        snapshot
+    }
+
+    /// Olvida las voces que llevan [`IDLE_SOURCE`] sin enviar: se sueltan en el hilo de contadores.
+    fn retire_idle(&mut self, now: Instant) {
+        let mut index = 0;
+        while index < self.voices.len() {
+            if now.saturating_duration_since(self.voices[index].last_packet) < IDLE_SOURCE {
+                index += 1;
+                continue;
+            }
+            let stream = self.voices.swap_remove(index);
+            if let Err(err) = self.links.retired.try_send(stream) {
+                // Sin sitio: se queda hasta la próxima vez (el orden de la mezcla da igual).
+                self.voices.push(err.into_inner());
+                index += 1;
+            }
+        }
+    }
+}
+
+/// El hilo de contadores de la reproducción: lo que no puede hacerse en tiempo real. Pasa las
+/// marcas y los contadores al registro, calcula los percentiles de la sincronía, lleva al
+/// reproductor los fotogramas que necesita la sincronía, prepara los emisores nuevos y suelta
+/// los olvidados.
+struct Housekeeper {
+    core: Arc<Core>,
+    control: AudioControl,
+    links: HousekeeperLinks,
+    av_sync: bool,
+    last_video: u64,
+    last_status: Option<Instant>,
+    device: Arc<DeviceStats>,
+}
+
+/// Cada cuánto se publica quién habla.
+const STATUS_PERIOD: Duration = Duration::from_millis(500);
+
+impl Housekeeper {
+    /// Sin bloquear: lo pendiente de cada canal.
+    fn tick(&mut self) {
+        let ledger = &self.core.ledger;
+        self.refill();
+        while let Ok(stream) = self.links.retired.try_recv() {
+            drop(stream);
+        }
+        if self.av_sync {
+            let video = &self.links.video;
+            ledger.video_pairs_since(&mut self.last_video, |captured, presented| {
+                // Lleno: el reproductor no está sonando el juego; esos fotogramas no hacen falta.
+                let _ = video.try_send((captured, presented));
             });
+        }
+        while let Ok((track, timeline)) = self.links.heard.try_recv() {
+            ledger.record_audio(track, AudioSide::Receiver, timeline);
+        }
+        while let Ok(snapshot) = self.links.snapshots.try_recv() {
+            self.publish(&snapshot);
+        }
+        let now = Instant::now();
+        if self
+            .last_status
+            .is_none_or(|last| now.saturating_duration_since(last) >= STATUS_PERIOD)
+        {
+            self.last_status = Some(now);
             let speaking = self
                 .control
                 .talkers()
@@ -965,18 +1128,56 @@ impl Playout {
         }
     }
 
-    fn publish(&self) {
-        publish(
-            &self.core.ledger,
-            self.game.iter().chain(self.voices.iter()),
-            self.device.load(),
-        );
+    /// Deja preparados un emisor del juego y [`SPARE_VOICES`] de voz.
+    fn refill(&self) {
+        let fill = |track: AudioTrack, spares: &Sender<Stream>| {
+            while !spares.is_full() {
+                match Stream::new(track, 0) {
+                    Ok(stream) => {
+                        if spares.try_send(stream).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        self.core.warn(format!("audio: {err}"));
+                        break;
+                    }
+                }
+            }
+        };
+        fill(AudioTrack::Game, &self.links.spare_game);
+        fill(AudioTrack::Voice, &self.links.spare_voices);
+    }
+
+    fn publish(&self, snapshot: &Snapshot) {
+        let ledger = &self.core.ledger;
+        if let Some(av) = &snapshot.av {
+            let stats = av.stats();
+            ledger.set_av(AvSummary {
+                samples: stats.samples,
+                p50_ms: stats.p50_abs_ms,
+                p95_ms: stats.p95_abs_ms,
+                offset_ms: stats.offset_ms,
+                adjust_ms: stats.adjust_ms,
+            });
+        }
+        publish(ledger, snapshot.streams(), self.device.load());
+    }
+
+    /// Al terminar: lo último que quedó en los canales y la foto final de la reproducción.
+    fn finish(&mut self, playout: &Playout) {
+        self.tick();
+        self.publish(&playout.snapshot());
     }
 }
 
+// La foto de los contadores cae en una trama de sincronía.
+const _: () = assert!(PUBLISH_TICKS.is_multiple_of(SYNC_TICKS));
+
 /// Hilo `audio-play`. Con un sumidero a demanda ([`AudioSink::start_pull`]) el dispositivo pide
-/// cada trama justo cuando la necesita y este hilo solo vigila; si no, la decide este hilo en
-/// cuanto el sumidero tiene sitio, una trama antes de que suene.
+/// cada trama justo cuando la necesita y este hilo solo vigila y hace de hilo de contadores; si
+/// no, la decide este hilo en cuanto el sumidero tiene sitio, una trama antes de que suene, y los
+/// contadores van en un hilo aparte (`audio-stats`).
 pub(crate) fn play_loop(
     core: &Arc<Core>,
     player: Player,
@@ -997,8 +1198,19 @@ pub(crate) fn play_loop(
     };
     let closed = Arc::new(AtomicBool::new(false));
     let device = Arc::new(DeviceStats::default());
-    let playout = Playout {
+    let (links, housekeeper_links) = links();
+    let housekeeper = Housekeeper {
         core: Arc::clone(core),
+        control: control.clone(),
+        links: housekeeper_links,
+        av_sync,
+        last_video: 0,
+        last_status: None,
+        device: Arc::clone(&device),
+    };
+    // Los emisores del arranque, preparados antes de que suene nada.
+    housekeeper.refill();
+    let playout = Playout {
         control,
         render,
         packets,
@@ -1009,28 +1221,35 @@ pub(crate) fn play_loop(
         voices: Vec::with_capacity(MAX_VOICES),
         heard: Vec::with_capacity(MAX_VOICES + 1),
         av: av_sync.then(AvSync::new),
-        last_video: 0,
         ticks: 0,
+        links,
         closed: Arc::clone(&closed),
-        device: Arc::clone(&device),
     };
     let frame_len = coroom_audio::SAMPLES_PER_CHANNEL * usize::from(format.channels);
     if sink.supports_pull() {
-        play_pull(core, sink.as_mut(), &config, playout, &closed, &device);
+        play_pull(core, sink.as_mut(), &config, playout, housekeeper, &closed);
     } else {
-        play_push(core, sink.as_mut(), &config, playout, frame_len, &device);
+        play_push(
+            core,
+            sink.as_mut(),
+            &config,
+            playout,
+            housekeeper,
+            frame_len,
+        );
     }
 }
 
-/// A demanda: el dispositivo llama a la reproducción desde su hilo.
+/// A demanda: el dispositivo llama a la reproducción desde su hilo; este, el de contadores.
 fn play_pull(
     core: &Core,
     sink: &mut dyn AudioSink,
     config: &AudioConfig,
     playout: Playout,
+    mut housekeeper: Housekeeper,
     closed: &AtomicBool,
-    device_stats: &DeviceStats,
 ) {
+    // Solo el dispositivo lo toma mientras suena (este hilo, al final): el cerrojo no se disputa.
     let playout = Arc::new(Mutex::new(playout));
     let device = Arc::clone(&playout);
     let render: Render = Box::new(move |out, played_at| {
@@ -1052,12 +1271,13 @@ fn play_pull(
             core.warn(format!("la salida de audio se detuvo: {err}"));
             break;
         }
-        device_stats.store(sink.device_counters());
+        housekeeper.device.store(sink.device_counters());
+        housekeeper.tick();
         std::thread::sleep(PULL_WATCH);
     }
-    device_stats.store(sink.device_counters());
+    housekeeper.device.store(sink.device_counters());
     sink.stop();
-    lock(&playout).publish();
+    housekeeper.finish(&lock(&playout));
 }
 
 /// Con la cola del sumidero: se espera su sitio y después se decide qué suena.
@@ -1066,38 +1286,62 @@ fn play_push(
     sink: &mut dyn AudioSink,
     config: &AudioConfig,
     mut playout: Playout,
+    mut housekeeper: Housekeeper,
     frame_len: usize,
-    device: &DeviceStats,
 ) {
-    // Con la cola, este hilo marca el ritmo del sumidero (a demanda lo marca el dispositivo).
-    realtime("audio-play");
     if let Err(err) = sink.start(config) {
         core.warn(format!("sin salida de audio: {err}"));
         return;
     }
     debug!(salida = %sink.describe(), "reproducción de audio");
-    let mut out = [0i16; MAX_FRAME_SAMPLES];
-    while !core.shared.stopping() {
-        if let Err(err) = sink.wait_ready() {
-            core.warn(format!("la salida de audio se detuvo: {err}"));
-            break;
-        }
-        let decided = Instant::now();
-        if !playout.fill(&mut out[..frame_len], decided) {
-            return;
-        }
-        let played = match sink.write(&out[..frame_len]) {
-            Ok(played) => played,
+    let device = Arc::clone(&housekeeper.device);
+    let done_flag = AtomicBool::new(false);
+    let done = &done_flag;
+    std::thread::scope(|scope| {
+        let stats = std::thread::Builder::new()
+            .name("audio-stats".into())
+            .spawn_scoped(scope, move || {
+                while !done.load(Ordering::Acquire) {
+                    housekeeper.tick();
+                    std::thread::sleep(PULL_WATCH);
+                }
+                housekeeper
+            });
+        let mut stats = match stats {
+            Ok(handle) => Some(handle),
             Err(err) => {
+                core.warn(format!("sin contadores de audio: {err}"));
+                None
+            }
+        };
+        // Con la cola, este hilo marca el ritmo del sumidero (a demanda lo marca el dispositivo).
+        realtime("audio-play");
+        let mut out = [0i16; MAX_FRAME_SAMPLES];
+        while !core.shared.stopping() {
+            if let Err(err) = sink.wait_ready() {
                 core.warn(format!("la salida de audio se detuvo: {err}"));
                 break;
             }
-        };
+            let decided = Instant::now();
+            if !playout.fill(&mut out[..frame_len], decided) {
+                break;
+            }
+            let played = match sink.write(&out[..frame_len]) {
+                Ok(played) => played,
+                Err(err) => {
+                    core.warn(format!("la salida de audio se detuvo: {err}"));
+                    break;
+                }
+            };
+            device.store(sink.device_counters());
+            playout.played(&out[..frame_len], decided, played.played_at_estimate);
+        }
         device.store(sink.device_counters());
-        playout.played(&out[..frame_len], decided, played.played_at_estimate);
-    }
-    device.store(sink.device_counters());
-    playout.publish();
+        done.store(true, Ordering::Release);
+        if let Some(mut housekeeper) = stats.take().and_then(|handle| handle.join().ok()) {
+            housekeeper.finish(&playout);
+        }
+    });
     sink.stop();
 }
 
@@ -1154,9 +1398,9 @@ impl AudioReader {
 
 /// Suma los contadores de los buffers por pista y los deja en el registro, con los de la salida
 /// (común a las pistas: el mismo valor en cada una).
-fn publish<'a>(
+fn publish(
     ledger: &LatencyLedger,
-    streams: impl Iterator<Item = &'a Stream>,
+    streams: impl Iterator<Item = (AudioTrack, JitterStats)>,
     device: DeviceCounters,
 ) {
     let mut totals = [AudioCounters {
@@ -1165,13 +1409,12 @@ fn publish<'a>(
         ..AudioCounters::default()
     }; 2];
     let mut seen = [false; 2];
-    for stream in streams {
-        let index = match stream.track {
+    for (track, stats) in streams {
+        let index = match track {
             AudioTrack::Game => 0,
             AudioTrack::Voice => 1,
         };
         seen[index] = true;
-        let stats = stream.jitter.stats();
         let total = &mut totals[index];
         total.received += stats.received;
         total.played += stats.played;
@@ -1277,7 +1520,11 @@ mod tests {
             underruns: 7,
             overruns: 2,
         });
-        publish(&ledger, std::iter::once(&game), device.load());
+        publish(
+            &ledger,
+            std::iter::once((game.track, game.jitter.stats())),
+            device.load(),
+        );
         let summary = ledger.audio_summary().expect("resumen");
         let counters = summary
             .tracks

@@ -7,11 +7,20 @@
 //! compartido con el hilo de audio de la sesión (como el backend de PipeWire).
 //!
 //! La reproducción va **a demanda** por defecto ([`AudioSink::start_pull`]): en cada evento se
-//! rellena el búfer del dispositivo hasta el nivel de [`crate::pacing::Pacing`] (dos periodos del
-//! motor o 20 ms, lo que sea más, y un margen) pidiendo las tramas a la sesión en ese momento. El
-//! motor no consume siempre 480 tramas por pasada (mezcla a 44,1 kHz, periodos de 512 tramas o de
-//! 20 ms en USB y Bluetooth, despertares tardíos que funden dos eventos): escribir una trama de
-//! 10 ms por evento lo dejaba sin audio a trozos y el sonido era robótico.
+//! rellena el búfer del dispositivo hasta el nivel de [`crate::pacing::Pacing`] (un periodo del
+//! motor, el que dice `GetDevicePeriod`, más el margen que se mide en los propios eventos)
+//! pidiendo las tramas a la sesión en ese momento. El motor no consume siempre 480 tramas por
+//! pasada (mezcla a 44,1 kHz, periodos de 512 tramas o de 20 ms en USB y Bluetooth, despertares
+//! tardíos que funden dos eventos): escribir una trama de 10 ms por evento lo dejaba sin audio a
+//! trozos y el sonido era robótico.
+//!
+//! **Cuándo suena cada trama**: con la posición del dispositivo (`IAudioClock::GetPosition`,
+//! convertida con `GetFrequency`), lo escrito y aún no reproducido es «tramas escritas − posición»,
+//! que incluye el búfer y la latencia del motor hasta el dispositivo. Si el cliente no da reloj, el
+//! relleno del búfer (`GetCurrentPadding`) más la latencia del flujo que dice el motor
+//! (`IAudioClient::GetStreamLatency`); nunca una constante. **Cuándo se capturó**: la marca
+//! QPC de cada paquete (`GetBuffer`), pasada al reloj local con una lectura del reloj del
+//! dispositivo (`GetPosition` da también el QPC del momento en que se llama); sin ella, la llegada.
 //!
 //! - [`LoopbackSource`]: *loopback* del dispositivo de salida por defecto (lo que suena).
 //! - [`ProcessLoopbackSource`]: **loopback por proceso** (`AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`
@@ -30,11 +39,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use wasapi::{
-    AudioCaptureClient, AudioClient, AudioRenderClient, DeviceEnumerator, Direction, Handle,
-    SampleType, StreamMode, WaveFormat,
+    AudioCaptureClient, AudioClient, AudioClock, AudioRenderClient, DeviceEnumerator, Direction,
+    Handle, SampleType, StreamMode, WaveFormat,
 };
 
 use crate::pacing::{Pacing, hns_to_frames};
@@ -79,6 +88,64 @@ enum Io {
     Render(AudioRenderClient, Pacing),
 }
 
+/// Reloj del dispositivo (`IAudioClock`): posición en tramas a 48 kHz y el QPC del momento.
+struct DeviceClock {
+    clock: AudioClock,
+    /// Unidades de posición por segundo (`GetFrequency`).
+    frequency: u64,
+}
+
+impl DeviceClock {
+    fn new(client: &AudioClient) -> Option<Self> {
+        let clock = client.get_audioclock().ok()?;
+        let frequency = clock.get_frequency().ok().filter(|f| *f > 0)?;
+        Some(Self { clock, frequency })
+    }
+
+    /// Posición del dispositivo en tramas, el QPC (en unidades de 100 ns) en que se leyó y el
+    /// instante local de la lectura (el medio de la llamada).
+    fn read(&self) -> Option<(u64, u64, Instant)> {
+        let before = Instant::now();
+        let (position, qpc) = self.clock.get_position().ok()?;
+        let after = Instant::now();
+        let frames = u128::from(position) * u128::from(SAMPLE_RATE_HZ) / u128::from(self.frequency);
+        Some((frames as u64, qpc, before + (after - before) / 2))
+    }
+}
+
+/// Latencia del flujo que dice el motor (`IAudioClient::GetStreamLatency`), si la da.
+#[allow(unsafe_code)] // `wasapi` no envuelve `GetStreamLatency`.
+fn stream_latency(client: &AudioClient) -> Option<Duration> {
+    // SAFETY: `as_iaudioclient` es la interfaz COM viva de `client`, ya inicializada (solo se llama
+    // después de `initialize_client`); `GetStreamLatency` solo escribe su resultado.
+    let hns = unsafe { client.as_iaudioclient().GetStreamLatency() }.ok()?;
+    u64::try_from(hns)
+        .ok()
+        .filter(|hns| *hns > 0)
+        .map(|hns| Duration::from_nanos(hns * 100))
+}
+
+/// Instante local de una marca QPC en unidades de 100 ns, con `reference` = (QPC, instante) de
+/// una lectura del reloj del dispositivo.
+fn qpc_to_instant(qpc: u64, reference: (u64, Instant)) -> Option<Instant> {
+    let (ref_qpc, ref_at) = reference;
+    if qpc <= ref_qpc {
+        ref_at.checked_sub(Duration::from_nanos((ref_qpc - qpc).saturating_mul(100)))
+    } else {
+        ref_at.checked_add(Duration::from_nanos((qpc - ref_qpc).saturating_mul(100)))
+    }
+}
+
+/// Tramas a 48 kHz que dura `duration`.
+fn duration_frames(duration: Duration) -> usize {
+    (duration.as_micros() * u128::from(SAMPLE_RATE_HZ) / 1_000_000) as usize
+}
+
+/// Duración de `frames` tramas a 48 kHz.
+fn frames_duration(frames: u64) -> Duration {
+    Duration::from_micros(frames * 1_000_000 / u64::from(SAMPLE_RATE_HZ))
+}
+
 fn device(
     enumerator: &DeviceEnumerator,
     direction: Direction,
@@ -94,7 +161,11 @@ fn device(
     }
 }
 
-fn open(endpoint: &Endpoint, format: AudioFormat) -> Result<(AudioClient, Handle, Io), AudioError> {
+/// Abre el flujo; devuelve también las tramas de silencio escritas antes de arrancar.
+fn open(
+    endpoint: &Endpoint,
+    format: AudioFormat,
+) -> Result<(AudioClient, Handle, Io, u64), AudioError> {
     let enumerator = DeviceEnumerator::new().map_err(backend)?;
     let mut client = match endpoint {
         Endpoint::AllButSelf => {
@@ -152,10 +223,11 @@ fn open(endpoint: &Endpoint, format: AudioFormat) -> Result<(AudioClient, Handle
         .initialize_client(&wave, &direction, &mode)
         .map_err(backend)?;
     let handle = client.set_get_eventhandle().map_err(backend)?;
+    let mut prefilled = 0;
     let io = match direction {
         Direction::Render => {
             let render = client.get_audiorenderclient().map_err(backend)?;
-            let pacing = render_pacing(&client)?;
+            let mut pacing = render_pacing(&client)?;
             // Un periodo de silencio antes de arrancar: la primera pasada del motor tiene qué leer
             // y el primer evento ya rellena hasta el objetivo.
             let prefill = pacing.prefill();
@@ -163,12 +235,13 @@ fn open(endpoint: &Endpoint, format: AudioFormat) -> Result<(AudioClient, Handle
             render
                 .write_to_device(prefill, &silence, None)
                 .map_err(backend)?;
+            prefilled = prefill as u64;
             Io::Render(render, pacing)
         }
         Direction::Capture => Io::Capture(client.get_audiocaptureclient().map_err(backend)?),
     };
     client.start_stream().map_err(backend)?;
-    Ok((client, handle, io))
+    Ok((client, handle, io, prefilled))
 }
 
 /// Búfer y periodo de un flujo de reproducción ya inicializado, en tramas de nuestro formato (a
@@ -177,6 +250,7 @@ fn render_pacing(client: &AudioClient) -> Result<Pacing, AudioError> {
     let buffer = client.get_buffer_size().map_err(backend)? as usize;
     let (period_hns, min_period_hns) = client.get_device_period().unwrap_or((0, 0));
     let pacing = Pacing::new(buffer, hns_to_frames(period_hns));
+    let latency_hns = stream_latency(client).map_or(0, |latency| latency.as_nanos() / 100);
     match client.get_mixformat() {
         Ok(mix) => tracing::debug!(
             buffer_frames = buffer,
@@ -184,6 +258,7 @@ fn render_pacing(client: &AudioClient) -> Result<Pacing, AudioError> {
             min_period_hns,
             period_frames = pacing.period,
             target_frames = pacing.target,
+            latency_hns,
             mix_rate_hz = mix.get_samplespersec(),
             mix_channels = mix.get_nchannels(),
             mix_bits = mix.get_bitspersample(),
@@ -195,6 +270,7 @@ fn render_pacing(client: &AudioClient) -> Result<Pacing, AudioError> {
             min_period_hns,
             period_frames = pacing.period,
             target_frames = pacing.target,
+            latency_hns,
             error = %err,
             "salida WASAPI (sin formato de mezcla)"
         ),
@@ -217,7 +293,7 @@ fn run(
         Err(reason) => tracing::debug!(%reason, "wasapi-audio sin tiempo real"),
     }
     let _ = wasapi::initialize_mta();
-    let (client, handle, io) = match open(&endpoint, format) {
+    let (client, handle, mut io, prefilled) = match open(&endpoint, format) {
         Ok(opened) => opened,
         Err(err) => {
             shared.fail(err.clone());
@@ -228,23 +304,34 @@ fn run(
     let _ = ready.send(Ok(()));
     let channels = usize::from(format.channels);
     let bytes_per_frame = 2 * channels;
-    // Búferes reservados una vez: 100 ms o el objetivo de relleno, lo que sea más.
+    // Búferes reservados una vez: 100 ms o el búfer del dispositivo, lo que sea más.
     let frames_max = match &io {
-        Io::Render(_, pacing) => pacing.target.max(SAMPLES_PER_CHANNEL * 10),
+        Io::Render(_, pacing) => pacing.buffer.max(SAMPLES_PER_CHANNEL * 10),
         Io::Capture(_) => SAMPLES_PER_CHANNEL * 10,
     };
     let mut bytes = vec![0u8; frames_max * bytes_per_frame];
     let mut samples = vec![0i16; frames_max * channels];
     let mut pull = pull.map(Pull::new);
+    let clock = DeviceClock::new(&client);
+    let latency = stream_latency(&client);
+    // Tramas escritas al dispositivo desde que arrancó (con el silencio inicial).
+    let mut written = prefilled;
+    // Último evento atendido: lo que pasó desde entonces es lo que pudo llevarse el motor.
+    let mut last_event = Instant::now();
     // El primer evento llega tras consumir el relleno inicial: vacío entonces no es una falta.
     let mut rendered = false;
     while !stop.load(Ordering::Acquire) {
         let event = handle.wait_for_event(100);
-        match &io {
+        match &mut io {
             Io::Capture(capture) => {
                 if event.is_err() {
                     continue;
                 }
+                // QPC ↔ reloj local, para fechar los paquetes con su marca del dispositivo.
+                let reference = clock
+                    .as_ref()
+                    .and_then(DeviceClock::read)
+                    .map(|(_, qpc, at)| (qpc, at));
                 loop {
                     match capture.get_next_packet_size() {
                         Ok(Some(0)) | Ok(None) => break,
@@ -259,12 +346,17 @@ fn run(
                         Ok((frames, info)) => {
                             let len = frames as usize * bytes_per_frame;
                             let silent = info.flags.silent;
+                            let captured_at = reference
+                                .filter(|_| !info.flags.timestamp_error && info.timestamp > 0)
+                                .and_then(|reference| qpc_to_instant(info.timestamp, reference));
                             shared.push(
+                                format,
                                 bytes[..len]
                                     .as_chunks::<2>()
                                     .0
                                     .iter()
                                     .map(|&pair| if silent { 0 } else { i16::from_le_bytes(pair) }),
+                                captured_at,
                             );
                         }
                         Err(err) => {
@@ -286,19 +378,36 @@ fn run(
                     // El motor se lo llevó todo: en su pasada siguiente sonaría silencio.
                     shared.note_underrun();
                 }
-                // Hasta el objetivo, no el búfer entero: llenarlo de más añadiría latencia.
+                // Hasta el objetivo, no el búfer entero: llenarlo de más añadiría latencia. El
+                // tiempo desde el evento anterior le dice al ritmo cuánto se llevó el motor si lo
+                // vació.
+                let now = Instant::now();
+                let elapsed = duration_frames(now - last_event);
+                last_event = now;
                 let frames = pacing
-                    .frames_to_write(padding)
+                    .frames_to_write(padding, elapsed)
                     .min(samples.len() / channels);
                 if frames == 0 {
                     continue;
                 }
                 let wanted = frames * channels;
+                // Cuándo suena lo que se escribe ahora: lo escrito que el dispositivo aún no ha
+                // reproducido, por su reloj; sin reloj, el relleno y la latencia del flujo.
+                let ahead = |written: u64| match clock.as_ref().and_then(DeviceClock::read) {
+                    Some((position, _, at)) => {
+                        let pending = frames_duration(written.saturating_sub(position));
+                        (at + pending).saturating_duration_since(Instant::now())
+                    }
+                    None => {
+                        let queued = client
+                            .get_current_padding()
+                            .map_or(padding as u64, u64::from);
+                        frames_duration(queued) + latency.unwrap_or_default()
+                    }
+                };
                 match &mut pull {
                     Some(pull) => {
-                        let delay = Duration::from_micros(
-                            padding as u64 * 1_000_000 / u64::from(SAMPLE_RATE_HZ),
-                        );
+                        let delay = ahead(written);
                         pull.fill(&mut samples[..wanted], channels, delay);
                     }
                     None => shared.pop_into(&mut samples[..wanted]),
@@ -315,9 +424,11 @@ fn run(
                     shared.fail(backend(err));
                     return;
                 }
+                written += frames as u64;
                 rendered = true;
-                if let Ok(padding) = client.get_current_padding() {
-                    let us = u64::from(padding) * 1_000_000 / u64::from(SAMPLE_RATE_HZ);
+                // Con la cola (`write`): lo que se encole después sonará tras todo lo escrito.
+                if pull.is_none() {
+                    let us = ahead(written).as_micros() as u64;
                     shared.delay_us.store(us, Ordering::Relaxed);
                 }
             }

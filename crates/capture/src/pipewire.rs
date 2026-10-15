@@ -522,16 +522,17 @@ struct StreamState {
     epoch: Instant,
 }
 
-/// Puntero a un `pw_buffer` retenido, para devolverlo por el canal.
+/// Puntero a un `pw_buffer` sacado del flujo, para devolverlo por el canal.
 struct BufferPtr(*mut pw::sys::pw_buffer);
 
-// SAFETY: el puntero solo se usa en el hilo de PipeWire (que es el que lo recibe por el canal y
-// llama a `pw_stream_queue_buffer`); los demás hilos solo lo mueven.
+// SAFETY: el puntero solo se desreferencia en los hilos de PipeWire de este flujo: el de datos lo
+// saca y lee en `process`, y el bucle principal, que lo recibe por el canal, llama a
+// `pw_stream_queue_buffer`; los demás hilos solo lo mueven.
 unsafe impl Send for BufferPtr {}
-// SAFETY: ver `Send`: nadie lo desreferencia fuera del hilo de PipeWire.
+// SAFETY: ver `Send`: nadie lo desreferencia fuera de los hilos de PipeWire.
 unsafe impl Sync for BufferPtr {}
 
-/// Devuelve un búfer DMA-BUF retenido al compositor al soltarse (en el hilo de PipeWire).
+/// Devuelve un búfer DMA-BUF retenido al compositor al soltarse (por el bucle de PipeWire).
 struct BufferRelease {
     buffer: Option<BufferPtr>,
     release: pw::channel::Sender<BufferPtr>,
@@ -550,19 +551,21 @@ impl Drop for BufferRelease {
 /// retenga ([`Dequeued::retain`]).
 struct Dequeued {
     raw: *mut pw::sys::pw_buffer,
-    stream: *mut pw::sys::pw_stream,
+    /// Por donde vuelve a PipeWire al soltarse (`None` si se retuvo).
+    release: Option<pw::channel::Sender<BufferPtr>>,
 }
 
 impl Dequeued {
     /// Saca el siguiente búfer del flujo, si hay.
-    fn next(stream: &pw::stream::Stream) -> Option<Self> {
-        // SAFETY: se llama desde el callback `process` del propio flujo (hilo de PipeWire); el
-        // puntero que devuelve, si no es nulo, es nuestro hasta que se devuelva con
-        // `pw_stream_queue_buffer` (lo hace `Drop` o el canal de `BufferRelease`).
+    fn next(stream: &pw::stream::Stream, release: &pw::channel::Sender<BufferPtr>) -> Option<Self> {
+        // SAFETY: se llama desde el callback `process` del propio flujo (hilo de datos de
+        // PipeWire); el puntero que devuelve, si no es nulo, es nuestro hasta que vuelva al flujo
+        // con `pw_stream_queue_buffer` (por el canal `release`, al soltar `Dequeued` o su
+        // `BufferRelease`).
         let raw = unsafe { stream.dequeue_raw_buffer() };
         (!raw.is_null()).then(|| Self {
             raw,
-            stream: stream.as_raw_ptr(),
+            release: Some(release.clone()),
         })
     }
 
@@ -629,20 +632,23 @@ impl Dequeued {
     }
 
     /// Se queda con el búfer: devuelve el `release` que lo devolverá a PipeWire.
-    fn retain(self, release: &pw::channel::Sender<BufferPtr>) -> BufferRelease {
-        let buffer = BufferPtr(self.raw);
-        std::mem::forget(self);
-        BufferRelease {
-            buffer: Some(buffer),
-            release: release.clone(),
-        }
+    fn retain(mut self) -> Option<BufferRelease> {
+        // Sin `release`, `Drop` ya no lo devuelve: queda a cargo de `BufferRelease`.
+        let release = self.release.take()?;
+        Some(BufferRelease {
+            buffer: Some(BufferPtr(self.raw)),
+            release,
+        })
     }
 }
 
 impl Drop for Dequeued {
     fn drop(&mut self) {
-        // SAFETY: `raw` salió de `dequeue_raw_buffer` de este mismo flujo y no se ha devuelto.
-        unsafe { pw::sys::pw_stream_queue_buffer(self.stream, self.raw) };
+        // Vuelve por el canal: `pw_stream_queue_buffer` se llama siempre desde el bucle principal
+        // (ver `run_stream`). Si el bucle ya no está, el flujo y sus búferes tampoco.
+        if let Some(release) = self.release.take() {
+            let _ = release.send(BufferPtr(self.raw));
+        }
     }
 }
 
@@ -1042,7 +1048,7 @@ fn dmabuf_planes(datas: &[Data]) -> Option<Vec<DmaBufPlane>> {
 /// Callback `process`: saca el búfer, lee el cursor y entrega la imagen (DMA-BUF retenido o copia
 /// a BGRA).
 fn process(stream: &pw::stream::Stream, state: &mut StreamState) {
-    let Some(buffer) = Dequeued::next(stream) else {
+    let Some(buffer) = Dequeued::next(stream, &state.release) else {
         return;
     };
     let captured_at = Instant::now();
@@ -1106,7 +1112,10 @@ fn process(stream: &pw::stream::Stream, state: &mut StreamState) {
             return;
         };
         let modifier = state.format.modifier();
-        let release: crate::Release = Arc::new(buffer.retain(&state.release));
+        let Some(release) = buffer.retain() else {
+            return;
+        };
+        let release: crate::Release = Arc::new(release);
         (
             FramePixels::DmaBuf(Arc::new(DmaBufFrame {
                 planes,
@@ -1281,7 +1290,13 @@ fn run_stream(
             .connect(
                 spa::utils::Direction::Input,
                 Some(node_id),
-                pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+                // `process` en el hilo de datos de PipeWire, que ya tiene prioridad de tiempo
+                // real: el fotograma no espera a que se despierte este hilo. Los búferes vuelven
+                // al flujo siempre desde el bucle principal (canal `release`): en el hilo de datos
+                // solo se sacan, y la cola de devueltos de `pw_stream` es de un solo productor.
+                pw::stream::StreamFlags::AUTOCONNECT
+                    | pw::stream::StreamFlags::MAP_BUFFERS
+                    | pw::stream::StreamFlags::RT_PROCESS,
                 &mut pods,
             )
             .map_err(backend)?;
@@ -1292,9 +1307,10 @@ fn run_stream(
         // Se suelta antes que `stream` (orden inverso de declaración): no llega ningún búfer a
         // un flujo ya destruido.
         let _release = release_rx.attach(main_loop.loop_(), move |buffer: BufferPtr| {
-            // SAFETY: `buffer` es un `pw_buffer` retenido de este flujo (ver `Dequeued::retain`)
-            // que vuelve a él en su propio hilo; el flujo sigue vivo mientras este receptor esté
-            // enganchado al bucle.
+            // SAFETY: `buffer` es un `pw_buffer` que `process` sacó de este flujo y aún no volvió
+            // (ver `Dequeued`); vuelve siempre desde este bucle, el único que lo devuelve, así que
+            // la cola de devueltos tiene un solo productor; el flujo sigue vivo mientras este
+            // receptor esté enganchado al bucle (se desconecta antes de soltarlo).
             unsafe { pw::sys::pw_stream_queue_buffer(raw_stream, buffer.0) };
         });
         let _ = ready.send(Ok(()));

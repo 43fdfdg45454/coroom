@@ -6,7 +6,9 @@
 //! su proceso). La mezcla:
 //!
 //! - **Lleva su propio reloj** de 10 ms: en cada trama toma lo que haya de cada captura sin
-//!   esperar (una aplicación en silencio no entrega nada) y suma con el [`Mixer`].
+//!   esperar (una aplicación en silencio no entrega nada) y suma con el [`Mixer`]. Detrás de lo
+//!   que toma no deja más de una trama (10 ms) en cola por captura, y la trama lleva la hora de
+//!   captura real de lo que mezcla (la del dispositivo para ese búfer).
 //! - **Sigue a las aplicaciones**: un hilo (`audio-apps`) vuelve a mirar qué suena cada
 //!   [`RESCAN`] y abre o cierra capturas según el [`AppFilter`]. Con [`AppFilter::AllExcept`],
 //!   una aplicación que empieza a sonar después entra sola.
@@ -304,10 +306,14 @@ impl AudioSource for AppMixSource {
         self.next_tick = Some(tick + FRAME_DURATION);
         let needed = self.format.samples_per_frame();
         self.mixer.begin();
+        // La hora de la trama es la de captura de lo que se mezcla (la más antigua, si hay varias
+        // aplicaciones), que da el dispositivo para cada búfer; nunca «ahora menos algo».
+        let mut captured_at: Option<Instant> = None;
         {
             let taps = self.taps.lock().unwrap_or_else(PoisonError::into_inner);
             for (index, tap) in taps.values().enumerate() {
-                if tap.shared.try_take(self.format, &mut self.scratch) {
+                if let Some(at) = tap.shared.try_take(self.format, &mut self.scratch) {
+                    captured_at = Some(captured_at.map_or(at, |earliest| earliest.min(at)));
                     self.mixer.add(
                         u32::try_from(index).unwrap_or(u32::MAX),
                         &self.scratch,
@@ -323,9 +329,8 @@ impl AudioSource for AppMixSource {
         }
         Ok(Captured {
             samples: needed,
-            captured_at: Instant::now()
-                .checked_sub(FRAME_DURATION)
-                .unwrap_or_else(Instant::now),
+            // Sin ninguna aplicación sonando, el silencio lleva la hora del reloj de la mezcla.
+            captured_at: captured_at.unwrap_or(tick),
             channels: self.format.channels,
         })
     }
@@ -451,14 +456,18 @@ mod tests {
         source.start(&AudioConfig::game()).expect("start");
         assert_eq!(source.taps.lock().unwrap().len(), 1, "voz no se abre");
         let loud = fake.loud.lock().unwrap().clone().expect("juego abierto");
-        loud.push(std::iter::repeat_n(
-            1000,
-            AudioFormat::GAME.samples_per_frame(),
-        ));
+        // El dispositivo fecha el búfer hace 30 ms: es la hora que lleva la trama mezclada.
+        let device = Instant::now() - Duration::from_millis(30);
+        loud.push(
+            AudioFormat::GAME,
+            std::iter::repeat_n(1000, AudioFormat::GAME.samples_per_frame()),
+            Some(device),
+        );
         let mut frame = Vec::new();
         let started = Instant::now();
         let first = source.read(&mut frame).expect("trama");
         assert_eq!(first.samples, AudioFormat::GAME.samples_per_frame());
+        assert_eq!(first.captured_at, device, "la hora real de captura");
         assert!(frame.iter().all(|&s| s > 0), "suena el juego");
         // Sin nada en el anillo: silencio a su ritmo, sin esperar al backend.
         source.read(&mut frame).expect("trama");

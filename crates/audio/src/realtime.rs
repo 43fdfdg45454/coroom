@@ -1,10 +1,12 @@
 //! Prioridad de tiempo real para los hilos de audio de coroom.
 //!
-//! Los hilos de los dispositivos ya la tienen (el de datos de PipeWire, por su `module-rt`); estos
-//! son los nuestros: recepción y descifrado del audio, captura y codificación, y la reproducción
-//! con cola de WASAPI. Con la CPU cargada por un juego, un hilo normal puede esperar su turno más
-//! de una trama de audio (10 ms): eso es jitter que el buffer tiene que absorber con más cola, o un
-//! hueco que se oye.
+//! Los hilos de los dispositivos ya la tienen: el de datos de PipeWire, por su `module-rt`, y ahí
+//! corre el callback de cada flujo de coroom (se conectan con `PW_STREAM_FLAG_RT_PROCESS`, ver
+//! el módulo `pipewire`), y el de cada flujo WASAPI, que pide MMCSS con esta función. El resto son
+//! los nuestros: recepción y descifrado del audio, captura y codificación, y la reproducción con
+//! cola. Con la CPU cargada por un juego, un hilo normal puede esperar su turno más de una trama
+//! de audio (10 ms): eso es jitter que el buffer tiene que absorber con más cola, o un hueco que
+//! se oye.
 //!
 //! - **Linux**: `SCHED_FIFO` directo si el límite `RLIMIT_RTPRIO` lo permite; si no, a través del
 //!   portal `org.freedesktop.portal.Realtime` (dentro de Flatpak) o de RealtimeKit
