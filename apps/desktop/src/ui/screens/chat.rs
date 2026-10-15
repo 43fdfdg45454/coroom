@@ -1145,6 +1145,9 @@ fn system_row<'a>(look: Look, spans: &'a [(String, bool)], clock: &'a str) -> El
     .into()
 }
 
+/// Relleno vertical de la caja de texto del chat.
+const EDITOR_PADDING_Y: f32 = 8.0;
+
 fn composer(app: &App, look: Look) -> Element<'_, Message> {
     let chat = &app.chat;
     let ready = chat.ready;
@@ -1157,9 +1160,11 @@ fn composer(app: &App, look: Look) -> Element<'_, Message> {
         })
         .key_binding(key_binding)
         .height(Length::Shrink)
-        .min_height(size::CONTROL)
+        // `min_height` acota el texto, sin el relleno: con una línea la caja mide lo mismo que el
+        // botón de enviar (`CONTROL`), y crece a partir de ahí.
+        .min_height(size::CONTROL - 2.0 * EDITOR_PADDING_Y)
         .max_height(120.0)
-        .padding(Padding::from([8.0, 10.0]))
+        .padding(Padding::from([EDITOR_PADDING_Y, 10.0]))
         .size(type_size::BODY)
         .wrapping(Wrapping::WordOrGlyph)
         .class(match look.surface {

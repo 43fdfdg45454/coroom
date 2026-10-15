@@ -571,9 +571,9 @@ pub fn with_toasts<'a, M: 'a>(
     toasts: Vec<Element<'a, M>>,
     offset: f32,
 ) -> Element<'a, M> {
-    if toasts.is_empty() {
-        return base.into();
-    }
+    // Siempre la misma forma (pila de dos capas), con o sin toasts: si la raíz cambiara de tipo,
+    // iced tiraría el estado de toda la interfaz (el desplazamiento de la página, el foco) cada
+    // vez que aparece o se va un toast.
     let stacked = Column::with_children(toasts)
         .spacing(gap::XS)
         .align_x(Alignment::Center);
@@ -626,22 +626,20 @@ pub fn modal<'a, M: Clone + 'a>(
     dialog: Option<Element<'a, M>>,
     on_dismiss: M,
 ) -> Element<'a, M> {
-    let base = base.into();
-    let Some(dialog) = dialog else {
-        return base;
-    };
-    stack![
-        base,
-        opaque(
+    // Misma forma con o sin diálogo (ver [`with_toasts`]): abrir o cerrar el diagnóstico no debe
+    // devolver la página al principio.
+    let overlay: Element<'a, M> = match dialog {
+        Some(dialog) => opaque(
             mouse_area(
                 center(opaque(dialog))
                     .padding(gap::L)
-                    .class(ContainerClass::Scrim)
+                    .class(ContainerClass::Scrim),
             )
-            .on_press(on_dismiss)
-        )
-    ]
-    .into()
+            .on_press(on_dismiss),
+        ),
+        None => Space::new().width(0).height(0).into(),
+    };
+    stack![base.into(), overlay].into()
 }
 
 // --- Progreso y estados ---------------------------------------------------------------------------

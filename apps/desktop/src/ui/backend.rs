@@ -751,7 +751,10 @@ impl Backend {
             "abriendo la sala"
         );
         let slot = Arc::clone(&self.host);
-        let preview = self.feed(None);
+        // La vista previa se pinta dentro de la página (un recuadro entre tarjetas opacas), así
+        // que no va por el compositor, que pone el vídeo debajo de toda la interfaz y aquí
+        // quedaría tapado (se veía negra): sus I420 se suben como capa del propio widget.
+        let preview = VideoFeed::new(None, Arc::clone(&self.wake), None);
         let on_panic: fn(String) -> Event = |reason| Event::HostEnded(Some(reason));
         self.spawn_or("sala", on_panic, move |notify| {
             let prepared =

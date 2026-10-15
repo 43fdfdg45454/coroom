@@ -141,6 +141,16 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **La vista previa de la sala se veía negra** en el equipo del anfitrión: iba por el compositor,
+  que pone el vídeo debajo de toda la interfaz, y la página opaca la tapaba. Ahora se sube como
+  capa del propio recuadro.
+- **La página de Compartir volvía al principio** al tocar una opción (4:4:4, HDR, un perfil) si en
+  ese momento aparecía o se iba un toast, y también al abrir o cerrar el menú de la cuenta o el
+  diagnóstico: la raíz de la interfaz cambiaba de forma e iced tiraba el desplazamiento. Ahora la
+  forma es siempre la misma.
+- **Cabecera pegada a la barra de título** del sistema (KDE): una línea la separa.
+- En la sala del anfitrión, **aire entre la barra de desplazamiento y el chat**, y el **botón de
+  enviar** del chat mide lo mismo que la caja de texto con una línea.
 - **El vídeo del invitado en ventana real se quedaba colgado**: el compositor tomaba su candado
   mientras iced presentaba la interfaz y, dentro de esa presentación, el primitivo de vídeo volvía
   a tomarlo desde el mismo hilo. Ahora el área del vídeo solo se anota y la interfaz se dibuja en
@@ -417,6 +427,9 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Eliminado
 
+- El modo **«Juego»** de Compartir (una ventana con el audio solo de su aplicación): confundía
+  con «Ventana», y el audio ya se elige aplicación por aplicación en «Audio que se envía». Quedan
+  Pantalla y Ventana.
 - El bitrate máximo «Sin límite» y los valores fijos: el único modo es «Auto», con o sin
   tope.
 - La pantalla «Vídeo» de Ajustes: el códec, el bitrate y la calidad se eligen en Compartir y en

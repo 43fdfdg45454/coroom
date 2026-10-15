@@ -1361,12 +1361,13 @@ impl App {
             Page::Host => host::view(self),
             Page::Settings => settings_screen::view(self),
         };
-        let shell = column![self.headerbar(), page].height(Length::Fill);
-        if !self.account_menu {
-            return shell.into();
-        }
-        iced_widget::stack![
-            shell,
+        // Una línea bajo la cabecera: con la barra de título del sistema (KDE) encima, del mismo
+        // gris, las dos se leían como una sola barra gruesa con el título pegado arriba.
+        let shell =
+            column![self.headerbar(), iced_widget::rule::horizontal(1), page].height(Length::Fill);
+        // Siempre una pila de dos capas, con el menú o sin él: si la raíz cambiara de tipo, iced
+        // tiraría el estado de la página (su desplazamiento, el foco) al abrir o cerrar el menú.
+        let menu: Element<'_, Message> = if self.account_menu {
             iced_widget::opaque(
                 iced_widget::mouse_area(
                     container(iced_widget::opaque(self.account_menu_view()))
@@ -1379,12 +1380,14 @@ impl App {
                             right: 12.0,
                             bottom: 0.0,
                             left: 0.0,
-                        })
+                        }),
                 )
-                .on_press(Message::ToggleAccountMenu)
+                .on_press(Message::ToggleAccountMenu),
             )
-        ]
-        .into()
+        } else {
+            iced_widget::Space::new().width(0).height(0).into()
+        };
+        iced_widget::stack![shell, menu].into()
     }
 
     /// Título de la página para la cabecera (`None` en Inicio: va la marca).
