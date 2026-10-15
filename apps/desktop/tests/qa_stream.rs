@@ -8,7 +8,10 @@
 //!   expulsar, reconectar, cerrar la sala con el invitado dentro y pérdida de paquetes;
 //! - `qa_more`: tamaño impar al abrir, un invitado que solo decodifica H.264 junto a otro con
 //!   todo (el anfitrión baja a H.264 con el codificador calibrado) y 4:4:4;
-//! - `qa_server_dies`: el servidor se cae con la sesión en marcha (imprime lo que pasa).
+//! - `qa_server_dies`: el servidor se cae con la sesión en marcha (imprime lo que pasa);
+//! - `qa_freezes`: 3 minutos a 1080p60 con red limpia y otros 3 con 1 % de pérdida, midiendo
+//!   cada hueco entre fotogramas presentados y la latencia por segundo (tirones, congelados y
+//!   latencia que se acumula); `QA_MINUTES` cambia la duración.
 //!
 //! Necesitan GPU y tardan minutos: `#[ignore]`. Se lanzan con
 //! `cargo test --release -p coroom --test qa_stream -- --ignored --nocapture --test-threads=1`.
@@ -781,4 +784,154 @@ fn qa_server_dies() {
     );
     viewer.close();
     host.close();
+}
+
+/// Tirones y congelados en una sesión larga: 3 minutos a 1080p60 con los códecs reales (y
+/// otros 3 con 1 % de pérdida y ±5 ms de jitter, como una wifi normal). Mide cada hueco entre dos
+/// fotogramas presentados y la latencia de cada uno por segundo: un congelado se ve como un hueco
+/// largo; una latencia que se acumula, como segundos con el máximo disparado.
+#[test]
+#[ignore = "necesita GPU; QA manual, 6 minutos"]
+fn qa_freezes() {
+    use coroom_session::latency::Stage;
+    let _serial = serial();
+    let minutes: u64 = std::env::var("QA_MINUTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3);
+    let server = TestServer::start();
+    for lossy in [false, true] {
+        let label = if lossy {
+            "1 % de pérdida, 5 ± 5 ms"
+        } else {
+            "red limpia"
+        };
+        let mut host_config = server.config();
+        let proxy = if lossy {
+            let port = std::net::UdpSocket::bind("127.0.0.1:0")
+                .and_then(|socket| socket.local_addr())
+                .expect("puerto libre")
+                .port();
+            let host_addr: std::net::SocketAddr = (std::net::Ipv4Addr::LOCALHOST, port).into();
+            let proxy = server
+                .runtime
+                .block_on(UdpLossy::start(
+                    host_addr,
+                    LossyConfig {
+                        loss: 0.01,
+                        delay: Duration::from_millis(5),
+                        jitter: Duration::from_millis(5),
+                        rate_bps: None,
+                        queue_limit: Duration::from_millis(200),
+                        seed: 3,
+                        outages: None,
+                    },
+                ))
+                .expect("proxy");
+            host_config.bind = Some(host_addr);
+            host_config.advertise_candidates = Some(vec![proxy.addr()]);
+            Some(proxy)
+        } else {
+            None
+        };
+        let mut host = host(host_config, 1920, 1080, 60, EncoderSet::probe());
+        let code = room_code(&host).expect("sala");
+        let mut guest_config = server.config();
+        if lossy {
+            guest_config.advertise_candidates = Some(Vec::new());
+        }
+        let seen = Seen::default();
+        let mut viewer = guest(guest_config, &code, None, DecoderSet::probe(), &seen);
+        advance(&host, &viewer, &seen, 60, None, Duration::from_secs(20)).expect("arranque");
+        let started = Instant::now();
+        // El registro guarda los últimos 4096 fotogramas (~68 s a 60 fps): se lee cada 20 s y se
+        // acumula por fotograma.
+        let mut collected: std::collections::HashMap<u64, (Instant, Duration)> =
+            std::collections::HashMap::new();
+        let mut collect = |viewer: &RemoteSession| {
+            for timeline in viewer.ledger().timelines() {
+                if let (Some(presented), Some(captured)) =
+                    (timeline.at(Stage::Presented), timeline.at(Stage::Captured))
+                {
+                    collected.insert(
+                        timeline.frame_id,
+                        (presented, presented.saturating_duration_since(captured)),
+                    );
+                }
+            }
+        };
+        let deadline = started + Duration::from_secs(minutes * 60);
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_secs(20).min(deadline - Instant::now()));
+            collect(&viewer);
+        }
+        let ended = Instant::now();
+        let alive = !viewer.is_finished() && !host.is_finished();
+        let mut frames: Vec<(Instant, Duration)> = collected
+            .into_values()
+            .filter(|(presented, _)| *presented >= started && *presented <= ended)
+            .collect();
+        frames.sort_by_key(|(presented, _)| *presented);
+        let gaps: Vec<Duration> = frames
+            .windows(2)
+            .map(|pair| pair[1].0 - pair[0].0)
+            .collect();
+        let over = |limit: u64| {
+            gaps.iter()
+                .filter(|gap| **gap > Duration::from_millis(limit))
+                .count()
+        };
+        let max_gap = gaps.iter().max().copied().unwrap_or_default();
+        let mut latencies: Vec<Duration> = frames.iter().map(|(_, latency)| *latency).collect();
+        latencies.sort();
+        let pct = |p: f64| {
+            latencies
+                .get(((latencies.len().saturating_sub(1)) as f64 * p) as usize)
+                .copied()
+                .unwrap_or_default()
+        };
+        // Segundos en los que la latencia máxima pasó de 50 ms y de 100 ms (acumulación).
+        let mut per_second: std::collections::BTreeMap<u64, Duration> =
+            std::collections::BTreeMap::new();
+        for (presented, latency) in &frames {
+            let second = (*presented - started).as_secs();
+            let slot = per_second.entry(second).or_default();
+            *slot = (*slot).max(*latency);
+        }
+        let bad50 = per_second
+            .values()
+            .filter(|max| **max > Duration::from_millis(50))
+            .count();
+        let bad100 = per_second
+            .values()
+            .filter(|max| **max > Duration::from_millis(100))
+            .count();
+        let worst: Vec<String> = {
+            let mut list: Vec<(&u64, &Duration)> = per_second.iter().collect();
+            list.sort_by_key(|(_, max)| std::cmp::Reverse(**max));
+            list.iter()
+                .take(5)
+                .map(|(second, max)| format!("s{second}: {:.0} ms", max.as_secs_f64() * 1000.0))
+                .collect()
+        };
+        println!(
+            "QA {label}, {minutes} min: {} fotogramas ({:.1} fps) · huecos > 50 ms: {} · > 100 ms: {} · > 500 ms: {} · máximo {:.0} ms · latencia p50 {:.1} / p95 {:.1} / p99 {:.1} / máx {:.1} ms · segundos con máx > 50 ms: {bad50} · > 100 ms: {bad100} de {} · peores: {} · sigue viva: {alive}",
+            frames.len(),
+            frames.len() as f64 / (ended - started).as_secs_f64(),
+            over(50),
+            over(100),
+            over(500),
+            max_gap.as_secs_f64() * 1000.0,
+            pct(0.5).as_secs_f64() * 1000.0,
+            pct(0.95).as_secs_f64() * 1000.0,
+            pct(0.99).as_secs_f64() * 1000.0,
+            latencies.last().copied().unwrap_or_default().as_secs_f64() * 1000.0,
+            per_second.len(),
+            worst.join(", ")
+        );
+        println!("QA   {}", line(&viewer.summary()));
+        viewer.close();
+        host.close();
+        drop(proxy);
+    }
 }
