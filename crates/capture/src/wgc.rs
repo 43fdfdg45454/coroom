@@ -547,6 +547,28 @@ fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext), CaptureError> 
     }
 }
 
+/// El dispositivo D3D11 del proceso, uno para todas las capturas. El codificador importa las
+/// texturas sin copias solo si son de su mismo dispositivo, y lo toma de la primera captura: si
+/// cada captura creara el suyo, cambiar de fuente con la sala abierta rompería la importación
+/// («la textura es de otro dispositivo D3D11») y cerraría la sala. Si el dispositivo se perdió
+/// (controlador reiniciado), se crea otro.
+fn shared_device() -> Result<(ID3D11Device, ID3D11DeviceContext), CaptureError> {
+    static SHARED: Mutex<Option<(ID3D11Device, ID3D11DeviceContext)>> = Mutex::new(None);
+    let mut shared = SHARED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((device, context)) = shared.as_ref() {
+        // SAFETY: `GetDeviceRemovedReason` solo consulta el estado del dispositivo.
+        if unsafe { device.GetDeviceRemovedReason() }.is_ok() {
+            return Ok((device.clone(), context.clone()));
+        }
+        tracing::warn!("el dispositivo D3D11 de la captura se perdió; se crea otro");
+    }
+    let created = create_device()?;
+    *shared = Some(created.clone());
+    Ok(created)
+}
+
 fn winrt_device(device: &ID3D11Device) -> Result<IDirect3DDevice, CaptureError> {
     let dxgi: IDXGIDevice = device.cast().map_err(|err| backend("IDXGIDevice", err))?;
     // SAFETY: `dxgi` es un `IDXGIDevice` válido obtenido del dispositivo D3D11 recién creado.
@@ -1014,7 +1036,7 @@ impl WgcCapturer {
         window: Option<u64>,
         watch: bool,
     ) -> Result<(), CaptureError> {
-        let (device, context) = create_device()?;
+        let (device, context) = shared_device()?;
         let d3d_device = winrt_device(&device)?;
         let size = item
             .Size()

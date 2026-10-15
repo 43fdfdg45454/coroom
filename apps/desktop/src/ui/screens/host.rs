@@ -813,7 +813,7 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                         Tone::Info,
                         t!(
                             "pantalla-host-video-de-la-sala-cambiado",
-                            valor = settings_screen::bitrate_phrase(kbps, false)
+                            valor = settings_screen::bitrate_phrase(kbps)
                         ),
                     ),
                     Err(err) => app.toast(
@@ -1056,7 +1056,7 @@ fn setup(app: &App) -> Element<'_, Message> {
                 width = width,
                 height = height,
                 fps = video.fps,
-                valor = settings_screen::bitrate_phrase(video.max_bitrate_kbps, true),
+                valor = settings_screen::bitrate_phrase(video.max_bitrate_kbps),
                 codec = codec
             )),
             ui::button_with(

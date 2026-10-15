@@ -9,7 +9,7 @@ use coroom_session::codec::gpu::{GpuInput, zero_copy_disabled};
 use coroom_session::codec::select::gpu_input_for;
 use coroom_session::codec::{Backend, Capabilities};
 use coroom_transport::crypto::{FileStore, KeyringStore};
-use coroom_transport::nat::{Mapper, default_gateway};
+use coroom_transport::nat::{Mapper, default_route};
 use coroom_transport::proto::PROTOCOL_VERSION;
 
 /// Las líneas del diagnóstico (tarda unos segundos: sondea los códecs de verdad).
@@ -140,8 +140,14 @@ pub fn report() -> Result<Vec<String>, String> {
 /// Pide al router que abra un puerto UDP de prueba y lo cierra: dice si hay UPnP, NAT-PMP o PCP y
 /// qué dirección externa da (la WAN del router; si empieza por 100.64-100.127, hay CGNAT).
 fn router_report() -> Vec<String> {
-    let gateway = match default_gateway() {
-        Ok(ip) => format!("puerta de enlace: {ip}"),
+    let gateway = match default_route() {
+        Ok(route) => format!(
+            "puerta de enlace: {} (MTU del adaptador: {})",
+            route.gateway,
+            route
+                .mtu
+                .map_or_else(|| "desconocida".to_owned(), |mtu| mtu.to_string())
+        ),
         Err(err) => return vec![format!("puerta de enlace: no se encontró ({err})")],
     };
     let runtime = match tokio::runtime::Builder::new_current_thread()

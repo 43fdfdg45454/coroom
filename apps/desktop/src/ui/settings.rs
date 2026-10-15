@@ -400,8 +400,8 @@ pub struct Settings {
 /// Valores admitidos de fps.
 pub const FPS_CHOICES: [u32; 3] = [30, 60, 120];
 
-/// Bitrates máximos que se ofrecen (kbit/s). El último es «sin límite»
-/// ([`coroom_session::remote::UNLIMITED_KBPS`]).
+/// Topes del bitrate que se ofrecen (kbit/s). El último es «sin tope»
+/// ([`coroom_session::remote::UNLIMITED_KBPS`]): Auto sube hasta donde la red aguante.
 pub const BITRATE_CHOICES: [u32; 8] = [
     5_000,
     10_000,

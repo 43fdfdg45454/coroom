@@ -269,22 +269,24 @@ pub fn bitrate_choices() -> Vec<Choice<u32>> {
         .collect()
 }
 
-/// Un bitrate máximo dentro de una frase: «80 Mbit/s», «sin límite» o, con `of_bitrate`, «sin
-/// límite de bitrate» (donde no se dice antes que es el bitrate).
-pub fn bitrate_phrase(kbps: u32, of_bitrate: bool) -> String {
+/// El bitrate dentro de una frase: «Auto hasta 80 Mbit/s» o «Auto sin tope». Auto es el único
+/// modo: el control de tasa sube hasta donde la red aguanta y baja antes de que se congele; el
+/// tope solo le pone techo.
+pub fn bitrate_phrase(kbps: u32) -> String {
     if kbps < coroom_session::remote::UNLIMITED_KBPS {
-        stats::kbps(f64::from(kbps))
-    } else if of_bitrate {
-        t!("pantalla-settings-sin-limite-de-bitrate").to_owned()
+        t!(
+            "pantalla-settings-auto-hasta",
+            valor = stats::kbps(f64::from(kbps))
+        )
     } else {
-        t!("pantalla-settings-sin-limite-frase").to_owned()
+        t!("pantalla-settings-auto-sin-tope").to_owned()
     }
 }
 
-/// Cómo se nombra un bitrate máximo en el selector: «80 Mbit/s» o «Sin límite».
+/// Cómo se nombra un tope en el selector: «80 Mbit/s» o «Sin tope».
 pub fn bitrate_label(kbps: u32) -> String {
     if kbps >= coroom_session::remote::UNLIMITED_KBPS {
-        t!("pantalla-settings-sin-limite").to_owned()
+        t!("pantalla-settings-sin-tope").to_owned()
     } else {
         stats::kbps(f64::from(kbps))
     }
@@ -613,9 +615,9 @@ fn video(app: &App) -> Element<'_, Message> {
                     t!("pantalla-settings-bitrate-maximo"),
                     Some(
                         if video.max_bitrate_kbps >= coroom_session::remote::UNLIMITED_KBPS {
-                            t!("pantalla-settings-sin-limite-ayuda")
+                            t!("pantalla-settings-auto-sin-tope-ayuda")
                         } else {
-                            t!("pantalla-settings-el-control-de-tasa-lo-baja")
+                            t!("pantalla-settings-auto-con-tope-ayuda")
                         }
                         .to_owned()
                     ),
@@ -1490,14 +1492,17 @@ mod tests {
     #[test]
     fn unlimited_bitrate_is_named_as_such() {
         let unlimited = coroom_session::remote::UNLIMITED_KBPS;
-        assert_eq!(bitrate_label(unlimited), "Sin límite");
-        assert_eq!(bitrate_phrase(unlimited, false), "sin límite");
-        assert_eq!(bitrate_phrase(unlimited, true), "sin límite de bitrate");
+        assert_eq!(bitrate_label(unlimited), "Sin tope");
+        assert_eq!(bitrate_phrase(unlimited), "Auto sin tope");
+        assert_eq!(
+            bitrate_phrase(80_000),
+            format!("Auto hasta {}", stats::kbps(80_000.0))
+        );
         assert_eq!(bitrate_label(80_000), stats::kbps(80_000.0));
         assert_eq!(
             bitrate_choices().last().map(|c| c.value),
             Some(unlimited),
-            "«Sin límite» es la última opción"
+            "«Sin tope» es la última opción"
         );
     }
 

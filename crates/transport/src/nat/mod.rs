@@ -21,7 +21,7 @@ mod gateway;
 mod pmp;
 mod upnp;
 
-pub use gateway::default_gateway;
+pub use gateway::{DefaultRoute, default_gateway, default_route};
 pub use pmp::{
     NATPMP_EXTERNAL_REQUEST, NatPmpResponse, PCP_OP_MAP, PCP_VERSION, PcpMapResponse,
     natpmp_map_request, parse_natpmp, parse_pcp_map, pcp_map_request,

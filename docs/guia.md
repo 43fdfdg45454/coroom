@@ -123,8 +123,9 @@ Las letras de `Ctrl+Alt` se cambian en Ajustes → Entrada (no pueden coincidir 
 
 ## Ajustes
 
-- **Vídeo**: resolución, fps (30, 60 o 120), bitrate máximo (o **Sin límite**, que sube hasta
-  llenar el enlace: para una red local o una conexión rápida), códec preferido, 4:4:4 y HDR (solo si
+- **Vídeo**: resolución, fps (30, 60 o 120), tope del bitrate (el bitrate siempre es **Auto**: sube
+  hasta donde la red aguanta y baja antes de que se congele; el tope solo le pone techo, útil en
+  redes que no avisan de la congestión), códec preferido, 4:4:4 y HDR (solo si
   el anfitrión, el equipo y todos los invitados lo admiten; si no, Ajustes te dice por qué).
   En **Avanzado**, el codificador del anfitrión y el decodificador del invitado: déjalos en
   Automático salvo que el vídeo se vea gris o corrupto o la aplicación se cierre al compartir. En

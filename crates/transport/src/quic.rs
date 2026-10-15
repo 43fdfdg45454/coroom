@@ -77,6 +77,48 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 /// `max_datagram_size` que quede ([`PeerConnection::max_packet`], 1162 bytes).
 pub const INITIAL_MTU: u16 = 1252;
 
+/// Techo por defecto de `quinn` para el sondeo de MTU: 1452 bytes de carga UDP.
+pub const DEFAULT_MTU_UPPER_BOUND: u16 = 1452;
+
+/// Cabeceras de IPv4 (20) y UDP (8) por fuera de la carga que sondea `quinn`, con 20 más de
+/// margen por si el adaptador cuenta un túnel o IPv6 (40) que la tabla de rutas no enseña.
+const MTU_HEADERS: u32 = 48;
+
+/// Techo del sondeo de MTU de `quinn` para un adaptador con `adapter_mtu` bytes de MTU (lo que
+/// dice la ruta por defecto): la carga UDP que cabe sin fragmentar, entre [`INITIAL_MTU`] y
+/// [`DEFAULT_MTU_UPPER_BOUND`].
+///
+/// Sin este techo, `quinn` sondea hasta 1452 bytes y en Windows cada sonda que no cabe en el
+/// adaptador (un túnel o un PPPoE de 1492, por ejemplo) hace fallar `sendto` con `WSAEMSGSIZE`
+/// (10040), que `quinn` registra como error de envío de la conexión en lugar de como una sonda
+/// perdida. Con el techo, la sonda nunca supera el adaptador.
+pub fn mtu_upper_bound(adapter_mtu: u32) -> u16 {
+    let payload = adapter_mtu.saturating_sub(MTU_HEADERS);
+    u16::try_from(payload)
+        .unwrap_or(DEFAULT_MTU_UPPER_BOUND)
+        .clamp(INITIAL_MTU, DEFAULT_MTU_UPPER_BOUND)
+}
+
+/// Techo del sondeo de MTU para este equipo: el de [`mtu_upper_bound`] con el MTU del adaptador
+/// de la ruta por defecto, o ninguno (el de `quinn`) si la tabla de rutas no lo dice.
+fn local_mtu_upper_bound() -> Option<u16> {
+    let route = match crate::nat::default_route() {
+        Ok(route) => route,
+        Err(err) => {
+            tracing::debug!(error = %err, "sin ruta por defecto: sondeo de MTU con el techo de quinn");
+            return None;
+        }
+    };
+    let mtu = route.mtu?;
+    let bound = mtu_upper_bound(mtu);
+    tracing::info!(
+        adapter_mtu = mtu,
+        upper_bound = bound,
+        "techo del sondeo de MTU según el adaptador de la ruta por defecto"
+    );
+    Some(bound)
+}
+
 /// Espera máxima del saludo de un stream de control.
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -188,14 +230,21 @@ pub fn transport_config(
 }
 
 /// Configuración de transporte de las conexiones del `Endpoint`: la de [`transport_config`] con la
-/// cola de datagramas por enviar de [`datagram_send_buffer`] para `max_kbps`.
+/// cola de datagramas por enviar de [`datagram_send_buffer`] para `max_kbps` y, si se conoce, el
+/// techo del sondeo de MTU del adaptador ([`mtu_upper_bound`]).
 fn endpoint_transport_config(
     shared: &Arc<CongestionShared>,
     congestion: Congestion,
     max_kbps: u32,
+    mtu_upper_bound: Option<u16>,
 ) -> quinn::TransportConfig {
     let mut config = transport_config(shared, congestion);
     config.datagram_send_buffer_size(datagram_send_buffer(max_kbps));
+    if let Some(bound) = mtu_upper_bound {
+        let mut discovery = quinn::MtuDiscoveryConfig::default();
+        discovery.upper_bound(bound);
+        config.mtu_discovery_config(Some(discovery));
+    }
     config
 }
 
@@ -262,6 +311,7 @@ struct EndpointInner {
     key: IdentityKey,
     admitted: Admitted,
     options: EndpointOptions,
+    mtu_upper_bound: Option<u16>,
     dispatch: Arc<Mutex<Dispatch>>,
     unclaimed: Arc<Notify>,
     accept_task: JoinHandle<()>,
@@ -364,7 +414,8 @@ impl Endpoint {
             TransportError::Protocol("el Endpoint necesita un runtime de tokio".to_owned())
         })?;
         let socket = bind_socket(addr)?;
-        let server_config = server_config(&crypto, options);
+        let mtu_upper_bound = local_mtu_upper_bound();
+        let server_config = server_config(&crypto, options, mtu_upper_bound);
         let quinn = quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
             Some(server_config.0),
@@ -378,6 +429,7 @@ impl Endpoint {
             quinn.clone(),
             crypto,
             options,
+            mtu_upper_bound,
             Arc::clone(&dispatch),
             Arc::clone(&unclaimed),
         ));
@@ -387,6 +439,7 @@ impl Endpoint {
                 key,
                 admitted,
                 options,
+                mtu_upper_bound,
                 dispatch,
                 unclaimed,
                 accept_task,
@@ -442,6 +495,7 @@ impl Endpoint {
             &shared,
             self.inner.options.congestion,
             self.inner.options.max_kbps(),
+            self.inner.mtu_upper_bound,
         )));
         let connection = self
             .inner
@@ -486,6 +540,7 @@ impl Endpoint {
             &shared,
             congestion,
             self.inner.options.max_kbps(),
+            self.inner.mtu_upper_bound,
         )));
         let connection = self
             .inner
@@ -561,6 +616,7 @@ struct ServerConfigWithShared(quinn::ServerConfig, Arc<CongestionShared>);
 fn server_config(
     crypto: &Arc<QuicServerConfig>,
     options: EndpointOptions,
+    mtu_upper_bound: Option<u16>,
 ) -> ServerConfigWithShared {
     let shared = CongestionShared::new(options.initial_target_kbps);
     let mut config = quinn::ServerConfig::with_crypto(Arc::clone(crypto) as _);
@@ -568,6 +624,7 @@ fn server_config(
         &shared,
         options.congestion,
         options.max_kbps(),
+        mtu_upper_bound,
     )));
     config.migration(true);
     ServerConfigWithShared(config, shared)
@@ -577,6 +634,7 @@ async fn accept_loop(
     quinn: quinn::Endpoint,
     crypto: Arc<QuicServerConfig>,
     options: EndpointOptions,
+    mtu_upper_bound: Option<u16>,
     dispatch: Arc<Mutex<Dispatch>>,
     unclaimed: Arc<Notify>,
 ) {
@@ -587,7 +645,8 @@ async fn accept_loop(
         tokio::spawn(async move {
             let remote = incoming.remote_address();
             // Un controlador de congestión con estado propio por conexión.
-            let ServerConfigWithShared(config, shared) = server_config(&crypto, options);
+            let ServerConfigWithShared(config, shared) =
+                server_config(&crypto, options, mtu_upper_bound);
             let connection = match incoming.accept_with(Arc::new(config)) {
                 Ok(connecting) => match connecting.await {
                     Ok(connection) => connection,
@@ -1171,6 +1230,21 @@ impl ControlReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_mtu_probe_never_exceeds_the_adapter_nor_the_quinn_default() {
+        // Ethernet normal: el techo de quinn.
+        assert_eq!(mtu_upper_bound(1500), DEFAULT_MTU_UPPER_BOUND);
+        // PPPoE de 1492: 1444 de carga UDP.
+        assert_eq!(mtu_upper_bound(1492), 1444);
+        // Un túnel de 1400: 1352.
+        assert_eq!(mtu_upper_bound(1400), 1352);
+        // Por debajo del MTU inicial no se baja de él (el suelo lo pone `min_mtu`).
+        assert_eq!(mtu_upper_bound(1280), INITIAL_MTU);
+        assert_eq!(mtu_upper_bound(0), INITIAL_MTU);
+        // Un MTU enorme (loopback) tampoco pasa del techo de quinn.
+        assert_eq!(mtu_upper_bound(65_536), DEFAULT_MTU_UPPER_BOUND);
+    }
 
     #[test]
     fn the_blocking_reader_waits_times_out_and_sees_the_close() {

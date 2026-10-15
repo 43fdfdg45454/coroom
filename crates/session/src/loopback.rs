@@ -1096,7 +1096,7 @@ pub(crate) fn encode_loop(
         if let Some(control) = control {
             let target = control.bitrate_kbps.load(Ordering::Acquire);
             if let Some(kbps) = gate.decide(target, encoder.live_bitrate(), Instant::now()) {
-                // Un bitrate que el codificador no acepta (con «sin límite», uno por encima de lo
+                // Un bitrate que el codificador no acepta (con «Auto sin tope», uno por encima de lo
                 // que admite su driver) no corta la sesión: sigue con el que tenía.
                 match encoder.set_bitrate(kbps) {
                     Ok(()) => bump(&shared.counters.bitrate_changes),

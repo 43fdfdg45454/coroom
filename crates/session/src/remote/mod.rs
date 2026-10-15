@@ -137,15 +137,15 @@ pub const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 /// Espera antes del primer reintento; se duplica en cada uno ([`reconnect_delay`]).
 pub const RECONNECT_BASE_DELAY: Duration = Duration::from_millis(500);
 
-/// Bitrate máximo «sin límite» (kbit/s): el control de tasa sube mientras el camino no haga cola,
-/// hasta llenar el enlace. Es un techo técnico, no uno que se espere alcanzar: un codificador
-/// por hardware a 4K60 casi sin pérdidas se queda por debajo.
+/// Tope del bitrate «Auto sin tope» (kbit/s): el control de tasa sube mientras el camino no haga
+/// cola, hasta llenar el enlace. Es un techo técnico, no uno que se espere alcanzar: un
+/// codificador por hardware a 4K60 casi sin pérdidas se queda por debajo.
 pub const UNLIMITED_KBPS: u32 = 500_000;
 
 /// Bitrate con el que arranca el control de tasa para un máximo `max_kbps`: 8 Mbit/s (la
 /// 1080p60 «buena» de `docs/ARQUITECTURA.md` §2.1), o el máximo si es menor. Es la única cifra que
 /// no sale de una medida: con el primer `Feedback` el control de tasa sube un 5 % cada 100 ms hasta
-/// lo que el enlace entrega. Arrancar en la mitad del máximo (40 Mbit/s con «sin límite») mandaba el
+/// lo que el enlace entrega. Arrancar en la mitad del máximo (40 Mbit/s sin tope) mandaba el
 /// primer intra, el más grande, a un bitrate que nadie había comprobado.
 pub fn start_kbps(max_kbps: u32) -> u32 {
     max_kbps.clamp(1, 8_000)
@@ -1686,7 +1686,7 @@ mod tests {
         assert_eq!((start_kbps(10_000), min_kbps(10_000)), (8_000, 1_000));
         assert_eq!((start_kbps(80_000), min_kbps(80_000)), (8_000, 8_000));
         assert_eq!((start_kbps(500), min_kbps(500)), (500, 100));
-        // Sin límite arranca igual y no se queda con un mínimo de 50 kbit/s.
+        // Sin tope arranca igual y no se queda con un mínimo de 50 kbit/s.
         assert_eq!(start_kbps(UNLIMITED_KBPS), 8_000);
         assert_eq!(min_kbps(UNLIMITED_KBPS), 8_000);
     }
