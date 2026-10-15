@@ -140,7 +140,7 @@ Las letras de `Ctrl+Alt` se cambian en Ajustes → Mandos (no pueden coincidir e
   Windows, Automático usa NVENC, AMF o Quick Sync antes que Vulkan Video. Al abrirse, coroom
   comprueba cada codificador y decodificador por GPU: codifica unos segundos de vídeo de prueba y
   mira que se decodifique igual que el original. Los que dan vídeo dañado con tu driver (AV1 por
-  Vulkan Video en las NVIDIA RTX 50 con los drivers actuales, por ejemplo) no se usan en
+  Vulkan Video con algunos drivers de NVIDIA, por ejemplo) no se usan en
   Automático, y `coroom doctor` y el registro dicen cuáles y por qué; cuando actualices un driver
   que lo arregle, se vuelven a usar solos. Si el invitado recibe muchos fotogramas dañados, la
   aplicación lo avisa.

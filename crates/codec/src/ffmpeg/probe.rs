@@ -8,8 +8,8 @@
 //!   hardware pasan además la **comprobación de imagen** ([`check_encoder`]): codifican
 //!   [`CHECK_FRAMES`] fotogramas de un patrón en movimiento (unos 10 s de vídeo, con sus fotogramas
 //!   predichos), se decodifican por software y cada uno se compara con el original
-//!   ([`MIN_PSNR_DB`]). Un driver que codifica mal (AV1 por Vulkan Video en NVIDIA Blackwell con los
-//!   drivers de 2026, por ejemplo) queda fuera en ese equipo, y se dice por qué
+//!   ([`MIN_PSNR_DB`]). Un driver que codifica mal (AV1 por Vulkan Video con algunos
+//!   drivers de NVIDIA, por ejemplo) queda fuera en ese equipo, y se dice por qué
 //!   ([`Probed::rejected`]); cuando el driver se arregle, el sondeo lo vuelve a aceptar solo.
 //! - **Decodificadores**: se abre el decodificador (con el dispositivo y su `hwaccel`) y se
 //!   decodifica una muestra real de [`SAMPLE_SIDE`]² hecha aquí mismo (OpenH264 para H.264,

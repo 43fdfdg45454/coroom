@@ -28,7 +28,7 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 - **El codificador «auto» se calibra midiendo** (decisión del propietario): al abrir la sala, si
   hay más de un backend para el códec, se codifican 30 fotogramas con cada uno y se elige el de
   menor p95 de latencia; el resultado se guarda en `calibration.json` por GPU, driver, códec,
-  resolución y formato, y solo se repite si cambian. En la RTX 5070 Ti del propietario NVENC tarda
+  resolución y formato, y solo se repite si cambian. En una GPU NVIDIA de escritorio NVENC tarda
   2,1 ms y Vulkan Video 3,0 ms (H.264 y AV1) y «auto» elegía el segundo.
 - **Vigilante de medios** en el invitado: 3 s sin datagramas ni `Pong` con el códec ya acordado
   y se pasa a reconectar, sin esperar al idle de QUIC (que baja de 15 a 8 s; keep-alive a 2,5 s).
@@ -148,7 +148,7 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 - **Al renegociar el códec con la sala abierta se abría el primer codificador de la lista**
   (Vulkan Video en Linux) aunque la calibración hubiera elegido otro: cuando entraba un invitado
-  que solo decodifica H.264, una RTX 5070 Ti pasaba de AV1 por NVENC a H.264 por Vulkan Video,
+  que solo decodifica H.264, una GPU NVIDIA pasaba de AV1 por NVENC a H.264 por Vulkan Video,
   que allí da menos de la mitad del bitrate. Sin medir en el aire, ahora se abre lo calibrado
   para ese códec o, si no se calibró, el backend que ganó para otro códec en la misma GPU.
 - **Una resolución impar al abrir la sala** (`--width 1001`) ya no impide abrirla: se recorta a
@@ -188,8 +188,8 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
   antes el sondeo se repetía en cada arranque, como en Linux.
 - El aviso «Los invitados entran con la voz permitida» de Compartir va en tono neutro: el tono
   de información lleva el color de acento del sistema y con un acento rojo se leía como error.
-- «Audio que se envía» muestra el nombre del ejecutable («kodi») cuando PipeWire solo da el
-  envoltorio genérico de pipewire-alsa («ALSA plug-in [kodi.bin]»).
+- «Audio que se envía» muestra el nombre del ejecutable («reproductor») cuando PipeWire solo da el
+  envoltorio genérico de pipewire-alsa («ALSA plug-in [reproductor.bin]»).
 - **Cabecera pegada a la barra de título** del sistema (KDE): la cabecera (también la de la
   sala del invitado) lleva ahora el tono de las tarjetas, 56 px de alto con el título centrado y
   una línea fina por encima y por debajo, así no se funde con la barra gris de KDE.
@@ -329,7 +329,7 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
   original; los decodificadores de hardware, igual con una muestra. Los que dan vídeo dañado en ese
   equipo quedan fuera de Automático, con el motivo en `coroom doctor` y en el registro, y se
   vuelven a usar solos cuando el driver lo arregle. Se va la lista fija que dejaba AV1 por Vulkan
-  Video solo a mano: en las NVIDIA RTX 50 (Blackwell), cuyo driver codifica mal AV1 por Vulkan
+  Video solo a mano: en las GPU cuyo driver codifica mal AV1 por Vulkan Video
   (fallo conocido de NVIDIA), lo descarta la comprobación, y en las demás GPU se usa.
 - **La cadencia pedida (30, 60 o 120 fps) sale igual en Windows y en Linux, con cualquier
   monitor.** Se le pedía a la captura un intervalo mínimo de `1 / fps` (WGC en Windows,

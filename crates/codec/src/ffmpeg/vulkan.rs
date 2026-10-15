@@ -186,8 +186,8 @@ unsafe fn has_extension(hw: *const AVVulkanDeviceContext, name: &CStr) -> bool {
     }
 }
 
-/// Nombre del dispositivo Vulkan y versión de su driver (`NVIDIA GeForce RTX 5070 Ti /
-/// 580.76.5`), la identidad de la GPU para la caché de calibración. `None` si no se puede crear
+/// Nombre del dispositivo Vulkan y versión de su driver (`GPU de ejemplo /
+/// 1.2.3`), la identidad de la GPU para la caché de calibración. `None` si no se puede crear
 /// un dispositivo Vulkan de FFmpeg.
 pub(crate) fn adapter_identity() -> Option<String> {
     let device = super::create_device(ffi::AV_HWDEVICE_TYPE_VULKAN).ok()?;

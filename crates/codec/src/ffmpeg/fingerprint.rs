@@ -2,7 +2,7 @@
 //! para guardarlo en disco y no repetirlo en cada arranque.
 //!
 //! El sondeo abre cada codificador y decodificador por hardware y crea un dispositivo de la GPU
-//! en cada apertura; en una RTX 5070 Ti con Linux son unos 15 dispositivos Vulkan de ~0,7 s, que
+//! en cada apertura; en una GPU NVIDIA con Linux son unos 15 dispositivos Vulkan de ~0,7 s, que
 //! el driver no deja crear en paralelo, y el sondeo tarda unos 13 s. Quien abría una sala al poco
 //! de arrancar esperaba todo eso sin saberlo. El resultado solo cambia si cambia algo de lo que
 //! sigue, y eso es la huella (sin abrir nada de la GPU, así que un cargador Vulkan roto no la

@@ -376,7 +376,7 @@ pub fn choice_from(key: CalibrationKey, result: &CalibrationResult) -> CachedCho
 static ADAPTER: OnceLock<String> = OnceLock::new();
 
 /// Identidad de la GPU de esta máquina para la clave de la caché: nombre del dispositivo Vulkan y
-/// versión de su driver (`NVIDIA GeForce RTX 5070 Ti / driver 580.76.5 / vulkan 1.4.312`). Solo
+/// versión de su driver (`GPU de ejemplo / driver 1.2.3 / vulkan 1.4.0`). Solo
 /// se crea un dispositivo Vulkan si el sondeo ([`Capabilities::probe`]) dio por bueno algún códec
 /// Vulkan: si el sondeo lo descartó (el cargador viejo que mata el proceso al abrir), la identidad
 /// es `sin-vulkan` y no se toca Vulkan en el proceso del anfitrión. Se consulta una vez por

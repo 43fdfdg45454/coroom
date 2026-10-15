@@ -774,8 +774,8 @@ fn resolve_app(name: &str) -> Result<String, AudioError> {
 }
 
 /// Nombre de la aplicación para mostrar: `application.name`, salvo cuando es el envoltorio
-/// genérico de pipewire-alsa («ALSA plug-in [kodi.bin]»), que no dice nada al usuario; entonces
-/// el nombre del ejecutable sin ruta ni extensión (`kodi`), y si no hay, el nombre del nodo.
+/// genérico de pipewire-alsa («ALSA plug-in [reproductor.bin]»), que no dice nada al usuario; entonces
+/// el nombre del ejecutable sin ruta ni extensión (`reproductor`), y si no hay, el nombre del nodo.
 fn app_display_name(app: &str, binary: &str, name: &str) -> String {
     let app = app.trim();
     let wrapper = app.is_empty() || app.to_lowercase().starts_with("alsa plug-in");
@@ -794,7 +794,7 @@ fn app_display_name(app: &str, binary: &str, name: &str) -> String {
     if !binary.is_empty() {
         return binary.to_owned();
     }
-    // «ALSA plug-in [kodi.bin]» sin binario: lo que va entre corchetes.
+    // «ALSA plug-in [reproductor.bin]» sin binario: lo que va entre corchetes.
     if let Some((_, rest)) = app.split_once('[')
         && let Some((inner, _)) = rest.split_once(']')
         && !inner.trim().is_empty()
@@ -900,14 +900,17 @@ mod tests {
     fn the_alsa_wrapper_shows_the_executable_instead() {
         assert_eq!(app_display_name("Firefox", "firefox", "n"), "Firefox");
         assert_eq!(
-            app_display_name("ALSA plug-in [kodi.bin]", "kodi.bin", "n"),
-            "kodi"
+            app_display_name("ALSA plug-in [reproductor.bin]", "reproductor.bin", "n"),
+            "reproductor"
         );
-        assert_eq!(app_display_name("ALSA plug-in [kodi.bin]", "", "n"), "kodi");
+        assert_eq!(
+            app_display_name("ALSA plug-in [reproductor.bin]", "", "n"),
+            "reproductor"
+        );
         assert_eq!(app_display_name("", "/usr/bin/game.x86_64", "n"), "game");
         assert_eq!(
-            app_display_name("", "", "alsa_playback.kodi"),
-            "alsa_playback.kodi"
+            app_display_name("", "", "alsa_playback.reproductor"),
+            "alsa_playback.reproductor"
         );
         assert_eq!(app_display_name("  ", "", "n"), "n");
     }
