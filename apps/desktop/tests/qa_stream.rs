@@ -11,7 +11,8 @@
 //! - `qa_server_dies`: el servidor se cae con la sesión en marcha (imprime lo que pasa);
 //! - `qa_freezes`: 3 minutos a 1080p60 con red limpia y otros 3 con 1 % de pérdida, midiendo
 //!   cada hueco entre fotogramas presentados y la latencia por segundo (tirones, congelados y
-//!   latencia que se acumula); `QA_MINUTES` cambia la duración.
+//!   latencia que se acumula); `QA_MINUTES` cambia la duración;
+//! - `qa_live_resolution_fps`: tope de resolución y fps en caliente, valores inválidos y ráfaga.
 //!
 //! Necesitan GPU y tardan minutos: `#[ignore]`. Se lanzan con
 //! `cargo test --release -p coroom --test qa_stream -- --ignored --nocapture --test-threads=1`.
@@ -934,4 +935,185 @@ fn qa_freezes() {
         host.close();
         drop(proxy);
     }
+}
+
+/// Resolución máxima y fps en caliente (`VideoChange::max_size` y `fps`): desde una fuente de
+/// 2560×1440 a 60 fps, bajar y subir el tope (también por encima de la fuente, impar y con otra
+/// proporción), cambiar los fps de 15 a 240, una ráfaga alternando los dos y valores que no
+/// valen (0×0, 0 fps), que tienen que devolver error sin tumbar nada. Imprime el tamaño y los fps
+/// que ve el invitado tras cada paso.
+#[test]
+#[ignore = "necesita GPU; QA manual"]
+fn qa_live_resolution_fps() {
+    let _serial = serial();
+    let server = TestServer::start();
+    let mut host = host(server.config(), 2560, 1440, 60, EncoderSet::probe());
+    let code = room_code(&host).expect("sala");
+    let seen = Seen::default();
+    let mut viewer = guest(server.config(), &code, None, DecoderSet::probe(), &seen);
+    let mut failures: Vec<String> = Vec::new();
+    check(
+        &mut failures,
+        "arranque 2560×1440@60",
+        advance(
+            &host,
+            &viewer,
+            &seen,
+            60,
+            Some((2560, 1440)),
+            Duration::from_secs(20),
+        ),
+    );
+    // fps que ve el invitado en una ventana de 2 s.
+    let measure_fps = |seen: &Seen| {
+        let before = seen.frames();
+        std::thread::sleep(Duration::from_secs(2));
+        (seen.frames() - before) as f64 / 2.0
+    };
+    let steps: [(&str, Option<(u32, u32)>, Option<u32>, Option<(u32, u32)>); 12] = [
+        (
+            "tope 1920×1080",
+            Some((1920, 1080)),
+            None,
+            Some((1920, 1080)),
+        ),
+        ("tope 1280×720", Some((1280, 720)), None, Some((1280, 720))),
+        ("tope 640×360", Some((640, 360)), None, Some((640, 360))),
+        ("tope impar 1001×701", Some((1001, 701)), None, None),
+        (
+            "tope 1000×1000 (otra proporción)",
+            Some((1000, 1000)),
+            None,
+            None,
+        ),
+        (
+            "tope 3840×2160 (más que la fuente)",
+            Some((3840, 2160)),
+            None,
+            None,
+        ),
+        ("30 fps", None, Some(30), None),
+        ("144 fps", None, Some(144), None),
+        ("240 fps", None, Some(240), None),
+        ("15 fps", None, Some(15), None),
+        (
+            "1280×720 y 120 fps a la vez",
+            Some((1280, 720)),
+            Some(120),
+            Some((1280, 720)),
+        ),
+        (
+            "vuelta a 2560×1440@60",
+            Some((2560, 1440)),
+            Some(60),
+            Some((2560, 1440)),
+        ),
+    ];
+    for (what, max_size, fps, expect) in steps {
+        let result = host.set_video(VideoChange {
+            max_size,
+            fps,
+            ..VideoChange::default()
+        });
+        let outcome = result
+            .map_err(|err| format!("set_video: {err}"))
+            .and_then(|()| advance(&host, &viewer, &seen, 30, expect, Duration::from_secs(15)));
+        let fps_seen = if outcome.is_ok() {
+            measure_fps(&seen)
+        } else {
+            0.0
+        };
+        println!(
+            "  {what}: invitado ve {:?} a {fps_seen:.1} fps",
+            seen.size()
+        );
+        check(&mut failures, what, outcome);
+    }
+    // Valores que no valen: error, y la sala sigue.
+    for (what, change) in [
+        (
+            "tope 0×0",
+            VideoChange {
+                max_size: Some((0, 0)),
+                ..VideoChange::default()
+            },
+        ),
+        (
+            "tope 1×1",
+            VideoChange {
+                max_size: Some((1, 1)),
+                ..VideoChange::default()
+            },
+        ),
+        (
+            "0 fps",
+            VideoChange {
+                fps: Some(0),
+                ..VideoChange::default()
+            },
+        ),
+    ] {
+        let result = host.set_video(change);
+        println!("  {what}: {result:?}");
+        if result.is_ok() {
+            failures.push(format!("{what}: se aceptó"));
+        }
+    }
+    check(
+        &mut failures,
+        "sigue tras los valores inválidos",
+        advance(&host, &viewer, &seen, 60, None, Duration::from_secs(10)),
+    );
+    // Ráfaga: 30 cambios cada 100 ms alternando tamaño y fps.
+    for i in 0..30u32 {
+        let change = if i % 2 == 0 {
+            let sizes = [(1920, 1080), (1280, 720), (2560, 1440), (854, 480)];
+            VideoChange {
+                max_size: Some(sizes[(i as usize / 2) % 4]),
+                ..VideoChange::default()
+            }
+        } else {
+            let rates = [30, 144, 60, 240, 90];
+            VideoChange {
+                fps: Some(rates[(i as usize / 2) % 5]),
+                ..VideoChange::default()
+            }
+        };
+        if let Err(err) = host.set_video(change) {
+            failures.push(format!("ráfaga {i}: {err}"));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let settle = host.set_video(VideoChange {
+        max_size: Some((1920, 1080)),
+        fps: Some(60),
+        ..VideoChange::default()
+    });
+    check(
+        &mut failures,
+        "tras la ráfaga, 1920×1080@60",
+        settle.map_err(|err| err.to_string()).and_then(|()| {
+            advance(
+                &host,
+                &viewer,
+                &seen,
+                120,
+                Some((1920, 1080)),
+                Duration::from_secs(20),
+            )
+        }),
+    );
+    println!(
+        "  final: {:?} a {:.1} fps · {}",
+        seen.size(),
+        measure_fps(&seen),
+        line(&viewer.summary())
+    );
+    viewer.close();
+    host.close();
+    assert!(
+        failures.is_empty(),
+        "pasos con fallo:\n{}",
+        failures.join("\n")
+    );
 }
