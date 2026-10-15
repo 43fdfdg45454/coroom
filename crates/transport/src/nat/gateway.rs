@@ -124,6 +124,7 @@ mod platform {
     use super::DefaultRoute;
 
     /// La fila `0.0.0.0/0` de menor métrica de `GetIpForwardTable2` y la MTU de su adaptador.
+    #[allow(unsafe_code)] // Win32 sin envoltorio seguro; cada bloque lleva su `SAFETY:`.
     pub fn default_route() -> Result<DefaultRoute, String> {
         let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
         // SAFETY: `GetIpForwardTable2` rellena `table` con una tabla que es nuestra hasta
@@ -162,6 +163,7 @@ mod platform {
     }
 
     /// La MTU del adaptador con índice `index` (`GetAdaptersAddresses`).
+    #[allow(unsafe_code)] // Win32 sin envoltorio seguro; cada bloque lleva su `SAFETY:`.
     fn adapter_mtu(index: u32) -> Option<u32> {
         let flags = GAA_FLAG_SKIP_UNICAST
             | GAA_FLAG_SKIP_ANYCAST
