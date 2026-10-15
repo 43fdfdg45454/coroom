@@ -296,6 +296,8 @@ impl Video {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Room {
+    /// Los invitados entran con el micrófono cerrado (el permiso de voz se da después).
+    pub guests_muted: bool,
     /// Sonido al llegar un mensaje del chat.
     pub chat_sound: bool,
     /// Notificación del escritorio con la ventana sin foco.
@@ -307,6 +309,7 @@ pub struct Room {
 impl Default for Room {
     fn default() -> Self {
         Self {
+            guests_muted: false,
             chat_sound: true,
             chat_notifications: true,
             chat_bubbles: true,

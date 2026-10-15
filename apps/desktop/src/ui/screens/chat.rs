@@ -83,6 +83,21 @@ pub fn on_event(_app: &mut App, _event: &Event) -> Vec<Effect> {
     Vec::new()
 }
 
+/// Dónde se dibuja el panel: en la ventana (anfitrión, con el tema de la ventana) o flotando
+/// sobre el vídeo (invitado, oscuro).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    /// Panel fijo con el tema de la ventana.
+    Window,
+    /// Panel flotante sobre el vídeo.
+    Overlay,
+}
+
+/// Panel del chat (mensajes y cuadro de escritura) para `surface`.
+pub fn panel(app: &App, _surface: Surface) -> Element<'_, Message> {
+    view(app)
+}
+
 /// Panel del chat.
 pub fn view(app: &App) -> Element<'_, Message> {
     ui::empty_state(
