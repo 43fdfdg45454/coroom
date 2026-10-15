@@ -1319,10 +1319,11 @@ impl HostControl {
                 "no hay ningún codificador disponible con las opciones dadas".into(),
             ));
         }
-        let change = change.normalized();
+        // Se valida lo pedido (así el error dice «1×1», no el «0×0» ya redondeado) y se manda
+        // redondeado a par.
         change.validate().map_err(SessionError::Media)?;
         self.commands
-            .send(Command::Video(change))
+            .send(Command::Video(change.normalized()))
             .map_err(|_| SessionError::Network("la sesión terminó".into()))
     }
 }
@@ -1973,11 +1974,19 @@ mod tests {
             let change = VideoChange {
                 max_size: Some(size),
                 ..VideoChange::default()
-            }
-            .normalized();
+            };
             let err = change.validate().expect_err("tamaño inválido");
             assert!(err.contains("2×2"), "{err}");
+            assert!(change.normalized().validate().is_err());
         }
+        // El error nombra lo pedido, no lo redondeado.
+        let err = VideoChange {
+            max_size: Some((1, 1)),
+            ..VideoChange::default()
+        }
+        .validate()
+        .expect_err("1×1");
+        assert!(err.contains("1×1"), "{err}");
         let change = VideoChange {
             fps: Some(0),
             ..VideoChange::default()
