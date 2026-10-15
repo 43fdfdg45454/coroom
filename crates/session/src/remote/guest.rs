@@ -267,8 +267,9 @@ fn audio_receiver(
         let own = core.own_leaf.load(Ordering::Acquire);
         let accept = match track {
             AudioTrack::Game => source == host,
-            // La propia vuelve por el abanico del relay; sin permiso de voz no se oye a nadie.
-            AudioTrack::Voice => (source != own || !core.sframe) && core.audio.voice_allowed(),
+            // La propia vuelve por el abanico del relay. Oír a la sala no necesita permiso: el
+            // permiso de voz es para hablar.
+            AudioTrack::Voice => source != own || !core.sframe,
         };
         if !accept {
             return;
@@ -1129,11 +1130,6 @@ async fn control_loop(
             ),
             Some(ControlMessage::VoicePermission { allowed }) => {
                 core.audio.set_voice_allowed(allowed);
-                if !allowed {
-                    for who in core.audio.talkers() {
-                        core.audio.clear_talker(who);
-                    }
-                }
             }
             Some(ControlMessage::VoiceState { guest, speaking }) => {
                 core.audio.set_talker(guest, speaking);

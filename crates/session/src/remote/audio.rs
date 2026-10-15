@@ -265,10 +265,6 @@ impl AudioControl {
         }
     }
 
-    pub(crate) fn clear_talker(&self, who: u32) {
-        lock(&self.inner.talkers).remove(&who);
-    }
-
     /// Estado local en palabras: «micrófono abierto (activación por voz)», «micrófono
     /// silenciado», «sin permiso de voz», «juego silenciado»…
     pub fn status_label(&self) -> String {

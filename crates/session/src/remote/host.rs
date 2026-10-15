@@ -475,7 +475,6 @@ fn start_audio(
     let out = Arc::new(HostAudioOut {
         core: Arc::clone(core),
         links: Arc::clone(links),
-        permitted: std::sync::Mutex::new(Vec::with_capacity(16)),
     });
     let processor =
         host_audio
@@ -557,8 +556,6 @@ fn start_audio(
 struct HostAudioOut {
     core: Arc<Core>,
     links: Arc<std::sync::Mutex<Links>>,
-    /// Invitados con permiso de voz (búfer reutilizado).
-    permitted: std::sync::Mutex<Vec<GuestId>>,
 }
 
 /// Rellena `out` con los invitados con permiso de voz.
@@ -615,17 +612,9 @@ impl AudioOut for HostAudioOut {
         let Some(datagram) = audio_datagram(track, seq, epoch, sealed) else {
             return false;
         };
-        let mut permitted = lock(&self.permitted);
-        if track == Track::Voice {
-            voice_permitted(&self.core, &mut permitted);
-        }
+        // La voz de la sala la oyen todos los invitados; el permiso de voz es para hablar.
         let links = lock(&self.links);
-        send_to(
-            &links,
-            &datagram,
-            |guest| track != Track::Voice || permitted.contains(guest),
-            None,
-        )
+        send_to(&links, &datagram, |_| true, None)
     }
 
     fn has_targets(&self, _track: Track) -> bool {
@@ -647,7 +636,7 @@ impl AudioOut for HostAudioOut {
 
 /// Lee la voz de los invitados que llega por `conn` (la directa de `only` o la del relay): la
 /// descifra para saber quién habla y oírla, comprueba su permiso y la reenvía tal cual a los
-/// demás invitados con permiso.
+/// demás invitados.
 fn voice_reader(ctx: &Arc<HostCtx>, conn: PeerConnection, only: Option<GuestId>) {
     let core = Arc::clone(&ctx.core);
     let thread_ctx = Arc::clone(ctx);
@@ -688,8 +677,9 @@ fn voice_reader(ctx: &Arc<HostCtx>, conn: PeerConnection, only: Option<GuestId>)
             return;
         }
         {
+            // A todos los demás: oír a la sala no necesita permiso.
             let links = lock(&ctx.links);
-            send_to(&links, &datagram, |g| permitted.contains(g), Some(guest));
+            send_to(&links, &datagram, |_| true, Some(guest));
         }
         if let Some(tx) = lock(&core.audio_tx).as_ref()
             && let Some(packet) = Packet::parse(AudioTrack::Voice, guest.0, &plain, arrived)

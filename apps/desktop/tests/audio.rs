@@ -409,8 +409,8 @@ fn voice_round(server: &TestServer, relay: bool, permitted: bool) {
             "ni se reenvía"
         );
         assert!(
-            level(&at_speaker, HOST_VOICE_HZ) < ABSENT,
-            "ni oye a la sala"
+            level(&at_speaker, HOST_VOICE_HZ) > HEARD,
+            "pero oye a la sala igual: el permiso es para hablar"
         );
         assert!(!speaker.session.audio().voice_allowed());
     }

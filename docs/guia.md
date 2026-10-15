@@ -83,7 +83,8 @@ El anfitrión da y quita, a cada invitado y en cualquier momento:
   llega **tal cual** (el juego y Steam lo ven como ese mando, con sus botones) o **convertido a
   Xbox 360**, como decida el anfitrión. Si tienes varios mandos, eliges cuál envías en el panel de
   mandos de la barra (`Ctrl+Alt+J`).
-- **Voz**: el invitado habla y oye a la sala.
+- **Voz**: el invitado habla a la sala. Oír al anfitrión y a los demás no necesita permiso: todo
+  invitado oye la voz de la sala desde que entra.
 
 Aparte de los permisos, cada uno elige a quién oye en su equipo: el invitado, en **Personas en la
 sala** (icono de personas en la barra), y el anfitrión, en la tarjeta de cada invitado, con el icono
