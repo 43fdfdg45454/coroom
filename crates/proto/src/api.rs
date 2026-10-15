@@ -183,6 +183,13 @@ pub struct Friend {
     pub display_name: String,
     /// Conectado ahora a la señalización (solo de los amigos; `false` en las solicitudes).
     pub online: bool,
+    /// Qué hace ahora (solo de los amigos conectados).
+    #[serde(default, skip_serializing_if = "is_idle")]
+    pub activity: crate::signal::Activity,
+}
+
+fn is_idle(activity: &crate::signal::Activity) -> bool {
+    *activity == crate::signal::Activity::Idle
 }
 
 /// Solicitud de amistad pendiente.

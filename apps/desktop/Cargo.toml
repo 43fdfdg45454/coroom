@@ -40,13 +40,22 @@ winit.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `settings`: tema y acento del sistema; `open_uri`: abrir la página de una versión nueva;
-# `secret`: la clave del llavero dentro de Flatpak y `notification`: los mensajes del chat con la
-# ventana sin foco.
-ashpd = { workspace = true, features = ["settings", "open_uri", "secret", "notification"] }
+# `secret`: la clave del llavero dentro de Flatpak; `notification`: los mensajes del chat con la
+# ventana sin foco; `file_chooser`: elegir el tono del chat.
+ashpd = { workspace = true, features = ["settings", "open_uri", "secret", "notification", "file_chooser"] }
 futures-util.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg.workspace = true
+# `Win32_Media_Audio`: `PlaySound` para el tono del chat; `Win32_UI_Shell` y `Win32_System_Com`:
+# el diálogo de abrir fichero para elegirlo.
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+] }
 
 [dev-dependencies]
 # Tests de extremo a extremo (`tests/remote.rs`): servidor real en proceso y proxy con pérdida.

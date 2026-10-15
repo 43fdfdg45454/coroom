@@ -11,10 +11,16 @@
 //! ([`OverlayBlit`]); en HDR, todo a la textura intermedia de [`HdrOutput`] y su pasada final a la
 //! superficie.
 //!
-//! Un solo candado ordena los dos hilos: la importación sin copias de una imagen Vulkan deja su
-//! semáforo para la **siguiente** entrega de la cola, así que entre importar y entregar no puede
-//! colarse otra entrega. El hilo de la ventana dibuja `iced` con el candado tomado (unos ms, solo
-//! cuando la interfaz cambia) y el de `present` nunca espera a que la interfaz se reconstruya.
+//! Dos candados ordenan los dos hilos. El del estado (`inner`: superficie, capas, texturas) se
+//! toma poco: para componer y para intercambiar las texturas de la interfaz. La interfaz se dibuja
+//! en una textura **trasera** sin ese candado (doble búfer: el hilo de `present` sigue componiendo
+//! la delantera mientras `iced` dibuja) y al acabar se intercambian y se compone. El otro
+//! (`submit`) ordena las entregas a la cola: la importación sin copias de una imagen Vulkan deja
+//! su semáforo para la **siguiente** entrega, así que entre importar y entregar (en la
+//! composición) no puede colarse la entrega del dibujo de la interfaz; es lo único por lo que el
+//! hilo de `present` llega a esperar al de la ventana, y nunca a que la interfaz se reconstruya.
+//! Dentro del dibujo de la interfaz nadie vuelve a llamar al compositor ([`VideoFeed::set_area`]
+//! solo anota el área).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -44,7 +50,10 @@ struct Inner {
     render_format: wgpu::TextureFormat,
     hdr: Option<(HdrOutput, HdrSurface)>,
     blit: OverlayBlit,
+    /// Textura de la interfaz que se compone (la última que terminó de dibujarse).
     ui: Option<UiTexture>,
+    /// Textura en la que la ventana dibuja la interfaz ahora; al acabar se intercambia con `ui`.
+    ui_back: Option<UiTexture>,
     /// Fondo de la composición (el de la ventana o el del vídeo), como lo limpia `iced`.
     background: wgpu::Color,
     feeds: Vec<Weak<VideoFeed>>,
@@ -65,6 +74,8 @@ pub struct Compositor {
     device: wgpu::Device,
     queue: wgpu::Queue,
     inner: Mutex<Inner>,
+    /// Orden de las entregas a la cola (ver el módulo). Se toma después de `inner`, nunca antes.
+    submit: Mutex<()>,
 }
 
 impl std::fmt::Debug for Compositor {
@@ -103,6 +114,7 @@ impl Compositor {
                 hdr,
                 blit,
                 ui: None,
+                ui_back: None,
                 // Hasta el primer `draw_ui`, que trae el fondo del tema.
                 background: wgpu::Color::TRANSPARENT,
                 feeds: Vec::new(),
@@ -112,11 +124,16 @@ impl Compositor {
                 low_latency_mode: setup.config.present_mode,
                 vsync: false,
             }),
+            submit: Mutex::new(()),
         })
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn submit_lock(&self) -> MutexGuard<'_, ()> {
+        self.submit.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Formato de las vistas en las que dibuja la interfaz (sin sRGB; en HDR, `Rgba16Float`).
@@ -143,6 +160,7 @@ impl Compositor {
         inner.surface.configure(&self.device, &inner.config);
         inner.outdated = false;
         inner.ui = None;
+        inner.ui_back = None;
     }
 
     /// Rehace la superficie para el ajuste de HDR `wanted` y devuelve el formato de dibujo (si
@@ -168,6 +186,7 @@ impl Compositor {
             inner.layers.clear();
         }
         inner.ui = None;
+        inner.ui_back = None;
         inner.hdr = super::runner::make_hdr(gpu, setup.hdr);
         inner.outdated = false;
         Ok(setup)
@@ -196,20 +215,40 @@ impl Compositor {
         inner.feeds.push(Arc::downgrade(feed));
     }
 
-    /// Dibuja la interfaz: `draw` recibe la vista de la textura de la interfaz (limpiarla a
-    /// transparente y dibujar encima) y, después, se compone con el vídeo y se entrega.
-    /// `background` es el fondo bajo la interfaz y el vídeo.
+    /// Dibuja la interfaz: `draw` recibe la vista de la textura trasera de la interfaz (limpiarla
+    /// a transparente y dibujar encima) **sin el candado del compositor** (el hilo de `present`
+    /// sigue componiendo la delantera mientras tanto) y, después, las texturas se intercambian y
+    /// se compone con el vídeo y se entrega. `background` es el fondo bajo la interfaz y el vídeo.
+    /// `draw` no debe llamar al compositor.
     pub fn draw_ui(&self, background: Color, draw: impl FnOnce(&wgpu::TextureView)) {
+        let (view, size) = {
+            let mut inner = self.lock();
+            let size = (inner.config.width, inner.config.height);
+            if inner.ui_back.as_ref().is_none_or(|ui| ui.size != size) {
+                let ui = self.make_ui_texture(&inner, size);
+                inner.ui_back = Some(ui);
+            }
+            let view = inner
+                .ui_back
+                .as_ref()
+                .map(|ui| ui.view.clone())
+                .expect("ui_back texture was just created");
+            (view, size)
+        };
+        {
+            // `iced` prepara y entrega a la cola: ordenado frente a la composición (semáforo de
+            // la importación), pero sin retener el estado del compositor.
+            let _order = self.submit_lock();
+            draw(&view);
+        }
         let mut inner = self.lock();
         inner.background = clear_color(background);
-        let size = (inner.config.width, inner.config.height);
-        if inner.ui.as_ref().is_none_or(|ui| ui.size != size) {
-            let ui = self.make_ui_texture(&inner, size);
-            inner.ui = Some(ui);
-        }
-        if let Some(ui) = inner.ui.as_mut() {
-            draw(&ui.view);
-            ui.drawn = true;
+        if inner.ui_back.as_ref().is_some_and(|ui| ui.size == size) {
+            let inner = &mut *inner;
+            std::mem::swap(&mut inner.ui, &mut inner.ui_back);
+            if let Some(ui) = inner.ui.as_mut() {
+                ui.drawn = true;
+            }
         }
         self.composite(&mut inner);
     }
@@ -247,7 +286,8 @@ impl Compositor {
     }
 
     /// Fondo, capas de vídeo e interfaz a la superficie (y el aviso a las fuentes de que su
-    /// fotograma ya salió).
+    /// fotograma ya salió). Si la superficie no da imagen (ventana oculta), no se avisa a las
+    /// fuentes: su fotograma no se mostró y el pipeline lo cuenta como descarte.
     fn composite(&self, inner: &mut Inner) {
         if inner.outdated {
             inner.surface.configure(&self.device, &inner.config);
@@ -262,6 +302,8 @@ impl Compositor {
                 return;
             }
         };
+        // Desde la primera importación hasta la entrega, ninguna otra entrega a la cola.
+        let _order = self.submit_lock();
         // Las fuentes vivas suben su fotograma pendiente y se colocan donde dijo la interfaz.
         inner.feeds.retain(|weak| weak.strong_count() > 0);
         let feeds: Vec<Arc<VideoFeed>> = inner.feeds.iter().filter_map(Weak::upgrade).collect();

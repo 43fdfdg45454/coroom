@@ -2,14 +2,16 @@
 //!
 //! Una sola pantalla bajo la cabecera: dos tarjetas grandes («Compartir mi pantalla» y «Unirse
 //! con código»), las invitaciones que llegan (con su cuenta atrás de [`INVITATION_TTL`]) y la
-//! lista de amigos, que se actualiza sola con la presencia de la señalización (también con la
-//! sala abierta o desde dentro de una), con las solicitudes pendientes y «Agregar amigo».
+//! lista de amigos, que se actualiza sola con la presencia y la actividad de la señalización
+//! (también con la sala abierta o desde dentro de una), con las solicitudes pendientes y «Agregar
+//! amigo». A un amigo con sala abierta se le puede **pedir entrar** ([`Msg::AskToJoin`]): el botón
+//! queda en «Pedido…» hasta que invita (se entra solo), dice que no o pasa [`JOIN_REQUEST_TTL`].
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use coroom_transport::proto::api::{Friend, Friends};
-use coroom_transport::proto::signal::{ROOM_CODE_LEN, is_valid_room_code};
+use coroom_transport::proto::signal::{Activity, ROOM_CODE_LEN, is_valid_room_code};
 use coroom_ui::Element;
 use coroom_ui::font::MONO;
 use coroom_ui::icon::{Icon, icon_with};
@@ -21,7 +23,9 @@ use iced_core::text::{LineHeight, Wrapping};
 use iced_core::{Alignment, Length, Padding};
 use iced_widget::{Column, column, container, row, text, text_input};
 
-use crate::ui::app::{App, Effect, Event, Invitation, Load, Message, Page, Screen};
+use crate::ui::app::{
+    App, Effect, Event, Invitation, JOIN_REQUEST_TTL, Load, Message, Page, Screen,
+};
 use crate::ui::screens::friends::{self, Msg as FriendsMsg};
 use crate::ui::screens::guest;
 
@@ -42,6 +46,8 @@ pub struct State {
     pub invited_at: HashMap<u64, Instant>,
     /// Cuándo llegó la lista de amigos o el último cambio de presencia.
     pub friends_updated: Option<Instant>,
+    /// A qué amigos se les pidió entrar en su sala y cuándo (sin respuesta todavía).
+    pub asked_at: HashMap<u64, Instant>,
 }
 
 /// Mensajes.
@@ -59,6 +65,8 @@ pub enum Msg {
     Share,
     /// Invitar a un amigo: con la sala abierta, la invitación; sin sala, a Compartir.
     Invite(u64),
+    /// Pedir entrar en la sala abierta de un amigo.
+    AskToJoin(u64),
 }
 
 /// Normaliza lo que se escribe en el código: mayúsculas, sin espacios ni guiones, como mucho seis.
@@ -71,8 +79,28 @@ pub fn clean_code(text: &str) -> String {
 }
 
 /// Si el servidor no responde (la cabecera lo dice en rojo): no se puede abrir ni entrar.
-fn server_down(app: &App) -> bool {
+pub fn server_down(app: &App) -> bool {
     app.server_status.online == Some(false)
+}
+
+/// Si se puede pedir entrar en la sala de alguien: sin sala propia (abierta o abriéndose) y sin
+/// estar en otra.
+fn can_ask(app: &App) -> bool {
+    !app.host.is_open() && app.guest.is_none()
+}
+
+/// Nombre visible de un amigo (o «tu amigo» si ya no está en la lista).
+fn friend_name(app: &App, user: u64) -> String {
+    app.friends
+        .loaded()
+        .and_then(|friends| friends.friends.iter().find(|f| f.id == user))
+        .map(|friend| friend.display_name.clone())
+        .unwrap_or_else(|| t!("home-your-friend").to_owned())
+}
+
+/// Si se le había pedido entrar a `user`, lo olvida y dice que sí (la respuesta llegó).
+pub fn take_asked(app: &mut App, user: u64) -> bool {
+    app.home.asked_at.remove(&user).is_some()
 }
 
 /// Reduce un mensaje.
@@ -129,14 +157,27 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             if room_code(app).is_none() {
                 return Vec::new();
             }
-            let name = app
-                .friends
-                .loaded()
-                .and_then(|friends| friends.friends.iter().find(|f| f.id == user))
-                .map(|friend| friend.display_name.clone())
-                .unwrap_or_else(|| t!("home-your-friend").to_owned());
+            let name = friend_name(app, user);
             app.toast(Tone::Info, t!("home-invitation-sent", name = name));
             vec![Effect::Invite(user)]
+        }
+        Msg::AskToJoin(user) => {
+            if server_down(app) || !can_ask(app) || app.home.asked_at.contains_key(&user) {
+                return Vec::new();
+            }
+            let hosting = app.friends.loaded().is_some_and(|friends| {
+                friends
+                    .friends
+                    .iter()
+                    .any(|f| f.id == user && f.online && f.activity == Activity::Hosting)
+            });
+            if !hosting {
+                return Vec::new();
+            }
+            let name = friend_name(app, user);
+            app.home.asked_at.insert(user, app.now);
+            app.toast(Tone::Info, t!("home-ask-sent", name = name));
+            vec![Effect::AskToJoin(user)]
         }
     }
 }
@@ -152,9 +193,27 @@ pub fn on_event(app: &mut App, event: &Event) {
         Event::Invited(invitation) => {
             app.home.invited_at.insert(invitation.from_user, app.now);
         }
-        Event::Friends(Ok(_)) | Event::Presence { .. } => {
+        Event::Friends(Ok(_)) | Event::Presence { .. } | Event::Activity { .. } => {
             app.home.friends_updated = Some(app.now);
+            // Si al que se le pidió entrar cierra la sala o se desconecta, ya no hay a qué esperar.
+            match event {
+                Event::Presence {
+                    user,
+                    online: false,
+                } => {
+                    app.home.asked_at.remove(user);
+                }
+                Event::Activity { user, activity } if *activity != Activity::Hosting => {
+                    app.home.asked_at.remove(user);
+                }
+                _ => {}
+            }
         }
+        Event::JoinDeclined { from_user, .. } => {
+            app.home.asked_at.remove(from_user);
+        }
+        // La sala de espera solo manda peticiones de entrar: un error suyo las da por perdidas.
+        Event::JoinRequestFailed { .. } => app.home.asked_at.clear(),
         Event::FriendChanged(result) => friends::on_changed(app, result),
         _ => {}
     }
@@ -177,7 +236,8 @@ fn prune_times(app: &mut App) {
         .retain(|user, _| invitations.iter().any(|known| known.from_user == *user));
 }
 
-/// Pasa el tiempo: las invitaciones caducadas desaparecen.
+/// Pasa el tiempo: las invitaciones caducadas desaparecen y las peticiones de entrar sin
+/// respuesta se dan por perdidas (con un aviso).
 pub fn tick(app: &mut App) {
     let now = app.now;
     let times = &mut app.home.invited_at;
@@ -190,6 +250,18 @@ pub fn tick(app: &mut App) {
             .is_none_or(|at| now.saturating_duration_since(*at) < INVITATION_TTL)
     });
     prune_times(app);
+    let expired: Vec<u64> = app
+        .home
+        .asked_at
+        .iter()
+        .filter(|(_, at)| now.saturating_duration_since(**at) >= JOIN_REQUEST_TTL)
+        .map(|(user, _)| *user)
+        .collect();
+    for user in expired {
+        app.home.asked_at.remove(&user);
+        let name = friend_name(app, user);
+        app.toast(Tone::Neutral, t!("home-ask-no-answer", name = name));
+    }
 }
 
 /// El siguiente múltiplo de `step` desde `since` que está después de `now`.
@@ -230,21 +302,36 @@ pub fn next_tick(app: &App) -> Option<Instant> {
         let step = updated_step(now.saturating_duration_since(at));
         consider(next_step(at, now, step));
     }
+    for at in app.home.asked_at.values() {
+        consider((*at + JOIN_REQUEST_TTL).max(now + Duration::from_millis(1)));
+    }
     next
 }
 
-/// Amigos en el orden de la lista: conectados primero y, dentro de cada grupo, por nombre (el
-/// identificador desempata, para que el orden no salte).
+/// Amigos en el orden de la lista: conectados primero, entre ellos los que tienen una sala
+/// abierta, y dentro de cada grupo por nombre (el identificador desempata, para que el orden no
+/// salte).
 pub fn sorted_friends(friends: &Friends) -> Vec<&Friend> {
     let mut sorted: Vec<_> = friends.friends.iter().collect();
     sorted.sort_by_cached_key(|friend| {
         (
             !friend.online,
+            !(friend.online && friend.activity == Activity::Hosting),
             friend.display_name.to_lowercase(),
             friend.id,
         )
     });
     sorted
+}
+
+/// Insignia del estado de un amigo: desconectado, disponible, en su sala o jugando en una.
+pub fn activity_badge<'a, M: 'a>(friend: &Friend) -> Element<'a, M> {
+    match (friend.online, friend.activity) {
+        (false, _) => ui::status_badge(Tone::Neutral, t!("home-offline")),
+        (true, Activity::Idle) => ui::status_badge(Tone::Success, t!("home-available")),
+        (true, Activity::Hosting) => ui::status_badge(Tone::Info, t!("home-hosting")),
+        (true, Activity::Playing) => ui::status_badge(Tone::Info, t!("home-playing")),
+    }
 }
 
 fn on(msg: Msg) -> Message {
@@ -676,17 +763,30 @@ fn requests<'a>(app: &'a App, friends: &'a Friends) -> Option<Element<'a, Messag
     )
 }
 
-/// Fila de un amigo: avatar, nombre, usuario, estado, «Invitar» y quitar.
+/// Fila de un amigo: avatar, nombre, usuario, estado, «Invitar» (o «Pedir entrar» si tiene una
+/// sala abierta y aquí no hay ninguna) y quitar.
 fn friend_row<'a>(app: &'a App, friend: &'a Friend) -> Element<'a, Message> {
-    let badge = if friend.online {
-        ui::status_badge(Tone::Success, t!("home-available"))
-    } else {
-        ui::status_badge(Tone::Neutral, t!("home-offline"))
-    };
+    let badge = activity_badge(friend);
     let invite_button = |on_press: Option<Message>| {
         ui::button_with(Kind::Normal, t!("home-invite"), None, on_press)
     };
-    let invite: Element<'_, Message> = if !friend.online {
+    let hosting = friend.online && friend.activity == Activity::Hosting;
+    let invite: Element<'_, Message> = if hosting && can_ask(app) {
+        if app.home.asked_at.contains_key(&friend.id) {
+            ui::with_tooltip(
+                ui::button_with(Kind::Normal, t!("home-asked"), Some(Icon::LogIn), None),
+                t!("home-asked-tip", name = friend.display_name),
+            )
+        } else {
+            ui::button_with(
+                Kind::Primary,
+                t!("home-ask-to-join"),
+                Some(Icon::LogIn),
+                (!server_down(app)).then(|| on(Msg::AskToJoin(friend.id))),
+            )
+            .into()
+        }
+    } else if !friend.online {
         ui::with_tooltip(invite_button(None), t!("home-invite-offline-tip"))
     } else if !app.host.is_open() {
         ui::with_tooltip(
@@ -721,9 +821,11 @@ fn friend_row<'a>(app: &'a App, friend: &'a Friend) -> Element<'a, Message> {
 pub(crate) mod shots {
     use std::time::Duration;
 
+    use super::Msg;
     use crate::ui::app::{App, Event, Invitation, Message, Page};
     use crate::ui::shots::{Builder, signed_in};
     use coroom_transport::proto::api::Friends;
+    use coroom_transport::proto::signal::Activity;
 
     /// Hace `secs` segundos (o ahora, si el reloj no llega tan atrás).
     fn ago(app: &App, secs: u64) -> std::time::Instant {
@@ -732,12 +834,21 @@ pub(crate) mod shots {
             .unwrap_or(app.now)
     }
 
-    /// Inicio con una invitación de Bea de hace 8 s, amigos y solicitudes pendientes.
+    /// Inicio con una invitación de Bea de hace 8 s, amigos (Bea con su sala abierta, Carla
+    /// jugando en una) y solicitudes pendientes.
     pub(crate) fn home(app: &mut App) {
         signed_in(app, Page::Home);
         app.update(Message::Event(Event::ServerStatus {
             rtt_ms: Some(12.0),
             online: true,
+        }));
+        app.update(Message::Event(Event::Activity {
+            user: 2,
+            activity: Activity::Hosting,
+        }));
+        app.update(Message::Event(Event::Activity {
+            user: 3,
+            activity: Activity::Playing,
         }));
         app.invitations = vec![Invitation {
             from_user: 2,
@@ -752,6 +863,16 @@ pub(crate) mod shots {
             version: "0.2.0".to_owned(),
             url: format!("{}/tag/v0.2.0", crate::update::RELEASES_PAGE),
         });
+    }
+
+    /// Inicio tras pedirle entrar a Bea: «Pedido…» en su fila.
+    pub(crate) fn home_asked(app: &mut App) {
+        home(app);
+        app.invitations.clear();
+        app.home.invited_at.clear();
+        app.update(Message::Home(Msg::AskToJoin(2)));
+        app.home.asked_at.insert(2, ago(app, 4));
+        app.toasts.clear();
     }
 
     pub(crate) fn home_empty(app: &mut App) {
@@ -789,6 +910,7 @@ pub(crate) mod shots {
             home(app);
             app.update(Message::ToggleAccountMenu);
         }),
+        ("05-inicio-pedido", home_asked),
         ("06-inicio-vacio", home_empty),
         ("06-inicio-sin-servidor", home_offline),
         ("07-agregar-amigo", add_friend),
@@ -807,7 +929,25 @@ mod tests {
             username: name.to_lowercase(),
             display_name: name.to_owned(),
             online,
+            activity: Default::default(),
         }
+    }
+
+    fn hosting(id: u64, name: &str) -> Friend {
+        Friend {
+            activity: Activity::Hosting,
+            ..friend(id, name, true)
+        }
+    }
+
+    /// Inicio con la lista de amigos cargada: Bea con su sala abierta y Carla disponible.
+    fn with_friends(app: &mut App) {
+        app.update(Message::Event(Event::Friends(Ok(Friends {
+            friends: vec![hosting(2, "Bea"), friend(3, "Carla", true)],
+            incoming: Vec::new(),
+            outgoing: Vec::new(),
+        }))));
+        app.toasts.clear();
     }
 
     fn main_app() -> App {
@@ -954,6 +1094,175 @@ mod tests {
         };
         let order: Vec<u64> = sorted_friends(&friends).iter().map(|f| f.id).collect();
         assert_eq!(order, [2, 6, 3, 4, 5]);
+    }
+
+    /// Entre los conectados, los que tienen una sala abierta van primero; jugar en una no cuenta
+    /// y un desconectado con actividad (no debería pasar) sigue al final.
+    #[test]
+    fn friends_with_an_open_room_sort_first_among_the_online() {
+        let friends = Friends {
+            friends: vec![
+                friend(2, "Bea", true),
+                hosting(5, "Eli"),
+                Friend {
+                    activity: Activity::Playing,
+                    ..friend(1, "Ana", true)
+                },
+                Friend {
+                    activity: Activity::Hosting,
+                    ..friend(4, "Dani", false)
+                },
+                hosting(3, "Carla"),
+            ],
+            incoming: Vec::new(),
+            outgoing: Vec::new(),
+        };
+        let order: Vec<u64> = sorted_friends(&friends).iter().map(|f| f.id).collect();
+        assert_eq!(order, [3, 5, 1, 2, 4]);
+    }
+
+    /// La actividad llega por la señalización y cambia la insignia; desconectarse la borra.
+    #[test]
+    fn activity_updates_the_friend_and_counts_as_an_update() {
+        let mut app = main_app();
+        with_friends(&mut app);
+        app.now += Duration::from_secs(3);
+        app.update(Message::Event(Event::Activity {
+            user: 3,
+            activity: Activity::Playing,
+        }));
+        assert_eq!(app.home.friends_updated, Some(app.now));
+        let carla = |app: &App| app.friends.loaded().unwrap().friends[1].clone();
+        assert_eq!(carla(&app).activity, Activity::Playing);
+        app.update(Message::Event(Event::Presence {
+            user: 3,
+            online: false,
+        }));
+        assert!(!carla(&app).online);
+        assert_eq!(carla(&app).activity, Activity::Idle, "desconectado: nada");
+    }
+
+    /// Pedir entrar: solo a un amigo con sala abierta, sin sala propia ni estar en otra; una vez
+    /// hasta que conteste.
+    #[test]
+    fn ask_to_join_needs_a_hosting_friend_and_no_room() {
+        let mut app = main_app();
+        with_friends(&mut app);
+        // Carla está disponible, sin sala: nada que pedir.
+        assert!(app.update(Message::Home(Msg::AskToJoin(3))).is_empty());
+        assert!(app.home.asked_at.is_empty());
+        // Con la sala propia abriéndose, tampoco.
+        app.host.starting = true;
+        assert!(app.update(Message::Home(Msg::AskToJoin(2))).is_empty());
+        app.host.starting = false;
+        // Bea tiene su sala abierta: se le pide.
+        let effects = app.update(Message::Home(Msg::AskToJoin(2)));
+        assert_eq!(effects, [Effect::AskToJoin(2)]);
+        assert_eq!(app.home.asked_at.get(&2), Some(&app.now));
+        assert!(app.toasts.iter().any(|t| t.text.contains("Bea")));
+        // Repetir mientras espera no manda nada.
+        assert!(app.update(Message::Home(Msg::AskToJoin(2))).is_empty());
+    }
+
+    /// Sin respuesta, la petición caduca con un aviso (y el `Tick` se pide para entonces).
+    #[test]
+    fn a_pending_ask_expires() {
+        let mut app = main_app();
+        with_friends(&mut app);
+        let start = app.now;
+        app.update(Message::Home(Msg::AskToJoin(2)));
+        app.toasts.clear();
+        app.page = Page::Settings;
+        assert_eq!(app.next_tick(), Some(start + JOIN_REQUEST_TTL));
+        app.now = start + JOIN_REQUEST_TTL - Duration::from_secs(1);
+        app.update(Message::Tick);
+        assert!(app.home.asked_at.contains_key(&2), "todavía espera");
+        app.now = start + JOIN_REQUEST_TTL;
+        app.update(Message::Tick);
+        assert!(app.home.asked_at.is_empty());
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.text.contains("Bea") && t.text.contains("no respondió")),
+            "{:?}",
+            app.toasts
+        );
+        assert_eq!(next_tick(&app), None, "ya no hay nada que esperar");
+    }
+
+    /// La invitación del anfitrión al que se le pidió entrar es la respuesta: se entra sin tocar
+    /// nada; una invitación de otro sigue siendo una tarjeta.
+    #[test]
+    fn an_invitation_from_the_asked_host_joins_at_once() {
+        let mut app = main_app();
+        with_friends(&mut app);
+        app.update(Message::Home(Msg::AskToJoin(2)));
+        app.toasts.clear();
+        invited(&mut app, 3, "CCCCCC");
+        assert_eq!(app.invitations.len(), 1, "Carla no fue la pedida");
+        assert_eq!(app.screen, Screen::Main);
+        let effects = app.update(Message::Event(Event::Invited(Invitation {
+            from_user: 2,
+            from_name: "Bea".into(),
+            code: "K7Q2MZ".into(),
+        })));
+        assert!(
+            effects.contains(&Effect::Join("K7Q2MZ".into())),
+            "{effects:?}"
+        );
+        assert_eq!(app.screen, Screen::Guest);
+        assert!(app.home.asked_at.is_empty());
+        assert_eq!(app.invitations.len(), 1, "la de Carla sigue");
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.text.contains("Bea te deja entrar")),
+            "{:?}",
+            app.toasts
+        );
+    }
+
+    /// Un «ahora no» quita la espera y avisa; que el anfitrión cierre la sala o se desconecte,
+    /// también la quita (sin aviso).
+    #[test]
+    fn a_decline_clears_the_pending_ask() {
+        let mut app = main_app();
+        with_friends(&mut app);
+        app.update(Message::Home(Msg::AskToJoin(2)));
+        app.toasts.clear();
+        assert!(
+            app.update(Message::Event(Event::JoinDeclined {
+                from_user: 2,
+                from_name: "Bea".into(),
+            }))
+            .is_empty()
+        );
+        assert!(app.home.asked_at.is_empty());
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.text.contains("Bea no puede dejarte entrar ahora")),
+            "{:?}",
+            app.toasts
+        );
+        app.update(Message::Home(Msg::AskToJoin(2)));
+        app.update(Message::Event(Event::Activity {
+            user: 2,
+            activity: Activity::Idle,
+        }));
+        assert!(app.home.asked_at.is_empty(), "cerró la sala");
+        // Un error de la sala de espera también la da por perdida.
+        app.update(Message::Event(Event::Activity {
+            user: 2,
+            activity: Activity::Hosting,
+        }));
+        app.update(Message::Home(Msg::AskToJoin(2)));
+        app.toasts.clear();
+        app.update(Message::Event(Event::JoinRequestFailed {
+            message: "tu amigo no tiene ninguna sala abierta".into(),
+        }));
+        assert!(app.home.asked_at.is_empty());
+        assert_eq!(app.toasts.len(), 1);
     }
 
     /// «Compartir» pasa por `Navigate`: pide ya qué se puede compartir.

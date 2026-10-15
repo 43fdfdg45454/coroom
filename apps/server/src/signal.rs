@@ -28,8 +28,8 @@ use coroom_transport::proto::PROTOCOL_VERSION;
 use coroom_transport::proto::codec::{self, FrameBuffer};
 use coroom_transport::proto::control::Role;
 use coroom_transport::proto::signal::{
-    ErrorCode, HOST_PEER_ID, PeerId, ROOM_CODE_ALPHABET, ROOM_CODE_LEN, SignalMessage, UserId,
-    is_valid_room_code,
+    Activity, ErrorCode, HOST_PEER_ID, PeerId, ROOM_CODE_ALPHABET, ROOM_CODE_LEN, SignalMessage,
+    UserId, is_valid_room_code,
 };
 
 use crate::auth::{constant_time_eq, token_hash};
@@ -114,6 +114,12 @@ struct Member {
     account: Account,
 }
 
+/// Una misma persona no puede pedir entrar en la misma sala más de una vez cada tanto.
+const JOIN_REQUEST_EVERY: Duration = Duration::from_secs(5);
+/// Cuánto vive una petición de entrada sin respuesta: lo mismo que muestra la aplicación, para que
+/// «Ahora no» siga teniendo a quién responder aunque entre tanto otros hayan pedido entrar.
+const JOIN_REQUEST_TTL: Duration = Duration::from_secs(60);
+
 /// Si la sala tiene relay y, si no, por qué.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelayState {
@@ -129,6 +135,15 @@ struct Room {
     guests: BTreeMap<PeerId, Member>,
     next_peer: PeerId,
     relay: RelayState,
+}
+
+/// Lo que cambia cuando se cierra una sesión de señalización.
+#[derive(Debug, Default)]
+struct Left {
+    /// El usuario, si era su última sesión (toca avisar «desconectado»).
+    last: Option<i64>,
+    /// Usuarios cuya actividad cambió (salieron de una sala, o la sala se cerró).
+    changed: Vec<i64>,
 }
 
 #[derive(Debug)]
@@ -153,11 +168,38 @@ struct HubInner {
     codes: HashMap<String, u64>,
     online: HashMap<i64, HashSet<SessionId>>,
     join_failures: HashMap<FailureKey, VecDeque<Instant>>,
+    /// Última petición de entrar de cada (quien pide, anfitrión): una cada [`JOIN_REQUEST_EVERY`].
+    join_requests: HashMap<(i64, i64), Instant>,
     next_session: SessionId,
     next_room: u64,
 }
 
 impl HubInner {
+    /// Qué hace `user` ahora: anfitrión de una sala, invitado en una, o nada.
+    fn activity_of(&self, user: i64) -> Activity {
+        let mut activity = Activity::Idle;
+        for room in self.rooms.values() {
+            if room.host.account.user == Some(user) {
+                return Activity::Hosting;
+            }
+            if room
+                .guests
+                .values()
+                .any(|member| member.account.user == Some(user))
+            {
+                activity = Activity::Playing;
+            }
+        }
+        activity
+    }
+
+    /// La sala que `user` tiene abierta como anfitrión.
+    fn hosted_room(&self, user: i64) -> Option<&Room> {
+        self.rooms
+            .values()
+            .find(|room| room.host.account.user == Some(user))
+    }
+
     /// Fallos recientes de `key`, olvidando los de fuera de la ventana.
     fn recent_failures(&mut self, key: FailureKey, now: Instant) -> usize {
         let Some(failures) = self.join_failures.get_mut(&key) else {
@@ -299,6 +341,142 @@ impl Hub {
             .lock()
             .map(|inner| inner.online.get(&user).is_some_and(|set| !set.is_empty()))
             .unwrap_or(false)
+    }
+
+    /// Qué hace `user` ahora (para `GET /friends`).
+    pub fn activity(&self, user: i64) -> Activity {
+        self.inner
+            .lock()
+            .map(|inner| inner.activity_of(user))
+            .unwrap_or_default()
+    }
+
+    /// Avisa a los amigos conectados de lo que hace `user` ahora (se recalcula bajo el cerrojo,
+    /// como [`Hub::announce`]: el último aviso siempre es el estado real). Sin sesiones abiertas
+    /// no se avisa: eso lo cuenta `Presence`.
+    async fn announce_activity(&self, user: i64) {
+        let friends = self.friend_ids(Some(user)).await;
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        if !inner.online.get(&user).is_some_and(|set| !set.is_empty()) {
+            return;
+        }
+        let message = SignalMessage::Activity {
+            user: u64::try_from(user).unwrap_or(0),
+            activity: inner.activity_of(user),
+        };
+        for friend in &friends {
+            Self::deliver_user(&mut inner, *friend, &message);
+        }
+    }
+
+    /// Como [`Hub::announce_activity`], para el usuario de `session`.
+    async fn announce_session_activity(&self, session: SessionId) {
+        let user = self.inner.lock().ok().and_then(|inner| {
+            inner
+                .sessions
+                .get(&session)
+                .and_then(|entry| entry.account.user)
+        });
+        if let Some(user) = user {
+            self.announce_activity(user).await;
+        }
+    }
+
+    /// Pide entrar en la sala que `to_user` tiene abierta: se le hace llegar al anfitrión.
+    async fn join_request(&self, session: SessionId, to_user: UserId) -> Reply {
+        let account = self.session_account(session)?;
+        let (Some(db), Some(from)) = (&self.db, account.user) else {
+            return Err((
+                ErrorCode::BadRequest,
+                "pedir entrar necesita una cuenta (no funciona en modo desarrollo)".into(),
+            ));
+        };
+        let to = i64::try_from(to_user)
+            .map_err(|_| (ErrorCode::BadRequest, "usuario no válido".to_owned()))?;
+        if to == from {
+            return Err((
+                ErrorCode::BadRequest,
+                "no puedes pedir entrar en tu propia sala".to_owned(),
+            ));
+        }
+        let friends = db.are_friends(from, to).await.map_err(|err| {
+            warn!(error = %err, "no se pudo comprobar la amistad");
+            (ErrorCode::Internal, "error de la base de datos".to_owned())
+        })?;
+        if !friends {
+            return Err((
+                ErrorCode::NotFriend,
+                "solo puedes pedir entrar en la sala de un amigo".to_owned(),
+            ));
+        }
+        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+        let now = Instant::now();
+        if inner
+            .join_requests
+            .get(&(from, to))
+            .is_some_and(|last| now.duration_since(*last) < JOIN_REQUEST_EVERY)
+        {
+            return Err((
+                ErrorCode::BadRequest,
+                "ya se lo has pedido: espera a que responda".to_owned(),
+            ));
+        }
+        let host_session = inner.hosted_room(to).map(|room| room.host.session).ok_or((
+            ErrorCode::RoomNotFound,
+            "tu amigo no tiene ninguna sala abierta".to_owned(),
+        ))?;
+        inner.join_requests.insert((from, to), now);
+        inner
+            .join_requests
+            .retain(|_, last| now.duration_since(*last) < JOIN_REQUEST_TTL);
+        Self::deliver(
+            &mut inner,
+            host_session,
+            SignalMessage::JoinRequested {
+                from_user: account.user_id(),
+                from_name: account.name.clone(),
+            },
+        );
+        Ok(Vec::new())
+    }
+
+    /// El anfitrión no deja entrar a `to_user`: se le dice.
+    fn join_decline(&self, session: SessionId, to_user: UserId) -> Reply {
+        let account = self.session_account(session)?;
+        let Some(from) = account.user else {
+            return Err((
+                ErrorCode::BadRequest,
+                "pedir entrar necesita una cuenta (no funciona en modo desarrollo)".into(),
+            ));
+        };
+        let to = i64::try_from(to_user)
+            .map_err(|_| (ErrorCode::BadRequest, "usuario no válido".to_owned()))?;
+        let mut inner = self.inner.lock().map_err(|_| poisoned())?;
+        if inner.hosted_room(from).is_none() {
+            return Err((
+                ErrorCode::BadRequest,
+                "solo el anfitrión de una sala puede responder".to_owned(),
+            ));
+        }
+        // Solo se contesta a quien lo pidió y aún espera (la aplicación lo muestra el mismo tiempo).
+        let asked = inner.join_requests.remove(&(to, from));
+        if asked.is_none_or(|at| at.elapsed() >= JOIN_REQUEST_TTL) {
+            return Err((
+                ErrorCode::BadRequest,
+                "ese usuario no ha pedido entrar".to_owned(),
+            ));
+        }
+        Self::deliver_user(
+            &mut inner,
+            to,
+            &SignalMessage::JoinDeclined {
+                from_user: account.user_id(),
+                from_name: account.name.clone(),
+            },
+        );
+        Ok(Vec::new())
     }
 
     /// Cierra todas las sesiones de `user` (cuenta deshabilitada o contraseña cambiada).
@@ -834,7 +1012,15 @@ impl Hub {
         Ok(Vec::new())
     }
 
-    fn kick(&self, session: SessionId, peer: PeerId) -> Reply {
+    /// Expulsa a `peer` de la sala del anfitrión `session`; devuelve también el usuario expulsado
+    /// (su actividad cambia).
+    fn kick(&self, session: SessionId, peer: PeerId) -> (Reply, Option<i64>) {
+        let mut kicked = None;
+        let reply = self.kick_inner(session, peer, &mut kicked);
+        (reply, kicked)
+    }
+
+    fn kick_inner(&self, session: SessionId, peer: PeerId, kicked: &mut Option<i64>) -> Reply {
         let mut inner = self.inner.lock().map_err(|_| poisoned())?;
         let (room_id, from) = inner
             .sessions
@@ -855,6 +1041,7 @@ impl Hub {
                 ErrorCode::PeerNotFound,
                 format!("el par {peer} no está en la sala"),
             ))?;
+        *kicked = member.account.user;
         Self::deliver(
             &mut inner,
             member.session,
@@ -872,29 +1059,36 @@ impl Hub {
         Ok(vec![SignalMessage::PeerLeft { peer_id: peer }])
     }
 
-    /// La sesión terminó: sale de su sala (y la cierra si era el anfitrión). Devuelve el usuario
-    /// si era su última sesión.
-    fn leave(&self, session: SessionId) -> Option<i64> {
-        let mut inner = self.inner.lock().ok()?;
-        let entry = inner.sessions.remove(&session)?;
+    /// La sesión terminó: sale de su sala (y la cierra si era el anfitrión).
+    fn leave(&self, session: SessionId) -> Left {
+        let mut left = Left::default();
+        let Ok(mut inner) = self.inner.lock() else {
+            return left;
+        };
+        let Some(entry) = inner.sessions.remove(&session) else {
+            return left;
+        };
         inner.join_failures.remove(&FailureKey::Session(session));
-        let mut last = None;
         if let Some(user) = entry.account.user
             && let Some(set) = inner.online.get_mut(&user)
         {
             set.remove(&session);
             if set.is_empty() {
                 inner.online.remove(&user);
-                last = Some(user);
+                left.last = Some(user);
             }
         }
         let Some((room_id, peer)) = entry.member else {
-            return last;
+            return left;
         };
+        left.changed.extend(entry.account.user);
         if peer == HOST_PEER_ID {
-            let room = inner.rooms.remove(&room_id)?;
+            let Some(room) = inner.rooms.remove(&room_id) else {
+                return left;
+            };
             inner.codes.remove(&room.code);
             for member in room.guests.values() {
+                left.changed.extend(member.account.user);
                 Self::deliver(
                     &mut inner,
                     member.session,
@@ -919,7 +1113,7 @@ impl Hub {
             self.relay.revoke_peer(room_id, peer);
             info!(room = room_id, peer, "invitado fuera de la sala");
         }
-        last
+        left
     }
 
     async fn handle(
@@ -930,19 +1124,38 @@ impl Hub {
     ) -> Reply {
         match message {
             SignalMessage::CreateRoom { identity_pk, name } => {
-                self.create_room(session, identity_pk, &name, relay_addr)
-                    .await
+                let reply = self
+                    .create_room(session, identity_pk, &name, relay_addr)
+                    .await;
+                if reply.is_ok() {
+                    self.announce_session_activity(session).await;
+                }
+                reply
             }
             SignalMessage::JoinRoom {
                 code,
                 identity_pk,
                 key_package,
-            } => self.join_room(session, &code, identity_pk, key_package, relay_addr),
+            } => {
+                let reply = self.join_room(session, &code, identity_pk, key_package, relay_addr);
+                if reply.is_ok() {
+                    self.announce_session_activity(session).await;
+                }
+                reply
+            }
             message @ (SignalMessage::Candidates { .. } | SignalMessage::Mls { .. }) => {
                 self.forward(session, message)
             }
-            SignalMessage::Kick { peer_id } => self.kick(session, peer_id),
+            SignalMessage::Kick { peer_id } => {
+                let (reply, kicked) = self.kick(session, peer_id);
+                if let Some(user) = kicked {
+                    self.announce_activity(user).await;
+                }
+                reply
+            }
             SignalMessage::Invite { to_user, code } => self.invite(session, to_user, &code).await,
+            SignalMessage::JoinRequest { to_user } => self.join_request(session, to_user).await,
+            SignalMessage::JoinDecline { to_user } => self.join_decline(session, to_user),
             SignalMessage::Auth { .. } => {
                 Err((ErrorCode::BadRequest, "ya estás autenticado".to_owned()))
             }
@@ -1081,12 +1294,14 @@ impl Hub {
             }
             for friend in &friends {
                 if self.is_online(*friend) {
+                    let user = u64::try_from(*friend).unwrap_or(0);
                     let _ = tx
-                        .send(SignalMessage::Presence {
-                            user: u64::try_from(*friend).unwrap_or(0),
-                            online: true,
-                        })
+                        .send(SignalMessage::Presence { user, online: true })
                         .await;
+                    let activity = self.activity(*friend);
+                    if activity != Activity::Idle {
+                        let _ = tx.send(SignalMessage::Activity { user, activity }).await;
+                    }
                 }
             }
         }
@@ -1113,9 +1328,13 @@ impl Hub {
                 }
             }
         }
-        if let Some(user) = self.leave(session) {
+        let left = self.leave(session);
+        if let Some(user) = left.last {
             let friends = self.friend_ids(Some(user)).await;
             self.announce(user, &friends, false);
+        }
+        for user in left.changed {
+            self.announce_activity(user).await;
         }
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(2), writer_task).await;
@@ -1249,7 +1468,7 @@ mod tests {
         hub.register(tx, close, friend).expect("sesión del amigo");
         let lobby = session(&hub, Some(2));
         // La sala de espera se cierra: era la última sesión, toca «desconectado»…
-        assert_eq!(hub.leave(lobby), Some(2));
+        assert_eq!(hub.leave(lobby).last, Some(2));
         // …pero antes de avisar (se esperaba a la base de datos) entra la sala del anfitrión.
         let (host, first) = {
             let (tx, _rx) = mpsc::channel(SESSION_QUEUE);
@@ -1277,7 +1496,7 @@ mod tests {
             "el aviso caducado se descarta"
         );
         // Al cerrarse de verdad, sí llega.
-        assert_eq!(hub.leave(host), Some(2));
+        assert_eq!(hub.leave(host).last, Some(2));
         hub.announce(2, &[1], false);
         assert_eq!(
             friend_rx.try_recv().ok(),

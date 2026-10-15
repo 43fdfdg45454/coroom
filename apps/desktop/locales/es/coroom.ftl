@@ -32,6 +32,8 @@ app-hay-una-version-nueva = Hay una versión nueva: { $version }
 app-huella-de-name-fingerprint = Huella de { $name }: { $fingerprint }
 app-inicio = Inicio
 app-la-sala-se-cierra-y-todos = La sala se cierra y todos los invitados salen.
+app-name-no-puede-dejarte-entrar = { $name } no puede dejarte entrar ahora
+app-name-te-deja-entrar = { $name } te deja entrar
 app-no-se-pudo-comprobar-err = No se pudo comprobar: { $err }
 app-numero-de-seguridad-con-name = Número de seguridad con { $name }
 app-quitar = Quitar
@@ -53,6 +55,8 @@ backend-no-se-pudo-arrancar-una-tarea = no se pudo arrancar una tarea: { $err }
 backend-sin-audio-en-la-prueba-local = sin audio en la prueba local
 backend-fallo-interno = Fallo interno en «{ $task }»: { $err }. Mira el registro de coroom para enviarlo.
 backend-la-sala-no-respondio = El servidor no respondió en { $secs } s al abrir la sala. Comprueba la conexión y vuelve a intentarlo.
+backend-sin-conexion-para-pedir-entrar = No hay conexión con el servidor para pedir entrar; vuelve a intentarlo en un momento.
+backend-no-se-pudo-pedir-entrar = No se pudo pedir entrar: { $err }
 
 
 ## pantalla-login

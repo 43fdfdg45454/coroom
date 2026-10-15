@@ -10,6 +10,7 @@
 //!   dibujada en su textura solo cuando cambia, va encima.
 //! - [`video`]: el vídeo como widget de `iced` (fotogramas por canal desde la sesión).
 //! - [`settings`]: `settings.toml` en el directorio de datos.
+//! - [`sound`]: el sonido del chat (tono por defecto o elegido) y su selector de ficheros.
 //! - [`system`]: tema claro u oscuro, acento y fuente del sistema.
 //! - [`stats`]: cifras en español para el panel de estadísticas.
 //! - [`shots`]: capturas de cada pantalla fuera de pantalla, con datos de ejemplo.
@@ -24,6 +25,7 @@ pub mod runner;
 pub mod screens;
 pub mod settings;
 pub mod shots;
+pub mod sound;
 pub mod stats;
 pub mod system;
 pub mod video;

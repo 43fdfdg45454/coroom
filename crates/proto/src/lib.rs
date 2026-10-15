@@ -36,8 +36,11 @@ pub mod signal;
 /// datagramas con el estado completo en cada paquete ([`input::InputState`], `queued_us`), el
 /// stream solo para declarar mandos y el `InputReport` por etapas; la 12, el chat de la sala
 /// (`Chat`, `ChatHistory` y `ChatClear`, cifrados de extremo a extremo con la clave de chat de la
-/// época MLS: el relay los reenvía sin poder leerlos).
-pub const PROTOCOL_VERSION: u16 = 12;
+/// época MLS: el relay los reenvía sin poder leerlos); la 13, el *keepalive* de la entrada: el
+/// invitado repite su estado cada [`input::KEEPALIVE_PRESSED`] mientras tiene algo pulsado (y cada
+/// [`input::KEEPALIVE_IDLE`] si no) y el anfitrión suelta lo de quien lleva [`input::STALE_AFTER`]
+/// sin mandar nada.
+pub const PROTOCOL_VERSION: u16 = 13;
 
 /// Identificadores ALPN (RFC 7301) que el socket QUIC usa para demultiplexar conexiones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

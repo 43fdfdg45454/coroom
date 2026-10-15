@@ -13,7 +13,15 @@
 //!   oculto, con los deltas crudos de `DeviceEvent::MouseMotion`.
 //! - **Eventos crudos para [`InputCapture`]**: con el vídeo delante, el teclado va al juego si hay
 //!   permiso (salvo `F11`) y el ratón también cuando la interfaz no lo usa (un clic en la barra no
-//!   llega al anfitrión; con el cursor capturado no llega nada a la interfaz).
+//!   llega al anfitrión; con el cursor capturado no llega nada a la interfaz). En modo escritorio
+//!   la posición del cursor sale hacia el anfitrión **antes** de pasar por la interfaz.
+//! - **Un dibujo por refresco**: los eventos de la ventana se convierten y se acumulan
+//!   ([`Ready::queue`]); la interfaz los recibe todos de golpe en el siguiente `RedrawRequested`
+//!   (como hace `iced_winit`), no se reconstruye por cada evento (un ratón a 1 kHz la
+//!   reconstruiría mil veces por segundo). Solo un clic o la rueda con el vídeo delante pasan al
+//!   momento, porque hay que saber si la interfaz los usó antes de dárselos al anfitrión. Con el
+//!   vídeo delante, mover el cursor solo pide dibujar si está sobre algo de la interfaz
+//!   ([`guest::pointer_over_ui`]).
 //! - Atajos de la aplicación (`Ctrl+Q`, `Ctrl+,`, `F11`, `Esc`, `Tab` y `Mayús+Tab`), el
 //!   portapapeles (`window_clipboard`) y los métodos de entrada (IME).
 //! - **Chat sobre el vídeo**: mientras su campo tiene el foco, el teclado es de la interfaz y no
@@ -41,6 +49,7 @@ use coroom_transport::crypto::Identity;
 use coroom_ui::font::Fonts;
 use iced_core::clipboard::Kind;
 
+use iced_core::event::Status;
 use iced_core::{
     Color, Event as UiEvent, Font, InputMethod, Pixels, Size, mouse, renderer, window,
 };
@@ -134,6 +143,19 @@ struct Ready {
     interaction: mouse::Interaction,
     /// La aplicación pidió salir (`Ctrl+Q` confirmado).
     quit: bool,
+    /// Eventos ya convertidos que la interfaz recibe de golpe en el próximo dibujo.
+    pending: Vec<UiEvent>,
+}
+
+/// Lo que devolvió una pasada de la interfaz ([`Ready::pass`]).
+struct Pass {
+    messages: Vec<Message>,
+    /// El campo del chat tiene el foco.
+    typing: bool,
+    /// Qué quiere la interfaz de la ventana (si llegó a actualizarse).
+    state: Option<(mouse::Interaction, window::RedrawRequest, InputMethod)>,
+    /// Qué hizo con cada evento.
+    statuses: Vec<Status>,
 }
 
 struct Runner {
@@ -391,38 +413,87 @@ impl Runner {
             ime: None,
             interaction: mouse::Interaction::None,
             quit: false,
+            pending: Vec::new(),
         })
     }
 }
 
 impl Ready {
-    /// Pasa eventos por la interfaz; devuelve qué hizo con cada uno.
-    fn process(&mut self, events: &[UiEvent]) -> Vec<iced_core::event::Status> {
+    /// Deja `event` para la interfaz en el próximo dibujo. Los movimientos del cursor seguidos se
+    /// funden en el último: a la interfaz solo le importa dónde está ahora.
+    fn queue(&mut self, event: UiEvent) {
+        if matches!(event, UiEvent::Mouse(mouse::Event::CursorMoved { .. }))
+            && matches!(
+                self.pending.last(),
+                Some(UiEvent::Mouse(mouse::Event::CursorMoved { .. }))
+            )
+        {
+            self.pending.pop();
+        }
+        self.pending.push(event);
+    }
+
+    /// Construye la interfaz, le pasa `events` y, con `draw`, la dibuja en el motor de `iced`
+    /// (lista para [`Compositor::draw_ui`]).
+    fn pass(&mut self, events: &[UiEvent], draw: bool) -> Pass {
         let mut messages = Vec::new();
-        let (statuses, typing) = {
-            let mut interface = UserInterface::build(
-                self.app.view(),
-                self.viewport.logical_size(),
-                std::mem::take(&mut self.cache),
-                &mut self.renderer,
-            );
-            let (_, statuses) = interface.update(
-                events,
-                self.cursor,
-                &mut self.renderer,
-                &mut self.clipboard,
-                &mut messages,
-            );
-            let typing = chat::active(&self.app) && chat_focused(&mut interface, &self.renderer);
-            self.cache = interface.into_cache();
-            (statuses, typing)
+        let theme = self.app.theme;
+        let mut interface = UserInterface::build(
+            self.app.view(),
+            self.viewport.logical_size(),
+            std::mem::take(&mut self.cache),
+            &mut self.renderer,
+        );
+        let (state, statuses) = interface.update(
+            events,
+            self.cursor,
+            &mut self.renderer,
+            &mut self.clipboard,
+            &mut messages,
+        );
+        let state = match state {
+            user_interface::State::Updated {
+                mouse_interaction,
+                redraw_request,
+                input_method,
+                ..
+            } => Some((mouse_interaction, redraw_request, input_method)),
+            user_interface::State::Outdated => None,
         };
-        for message in messages {
+        let typing = chat::active(&self.app) && chat_focused(&mut interface, &self.renderer);
+        if draw {
+            interface.draw(
+                &mut self.renderer,
+                &theme,
+                &renderer::Style {
+                    text_color: theme.text_color(),
+                },
+                self.cursor,
+            );
+        }
+        self.cache = interface.into_cache();
+        Pass {
+            messages,
+            typing,
+            state,
+            statuses,
+        }
+    }
+
+    /// Pasa ahora por la interfaz lo pendiente y `event` (un clic o la rueda con el vídeo
+    /// delante: hay que saber si la interfaz lo usó antes de dárselo al anfitrión). Devuelve si
+    /// la interfaz usó `event`.
+    fn process_now(&mut self, event: UiEvent) -> bool {
+        let mut events = std::mem::take(&mut self.pending);
+        events.push(event);
+        let pass = self.pass(&events, false);
+        let captured = pass.statuses.last() == Some(&Status::Captured);
+        for message in pass.messages {
             self.dispatch(message);
         }
-        self.set_composing(typing);
+        self.set_composing(pass.typing);
         self.window.request_redraw();
-        statuses
+        captured
     }
 
     /// El campo del chat ganó o perdió el foco (un clic, `Tab`): la aplicación lo sabe y, al
@@ -483,6 +554,15 @@ impl Ready {
         self.run_effects(effects);
         if self.app.guest.is_none() && self.input.is_some() {
             self.detach_input();
+        }
+    }
+
+    /// Guarda ya, en este hilo, los ajustes que cambiaron en los últimos cientos de ms y aún no se
+    /// guardaron. Para los caminos de cierre: el proceso termina justo después y un guardado en
+    /// segundo plano se perdería.
+    fn save_settings_now(&mut self) {
+        if self.app.flush_settings().is_some() {
+            self.backend.save_settings(&self.app, true);
         }
     }
 
@@ -684,6 +764,10 @@ impl Ready {
         if !(self.modifiers.control_key() && self.modifiers.alt_key()) {
             return false;
         }
+        // Con un diálogo abierto (¿Salir de la sala?…) los atajos de la sala esperan.
+        if self.app.dialog.is_some() {
+            return false;
+        }
         let keys = shortcut_keys(&self.app.settings.input.shortcuts);
         if code == keys.chat && chat::active(&self.app) {
             self.dispatch(Message::Chat(chat::Msg::Toggle));
@@ -746,6 +830,8 @@ impl Ready {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        // Si la barra del vídeo aparece con este evento (un movimiento), hay que dibujarla.
+        let bar_was_visible = self.bar_visible();
         match &event {
             WindowEvent::RedrawRequested => {
                 self.redraw(event_loop);
@@ -755,6 +841,7 @@ impl Ready {
                 if self.app.host.is_open() && !self.app.probe {
                     self.dispatch(Message::Shortcut(Shortcut::Quit));
                 } else {
+                    self.save_settings_now();
                     event_loop.exit();
                 }
                 return;
@@ -767,7 +854,16 @@ impl Ready {
             }
             WindowEvent::ScaleFactorChanged { .. } => self.resized = true,
             WindowEvent::Focused(focused) => self.dispatch(Message::WindowFocused(*focused)),
-            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+                // La captura sigue Ctrl y Alt por sus teclas; al volver el foco (o si una
+                // pulsación se perdió) se reajusta con lo que dice el sistema, sin enviar nada.
+                if let Some(input) = self.input.as_mut() {
+                    input
+                        .capture
+                        .set_modifiers(self.modifiers.control_key(), self.modifiers.alt_key());
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = mouse::Cursor::Available(conversion::cursor_position(
                     *position,
@@ -885,18 +981,54 @@ impl Ready {
         let Some(converted) = converted else {
             return;
         };
-        let statuses = self.process(std::slice::from_ref(&converted));
-        let ignored = statuses
-            .first()
-            .is_none_or(|status| *status == iced_core::event::Status::Ignored);
-        // El cursor y los clics sobre el vídeo (no sobre la barra) van al anfitrión.
-        if capture_if_ignored
-            && (ignored || matches!(event, WindowEvent::CursorMoved { .. }))
-            && let Some(input) = self.input.as_mut()
-        {
-            let actions = input.capture.on_window_event(&event);
-            self.apply(actions);
+        match &event {
+            // Modo escritorio sobre el vídeo: la posición sale hacia el anfitrión ya, y la
+            // interfaz la ve en el próximo dibujo, si es que le importa.
+            WindowEvent::CursorMoved { .. } if capture_if_ignored => {
+                if let Some(input) = self.input.as_mut() {
+                    let actions = input.capture.on_window_event(&event);
+                    self.apply(actions);
+                }
+                self.queue(converted);
+                if !bar_was_visible || self.pointer_over_ui() {
+                    self.window.request_redraw();
+                }
+            }
+            // Un clic o la rueda sobre el vídeo (no sobre la barra) van al anfitrión.
+            WindowEvent::MouseInput { .. } | WindowEvent::MouseWheel { .. }
+                if capture_if_ignored =>
+            {
+                let captured = self.process_now(converted);
+                if !captured && let Some(input) = self.input.as_mut() {
+                    let actions = input.capture.on_window_event(&event);
+                    self.apply(actions);
+                }
+            }
+            _ => {
+                self.queue(converted);
+                self.window.request_redraw();
+            }
         }
+    }
+
+    /// Si la barra del vídeo se ve ahora.
+    fn bar_visible(&self) -> bool {
+        self.app
+            .guest
+            .as_ref()
+            .is_some_and(|guest| guest.bar_visible(self.app.now))
+    }
+
+    /// Con el vídeo delante, si a la interfaz le importa dónde está el cursor: sobre algo que
+    /// reacciona (barra, panel, píldora, burbujas, toasts) o viniendo de algo que reaccionaba.
+    fn pointer_over_ui(&self) -> bool {
+        if self.interaction != mouse::Interaction::None {
+            return true;
+        }
+        let Some(position) = self.cursor.position() else {
+            return false;
+        };
+        guest::pointer_over_ui(&self.app, position, self.viewport.logical_size())
     }
 
     fn reconfigure(&mut self) {
@@ -962,63 +1094,27 @@ impl Ready {
             event_loop.exit();
             return;
         }
-        let mut messages = Vec::new();
-        let mut ime = None;
-        let theme = self.app.theme;
-        let mut interface = UserInterface::build(
-            self.app.view(),
-            self.viewport.logical_size(),
-            std::mem::take(&mut self.cache),
-            &mut self.renderer,
-        );
-        let (state, _) = interface.update(
-            &[UiEvent::Window(window::Event::RedrawRequested(now))],
-            self.cursor,
-            &mut self.renderer,
-            &mut self.clipboard,
-            &mut messages,
-        );
-        if let user_interface::State::Updated {
-            mouse_interaction,
-            redraw_request,
-            input_method,
-            ..
-        } = state
-        {
-            let grabbed = self
-                .input
-                .as_ref()
-                .is_some_and(|input| input.capture.grabbed());
-            if !grabbed && mouse_interaction != self.interaction {
-                match conversion::mouse_interaction(mouse_interaction) {
-                    Some(icon) => {
-                        self.window.set_cursor(icon);
-                        self.window.set_cursor_visible(true);
-                    }
-                    None => self.window.set_cursor_visible(false),
-                }
-                self.interaction = mouse_interaction;
+        // Los eventos acumulados desde el último dibujo y el `RedrawRequested`, en una pasada.
+        let mut events = std::mem::take(&mut self.pending);
+        events.push(UiEvent::Window(window::Event::RedrawRequested(now)));
+        let mut pass = self.pass(&events, true);
+        self.apply_state(pass.state.take());
+        if !pass.messages.is_empty() || pass.typing != self.app.chat.composing {
+            // Los eventos cambiaron la aplicación: la interfaz se reconstruye con el estado nuevo
+            // antes de dibujarla (como `iced_winit`), para no enseñar el de antes del clic.
+            for message in pass.messages {
+                self.dispatch(message);
             }
-            match redraw_request {
-                window::RedrawRequest::NextFrame => self.window.request_redraw(),
-                window::RedrawRequest::At(at) => {
-                    self.redraw_at = Some(self.redraw_at.map_or(at, |old| old.min(at)));
-                }
-                window::RedrawRequest::Wait => {}
+            self.set_composing(pass.typing);
+            if self.should_exit() {
+                event_loop.exit();
+                return;
             }
-            ime = Some(input_method);
-        }
-        interface.draw(
-            &mut self.renderer,
-            &theme,
-            &renderer::Style {
-                text_color: theme.text_color(),
-            },
-            self.cursor,
-        );
-        self.cache = interface.into_cache();
-        if let Some(method) = ime {
-            self.input_method(method);
+            pass = self.pass(
+                &[UiEvent::Window(window::Event::RedrawRequested(now))],
+                true,
+            );
+            self.apply_state(pass.state.take());
         }
         // La interfaz va a su textura (transparente donde no dibuja nada: el vídeo se ve
         // debajo) y el compositor la pone sobre el fondo y el vídeo y entrega.
@@ -1028,12 +1124,49 @@ impl Ready {
         self.compositor.draw_ui(self.app.backdrop(), |target| {
             let _ = renderer.present(Some(Color::TRANSPARENT), format, target, viewport);
         });
-        for message in messages {
-            self.dispatch(message);
+        if !pass.messages.is_empty() {
+            for message in pass.messages {
+                self.dispatch(message);
+            }
+            self.window.request_redraw();
         }
+        self.set_composing(pass.typing);
         if self.app.animating() {
             self.window.request_redraw();
         }
+    }
+
+    /// Lo que la interfaz quiere de la ventana tras una pasada: el icono del cursor, cuándo volver
+    /// a dibujar y el método de entrada.
+    fn apply_state(
+        &mut self,
+        state: Option<(mouse::Interaction, window::RedrawRequest, InputMethod)>,
+    ) {
+        let Some((mouse_interaction, redraw_request, input_method)) = state else {
+            return;
+        };
+        let grabbed = self
+            .input
+            .as_ref()
+            .is_some_and(|input| input.capture.grabbed());
+        if !grabbed && mouse_interaction != self.interaction {
+            match conversion::mouse_interaction(mouse_interaction) {
+                Some(icon) => {
+                    self.window.set_cursor(icon);
+                    self.window.set_cursor_visible(true);
+                }
+                None => self.window.set_cursor_visible(false),
+            }
+            self.interaction = mouse_interaction;
+        }
+        match redraw_request {
+            window::RedrawRequest::NextFrame => self.window.request_redraw(),
+            window::RedrawRequest::At(at) => {
+                self.redraw_at = Some(self.redraw_at.map_or(at, |old| old.min(at)));
+            }
+            window::RedrawRequest::Wait => {}
+        }
+        self.input_method(input_method);
     }
 
     /// Si hay que cerrar: salir confirmado o, en `probe`/`join` con ventana, la sala terminó.
@@ -1185,6 +1318,7 @@ impl ApplicationHandler<UserEvent> for Runner {
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(ready) = self.ready.as_mut() {
+            ready.save_settings_now();
             ready.detach_input();
             self.result = ready.backend.shutdown();
         }

@@ -19,7 +19,7 @@ use coroom_transport::proto::api::{
 use coroom_transport::proto::control::Role;
 use coroom_transport::proto::hex;
 use coroom_transport::proto::media::{ObjectHeader, Track};
-use coroom_transport::proto::signal::{ErrorCode, SignalMessage};
+use coroom_transport::proto::signal::{Activity, ErrorCode, SignalMessage};
 use coroom_transport::{RelayInfo, SignalClient, TransportError, connect};
 use http::Method;
 use serde_json::{Value, json};
@@ -481,6 +481,225 @@ async fn friends_see_each_other_and_only_friends_can_be_invited() {
     })
     .await;
     assert_eq!(error, ErrorCode::NotFriend);
+    server.stop().await;
+}
+
+/// «Pedir entrar»: un amigo ve que el otro tiene una sala abierta (`Activity`), le pide entrar, el
+/// anfitrión lo invita o lo rechaza, y quien no es amigo o no tiene sala no puede.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn friends_can_ask_to_join_an_open_room() {
+    let server = start(|_| {}).await;
+    let admin = server.admin().await;
+    let (ana_id, ana) = server.user(&admin, "ana").await;
+    let (bea_id, bea) = server.user(&admin, "bea").await;
+    let (carla_id, carla) = server.user(&admin, "carla").await;
+    let ana_api = server.api_with(&ana.token);
+    let bea_api = server.api_with(&bea.token);
+    let ana_user = ana.user.id;
+    let bea_user = bea.user.id;
+    ana_api.add_friend("bea").await.expect("solicitud");
+    let incoming = bea_api.friends().await.expect("amigos").incoming;
+    bea_api
+        .accept_friend(incoming[0].id)
+        .await
+        .expect("aceptar");
+
+    let (_ana_endpoint, mut ana_signal) = server.signal(&ana_id, &ana.token).await;
+    let (_bea_endpoint, mut bea_signal) = server.signal(&bea_id, &bea.token).await;
+    let (_carla_endpoint, mut carla_signal) = server.signal(&carla_id, &carla.token).await;
+    next_matching(&mut bea_signal, |message| match message {
+        SignalMessage::Presence { user, online: true } if user == ana_user => Some(()),
+        _ => None,
+    })
+    .await;
+
+    // Sin sala abierta no hay a dónde pedir entrar.
+    bea_signal
+        .send(&SignalMessage::JoinRequest { to_user: ana_user })
+        .await
+        .expect("JoinRequest");
+    let error = next_matching(&mut bea_signal, |message| match message {
+        SignalMessage::Error { code, .. } => Some(code),
+        _ => None,
+    })
+    .await;
+    assert_eq!(error, ErrorCode::RoomNotFound);
+    assert_eq!(
+        bea_api.friends().await.expect("amigos").friends[0].activity,
+        Activity::Idle
+    );
+
+    // ana abre una sala: bea lo ve al momento y en la lista de amigos.
+    ana_signal
+        .send(&SignalMessage::CreateRoom {
+            identity_pk: ana_id.public_key(),
+            name: "Sala".to_owned(),
+        })
+        .await
+        .expect("CreateRoom");
+    let code = next_matching(&mut ana_signal, |message| match message {
+        SignalMessage::RoomCreated { code } => Some(code),
+        _ => None,
+    })
+    .await;
+    let activity = next_matching(&mut bea_signal, |message| match message {
+        SignalMessage::Activity { user, activity } if user == ana_user => Some(activity),
+        _ => None,
+    })
+    .await;
+    assert_eq!(activity, Activity::Hosting);
+    assert_eq!(
+        bea_api.friends().await.expect("amigos").friends[0].activity,
+        Activity::Hosting
+    );
+
+    // Quien no es amigo no puede pedir entrar.
+    carla_signal
+        .send(&SignalMessage::JoinRequest { to_user: ana_user })
+        .await
+        .expect("JoinRequest");
+    let error = next_matching(&mut carla_signal, |message| match message {
+        SignalMessage::Error { code, .. } => Some(code),
+        _ => None,
+    })
+    .await;
+    assert_eq!(error, ErrorCode::NotFriend);
+
+    // bea pide entrar: le llega al anfitrión con su nombre; repetirlo enseguida no vale.
+    bea_signal
+        .send(&SignalMessage::JoinRequest { to_user: ana_user })
+        .await
+        .expect("JoinRequest");
+    let requested = next_matching(&mut ana_signal, |message| match message {
+        SignalMessage::JoinRequested {
+            from_user,
+            from_name,
+        } => Some((from_user, from_name)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(requested, (bea_user, "bea (prueba)".to_owned()));
+    bea_signal
+        .send(&SignalMessage::JoinRequest { to_user: ana_user })
+        .await
+        .expect("JoinRequest");
+    let error = next_matching(&mut bea_signal, |message| match message {
+        SignalMessage::Error { code, .. } => Some(code),
+        _ => None,
+    })
+    .await;
+    assert_eq!(error, ErrorCode::BadRequest);
+
+    // «Ahora no»: bea se entera; una segunda negativa sin petición no tiene a quién responder.
+    ana_signal
+        .send(&SignalMessage::JoinDecline { to_user: bea_user })
+        .await
+        .expect("JoinDecline");
+    let declined = next_matching(&mut bea_signal, |message| match message {
+        SignalMessage::JoinDeclined {
+            from_user,
+            from_name,
+        } => Some((from_user, from_name)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(declined, (ana_user, "ana (prueba)".to_owned()));
+    ana_signal
+        .send(&SignalMessage::JoinDecline { to_user: bea_user })
+        .await
+        .expect("JoinDecline");
+    let error = next_matching(&mut ana_signal, |message| match message {
+        SignalMessage::Error { code, .. } => Some(code),
+        _ => None,
+    })
+    .await;
+    assert_eq!(error, ErrorCode::BadRequest);
+    // Solo un anfitrión responde.
+    bea_signal
+        .send(&SignalMessage::JoinDecline { to_user: ana_user })
+        .await
+        .expect("JoinDecline");
+    let error = next_matching(&mut bea_signal, |message| match message {
+        SignalMessage::Error { code, .. } => Some(code),
+        _ => None,
+    })
+    .await;
+    assert_eq!(error, ErrorCode::BadRequest);
+
+    // Tras la negativa puede volver a pedir; esta vez ana la deja entrar invitándola.
+    bea_signal
+        .send(&SignalMessage::JoinRequest { to_user: ana_user })
+        .await
+        .expect("JoinRequest");
+    next_matching(&mut ana_signal, |message| match message {
+        SignalMessage::JoinRequested { from_user, .. } if from_user == bea_user => Some(()),
+        _ => None,
+    })
+    .await;
+    ana_signal
+        .send(&SignalMessage::Invite {
+            to_user: bea_user,
+            code: code.clone(),
+        })
+        .await
+        .expect("Invite");
+    let invited = next_matching(&mut bea_signal, |message| match message {
+        SignalMessage::Invited {
+            from_user, code, ..
+        } if from_user == ana_user => Some(code),
+        _ => None,
+    })
+    .await;
+    assert_eq!(invited, code);
+    bea_signal
+        .send(&SignalMessage::JoinRoom {
+            code,
+            identity_pk: bea_id.public_key(),
+            key_package: Vec::new(),
+        })
+        .await
+        .expect("JoinRoom");
+    next_matching(&mut bea_signal, |message| match message {
+        SignalMessage::Joined { .. } => Some(()),
+        _ => None,
+    })
+    .await;
+    // Dentro de la sala, sus amigos la ven «jugando»…
+    let activity = next_matching(&mut ana_signal, |message| match message {
+        SignalMessage::Activity { user, activity } if user == bea_user => Some(activity),
+        _ => None,
+    })
+    .await;
+    assert_eq!(activity, Activity::Playing);
+    assert_eq!(
+        ana_api.friends().await.expect("amigos").friends[0].activity,
+        Activity::Playing
+    );
+    // …y al cerrar ana la sala, bea vuelve a estar disponible para los suyos (ana ya no está).
+    drop(ana_signal);
+    next_matching(&mut bea_signal, |message| match message {
+        SignalMessage::Presence {
+            user,
+            online: false,
+        } if user == ana_user => Some(()),
+        _ => None,
+    })
+    .await;
+    let (_ana_endpoint, mut ana_signal) = server.signal(&ana_id, &ana.token).await;
+    next_matching(&mut ana_signal, |message| match message {
+        SignalMessage::Presence { user, online: true } if user == bea_user => Some(()),
+        _ => None,
+    })
+    .await;
+    // Al autenticarse solo se anuncia la actividad distinta de «disponible».
+    assert_eq!(
+        bea_api.friends().await.expect("amigos").friends[0].activity,
+        Activity::Idle
+    );
+    assert_eq!(
+        ana_api.friends().await.expect("amigos").friends[0].activity,
+        Activity::Idle
+    );
     server.stop().await;
 }
 

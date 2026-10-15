@@ -28,7 +28,7 @@ use coroom_transport::Path;
 use coroom_ui::Element;
 use coroom_ui::icon::{Icon, icon_with};
 use coroom_ui::style::{ButtonClass, ContainerClass, SvgClass, TextClass};
-use coroom_ui::theme::{Mode, Palette, Tone};
+use coroom_ui::theme::{Palette, Tone};
 use coroom_ui::tokens::{motion, size, space, text as type_size};
 use coroom_ui::widget::{self as ui};
 use iced_core::alignment::{Horizontal, Vertical};
@@ -39,7 +39,8 @@ use iced_widget::{Column, Space, button, center, column, container, row, scrolla
 use super::chat::{self, Surface};
 use super::diagnostics;
 use crate::ui::app::{
-    App, Dialog, Effect, Event, HEADERBAR_HEIGHT, Invitation, Message, Page, Screen, quality_tone,
+    App, Dialog, Effect, EndKind, Event, HEADERBAR_HEIGHT, Invitation, Message, Page, Screen,
+    quality_tone,
 };
 use crate::ui::settings::{KnownPeer, VoiceMode};
 use crate::ui::stats;
@@ -50,6 +51,9 @@ pub const ESTIMATE_DWELL: Duration = Duration::from_millis(1500);
 
 /// Lo que tarda la barra en aparecer.
 const BAR_IN: Duration = motion::PANEL;
+
+/// Lo que se ve la píldora a pantalla completa (sin la barra) cuando cambia el nivel de latencia.
+pub const PILL_FLASH: Duration = Duration::from_millis(2500);
 
 /// Estadísticas del invitado (las manda el backend cada 250 ms).
 #[derive(Debug, Clone, PartialEq)]
@@ -173,6 +177,9 @@ pub struct State {
     pub decode_window: Option<(Instant, u64)>,
     /// Último aviso de vídeo dañado.
     pub corrupt_notice_at: Option<Instant>,
+    /// Cuándo cambió por última vez el nivel de la latencia (a pantalla completa, la píldora se
+    /// enseña un momento).
+    pub level_changed_at: Option<Instant>,
 }
 
 /// Ventana en la que se cuentan los errores de decodificación.
@@ -238,20 +245,46 @@ impl State {
             now,
             decode_window: None,
             corrupt_notice_at: None,
+            level_changed_at: None,
         }
     }
 
-    /// Si hay algo animándose (los pasos, la cuenta atrás de la reconexión, la entrada de la
-    /// barra).
+    /// Si hay algo animándose a cada refresco: solo la entrada de la barra. Los pasos de la
+    /// conexión y la cuenta atrás de la reconexión cambian a plazos fijos ([`State::next_tick`]),
+    /// no hace falta dibujar a 60 Hz mientras tanto.
     pub fn animating(&self) -> bool {
-        self.phase == Phase::Connecting
-            || self.reconnecting.is_some()
-            || (self.bar_visible(self.now) && self.now.duration_since(self.bar_shown_at) < BAR_IN)
+        self.bar_visible(self.now) && self.now.duration_since(self.bar_shown_at) < BAR_IN
     }
 
-    /// Próximo momento en que cambia algo sin eventos (la barra se oculta).
+    /// Próximo momento en que cambia algo sin eventos: la barra se oculta, la píldora deja de
+    /// verse, acaba la espera de la estimación (pasa al vídeo) o la cuenta atrás de la reconexión
+    /// baja un segundo.
     pub fn next_tick(&self) -> Option<Instant> {
-        (self.phase == Phase::Video && self.bar_until > self.now).then_some(self.bar_until)
+        let now = self.now;
+        let mut next: Option<Instant> = None;
+        let mut consider = |at: Instant| {
+            if at > now {
+                next = Some(next.map_or(at, |next| next.min(at)));
+            }
+        };
+        if self.phase == Phase::Video {
+            consider(self.bar_until);
+            if let Some(at) = self.level_changed_at {
+                consider(at + PILL_FLASH);
+            }
+        } else if self.feed.has_frame()
+            && let Some(estimate) = self.estimate
+        {
+            consider(estimate.at + ESTIMATE_DWELL);
+        }
+        if let Some(reconnecting) = &self.reconnecting {
+            let wait = reconnecting.at.saturating_duration_since(now);
+            if !wait.is_zero() {
+                // El texto enseña los segundos redondeados hacia arriba: cambia en cada entero.
+                consider(reconnecting.at - Duration::from_secs(wait.as_secs()));
+            }
+        }
+        next
     }
 
     /// Si la barra se ve.
@@ -260,9 +293,15 @@ impl State {
             && (now < self.bar_until || self.panel.is_some() || self.reconnecting.is_some())
     }
 
-    /// Si la píldora se ve: siempre en ventana; a pantalla completa, con la barra.
+    /// Si la píldora se ve: siempre en ventana; a pantalla completa, con la barra o un momento
+    /// ([`PILL_FLASH`]) tras cambiar el nivel de latencia.
     pub fn pill_visible(&self, now: Instant, fullscreen: bool) -> bool {
-        self.phase == Phase::Video && (!fullscreen || self.bar_visible(now))
+        self.phase == Phase::Video
+            && (!fullscreen
+                || self.bar_visible(now)
+                || self
+                    .level_changed_at
+                    .is_some_and(|at| now.duration_since(at) < PILL_FLASH))
     }
 
     /// Enseña la barra durante [`motion::BAR_HIDE`].
@@ -477,6 +516,35 @@ pub fn start(app: &mut App, code: String) -> Vec<Effect> {
     app.screen = Screen::Guest;
     app.account_menu = false;
     vec![Effect::StopLobby, Effect::Join(code)]
+}
+
+/// Con el vídeo delante, si a la interfaz le importa que el cursor esté en `position` (lógica,
+/// en una ventana de `size`): sobre la franja de la barra (y el aviso de reconexión), el panel
+/// lateral, la píldora y las burbujas del chat abajo, o con toasts a la vista. Fuera de ahí solo
+/// hay vídeo: moverse no cambia nada que dibujar, y la ventana se ahorra reconstruir la interfaz.
+pub fn pointer_over_ui(app: &App, position: iced_core::Point, size: iced_core::Size) -> bool {
+    let Some(state) = app.guest.as_ref() else {
+        return true;
+    };
+    if state.phase != Phase::Video || !app.toasts.is_empty() || state.reconnecting.is_some() {
+        return true;
+    }
+    let now = app.now;
+    let top = space::S + size::VIDEO_BAR + space::S;
+    if state.bar_visible(now) && position.y <= top {
+        return true;
+    }
+    if state.panel.is_some() && position.x >= size.width - (size::STATS_PANEL + 2.0 * space::S) {
+        return true;
+    }
+    // Abajo: la píldora (izquierda) y las burbujas del chat (derecha, hasta tres).
+    let bottom = if app.chat.bubbles.is_empty() {
+        size::CONTROL + 2.0 * space::S
+    } else {
+        4.0 * (size::CONTROL + space::S) + 2.0 * space::S
+    };
+    (state.pill_visible(now, app.fullscreen) || !app.chat.bubbles.is_empty())
+        && position.y >= size.height - bottom
 }
 
 /// Sale de la sala.
@@ -720,7 +788,11 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                     stats.summary.decode_errors,
                     now,
                 );
+                let level_before = state.level();
                 state.stats = Some(*stats);
+                if state.level() != level_before && level_before.is_some() {
+                    state.level_changed_at = Some(now);
+                }
                 state.tick(now);
             }
             if let Some((tone, text)) = notice {
@@ -742,20 +814,16 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                         text: t!("room-el-anfitrion-ha-cerrado-la-sala").to_owned(),
                     });
                 }
-                Some(reason) => {
-                    let lower = reason.to_lowercase();
-                    let title = if lower.contains("expulsado") {
-                        t!("room-el-anfitrion-te-ha-expulsado-de")
-                    } else if lower.contains("cerrado la sala") {
-                        t!("room-el-anfitrion-ha-cerrado-la-sala-2")
-                    } else if lower.contains("red") || lower.contains("conexión") {
-                        t!("room-se-perdio-la-conexion-con-la")
-                    } else {
-                        t!("room-la-sesion-ha-terminado")
+                Some(end) => {
+                    let title = match end.kind {
+                        EndKind::Removed => t!("room-el-anfitrion-te-ha-expulsado-de"),
+                        EndKind::RoomClosed => t!("room-el-anfitrion-ha-cerrado-la-sala-2"),
+                        EndKind::Network => t!("room-se-perdio-la-conexion-con-la"),
+                        EndKind::Other => t!("room-la-sesion-ha-terminado"),
                     };
                     app.dialog = Some(Dialog::SessionEnded {
                         title: title.to_owned(),
-                        text: reason,
+                        text: end.text,
                     });
                 }
             }
@@ -1162,9 +1230,10 @@ fn overlay_text<'a>(
         .class(TextClass::OverlaySecondary)
 }
 
-/// Colores del modo oscuro (el panel y la barra flotan siempre oscuros sobre el vídeo).
-fn dark(app: &App) -> Palette {
-    Palette::new(Mode::Dark, app.accent())
+/// Colores del modo oscuro (el panel y la barra flotan siempre oscuros sobre el vídeo); la
+/// aplicación los tiene calculados con el tema.
+fn dark(app: &App) -> &Palette {
+    &app.dark
 }
 
 /// Insignia del nivel con la latencia añadida («Buena · 48 ms»), o «Midiendo».
@@ -1224,7 +1293,7 @@ fn bar_facts(state: &State) -> String {
 
 fn top_bar<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     let left = row![
-        level_badge(state, &dark(app)),
+        level_badge(state, dark(app)),
         column![
             text(room_title(state))
                 .size(type_size::BODY)
@@ -2433,6 +2502,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::ui::app::GuestEnd;
     use crate::ui::app::tests::app;
     use coroom_render::{PresentFrame, PresentImage};
     use coroom_session::SessionError;
@@ -2686,9 +2756,9 @@ mod tests {
         })));
         assert!(app.guest.as_ref().is_some_and(|g| g.reconnecting.is_none()));
         assert!(app.toasts.iter().any(|t| t.text.contains("recuperada")));
-        app.update(Message::Event(Event::GuestEnded(Some(
-            SessionError::Removed.to_string(),
-        ))));
+        app.update(Message::Event(Event::GuestEnded(Some(GuestEnd::from(
+            SessionError::Removed,
+        )))));
         assert!(matches!(
             &app.dialog,
             Some(Dialog::SessionEnded { title, .. }) if title.contains("expulsado")
@@ -2735,5 +2805,66 @@ mod tests {
         let app = app();
         let dark = dark(&app);
         assert_ne!(dark.accent_text.color(), iced_core::Color::TRANSPARENT);
+    }
+
+    #[test]
+    fn nothing_animates_while_connecting_and_the_next_tick_is_a_deadline() {
+        let mut app = app();
+        shots::joined(&mut app, true, false);
+        let state = app.guest.as_ref().expect("invitado");
+        assert_eq!(state.phase, Phase::Connecting);
+        assert!(!state.animating(), "los pasos no se animan a cada refresco");
+        assert_eq!(
+            state.next_tick(),
+            None,
+            "sin vídeo no hay plazo que esperar"
+        );
+        // Con vídeo, el plazo es el final de la espera de la estimación.
+        let feed = Arc::clone(&state.feed);
+        feed.push(frame(), None, None);
+        let estimate_at = state.estimate.expect("estimación").at;
+        assert_eq!(state.next_tick(), Some(estimate_at + ESTIMATE_DWELL));
+        // Reconectando: la cuenta atrás cambia en cada segundo entero, no a 60 Hz.
+        app.update(Message::Event(Event::Guest(SessionEvent::Reconnecting {
+            attempt: 1,
+            of: 3,
+            retry_in: Duration::from_millis(2400),
+            reason: "red".into(),
+        })));
+        let state = app.guest.as_ref().expect("invitado");
+        assert!(!state.animating());
+        let next = state.next_tick().expect("plazo");
+        assert_eq!(next, app.now + Duration::from_millis(400));
+    }
+
+    #[test]
+    fn the_pointer_only_matters_to_the_interface_over_its_pieces() {
+        use iced_core::{Point, Size};
+        let mut app = app();
+        shots::video(&mut app);
+        let size = Size::new(1280.0, 800.0);
+        let state = app.guest.as_ref().expect("invitado");
+        assert!(state.bar_visible(app.now));
+        // Sobre la barra (arriba) y la píldora (abajo), sí; en medio del vídeo, no.
+        assert!(pointer_over_ui(&app, Point::new(600.0, 20.0), size));
+        assert!(pointer_over_ui(&app, Point::new(40.0, 790.0), size));
+        assert!(!pointer_over_ui(&app, Point::new(600.0, 400.0), size));
+        // Con el panel abierto, la franja derecha también.
+        app.update(Message::Guest(Msg::TogglePanel(Tab::Connection)));
+        assert!(pointer_over_ui(&app, Point::new(1200.0, 400.0), size));
+        assert!(!pointer_over_ui(&app, Point::new(600.0, 400.0), size));
+        // A pantalla completa, con la barra escondida, la píldora se enseña un momento cuando
+        // cambia el nivel y luego se va.
+        app.update(Message::Guest(Msg::ClosePanel));
+        app.fullscreen = true;
+        let now = app.now;
+        let state = app.guest.as_mut().expect("invitado");
+        state.bar_until = now - Duration::from_millis(1);
+        assert!(!state.bar_visible(now));
+        assert!(!state.pill_visible(now, true));
+        state.level_changed_at = Some(now);
+        assert!(state.pill_visible(now, true));
+        assert_eq!(state.next_tick(), Some(now + PILL_FLASH));
+        assert!(!state.pill_visible(now + PILL_FLASH, true));
     }
 }

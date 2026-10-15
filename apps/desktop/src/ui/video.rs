@@ -6,23 +6,27 @@
 //!   interfaz se reconstruya: la marca de presentación del registro de latencia es la de la
 //!   entrega real. Sin compositor (capturas de pantalla, tests), espera a que quien dibuje la
 //!   interfaz lo muestre, como antes.
-//! - [`video_view`]: *widget* de `iced` que ocupa el sitio del vídeo. Con compositor solo le dice
-//!   dónde ([`VideoFeed::set_area`]); sin él dibuja el fotograma con
+//! - [`video_view`]: *widget* de `iced` que ocupa el sitio del vídeo. Con compositor solo anota
+//!   dónde ([`VideoFeed::set_area`]: nunca llama al compositor desde dentro del dibujo de la
+//!   interfaz, que ya compone al terminar); sin él dibuja el fotograma con
 //!   [`coroom_render::layer::VideoLayer`] en la pasada de la interfaz y con su mismo
 //!   `wgpu::Device`. Los planos I420/NV12 se suben como siempre (una copia de CPU a GPU); las
 //!   imágenes Vulkan del decodificador se importan sin copia con el
 //!   [`coroom_render::wgpu::VideoImporter`] del dispositivo compartido.
+//! - [`CursorPump`]: el cursor del anfitrión viaja aparte del vídeo; con compositor, cada
+//!   posición nueva se compone sobre el último fotograma desde un hilo propio (como mucho una vez
+//!   por [`CURSOR_PERIOD`]), sin esperar al siguiente fotograma ni bloquear al hilo de control.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use coroom_render::layer::VideoLayer;
 use coroom_render::wgpu::VideoImporter;
 use coroom_render::{CursorImage, CursorOverlay, PresentFrame, PresentImage};
-use coroom_session::capture::CursorShape;
-use coroom_session::loopback::{DecodedFrame, FrameSink, SinkError};
+use coroom_session::capture::{CursorShape, CursorState};
+use coroom_session::loopback::{CursorSink, DecodedFrame, FrameSink, SinkError};
 use iced_core::{Length, Rectangle, mouse};
 use iced_wgpu::graphics::Viewport;
 use iced_wgpu::primitive::{Pipeline, Primitive};
@@ -36,6 +40,10 @@ use iced_wgpu::wgpu;
 /// Lo que espera el hilo `present` a que la ventana muestre un fotograma (si la ventana no dibuja,
 /// por ejemplo minimizada, el pipeline no se para: sigue y gana el último).
 pub const SHOW_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Intervalo mínimo entre dos composiciones por el cursor solo (sin fotograma nuevo): ~120 Hz,
+/// más que cualquier pantalla corriente; si llegan más posiciones, gana la última.
+pub const CURSOR_PERIOD: Duration = Duration::from_millis(8);
 
 static NEXT_FEED: AtomicU64 = AtomicU64::new(1);
 
@@ -129,15 +137,41 @@ impl VideoFeed {
         self.lock().area
     }
 
-    /// La interfaz dice dónde va el vídeo (píxeles físicos); si cambia, se recompone.
+    /// La interfaz dice dónde va el vídeo (píxeles físicos). Solo lo anota: se llama desde el
+    /// `prepare` del *widget*, dentro del dibujo de la interfaz, y el compositor compone justo
+    /// después con el área nueva. Llamar al compositor desde aquí volvería a tomar su candado en
+    /// el mismo hilo (bloqueo mutuo).
     pub(super) fn set_area(&self, area: [f32; 4]) {
-        let changed = {
-            let mut state = self.lock();
-            let changed = state.area != Some(area);
-            state.area = Some(area);
-            changed
+        self.lock().area = Some(area);
+    }
+
+    /// Cursor nuevo del anfitrión sin fotograma nuevo. Devuelve si cambió algo que dibujar.
+    pub(super) fn set_cursor(
+        &self,
+        cursor: Option<CursorOverlay>,
+        cursor_image: Option<Arc<CursorImage>>,
+    ) -> bool {
+        let mut state = self.lock();
+        if state.frame.is_none() {
+            return false;
+        }
+        let same_image = match (&state.cursor_image, &cursor_image) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b) || a.id == b.id,
+            (None, None) => true,
+            _ => false,
         };
-        if changed && let Some(compositor) = self.compositor() {
+        if state.cursor == cursor && same_image {
+            return false;
+        }
+        state.cursor = cursor;
+        state.cursor_image = cursor_image;
+        true
+    }
+
+    /// Compone y entrega ya lo que haya (el fotograma de siempre con el cursor nuevo), si la
+    /// fuente está en la ventana.
+    pub(super) fn present_now(&self) {
+        if let Some(compositor) = self.compositor() {
             compositor.present_video();
         }
     }
@@ -286,52 +320,181 @@ impl VideoFeed {
     }
 }
 
+/// Última forma del cursor convertida a imagen (se reutiliza mientras no cambie). La comparten
+/// el hilo `present` y el del cursor.
+#[derive(Default)]
+struct CursorCache(Mutex<Option<(Arc<CursorShape>, Arc<CursorImage>)>>);
+
+impl CursorCache {
+    fn image(&self, shape: Option<&Arc<CursorShape>>) -> Option<Arc<CursorImage>> {
+        let shape = shape?;
+        let mut cache = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((last, image)) = cache.as_ref()
+            && (Arc::ptr_eq(shape, last) || last.shape_id == shape.shape_id)
+        {
+            return Some(Arc::clone(image));
+        }
+        let image = Arc::new(to_cursor_image(shape));
+        *cache = Some((Arc::clone(shape), Arc::clone(&image)));
+        Some(image)
+    }
+}
+
+fn overlay(cursor: CursorState) -> CursorOverlay {
+    CursorOverlay {
+        x: cursor.x,
+        y: cursor.y,
+        visible: cursor.visible,
+    }
+}
+
+/// El cursor del anfitrión entre fotogramas (ver el módulo). El hilo de control deja la última
+/// posición ([`CursorSink::cursor_moved`], sin bloquearse) y el hilo «cursor» la compone, como
+/// mucho una vez por [`CURSOR_PERIOD`]; entregar a la superficie puede esperar al refresco con la
+/// sincronización vertical, y eso no debe frenar al control de la sesión.
+pub struct CursorPump {
+    feed: Weak<VideoFeed>,
+    cache: Arc<CursorCache>,
+    pending: Mutex<Option<(CursorState, Option<Arc<CursorShape>>)>>,
+    changed: Condvar,
+    stop: AtomicBool,
+}
+
+impl CursorPump {
+    fn spawn(feed: &Arc<VideoFeed>, cache: Arc<CursorCache>) -> Option<Arc<Self>> {
+        let pump = Arc::new(Self {
+            feed: Arc::downgrade(feed),
+            cache,
+            pending: Mutex::new(None),
+            changed: Condvar::new(),
+            stop: AtomicBool::new(false),
+        });
+        let worker = Arc::clone(&pump);
+        std::thread::Builder::new()
+            .name("cursor".into())
+            .spawn(move || worker.run())
+            .map_err(|err| tracing::warn!(error = %err, "sin hilo para el cursor"))
+            .ok()?;
+        Some(pump)
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        self.changed.notify_all();
+    }
+
+    /// Espera a la próxima posición (`None`: hay que parar).
+    fn next(&self) -> Option<(CursorState, Option<Arc<CursorShape>>)> {
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if self.stop.load(Ordering::Acquire) {
+                return None;
+            }
+            if let Some(item) = pending.take() {
+                return Some(item);
+            }
+            pending = self
+                .changed
+                .wait(pending)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn run(&self) {
+        let mut last = Instant::now() - CURSOR_PERIOD;
+        while let Some((mut cursor, mut shape)) = self.next() {
+            let since = last.elapsed();
+            if since < CURSOR_PERIOD {
+                std::thread::sleep(CURSOR_PERIOD - since);
+                // Mientras se esperaba pudo llegar otra: gana la última.
+                if let Some(newer) = self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take()
+                {
+                    (cursor, shape) = newer;
+                }
+            }
+            let Some(feed) = self.feed.upgrade() else {
+                return;
+            };
+            let image = self.cache.image(shape.as_ref());
+            if feed.set_cursor(Some(overlay(cursor)), image) {
+                feed.present_now();
+            }
+            last = Instant::now();
+        }
+    }
+}
+
+impl CursorSink for CursorPump {
+    fn cursor_moved(&self, cursor: CursorState, shape: Option<Arc<CursorShape>>) {
+        *self.pending.lock().unwrap_or_else(PoisonError::into_inner) = Some((cursor, shape));
+        self.changed.notify_one();
+    }
+}
+
 /// Última etapa del pipeline para la ventana: deja cada fotograma en su [`VideoFeed`] y espera a
 /// que se muestre.
 pub struct FeedSink {
     feed: Arc<VideoFeed>,
-    /// Última forma del cursor convertida (se reutiliza mientras no cambie).
-    cursor: Option<(Arc<CursorShape>, Arc<CursorImage>)>,
+    cache: Arc<CursorCache>,
+    /// El cursor entre fotogramas, con compositor.
+    pump: Option<Arc<CursorPump>>,
     gpu: bool,
+    /// Si el último fotograma llegó a la pantalla.
+    shown: bool,
 }
 
 impl FeedSink {
     /// Presentación en `feed`.
     pub fn new(feed: Arc<VideoFeed>) -> Self {
+        let cache = Arc::new(CursorCache::default());
+        let pump = feed
+            .is_composited()
+            .then(|| CursorPump::spawn(&feed, Arc::clone(&cache)))
+            .flatten();
         Self {
             feed,
-            cursor: None,
+            cache,
+            pump,
             gpu: false,
+            shown: true,
+        }
+    }
+}
+
+impl Drop for FeedSink {
+    fn drop(&mut self) {
+        if let Some(pump) = &self.pump {
+            pump.stop();
         }
     }
 }
 
 impl FrameSink for FeedSink {
     fn present(&mut self, decoded: DecodedFrame) -> Result<(), SinkError> {
-        let cursor = decoded.cursor.map(|cursor| CursorOverlay {
-            x: cursor.x,
-            y: cursor.y,
-            visible: cursor.visible,
-        });
-        let image = match (&decoded.cursor_shape, &self.cursor) {
-            (Some(shape), Some((last, image))) if Arc::ptr_eq(shape, last) => {
-                Some(Arc::clone(image))
-            }
-            (Some(shape), _) => {
-                let image = Arc::new(to_cursor_image(shape));
-                self.cursor = Some((Arc::clone(shape), Arc::clone(&image)));
-                Some(image)
-            }
-            (None, _) => None,
-        };
+        let cursor = decoded.cursor.map(overlay);
+        let image = self.cache.image(decoded.cursor_shape.as_ref());
         let frame = to_present_frame(decoded.frame)?;
         self.gpu = matches!(frame.image, PresentImage::Vulkan(_));
-        self.feed.push_and_wait(frame, cursor, image, SHOW_TIMEOUT);
+        self.shown = self.feed.push_and_wait(frame, cursor, image, SHOW_TIMEOUT);
         Ok(())
     }
 
     fn cpu_copies(&self) -> u32 {
         u32::from(!self.gpu)
+    }
+
+    fn shown(&self) -> bool {
+        self.shown
+    }
+
+    fn cursor_sink(&self) -> Option<Arc<dyn CursorSink>> {
+        self.pump
+            .as_ref()
+            .map(|pump| Arc::clone(pump) as Arc<dyn CursorSink>)
     }
 }
 
@@ -480,5 +643,54 @@ mod tests {
         // Al cerrar no se espera.
         feed.close();
         assert!(!feed.push_and_wait(frame(3), None, None, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn the_sink_reports_whether_the_frame_reached_the_screen() {
+        let feed = VideoFeed::detached();
+        let mut sink = FeedSink::new(Arc::clone(&feed));
+        assert!(sink.pump.is_none(), "sin compositor no hay hilo del cursor");
+        assert!(sink.cursor_sink().is_none());
+        assert!(
+            sink.shown(),
+            "antes del primer fotograma no hay nada que contar"
+        );
+        // La interfaz anota el área sin llamar a nadie.
+        feed.set_area([0.0, 0.0, 2.0, 2.0]);
+        assert_eq!(feed.area(), Some([0.0, 0.0, 2.0, 2.0]));
+        // Sin ventana que lo muestre, el fotograma no llega a la pantalla: es un descarte.
+        let raw = coroom_session::codec::RawFrame::cpu(
+            1,
+            (2, 2),
+            coroom_session::codec::PixelFormat::I420,
+            2,
+            vec![16, 16, 16, 16, 128, 128],
+        );
+        assert!(
+            sink.present(DecodedFrame {
+                frame: raw,
+                cursor: None,
+                cursor_shape: None,
+            })
+            .is_ok()
+        );
+        assert!(!sink.shown());
+        // El cursor solo cuenta como cambio con un fotograma y si de verdad cambia.
+        assert!(feed.set_cursor(
+            Some(CursorOverlay {
+                x: 1,
+                y: 1,
+                visible: true
+            }),
+            None
+        ));
+        assert!(!feed.set_cursor(
+            Some(CursorOverlay {
+                x: 1,
+                y: 1,
+                visible: true
+            }),
+            None
+        ));
     }
 }

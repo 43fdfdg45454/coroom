@@ -21,6 +21,7 @@ chat-sala-de-name = Sala de { $name }
 chat-notificacion-titulo = { $name } · { $room }
 chat-aun-no-disponible = El chat aún no está disponible: faltan las claves de la sala.
 chat-no-hay-sala = No estás en ninguna sala.
+chat-ver-los-n-anteriores = Ver los { $count } anteriores
 
 ## Avisos del sistema (solo en tu equipo)
 chat-entraste-a-la-sala = Entraste a la sala

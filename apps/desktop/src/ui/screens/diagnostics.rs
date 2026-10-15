@@ -152,6 +152,9 @@ pub struct State {
     pub percentile: Percentile,
     /// Líneas de `coroom doctor`, cuando llegan.
     pub doctor: Option<Vec<String>>,
+    /// Las mismas, ya filtradas (sin lo privado ni los nombres) para enseñarlas: se calcula al
+    /// llegar y cuando cambia lo que hay que ocultar, no en cada vista.
+    pub doctor_text: Option<String>,
     /// `coroom doctor` pedido y sin contestar.
     pub doctor_pending: bool,
     /// Como invitado.
@@ -207,6 +210,8 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                     return vec![Effect::RunDoctor];
                 }
             }
+            // Al abrir, con los nombres de ahora (amigos, invitados que llegaron después).
+            refresh_doctor_text(app);
             Vec::new()
         }
         Msg::Close => {
@@ -241,6 +246,7 @@ pub fn on_event(app: &mut App, event: &Event) {
         Event::Doctor(lines) => {
             state.doctor = Some(lines.clone());
             state.doctor_pending = false;
+            refresh_doctor_text(app);
         }
         Event::GuestStarted(_) | Event::GuestEnded(_) => state.guest = GuestSide::default(),
         Event::HostStarted(_) | Event::HostEnded(_) => state.host = HostSide::default(),
@@ -1439,11 +1445,22 @@ fn stages_card<'a>(app: &App, summary: Option<&LatencySummary>) -> Element<'a, M
     .into()
 }
 
+/// Vuelve a filtrar la salida de `coroom doctor` con los nombres que hay que ocultar ahora
+/// (al llegar y al abrir el diagnóstico, cuando puede haber nombres nuevos: amigos, invitados).
+pub fn refresh_doctor_text(app: &mut App) {
+    let text = app
+        .diagnostics
+        .doctor
+        .as_ref()
+        .map(|lines| scrub(&doctor_lines(lines).join("\n"), &private_names(app)));
+    app.diagnostics.doctor_text = text;
+}
+
 fn equipment<'a>(app: &App) -> Element<'a, Message> {
     let state = &app.diagnostics;
-    let content: Element<'a, Message> = match &state.doctor {
-        Some(lines) => {
-            let text = scrub(&doctor_lines(lines).join("\n"), &private_names(app));
+    let content: Element<'a, Message> = match &state.doctor_text {
+        Some(text) => {
+            let text = text.clone();
             container(ui::mono(text, type_size::CAPTION).wrapping(Wrapping::WordOrGlyph))
                 .padding(Padding::from([10.0, 14.0]))
                 .width(Length::Fill)

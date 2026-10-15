@@ -304,6 +304,8 @@ pub struct Room {
     pub guests_muted: bool,
     /// Sonido al llegar un mensaje del chat.
     pub chat_sound: bool,
+    /// Fichero del tono (`None`: el de por defecto; ver `ui::sound`). En Windows solo WAV.
+    pub chat_sound_file: Option<PathBuf>,
     /// Notificación del escritorio con la ventana sin foco.
     pub chat_notifications: bool,
     /// Burbuja de 5 s sobre el vídeo con el panel cerrado.
@@ -315,6 +317,7 @@ impl Default for Room {
         Self {
             guests_muted: false,
             chat_sound: true,
+            chat_sound_file: None,
             chat_notifications: true,
             chat_bubbles: true,
         }
@@ -636,7 +639,7 @@ impl Settings {
                 )
             })?;
         }
-        let temporary = path.with_extension("toml.tmp");
+        let temporary = temporary_path(path);
         std::fs::write(&temporary, text)
             .map_err(|err| t!("settings-no-se-pudieron-guardar-los-ajustes", err = err))?;
         std::fs::rename(&temporary, path)
@@ -662,6 +665,13 @@ impl Settings {
         self.peers.insert(0, peer);
         self.peers.truncate(64);
     }
+}
+
+/// Temporal en el que se escribe antes de renombrar a `path`, junto a él y propio de este proceso:
+/// dos coroom con el mismo directorio de datos no se pisan el temporal (dentro del proceso, los
+/// guardados ya van de uno en uno).
+fn temporary_path(path: &Path) -> PathBuf {
+    path.with_extension(format!("toml.{}.tmp", std::process::id()))
 }
 
 /// Directorio de datos: `COROOM_DATA_DIR` si está definida, si no el del usuario.
@@ -705,6 +715,7 @@ mod tests {
         settings.audio.push_to_talk_key = "CapsLock".into();
         settings.network.force_relay = true;
         settings.network.local_port = 47_000;
+        settings.room.chat_sound_file = Some(PathBuf::from("/home/ana/sonidos/tono.ogg"));
         settings.input.shortcuts.immersive = 'K';
         settings.video.chroma_444 = true;
         settings.video.hdr = true;
@@ -729,10 +740,48 @@ mod tests {
         settings.save(&path).expect("guardar");
         let text = std::fs::read_to_string(&path).expect("leer");
         assert!(text.contains("theme = \"dark\""), "{text}");
-        assert!(!path.with_extension("toml.tmp").exists(), "sin temporales");
+        assert!(
+            text.contains("chat_sound_file = \"/home/ana/sonidos/tono.ogg\""),
+            "{text}"
+        );
+        assert!(!temporary_path(&path).exists(), "sin temporales");
         let (loaded, warning) = Settings::load(&path);
         assert_eq!(warning, None);
         assert_eq!(loaded, settings);
+    }
+
+    /// El temporal del guardado va junto a los ajustes, lleva el pid y no sobrevive al guardado.
+    #[test]
+    fn the_save_temporary_is_unique_per_process_and_cleaned_up() {
+        let dir = tempfile::tempdir().expect("directorio");
+        let path = path_in(dir.path());
+        let temporary = temporary_path(&path);
+        assert_eq!(temporary.parent(), path.parent());
+        assert_ne!(temporary, path);
+        assert_eq!(
+            temporary.extension().and_then(|ext| ext.to_str()),
+            Some("tmp")
+        );
+        let name = temporary
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            name.contains(&std::process::id().to_string()),
+            "{name} lleva el pid"
+        );
+        // Un temporal que otro proceso dejó a medias no estorba.
+        std::fs::write(path.with_extension("toml.1.tmp"), "roto").expect("escribir");
+        Settings::default().save(&path).expect("guardar");
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("listar")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert_eq!(left, ["settings.toml.1.tmp"]);
+        assert!(!temporary.exists());
     }
 
     #[test]

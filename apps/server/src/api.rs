@@ -15,6 +15,7 @@ use coroom_transport::proto::api::{
     SetupStatus, Usage, User, challenge_message,
 };
 use coroom_transport::proto::hex;
+use coroom_transport::proto::signal::Activity;
 
 use crate::ServerState;
 use crate::auth::{self, CHALLENGE_TTL, SESSION_TTL, WEB_SESSION_TTL};
@@ -111,6 +112,11 @@ fn friend_dto(state: &ServerState, user: &UserRow, presence: bool) -> Friend {
         username: user.username.clone(),
         display_name: user.display_name.clone(),
         online: presence && state.hub.is_online(user.id),
+        activity: if presence {
+            state.hub.activity(user.id)
+        } else {
+            Activity::Idle
+        },
     }
 }
 

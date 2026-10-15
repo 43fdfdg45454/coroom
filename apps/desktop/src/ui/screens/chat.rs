@@ -27,7 +27,7 @@ use coroom_ui::icon::{Icon, icon_with};
 use coroom_ui::style::{ButtonClass, ContainerClass, SvgClass, TextClass};
 use coroom_ui::theme::{Mode, Palette, Tone};
 use coroom_ui::tokens::{size, space, text as type_size};
-use coroom_ui::widget as ui;
+use coroom_ui::widget::{self as ui, Kind};
 use coroom_ui::{Element, Renderer};
 use iced_core::text::Wrapping;
 use iced_core::{Alignment, Color, Font, Length, Padding, mouse};
@@ -49,6 +49,8 @@ pub const BUBBLE_LIFE: Duration = Duration::from_secs(5);
 pub const BUBBLES_SHOWN: usize = 3;
 /// Mensajes y avisos que se guardan como mucho (los más antiguos se van).
 pub const ENTRIES_MAX: usize = 500;
+/// Los que se pintan de entrada (los últimos); los anteriores, con «Ver los N anteriores».
+pub const ENTRIES_SHOWN: usize = 150;
 /// Caracteres a partir de los que se ve el contador del campo.
 pub const COUNTER_FROM: usize = CHAT_TEXT_MAX_CHARS - 200;
 /// Tiempo mínimo entre dos sonidos de mensaje (una ráfaga suena una vez).
@@ -56,18 +58,50 @@ const SOUND_GAP: Duration = Duration::from_secs(1);
 /// Cada cuánto se vuelve a leer la zona horaria (cambios de horario).
 const CLOCK_REFRESH: Duration = Duration::from_secs(3600);
 
-/// Un mensaje del chat o un aviso del sistema, con su hora local ya calculada.
+/// Un trozo del texto de un mensaje: su tramo en el texto y adónde lleva si es un enlace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Piece {
+    /// Tramo de bytes en el texto.
+    pub range: std::ops::Range<usize>,
+    /// URL si es un enlace.
+    pub link: Option<String>,
+}
+
+/// Los trozos de `text` ([`segments`]) como tramos, para calcularlos una vez al llegar el mensaje.
+pub fn pieces(text: &str) -> Vec<Piece> {
+    let base = text.as_ptr() as usize;
+    segments(text)
+        .into_iter()
+        .map(|(piece, link)| {
+            let start = piece.as_ptr() as usize - base;
+            Piece {
+                range: start..start + piece.len(),
+                link,
+            }
+        })
+        .collect()
+}
+
+/// Un mensaje del chat o un aviso del sistema, con su hora local ya calculada. Cada entrada
+/// lleva una clave propia y estable (`seq`), con la que la lista conserva lo que `iced` tiene
+/// medido de cada fila aunque las más antiguas se vayan.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Entry {
     /// Mensaje de alguien de la sala.
     Message {
+        /// Clave estable (la pone [`State::push`]).
+        seq: u64,
         /// El mensaje.
         line: ChatLine,
+        /// Sus trozos (texto y enlaces), calculados al llegar.
+        pieces: Vec<Piece>,
         /// `HH:MM`.
         clock: String,
     },
     /// Aviso local (en gris y centrado): trozos de texto y si van en negrita.
     System {
+        /// Clave estable (la pone [`State::push`]).
+        seq: u64,
         /// Trozos.
         spans: Vec<(String, bool)>,
         /// Hora Unix en ms (para ordenarlo con el historial).
@@ -82,6 +116,18 @@ impl Entry {
         match self {
             Entry::Message { line, .. } => line.at_unix_ms,
             Entry::System { at_unix_ms, .. } => *at_unix_ms,
+        }
+    }
+
+    fn seq(&self) -> u64 {
+        match self {
+            Entry::Message { seq, .. } | Entry::System { seq, .. } => *seq,
+        }
+    }
+
+    fn set_seq(&mut self, value: u64) {
+        match self {
+            Entry::Message { seq, .. } | Entry::System { seq, .. } => *seq = value,
         }
     }
 }
@@ -105,6 +151,10 @@ pub struct State {
     pub ready: bool,
     /// Mensajes y avisos, del más antiguo al más nuevo.
     pub entries: Vec<Entry>,
+    /// Siguiente clave de entrada.
+    next_seq: u64,
+    /// Se pintan todas las entradas, no solo las últimas [`ENTRIES_SHOWN`].
+    pub show_all: bool,
     /// Lo que se está escribiendo.
     pub draft: text_editor::Content<Renderer>,
     /// El campo tiene el foco: las teclas van al chat y no al juego.
@@ -145,6 +195,8 @@ impl Default for State {
             open: false,
             ready: false,
             entries: Vec::new(),
+            next_seq: 0,
+            show_all: false,
             draft: text_editor::Content::new(),
             composing: false,
             unread: 0,
@@ -191,6 +243,8 @@ pub enum Msg {
     ConfirmClear,
     /// Anfitrión: no vaciar.
     CancelClear,
+    /// Pintar también los mensajes anteriores a los últimos [`ENTRIES_SHOWN`].
+    ShowOlder,
 }
 
 impl State {
@@ -240,7 +294,9 @@ impl State {
         self.utc_offset = Some((offset, now));
     }
 
-    fn push(&mut self, entry: Entry) {
+    fn push(&mut self, mut entry: Entry) {
+        entry.set_seq(self.next_seq);
+        self.next_seq += 1;
         self.entries.push(entry);
         if self.entries.len() > ENTRIES_MAX {
             let extra = self.entries.len() - ENTRIES_MAX;
@@ -253,6 +309,7 @@ impl State {
         let at_unix_ms = unix_ms_now();
         let clock = self.clock(now, at_unix_ms);
         self.push(Entry::System {
+            seq: 0,
             spans,
             at_unix_ms,
             clock,
@@ -262,7 +319,13 @@ impl State {
     /// Añade un mensaje.
     fn message(&mut self, now: Instant, line: ChatLine) {
         let clock = self.clock(now, line.at_unix_ms);
-        self.push(Entry::Message { line, clock });
+        let pieces = pieces(&line.text);
+        self.push(Entry::Message {
+            seq: 0,
+            line,
+            pieces,
+            clock,
+        });
     }
 }
 
@@ -418,6 +481,10 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         }
         Msg::CancelClear => {
             app.chat.confirm_clear = false;
+            Vec::new()
+        }
+        Msg::ShowOlder => {
+            app.chat.show_all = true;
             Vec::new()
         }
     }
@@ -934,14 +1001,45 @@ fn messages<'a>(app: &'a App, look: Look) -> Element<'a, Message> {
         .account
         .as_ref()
         .map(|account| account.display_name.as_str());
-    let mut list = Column::new()
+    // Filas con clave estable: lo que `iced` tiene medido de cada una sobrevive a que las más
+    // antiguas se vayan. De entrada solo las últimas; las demás, a petición.
+    let entries = &app.chat.entries;
+    let hidden = if app.chat.show_all {
+        0
+    } else {
+        entries.len().saturating_sub(ENTRIES_SHOWN)
+    };
+    let mut list = iced_widget::keyed::Column::with_capacity(entries.len() - hidden + 1)
         .spacing(space::XS)
         .padding(Padding::from([space::S, space::M]));
-    for entry in &app.chat.entries {
-        list = list.push(match entry {
-            Entry::Message { line, clock } => message_row(app, look, line, clock, you),
-            Entry::System { spans, clock, .. } => system_row(look, spans, clock),
-        });
+    if hidden > 0 {
+        list = list.push(
+            u64::MAX,
+            container(
+                ui::button_with(
+                    Kind::Flat,
+                    t!("chat-ver-los-n-anteriores", count = hidden),
+                    None,
+                    Some(Message::Chat(Msg::ShowOlder)),
+                )
+                .width(Length::Fill),
+            )
+            .width(Length::Fill),
+        );
+    }
+    for entry in &entries[hidden..] {
+        list = list.push(
+            entry.seq(),
+            match entry {
+                Entry::Message {
+                    line,
+                    pieces,
+                    clock,
+                    ..
+                } => message_row(app, look, line, pieces, clock, you),
+                Entry::System { spans, clock, .. } => system_row(look, spans, clock),
+            },
+        );
     }
     scrollable(list)
         .anchor_bottom()
@@ -954,6 +1052,7 @@ fn message_row<'a>(
     app: &'a App,
     look: Look,
     line: &'a ChatLine,
+    pieces: &'a [Piece],
     clock: &'a str,
     you: Option<&'a str>,
 ) -> Element<'a, Message> {
@@ -986,7 +1085,7 @@ fn message_row<'a>(
     );
     row![
         ui::avatar(&app.theme, &seed, 28.0),
-        column![who, message_text(look, &line.text)]
+        column![who, message_text(look, &line.text, pieces)]
             .spacing(2)
             .width(Length::Fill)
     ]
@@ -994,13 +1093,19 @@ fn message_row<'a>(
     .into()
 }
 
-/// Texto plano con los enlaces subrayados y clicables.
-fn message_text<'a>(look: Look, content: &'a str) -> Element<'a, Message> {
-    let spans: Vec<Span<'a, String, Font>> = segments(content)
-        .into_iter()
-        .map(|(piece, link)| match link {
-            Some(url) => span(piece).link(url).underline(true).color(look.accent),
-            None => span(piece),
+/// Texto plano con los enlaces subrayados y clicables (`pieces`: sus trozos, ya calculados).
+fn message_text<'a>(look: Look, content: &'a str, pieces: &'a [Piece]) -> Element<'a, Message> {
+    let spans: Vec<Span<'a, String, Font>> = pieces
+        .iter()
+        .map(|piece| {
+            let text = content.get(piece.range.clone()).unwrap_or_default();
+            match &piece.link {
+                Some(url) => span(text)
+                    .link(url.clone())
+                    .underline(true)
+                    .color(look.accent),
+                None => span(text),
+            }
         })
         .collect();
     rich_text(spans)
@@ -1287,6 +1392,7 @@ pub(crate) mod shots {
         let at_unix_ms = BASE_MS + minutes * 60_000;
         let clock = crate::localtime::hhmm((at_unix_ms / 1000) as i64, 0);
         app.chat.push(Entry::System {
+            seq: 0,
             spans: spans
                 .iter()
                 .map(|(text, bold)| ((*text).to_owned(), *bold))
@@ -1422,7 +1528,7 @@ mod tests {
         message(&mut app, line(2, "Carla", "tres", false));
         assert!(matches!(
             app.chat.entries.last(),
-            Some(Entry::Message { line, clock }) if line.text == "tres" && clock == "21:02"
+            Some(Entry::Message { line, clock, .. }) if line.text == "tres" && clock == "21:02"
         ));
     }
 

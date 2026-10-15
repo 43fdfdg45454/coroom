@@ -14,8 +14,10 @@
 //!
 //! Con la sala abierta (la misma página): la cabecera con el código, los invitados y la ruta; la
 //! fuente con su vista previa y «Cambiar fuente» (el mismo selector, sin cerrar la sala); los
-//! invitados con sus permisos como conmutadores (teclado y ratón, mando, voz), expulsar y número
-//! de seguridad; la calidad en vivo; y, a la derecha, el chat de la sala.
+//! amigos que **piden entrar** ([`JoinRequest`], una tarjeta cada uno con «Dejar entrar» y «Ahora
+//! no», que caduca a los [`JOIN_REQUEST_TTL`]); los invitados con sus permisos como conmutadores
+//! (teclado y ratón, mando, voz), expulsar y número de seguridad; la calidad en vivo; y, a la
+//! derecha, el chat de la sala.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -40,7 +42,10 @@ use iced_core::{Alignment, Length, Padding};
 use iced_widget::{Column, Row, button, checkbox, column, container, row, rule};
 
 use super::chat;
-use crate::ui::app::{App, Dialog, Effect, Event, HostRequest, Load, Message, Page, quality_tone};
+use crate::ui::app::{
+    App, Dialog, Effect, Event, HostRequest, JOIN_REQUEST_TTL, Load, Message, Page, Screen,
+    quality_tone,
+};
 use crate::ui::settings::{
     BITRATE_CHOICES, CodecChoice, EncoderChoice, FPS_CHOICES, KnownPeer, QualityPreset,
     RememberedApp, Resolution, Video, VideoOption, When,
@@ -267,6 +272,17 @@ pub struct Room {
     pub guests_muted: bool,
 }
 
+/// Un amigo que pide entrar en la sala abierta.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinRequest {
+    /// Su usuario.
+    pub user: u64,
+    /// Su nombre visible.
+    pub name: String,
+    /// Cuándo lo pidió.
+    pub at: Instant,
+}
+
 /// Estado.
 #[derive(Debug, Clone, Default)]
 pub struct State {
@@ -301,6 +317,8 @@ pub struct State {
     pub last_cap_kbps: Option<u32>,
     /// Abriendo.
     pub starting: bool,
+    /// Desde cuándo (anima la barra de «Abriendo la sala…»).
+    pub starting_since: Option<Instant>,
     /// Cerrando.
     pub stopping: bool,
     /// Error al abrir.
@@ -313,6 +331,8 @@ pub struct State {
     pub shared: Option<Sharing>,
     /// Cambiando lo que se comparte con la sala abierta: lo pedido.
     pub switching: Option<Sharing>,
+    /// Amigos que piden entrar en la sala abierta, en el orden en que lo pidieron.
+    pub join_requests: Vec<JoinRequest>,
 }
 
 /// Fuente y monitor o ventana de una transmisión.
@@ -592,6 +612,10 @@ pub enum Msg {
     Safety(GuestId),
     /// Invitar a un amigo conectado con la sala abierta.
     Invite(u64),
+    /// Dejar entrar a quien lo pidió (se le invita).
+    AllowJoin(u64),
+    /// No dejar entrar ahora a quien lo pidió.
+    DeclineJoin(u64),
     /// Con la sala abierta: desplegar (o cancelar) el selector de fuente.
     ChangeSource(bool),
     /// Con la sala abierta: compartir lo elegido en vez de lo de ahora.
@@ -857,6 +881,16 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
         }
         Msg::Invite(user) => return app.update(Message::Home(super::home::Msg::Invite(user))),
+        Msg::AllowJoin(user) => {
+            if take_join_request(app, user).is_some() {
+                return app.update(Message::Home(super::home::Msg::Invite(user)));
+            }
+        }
+        Msg::DeclineJoin(user) => {
+            if take_join_request(app, user).is_some() && app.host.room.is_some() {
+                return vec![Effect::DeclineJoin(user)];
+            }
+        }
         Msg::ChangeSource(open) => return change_source(app, open),
         Msg::ApplySource => return apply_source(app),
     }
@@ -901,8 +935,10 @@ fn start(app: &mut App) -> Vec<Effect> {
     let audio = app.host.game_capture(&app.settings.audio.excluded_apps);
     let guests_muted = app.settings.room.guests_muted;
     let voice = app.settings.audio.host_voice;
+    let now = app.now;
     let host = &mut app.host;
     host.starting = true;
+    host.starting_since = Some(now);
     host.error = None;
     host.shared = Some(host.sharing());
     host.switching = None;
@@ -975,6 +1011,63 @@ pub fn refresh(app: &mut App) -> Vec<Effect> {
 /// Llegó la lista de amigos o un cambio de presencia (para «en vivo · hace N s»).
 pub fn on_friends(app: &mut App) {
     app.host.friends_at = Some(app.now);
+}
+
+/// Un amigo pide entrar: con la sala abierta aquí, su tarjeta (una por amigo: la nueva sustituye
+/// a la anterior) y un aviso si Compartir no está a la vista; sin sala en este equipo (la tiene
+/// abierta otro dispositivo de la cuenta), solo el aviso.
+pub fn on_join_requested(app: &mut App, user: u64, name: String) {
+    let visible = app.screen == Screen::Main && app.page == Page::Host;
+    let room_here = app.host.room.is_some();
+    if !visible || !room_here {
+        app.toast(
+            Tone::Info,
+            t!("host-name-pide-entrar-en-tu-sala", name = name),
+        );
+    }
+    if !room_here {
+        return;
+    }
+    take_join_request(app, user);
+    app.host.join_requests.push(JoinRequest {
+        user,
+        name,
+        at: app.now,
+    });
+}
+
+/// Quita (y devuelve) la petición de entrar de `user`.
+fn take_join_request(app: &mut App, user: u64) -> Option<JoinRequest> {
+    let requests = &mut app.host.join_requests;
+    let at = requests.iter().position(|request| request.user == user)?;
+    Some(requests.remove(at))
+}
+
+/// Pasa el tiempo: las peticiones de entrar sin respuesta caducan.
+pub fn tick(app: &mut App) {
+    let now = app.now;
+    app.host
+        .join_requests
+        .retain(|request| now.saturating_duration_since(request.at) < JOIN_REQUEST_TTL);
+}
+
+/// Cuándo hace falta el próximo `Tick` por las peticiones de entrar: al caducar la más antigua y,
+/// con la sala a la vista, cada segundo para su cuenta atrás.
+pub fn next_tick(app: &App) -> Option<Instant> {
+    let now = app.now;
+    let oldest = app
+        .host
+        .join_requests
+        .iter()
+        .map(|request| request.at)
+        .min()?;
+    let expiry = (oldest + JOIN_REQUEST_TTL).max(now + Duration::from_millis(1));
+    if app.screen == Screen::Main && app.page == Page::Host {
+        let elapsed = now.saturating_duration_since(oldest).as_secs();
+        Some(expiry.min(oldest + Duration::from_secs(elapsed + 1)))
+    } else {
+        Some(expiry)
+    }
 }
 
 /// Lo que se puede compartir, recién mirado.
@@ -1109,6 +1202,7 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
         Event::HostEnded(reason) => {
             let was_open = app.host.room.take().is_some();
             let host = &mut app.host;
+            host.join_requests.clear();
             host.shared = None;
             host.switching = None;
             host.starting = false;
@@ -1188,12 +1282,15 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
             effects.extend(invite_marked(app));
         }
         SessionEvent::GuestJoined {
+            user,
             name,
             fingerprint,
             safety_number,
             permissions,
             ..
         } => {
+            // Si había pedido entrar, ya está dentro.
+            take_join_request(app, user);
             app.settings.remember_peer(KnownPeer {
                 name: name.clone(),
                 fingerprint,
@@ -2374,10 +2471,11 @@ fn setup(app: &App) -> Element<'_, Message> {
         ));
     }
     let actions: Element<'_, Message> = if state.starting {
+        let since = state.starting_since.unwrap_or(app.now);
         container(ui::progress(
             t!("host-abriendo-la-sala"),
             None,
-            app.now.elapsed().as_secs_f32(),
+            app.now.duration_since(since).as_secs_f32() / 1.4,
         ))
         .width(Length::Fixed(420.0))
         .into()
@@ -2798,6 +2896,10 @@ fn guests_section<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
     ]
     .spacing(space::S)
     .align_y(Alignment::Center);
+    let mut section = column![head].spacing(space::XS);
+    for request in &app.host.join_requests {
+        section = section.push(join_request_card(app, room, request));
+    }
     let body: Element<'a, Message> = if room.guests.is_empty() {
         ui::card(ui::empty_state(
             Icon::Users,
@@ -2813,7 +2915,50 @@ fn guests_section<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
                 .collect(),
         )
     };
-    column![head, body].spacing(space::XS).into()
+    section.push(body).into()
+}
+
+/// Tarjeta de un amigo que pide entrar, con el borde del acento y su cuenta atrás: «Dejar
+/// entrar» lo invita (en cuanto la sala tiene código) y «Ahora no» se lo dice.
+fn join_request_card<'a>(
+    app: &'a App,
+    room: &'a Room,
+    request: &'a JoinRequest,
+) -> Element<'a, Message> {
+    let ago = app
+        .now
+        .saturating_duration_since(request.at)
+        .min(JOIN_REQUEST_TTL);
+    let left = JOIN_REQUEST_TTL.saturating_sub(ago).as_secs().max(1);
+    container(
+        row![
+            ui::avatar(&app.theme, &request.name, size::AVATAR),
+            column![
+                ui::strong(t!("host-name-pide-entrar", name = request.name))
+                    .wrapping(Wrapping::WordOrGlyph),
+                ui::secondary(t!("host-pidio-hace", ago = ago.as_secs(), left = left))
+                    .wrapping(Wrapping::WordOrGlyph)
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+            ui::flat(
+                t!("host-ahora-no"),
+                Some(on(Msg::DeclineJoin(request.user)))
+            ),
+            ui::button_with(
+                Kind::Primary,
+                t!("host-dejar-entrar"),
+                Some(Icon::LogIn),
+                room.code.as_ref().map(|_| on(Msg::AllowJoin(request.user)))
+            )
+        ]
+        .spacing(space::S)
+        .align_y(Alignment::Center),
+    )
+    .padding(Padding::from([12.0, 16.0]))
+    .width(Length::Fill)
+    .class(ContainerClass::CardAccent)
+    .into()
 }
 
 /// La calidad con la sala abierta: el segmentado de perfiles y «Avanzado».
@@ -2848,7 +2993,7 @@ fn invite_more<'a>(app: &'a App, room: &'a Room) -> Option<Element<'a, Message>>
                 friend.display_name.as_str(),
                 None,
                 vec![
-                    ui::status_badge(Tone::Success, t!("host-disponible")),
+                    super::home::activity_badge(friend),
                     ui::button_with(
                         Kind::Normal,
                         t!("host-invitar"),
@@ -3174,6 +3319,26 @@ pub(crate) mod shots {
         app.dialog = Some(Dialog::StopSharing);
     }
 
+    /// La sala abierta con Dani (conectado, sin sala) pidiendo entrar desde hace 6 s.
+    pub(crate) fn host_room_join_request(app: &mut App) {
+        host_room(app);
+        app.update(Message::Event(Event::Presence {
+            user: 4,
+            online: true,
+        }));
+        app.update(Message::Event(Event::JoinRequested {
+            from_user: 4,
+            from_name: "Dani".to_owned(),
+        }));
+        if let Some(request) = app.host.join_requests.first_mut() {
+            request.at = app
+                .now
+                .checked_sub(std::time::Duration::from_secs(6))
+                .unwrap_or(app.now);
+        }
+        app.toasts.clear();
+    }
+
     /// Escenas de esta pantalla.
     pub(crate) const BUILDERS: &[(&str, Builder)] = &[
         ("08-compartir", host_setup),
@@ -3182,6 +3347,7 @@ pub(crate) mod shots {
         ("08-compartir-wayland", host_setup_wayland),
         ("09-sala-abierta", host_room),
         ("09-sala-cambiar-fuente", host_room_switch),
+        ("09-sala-peticion-de-entrada", host_room_join_request),
         ("10-dejar-de-compartir", host_stop_dialog),
     ];
 }
@@ -3249,6 +3415,7 @@ mod tests {
             username: name.to_lowercase(),
             display_name: name.to_owned(),
             online,
+            activity: Default::default(),
         }
     }
 
@@ -3614,6 +3781,120 @@ mod tests {
         let effects = app.update(Message::Event(Event::HostEnded(None)));
         assert!(app.host.room.is_none());
         assert!(effects.is_empty(), "sin cuenta no hay sala de espera");
+    }
+
+    /// Un amigo pide entrar: su tarjeta con la sala abierta (una por amigo), aviso si Compartir no
+    /// está a la vista; «Dejar entrar» lo invita y «Ahora no» se lo dice.
+    #[test]
+    fn join_requests_are_listed_and_answered() {
+        let mut app = app();
+        app.screen = Screen::Main;
+        app.update(Message::Event(Event::Friends(Ok(Friends {
+            friends: vec![friend(4, "Dani", true), friend(5, "Eli", true)],
+            incoming: Vec::new(),
+            outgoing: Vec::new(),
+        }))));
+        // Sin sala en este equipo: solo el aviso.
+        app.update(Message::Event(Event::JoinRequested {
+            from_user: 4,
+            from_name: "Dani".into(),
+        }));
+        assert!(app.host.join_requests.is_empty());
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.text.contains("Dani pide entrar"))
+        );
+        app.toasts.clear();
+        open_room(&mut app);
+        assert_eq!(app.page, Page::Host);
+        app.toasts.clear();
+        app.update(Message::Event(Event::JoinRequested {
+            from_user: 4,
+            from_name: "Dani".into(),
+        }));
+        assert_eq!(app.host.join_requests.len(), 1);
+        assert!(app.toasts.is_empty(), "a la vista: sin aviso");
+        // Desde otra página sí avisa; repetir sustituye la tarjeta (sigue habiendo una).
+        app.page = Page::Home;
+        app.now += Duration::from_secs(5);
+        app.update(Message::Event(Event::JoinRequested {
+            from_user: 4,
+            from_name: "Dani".into(),
+        }));
+        app.update(Message::Event(Event::JoinRequested {
+            from_user: 5,
+            from_name: "Eli".into(),
+        }));
+        assert_eq!(app.host.join_requests.len(), 2);
+        assert_eq!(app.host.join_requests[0].at, app.now);
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.text.contains("Dani pide entrar"))
+        );
+        app.toasts.clear();
+        // Dejar entrar: la invitación de siempre.
+        let effects = app.update(Message::Host(Msg::AllowJoin(4)));
+        assert_eq!(effects, [Effect::Invite(4)]);
+        assert!(app.toasts.iter().any(|t| t.text.contains("Dani")));
+        assert_eq!(app.host.join_requests.len(), 1);
+        // Ahora no.
+        assert_eq!(
+            app.update(Message::Host(Msg::DeclineJoin(5))),
+            [Effect::DeclineJoin(5)]
+        );
+        assert!(app.host.join_requests.is_empty());
+        // Sin petición no se hace nada.
+        assert!(app.update(Message::Host(Msg::AllowJoin(4))).is_empty());
+        assert!(app.update(Message::Host(Msg::DeclineJoin(5))).is_empty());
+    }
+
+    /// Las peticiones caducan a los [`JOIN_REQUEST_TTL`] (el `Tick` se pide para entonces y, con
+    /// la sala a la vista, cada segundo), desaparecen cuando el amigo entra y con la sala cerrada.
+    #[test]
+    fn join_requests_expire_or_end_when_the_guest_joins() {
+        let mut app = app();
+        app.screen = Screen::Main;
+        open_room(&mut app);
+        let start = app.now;
+        app.update(Message::Event(Event::JoinRequested {
+            from_user: 13,
+            from_name: "Dani".into(),
+        }));
+        assert_eq!(next_tick(&app), Some(start + Duration::from_secs(1)));
+        app.now += Duration::from_millis(2_300);
+        assert_eq!(next_tick(&app), Some(start + Duration::from_secs(3)));
+        app.page = Page::Home;
+        assert_eq!(next_tick(&app), Some(start + JOIN_REQUEST_TTL));
+        app.now = start + JOIN_REQUEST_TTL - Duration::from_secs(1);
+        app.update(Message::Tick);
+        assert_eq!(app.host.join_requests.len(), 1, "todavía");
+        app.now = start + JOIN_REQUEST_TTL;
+        app.update(Message::Tick);
+        assert!(app.host.join_requests.is_empty(), "caducó");
+        assert_eq!(next_tick(&app), None);
+        // Entra quien lo pidió: su tarjeta sobra.
+        app.update(Message::Event(Event::JoinRequested {
+            from_user: 13,
+            from_name: "Dani".into(),
+        }));
+        app.update(Message::Event(Event::Host(SessionEvent::GuestJoined {
+            guest: GuestId(3),
+            user: 13,
+            name: "Dani".into(),
+            fingerprint: "ef".repeat(32),
+            safety_number: coroom_transport::crypto::SafetyNumber::between(&[1; 32], &[3; 32]),
+            permissions: Permissions::VIEW_ONLY,
+        })));
+        assert!(app.host.join_requests.is_empty());
+        // Al cerrar la sala no queda ninguna.
+        app.update(Message::Event(Event::JoinRequested {
+            from_user: 14,
+            from_name: "Eli".into(),
+        }));
+        app.update(Message::Event(Event::HostEnded(None)));
+        assert!(app.host.join_requests.is_empty());
     }
 
     /// Los amigos marcados se invitan cuando el servidor crea la sala (antes no hay código), y

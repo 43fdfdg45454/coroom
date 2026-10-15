@@ -46,7 +46,7 @@ use coroom_session::remote::{
 };
 use coroom_session::{GuestId, Permissions, Session};
 use coroom_transport::crypto::{FileStore, Identity, IdentityStore, KeyringStore};
-use coroom_transport::proto::signal::SignalMessage;
+use coroom_transport::proto::signal::{Activity, SignalMessage};
 use coroom_transport::{Endpoint, EndpointOptions, SignalClient};
 
 use crate::account::{self, AccountOptions, AccountStore};
@@ -190,6 +190,8 @@ pub fn remote_config(net: &NetOptions) -> Result<RemoteConfig, String> {
     {
         config.insecure_no_sframe = net.insecure_no_sframe;
     }
+    // A/B del pacing sin recompilar (`COROOM_PACING_SHARE`, `COROOM_KEYFRAME_PACING_INTERVALS`…).
+    config.pacing = coroom_transport::media::PacingConfig::from_env();
     Ok(config)
 }
 
@@ -963,7 +965,11 @@ pub struct HostOptions {
 
 /// Codificadores del anfitrión según las opciones (los que pasaron el sondeo).
 pub fn host_encoders(codec: Option<Codec>, encoder: Option<Backend>) -> Result<EncoderSet, String> {
-    let set = EncoderSet::probe().only_codec(codec).only_backend(encoder);
+    // La calibración de «auto» (qué backend tarda menos en esta GPU) se recuerda entre arranques.
+    let set = EncoderSet::probe()
+        .with_calibration_cache(Some(default_data_dir().join("calibration.json")))
+        .only_codec(codec)
+        .only_backend(encoder);
     if set.is_empty() {
         return Err(format!(
             "este equipo no tiene ese codificador ({} con {}); mira `coroom doctor`",
@@ -1201,7 +1207,8 @@ pub fn wait_for_invitation(
         .await
         .map_err(|err| err.to_string())?;
         eprintln!(
-            "Esperando invitaciones de tus amigos como {} (Ctrl+C para salir)…",
+            "Esperando invitaciones de tus amigos como {} (Ctrl+C para salir; `ask NOMBRE` pide \
+             entrar en la sala abierta de un amigo)…",
             session.credentials.username
         );
         let mut invitations: Vec<String> = Vec::new();
@@ -1226,6 +1233,17 @@ pub fn wait_for_invitation(
                         let name = names.get(&user).cloned().unwrap_or_else(|| format!("usuario {user}"));
                         eprintln!("{name} {}.", if online { "está en línea" } else { "ya no está en línea" });
                     }
+                    Ok(Some(SignalMessage::Activity { user, activity })) => {
+                        let name = names.get(&user).cloned().unwrap_or_else(|| format!("usuario {user}"));
+                        eprintln!("{name} {}.", match activity {
+                            Activity::Idle => "está disponible",
+                            Activity::Hosting => "tiene una sala abierta",
+                            Activity::Playing => "está jugando en una sala",
+                        });
+                    }
+                    Ok(Some(SignalMessage::JoinDeclined { from_name, .. })) => {
+                        eprintln!("{from_name} no puede dejarte entrar ahora.");
+                    }
                     Ok(Some(SignalMessage::Error { message, .. })) => {
                         eprintln!("Aviso: el servidor dice: {message}");
                     }
@@ -1236,6 +1254,19 @@ pub fn wait_for_invitation(
                 _ = tick.tick() => {
                     let Some(lines) = &lines else { continue };
                     while let Ok(line) = lines.try_recv() {
+                        if let Some(who) = line.trim().strip_prefix("ask ") {
+                            let who = who.trim();
+                            match names.iter().find(|(_, name)| name.eq_ignore_ascii_case(who)) {
+                                Some((&to_user, name)) => {
+                                    match signal.send(&SignalMessage::JoinRequest { to_user }).await {
+                                        Ok(()) => eprintln!("Le pediste entrar a {name}."),
+                                        Err(err) => eprintln!("No se pudo pedir entrar: {err}"),
+                                    }
+                                }
+                                None => eprintln!("No tienes ningún amigo que se llame «{who}»."),
+                            }
+                            continue;
+                        }
                         if invitations.is_empty() {
                             eprintln!("Todavía no hay invitaciones.");
                             continue;

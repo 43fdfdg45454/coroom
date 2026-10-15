@@ -269,6 +269,7 @@ pub(crate) fn friend(id: u64, username: &str, display_name: &str, online: bool) 
         username: username.to_owned(),
         display_name: display_name.to_owned(),
         online,
+        activity: Default::default(),
     }
 }
 

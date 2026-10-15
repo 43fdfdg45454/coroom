@@ -86,6 +86,23 @@ impl fmt::Display for ErrorCode {
     }
 }
 
+/// Lo que hace un usuario conectado, para la lista de amigos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum Activity {
+    /// Conectado, sin sala.
+    #[default]
+    Idle,
+    /// Tiene una sala abierta como anfitrión.
+    Hosting,
+    /// Está en la sala de otro.
+    Playing,
+}
+
+impl Activity {
+    /// Las tres, para los tests y las capturas.
+    pub const ALL: [Activity; 3] = [Activity::Idle, Activity::Hosting, Activity::Playing];
+}
+
 /// Mensaje de señalización.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SignalMessage {
@@ -211,6 +228,40 @@ pub enum SignalMessage {
         /// Si está conectado.
         online: bool,
     },
+    /// Servidor → cliente: qué hace un amigo conectado (al autenticarse llega una por cada amigo
+    /// que no está simplemente disponible; después, cada vez que cambia).
+    Activity {
+        /// El amigo.
+        user: UserId,
+        /// Lo que hace.
+        activity: Activity,
+    },
+    /// Cliente → servidor: pide entrar en la sala que un amigo tiene abierta. El servidor se lo
+    /// hace llegar al anfitrión como `JoinRequested`; si acepta, invita (`Invite`) y si no,
+    /// `JoinDecline`.
+    JoinRequest {
+        /// El amigo anfitrión.
+        to_user: UserId,
+    },
+    /// Servidor → anfitrión: un amigo pide entrar en tu sala.
+    JoinRequested {
+        /// Quien pide entrar.
+        from_user: UserId,
+        /// Su nombre visible.
+        from_name: String,
+    },
+    /// Cliente (anfitrión) → servidor: no deja entrar a quien lo pidió.
+    JoinDecline {
+        /// Quien pidió entrar.
+        to_user: UserId,
+    },
+    /// Servidor → quien pidió entrar: el anfitrión no lo deja entrar ahora.
+    JoinDeclined {
+        /// El anfitrión.
+        from_user: UserId,
+        /// Su nombre visible.
+        from_name: String,
+    },
     /// Servidor → miembros de una sala: el anfitrión agotó su cuota mensual del relay; la sala
     /// sigue solo en directo (se envía en lugar de `RelayToken` o al cortar el relay).
     QuotaExceeded {
@@ -311,6 +362,22 @@ mod tests {
             }),
             (any::<u64>(), any::<bool>())
                 .prop_map(|(user, online)| SignalMessage::Presence { user, online }),
+            (any::<u64>(), prop::sample::select(Activity::ALL.to_vec()))
+                .prop_map(|(user, activity)| SignalMessage::Activity { user, activity }),
+            any::<u64>().prop_map(|to_user| SignalMessage::JoinRequest { to_user }),
+            (any::<u64>(), ".{0,40}").prop_map(|(from_user, from_name)| {
+                SignalMessage::JoinRequested {
+                    from_user,
+                    from_name,
+                }
+            }),
+            any::<u64>().prop_map(|to_user| SignalMessage::JoinDecline { to_user }),
+            (any::<u64>(), ".{0,40}").prop_map(|(from_user, from_name)| {
+                SignalMessage::JoinDeclined {
+                    from_user,
+                    from_name,
+                }
+            }),
             ".{0,40}".prop_map(|message| SignalMessage::QuotaExceeded { message }),
             Just(SignalMessage::RelayDisabled),
             any::<u32>().prop_map(|peer_id| SignalMessage::PeerLeft { peer_id }),

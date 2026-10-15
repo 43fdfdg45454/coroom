@@ -12,10 +12,11 @@ use std::time::{Duration, Instant};
 
 use coroom_session::input::gamepad::PadChoice;
 use coroom_session::remote::{GuestStatus, QualityLevel, SessionEvent};
-use coroom_session::{GuestId, Permissions};
+use coroom_session::{GuestId, Permissions, SessionError};
 use coroom_transport::api::ServerProbe;
 use coroom_transport::proto::api::{Devices, Friends, Usage};
-use coroom_ui::theme::{Accent, Mode, Tone};
+use coroom_transport::proto::signal::Activity;
+use coroom_ui::theme::{Accent, Mode, Palette, Tone};
 use coroom_ui::widget::{self as ui};
 use coroom_ui::{Element, Theme, font::Fonts};
 use iced_core::{Alignment, Length, Padding};
@@ -212,6 +213,32 @@ pub enum Event {
         /// Si está conectado.
         online: bool,
     },
+    /// Qué hace un amigo conectado (abre una sala, juega en una, nada).
+    Activity {
+        /// Usuario.
+        user: u64,
+        /// Lo que hace.
+        activity: Activity,
+    },
+    /// Un amigo pide entrar en la sala que compartes.
+    JoinRequested {
+        /// Quien lo pide.
+        from_user: u64,
+        /// Su nombre.
+        from_name: String,
+    },
+    /// El anfitrión al que pediste entrar dijo que ahora no.
+    JoinDeclined {
+        /// El anfitrión.
+        from_user: u64,
+        /// Su nombre.
+        from_name: String,
+    },
+    /// Pedir entrar no llegó al servidor (o este lo rechazó): el motivo, en español.
+    JoinRequestFailed {
+        /// Motivo.
+        message: String,
+    },
     /// El servidor responde (o no) y con qué RTT.
     ServerStatus {
         /// RTT con el servidor en ms, si responde.
@@ -245,7 +272,7 @@ pub enum Event {
     /// Invitado: estadísticas de ahora.
     GuestStats(Box<guest::Stats>),
     /// Invitado: la sesión terminó (`Some` con el motivo si no fue normal).
-    GuestEnded(Option<String>),
+    GuestEnded(Option<GuestEnd>),
     /// Resultado de buscar una versión nueva, con la hora (segundos desde 1970) de la consulta.
     UpdateChecked {
         /// `Ok(None)`: esta es la última.
@@ -426,8 +453,11 @@ pub enum Effect {
         /// El texto.
         body: String,
     },
-    /// Sonido de mensaje nuevo del chat.
+    /// Sonido de mensaje nuevo del chat (el tono elegido en Ajustes o el de por defecto).
     ChatSound,
+    /// Abrir el selector de ficheros para elegir el tono del chat; vuelve con
+    /// `Message::Settings(Msg::ChatSoundPicked)`.
+    PickChatSound,
     /// Dejar de oír (o volver a oír) una voz en este equipo: en la sala propia (`host`, por id de
     /// invitado) o en la que se está como invitado (por hoja MLS).
     SetVoiceMuted {
@@ -446,6 +476,10 @@ pub enum Effect {
     PauseInput(bool),
     /// Invitar a un amigo a la sala.
     Invite(u64),
+    /// Pedir entrar en la sala abierta de un amigo (por la señalización de espera).
+    AskToJoin(u64),
+    /// Anfitrión: no dejar entrar ahora a quien lo pidió.
+    DeclineJoin(u64),
     /// Entrar en una sala.
     Join(String),
     /// Salir de la sala.
@@ -547,6 +581,53 @@ pub enum Dialog {
     },
 }
 
+/// Por qué terminó la sesión del invitado (cuando no fue normal).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestEnd {
+    /// Qué pasó, para elegir el título del diálogo.
+    pub kind: EndKind,
+    /// El motivo en palabras, tal cual lo dio la sesión.
+    pub text: String,
+}
+
+/// Clase del final de una sesión de invitado, sacada del error de la sesión (no de su texto).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndKind {
+    /// El anfitrión nos expulsó.
+    Removed,
+    /// El anfitrión cerró la sala.
+    RoomClosed,
+    /// Falló la red (o se agotaron las reconexiones).
+    Network,
+    /// Otra cosa (medios, criptografía, un pánico…).
+    Other,
+}
+
+impl GuestEnd {
+    /// Final por un motivo cualquiera en palabras (un pánico, la prueba local).
+    pub fn other(text: impl Into<String>) -> Self {
+        Self {
+            kind: EndKind::Other,
+            text: text.into(),
+        }
+    }
+}
+
+impl From<SessionError> for GuestEnd {
+    fn from(err: SessionError) -> Self {
+        let kind = match &err {
+            SessionError::Removed => EndKind::Removed,
+            SessionError::RoomClosed => EndKind::RoomClosed,
+            SessionError::Network(_) => EndKind::Network,
+            _ => EndKind::Other,
+        };
+        Self {
+            kind,
+            text: err.to_string(),
+        }
+    }
+}
+
 /// La aplicación.
 #[derive(Debug)]
 pub struct App {
@@ -558,6 +639,9 @@ pub struct App {
     pub fonts: Fonts,
     /// Tema en uso.
     pub theme: Theme,
+    /// Paleta oscura con el acento en uso: lo que flota sobre el vídeo (barra, panel, píldora)
+    /// va siempre oscuro. Se recalcula con el tema, no en cada vista.
+    pub dark: Palette,
     /// Pantalla.
     pub screen: Screen,
     /// Página de la barra lateral.
@@ -617,6 +701,7 @@ impl App {
         let login = login::State::new(&settings);
         let mut app = Self {
             theme: Theme::new(Mode::Light, Accent::Blue, fonts),
+            dark: Palette::new(Mode::Dark, Accent::Blue),
             settings,
             system,
             fonts,
@@ -672,7 +757,9 @@ impl App {
 
     /// Recalcula el tema con los ajustes y el sistema.
     pub fn refresh_theme(&mut self) {
-        self.theme = Theme::new(self.mode(), self.accent(), self.fonts);
+        let accent = self.accent();
+        self.theme = Theme::new(self.mode(), accent, self.fonts);
+        self.dark = Palette::new(Mode::Dark, accent);
     }
 
     /// Si la pantalla es el vídeo del invitado (o la prueba local) ya en marcha.
@@ -739,6 +826,9 @@ impl App {
             consider(at);
         }
         if let Some(at) = home::next_tick(self) {
+            consider(at);
+        }
+        if let Some(at) = host::next_tick(self) {
             consider(at);
         }
         if let Some(at) = settings_screen::next_tick(self) {
@@ -812,6 +902,7 @@ impl App {
                 }
                 self.chat.tick(now);
                 home::tick(self);
+                host::tick(self);
                 effects.extend(settings_screen::tick(self));
                 if self.page == Page::Host
                     && self.screen == Screen::Main
@@ -1093,8 +1184,40 @@ impl App {
                     && let Some(friend) = friends.friends.iter_mut().find(|f| f.id == user)
                 {
                     friend.online = online;
+                    if !online {
+                        // Desconectado no hace nada: la actividad solo llega de los conectados.
+                        friend.activity = Activity::Idle;
+                    }
                 }
                 host::on_friends(self);
+                Vec::new()
+            }
+            Event::Activity { user, activity } => {
+                if let Load::Loaded(friends) = &mut self.friends
+                    && let Some(friend) = friends.friends.iter_mut().find(|f| f.id == user)
+                {
+                    friend.activity = activity;
+                }
+                host::on_friends(self);
+                Vec::new()
+            }
+            Event::JoinRequested {
+                from_user,
+                from_name,
+            } => {
+                host::on_join_requested(self, from_user, from_name);
+                Vec::new()
+            }
+            Event::JoinDeclined { from_name, .. } => {
+                // Inicio ya olvidó la petición (`home::on_event`).
+                self.toast(
+                    Tone::Info,
+                    t!("app-name-no-puede-dejarte-entrar", name = from_name),
+                );
+                Vec::new()
+            }
+            Event::JoinRequestFailed { message } => {
+                self.toast(Tone::Warning, message);
                 Vec::new()
             }
             Event::ServerStatus { rtt_ms, online } => {
@@ -1109,6 +1232,14 @@ impl App {
                 Vec::new()
             }
             Event::Invited(invitation) => {
+                // Si se le había pedido entrar, la invitación es la respuesta: se entra ya.
+                if home::take_asked(self, invitation.from_user) && !home::server_down(self) {
+                    self.toast(
+                        Tone::Success,
+                        t!("app-name-te-deja-entrar", name = invitation.from_name),
+                    );
+                    return home::update(self, home::Msg::Accept(invitation.code));
+                }
                 self.invitations
                     .retain(|known| known.from_user != invitation.from_user);
                 self.toast(
@@ -1511,6 +1642,10 @@ pub const HEADERBAR_HEIGHT: f32 = 48.0;
 
 /// Cuánto se espera tras el último cambio de ajustes para guardarlos.
 pub const SETTINGS_SAVE_DELAY: Duration = Duration::from_millis(600);
+
+/// Lo que dura una petición de entrar en una sala sin respuesta: en Inicio, «Pedido…» hasta que el
+/// anfitrión contesta o pasa este tiempo; en Compartir, la tarjeta de quien pide entrar.
+pub const JOIN_REQUEST_TTL: Duration = Duration::from_secs(60);
 
 /// Texto de la calidad para la interfaz.
 pub fn quality_tone(level: QualityLevel) -> Tone {

@@ -11,6 +11,7 @@
 //! Cada cambio se guarda solo, poco después ([`App::settings_changed`]); las filas cuyo cambio no
 //! llega a la sala abierta lo dicen con una etiqueta («Al abrir la sala», «Al entrar en la sala»).
 
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use coroom_session::input::gamepad::PadChoice;
@@ -18,7 +19,7 @@ use coroom_transport::proto::PROTOCOL_VERSION;
 use coroom_transport::proto::api::Devices;
 use coroom_ui::Element;
 use coroom_ui::icon::{Icon, icon_with};
-use coroom_ui::style::{ButtonClass, ContainerClass, SvgClass};
+use coroom_ui::style::{ButtonClass, ContainerClass, SvgClass, TextClass};
 use coroom_ui::tag;
 use coroom_ui::theme::{Accent, Tone};
 use coroom_ui::tokens::{space, text as type_size};
@@ -30,6 +31,7 @@ use iced_widget::{Column, Row, button, column, container, row, text};
 use crate::ui::app::{App, AudioDevice, Dialog, Effect, Event, Load, Message, Page, Screen};
 use crate::ui::screens::diagnostics;
 use crate::ui::settings::{Shortcuts, ThemeChoice, VoiceMode};
+use crate::ui::sound;
 
 /// Cada cuánto se vuelve a pedir la lista de micrófonos y salidas con «Audio y voz» abierta.
 pub const AUDIO_REFRESH: Duration = Duration::from_secs(3);
@@ -123,6 +125,10 @@ pub struct State {
     pub port: Option<String>,
     /// Error del puerto.
     pub port_error: Option<String>,
+    /// El selector del tono del chat está abierto («Elegir…» no se repite mientras).
+    pub chat_sound_picking: bool,
+    /// Error de la última elección del tono (fichero que no vale o selector que falló).
+    pub chat_sound_error: Option<String>,
 }
 
 /// Mensajes.
@@ -161,6 +167,14 @@ pub enum Msg {
     GuestsMuted(bool),
     /// Sonido al llegar un mensaje.
     ChatSound(bool),
+    /// Abrir el selector de ficheros para el tono del chat.
+    PickChatSound,
+    /// El selector volvió: un fichero, nada (cancelado) o un error.
+    ChatSoundPicked(Result<Option<PathBuf>, String>),
+    /// Oír el tono actual.
+    TestChatSound,
+    /// Volver al tono de por defecto.
+    ClearChatSound,
     /// Notificación del escritorio con la ventana sin foco.
     ChatNotifications(bool),
     /// Burbuja sobre el vídeo.
@@ -351,6 +365,37 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::NoiseSuppression(on) => settings.audio.noise_suppression = on,
         Msg::GuestsMuted(on) => settings.room.guests_muted = on,
         Msg::ChatSound(on) => settings.room.chat_sound = on,
+        Msg::PickChatSound => {
+            if app.settings_page.chat_sound_picking {
+                return Vec::new();
+            }
+            app.settings_page.chat_sound_picking = true;
+            return vec![Effect::PickChatSound];
+        }
+        Msg::ChatSoundPicked(picked) => {
+            app.settings_page.chat_sound_picking = false;
+            match picked {
+                Ok(None) => return Vec::new(),
+                Ok(Some(file)) => {
+                    if let Err(error) = sound::check_tone(&file) {
+                        app.settings_page.chat_sound_error = Some(error);
+                        return Vec::new();
+                    }
+                    app.settings_page.chat_sound_error = None;
+                    settings.room.chat_sound_file = Some(file);
+                }
+                Err(error) => {
+                    app.settings_page.chat_sound_error =
+                        Some(t!("settings-tono-no-se-pudo-elegir", error = error));
+                    return Vec::new();
+                }
+            }
+        }
+        Msg::TestChatSound => return vec![Effect::ChatSound],
+        Msg::ClearChatSound => {
+            app.settings_page.chat_sound_error = None;
+            settings.room.chat_sound_file = None;
+        }
         Msg::ChatNotifications(on) => settings.room.chat_notifications = on,
         Msg::ChatBubbles(on) => settings.room.chat_bubbles = on,
         Msg::PadAuto => {
@@ -1034,6 +1079,7 @@ fn room(app: &App) -> Element<'_, Message> {
                     Some(t!("settings-sonido-al-llegar-un-mensaje-ayuda").to_owned()),
                     ui::switch(room.chat_sound, Some(|on_off| on(Msg::ChatSound(on_off)))),
                 ),
+                tone_row(app),
                 ui::pref_row(
                     t!("settings-notificacion-del-escritorio"),
                     Some(t!("settings-notificacion-del-escritorio-ayuda").to_owned()),
@@ -1055,6 +1101,66 @@ fn room(app: &App) -> Element<'_, Message> {
     ]
     .spacing(space::L)
     .into()
+}
+
+/// Fila del tono del chat: cuál suena ahora, «Probar», «Elegir…» y, con uno propio, «Quitar»; el
+/// error de la última elección va bajo el texto.
+fn tone_row(app: &App) -> Element<'_, Message> {
+    let room = &app.settings.room;
+    let state = &app.settings_page;
+    let windows = cfg!(target_os = "windows");
+    let current = match &room.chat_sound_file {
+        Some(file) => file.file_name().map_or_else(
+            || file.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        ),
+        None if windows => t!("settings-tono-por-defecto-windows").to_owned(),
+        None => t!("settings-tono-por-defecto-linux").to_owned(),
+    };
+    let help = if windows {
+        t!("settings-tono-ayuda-windows")
+    } else {
+        t!("settings-tono-ayuda-linux")
+    };
+    let mut texts = column![
+        ui::body(t!("settings-tono")),
+        ui::secondary(current).wrapping(Wrapping::WordOrGlyph),
+        ui::caption(help).wrapping(Wrapping::WordOrGlyph),
+    ]
+    .spacing(2);
+    if let Some(error) = &state.chat_sound_error {
+        texts = texts.push(
+            row![
+                icon_with(Icon::CircleAlert, 14.0, SvgClass::Tone(Tone::Error)),
+                text(error)
+                    .size(type_size::SECONDARY)
+                    .class(TextClass::Tone(Tone::Error))
+                    .wrapping(Wrapping::WordOrGlyph)
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+    }
+    let mut buttons = row![
+        ui::flat(t!("settings-tono-probar"), Some(on(Msg::TestChatSound))),
+        ui::normal(
+            t!("settings-tono-elegir"),
+            (!state.chat_sound_picking).then(|| on(Msg::PickChatSound)),
+        ),
+    ]
+    .spacing(space::XS)
+    .align_y(Alignment::Center);
+    if room.chat_sound_file.is_some() {
+        buttons = buttons.push(ui::flat(
+            t!("settings-tono-quitar"),
+            Some(on(Msg::ClearChatSound)),
+        ));
+    }
+    row![texts.width(Length::Fill), buttons]
+        .spacing(space::M)
+        .align_y(Alignment::Center)
+        .padding(Padding::from([10.0, 16.0]))
+        .into()
 }
 
 // --- Mandos --------------------------------------------------------------------------------------
@@ -1555,7 +1661,9 @@ pub(crate) mod shots {
             app.settings.audio.push_to_talk_key = "V".to_owned();
         }),
         ("18-ajustes-sala", |app| {
-            settings_page(app, SettingsPage::Room)
+            settings_page(app, SettingsPage::Room);
+            app.settings.room.chat_sound_file =
+                Some(std::path::PathBuf::from("/home/ana/Sonidos/campanita.ogg"));
         }),
         ("19-ajustes-mandos", |app| {
             settings_page(app, SettingsPage::Gamepads);
@@ -1627,6 +1735,16 @@ mod tests {
         assert!(app.settings.room.guests_muted);
         change(&mut app, Msg::ChatSound(false));
         assert!(!app.settings.room.chat_sound);
+        let dir = tempfile::tempdir().expect("directorio");
+        let tone = dir.path().join("tono.wav");
+        std::fs::write(&tone, sound::chime_wav()).expect("escribir");
+        change(&mut app, Msg::ChatSoundPicked(Ok(Some(tone.clone()))));
+        assert_eq!(
+            app.settings.room.chat_sound_file.as_deref(),
+            Some(tone.as_path())
+        );
+        change(&mut app, Msg::ClearChatSound);
+        assert_eq!(app.settings.room.chat_sound_file, None);
         change(&mut app, Msg::ChatNotifications(false));
         assert!(!app.settings.room.chat_notifications);
         change(&mut app, Msg::ChatBubbles(false));
@@ -1656,6 +1774,70 @@ mod tests {
             1,
             "{effects:?}"
         );
+    }
+
+    #[test]
+    fn chat_tone_is_picked_checked_and_tested() {
+        let mut app = open(SettingsPage::Room);
+        assert_eq!(
+            app.update(Message::Settings(Msg::PickChatSound)),
+            [Effect::PickChatSound]
+        );
+        assert!(app.settings_page.chat_sound_picking);
+        assert!(
+            app.update(Message::Settings(Msg::PickChatSound)).is_empty(),
+            "con el selector abierto no se abre otro"
+        );
+        // Cancelado: nada cambia.
+        assert!(
+            app.update(Message::Settings(Msg::ChatSoundPicked(Ok(None))))
+                .is_empty()
+        );
+        assert!(!app.settings_page.chat_sound_picking);
+        assert_eq!(app.settings.room.chat_sound_file, None);
+        // Un fichero que no existe: error en la fila y el ajuste como estaba.
+        let dir = tempfile::tempdir().expect("directorio");
+        let missing = dir.path().join("no-esta.wav");
+        assert!(
+            app.update(Message::Settings(Msg::ChatSoundPicked(Ok(Some(missing)))))
+                .is_empty()
+        );
+        assert!(app.settings_page.chat_sound_error.is_some());
+        assert_eq!(app.settings.room.chat_sound_file, None);
+        // El selector falló: se explica.
+        assert!(
+            app.update(Message::Settings(Msg::ChatSoundPicked(Err(
+                "sin portal".into()
+            ))))
+            .is_empty()
+        );
+        assert!(
+            app.settings_page
+                .chat_sound_error
+                .as_deref()
+                .is_some_and(|error| error.contains("sin portal"))
+        );
+        // Uno que vale quita el error y se guarda; «Probar» suena sin tocar nada.
+        let tone = dir.path().join("tono.wav");
+        std::fs::write(&tone, sound::chime_wav()).expect("escribir");
+        assert!(
+            app.update(Message::Settings(Msg::ChatSoundPicked(Ok(Some(
+                tone.clone()
+            )))))
+            .is_empty()
+        );
+        assert_eq!(app.settings_page.chat_sound_error, None);
+        assert_eq!(
+            app.settings.room.chat_sound_file.as_deref(),
+            Some(tone.as_path())
+        );
+        assert_eq!(
+            app.update(Message::Settings(Msg::TestChatSound)),
+            [Effect::ChatSound]
+        );
+        app.now += Duration::from_secs(5);
+        let effects = app.update(Message::Tick);
+        assert!(effects.contains(&Effect::SaveSettings), "{effects:?}");
     }
 
     #[test]

@@ -10,7 +10,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, TryLockError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,7 +26,8 @@ use coroom_transport::proto::signal::SignalMessage;
 use coroom_transport::{Endpoint, EndpointOptions, SignalClient};
 
 use super::app::{
-    AccountInfo, App, AudioDevice, Effect, Event, HostRequest, Invitation, Message, VideoSupport,
+    AccountInfo, App, AudioDevice, Effect, Event, GuestEnd, HostRequest, Invitation, Message,
+    VideoSupport,
 };
 use super::compose::Compositor;
 use super::screens::guest::Stats;
@@ -83,6 +84,16 @@ struct LocalRun {
     ledger: Arc<LatencyLedger>,
 }
 
+/// Sala de espera en marcha.
+struct Lobby {
+    /// Su parada.
+    stop: Arc<AtomicBool>,
+    /// El servidor al que escucha.
+    server: Option<String>,
+    /// Lo que tiene que enviar por su señalización (pedir entrar en la sala de un amigo).
+    commands: mpsc::Sender<SignalMessage>,
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -98,13 +109,16 @@ pub struct Backend {
     guest: Arc<Mutex<Option<GuestRun>>>,
     /// Cancelación de la entrada en curso (antes de que haya sesión que cerrar).
     join_cancel: Option<Arc<AtomicBool>>,
-    /// Sala de espera en marcha: su parada y el servidor al que escucha.
-    lobby: Option<(Arc<AtomicBool>, Option<String>)>,
+    /// Sala de espera en marcha.
+    lobby: Option<Lobby>,
     local: Arc<Mutex<Option<LocalRun>>>,
     /// Si la ventana puede presentar en HDR.
     hdr_display: Option<bool>,
     /// El compositor de la ventana, donde se componen las fuentes de vídeo (ninguno sin ventana).
     compositor: Option<Arc<Compositor>>,
+    /// El guardado de ajustes en curso, si lo hay: se espera antes del siguiente (así nunca hay dos
+    /// escribiendo el mismo temporal) y al cerrar (para que el último llegue al disco).
+    settings_save: Option<thread::JoinHandle<()>>,
 }
 
 /// Lo que este equipo hace con 4:4:4 y HDR (sondea los códecs la primera vez).
@@ -180,6 +194,7 @@ impl Backend {
             local: Arc::new(Mutex::new(None)),
             hdr_display: None,
             compositor,
+            settings_save: None,
         }
     }
 
@@ -198,14 +213,44 @@ impl Backend {
     }
 
     /// Como [`Backend::spawn`]; si la tarea entra en pánico, avisa con `on_panic` (la sala o la
-    /// sesión del invitado, para que la pantalla no se quede esperando).
+    /// sesión del invitado, para que la pantalla no se quede esperando). Devuelve el hilo, si
+    /// arrancó, para quien tenga que esperarlo.
     fn spawn_or(
         &self,
         name: &str,
         on_panic: fn(String) -> Event,
         job: impl FnOnce(Notify) + Send + 'static,
-    ) {
-        spawn_job(Arc::clone(&self.notify), name, on_panic, job);
+    ) -> Option<thread::JoinHandle<()>> {
+        spawn_job(Arc::clone(&self.notify), name, on_panic, job)
+    }
+
+    /// Guarda los ajustes de `app` en disco. En segundo plano (también se guarda en plena sesión:
+    /// un ajuste del vídeo, un par conocido) salvo con `blocking`, para los caminos de cierre: el
+    /// proceso termina justo después y un hilo suelto no llegaría a escribir. Nunca hay dos
+    /// guardados a la vez: el anterior se espera antes de empezar.
+    pub fn save_settings(&mut self, app: &App, blocking: bool) {
+        self.join_settings_save();
+        let settings = app.settings.clone();
+        let path = self.settings_path.clone();
+        if blocking {
+            if let Err(err) = settings.save(&path) {
+                tracing::warn!(error = %err, "no se pudieron guardar los ajustes al cerrar");
+            }
+            return;
+        }
+        self.settings_save = self.spawn_or("ajustes", Event::Failed, move |notify| {
+            if let Err(err) = settings.save(&path) {
+                notify(Message::Event(Event::Failed(err)));
+            }
+        });
+    }
+
+    /// Espera al guardado de ajustes en curso, si lo hay.
+    fn join_settings_save(&mut self) {
+        if let Some(save) = self.settings_save.take() {
+            // Un pánico ya lo avisó `spawn_job`; aquí solo importa que terminó.
+            let _ = save.join();
+        }
     }
 
     /// Mandos del invitado, cuando su sesión ya arrancó.
@@ -319,7 +364,16 @@ impl Backend {
             Effect::ChatNotify { title, body } => self.spawn("aviso", move |_| {
                 chat_notification(&title, &body);
             }),
-            Effect::ChatSound => self.spawn("sonido", |_| chat_sound()),
+            Effect::ChatSound => {
+                let tone = app.settings.room.chat_sound_file.clone();
+                self.spawn("sonido", move |_| super::sound::play(tone.as_deref()));
+            }
+            Effect::PickChatSound => self.spawn("tono", |notify| {
+                let picked = super::sound::pick_tone();
+                notify(Message::Settings(
+                    super::screens::settings::Msg::ChatSoundPicked(picked),
+                ));
+            }),
             // Lo hace la ventana (`runner.rs`): aquí no hay campo que enfocar.
             Effect::FocusChat(_) => {}
             Effect::SetVoiceMuted {
@@ -366,6 +420,28 @@ impl Backend {
                     (self.notify)(Message::Event(Event::Failed(err.to_string())));
                 }
             }
+            Effect::AskToJoin(user) => {
+                // Va por la señalización de la sala de espera (sin sesión no hay otra); si la
+                // conexión está caída, el bucle de espera avisa al descartar lo encolado.
+                let sent = self.lobby.as_ref().is_some_and(|lobby| {
+                    lobby
+                        .commands
+                        .send(SignalMessage::JoinRequest { to_user: user })
+                        .is_ok()
+                });
+                if !sent {
+                    (self.notify)(Message::Event(Event::JoinRequestFailed {
+                        message: t!("backend-sin-conexion-para-pedir-entrar").to_owned(),
+                    }));
+                }
+            }
+            Effect::DeclineJoin(user) => {
+                if let Some(session) = lock(&self.host).clone()
+                    && let Err(err) = lock(&session).decline_join(user)
+                {
+                    (self.notify)(Message::Event(Event::Failed(err.to_string())));
+                }
+            }
             Effect::Join(code) => {
                 if let Some(options) = account {
                     let join = join_options(&options, &app.settings, code);
@@ -400,11 +476,7 @@ impl Backend {
                     controls.audio.toggle_game();
                 }
             }
-            Effect::SaveSettings => {
-                if let Err(err) = app.settings.save(&self.settings_path) {
-                    (self.notify)(Message::Event(Event::Failed(err)));
-                }
-            }
+            Effect::SaveSettings => self.save_settings(app, false),
             Effect::RunDoctor => self.spawn("diagnostico", |notify| {
                 let lines = crate::doctor::report().unwrap_or_else(|err| vec![err]);
                 notify(Message::Event(Event::Doctor(lines)));
@@ -499,21 +571,28 @@ impl Backend {
         if self
             .lobby
             .as_ref()
-            .is_some_and(|(_, server)| *server == options.server)
+            .is_some_and(|lobby| lobby.server == options.server)
         {
             return;
         }
         self.stop_lobby();
         let stop = Arc::new(AtomicBool::new(false));
-        self.lobby = Some((Arc::clone(&stop), options.server.clone()));
+        let (commands, inbox) = mpsc::channel();
+        self.lobby = Some(Lobby {
+            stop: Arc::clone(&stop),
+            server: options.server.clone(),
+            commands,
+        });
         tracing::info!("sala de espera abierta");
-        self.spawn("espera", move |notify| lobby(&options, &stop, &notify));
+        self.spawn("espera", move |notify| {
+            lobby(&options, &stop, &inbox, &notify);
+        });
     }
 
     fn stop_lobby(&mut self) {
-        if let Some((stop, _)) = self.lobby.take() {
+        if let Some(lobby) = self.lobby.take() {
             tracing::info!("sala de espera cerrada");
-            stop.store(true, Ordering::Release);
+            lobby.stop.store(true, Ordering::Release);
         }
     }
 
@@ -727,7 +806,9 @@ impl Backend {
             }
             notify(Message::Event(Event::HostStarted(Ok(preview))));
             poll_host_guests(Arc::downgrade(&session), Arc::clone(&notify));
-            let reason = forward_events(events, &notify, Event::Host, &session, "host");
+            let reason = forward_events(events, &notify, Event::Host, &session, "host")
+                .as_ref()
+                .map(SessionError::to_string);
             // Terminó (sola o porque se cerró): sale del hueco si sigue siendo la de ahora, para
             // que la próxima sala no tropiece con ella.
             drop(take_if(&slot, |current| Arc::ptr_eq(current, &session)));
@@ -753,7 +834,8 @@ impl Backend {
             hdr = options.hdr,
             "entrando en una sala"
         );
-        let on_panic: fn(String) -> Event = |reason| Event::GuestEnded(Some(reason));
+        let on_panic: fn(String) -> Event =
+            |reason| Event::GuestEnded(Some(GuestEnd::other(reason)));
         self.spawn_or("invitado", on_panic, move |notify| {
             let identity = match identity {
                 Some(identity) => Ok(identity),
@@ -824,10 +906,14 @@ impl Backend {
             close_detached(session);
             feed.close();
             tracing::info!(
-                reason = reason.as_deref().unwrap_or("cierre normal"),
+                reason = reason
+                    .as_ref()
+                    .map_or_else(|| "cierre normal".to_owned(), SessionError::to_string),
                 "fuera de la sala"
             );
-            notify(Message::Event(Event::GuestEnded(reason)));
+            notify(Message::Event(Event::GuestEnded(
+                reason.map(GuestEnd::from),
+            )));
         });
     }
 
@@ -855,9 +941,9 @@ impl Backend {
                             return;
                         };
                         if finished {
-                            notify(Message::Event(Event::GuestEnded(
-                                failure.map(|err| t!("backend-la-prueba-se-detuvo-err", err = err)),
-                            )));
+                            notify(Message::Event(Event::GuestEnded(failure.map(|err| {
+                                GuestEnd::other(t!("backend-la-prueba-se-detuvo-err", err = err))
+                            }))));
                             return;
                         }
                         let summary = ledger.summary();
@@ -898,6 +984,7 @@ impl Backend {
     /// Cierra todo al salir (espera a que las sesiones terminen). Devuelve el resumen del
     /// invitado, si había sesión, y el motivo si terminó por un error.
     pub fn shutdown(&mut self) -> Option<Result<LatencySummary, String>> {
+        self.join_settings_save();
         self.stop_lobby();
         let host = lock(&self.host).take();
         if let Some(session) = host {
@@ -942,7 +1029,7 @@ fn forward_events(
     each: fn(SessionEvent) -> Event,
     session: &Mutex<RemoteSession>,
     role: &'static str,
-) -> Option<String> {
+) -> Option<SessionError> {
     let mut reason = None;
     while let Ok(event) = events.recv() {
         match &event {
@@ -955,35 +1042,64 @@ fn forward_events(
             reason = ended;
             break;
         }
-        // La presencia de los amigos llega también por la señalización de la sala: Inicio la
-        // sigue aunque la sala esté abierta.
-        if let SessionEvent::Presence { user, online } = event {
-            notify(Message::Event(Event::Presence { user, online }));
+        // La presencia y la actividad de los amigos (y lo que tiene que ver con pedir entrar)
+        // llegan también por la señalización de la sala: Inicio y Compartir las siguen aunque la
+        // sala esté abierta o se esté en otra.
+        if let Some(shared) = lobby_event(&event) {
+            notify(Message::Event(shared));
             continue;
         }
         notify(Message::Event(each(event)));
     }
-    reason
-        .or_else(|| {
-            // Sin esperar: si alguien la está cerrando, el motivo ya llegó con el evento.
-            let session = match session.try_lock() {
-                Ok(session) => session,
-                Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-                Err(TryLockError::WouldBlock) => return None,
-            };
-            session.end_reason()
-        })
-        .as_ref()
-        .map(SessionError::to_string)
+    reason.or_else(|| {
+        // Sin esperar: si alguien la está cerrando, el motivo ya llegó con el evento.
+        let session = match session.try_lock() {
+            Ok(session) => session,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
+        session.end_reason()
+    })
 }
 
-/// Lanza `job` en un hilo propio; si entra en pánico, avisa con `on_panic` y el motivo.
+/// Los eventos de una sesión que no son de la sala sino de la cuenta (los mismos que la sala de
+/// espera reparte): presencia y actividad de los amigos, y las peticiones de entrar.
+fn lobby_event(event: &SessionEvent) -> Option<Event> {
+    Some(match event {
+        SessionEvent::Presence { user, online } => Event::Presence {
+            user: *user,
+            online: *online,
+        },
+        SessionEvent::Activity { user, activity } => Event::Activity {
+            user: *user,
+            activity: *activity,
+        },
+        SessionEvent::JoinRequested {
+            from_user,
+            from_name,
+        } => Event::JoinRequested {
+            from_user: *from_user,
+            from_name: from_name.clone(),
+        },
+        SessionEvent::JoinDeclined {
+            from_user,
+            from_name,
+        } => Event::JoinDeclined {
+            from_user: *from_user,
+            from_name: from_name.clone(),
+        },
+        _ => return None,
+    })
+}
+
+/// Lanza `job` en un hilo propio; si entra en pánico, avisa con `on_panic` y el motivo. Devuelve
+/// el hilo, o `None` (ya avisado) si no pudo arrancar.
 fn spawn_job(
     notify: Notify,
     name: &str,
     on_panic: fn(String) -> Event,
     job: impl FnOnce(Notify) + Send + 'static,
-) {
+) -> Option<thread::JoinHandle<()>> {
     let task = name.to_owned();
     let inner = Arc::clone(&notify);
     let spawned = thread::Builder::new()
@@ -999,18 +1115,23 @@ fn spawn_job(
                 ))));
             }
         });
-    if let Err(err) = spawned {
-        notify(Message::Event(Event::Failed(t!(
-            "backend-no-se-pudo-arrancar-una-tarea",
-            err = err
-        ))));
+    match spawned {
+        Ok(handle) => Some(handle),
+        Err(err) => {
+            notify(Message::Event(Event::Failed(t!(
+                "backend-no-se-pudo-arrancar-una-tarea",
+                err = err
+            ))));
+            None
+        }
     }
 }
 
 /// Notificación del escritorio de un mensaje del chat: en Linux por el portal de notificaciones
 /// (GNOME y KDE la muestran con su estilo, también dentro de Flatpak); siempre la misma, así que
-/// una ráfaga de mensajes no apila avisos. En Windows, todavía ninguna (haría falta el sistema de
-/// notificaciones de WinRT, que no está entre las dependencias).
+/// una ráfaga de mensajes no apila avisos. En Windows, todavía ninguna: los avisos de WinRT exigen
+/// un AppUserModelID registrado (acceso directo en el menú Inicio o clave del registro) para el
+/// ejecutable suelto, y otro camino para el MSIX; hasta decidirlo, solo el registro.
 fn chat_notification(title: &str, body: &str) {
     #[cfg(target_os = "linux")]
     {
@@ -1048,47 +1169,6 @@ fn chat_notification(title: &str, body: &str) {
     {
         let _ = (title, body);
         tracing::debug!("notificación del chat: aún no disponible en este sistema");
-    }
-}
-
-/// Sonido de mensaje nuevo: `message-new-instant` del tema de sonido freedesktop con el
-/// reproductor del sistema (`pw-play` o `paplay`). Sin fichero ni reproductor, en silencio (en
-/// Windows, por ahora, nada).
-fn chat_sound() {
-    #[cfg(unix)]
-    {
-        use std::process::{Command, Stdio};
-        const SOUND: &str = "sounds/freedesktop/stereo/message-new-instant.oga";
-        let mut dirs: Vec<PathBuf> = Vec::new();
-        if let Some(home) = std::env::var_os("XDG_DATA_HOME").filter(|dir| !dir.is_empty()) {
-            dirs.push(PathBuf::from(home));
-        }
-        let shared = std::env::var("XDG_DATA_DIRS")
-            .ok()
-            .filter(|dirs| !dirs.is_empty())
-            .unwrap_or_else(|| "/usr/local/share:/usr/share".to_owned());
-        dirs.extend(shared.split(':').map(PathBuf::from));
-        let Some(file) = dirs
-            .into_iter()
-            .map(|dir| dir.join(SOUND))
-            .find(|path| path.is_file())
-        else {
-            tracing::debug!("sin el sonido message-new-instant del tema");
-            return;
-        };
-        for player in ["pw-play", "paplay"] {
-            let started = Command::new(player)
-                .arg(&file)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
-            if let Ok(mut child) = started {
-                let _ = child.wait();
-                return;
-            }
-        }
-        tracing::debug!("sin pw-play ni paplay para el sonido del chat");
     }
 }
 
@@ -1361,11 +1441,18 @@ fn resume_from(store: &AccountStore, server: ServerEntry) -> Event {
     Event::SignedIn(account::resume(&options).map(|(_, signed)| account_info(server, signed)))
 }
 
-/// Sala de espera: con la cuenta abierta y sin sesión, escucha invitaciones y presencia (y así
-/// los amigos te ven conectado). Si la señalización se cae, vuelve a intentarlo.
-fn lobby(options: &AccountOptions, stop: &AtomicBool, notify: &Notify) {
+/// Sala de espera: con la cuenta abierta y sin sesión, escucha invitaciones, presencia y
+/// actividad (y así los amigos te ven conectado) y envía lo que llega por `inbox` (pedir entrar
+/// en la sala de un amigo). Si la señalización se cae, vuelve a intentarlo; mientras, lo que se
+/// pida enviar se descarta con un aviso.
+fn lobby(
+    options: &AccountOptions,
+    stop: &AtomicBool,
+    inbox: &mpsc::Receiver<SignalMessage>,
+    notify: &Notify,
+) {
     while !stop.load(Ordering::Acquire) {
-        if let Err(err) = lobby_once(options, stop, notify) {
+        if let Err(err) = lobby_once(options, stop, inbox, notify) {
             tracing::debug!(error = %err, "sala de espera");
             if !stop.load(Ordering::Acquire) {
                 notify(Message::Event(Event::ServerStatus {
@@ -1379,12 +1466,27 @@ fn lobby(options: &AccountOptions, stop: &AtomicBool, notify: &Notify) {
             if stop.load(Ordering::Acquire) {
                 return;
             }
+            discard_lobby_commands(inbox, notify);
             thread::sleep(Duration::from_millis(200));
         }
     }
 }
 
-fn lobby_once(options: &AccountOptions, stop: &AtomicBool, notify: &Notify) -> Result<(), String> {
+/// Sin señalización no se puede enviar nada: lo encolado se descarta avisando.
+fn discard_lobby_commands(inbox: &mpsc::Receiver<SignalMessage>, notify: &Notify) {
+    while inbox.try_recv().is_ok() {
+        notify(Message::Event(Event::JoinRequestFailed {
+            message: t!("backend-sin-conexion-para-pedir-entrar").to_owned(),
+        }));
+    }
+}
+
+fn lobby_once(
+    options: &AccountOptions,
+    stop: &AtomicBool,
+    inbox: &mpsc::Receiver<SignalMessage>,
+    notify: &Notify,
+) -> Result<(), String> {
     let session = account::session(options)?;
     let (identity, _) = load_identity(options.data_dir.as_deref(), options.headless)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1423,12 +1525,38 @@ fn lobby_once(options: &AccountOptions, stop: &AtomicBool, notify: &Notify) -> R
                     Ok(Some(SignalMessage::Presence { user, online })) => {
                         notify(Message::Event(Event::Presence { user, online }));
                     }
+                    Ok(Some(SignalMessage::Activity { user, activity })) => {
+                        notify(Message::Event(Event::Activity { user, activity }));
+                    }
+                    // Solo si la sala está abierta en otro dispositivo de la cuenta: se avisa.
+                    Ok(Some(SignalMessage::JoinRequested { from_user, from_name })) => {
+                        notify(Message::Event(Event::JoinRequested { from_user, from_name }));
+                    }
+                    Ok(Some(SignalMessage::JoinDeclined { from_user, from_name })) => {
+                        notify(Message::Event(Event::JoinDeclined { from_user, from_name }));
+                    }
+                    // La sala de espera solo envía peticiones de entrar: un error es su respuesta
+                    // (el texto del servidor ya viene en español).
+                    Ok(Some(SignalMessage::Error { message, .. })) => {
+                        notify(Message::Event(Event::JoinRequestFailed { message }));
+                    }
                     Ok(Some(_)) => {}
                     Ok(None) => break Err(t!("backend-el-servidor-cerro-la-senalizacion").to_owned()),
                     Err(err) => break Err(err.to_string()),
                 },
                 _ = tick.tick() => {
-                    if stop.load(Ordering::Acquire) {
+                    // La parada se mira antes de vaciar la cola: lo que se encoló antes de pedirla
+                    // (una petición de entrar justo antes de cerrar la sala de espera) sale
+                    // todavía, en vez de perderse en silencio.
+                    let stopping = stop.load(Ordering::Acquire);
+                    while let Ok(message) = inbox.try_recv() {
+                        if let Err(err) = signal.send(&message).await {
+                            notify(Message::Event(Event::JoinRequestFailed {
+                                message: t!("backend-no-se-pudo-pedir-entrar", err = err),
+                            }));
+                        }
+                    }
+                    if stopping {
                         break Ok(());
                     }
                 }
