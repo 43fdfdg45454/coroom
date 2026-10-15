@@ -9,6 +9,12 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Añadido
 
+- **Volumen por participante**: junto al botón de oír o no a cada persona (la tarjeta de cada
+  invitado en Compartir y «Personas en la sala» del invitado) hay un deslizador de 0 a 200 % (de
+  5 en 5, Ctrl+clic vuelve al 100 %) que sube o baja su voz solo en este equipo; a más del 100 %
+  el limitador suave del mezclador evita que recorte. El volumen se recuerda por nombre de cuenta
+  (`voice_volumes` en los ajustes locales) y se aplica solo cuando esa persona vuelve a
+  coincidir en una sala. La propia voz no tiene deslizador.
 - **El permiso de compartir la pantalla se recuerda** (Linux): el diálogo del portal sale una
   vez; el token de restauración se guarda en `portal.json` del directorio de datos (solo legible
   por el usuario), por separado para pantalla y ventana, y lo usan la aplicación, `coroom host`

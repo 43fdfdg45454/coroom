@@ -6,6 +6,7 @@
 //! aplicación sin arrancar. Se escribe entero en un fichero temporal y se renombra (nunca queda a
 //! medias). No guarda secretos: las credenciales van al llavero ([`crate::account`]).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use coroom_session::input::gamepad::PadChoice;
@@ -358,6 +359,42 @@ pub struct Audio {
     /// Como anfitrión, compartir el micrófono con la sala (se aplica al abrirla). [`Audio::voice`]
     /// es lo mismo como invitado.
     pub host_voice: bool,
+    /// Volumen de la voz de cada participante en este equipo, por su nombre de cuenta, en
+    /// porcentaje (0-200); solo los distintos de 100. Se aplica cuando esa persona aparece en la
+    /// sala, se comparta o se esté de invitado.
+    #[serde(default)]
+    pub voice_volumes: BTreeMap<String, u8>,
+}
+
+/// Volumen normal de una voz (porcentaje).
+pub const DEFAULT_VOICE_VOLUME: u8 = 100;
+
+/// Volumen máximo de una voz (porcentaje; el doble, [`coroom_session::remote::audio::MAX_VOICE_GAIN`]).
+pub const MAX_VOICE_VOLUME: u8 = 200;
+
+/// Ganancia lineal de un volumen en porcentaje.
+pub fn voice_gain(percent: u8) -> f32 {
+    f32::from(percent.min(MAX_VOICE_VOLUME)) / 100.0
+}
+
+impl Audio {
+    /// Volumen recordado para la voz de `name` ([`DEFAULT_VOICE_VOLUME`] si no se tocó).
+    pub fn voice_volume(&self, name: &str) -> u8 {
+        self.voice_volumes
+            .get(name)
+            .copied()
+            .unwrap_or(DEFAULT_VOICE_VOLUME)
+    }
+
+    /// Recuerda el volumen de la voz de `name`; el normal se olvida (no ocupa sitio).
+    pub fn set_voice_volume(&mut self, name: &str, percent: u8) {
+        let percent = percent.min(MAX_VOICE_VOLUME);
+        if percent == DEFAULT_VOICE_VOLUME {
+            self.voice_volumes.remove(name);
+        } else {
+            self.voice_volumes.insert(name.to_owned(), percent);
+        }
+    }
 }
 
 /// Aplicación recordada en la lista de audio.
@@ -380,6 +417,7 @@ impl Default for Audio {
             noise_suppression: true,
             excluded_apps: Vec::new(),
             host_voice: true,
+            voice_volumes: BTreeMap::new(),
         }
     }
 }
@@ -591,6 +629,12 @@ impl Settings {
         {
             self.audio.push_to_talk_key = Audio::default().push_to_talk_key;
         }
+        for volume in self.audio.voice_volumes.values_mut() {
+            *volume = (*volume).min(MAX_VOICE_VOLUME);
+        }
+        self.audio
+            .voice_volumes
+            .retain(|_, volume| *volume != DEFAULT_VOICE_VOLUME);
         let mut seen = std::collections::BTreeSet::new();
         self.servers
             .retain(|server| seen.insert(server.url.clone()));
@@ -739,6 +783,7 @@ mod tests {
             fingerprint: "cd".repeat(32),
             safety_number: "12345 67890".into(),
         });
+        settings.audio.set_voice_volume("Carla", 60);
         settings.save(&path).expect("guardar");
         let text = std::fs::read_to_string(&path).expect("leer");
         assert!(text.contains("theme = \"dark\""), "{text}");
@@ -817,6 +862,40 @@ mod tests {
         let (loaded, warning) = Settings::load(&path);
         assert_eq!(loaded, Settings::default());
         assert!(warning.is_some_and(|w| w.contains("por defecto")));
+    }
+
+    #[test]
+    fn voice_volumes_remember_only_what_differs_from_normal() {
+        let mut audio = Audio::default();
+        assert!(audio.voice_volumes.is_empty(), "por defecto, nadie");
+        assert_eq!(audio.voice_volume("Bea"), DEFAULT_VOICE_VOLUME);
+        audio.set_voice_volume("Bea", 150);
+        audio.set_voice_volume("Carla", 250);
+        assert_eq!(audio.voice_volume("Bea"), 150);
+        assert_eq!(audio.voice_volume("Carla"), MAX_VOICE_VOLUME, "acotado");
+        audio.set_voice_volume("Bea", DEFAULT_VOICE_VOLUME);
+        assert_eq!(audio.voice_volumes.len(), 1, "el normal no se guarda");
+        assert_eq!(voice_gain(50), 0.5);
+        assert_eq!(voice_gain(200), 2.0);
+        assert_eq!(voice_gain(255), 2.0);
+        // Ida y vuelta por TOML, y sin la tabla (ajustes de antes) queda vacía.
+        let settings = Settings {
+            audio,
+            ..Settings::default()
+        };
+        let text = toml::to_string_pretty(&settings).expect("escribir");
+        assert!(text.contains("[audio.voice_volumes]"), "{text}");
+        assert!(text.contains("Carla = 200"), "{text}");
+        let loaded: Settings = toml::from_str(&text).expect("leer");
+        assert_eq!(loaded, settings);
+        let old: Settings = toml::from_str("[audio]\nvoice = true\n").expect("leer");
+        assert!(old.audio.voice_volumes.is_empty());
+        // Un fichero editado a mano se sanea: 100 se quita y lo que pasa de 200 se acota.
+        let edited: Settings =
+            toml::from_str("[audio.voice_volumes]\nAna = 100\nBea = 230\n").expect("leer");
+        let sane = edited.sanitized();
+        assert_eq!(sane.audio.voice_volumes.get("Ana"), None);
+        assert_eq!(sane.audio.voice_volumes.get("Bea"), Some(&200));
     }
 
     #[test]

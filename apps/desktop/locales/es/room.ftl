@@ -54,6 +54,7 @@ room-invitado = invitado
 room-tu-nombre = { $name } (tú)
 room-dejar-de-oir = Dejar de oír a { $name } (solo tú)
 room-volver-a-oir = Volver a oír a { $name }
+room-volumen-porcentaje = { $percent } %
 room-esperando-la-lista = Esperando la lista de la sala…
 room-solo-en-tu-equipo = Silenciar a alguien solo cambia lo que oyes tú: los demás le siguen oyendo.
 room-mando-que-envias = Mando que envías

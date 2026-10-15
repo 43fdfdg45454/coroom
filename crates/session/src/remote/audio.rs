@@ -29,10 +29,11 @@
 //! registro (las marcas, los contadores, los percentiles de la sincronía, los emisores nuevos
 //! (preparados de antemano) y los olvidados van y vienen por canales acotados a un hilo de
 //! contadores: el propio `audio-play` a demanda, `audio-stats` con la cola del sumidero), ni el de
-//! las voces silenciadas (huecos atómicos, [`ControlInner::muted_voices`]), ni el del reloj de la
-//! sesión más que una vez cada [`SYNC_TICKS`] tramas para renovar el ancla con la que convierte
-//! las marcas de captura ([`Playout::local_capture`]). Lo único que ordena es la copia de 200
-//! tránsitos del buffer de jitter, en su propia memoria.
+//! las voces silenciadas ni el de sus volúmenes (huecos atómicos, [`ControlInner::muted_voices`]
+//! y [`ControlInner::voice_gains`]), ni el del reloj de la sesión más que una vez cada
+//! [`SYNC_TICKS`] tramas para renovar el ancla con la que convierte las marcas de captura
+//! ([`Playout::local_capture`]). Lo único que ordena es la copia de 200 tránsitos del buffer de
+//! jitter, en su propia memoria.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -87,6 +88,17 @@ const MUTED_SLOTS: usize = 2 * MAX_VOICES;
 
 /// Marca de un hueco de voz silenciada ocupado (el emisor va en los 32 bits bajos).
 const MUTED_USED: u64 = 1 << 32;
+
+/// Voces con un volumen distinto del normal a la vez (huecos de [`ControlInner::voice_gains`]).
+const GAIN_SLOTS: usize = 2 * MAX_VOICES;
+
+/// Marca de un hueco de volumen ocupado: es el bit de signo de la ganancia (que nunca es negativa)
+/// en los 32 bits altos, donde van los bits del `f32`; el emisor va en los 32 bits bajos.
+const GAIN_USED: u64 = 1 << 63;
+
+/// Ganancia máxima de una voz (lineal: 2 es el doble de volumen; el limitador del mezclador evita
+/// que recorte).
+pub const MAX_VOICE_GAIN: f32 = 2.0;
 
 /// Fuente del juego en el mezclador.
 const GAME_SOURCE: u32 = u32::MAX;
@@ -174,6 +186,25 @@ struct ControlInner {
     /// ([`MUTED_USED`] | emisor, o 0 si está libre) en vez de un conjunto con cerrojo: la
     /// reproducción los consulta por cada voz y trama desde el hilo del dispositivo.
     muted_voices: [AtomicU64; MUTED_SLOTS],
+    /// Volumen de cada voz en este equipo, por emisor, cuando no es el normal (1.0): huecos
+    /// atómicos ([`GAIN_USED`] | bits de la ganancia << 32 | emisor, o 0 si está libre), por lo
+    /// mismo que [`ControlInner::muted_voices`]. Una voz sin hueco suena a 1.0.
+    voice_gains: [AtomicU64; GAIN_SLOTS],
+}
+
+/// Hueco de [`ControlInner::voice_gains`] del emisor `source` con la ganancia `gain` (acotada).
+fn gain_key(source: u32, gain: f32) -> u64 {
+    GAIN_USED | (u64::from(gain.to_bits()) << 32) | u64::from(source)
+}
+
+/// Si el hueco `slot` es del emisor `source`.
+fn gain_slot_is(slot: u64, source: u32) -> bool {
+    slot & GAIN_USED != 0 && slot as u32 == source
+}
+
+/// Ganancia guardada en un hueco ocupado.
+fn gain_of(slot: u64) -> f32 {
+    f32::from_bits(((slot & !GAIN_USED) >> 32) as u32)
 }
 
 /// Mandos del audio que la ventana y la consola tocan en caliente (atajos `Ctrl+Alt+M` y
@@ -284,6 +315,52 @@ impl AudioControl {
             .muted_voices
             .iter()
             .any(|slot| slot.load(Ordering::Relaxed) == key)
+    }
+
+    /// Volumen de la voz de `source` en este equipo: ganancia lineal entre 0.0 y
+    /// [`MAX_VOICE_GAIN`] (1.0, lo normal, libera el hueco; fuera del rango se acota; no finita
+    /// cuenta como 1.0). Aparte del silencio ([`AudioControl::set_voice_muted`]): una voz
+    /// silenciada conserva su volumen para cuando vuelva a oírse.
+    pub fn set_voice_gain(&self, source: u32, gain: f32) {
+        let gain = if gain.is_finite() {
+            gain.clamp(0.0, MAX_VOICE_GAIN)
+        } else {
+            1.0
+        };
+        let slots = &self.inner.voice_gains;
+        let wanted = (gain != 1.0).then(|| gain_key(source, gain));
+        for slot in slots {
+            let current = slot.load(Ordering::Acquire);
+            if gain_slot_is(current, source) {
+                // El mismo hueco cambia de ganancia o se libera.
+                let _ = slot.compare_exchange(
+                    current,
+                    wanted.unwrap_or(0),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                return;
+            }
+        }
+        if let Some(key) = wanted
+            && !slots.iter().any(|slot| {
+                slot.compare_exchange(0, key, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            })
+        {
+            debug!(source, "sin sitio para más voces con volumen propio");
+        }
+    }
+
+    /// Ganancia lineal de la voz de `source` aquí (1.0 si no se tocó). Sin cerrojo: la mezcla la
+    /// consulta en el hilo del dispositivo por cada voz y trama.
+    pub fn voice_gain(&self, source: u32) -> f32 {
+        self.inner
+            .voice_gains
+            .iter()
+            .map(|slot| slot.load(Ordering::Relaxed))
+            .find(|slot| gain_slot_is(*slot, source))
+            .map_or(1.0, gain_of)
     }
 
     /// Quién habla en la sala (ids de invitado; 0 = el anfitrión), según `VoiceState`.
@@ -1006,6 +1083,12 @@ impl Playout {
                     // Silenciada aquí: sigue su ritmo (para volver al instante), pero no suena.
                     continue;
                 }
+                // Su volumen en este equipo (el mezclador lo aplica al sumar; solo se le anota
+                // cuando cambia, para no gastar sus entradas con voces al volumen normal).
+                let gain = self.control.voice_gain(stream.source);
+                if self.mixer.gain(stream.source) != gain {
+                    self.mixer.set_gain(stream.source, gain);
+                }
                 let len = stream.frame_len();
                 self.mixer.add(
                     stream.source,
@@ -1565,6 +1648,132 @@ mod tests {
         control.set_voice_muted(0, false);
         control.set_voice_muted(999, true);
         assert!(control.voice_muted(999));
+    }
+
+    #[test]
+    fn voice_gains_live_in_atomic_slots() {
+        let control = AudioControl::default();
+        assert_eq!(control.voice_gain(7), 1.0, "sin tocar, volumen normal");
+        control.set_voice_gain(7, 2.0);
+        control.set_voice_gain(u32::MAX, 0.5);
+        assert_eq!(
+            (control.voice_gain(7), control.voice_gain(u32::MAX)),
+            (2.0, 0.5)
+        );
+        assert_eq!(
+            control.voice_gain(0),
+            1.0,
+            "el emisor 0 no se confunde con un hueco libre"
+        );
+        control.set_voice_gain(0, 0.0);
+        assert_eq!(control.voice_gain(0), 0.0, "ni tampoco al volumen cero");
+        // Acotada a 0.0..=2.0; lo que no es un número cuenta como 1.0.
+        control.set_voice_gain(9, 5.0);
+        assert_eq!(control.voice_gain(9), MAX_VOICE_GAIN);
+        control.set_voice_gain(9, -1.0);
+        assert_eq!(control.voice_gain(9), 0.0);
+        control.set_voice_gain(9, f32::NAN);
+        assert_eq!(control.voice_gain(9), 1.0);
+        // Un solo hueco por emisor, que cambia en el sitio y se libera al volver a 1.0.
+        let used = || {
+            control
+                .inner
+                .voice_gains
+                .iter()
+                .filter(|slot| slot.load(Ordering::Relaxed) != 0)
+                .count()
+        };
+        assert_eq!(used(), 3);
+        control.set_voice_gain(7, 1.5);
+        assert_eq!((control.voice_gain(7), used()), (1.5, 3));
+        control.set_voice_gain(7, 1.0);
+        assert_eq!((control.voice_gain(7), used()), (1.0, 2));
+        // Lleno: los que no caben suenan al volumen normal, y al liberar vuelve a haber sitio.
+        for source in 100..100 + GAIN_SLOTS as u32 {
+            control.set_voice_gain(source, 0.25);
+        }
+        assert_eq!(control.voice_gain(100 + GAIN_SLOTS as u32 - 2), 1.0);
+        control.set_voice_gain(0, 1.0);
+        control.set_voice_gain(999, 0.75);
+        assert_eq!(control.voice_gain(999), 0.75);
+        // El silencio va aparte.
+        control.set_voice_muted(999, true);
+        assert!(control.voice_muted(999));
+        assert_eq!(control.voice_gain(999), 0.75);
+    }
+
+    /// Mezcla una voz (un tono de `amplitude`) con la ganancia `gain` y devuelve el pico que suena.
+    fn mixed_peak(gain: f32, amplitude: f64) -> i16 {
+        let mut encoder = OpusEncoder::new(Profile::Voice).expect("codificador");
+        let mut stream = Stream::new(AudioTrack::Voice, 3).expect("emisor");
+        let pcm: Vec<i16> = (0..960)
+            .map(|n| ((n as f64 * 0.04).sin() * amplitude) as i16)
+            .collect();
+        let mut packet = [0u8; coroom_audio::codec::MAX_PACKET];
+        let base = Instant::now();
+        for seq in 0..5u32 {
+            let len = encoder.encode(&pcm, &mut packet).expect("codificar");
+            stream.jitter.push_frames(
+                seq,
+                seq * 20_000,
+                0,
+                2,
+                &packet[..len],
+                base + Duration::from_millis(u64::from(seq) * 20),
+            );
+        }
+        let control = AudioControl::default();
+        control.set_voice_gain(3, gain);
+        let (_packets_tx, packets) = crossbeam_channel::bounded::<Packet>(1);
+        let (links, _housekeeper) = links();
+        let mut playout = Playout {
+            control,
+            render: None,
+            packets,
+            to_local: Box::new(|_| None),
+            anchor: None,
+            channels: 1,
+            mixer: Mixer::new(1),
+            game: None,
+            voices: vec![stream],
+            heard: Vec::with_capacity(MAX_VOICES + 1),
+            av: None,
+            ticks: 0,
+            links,
+            closed: Arc::new(AtomicBool::new(false)),
+        };
+        let mut out = [0i16; coroom_audio::SAMPLES_PER_CHANNEL];
+        let mut peak = 0i16;
+        for tick in 0..12u64 {
+            assert!(playout.fill(&mut out, base + Duration::from_millis(30 + tick * 10)));
+            peak = peak.max(out.iter().map(|s| s.saturating_abs()).max().unwrap_or(0));
+        }
+        peak
+    }
+
+    #[test]
+    fn the_voice_gain_scales_the_mix_without_hard_clipping() {
+        let normal = mixed_peak(1.0, 8_000.0);
+        // Opus no es transparente: el pico decodificado se mueve algo alrededor del original.
+        assert!((6_000..=10_000).contains(&normal), "{normal}");
+        let double = mixed_peak(2.0, 8_000.0);
+        let half = mixed_peak(0.5, 8_000.0);
+        let ratio = f64::from(double) / f64::from(normal);
+        assert!(
+            (1.9..=2.1).contains(&ratio),
+            "al doble: {normal} → {double}"
+        );
+        let ratio = f64::from(half) / f64::from(normal);
+        assert!(
+            (0.45..=0.55).contains(&ratio),
+            "a la mitad: {normal} → {half}"
+        );
+        // Una voz fuerte al doble pasaría del fondo de escala: el limitador la deja por encima
+        // del codo y por debajo del tope, sin recorte duro.
+        let knee = (coroom_audio::mix::KNEE * 32_767.0) as i16;
+        let loud = mixed_peak(2.0, 20_000.0);
+        assert!(loud > knee && loud < i16::MAX, "{loud}");
+        assert_eq!(mixed_peak(0.0, 20_000.0), 0, "a cero no suena");
     }
 
     #[test]

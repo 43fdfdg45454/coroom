@@ -19,7 +19,7 @@
 //! (teclado y ratón, mando, voz), expulsar y número de seguridad; la calidad en vivo; y, a la
 //! derecha, el chat de la sala.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,7 +33,7 @@ use coroom_session::remote::{
 use coroom_session::{GuestId, Permissions};
 use coroom_ui::Element;
 use coroom_ui::icon::{Icon, icon_with};
-use coroom_ui::style::{ButtonClass, ContainerClass, SvgClass, TextClass};
+use coroom_ui::style::{ButtonClass, ContainerClass, SliderClass, SvgClass, TextClass};
 use coroom_ui::theme::Tone;
 use coroom_ui::tokens::{size, space, text as type_size};
 use coroom_ui::widget::{self as ui, Kind};
@@ -48,8 +48,9 @@ use crate::ui::app::{
     quality_tone,
 };
 use crate::ui::settings::{
-    BITRATE_CHOICES, CodecChoice, EncoderChoice, FPS_CHOICES, KnownPeer, QualityPreset,
-    RememberedApp, Resolution, Video, VideoOption, When,
+    BITRATE_CHOICES, CodecChoice, DEFAULT_VOICE_VOLUME, EncoderChoice, FPS_CHOICES, KnownPeer,
+    MAX_VOICE_VOLUME, QualityPreset, RememberedApp, Resolution, Video, VideoOption, When,
+    voice_gain,
 };
 use crate::ui::stats;
 use crate::ui::video::{VideoFeed, video_view};
@@ -252,8 +253,20 @@ pub struct Room {
     pub relay: Option<String>,
     /// Invitados cuya voz no se oye en este equipo (decisión del anfitrión, solo para él).
     pub muted: BTreeSet<GuestId>,
+    /// Volumen de la voz de cada invitado en este equipo (porcentaje; sin entrada, 100).
+    pub volumes: BTreeMap<GuestId, u8>,
     /// Si los invitados de esta sala entran callados.
     pub guests_muted: bool,
+}
+
+impl Room {
+    /// Volumen de la voz del invitado `id` en este equipo (porcentaje).
+    pub fn volume(&self, id: GuestId) -> u8 {
+        self.volumes
+            .get(&id)
+            .copied()
+            .unwrap_or(DEFAULT_VOICE_VOLUME)
+    }
 }
 
 /// Un amigo que pide entrar en la sala abierta.
@@ -539,6 +552,10 @@ pub enum Msg {
     GuestVoice(GuestId, bool),
     /// Oír o no la voz de un invitado en este equipo.
     Hear(GuestId, bool),
+    /// Volumen de la voz de un invitado en este equipo (porcentaje), mientras se arrastra.
+    Volume(GuestId, u8),
+    /// Al soltar el deslizador: recordar el volumen por el nombre del invitado.
+    VolumeDone(GuestId),
     /// Expulsar (pide confirmación).
     Kick(GuestId),
     /// Número de seguridad de un invitado.
@@ -790,6 +807,26 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                     source: id.0,
                     muted: !hear,
                 }];
+            }
+        }
+        Msg::Volume(id, percent) => {
+            if let Some(room) = app.host.room.as_mut() {
+                let percent = percent.min(MAX_VOICE_VOLUME);
+                room.volumes.insert(id, percent);
+                return vec![Effect::SetVoiceGain {
+                    host: true,
+                    source: id.0,
+                    gain: voice_gain(percent),
+                }];
+            }
+        }
+        Msg::VolumeDone(id) => {
+            if let Some(room) = app.host.room.as_ref()
+                && let Some(status) = guest(app, id)
+            {
+                let name = status.name.clone();
+                app.settings.audio.set_voice_volume(&name, room.volume(id));
+                return app.settings_changed();
             }
         }
         Msg::Kick(id) => {
@@ -1108,6 +1145,7 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                 preview_unavailable: false,
                 relay: None,
                 muted: BTreeSet::new(),
+                volumes: BTreeMap::new(),
                 guests_muted,
             });
             app.page = Page::Host;
@@ -1123,9 +1161,29 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
             return vec![Effect::StartLobby];
         }
         Event::HostGuests(guests) => {
+            let mut effects = Vec::new();
             if let Some(room) = app.host.room.as_mut() {
+                // A quien llega se le aplica el volumen recordado por su nombre (una vez: lo que
+                // se toque después manda); quien se fue no deja entrada.
+                room.volumes
+                    .retain(|id, _| guests.iter().any(|status| status.guest == *id));
+                for status in &guests {
+                    if room.volumes.contains_key(&status.guest) {
+                        continue;
+                    }
+                    let percent = app.settings.audio.voice_volume(&status.name);
+                    if percent != DEFAULT_VOICE_VOLUME {
+                        room.volumes.insert(status.guest, percent);
+                        effects.push(Effect::SetVoiceGain {
+                            host: true,
+                            source: status.guest.0,
+                            gain: voice_gain(percent),
+                        });
+                    }
+                }
                 room.guests = guests;
             }
+            return effects;
         }
         Event::PreviewUnavailable => {
             if let Some(room) = app.host.room.as_mut() {
@@ -1259,6 +1317,7 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
                 );
             room.guests.retain(|status| status.guest != guest);
             room.muted.remove(&guest);
+            room.volumes.remove(&guest);
             app.toast(
                 Tone::Neutral,
                 if kicked {
@@ -2744,7 +2803,7 @@ fn guest_row<'a>(app: &'a App, room: &'a Room, status: &'a GuestStatus) -> Eleme
             Some(on(Msg::Safety(id))),
         ))
         .push(kick);
-    let mut card = column![line].spacing(space::XS);
+    let mut card = column![line, volume_line(room, status)].spacing(space::XS);
     if permissions.gamepad_slot.is_some() {
         card = card.push(pad_line(app, status));
     }
@@ -2762,6 +2821,30 @@ fn guest_row<'a>(app: &'a App, room: &'a Room, status: &'a GuestStatus) -> Eleme
         .padding(Padding::from([10.0, 16.0]))
         .width(Length::Fill)
         .into()
+}
+
+/// Volumen de la voz de un invitado en este equipo, bajo su nombre: de 0 a 200 % de 5 en 5
+/// (Ctrl+clic, 100 %). Mientras se arrastra ya suena así; al soltar se recuerda por su nombre.
+fn volume_line<'a>(room: &Room, status: &'a GuestStatus) -> Element<'a, Message> {
+    let id = status.guest;
+    let percent = room.volume(id);
+    container(ui::slider(
+        0..=MAX_VOICE_VOLUME,
+        percent,
+        5,
+        DEFAULT_VOICE_VOLUME,
+        Some(Icon::Volume),
+        t!("host-volumen-porcentaje", percent = percent),
+        SliderClass::Accent,
+        move |value| on(Msg::Volume(id, value)),
+        Some(on(Msg::VolumeDone(id))),
+    ))
+    .max_width(320.0)
+    .padding(Padding {
+        left: size::AVATAR + space::S,
+        ..Padding::ZERO
+    })
+    .into()
 }
 
 /// El mando de un invitado: la ranura, si va tal cual o convertido, y el mando que declara
@@ -3238,6 +3321,7 @@ pub(crate) mod shots {
                 },
             ),
         ])));
+        app.update(Message::Host(Msg::Volume(GuestId(2), 60)));
         app.toasts.clear();
     }
 
@@ -4221,6 +4305,74 @@ mod tests {
     }
 
     /// La sala de espera se cierra cuando la sala ya está abierta, no antes.
+    #[test]
+    fn each_guest_has_a_volume_that_is_remembered_by_name() {
+        let mut app = app();
+        app.settings.audio.set_voice_volume("Carla", 60);
+        open_room(&mut app);
+        let room = app.host.room.as_ref().expect("sala");
+        assert_eq!(room.volume(GuestId(1)), 100, "Bea, sin tocar");
+        assert_eq!(room.volume(GuestId(2)), 60, "Carla, el recordado al llegar");
+        // Quien llega con un volumen recordado suena así desde el principio.
+        app.settings.audio.set_voice_volume("Dani", 130);
+        let effects = app.update(Message::Event(Event::HostGuests(vec![
+            status(1, "Bea"),
+            status(2, "Carla"),
+            status(3, "Dani"),
+        ])));
+        assert_eq!(
+            effects,
+            [Effect::SetVoiceGain {
+                host: true,
+                source: 3,
+                gain: 1.3,
+            }],
+            "solo el nuevo; Carla ya tenía el suyo"
+        );
+        // Arrastrar cambia el volumen en caliente; soltar lo recuerda por el nombre.
+        let effects = app.update(Message::Host(Msg::Volume(GuestId(1), 150)));
+        assert_eq!(
+            effects,
+            [Effect::SetVoiceGain {
+                host: true,
+                source: 1,
+                gain: 1.5,
+            }]
+        );
+        assert_eq!(
+            app.host.room.as_ref().expect("sala").volume(GuestId(1)),
+            150
+        );
+        assert_eq!(
+            app.settings.audio.voice_volume("Bea"),
+            100,
+            "aún no se soltó"
+        );
+        assert!(
+            app.update(Message::Host(Msg::VolumeDone(GuestId(1))))
+                .is_empty()
+        );
+        assert_eq!(app.settings.audio.voice_volume("Bea"), 150);
+        assert_eq!(app.flush_settings(), Some(Effect::SaveSettings));
+        // Volver al 100 % lo olvida, y quien se va no deja entrada.
+        app.update(Message::Host(Msg::Volume(GuestId(1), 100)));
+        app.update(Message::Host(Msg::VolumeDone(GuestId(1))));
+        assert!(!app.settings.audio.voice_volumes.contains_key("Bea"));
+        app.update(Message::Event(Event::Host(SessionEvent::GuestLeft {
+            guest: GuestId(2),
+            kicked: false,
+        })));
+        let room = app.host.room.as_ref().expect("sala");
+        assert!(!room.volumes.contains_key(&GuestId(2)));
+        assert_eq!(room.volume(GuestId(3)), 130);
+        // Fuera de rango se acota al máximo.
+        app.update(Message::Host(Msg::Volume(GuestId(3), 255)));
+        assert_eq!(
+            app.host.room.as_ref().expect("sala").volume(GuestId(3)),
+            MAX_VOICE_VOLUME
+        );
+    }
+
     #[test]
     fn the_lobby_stops_once_the_room_is_open() {
         let mut app = app();

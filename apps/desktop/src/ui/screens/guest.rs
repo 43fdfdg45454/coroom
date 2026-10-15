@@ -27,7 +27,7 @@ use coroom_session::remote::{QualityLevel, RoomMember, SessionEvent, talker_labe
 use coroom_transport::Path;
 use coroom_ui::Element;
 use coroom_ui::icon::{Icon, icon_with};
-use coroom_ui::style::{ButtonClass, ContainerClass, SvgClass, TextClass};
+use coroom_ui::style::{ButtonClass, ContainerClass, SliderClass, SvgClass, TextClass};
 use coroom_ui::theme::{Palette, Tone};
 use coroom_ui::tokens::{motion, size, space, text as type_size};
 use coroom_ui::widget::{self as ui};
@@ -42,7 +42,9 @@ use crate::ui::app::{
     App, Dialog, Effect, EndKind, Event, HEADERBAR_HEIGHT, Invitation, Message, Page, Screen,
     quality_tone,
 };
-use crate::ui::settings::{KnownPeer, VoiceMode};
+use crate::ui::settings::{
+    DEFAULT_VOICE_VOLUME, KnownPeer, MAX_VOICE_VOLUME, VoiceMode, voice_gain,
+};
 use crate::ui::stats;
 use crate::ui::video::{VideoFeed, video_view};
 
@@ -153,6 +155,8 @@ pub struct State {
     pub members: Vec<RoomMember>,
     /// Hojas MLS de las voces que este equipo no quiere oír.
     pub muted: std::collections::BTreeSet<u32>,
+    /// Volumen de cada voz en este equipo, por hoja MLS (porcentaje; sin entrada, 100).
+    pub volumes: std::collections::BTreeMap<u32, u8>,
     /// Mandos conectados a este equipo (`None`: aún no se sabe).
     pub pads: Option<Vec<ConnectedPad>>,
     /// Si el mando que se envía va tal cual.
@@ -214,6 +218,14 @@ pub fn corrupt_video_notice(
 }
 
 impl State {
+    /// Volumen de la voz de la hoja `leaf` en este equipo (porcentaje).
+    pub fn volume(&self, leaf: u32) -> u8 {
+        self.volumes
+            .get(&leaf)
+            .copied()
+            .unwrap_or(DEFAULT_VOICE_VOLUME)
+    }
+
     /// Sesión nueva en la sala `code` con `feed`.
     pub fn new(code: String, feed: Arc<VideoFeed>, now: Instant) -> Self {
         Self {
@@ -233,6 +245,7 @@ impl State {
             panel: None,
             members: Vec::new(),
             muted: std::collections::BTreeSet::new(),
+            volumes: std::collections::BTreeMap::new(),
             pads: None,
             pads_raw: false,
             bar_until: now,
@@ -482,6 +495,10 @@ pub enum Msg {
     ClosePanel,
     /// Oír o no a alguien (su hoja MLS) en este equipo.
     Hear(u32, bool),
+    /// Volumen de la voz de un miembro (por hoja MLS) en este equipo, mientras se arrastra.
+    Volume(u32, u8),
+    /// Al soltar el deslizador: recordar el volumen por el nombre del miembro.
+    VolumeDone(u32),
     /// Mandos conectados y si el que se envía va tal cual.
     Pads(Vec<ConnectedPad>, bool),
     /// Elegir qué mando enviar.
@@ -627,6 +644,35 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 source: leaf,
                 muted: !hear,
             }];
+        }
+        Msg::Volume(leaf, percent) => {
+            if state
+                .members
+                .iter()
+                .any(|member| member.leaf == leaf && member.you)
+            {
+                // La propia voz no se oye aquí: nada que ajustar.
+                return Vec::new();
+            }
+            let percent = percent.min(MAX_VOICE_VOLUME);
+            state.volumes.insert(leaf, percent);
+            return vec![Effect::SetVoiceGain {
+                host: false,
+                source: leaf,
+                gain: voice_gain(percent),
+            }];
+        }
+        Msg::VolumeDone(leaf) => {
+            if let Some(member) = state
+                .members
+                .iter()
+                .find(|member| member.leaf == leaf && !member.you)
+            {
+                let name = member.name.clone();
+                let percent = state.volume(leaf);
+                app.settings.audio.set_voice_volume(&name, percent);
+                return app.settings_changed();
+            }
         }
         Msg::Pads(pads, raw) => {
             let slot = state.stats.as_ref().and_then(|s| s.allowed.gamepad_slot);
@@ -904,11 +950,33 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
         }
         SessionEvent::Warning(message) => app.toast(Tone::Warning, message),
         SessionEvent::Members(members) => {
-            // Quien ya no está deja de contar como silenciado (su hoja puede volver a usarse).
+            // Quien ya no está deja de contar como silenciado ni conserva su volumen (su hoja
+            // puede volver a usarse).
             state
                 .muted
                 .retain(|leaf| members.iter().any(|member| member.leaf == *leaf));
+            state
+                .volumes
+                .retain(|leaf, _| members.iter().any(|member| member.leaf == *leaf));
+            // A quien llega se le aplica el volumen recordado por su nombre (una vez: lo que se
+            // toque después manda). Nunca a uno mismo.
+            let mut effects = Vec::new();
+            for member in members.iter().filter(|member| !member.you) {
+                if state.volumes.contains_key(&member.leaf) {
+                    continue;
+                }
+                let percent = app.settings.audio.voice_volume(&member.name);
+                if percent != DEFAULT_VOICE_VOLUME {
+                    state.volumes.insert(member.leaf, percent);
+                    effects.push(Effect::SetVoiceGain {
+                        host: false,
+                        source: member.leaf,
+                        gain: voice_gain(percent),
+                    });
+                }
+            }
             state.members = members;
+            return effects;
         }
         SessionEvent::Invited {
             from_user,
@@ -1637,6 +1705,9 @@ fn people_section(state: &State) -> Element<'_, Message> {
                 .align_y(Alignment::Center)
                 .into(),
         );
+        if let Some(volume) = volume_row(state, member) {
+            rows.push(volume);
+        }
     }
     let mut content = Column::new()
         .spacing(space::S)
@@ -1650,6 +1721,28 @@ fn people_section(state: &State) -> Element<'_, Message> {
             .wrapping(Wrapping::WordOrGlyph),
     );
     content.into()
+}
+
+/// Volumen de la voz de `member` en este equipo, bajo su nombre: de 0 a 200 % de 5 en 5
+/// (Ctrl+clic, 100 %). Mientras se arrastra ya suena así; al soltar se recuerda por su nombre.
+/// La propia voz no se oye aquí: sin deslizador.
+fn volume_row<'a>(state: &State, member: &RoomMember) -> Option<Element<'a, Message>> {
+    if member.you {
+        return None;
+    }
+    let leaf = member.leaf;
+    let percent = state.volume(leaf);
+    Some(ui::slider(
+        0..=MAX_VOICE_VOLUME,
+        percent,
+        5,
+        DEFAULT_VOICE_VOLUME,
+        Some(Icon::Volume),
+        t!("room-volumen-porcentaje", percent = percent),
+        SliderClass::Overlay,
+        move |value| on(Msg::Volume(leaf, value)),
+        Some(on(Msg::VolumeDone(leaf))),
+    ))
 }
 
 /// Mandos: cuál se envía (automático o uno concreto) entre los conectados.
@@ -2345,6 +2438,7 @@ pub(crate) mod shots {
             member(2, 2, "Carla", false),
         ]))));
         app.update(Message::Guest(Msg::Hear(2, false)));
+        app.update(Message::Guest(Msg::Volume(0, 150)));
         let eightbitdo = sample_pad(
             0x2dc8,
             0x6012,
@@ -2797,6 +2891,75 @@ mod tests {
         assert_eq!(permissions_notice(kbm, kbm), None);
         app.update(Message::Event(Event::GuestEnded(None)));
         assert!(app.guest.is_none(), "salida normal: sin diálogo");
+    }
+
+    #[test]
+    fn every_other_voice_has_a_volume_remembered_by_name_but_not_yours() {
+        let mut app = app();
+        app.settings.audio.set_voice_volume("Carla", 60);
+        app.settings.audio.set_voice_volume("Ana", 40);
+        shots::video(&mut app);
+        let member = |guest: u32, leaf: u32, name: &str, you: bool| RoomMember {
+            guest,
+            leaf,
+            name: name.to_owned(),
+            you,
+        };
+        let members = vec![
+            member(0, 0, "Bea", false),
+            member(1, 1, "Ana", true),
+            member(2, 2, "Carla", false),
+        ];
+        let effects = app.update(Message::Event(Event::Guest(SessionEvent::Members(
+            members.clone(),
+        ))));
+        assert_eq!(
+            effects,
+            [Effect::SetVoiceGain {
+                host: false,
+                source: 2,
+                gain: 0.6,
+            }],
+            "el recordado de Carla, nunca el de uno mismo"
+        );
+        let state = app.guest.as_ref().expect("invitado");
+        assert_eq!(
+            (state.volume(0), state.volume(1), state.volume(2)),
+            (100, 100, 60)
+        );
+        // El deslizador sale para los demás y no para uno mismo.
+        assert!(volume_row(state, &members[0]).is_some());
+        assert!(volume_row(state, &members[1]).is_none());
+        assert!(volume_row(state, &members[2]).is_some());
+        // Arrastrar cambia el volumen en caliente; soltar lo recuerda por el nombre.
+        let effects = app.update(Message::Guest(Msg::Volume(0, 150)));
+        assert_eq!(
+            effects,
+            [Effect::SetVoiceGain {
+                host: false,
+                source: 0,
+                gain: 1.5,
+            }]
+        );
+        assert_eq!(
+            app.settings.audio.voice_volume("Bea"),
+            100,
+            "aún no se soltó"
+        );
+        assert!(app.update(Message::Guest(Msg::VolumeDone(0))).is_empty());
+        assert_eq!(app.settings.audio.voice_volume("Bea"), 150);
+        assert_eq!(app.flush_settings(), Some(Effect::SaveSettings));
+        // La propia hoja se ignora aunque llegue el mensaje.
+        assert!(app.update(Message::Guest(Msg::Volume(1, 20))).is_empty());
+        assert_eq!(app.guest.as_ref().expect("invitado").volume(1), 100);
+        // Quien se va no deja entrada; quien sigue conserva lo que se tocó.
+        app.update(Message::Event(Event::Guest(SessionEvent::Members(vec![
+            member(0, 0, "Bea", false),
+            member(1, 1, "Ana", true),
+        ]))));
+        let state = app.guest.as_ref().expect("invitado");
+        assert!(!state.volumes.contains_key(&2));
+        assert_eq!(state.volume(0), 150);
     }
 
     #[test]

@@ -476,6 +476,16 @@ pub enum Effect {
         /// Silenciada.
         muted: bool,
     },
+    /// Volumen de una voz en este equipo (misma clave que [`Effect::SetVoiceMuted`]): ganancia
+    /// lineal, 1.0 lo normal y 2.0 el doble ([`coroom_session::remote::audio::MAX_VOICE_GAIN`]).
+    SetVoiceGain {
+        /// Si es la sala que este equipo comparte.
+        host: bool,
+        /// Emisor de la voz.
+        source: u32,
+        /// Ganancia.
+        gain: f32,
+    },
     /// Permisos de un invitado.
     SetPermissions(GuestId, Permissions),
     /// Expulsar.

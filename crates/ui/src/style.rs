@@ -7,8 +7,8 @@ use iced_core::widget::text as core_text;
 use iced_core::{Background, Color, Shadow, Vector};
 use iced_widget::overlay::menu;
 use iced_widget::{
-    button, checkbox, container, pick_list, progress_bar, rule, scrollable, svg, text_input,
-    toggler,
+    button, checkbox, container, pick_list, progress_bar, rule, scrollable, slider, svg,
+    text_input, toggler,
 };
 
 use crate::font::Fonts;
@@ -878,6 +878,63 @@ impl rule::Catalog for Theme {
             radius: rounded(0.0),
             fill_mode: rule::FillMode::Full,
             snap: true,
+        }
+    }
+}
+
+/// Clases de deslizador.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum SliderClass {
+    /// Sobre el fondo de la ventana o una tarjeta: raíl del acento, tirador como un botón.
+    #[default]
+    Accent,
+    /// Sobre el panel o la barra que flotan sobre el vídeo (siempre oscuros).
+    Overlay,
+}
+
+impl slider::Catalog for Theme {
+    type Class<'a> = SliderClass;
+
+    fn default<'a>() -> Self::Class<'a> {
+        SliderClass::Accent
+    }
+
+    fn style(&self, class: &Self::Class<'_>, status: slider::Status) -> slider::Style {
+        let p = &self.palette;
+        let touched = status != slider::Status::Active;
+        let filled = if touched {
+            p.accent_bg_hover
+        } else {
+            p.accent_bg
+        };
+        let (empty, handle, handle_border) = match *class {
+            SliderClass::Accent => (
+                Background::Color(p.button_hover.color()),
+                Background::Color(if touched {
+                    p.card_hover.color()
+                } else {
+                    p.card.color()
+                }),
+                if touched { filled } else { p.border },
+            ),
+            SliderClass::Overlay => (
+                Background::Color(p.overlay_text.alpha(0.25)),
+                Background::Color(p.overlay_text.color()),
+                if touched { filled } else { p.overlay_text },
+            ),
+        };
+        slider::Style {
+            rail: slider::Rail {
+                backgrounds: (Background::Color(filled.color()), empty),
+                width: 4.0,
+                border: outline(Color::TRANSPARENT, 0.0, radius::PILL),
+            },
+            handle: slider::Handle {
+                shape: slider::HandleShape::Circle { radius: 9.0 },
+                background: handle,
+                border_width: if touched { 2.0 } else { 1.0 },
+                border_color: handle_border.color(),
+            },
         }
     }
 }

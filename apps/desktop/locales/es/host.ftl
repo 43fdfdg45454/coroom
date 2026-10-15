@@ -201,6 +201,7 @@ host-dar-la-voz = Dar la voz
 host-quitar-la-voz = Quitar la voz
 host-dejar-de-oir = Dejar de oír a { $name } (solo en este equipo)
 host-volver-a-oir = Volver a oír a { $name }
+host-volumen-porcentaje = { $percent } %
 host-numero-de-seguridad = Número de seguridad
 host-expulsar = Expulsar
 host-esperando-la-clave-de-entrada-pareja = Esperando la clave de entrada pareja a pareja: su entrada se aplica en cuanto llegue.

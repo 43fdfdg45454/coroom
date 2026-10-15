@@ -1,8 +1,8 @@
 //! Componentes del sistema de diseño, hechos con los *widgets* de `iced` y las clases de
 //! [`crate::style`]: tipografía, botones, campos con validación, interruptores, filas de lista con
 //! avatar, insignias de estado, avisos en línea, toasts, diálogos modales, progreso con texto,
-//! selectores, teclas de atajo, barra lateral, cabecera de página, tarjetas, grupos de ajustes y
-//! los estados vacío, cargando y error.
+//! selectores, deslizadores, teclas de atajo, barra lateral, cabecera de página, tarjetas,
+//! grupos de ajustes y los estados vacío, cargando y error.
 
 use iced_core::alignment::{Horizontal, Vertical};
 use iced_core::text::Wrapping;
@@ -14,7 +14,9 @@ use iced_widget::{
 
 use crate::font::{MONO, SEMIBOLD, UI};
 use crate::icon::{Icon, icon, icon_with};
-use crate::style::{ButtonClass, ContainerClass, InputClass, ProgressClass, SvgClass, TextClass};
+use crate::style::{
+    ButtonClass, ContainerClass, InputClass, ProgressClass, SliderClass, SvgClass, TextClass,
+};
 use crate::theme::Tone;
 use crate::tokens::{size, space as gap, text as type_size};
 use crate::{Element, Renderer, Theme};
@@ -334,6 +336,58 @@ pub fn switch<'a, M: Clone + 'a>(
     on_toggle: Option<impl Fn(bool) -> M + 'a>,
 ) -> Element<'a, M> {
     toggler(value).size(22).on_toggle_maybe(on_toggle).into()
+}
+
+/// Deslizador de coroom.
+pub type Slider<'a, M> = iced_widget::Slider<'a, u8, M, Theme>;
+
+/// Ancho de la etiqueta del valor de [`slider`] («200 %» cabe sin mover el raíl).
+const SLIDER_LABEL: f32 = 48.0;
+
+/// Deslizador de un valor entero pequeño (porcentajes, niveles) con su valor a la derecha:
+/// `label` es el valor ya escrito para quien lo lee («150 %»); `icon`, si se da, lo precede.
+/// `on_change` llega mientras se arrastra (también con las flechas, de `step` en `step`) y
+/// `on_release` al soltar: para guardar. Con Ctrl pulsado, el tirador vuelve a `default`.
+/// `class` lo adapta al fondo (ventana o panel sobre el vídeo); el raíl ocupa lo que le dejen.
+#[allow(clippy::too_many_arguments)]
+pub fn slider<'a, M: Clone + 'a>(
+    range: std::ops::RangeInclusive<u8>,
+    value: u8,
+    step: u8,
+    default: u8,
+    icon: Option<Icon>,
+    label: impl text::IntoFragment<'a>,
+    class: SliderClass,
+    on_change: impl Fn(u8) -> M + 'a,
+    on_release: Option<M>,
+) -> Element<'a, M> {
+    let mut control: Slider<'a, M> = iced_widget::Slider::new(range, value, on_change)
+        .step(step)
+        .shift_step(1)
+        .default(default)
+        .height(size::CONTROL - 12.0)
+        .class(class);
+    if let Some(on_release) = on_release {
+        control = control.on_release(on_release);
+    }
+    let (icon_class, text_class) = match class {
+        SliderClass::Accent => (SvgClass::Secondary, TextClass::Secondary),
+        SliderClass::Overlay => (SvgClass::Overlay, TextClass::OverlaySecondary),
+    };
+    let mut line = Row::new().spacing(gap::XS).align_y(Alignment::Center);
+    if let Some(glyph) = icon {
+        line = line.push(icon_with(glyph, size::ICON, icon_class));
+    }
+    line.push(control.width(Length::Fill))
+        .push(
+            text(label)
+                .size(type_size::SECONDARY)
+                .font(UI)
+                .class(text_class)
+                .width(Length::Fixed(SLIDER_LABEL))
+                .align_x(Horizontal::Right),
+        )
+        .into()
 }
 
 /// Selector desplegable.
