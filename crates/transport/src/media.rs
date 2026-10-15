@@ -52,8 +52,8 @@
 //! de envío y obtiene las muestras de OWD para [`crate::rate::RateController`].
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -343,21 +343,91 @@ pub fn pacing_duration(
     spread.min(cap)
 }
 
-/// Envía `packets` por `conn` repartidos en `pacing` (en ráfagas de 0,5 ms: los temporizadores no
-/// dan más resolución). Devuelve los que salieron, o el primer error que no sea de tamaño.
+/// Lo que una espera del pacing puede adelantarse sin dormir aunque el retraso medido sea menor:
+/// los temporizadores de `tokio` van en pasos de 1 ms, así que una espera más corta que esto se
+/// despertaría igual de tarde que no esperar.
+const MIN_PACING_WAIT: Duration = Duration::from_micros(500);
+
+/// Techo del retraso que se recuerda: una pausa del sistema de medio segundo no debe anular el
+/// pacing durante los fotogramas siguientes.
+const MAX_TIMER_LAG: Duration = Duration::from_millis(50);
+
+/// Retraso **medido** con que se despiertan las esperas del pacing ([`send_paced`]): hora real de
+/// despertar menos la pedida, media móvil (1/4 de peso a cada medida nueva). Sin carga es el
+/// redondeo de los temporizadores (0-1 ms); con la CPU saturada (un juego que ocupa todos los
+/// núcleos, un runner pequeño) sube a varios milisegundos, y entonces dormir para repartir los
+/// últimos paquetes de un fotograma solo lo retrasa: los paquetes cuyo turno llega antes que ese
+/// retraso salen sin esperar. Cuando un reparto entero sale sin dormir no hay medida nueva, así
+/// que el retraso recordado se rebaja un octavo por reparto y la siguiente espera larga lo vuelve
+/// a medir. Nada de esto depende del sistema ni del hardware: solo de lo que tardó la última espera.
+#[derive(Debug, Default)]
+pub struct TimerLag {
+    /// Microsegundos.
+    lag_us: AtomicU32,
+}
+
+impl TimerLag {
+    /// Sin medidas: solo cuenta [`MIN_PACING_WAIT`].
+    pub const fn new() -> Self {
+        Self {
+            lag_us: AtomicU32::new(0),
+        }
+    }
+
+    /// Retraso medido.
+    pub fn get(&self) -> Duration {
+        Duration::from_micros(u64::from(self.lag_us.load(Ordering::Relaxed)))
+    }
+
+    /// Una espera pedida para `due` despertó en `woke`.
+    pub fn observe(&self, due: tokio::time::Instant, woke: tokio::time::Instant) {
+        let late = woke.saturating_duration_since(due).min(MAX_TIMER_LAG);
+        let late = u32::try_from(late.as_micros()).unwrap_or(u32::MAX);
+        let _ = self
+            .lag_us
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |lag| {
+                Some(lag - lag / 4 + late / 4)
+            });
+    }
+
+    /// Un reparto entero salió sin dormir: no hubo medida, así que el retraso recordado se rebaja
+    /// para volver a medirlo pronto.
+    pub fn decay(&self) {
+        let _ = self
+            .lag_us
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |lag| {
+                Some(lag - lag / 8)
+            });
+    }
+
+    /// Si merece la pena dormir hasta `due` estando en `now`: solo cuando falta más que el retraso
+    /// medido (y que [`MIN_PACING_WAIT`]); si no, el paquete sale ya.
+    pub fn worth_waiting(&self, now: tokio::time::Instant, due: tokio::time::Instant) -> bool {
+        due.saturating_duration_since(now) > self.get().max(MIN_PACING_WAIT)
+    }
+}
+
+/// Envía `packets` por `conn` repartidos en `pacing`, en ráfagas de al menos [`MIN_PACING_WAIT`]
+/// (los temporizadores no dan más resolución) y, con la CPU saturada, del retraso medido de las
+/// esperas (`lag`, ver [`TimerLag`]). Devuelve los que salieron, o el primer error que no sea de
+/// tamaño.
 async fn send_paced(
     conn: &PeerConnection,
     packets: Vec<Bytes>,
     pacing: Duration,
     group: u32,
+    lag: &TimerLag,
 ) -> Result<usize, TransportError> {
     let n = packets.len() as u32;
     let start = tokio::time::Instant::now();
     let mut sent = 0;
+    let mut slept = false;
     for (i, packet) in packets.into_iter().enumerate() {
         let due = start + pacing * i as u32 / n.max(1);
-        if due > tokio::time::Instant::now() + Duration::from_micros(500) {
+        if lag.worth_waiting(tokio::time::Instant::now(), due) {
             tokio::time::sleep_until(due).await;
+            lag.observe(due, tokio::time::Instant::now());
+            slept = true;
         }
         match conn.send_datagram(packet) {
             Ok(()) => sent += 1,
@@ -368,6 +438,9 @@ async fn send_paced(
             }
             Err(err) => return Err(err),
         }
+    }
+    if !slept && n > 1 {
+        lag.decay();
     }
     Ok(sent)
 }
@@ -697,6 +770,8 @@ pub struct MediaSender {
     frame_interval_us: AtomicU64,
     /// Identificador del siguiente tren de sonda.
     next_train: AtomicU32,
+    /// Retraso medido de las esperas del pacing ([`TimerLag`]); compartido con los reenvíos.
+    timer_lag: Arc<TimerLag>,
     state: Mutex<SenderState>,
 }
 
@@ -721,6 +796,7 @@ impl MediaSender {
             config,
             max_kbps: AtomicU32::new(0),
             next_train: AtomicU32::new(1),
+            timer_lag: Arc::new(TimerLag::new()),
             state: Mutex::new(SenderState {
                 history: VecDeque::with_capacity(HISTORY_GROUPS + 1),
                 repair_ratio: INITIAL_REPAIR_RATIO,
@@ -926,7 +1002,7 @@ impl MediaSender {
             }
         }
         let pacing = Duration::from_secs_f64(bytes as f64 * 8.0 / (f64::from(pace_kbps) * 1000.0));
-        send_paced(&self.conn, packets, pacing, train).await?;
+        send_paced(&self.conn, packets, pacing, train, &self.timer_lag).await?;
         Ok(train)
     }
 
@@ -1173,7 +1249,7 @@ impl MediaSender {
             &self.config.pacing,
         );
         let all: Vec<Bytes> = sources.into_iter().chain(repairs).collect();
-        send_paced(&self.conn, all, pacing, group).await?;
+        send_paced(&self.conn, all, pacing, group, &self.timer_lag).await?;
         Ok(report)
     }
 
@@ -1230,9 +1306,10 @@ impl MediaSender {
                 &self.config.pacing,
             );
             let conn = self.conn.clone();
+            let lag = Arc::clone(&self.timer_lag);
             let count = packets.len();
             runtime.spawn(async move {
-                if let Err(err) = send_paced(&conn, packets, pacing, group).await {
+                if let Err(err) = send_paced(&conn, packets, pacing, group, &lag).await {
                     debug!(error = %err, group, "no se pudo reenviar lo que pidió un Nack");
                 }
             });
@@ -2853,6 +2930,45 @@ mod tests {
             ),
             interval_60
         );
+    }
+
+    /// El retraso de las esperas se mide y manda: sin medidas solo cuenta el medio milisegundo de
+    /// los temporizadores; con esperas que despiertan 3 ms tarde, los paquetes a menos de 3 ms
+    /// salen sin dormir; sin dormir no hay medida y el retraso recordado baja hasta volver a medir.
+    #[test]
+    fn the_measured_timer_lag_decides_when_waiting_is_worth_it() {
+        let lag = TimerLag::new();
+        let now = tokio::time::Instant::now();
+        assert_eq!(lag.get(), Duration::ZERO);
+        assert!(!lag.worth_waiting(now, now + Duration::from_micros(400)));
+        assert!(lag.worth_waiting(now, now + Duration::from_micros(600)));
+        // Cuatro esperas de 3 ms tarde: la media móvil se acerca (1 − (3/4)^4 ≈ 68 %).
+        for _ in 0..4 {
+            lag.observe(now, now + Duration::from_millis(3));
+        }
+        let measured = lag.get();
+        assert!(
+            measured > Duration::from_micros(2_000) && measured < Duration::from_millis(3),
+            "{measured:?}"
+        );
+        assert!(!lag.worth_waiting(now, now + Duration::from_millis(2)));
+        assert!(lag.worth_waiting(now, now + Duration::from_millis(4)));
+        // Despertar a tiempo (o antes) no suma.
+        lag.observe(now + Duration::from_millis(1), now);
+        assert!(lag.get() < measured);
+        // Un reparto sin esperas rebaja un octavo; tras unos cuantos vuelve al medio milisegundo.
+        let before = lag.get();
+        lag.decay();
+        assert!(lag.get() < before && lag.get() > before.mul_f64(0.8));
+        for _ in 0..40 {
+            lag.decay();
+        }
+        assert!(lag.worth_waiting(now, now + Duration::from_micros(600)));
+        // Una pausa enorme no se recuerda entera.
+        for _ in 0..50 {
+            lag.observe(now, now + Duration::from_secs(1));
+        }
+        assert!(lag.get() <= MAX_TIMER_LAG);
     }
 
     /// Los trenes de la sonda salen a [`PROBE_PACE_GAIN`] veces el máximo del usuario, hasta el
