@@ -1015,22 +1015,24 @@ fn messages<'a>(app: &'a App, look: Look) -> Element<'a, Message> {
     if hidden > 0 {
         list = list.push(
             u64::MAX,
-            container(
-                ui::button_with(
-                    Kind::Flat,
-                    t!("chat-ver-los-n-anteriores", count = hidden),
-                    None,
-                    Some(Message::Chat(Msg::ShowOlder)),
+            keyed_item(
+                container(
+                    ui::button_with(
+                        Kind::Flat,
+                        t!("chat-ver-los-n-anteriores", count = hidden),
+                        None,
+                        Some(Message::Chat(Msg::ShowOlder)),
+                    )
+                    .width(Length::Fill),
                 )
                 .width(Length::Fill),
-            )
-            .width(Length::Fill),
+            ),
         );
     }
     for entry in &entries[hidden..] {
         list = list.push(
             entry.seq(),
-            match entry {
+            keyed_item(match entry {
                 Entry::Message {
                     line,
                     pieces,
@@ -1038,7 +1040,7 @@ fn messages<'a>(app: &'a App, look: Look) -> Element<'a, Message> {
                     ..
                 } => message_row(app, look, line, pieces, clock, you),
                 Entry::System { spans, clock, .. } => system_row(look, spans, clock),
-            },
+            }),
         );
     }
     scrollable(list)
@@ -1046,6 +1048,16 @@ fn messages<'a>(app: &'a App, look: Look) -> Element<'a, Message> {
         .height(Length::Fill)
         .width(Length::Fill)
         .into()
+}
+
+/// Envuelve una fila de la lista con clave en una columna de un solo hijo. `keyed::Column` de
+/// `iced` 0.14 compara el árbol que conserva con `Widget::diff` directamente, sin mirar el tipo
+/// (`Tree::diff` sí lo hace); al vaciar el chat se quedaba con el árbol de un mensaje (`row`, sin
+/// estado) para la línea «Vaciaste el chat» (`rich_text`, que lo necesita) y entraba en pánico
+/// («Downcast on stateless state»). La columna compara sus hijos con `Tree::diff` y rehace el
+/// árbol cuando el tipo cambia.
+fn keyed_item<'a>(row: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    Column::with_children([row.into()]).into()
 }
 
 fn message_row<'a>(
