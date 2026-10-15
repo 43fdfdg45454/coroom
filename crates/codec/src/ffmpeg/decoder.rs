@@ -2,9 +2,11 @@
 //!
 //! Dónde deja las imágenes lo decide [`DecodeOutput`]:
 //!
-//! - [`DecodeOutput::Cpu`]: la imagen de la GPU se baja con
-//!   `av_hwframe_transfer_data` y se copia a un [`RawFrame`] I420 o NV12 (dos copias a CPU; una con
-//!   los decodificadores por software).
+//! - [`DecodeOutput::Cpu`]: la imagen se deja en un búfer de un [`BufferPool`] (reutilizado entre
+//!   fotogramas: ni reserva ni relleno de ceros por fotograma). De la GPU se baja con
+//!   `av_hwframe_transfer_data` directamente a ese búfer (una copia: un `AVFrame` cuyos planos
+//!   apuntan a él, [`frame_over`]); de un decodificador por software se copia a él (una copia).
+//!   Quien presenta el fotograma devuelve el búfer con [`RawFrame::recycle`].
 //! - [`DecodeOutput::Gpu`] con el dispositivo Vulkan del presentador: con el backend Vulkan, FFmpeg
 //!   decodifica en ese mismo `VkDevice` y la imagen sale tal cual ([`GpuImage::Vulkan`], cero
 //!   copias); con VA-API o D3D11VA se intenta mapear a Vulkan con `av_hwframe_map` (también sin
@@ -12,8 +14,17 @@
 //!   se baja a CPU.
 //! - [`DecodeOutput::Gpu`] sin dispositivo (sin ventana): la imagen de GPU se queda donde la dejó
 //!   el decodificador ([`GpuImage::Opaque`]), sin copia.
+//!
+//! Con la salida en la GPU, [`Decoder::decode`] devuelve la imagen en cuanto FFmpeg la entrega: la
+//! GPU puede seguir escribiéndola, y es el presentador quien espera en la GPU al semáforo de la
+//! imagen antes de muestrearla (`coroom-render`). La marca `decodificado` de la sesión mide, por
+//! tanto, la entrega del decodificador, no el fin del trabajo de la GPU. El hilo de decodificación
+//! no se bloquea nunca esperando a la GPU; solo comprueba, sin esperar, que la imagen del fotograma
+//! anterior terminó en [`GPU_WAIT_NS`] (si no, el dispositivo se perdió o se atascó y el fotograma
+//! cuenta como error de decodificación).
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVCodecRef, AVPacket};
 use rsmpeg::avutil::{AVFrame, AVHWDeviceContext, AVHWFramesContext};
@@ -23,6 +34,7 @@ use rsmpeg::ffi;
 use super::vulkan::{SemaphoreWaiter, VkFrameAccess, buffer_key, device_from_shared, handles};
 use super::{backend_error, create_device, decoder_device, decoder_name, hw_pixel_format};
 use crate::gpu::{GpuImage, OpaqueImage, SharedVulkanDevice, VulkanImage};
+use crate::pool::BufferPool;
 use crate::{
     Codec, CodecError, ColorSpace, DecodeOutput, Decoder, DecoderBackend, EncodedSlice,
     PixelFormat, RawFrame,
@@ -32,8 +44,17 @@ use crate::{
 /// esperan en el canal hacia la presentación, el que se presenta y los que la GPU aún muestrea.
 const EXTRA_HW_FRAMES: i32 = 6;
 
-/// Espera máxima a que la GPU termine de decodificar una imagen que sale sin copia.
+/// Tiempo máximo que puede tardar la GPU en terminar una imagen que sale sin copia: se comprueba
+/// sin esperar, al fotograma siguiente.
 const GPU_WAIT_NS: u64 = 100_000_000;
+
+/// Imagen de GPU del último fotograma entregado, para comprobar al siguiente que la GPU la terminó.
+struct PendingGpu {
+    device: usize,
+    semaphore: u64,
+    value: u64,
+    since: Instant,
+}
 
 /// Opciones de baja latencia de los decodificadores: sin hilos por fotograma (cada uno añade un
 /// fotograma de retardo), solo por slice, y `low_delay`; dav1d con un único fotograma en vuelo.
@@ -71,8 +92,12 @@ pub struct FfmpegDecoder {
     copies: u32,
     /// Fotogramas que salieron sin copia (en la GPU).
     gpu_frames: u64,
-    /// Espera a la GPU de las imágenes Vulkan que salen sin copia (por dispositivo).
+    /// Sondeo del semáforo de las imágenes Vulkan que salen sin copia (por dispositivo).
     waiters: Vec<(usize, SemaphoreWaiter)>,
+    /// Última imagen de GPU entregada cuya GPU no se ha comprobado aún.
+    pending_gpu: Option<PendingGpu>,
+    /// Búferes de la salida en CPU.
+    pool: Arc<BufferPool>,
 }
 
 /// `AVFrame` que solo se mantiene vivo (imagen de GPU opaca).
@@ -161,30 +186,68 @@ impl FfmpegDecoder {
             copies: 0,
             gpu_frames: 0,
             waiters: Vec::new(),
+            pending_gpu: None,
+            pool: BufferPool::shared(),
         })
     }
 
-    /// Espera en CPU a que la GPU termine de escribir la imagen Vulkan de `access` (así la marca
-    /// `decodificado` mide la decodificación de verdad). `device` es el de la imagen. Devuelve si
-    /// la GPU terminó a tiempo: si no, la imagen no se puede presentar (estaría a medio escribir o
-    /// el dispositivo se perdió) y el fotograma cuenta como error de decodificación.
-    fn wait_for_gpu(&mut self, device: &AVHWDeviceContext, access: &VkFrameAccess) -> bool {
+    /// Anota la imagen Vulkan de `access` (del dispositivo `device`) que se entrega ahora y
+    /// comprueba, **sin esperar**, que la GPU terminó la del fotograma anterior: si lleva más de
+    /// [`GPU_WAIT_NS`] sin acabar, el dispositivo se perdió o se atascó y el fotograma cuenta como
+    /// error de decodificación (el presentador espera en la GPU al semáforo de cada imagen; aquí
+    /// no hace falta bloquear el hilo).
+    fn track_gpu(
+        &mut self,
+        device: &AVHWDeviceContext,
+        access: &VkFrameAccess,
+    ) -> Result<(), CodecError> {
         let key = buffer_key(device.as_ptr());
-        if !self.waiters.iter().any(|(known, _)| *known == key) {
-            let Some(waiter) = SemaphoreWaiter::new(device) else {
-                // Sin `vkWaitSemaphores` no se puede esperar: se presenta como hasta ahora.
-                return true;
-            };
+        if !self.waiters.iter().any(|(known, _)| *known == key)
+            && let Some(waiter) = SemaphoreWaiter::new(device)
+        {
             self.waiters.push((key, waiter));
+        }
+        let Some((_, waiter)) = self.waiters.iter().find(|(known, _)| *known == key) else {
+            // Sin `vkWaitSemaphores` no se puede comprobar: se presenta como hasta ahora.
+            return Ok(());
+        };
+        if let Some(pending) = self.pending_gpu.take()
+            && pending.device == key
+            && !waiter.wait(pending.semaphore, pending.value, 0)
+        {
+            if pending.since.elapsed().as_nanos() > u128::from(GPU_WAIT_NS) {
+                return Err(self.gpu_timeout());
+            }
+            // Aún trabaja (va justo): se vuelve a mirar en el siguiente.
+            self.pending_gpu = Some(pending);
+            let state = crate::gpu::VulkanFrameAccess::lock(access);
+            crate::gpu::VulkanFrameAccess::unlock(access, None);
+            if state.semaphore == 0 {
+                return Ok(());
+            }
+            // La imagen más nueva manda: cuando acabe, acabó la anterior (misma cola). El plazo
+            // se cuenta desde que se espera a **esta** imagen: una ráfaga no acumula la espera de
+            // las anteriores sobre un fotograma sano.
+            if let Some(pending) = self.pending_gpu.as_mut()
+                && state.semaphore == pending.semaphore
+                && state.semaphore_value != pending.value
+            {
+                pending.value = state.semaphore_value;
+                pending.since = Instant::now();
+            }
+            return Ok(());
         }
         let state = crate::gpu::VulkanFrameAccess::lock(access);
         crate::gpu::VulkanFrameAccess::unlock(access, None);
-        self.waiters
-            .iter()
-            .find(|(known, _)| *known == key)
-            .is_none_or(|(_, waiter)| {
-                waiter.wait(state.semaphore, state.semaphore_value, GPU_WAIT_NS)
-            })
+        if state.semaphore != 0 {
+            self.pending_gpu = Some(PendingGpu {
+                device: key,
+                semaphore: state.semaphore,
+                value: state.semaphore_value,
+                since: Instant::now(),
+            });
+        }
+        Ok(())
     }
 
     /// Error de un fotograma cuya GPU no terminó en [`GPU_WAIT_NS`].
@@ -266,9 +329,8 @@ impl FfmpegDecoder {
                     if frame.format == ffi::AV_PIX_FMT_VULKAN
                         && let Some(device) = self.device.clone()
                         && let Some((access, _)) = VkFrameAccess::new(frame.clone())
-                        && !self.wait_for_gpu(&device, &access)
                     {
-                        return Err(self.gpu_timeout());
+                        self.track_gpu(&device, &access)?;
                     }
                     let kind = rsmpeg::avutil::get_pix_fmt_name(frame.format).map_or_else(
                         || "gpu".to_owned(),
@@ -312,9 +374,7 @@ impl FfmpegDecoder {
         let Some((access, info)) = VkFrameAccess::new(frame) else {
             return Ok(None);
         };
-        if !self.wait_for_gpu(&device, &access) {
-            return Err(self.gpu_timeout());
-        }
+        self.track_gpu(&device, &access)?;
         let (instance, device) = handles(&device);
         Ok(Some(GpuImage::Vulkan(Arc::new(VulkanImage {
             width: size.0,
@@ -405,21 +465,6 @@ impl FfmpegDecoder {
     }
 
     fn download(&mut self, frame: &AVFrame, frame_id: u64) -> Result<RawFrame, CodecError> {
-        let downloaded;
-        let frame = if self.hw_format != ffi::AV_PIX_FMT_NONE && frame.format == self.hw_format {
-            let mut sw = AVFrame::new();
-            sw.hwframe_transfer_data(frame)
-                .map_err(|err| backend_error("bajada de la GPU", &err))?;
-            self.hw_frames += 1;
-            // Bajada de la GPU y copia al búfer de salida.
-            self.copies = 2;
-            downloaded = sw;
-            &downloaded
-        } else {
-            self.sw_frames += 1;
-            self.copies = 1;
-            frame
-        };
         let (Ok(width), Ok(height)) = (u32::try_from(frame.width), u32::try_from(frame.height))
         else {
             return Err(CodecError::Backend(
@@ -431,27 +476,108 @@ impl FfmpegDecoder {
         } else {
             ColorSpace::SDR
         };
-        if frame.format == ffi::AV_PIX_FMT_YUV420P10LE {
-            // 10 bits por software (dav1d, `hevc`): a P010, el formato de 10 bits de `render`.
-            let plane = |index: usize, rows: usize| -> Result<(&[u8], usize), CodecError> {
-                let stride = usize::try_from(frame.linesize[index])
-                    .map_err(|_| CodecError::Backend("fila negativa".into()))?;
-                if frame.data[index].is_null() || stride == 0 || rows == 0 {
-                    return Err(CodecError::Backend("plano de 10 bits vacío".into()));
-                }
-                // SAFETY: un `AVFrame` decodificado tiene en `data[i]` al menos `linesize[i] ×
-                // filas` bytes legibles mientras vive `frame`, y aquí solo se leen.
-                let bytes = unsafe { std::slice::from_raw_parts(frame.data[index], stride * rows) };
-                Ok((bytes, stride))
-            };
+        let on_gpu = self.hw_format != ffi::AV_PIX_FMT_NONE && frame.format == self.hw_format;
+        let sw_format = if on_gpu {
+            hw_sw_format(frame)?
+        } else {
+            frame.format
+        };
+        let (format, expected) = match sw_format {
+            ffi::AV_PIX_FMT_YUV420P | ffi::AV_PIX_FMT_YUVJ420P => {
+                (PixelFormat::I420, RawFrame::i420_len(width, height))
+            }
+            ffi::AV_PIX_FMT_NV12 => (PixelFormat::Nv12, RawFrame::nv12_len(width, height)),
+            ffi::AV_PIX_FMT_YUV444P | ffi::AV_PIX_FMT_YUVJ444P => {
+                (PixelFormat::I444, RawFrame::i444_len(width, height))
+            }
+            ffi::AV_PIX_FMT_P010LE => (PixelFormat::P010, RawFrame::p010_len(width, height)),
+            // 10 bits planares (dav1d, `hevc`): se bajan a CPU en su formato y se convierten a
+            // P010, el de 10 bits de `render` (una copia más).
+            ffi::AV_PIX_FMT_YUV420P10LE => (PixelFormat::P010, 0),
+            other => {
+                return Err(CodecError::Unsupported(format!(
+                    "el decodificador entregó un formato de píxel no admitido ({other})"
+                )));
+            }
+        };
+        let planar10 = sw_format == ffi::AV_PIX_FMT_YUV420P10LE;
+        // Imagen de CPU en `sw_format`: la propia del decodificador por software, o la bajada de
+        // la GPU a un búfer del pool (una copia).
+        let mut downloaded: Option<Vec<u8>> = None;
+        let mut data = None;
+        let frame = if on_gpu {
+            self.hw_frames += 1;
+            let mut sw = AVFrame::new();
+            sw.set_format(sw_format);
+            sw.set_width(frame.width);
+            sw.set_height(frame.height);
+            let len = sw
+                .image_get_buffer_size(1)
+                .map_err(|err| backend_error("tamaño de la imagen", &err))?;
+            let mut buffer = self.pool.take(len);
+            frame_over(&mut sw, &mut buffer)?;
+            sw.hwframe_transfer_data(frame)
+                .map_err(|err| backend_error("bajada de la GPU", &err))?;
+            // El `AVFrame` deja de apuntar al búfer antes de que este cambie de dueño.
+            drop(sw);
+            self.copies = 1;
+            if planar10 {
+                // El búfer compacto se vuelve a leer como planos para convertirlo.
+                downloaded = Some(buffer);
+                None
+            } else {
+                data = Some(buffer);
+                None
+            }
+        } else {
+            self.sw_frames += 1;
+            self.copies = 1;
+            Some(frame)
+        };
+        if planar10 {
             let (_, ch) = RawFrame::chroma_size(width, height);
-            let planes = [
-                plane(0, height as usize)?,
-                plane(1, ch as usize)?,
-                plane(2, ch as usize)?,
-            ];
+            let (cw, _) = RawFrame::chroma_size(width, height);
+            let planes: [(&[u8], usize); 3] = match (&downloaded, frame) {
+                (Some(buffer), _) => {
+                    // Planos compactos de 16 bits: Y de `2 × width`, U y V de `2 × cw`.
+                    let y_len = 2 * width as usize * height as usize;
+                    let c_len = 2 * cw as usize * ch as usize;
+                    if buffer.len() < y_len + 2 * c_len {
+                        return Err(CodecError::Backend("plano de 10 bits vacío".into()));
+                    }
+                    [
+                        (&buffer[..y_len], 2 * width as usize),
+                        (&buffer[y_len..y_len + c_len], 2 * cw as usize),
+                        (&buffer[y_len + c_len..y_len + 2 * c_len], 2 * cw as usize),
+                    ]
+                }
+                (None, Some(frame)) => {
+                    let plane = |index: usize, rows: usize| -> Result<(&[u8], usize), CodecError> {
+                        let stride = usize::try_from(frame.linesize[index])
+                            .map_err(|_| CodecError::Backend("fila negativa".into()))?;
+                        if frame.data[index].is_null() || stride == 0 || rows == 0 {
+                            return Err(CodecError::Backend("plano de 10 bits vacío".into()));
+                        }
+                        // SAFETY: un `AVFrame` decodificado tiene en `data[i]` al menos
+                        // `linesize[i] × filas` bytes legibles mientras vive `frame`, y aquí solo
+                        // se leen.
+                        let bytes =
+                            unsafe { std::slice::from_raw_parts(frame.data[index], stride * rows) };
+                        Ok((bytes, stride))
+                    };
+                    [
+                        plane(0, height as usize)?,
+                        plane(1, ch as usize)?,
+                        plane(2, ch as usize)?,
+                    ]
+                }
+                (None, None) => return Err(CodecError::Backend("sin imagen".into())),
+            };
             let data = crate::convert::planar10_to_p010((width, height), planes)?;
             self.copies += 1;
+            if let Some(buffer) = downloaded {
+                self.pool.give(buffer);
+            }
             return Ok(RawFrame::cpu(
                 frame_id,
                 (width, height),
@@ -461,28 +587,21 @@ impl FfmpegDecoder {
             )
             .with_color(color));
         }
-        let (format, expected) = match frame.format {
-            ffi::AV_PIX_FMT_YUV420P | ffi::AV_PIX_FMT_YUVJ420P => {
-                (PixelFormat::I420, RawFrame::i420_len(width, height))
+        let data = match (data, frame) {
+            (Some(data), _) => data,
+            (None, Some(frame)) => {
+                // Decodificador por software: una copia de sus planos al búfer del pool.
+                let len = frame
+                    .image_get_buffer_size(1)
+                    .map_err(|err| backend_error("tamaño de la imagen", &err))?;
+                let mut data = self.pool.take(len);
+                frame
+                    .image_copy_to_buffer(&mut data, 1)
+                    .map_err(|err| backend_error("copia de la imagen", &err))?;
+                data
             }
-            ffi::AV_PIX_FMT_NV12 => (PixelFormat::Nv12, RawFrame::nv12_len(width, height)),
-            ffi::AV_PIX_FMT_YUV444P | ffi::AV_PIX_FMT_YUVJ444P => {
-                (PixelFormat::I444, RawFrame::i444_len(width, height))
-            }
-            ffi::AV_PIX_FMT_P010LE => (PixelFormat::P010, RawFrame::p010_len(width, height)),
-            other => {
-                return Err(CodecError::Unsupported(format!(
-                    "el decodificador entregó un formato de píxel no admitido ({other})"
-                )));
-            }
+            (None, None) => return Err(CodecError::Backend("sin imagen".into())),
         };
-        let len = frame
-            .image_get_buffer_size(1)
-            .map_err(|err| backend_error("tamaño de la imagen", &err))?;
-        let mut data = vec![0u8; len];
-        frame
-            .image_copy_to_buffer(&mut data, 1)
-            .map_err(|err| backend_error("copia de la imagen", &err))?;
         if data.len() != expected {
             return Err(CodecError::Backend(
                 "el decodificador entregó planos incompletos".into(),
@@ -493,8 +612,73 @@ impl FfmpegDecoder {
         } else {
             width
         };
-        Ok(RawFrame::cpu(frame_id, (width, height), format, stride, data).with_color(color))
+        Ok(
+            RawFrame::cpu(frame_id, (width, height), format, stride, data)
+                .with_color(color)
+                .with_pool(Arc::clone(&self.pool)),
+        )
     }
+}
+
+/// Formato de CPU (`sw_format`) del contexto de *hw frames* de una imagen de GPU: el que
+/// `av_hwframe_transfer_data` entrega al bajarla.
+fn hw_sw_format(frame: &AVFrame) -> Result<ffi::AVPixelFormat, CodecError> {
+    if frame.hw_frames_ctx.is_null() {
+        return Err(CodecError::Backend(
+            "imagen de GPU sin contexto de fotogramas".into(),
+        ));
+    }
+    // SAFETY: `hw_frames_ctx` de un fotograma de GPU es una referencia válida a un
+    // `AVHWFramesContext` iniciado; solo se lee `sw_format`.
+    Ok(unsafe { (*(*frame.hw_frames_ctx).data.cast::<ffi::AVHWFramesContext>()).sw_format })
+}
+
+/// Destructor del búfer «prestado» de [`frame_over`]: la memoria es de un `Vec` y no se libera
+/// aquí.
+unsafe extern "C" fn borrowed_free(_opaque: *mut std::ffi::c_void, _data: *mut u8) {}
+
+/// Apunta los planos de `frame` (con formato y tamaño ya puestos) a `buffer`, compacto
+/// (`align` 1), como hace `av_image_fill_arrays`, con un `AVBufferRef` que no libera nada: así
+/// `av_hwframe_transfer_data` escribe la imagen directamente en el búfer. `frame` debe soltarse
+/// antes de que `buffer` cambie de sitio o de dueño.
+fn frame_over(frame: &mut AVFrame, buffer: &mut [u8]) -> Result<(), CodecError> {
+    let size = i32::try_from(buffer.len())
+        .map_err(|_| CodecError::Backend("imagen demasiado grande".into()))?;
+    // SAFETY: `frame` es un fotograma nuestro sin búferes; `av_buffer_create` envuelve `buffer`
+    // (que vive más que `frame`, ver el contrato de la función) con un destructor que no hace
+    // nada, y `av_image_fill_arrays` rellena `data` y `linesize` para el formato y el tamaño del
+    // fotograma dentro de `size` bytes a partir de `buffer` (si no caben, devuelve error y no
+    // escribe punteros).
+    unsafe {
+        let raw = frame.as_mut_ptr();
+        let buf = ffi::av_buffer_create(
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            Some(borrowed_free),
+            std::ptr::null_mut(),
+            0,
+        );
+        if buf.is_null() {
+            return Err(CodecError::Backend("sin memoria para la imagen".into()));
+        }
+        (*raw).buf[0] = buf;
+        let ret = ffi::av_image_fill_arrays(
+            (*raw).data.as_mut_ptr(),
+            (*raw).linesize.as_mut_ptr(),
+            buffer.as_ptr(),
+            (*raw).format,
+            (*raw).width,
+            (*raw).height,
+            1,
+        );
+        if ret < 0 || ret > size {
+            return Err(CodecError::Backend(
+                "la imagen no cabe en el búfer de salida".into(),
+            ));
+        }
+        (*raw).extended_data = (*raw).data.as_mut_ptr();
+    }
+    Ok(())
 }
 
 /// Paquete con una copia de `data` (los slices de un fotograma, seguidos).

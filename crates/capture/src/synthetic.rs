@@ -239,7 +239,8 @@ impl SyntheticCapturer {
         let w = self.width as usize;
         let h = self.height as usize;
         let stride = w * 4;
-        let mut data = vec![0u8; stride * h];
+        // Del pool de la captura: todas las filas se escriben a continuación.
+        let mut data = crate::pool::take(stride * h);
 
         for (y, row) in data.chunks_exact_mut(stride).enumerate() {
             let band = y * BANDS / h;

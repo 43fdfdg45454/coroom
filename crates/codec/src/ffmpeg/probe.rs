@@ -22,6 +22,14 @@
 //!
 //! En una máquina sin GPU (o con lavapipe, que crea el dispositivo Vulkan pero no tiene colas de
 //! vídeo) solo queda el software.
+//!
+//! **Vulkan Video en un proceso hijo** ([`super::probe_child`]): un cargador Vulkan viejo
+//! (`libvulkan1` 1.3.239 de Debian 12 con un driver de 2026) hace que `avcodec_open2` de
+//! `av1_vulkan` **muera con SIGSEGV**, y un hilo con tiempo límite no protege de eso. Cuando el
+//! binario lo ha activado ([`super::probe_child::run_if_requested`]), el primer `open` de cada
+//! codificador y decodificador Vulkan se hace en un proceso hijo (el mismo ejecutable con una
+//! variable de entorno); si el hijo muere, la combinación queda «no disponible» con el motivo y
+//! el sondeo sigue.
 
 use std::sync::mpsc;
 use std::thread;
@@ -136,6 +144,7 @@ pub(crate) fn test_pattern(side: u32, frame_id: u64) -> RawFrame {
         data,
         gpu: None,
         color: crate::ColorSpace::SDR,
+        pool: None,
     }
 }
 
@@ -183,7 +192,7 @@ enum EncoderProbe {
 }
 
 /// Abre el codificador con la configuración del sondeo y codifica hasta que sale un paquete.
-fn open_and_encode(codec: Codec, backend: Backend) -> Result<(), String> {
+pub(super) fn open_and_encode(codec: Codec, backend: Backend) -> Result<(), String> {
     // Primero el dispositivo por separado, para tener el motivo de FFmpeg si falla (sin CUDA, una
     // GPU sin el bloque de codificación…).
     if let Some(device) = super::encoder_device(backend) {
@@ -205,6 +214,11 @@ fn probe_encoder(codec: Codec, backend: Backend) -> EncoderProbe {
         .is_some();
     if !compiled {
         return EncoderProbe::Missing;
+    }
+    if backend == Backend::VulkanVideo
+        && let Err(reason) = super::probe_child::isolated_encoder_open(codec, backend)
+    {
+        return EncoderProbe::Unavailable(reason);
     }
     let opened = with_timeout(&format!("{}-{}", codec.id(), backend.id()), move || {
         Some(open_and_encode(codec, backend))
@@ -368,6 +382,8 @@ fn samples() -> Vec<(Codec, Vec<Vec<EncodedSlice>>)> {
 enum DecoderProbe {
     /// No está o no decodifica en esta máquina (no se dice nada).
     Missing,
+    /// Su apertura aislada falló o murió ([`super::probe_child`]): por qué.
+    Unavailable(String),
     /// Decodifica, pero su imagen no coincide con la original: por qué.
     Rejected(String),
     /// Funciona.
@@ -381,6 +397,11 @@ fn probe_decoder(
     backend: DecoderBackend,
     sample: Vec<Vec<EncodedSlice>>,
 ) -> DecoderProbe {
+    if backend == DecoderBackend::Vulkan
+        && let Err(reason) = super::probe_child::isolated_decoder_open(codec, backend)
+    {
+        return DecoderProbe::Unavailable(reason);
+    }
     let result = with_timeout(&format!("dec-{}-{}", codec.id(), backend.id()), move || {
         let mut decoder = FfmpegDecoder::new(codec, backend).ok()?;
         let mut decoded = 0;
@@ -420,6 +441,8 @@ fn opens_with_hwaccel(codec: Codec, backend: DecoderBackend) -> bool {
             config.device_type == device && config.methods & super::HW_CONFIG_DEVICE_CTX != 0
         });
     has_config
+        && (backend != DecoderBackend::Vulkan
+            || super::probe_child::isolated_decoder_open(codec, backend).is_ok())
         && with_timeout(
             &format!("abre-{}-{}", codec.id(), backend.id()),
             move || FfmpegDecoder::new(codec, backend).ok().map(|_| ()),
@@ -488,6 +511,13 @@ pub(crate) fn probe() -> Probed {
                 Some(sample) => match probe_decoder(codec, backend, sample) {
                     DecoderProbe::Works => true,
                     DecoderProbe::Missing => false,
+                    DecoderProbe::Unavailable(reason) => {
+                        probed.unavailable.push(format!(
+                            "decodificar {codec} con {}: {reason}",
+                            crate::decoder_label(codec, backend)
+                        ));
+                        false
+                    }
                     DecoderProbe::Rejected(reason) => {
                         probed.rejected.push(format!(
                             "decodificar {codec} con {}: {reason}",

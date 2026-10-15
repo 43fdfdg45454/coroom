@@ -29,6 +29,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub mod pool;
 pub mod synthetic;
 
 mod counters;

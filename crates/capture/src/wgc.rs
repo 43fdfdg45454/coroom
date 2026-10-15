@@ -88,6 +88,7 @@ use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetDC, GetDIBits, GetMonitorInfoW, GetObjectW, HBITMAP, HDC, HMONITOR,
     MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW, MonitorFromWindow, ReleaseDC,
 };
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
@@ -808,16 +809,24 @@ impl FrameCopier {
             .map_err(|err| backend("TryGetNextFrame", err))?;
         crate::counters::record_arrived();
         // Sin marca de tiempo (no debería pasar) se entregan todos: el codificador toma el último.
-        if let Ok(time) = frame.SystemRelativeTime()
-            && !self.pacer.accept(Duration::from_nanos(
-                u64::try_from(time.Duration).unwrap_or(0) * 100,
-            ))
+        let arrived = Instant::now();
+        let relative = frame
+            .SystemRelativeTime()
+            .ok()
+            .and_then(|time| u64::try_from(time.Duration).ok())
+            .map(|ticks| Duration::from_nanos(ticks.saturating_mul(100)));
+        if let Some(relative) = relative
+            && !self.pacer.accept(relative)
         {
             crate::counters::record_paced_out();
             let _ = frame.Close();
             return Ok(());
         }
-        let captured_at = Instant::now();
+        // La marca `Captured` es la del compositor (`SystemRelativeTime`, el reloj de QPC) si es
+        // reciente; si no, la llegada del callback.
+        let captured_at = relative
+            .and_then(|relative| instant_from_qpc(relative, arrived))
+            .unwrap_or(arrived);
         let cursor = self.cursor();
         let content = frame
             .ContentSize()
@@ -888,21 +897,25 @@ impl FrameCopier {
         let bytes_per_pixel: u32 = if self.hdr { 8 } else { 4 };
         let row = (width * bytes_per_pixel) as usize;
         let pitch = mapped.RowPitch as usize;
-        let mut data = Vec::with_capacity(row * height as usize);
+        // Búfer del pool del proceso ([`crate::pool`]): sin reservar memoria por fotograma.
+        let mut data = crate::pool::take(row * height as usize);
+        let mut copied = false;
         if !mapped.pData.is_null() && pitch >= row {
             // SAFETY: mientras dura el `Map`, `pData` apunta a `RowPitch × Height` bytes legibles de
             // la textura de staging (`desc.Height >= height`).
             let bytes = unsafe {
                 std::slice::from_raw_parts(mapped.pData as *const u8, pitch * desc.Height as usize)
             };
-            for line in bytes.chunks(pitch).take(height as usize) {
-                data.extend_from_slice(&line[..row]);
+            for (dst, line) in data.chunks_exact_mut(row).zip(bytes.chunks(pitch)) {
+                dst.copy_from_slice(&line[..row]);
             }
+            copied = true;
         }
         // SAFETY: se desmapea el mismo subrecurso que se mapeó; `bytes` ya no se usa.
         unsafe { self.context.Unmap(&staging, 0) };
         drop(frame);
-        if data.len() != row * height as usize {
+        if !copied {
+            crate::pool::give(data);
             return Err(CaptureError::Backend(
                 "la textura mapeada no tiene el tamaño esperado".into(),
             ));
@@ -944,6 +957,29 @@ impl FrameCopier {
         });
         Ok(())
     }
+}
+
+/// Instante de `Instant` que corresponde a `relative` (`SystemRelativeTime` del fotograma: el
+/// reloj de `QueryPerformanceCounter`), calculado con el QPC de ahora: `now - (ahora - relative)`.
+/// `None` si la marca es futura o más vieja que un segundo (no es de este reloj o el fotograma se
+/// quedó atrás).
+fn instant_from_qpc(relative: Duration, now: Instant) -> Option<Instant> {
+    let (mut counter, mut frequency) = (0i64, 0i64);
+    // SAFETY: `QueryPerformanceCounter` y `QueryPerformanceFrequency` escriben en los enteros
+    // locales que se les pasan; no fallan desde Windows XP.
+    unsafe {
+        QueryPerformanceCounter(&mut counter).ok()?;
+        QueryPerformanceFrequency(&mut frequency).ok()?;
+    }
+    let frequency = u64::try_from(frequency).ok().filter(|f| *f > 0)?;
+    let counter = u64::try_from(counter).ok()?;
+    let seconds = counter / frequency;
+    let nanos = (counter % frequency) * 1_000_000_000 / frequency;
+    let qpc_now = Duration::new(seconds, u32::try_from(nanos).ok()?);
+    let age = qpc_now.checked_sub(relative)?;
+    (age <= Duration::from_secs(1))
+        .then(|| now.checked_sub(age))
+        .flatten()
 }
 
 /// Partes vivas de una captura en marcha.

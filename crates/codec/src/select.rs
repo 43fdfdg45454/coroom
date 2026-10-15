@@ -8,6 +8,11 @@
 //! ([`DecodeOutput`]) y [`EncoderSet::gpu_input`] qué imágenes de GPU acepta sin copia el
 //! codificador preferido (lo que la sesión le pide a la captura).
 
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::calibrate::{self, CalibrationCache, CalibrationKey, CalibrationResult};
 use crate::openh264::{OpenH264Decoder, OpenH264Encoder};
 use crate::{
     Backend, Capabilities, Codec, CodecError, DecodeOutput, Decoder, DecoderBackend, Encoder,
@@ -75,6 +80,38 @@ pub fn gpu_input_for(backend: Backend) -> GpuInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncoderSet {
     available: Vec<(Codec, Backend)>,
+    /// Fichero JSON de la calibración medida ([`crate::calibrate`]); sin él, solo en memoria.
+    calibration_cache: Option<PathBuf>,
+}
+
+/// Cómo se eligió el backend en [`EncoderSet::open_calibrated`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Calibrated {
+    /// El backend elegido.
+    pub backend: Backend,
+    /// p95 de la latencia entrega → paquete medida (o guardada).
+    pub p95: Duration,
+    /// Mediana de esa latencia.
+    pub p50: Duration,
+    /// Bitrate real medido en kbit/s.
+    pub kbit_s: u32,
+    /// Si salió de la caché (misma GPU, driver, códec, resolución y formato) o se midió ahora.
+    pub from_cache: bool,
+    /// Todas las medidas de esta vez (vacío con acierto de caché), para el registro.
+    pub results: Vec<CalibrationResult>,
+}
+
+impl fmt::Display for Calibrated {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} elegido por calibración{}: p95 {:.1} ms, p50 {:.1} ms",
+            self.backend,
+            if self.from_cache { " (guardada)" } else { "" },
+            self.p95.as_secs_f64() * 1000.0,
+            self.p50.as_secs_f64() * 1000.0
+        )
+    }
 }
 
 impl EncoderSet {
@@ -88,7 +125,20 @@ impl EncoderSet {
         let caps = Capabilities::with(available.into_iter().collect(), Vec::new());
         Self {
             available: caps.encoders,
+            calibration_cache: None,
         }
+    }
+
+    /// Dónde guardar la calibración medida del modo automático (el directorio de datos de la
+    /// aplicación); `None`, solo en memoria durante el proceso.
+    pub fn with_calibration_cache(mut self, path: Option<PathBuf>) -> Self {
+        self.calibration_cache = path;
+        self
+    }
+
+    /// Fichero de la calibración, si se dio.
+    pub fn calibration_cache(&self) -> Option<&Path> {
+        self.calibration_cache.as_deref()
     }
 
     /// Solo OpenH264 (siempre disponible).
@@ -168,6 +218,112 @@ impl EncoderSet {
                 config.codec, config.format
             ))
         }))
+    }
+
+    /// Backends de `config.codec` que admiten `config.format`, en orden de preferencia.
+    fn candidates(&self, config: &EncoderConfig) -> Vec<Backend> {
+        self.available
+            .iter()
+            .filter(|&&(c, backend)| {
+                c == config.codec && encoder_supports(c, backend, config.format)
+            })
+            .map(|(_, backend)| *backend)
+            .collect()
+    }
+
+    /// Como [`EncoderSet::open`], pero con **varios** backends para el códec elige el de menor
+    /// latencia medida ([`crate::calibrate`]) en vez del primero de la lista: con un acierto de
+    /// caché (misma GPU y driver, códec, clase de resolución y formato) abre el guardado; si no,
+    /// o si el guardado ya no abre, mide todos (unas décimas de segundo; fuera del hilo de la
+    /// interfaz) y guarda al ganador. Con un solo backend (ajuste explícito) no calibra nada y
+    /// devuelve `None` de segundo.
+    pub fn open_calibrated(
+        &self,
+        config: &EncoderConfig,
+    ) -> Result<(Box<dyn Encoder>, Option<Calibrated>), CodecError> {
+        let candidates = self.candidates(config);
+        if candidates.len() < 2 {
+            return self.open(config).map(|encoder| (encoder, None));
+        }
+        let open_one = |backend: Backend| -> Result<Box<dyn Encoder>, CodecError> {
+            let mut encoder = create_encoder(config.codec, backend)?;
+            encoder.configure(config)?;
+            Ok(encoder)
+        };
+        let key = CalibrationKey::of(config);
+        let mut cache = CalibrationCache::load(self.calibration_cache.as_deref());
+        let cached = calibrate::remembered(&key).or_else(|| cache.lookup(&key).cloned());
+        if let Some(cached) = cached
+            && let Some(backend) = cached.backend()
+            && candidates.contains(&backend)
+        {
+            match open_one(backend) {
+                Ok(encoder) => {
+                    calibrate::remember(&cached);
+                    return Ok((
+                        encoder,
+                        Some(Calibrated {
+                            backend,
+                            p95: cached.p95(),
+                            p50: cached.p50(),
+                            kbit_s: cached.kbit_s,
+                            from_cache: true,
+                            results: Vec::new(),
+                        }),
+                    ));
+                }
+                Err(_) => {
+                    // El guardado ya no abre (otro driver, GPU ocupada…): se vuelve a medir.
+                    calibrate::forget_remembered(&key);
+                    cache.forget(&key);
+                }
+            }
+        }
+        let results = calibrate::calibrate(&candidates, config);
+        if results.iter().all(|result| !result.opened) {
+            // Nada midió: se dice por qué (registro de FFmpeg, `COROOM_FFMPEG_LOG=warning`) y se
+            // sigue con la lista de preferencia.
+            let notes: Vec<String> = results.iter().map(ToString::to_string).collect();
+            #[cfg(feature = "ffmpeg")]
+            crate::ffmpeg::log_warning(&format!(
+                "calibración de {} en {}: ningún candidato midió ({})",
+                config.codec,
+                config.format,
+                notes.join("; ")
+            ));
+            #[cfg(not(feature = "ffmpeg"))]
+            drop(notes);
+        }
+        let mut ranked: Vec<&CalibrationResult> =
+            results.iter().filter(|result| result.opened).collect();
+        ranked.sort_by_key(|result| (result.p95, result.p50));
+        let mut last = None;
+        for result in ranked {
+            match open_one(result.backend) {
+                Ok(encoder) => {
+                    let choice = calibrate::choice_from(key.clone(), result);
+                    calibrate::remember(&choice);
+                    // Sin poder escribir la caché se sigue igual: solo se pierde el ahorro.
+                    let _ = cache.store(choice);
+                    return Ok((
+                        encoder,
+                        Some(Calibrated {
+                            backend: result.backend,
+                            p95: result.p95,
+                            p50: result.p50,
+                            kbit_s: result.kbit_s,
+                            from_cache: false,
+                            results: results.clone(),
+                        }),
+                    ));
+                }
+                Err(err) => last = Some(err),
+            }
+        }
+        // Ninguno midió, o los que midieron ya no abren: la lista de preferencia, como siempre
+        // (su error es el que explica por qué, si tampoco abre).
+        drop(last);
+        self.open(config).map(|encoder| (encoder, None))
     }
 }
 

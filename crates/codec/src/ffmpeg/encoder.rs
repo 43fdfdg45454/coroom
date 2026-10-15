@@ -7,10 +7,12 @@
 //!   codificador se abre con los *hw frames* de la importación. Si no puede (o si la importación no
 //!   existe para ese backend), se baja a CPU y se sigue por la ruta con copias, con las copias
 //!   contadas en [`Encoder::cpu_copies`].
-//! - Cada paquete se reparte en sus slices reales ([`crate::slices`]).
+//! - Por el pipeline ([`Encoder::encode_into`]) el paquete se copia una sola vez, entero, al búfer
+//!   del llamante; [`Encoder::encode`] lo reparte además en sus slices reales ([`crate::slices`]).
 //! - [`intra_refresh`] dice cómo se refresca cada backend sin IDR grandes.
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext, AVCodecRef, AVPacket};
@@ -27,8 +29,8 @@ use crate::convert::{
 };
 use crate::gpu::GpuImage;
 use crate::{
-    Backend, Codec, CodecError, EncodedSlice, Encoder, EncoderConfig, GpuInput, PixelFormat,
-    RawFrame,
+    Backend, Codec, CodecError, EncodedFrame, EncodedSlice, Encoder, EncoderConfig, GpuInput,
+    PixelFormat, RawFrame,
 };
 
 /// Periodo de GOP «infinito»: solo hay intra al pedirlo (o al empezar). Cabe en los 16 bits de
@@ -45,12 +47,18 @@ const OUTPUT_WAIT_MIN: Duration = Duration::from_millis(50);
 /// Pausa entre dos sondeos del paquete de salida, pasado [`OUTPUT_SPIN`].
 const OUTPUT_POLL: Duration = Duration::from_micros(200);
 
-/// Tiempo de espera al paquete en que se sondea sin dormir (cediendo el hilo con `yield_now`). Un
-/// `sleep` de 200 µs dura en Windows lo que el reloj del sistema (1 ms con `timeBeginPeriod`,
-/// 15,6 ms si el sistema ignora la petición con la ventana oculta o minimizada): con NVENC o QSV el
-/// paquete sale en 1 a 3 ms y cada `sleep` de más se come un fotograma a 60 fps. Pasado este tiempo
-/// (un codificador lento, como SVT-AV1 en un equipo justo) se duerme para no gastar un núcleo.
-const OUTPUT_SPIN: Duration = Duration::from_millis(4);
+/// Tiempo de espera al paquete en que se sondea sin dormir (cediendo el hilo con `yield_now`).
+/// Solo en Windows: allí un `sleep` de 200 µs dura lo que el reloj del sistema (1 ms con
+/// `timeBeginPeriod`, 15,6 ms si el sistema ignora la petición con la ventana oculta o
+/// minimizada): con NVENC o QSV el paquete sale en 1 a 3 ms y cada `sleep` de más se come un
+/// fotograma a 60 fps. Pasado este tiempo (un codificador lento, como SVT-AV1 en un equipo justo)
+/// se duerme para no gastar un núcleo. En Linux `nanosleep` despierta con decenas de µs de error,
+/// así que se duerme desde el principio y no se quema un núcleo por fotograma.
+const OUTPUT_SPIN: Duration = if cfg!(windows) {
+    Duration::from_millis(4)
+} else {
+    Duration::ZERO
+};
 
 /// Tamaño del búfer VBV en bits para `bitrate_kbps` a `fps`: lo que entra en **un** intervalo de
 /// fotograma. Se fija al abrir y se vuelve a fijar con cada cambio de bitrate
@@ -294,6 +302,71 @@ struct Session {
     height: u32,
     /// Con *hw frames* de la importación: identidad de su contexto.
     imported: Option<usize>,
+    /// Control de tasa leído del contexto ya abierto ([`RateControl`]).
+    rate_control: RateControl,
+}
+
+/// Lo que el contexto de FFmpeg dice de su control de tasa **después** de abrirse: `bit_rate`,
+/// `rc_max_rate` y `rc_buffer_size` tal como quedaron (lo que el codificador usa de verdad), y la
+/// opción privada de modo de tasa que se pidió (`rc_mode`, `rc`…) si el codificador la reconoció.
+/// Un `bit_rate` a cero con Vulkan Video sería «No rate control settings specified, using fixed
+/// QP = 18» en el registro de FFmpeg: QP fijo e ignorando el bitrate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateControl {
+    /// Bitrate objetivo en bit/s (0: sin control de tasa, QP fijo).
+    pub bit_rate: i64,
+    /// Bitrate máximo en bit/s.
+    pub max_rate: i64,
+    /// Búfer VBV en bits.
+    pub buffer_bits: i32,
+    /// Modo de tasa pedido (`cbr`, `CBR`, …) si el backend tiene esa opción y la aceptó.
+    pub mode: Option<String>,
+}
+
+impl fmt::Display for RateControl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.bit_rate <= 0 {
+            return f
+                .write_str("sin control de tasa (QP fijo): el bitrate no llegó al codificador");
+        }
+        match &self.mode {
+            Some(mode) => write!(f, "{} ", mode.to_uppercase())?,
+            None => f.write_str("tasa ")?,
+        }
+        write!(f, "{} kbit/s", self.bit_rate / 1000)?;
+        if self.max_rate > 0 && self.max_rate != self.bit_rate {
+            write!(f, " (máx. {} kbit/s)", self.max_rate / 1000)?;
+        }
+        if self.buffer_bits > 0 {
+            write!(f, ", VBV {} kbit", i64::from(self.buffer_bits) / 1000)?;
+        }
+        Ok(())
+    }
+}
+
+/// Lee el control de tasa de `ctx`, ya abierto, y el modo pedido en `options` si el codificador
+/// lo reconoció (`unused` son las opciones que devolvió `avcodec_open2`).
+fn read_rate_control(
+    ctx: &AVCodecContext,
+    options: &[(&str, String)],
+    unused: &[String],
+) -> RateControl {
+    // SAFETY: `ctx` es un contexto abierto que poseemos; solo se leen tres enteros.
+    let (bit_rate, max_rate, buffer_bits) = unsafe {
+        let raw = ctx.as_ptr();
+        ((*raw).bit_rate, (*raw).rc_max_rate, (*raw).rc_buffer_size)
+    };
+    let mode = options
+        .iter()
+        .find(|(key, _)| matches!(*key, "rc_mode" | "rc"))
+        .filter(|(key, _)| !unused.iter().any(|u| u == key))
+        .map(|(_, value)| value.clone());
+    RateControl {
+        bit_rate,
+        max_rate,
+        buffer_bits,
+        mode,
+    }
 }
 
 /// Codificador de vídeo de FFmpeg de baja latencia (ver [`low_latency_options`]).
@@ -473,6 +546,14 @@ impl FfmpegEncoder {
                 super::describe(&err)
             ))
         })?;
+        let rate_control = read_rate_control(&ctx, &options, &self.unused_options);
+        if rate_control.bit_rate <= 0 {
+            super::log_warning(&format!(
+                "{} abrió sin bitrate ({rate_control}); opciones no reconocidas: {:?}",
+                self.av_codec.name().to_string_lossy(),
+                self.unused_options
+            ));
+        }
 
         let mut sw = AVFrame::new();
         sw.set_format(sw_format);
@@ -490,7 +571,13 @@ impl FfmpegEncoder {
             width,
             height,
             imported: imported_key,
+            rate_control,
         })
+    }
+
+    /// Control de tasa con el que quedó abierto el codificador ([`RateControl`]).
+    pub fn rate_control_info(&self) -> Option<&RateControl> {
+        self.session.as_ref().map(|session| &session.rate_control)
     }
 
     /// Reabre con `config` conservando el modo de entrada (CPU o *hw frames* importados).
@@ -519,19 +606,26 @@ impl FfmpegEncoder {
         Ok(())
     }
 
-    /// Recoge los paquetes que haya; espera al del fotograma `pts` como mucho `wait`.
-    fn drain(&mut self, pts: i64, wait: Duration) -> Result<Vec<EncodedSlice>, CodecError> {
+    /// Recoge los paquetes que haya y los deja seguidos en `out` (vaciado antes); espera al del
+    /// fotograma `pts` como mucho `wait`. `None` si no salió ninguno.
+    fn drain_into(
+        &mut self,
+        pts: i64,
+        wait: Duration,
+        out: &mut Vec<u8>,
+    ) -> Result<Option<EncodedFrame>, CodecError> {
+        out.clear();
         let started = Instant::now();
         let deadline = started + wait;
-        let mut packets: Vec<(u64, bool, Vec<u8>)> = Vec::new();
+        let mut encoded: Option<EncodedFrame> = None;
         let mut orphans = 0u32;
         let Some(session) = self.session.as_mut() else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         loop {
             match session.ctx.receive_packet() {
                 Ok(packet) => {
-                    let (packet_pts, keyframe, data) = read_packet(&packet);
+                    let (packet_pts, keyframe, data) = packet_bytes(&packet);
                     // El fotograma de un paquete se identifica por su pts.
                     let mut frame_id = None;
                     while let Some(&(front_pts, id, _)) = self.in_flight.front() {
@@ -541,12 +635,17 @@ impl FfmpegEncoder {
                         self.in_flight.pop_front();
                         frame_id = Some(id);
                     }
-                    if let Some(frame_id) = frame_id.or_else(|| packets.last().map(|p| p.0)) {
-                        packets.push((frame_id, keyframe, data));
-                    } else {
+                    match frame_id.or(encoded.map(|e| e.frame_id)) {
+                        Some(id) => {
+                            out.extend_from_slice(data);
+                            encoded = Some(EncodedFrame {
+                                frame_id: encoded.map_or(id, |e| e.frame_id),
+                                keyframe: keyframe || encoded.is_some_and(|e| e.keyframe),
+                            });
+                        }
                         // Un paquete de ningún fotograma pendiente (pts inesperado): se pierde, y
                         // con él las referencias de lo que venga detrás.
-                        orphans += 1;
+                        None => orphans += 1,
                     }
                 }
                 Err(RsmpegError::EncoderDrainError) => {
@@ -578,41 +677,50 @@ impl FfmpegEncoder {
                 self.backend
             ));
         }
-        let mut slices: Vec<EncodedSlice> = Vec::with_capacity(packets.len());
-        for (frame_id, keyframe, data) in packets {
-            // Un `EncodedSlice` por slice real (NAL u OBU), en orden.
-            for range in crate::slices::split_slices(self.codec, &data) {
-                let index = slices.iter().filter(|s| s.frame_id == frame_id).count();
-                slices.push(EncodedSlice {
-                    frame_id,
-                    index: u8::try_from(index).unwrap_or(u8::MAX),
-                    count: 0,
-                    keyframe,
-                    data: data[range].to_vec(),
-                });
-            }
-        }
-        let ids: Vec<u64> = slices.iter().map(|slice| slice.frame_id).collect();
-        for slice in &mut slices {
-            let count = ids.iter().filter(|id| **id == slice.frame_id).count();
-            slice.count = u8::try_from(count).unwrap_or(u8::MAX);
-        }
-        Ok(slices)
+        Ok(encoded)
+    }
+
+    /// Como [`FfmpegEncoder::drain_into`], repartido en sus slices reales (NAL u OBU), en orden.
+    fn drain(&mut self, pts: i64, wait: Duration) -> Result<Vec<EncodedSlice>, CodecError> {
+        let mut data = Vec::new();
+        let Some(encoded) = self.drain_into(pts, wait, &mut data)? else {
+            return Ok(Vec::new());
+        };
+        let ranges = crate::slices::split_slices(self.codec, &data);
+        let count = u8::try_from(ranges.len()).unwrap_or(u8::MAX);
+        Ok(ranges
+            .into_iter()
+            .enumerate()
+            .map(|(index, range)| EncodedSlice {
+                frame_id: encoded.frame_id,
+                index: u8::try_from(index).unwrap_or(u8::MAX),
+                count,
+                keyframe: encoded.keyframe,
+                data: data[range].to_vec(),
+            })
+            .collect())
     }
 }
 
-/// Lee pts, marca de intra y datos de un paquete.
-fn read_packet(packet: &AVPacket) -> (i64, bool, Vec<u8>) {
+/// Pts, marca de intra y datos (prestados) de un paquete.
+fn packet_bytes(packet: &AVPacket) -> (i64, bool, &[u8]) {
     let len = usize::try_from(packet.size).unwrap_or(0);
-    let data = if packet.data.is_null() || len == 0 {
-        Vec::new()
+    let data: &[u8] = if packet.data.is_null() || len == 0 {
+        &[]
     } else {
         // SAFETY: un `AVPacket` devuelto por `avcodec_receive_packet` tiene `data` apuntando a
-        // `size` bytes válidos mientras viva el paquete, y aquí solo se copian.
-        unsafe { std::slice::from_raw_parts(packet.data, len) }.to_vec()
+        // `size` bytes válidos mientras viva el paquete, al que queda atado el préstamo.
+        unsafe { std::slice::from_raw_parts(packet.data, len) }
     };
     let keyframe = packet.flags & ffi::AV_PKT_FLAG_KEY as i32 != 0;
     (packet.pts, keyframe, data)
+}
+
+/// Lee pts, marca de intra y una copia de los datos de un paquete.
+#[cfg(test)]
+fn read_packet(packet: &AVPacket) -> (i64, bool, Vec<u8>) {
+    let (pts, keyframe, data) = packet_bytes(packet);
+    (pts, keyframe, data.to_vec())
 }
 
 /// Planos escribibles de un `AVFrame` de CPU ya reservado: `(plano, bytes por fila)`.
@@ -950,7 +1058,12 @@ impl Encoder for FfmpegEncoder {
         Some(match session.ctx.send_frame(Some(&hw)) {
             Ok(()) | Err(RsmpegError::SendFrameAgainError) => {
                 self.copies = 0;
-                self.finish_frame(pts, frame_id, None, fps)
+                self.finish_frame(Submitted {
+                    pts,
+                    frame_id,
+                    image: None,
+                    fps,
+                })
             }
             Err(err) => Err(backend_error("entregar el fotograma repetido", &err)),
         })
@@ -961,6 +1074,56 @@ impl Encoder for FfmpegEncoder {
     }
 
     fn encode(&mut self, frame: &RawFrame) -> Result<Vec<EncodedSlice>, CodecError> {
+        match self.submit(frame)? {
+            Some(submitted) => self.finish_frame(submitted),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn encode_into(
+        &mut self,
+        frame: &RawFrame,
+        out: &mut Vec<u8>,
+    ) -> Result<Option<EncodedFrame>, CodecError> {
+        match self.submit(frame)? {
+            Some(submitted) => self.finish_frame_into(submitted, out),
+            None => {
+                out.clear();
+                Ok(None)
+            }
+        }
+    }
+
+    fn gpu_input(&self) -> GpuInput {
+        if crate::gpu::zero_copy_disabled() {
+            GpuInput::None
+        } else {
+            super::import::gpu_input_for(self.backend, self.device.as_ref())
+        }
+    }
+
+    fn rate_control(&self) -> Option<String> {
+        self.rate_control_info().map(ToString::to_string)
+    }
+
+    fn cpu_copies(&self) -> u32 {
+        self.copies
+    }
+}
+
+/// Fotograma entregado al codificador, pendiente de su paquete.
+struct Submitted {
+    pts: i64,
+    frame_id: u64,
+    /// Imagen de GPU que hay que retener hasta que salga el paquete.
+    image: Option<GpuImage>,
+    fps: u32,
+}
+
+impl FfmpegEncoder {
+    /// Entrega `frame` al codificador (por la ruta de CPU o la de GPU). `None` si no se entregó
+    /// nada (el importador no sacó imagen).
+    fn submit(&mut self, frame: &RawFrame) -> Result<Option<Submitted>, CodecError> {
         let Some(config) = self.config else {
             return Err(CodecError::Unsupported(
                 "el codificador no está configurado".into(),
@@ -988,26 +1151,12 @@ impl Encoder for FfmpegEncoder {
             None if frame.format == PixelFormat::Rgba16F && !config.format.is_hdr() => {
                 // Captura HDR y flujo SDR: tone mapping a BGRA antes de convertir.
                 let sdr = rgba16f_to_bgra(frame)?;
-                self.encode_cpu(&sdr, config)
+                self.encode_cpu(&sdr, config).map(Some)
             }
-            None => self.encode_cpu(frame, config),
+            None => self.encode_cpu(frame, config).map(Some),
         }
     }
 
-    fn gpu_input(&self) -> GpuInput {
-        if crate::gpu::zero_copy_disabled() {
-            GpuInput::None
-        } else {
-            super::import::gpu_input_for(self.backend, self.device.as_ref())
-        }
-    }
-
-    fn cpu_copies(&self) -> u32 {
-        self.copies
-    }
-}
-
-impl FfmpegEncoder {
     /// Reabre si la sesión no es de CPU o no tiene el tamaño de `config`.
     fn ensure_cpu_session(&mut self, config: EncoderConfig) -> Result<(), CodecError> {
         let stale = self.session.as_ref().is_none_or(|s| {
@@ -1024,7 +1173,7 @@ impl FfmpegEncoder {
         &mut self,
         frame: &RawFrame,
         config: EncoderConfig,
-    ) -> Result<Vec<EncodedSlice>, CodecError> {
+    ) -> Result<Submitted, CodecError> {
         self.ensure_cpu_session(config)?;
         self.last_hw = None;
         let pts = self.next_pts;
@@ -1032,7 +1181,12 @@ impl FfmpegEncoder {
         let keyframe = std::mem::take(&mut self.keyframe_requested);
         let copies = self.send_cpu(frame, pts, keyframe)?;
         self.copies = copies;
-        self.finish_frame(pts, frame.frame_id, None, config.fps)
+        Ok(Submitted {
+            pts,
+            frame_id: frame.frame_id,
+            image: None,
+            fps: config.fps,
+        })
     }
 
     /// Copia `frame` en el `AVFrame` de CPU de la sesión, lo sube a la GPU si hace falta y lo
@@ -1070,7 +1224,7 @@ impl FfmpegEncoder {
         frame: &RawFrame,
         image: &GpuImage,
         config: EncoderConfig,
-    ) -> Result<Vec<EncodedSlice>, CodecError> {
+    ) -> Result<Option<Submitted>, CodecError> {
         let size = (frame.width, frame.height);
         if self
             .importer
@@ -1156,7 +1310,7 @@ impl FfmpegEncoder {
         }
         self.copies = copies;
         if !sent {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         // Un DMA-BUF se retiene hasta su paquete (el mapeo de FFmpeg no lo retiene); una textura
         // D3D11 ya se copió al pool propio.
@@ -1164,7 +1318,12 @@ impl FfmpegEncoder {
         let held = matches!(image, GpuImage::DmaBuf(_)).then(|| image.clone());
         #[cfg(not(unix))]
         let held = None;
-        self.finish_frame(pts, frame.frame_id, held, config.fps)
+        Ok(Some(Submitted {
+            pts,
+            frame_id: frame.frame_id,
+            image: held,
+            fps: config.fps,
+        }))
     }
 
     /// Importador para `image`: sin copias si no falló antes; si no se puede, el de respaldo.
@@ -1211,17 +1370,33 @@ impl FfmpegEncoder {
         self.gpu_note = Some(note);
     }
 
-    /// Anota el fotograma en vuelo y recoge lo que haya salido.
-    fn finish_frame(
-        &mut self,
-        pts: i64,
-        frame_id: u64,
-        image: Option<GpuImage>,
-        fps: u32,
-    ) -> Result<Vec<EncodedSlice>, CodecError> {
+    /// Anota el fotograma en vuelo y devuelve cuánto esperar a su paquete.
+    fn track(&mut self, submitted: Submitted) -> (i64, Duration) {
+        let Submitted {
+            pts,
+            frame_id,
+            image,
+            fps,
+        } = submitted;
         self.in_flight.push_back((pts, frame_id, image));
         let period = Duration::from_secs(1) / fps.max(1);
-        self.drain(pts, (period * OUTPUT_WAIT_FRAMES).max(OUTPUT_WAIT_MIN))
+        (pts, (period * OUTPUT_WAIT_FRAMES).max(OUTPUT_WAIT_MIN))
+    }
+
+    /// Anota el fotograma en vuelo y recoge lo que haya salido, en slices.
+    fn finish_frame(&mut self, submitted: Submitted) -> Result<Vec<EncodedSlice>, CodecError> {
+        let (pts, wait) = self.track(submitted);
+        self.drain(pts, wait)
+    }
+
+    /// Anota el fotograma en vuelo y recoge lo que haya salido, entero, en `out`.
+    fn finish_frame_into(
+        &mut self,
+        submitted: Submitted,
+        out: &mut Vec<u8>,
+    ) -> Result<Option<EncodedFrame>, CodecError> {
+        let (pts, wait) = self.track(submitted);
+        self.drain_into(pts, wait, out)
     }
 }
 
@@ -1551,6 +1726,52 @@ mod tests {
             intra_refresh(Codec::Av1, Backend::Nvenc),
             IntraRefresh::Native("intra-refresh")
         );
+    }
+
+    /// Las opciones genéricas del diccionario llegan al contexto: `b`, `maxrate` y `bufsize`
+    /// quedan en `bit_rate`, `rc_max_rate` y `rc_buffer_size` tras `avcodec_open2`, y
+    /// [`read_rate_control`] los lee de ahí (un cero sería el «fixed QP» de Vulkan Video).
+    #[test]
+    fn rate_control_is_read_back_from_the_open_context() {
+        let Some(codec) = AVCodec::find_encoder_by_name(c"libopenh264") else {
+            eprintln!("AVISO: esta build de FFmpeg no trae libopenh264; se omite");
+            return;
+        };
+        let mut ctx = AVCodecContext::new(&codec);
+        ctx.set_width(320);
+        ctx.set_height(192);
+        ctx.set_time_base(ffi::AVRational { num: 1, den: 30 });
+        ctx.set_pix_fmt(ffi::AV_PIX_FMT_YUV420P);
+        let options = vec![
+            ("b", "1000000".to_owned()),
+            ("maxrate", "1000000".to_owned()),
+            ("bufsize", "33333".to_owned()),
+            // `rc` (el modo de NVENC y AMF) no existe en libopenh264: vuelve sin usar.
+            ("rc", "cbr".to_owned()),
+        ];
+        let unused = super::super::open_codec(&mut ctx, &options).unwrap();
+        assert_eq!(unused, vec!["rc".to_owned()]);
+        let rc = read_rate_control(&ctx, &options, &unused);
+        assert_eq!(rc.bit_rate, 1_000_000);
+        assert_eq!(rc.max_rate, 1_000_000);
+        assert_eq!(rc.buffer_bits, 33_333);
+        assert_eq!(
+            rc.mode, None,
+            "libopenh264 no tiene `rc`: cuenta como no usada"
+        );
+        assert_eq!(rc.to_string(), "tasa 1000 kbit/s, VBV 33 kbit");
+        let vulkan_like = RateControl {
+            mode: Some("cbr".into()),
+            ..rc
+        };
+        assert_eq!(vulkan_like.to_string(), "CBR 1000 kbit/s, VBV 33 kbit");
+        let none = RateControl {
+            bit_rate: 0,
+            max_rate: 0,
+            buffer_bits: 0,
+            mode: None,
+        };
+        assert!(none.to_string().contains("QP fijo"));
     }
 
     /// Slices reales: `libopenh264` de FFmpeg con `slices=4` escribe cuatro NAL de slice por

@@ -15,7 +15,15 @@ ffmpeg = ["dep:rsmpeg", "dep:ash"]
 ash = { workspace = true, optional = true }
 openh264.workspace = true
 rsmpeg = { workspace = true, optional = true }
+# Caché JSON de la calibración de codificadores (`calibrate`).
+serde.workspace = true
+serde_json.workspace = true
 yuv.workspace = true
+
+# `dlopen` de libva: comprobar que la libva del sistema tiene lo que FFmpeg 8.1 enlaza (≥ 2.21)
+# antes de abrir VA-API, en vez de abortar en su *implib*.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
 
 # Texturas D3D11 de la captura y su importación en los *hw frames* de FFmpeg.
 [target.'cfg(target_os = "windows")'.dependencies]

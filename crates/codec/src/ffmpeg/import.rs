@@ -2,7 +2,12 @@
 //!
 //! **Linux (DMA-BUF)**: la imagen se envuelve en un `AVFrame` `AV_PIX_FMT_DRM_PRIME` (con un
 //! `AVDRMFrameDescriptor` construido desde sus planos, [`drm_descriptor`]) y se mapea con
-//! `av_hwframe_map` en un contexto de *hw frames* del dispositivo del codificador:
+//! `av_hwframe_map` en un contexto de *hw frames* del dispositivo del codificador. PipeWire
+//! reutiliza sus 4 a 16 búferes (cada vez con un `dup` nuevo del descriptor), y mapear cuesta
+//! (`vkImportMemoryFd`, `vkCreateImage` y su enlace por fotograma): el mapeo se guarda por
+//! identidad del búfer ([`DmaBufKey`]: el inodo del DMA-BUF, único por búfer desde Linux 5.3, con
+//! desplazamientos, pasos, modificador, formato y tamaño) en una caché LRU de
+//! [`MAPPED_CACHE`] entradas que se vacía al cambiar el tamaño (se rehace el importador):
 //!
 //! | Codificador | Mapeo | Conversión de color (GPU) | Lo que recibe el codificador |
 //! |---|---|---|---|
@@ -197,6 +202,9 @@ pub(crate) struct GpuImporter {
     filter: Option<HwFilter>,
     /// Copias a CPU del último fotograma.
     copies: u32,
+    /// Mapeos de DMA-BUF por identidad del búfer ([`MappedCache`]).
+    #[cfg(target_os = "linux")]
+    mapped: MappedCache<DmaBufKey, AVFrame>,
     #[cfg(windows)]
     d3d11: d3d11::Device,
     /// Lo que debe vivir tanto como el importador (dispositivos derivados).
@@ -311,6 +319,7 @@ impl GpuImporter {
             landing_format,
             filter: Some(filter),
             copies: 0,
+            mapped: MappedCache::new(MAPPED_CACHE, MAPPED_IDLE_FRAMES),
             _devices: devices,
         })
     }
@@ -449,8 +458,30 @@ impl GpuImporter {
         }
     }
 
+    /// Mapeo de `image`: el guardado si el búfer ya pasó por aquí ([`DmaBufKey`]), si no uno
+    /// nuevo que se guarda. Devuelve una referencia nueva (`av_frame_clone`) al mismo mapeo: el
+    /// filtro y el codificador toman las suyas y el guardado no cambia.
     #[cfg(target_os = "linux")]
     fn map_dmabuf(&mut self, image: &Arc<crate::gpu::DmaBufImage>) -> Result<AVFrame, String> {
+        let key = DmaBufKey::of(image);
+        self.mapped.tick();
+        if let Some(key) = &key
+            && let Some(frame) = self.mapped.get(key)
+        {
+            return Ok(frame.clone());
+        }
+        let mapped = self.map_dmabuf_fresh(image)?;
+        if let Some(key) = key {
+            self.mapped.insert(key, mapped.clone());
+        }
+        Ok(mapped)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn map_dmabuf_fresh(
+        &mut self,
+        image: &Arc<crate::gpu::DmaBufImage>,
+    ) -> Result<AVFrame, String> {
         let source = drm_frame(image)?;
         let mut mapped = AVFrame::new();
         mapped.set_format(self.landing_format);
@@ -469,6 +500,113 @@ impl GpuImporter {
         };
         check("mapeo del DMA-BUF", ret)?;
         Ok(mapped)
+    }
+}
+
+/// Mapeos de DMA-BUF que se recuerdan: PipeWire negocia como mucho 16 búferes.
+#[cfg(target_os = "linux")]
+const MAPPED_CACHE: usize = 16;
+
+/// Fotogramas sin usarse tras los que un mapeo se suelta: cuando el compositor reserva búferes
+/// nuevos (otro tamaño, otra lista), los viejos no vuelven a aparecer y, sin esto, quedarían
+/// retenidos (y con ellos su memoria de GPU) hasta que 16 búferes distintos los desplazaran.
+#[cfg(target_os = "linux")]
+const MAPPED_IDLE_FRAMES: u64 = 64;
+
+/// Caché de mapeos por identidad del búfer con dos salidas: la de menos uso reciente cuando se
+/// llena, y la que lleva [`MAPPED_IDLE_FRAMES`] fotogramas sin usarse ([`MappedCache::tick`] cuenta
+/// uno por imagen que llega). Genérica para probarla sin DMA-BUF.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct MappedCache<K, V> {
+    entries: Vec<(K, V, u64)>,
+    capacity: usize,
+    idle: u64,
+    now: u64,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl<K: PartialEq, V> MappedCache<K, V> {
+    fn new(capacity: usize, idle: u64) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+            capacity,
+            idle,
+            now: 0,
+        }
+    }
+
+    /// Llega una imagen: avanza el contador y suelta los mapeos que llevan `idle` sin usarse.
+    fn tick(&mut self) {
+        self.now += 1;
+        let (now, idle) = (self.now, self.idle);
+        self.entries
+            .retain(|(_, _, last_used)| now.saturating_sub(*last_used) <= idle);
+    }
+
+    /// El mapeo de `key`, marcándolo como usado ahora.
+    fn get(&mut self, key: &K) -> Option<&V> {
+        let now = self.now;
+        self.entries
+            .iter_mut()
+            .find(|(known, _, _)| known == key)
+            .map(|(_, value, last_used)| {
+                *last_used = now;
+                &*value
+            })
+    }
+
+    /// Guarda un mapeo nuevo; si no cabe, fuera el de menos uso reciente.
+    fn insert(&mut self, key: K, value: V) {
+        if self.entries.len() >= self.capacity
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, _, last_used))| *last_used)
+                .map(|(index, _)| index)
+        {
+            self.entries.swap_remove(oldest);
+        }
+        self.entries.push((key, value, self.now));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Identidad de un DMA-BUF de la captura: inodo de cada plano (el mismo objeto con distinto `fd`
+/// tras cada `dup`), desplazamientos y pasos, modificador, formato y tamaño.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DmaBufKey {
+    planes: Vec<(u64, u32, u32)>,
+    modifier: u64,
+    fourcc: u32,
+    size: (u32, u32),
+}
+
+#[cfg(target_os = "linux")]
+impl DmaBufKey {
+    /// `None` si algún inodo no se puede leer (entonces no se guarda el mapeo).
+    fn of(image: &crate::gpu::DmaBufImage) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let planes = image
+            .planes
+            .iter()
+            .map(|plane| {
+                let file = std::fs::File::from(plane.fd.try_clone().ok()?);
+                let inode = file.metadata().ok()?.ino();
+                (inode != 0).then_some((inode, plane.offset, plane.stride))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            planes,
+            modifier: image.modifier,
+            fourcc: image.fourcc,
+            size: (image.width, image.height),
+        })
     }
 }
 
@@ -791,6 +929,41 @@ mod d3d11 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// La caché de mapeos suelta lo que lleva demasiados fotogramas sin usarse y lo de menos uso
+    /// cuando se llena, y reconoce lo que vuelve.
+    #[test]
+    fn mapped_cache_evicts_idle_and_least_recent_entries() {
+        let mut cache: MappedCache<u32, &str> = MappedCache::new(3, 4);
+        cache.tick();
+        cache.insert(1, "uno");
+        cache.tick();
+        cache.insert(2, "dos");
+        assert_eq!(cache.get(&1), Some(&"uno"), "acierto por identidad");
+        assert_eq!(cache.get(&9), None);
+        // Se llena: fuera el de menos uso reciente (el 2, que no se ha vuelto a tocar).
+        cache.tick();
+        cache.insert(3, "tres");
+        cache.get(&1);
+        cache.tick();
+        cache.insert(4, "cuatro");
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.get(&2), None);
+        assert!(cache.get(&1).is_some() && cache.get(&3).is_some());
+        // Cuatro fotogramas sin tocar el 4: se suelta solo; el 1 y el 3, usados, siguen.
+        for _ in 0..5 {
+            cache.tick();
+            cache.get(&1);
+            cache.get(&3);
+        }
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get(&4), None);
+        // Sin usar nada, al cabo del tiempo la caché queda vacía (búferes que no volverán).
+        for _ in 0..5 {
+            cache.tick();
+        }
+        assert_eq!(cache.len(), 0);
+    }
 
     #[test]
     fn every_import_path_has_its_chain() {

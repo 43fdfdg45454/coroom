@@ -43,8 +43,9 @@ use coroom_capture::{
     GpuFrames,
 };
 use coroom_codec::{
-    Codec, CodecError, DEFAULT_SLICES, Decoder, DecoderBackend, DecoderSet, EncodedSlice, Encoder,
-    EncoderConfig, GpuInput, PixelFormat, RawFrame, VideoFormat, decoder_label, encoder_label,
+    Codec, CodecError, DEFAULT_SLICES, Decoder, DecoderBackend, DecoderSet, EncodedFrame,
+    EncodedSlice, Encoder, EncoderConfig, GpuInput, PixelFormat, RawFrame, VideoFormat,
+    decoder_label, encoder_label,
 };
 use coroom_transport::loopback::{UdpLoopback, UdpReceiver, UdpSender};
 use crossbeam_channel::{
@@ -53,6 +54,7 @@ use crossbeam_channel::{
 use tracing::{debug, warn};
 
 use crate::latency::{LatencyLedger, LatencySummary, Stage};
+use crate::preview::{PreviewTap, PreviewWorker};
 use crate::stats::{Counters, bump};
 
 /// Capacidad de cada canal entre etapas.
@@ -280,6 +282,27 @@ pub trait FrameSink: Send {
     fn cpu_copies(&self) -> u32 {
         0
     }
+
+    /// Si el último `present` llegó a la pantalla. `false` cuando la ventana no podía mostrarlo
+    /// (oculta, minimizada o sin superficie): el pipeline lo anota como descarte en la etapa de
+    /// presentación en vez de darlo por presentado. Por defecto, sí.
+    fn shown(&self) -> bool {
+        true
+    }
+
+    /// Quien quiera enterarse del cursor del anfitrión **entre** fotogramas (viaja aparte del
+    /// vídeo): el pipeline le pasa cada posición nueva desde el hilo que la recibe, con la forma
+    /// si ya se conoce. Por defecto, nadie: el cursor va con el siguiente fotograma.
+    fn cursor_sink(&self) -> Option<Arc<dyn CursorSink>> {
+        None
+    }
+}
+
+/// Destino del cursor del anfitrión entre fotogramas (ver [`FrameSink::cursor_sink`]). Se llama
+/// desde el hilo de control de la sesión: no debe bloquearse (ni esperar a la pantalla).
+pub trait CursorSink: Send + Sync {
+    /// El cursor del anfitrión se movió (o cambió de forma o de visibilidad).
+    fn cursor_moved(&self, cursor: CursorState, shape: Option<Arc<CursorShape>>);
 }
 
 /// Presentación que no dibuja nada; para tests y pruebas sin ventana.
@@ -338,6 +361,32 @@ pub(crate) struct Shared {
     pub(crate) counters: Counters,
     /// Captura nueva, ya arrancada, que el hilo `capture` adopta (cambio de fuente en marcha).
     pub(crate) next_capturer: CapturerSlot,
+    /// A quién avisar del cursor entre fotogramas (lo pone el hilo `present` con su sumidero).
+    cursor_sink: CursorSinkSlot,
+}
+
+/// Hueco para el [`CursorSink`] del sumidero de presentación.
+#[derive(Default)]
+struct CursorSinkSlot(Mutex<Option<Arc<dyn CursorSink>>>);
+
+impl CursorSinkSlot {
+    fn set(&self, sink: Option<Arc<dyn CursorSink>>) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = sink;
+    }
+
+    fn get(&self) -> Option<Arc<dyn CursorSink>> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl fmt::Debug for CursorSinkSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let set = self.0.lock().map(|slot| slot.is_some()).unwrap_or(false);
+        f.debug_tuple("CursorSinkSlot").field(&set).finish()
+    }
 }
 
 /// Hueco para la captura que sustituye a la actual.
@@ -411,6 +460,16 @@ impl Shared {
             shapes.pop_front();
         }
         true
+    }
+
+    /// Cursor nuevo del anfitrión (posición, visibilidad o forma): se guarda para el siguiente
+    /// fotograma y, si el sumidero de presentación quiere saberlo entre fotogramas, se le avisa
+    /// ya, con la forma si se conoce.
+    pub(crate) fn set_cursor(&self, cursor: CursorState) {
+        *self.cursor.lock().unwrap_or_else(PoisonError::into_inner) = Some(cursor);
+        if let Some(sink) = self.cursor_sink.get() {
+            sink.cursor_moved(cursor, self.cursor_shape(cursor.shape_id));
+        }
     }
 
     /// Forma del cursor `shape_id`, si se conoce.
@@ -927,14 +986,6 @@ pub(crate) fn capture_loop(
             if let Some(shape) = &frame.cursor_shape {
                 shared.remember_shape(Arc::clone(shape));
             }
-            let preview = shared
-                .preview
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
-            if let Some(preview) = preview {
-                preview.offer(&frame);
-            }
             if send_latest(&tx, &evict, frame, ledger, Stage::Encoded).is_err() {
                 break;
             }
@@ -1018,6 +1069,59 @@ fn can_repeat(raw: &RawFrame) -> bool {
     }
 }
 
+/// Devuelve a la captura el búfer de un fotograma de CPU que ya no se necesita
+/// ([`coroom_capture::pool`]): el siguiente se copia en él sin reservar memoria.
+fn recycle(raw: RawFrame) {
+    if raw.gpu.is_none() && matches!(raw.format, PixelFormat::Bgra | PixelFormat::Rgba16F) {
+        coroom_capture::pool::give(raw.data);
+    }
+}
+
+/// Guarda `raw` como último fotograma (si se puede repetir, [`can_repeat`]) tras ofrecérselo a la
+/// vista previa, que se lo lleva a su hilo cuando le toca y lo devuelve después
+/// ([`PreviewWorker::returned`]). Lo que no se guarda vuelve al pool de la captura.
+fn stash(
+    raw: Option<RawFrame>,
+    tap: Option<&Arc<PreviewTap>>,
+    worker: &mut PreviewWorker,
+    last: &mut Option<RawFrame>,
+    last_id: &mut Option<u64>,
+) {
+    if let Some(old) = last.take() {
+        recycle(old);
+    }
+    let Some(raw) = raw else {
+        return;
+    };
+    *last_id = Some(raw.frame_id);
+    let raw = match tap {
+        Some(tap) if tap.wants(&raw) => match worker.offer(Arc::clone(tap), raw) {
+            Some(back) => back,
+            None => return,
+        },
+        _ => raw,
+    };
+    if can_repeat(&raw) {
+        *last = Some(raw);
+    } else {
+        recycle(raw);
+    }
+}
+
+/// Deja los slices de un fotograma seguidos en `out` (la ruta de [`Encoder::repeat_last`]).
+fn concat_slices(slices: Vec<EncodedSlice>, out: &mut Vec<u8>) -> Option<EncodedFrame> {
+    out.clear();
+    let first = slices.first()?;
+    let encoded = EncodedFrame {
+        frame_id: first.frame_id,
+        keyframe: slices.iter().any(|slice| slice.keyframe),
+    };
+    for slice in &slices {
+        out.extend_from_slice(&slice.data);
+    }
+    Some(encoded)
+}
+
 pub(crate) fn encode_loop(
     mut encoder: Option<Box<dyn Encoder>>,
     rx: Receiver<CapturedFrame>,
@@ -1033,17 +1137,31 @@ pub(crate) fn encode_loop(
     // ([`can_repeat`]). Los D3D11 no: WGC tiene tres y la captura se quedaría sin dónde escribir;
     // con ellos repite el propio codificador desde su copia ([`Encoder::repeat_last`]).
     let mut last: Option<RawFrame> = None;
+    // Id del último fotograma guardado u ofrecido a la vista previa (para volver a guardarlo
+    // cuando lo devuelva, si no llegó otro mientras).
+    let mut last_id: Option<u64> = None;
     let mut last_at = Instant::now();
+    // La vista previa se reduce en su propio hilo con el fotograma que acaba de codificarse.
+    let mut preview = PreviewWorker::new();
+    // Tamaño del último fotograma comprimido, para reservar el siguiente de una vez.
+    let mut expected_len = 0usize;
     loop {
         if shared.stopping() {
             break;
+        }
+        for back in preview.returned() {
+            if last.is_none() && last_id == Some(back.frame_id) {
+                last = Some(back);
+            } else {
+                recycle(back);
+            }
         }
         let input = match rx.recv_timeout(POLL) {
             Ok(mut frame) => {
                 // Como `recv_latest`: el más reciente, y los demás cuentan como descartes.
                 while let Ok(newer) = rx.try_recv() {
                     ledger.record_drop(Stage::Encoded);
-                    frame = newer;
+                    coroom_capture::pool::recycle_frame(std::mem::replace(&mut frame, newer));
                 }
                 last_at = Instant::now();
                 EncodeInput::Captured(frame)
@@ -1067,6 +1185,7 @@ pub(crate) fn encode_loop(
                 let raw = to_raw_frame(frame);
                 if raw.width == 0 || raw.height == 0 {
                     ledger.record_drop(Stage::Encoded);
+                    recycle(raw);
                     continue;
                 }
                 Some(raw)
@@ -1074,9 +1193,13 @@ pub(crate) fn encode_loop(
             // Sin imagen de CPU guardada, repite el codificador (si puede).
             EncodeInput::Repeat => last.take(),
         };
+        let tap = shared
+            .preview
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         // Sin invitados o sin códec no se codifica, pero se guarda la imagen: si la pantalla está
         // quieta cuando llegue uno, es la que se le envía.
-        let keep = |raw: Option<RawFrame>| raw.filter(can_repeat);
         if let Some(control) = control {
             if let Some(next) = control.take_next() {
                 // Códec nuevo (negociación): sale ya configurado y su primer fotograma es intra.
@@ -1084,13 +1207,13 @@ pub(crate) fn encode_loop(
                 gate = BitrateGate::default();
             }
             if !control.active.load(Ordering::Acquire) {
-                last = keep(raw);
+                stash(raw, tap.as_ref(), &mut preview, &mut last, &mut last_id);
                 continue;
             }
         }
         let Some(encoder) = encoder.as_mut() else {
             // Todavía no hay códec (el anfitrión espera las capacidades del invitado).
-            last = keep(raw);
+            stash(raw, tap.as_ref(), &mut preview, &mut last, &mut last_id);
             continue;
         };
         if let Some(control) = control {
@@ -1109,10 +1232,14 @@ pub(crate) fn encode_loop(
             encoder.request_keyframe();
         }
         let started = Instant::now();
-        let slices = match &raw {
-            Some(raw) => encoder.encode(raw).map_err(PipelineError::Codec)?,
+        // El paquete entero, de una vez, en el búfer que viaja al hilo `send`.
+        let mut data = Vec::with_capacity(expected_len);
+        let encoded = match &raw {
+            Some(raw) => encoder
+                .encode_into(raw, &mut data)
+                .map_err(PipelineError::Codec)?,
             None => match encoder.repeat_last() {
-                Some(slices) => slices.map_err(PipelineError::Codec)?,
+                Some(slices) => concat_slices(slices.map_err(PipelineError::Codec)?, &mut data),
                 None => {
                     // Nada que repetir: el intra queda pedido para el siguiente fotograma.
                     if forced {
@@ -1131,29 +1258,22 @@ pub(crate) fn encode_loop(
         let Some(frame_id) = raw
             .as_ref()
             .map(|raw| raw.frame_id)
-            .or_else(|| slices.first().map(|slice| slice.frame_id))
+            .or(encoded.map(|encoded| encoded.frame_id))
         else {
             ledger.record_drop(Stage::Encoded);
             continue;
         };
-        // Una imagen D3D11 (y el búfer de la captura que retiene) se suelta en cuanto se codifica.
-        last = keep(raw);
+        // Una imagen D3D11 (y el búfer de la captura que retiene) se suelta en cuanto se codifica;
+        // la de CPU va a la vista previa si le toca y se guarda para repetirla.
+        stash(raw, tap.as_ref(), &mut preview, &mut last, &mut last_id);
         ledger.record_cpu_copies(Stage::Encoded, encoder.cpu_copies());
-        if slices.is_empty() {
+        let Some(encoded) = encoded else {
             // El codificador se saltó el fotograma.
             ledger.record_drop(Stage::Encoded);
             continue;
-        }
-        let keyframe = slices.iter().any(|slice| slice.keyframe);
-        let data = if slices.len() == 1 {
-            slices
-                .into_iter()
-                .next()
-                .map(|slice| slice.data)
-                .unwrap_or_default()
-        } else {
-            slices.into_iter().flat_map(|slice| slice.data).collect()
         };
+        let keyframe = encoded.keyframe;
+        expected_len = data.len() + data.len() / 4;
         ledger.mark(frame_id, Stage::Encoded, encoded_at);
         if control.is_none() {
             // En el bucle local no se cifra: la etapa dura 0.
@@ -1485,7 +1605,22 @@ pub(crate) fn present_loop(
     ledger: &LatencyLedger,
 ) -> Result<(), PipelineError> {
     let mut presented = 0u64;
-    while let Some(frame) = recv_latest(&rx, shared, ledger, Stage::Presented) {
+    // El cursor entre fotogramas va directo al sumidero mientras este hilo viva.
+    shared.cursor_sink.set(sink.cursor_sink());
+    let result = present_frames(sink.as_mut(), &rx, frames, shared, ledger, &mut presented);
+    shared.cursor_sink.set(None);
+    result
+}
+
+fn present_frames(
+    sink: &mut dyn FrameSink,
+    rx: &Receiver<RawFrame>,
+    frames: Option<u64>,
+    shared: &Shared,
+    ledger: &LatencyLedger,
+    presented: &mut u64,
+) -> Result<(), PipelineError> {
+    while let Some(frame) = recv_latest(rx, shared, ledger, Stage::Presented) {
         let frame_id = frame.frame_id;
         let cursor = *shared.cursor.lock().unwrap_or_else(PoisonError::into_inner);
         let cursor_shape = cursor.and_then(|cursor| shared.cursor_shape(cursor.shape_id));
@@ -1495,11 +1630,16 @@ pub(crate) fn present_loop(
             cursor_shape,
         })
         .map_err(PipelineError::Sink)?;
-        ledger.mark(frame_id, Stage::Presented, Instant::now());
+        if sink.shown() {
+            ledger.mark(frame_id, Stage::Presented, Instant::now());
+        } else {
+            // La ventana no podía mostrarlo (oculta): no es una latencia, es un descarte.
+            ledger.record_drop(Stage::Presented);
+        }
         ledger.record_cpu_copies(Stage::Presented, sink.cpu_copies());
         bump(&shared.counters.presented);
-        presented += 1;
-        if frames.is_some_and(|limit| presented >= limit) {
+        *presented += 1;
+        if frames.is_some_and(|limit| *presented >= limit) {
             shared.finish(None);
             break;
         }

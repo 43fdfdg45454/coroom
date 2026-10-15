@@ -182,30 +182,65 @@ impl fmt::Display for Capabilities {
                 "Solo software: sin GPU detectada o sin códecs acelerados."
             )?;
         }
-        writeln!(f, "{:<6} {:<12} Decodificar", "Códec", "Codificar")?;
-        for codec in Codec::PREFERENCE {
-            let join = |names: Vec<String>| {
-                if names.is_empty() {
-                    "—".to_owned()
-                } else {
-                    names.join(", ")
-                }
-            };
-            let encoders = join(
-                self.encoders
-                    .iter()
-                    .filter(|(c, _)| *c == codec)
-                    .map(|(c, b)| encoder_label(*c, *b))
-                    .collect(),
-            );
-            let decoders = join(
-                self.decoders
-                    .iter()
-                    .filter(|(c, _)| *c == codec)
-                    .map(|(c, b)| decoder_label(*c, *b))
-                    .collect(),
-            );
-            writeln!(f, "{:<6} {encoders:<12} {decoders}", codec.to_string())?;
+        let join = |names: Vec<String>| {
+            if names.is_empty() {
+                "—".to_owned()
+            } else {
+                names.join(", ")
+            }
+        };
+        let rows: Vec<(String, String, String)> = Codec::PREFERENCE
+            .into_iter()
+            .map(|codec| {
+                let encoders = join(
+                    self.encoders
+                        .iter()
+                        .filter(|(c, _)| *c == codec)
+                        .map(|(c, b)| encoder_label(*c, *b))
+                        .collect(),
+                );
+                let decoders = join(
+                    self.decoders
+                        .iter()
+                        .filter(|(c, _)| *c == codec)
+                        .map(|(c, b)| decoder_label(*c, *b))
+                        .collect(),
+                );
+                (codec.to_string(), encoders, decoders)
+            })
+            .collect();
+        // La columna «Codificar» se ensancha con la lista más larga (por caracteres, no por
+        // bytes: las etiquetas llevan tildes) para que «Decodificar» quede alineada.
+        let width = |pick: fn(&(String, String, String)) -> &String, header: &str| {
+            rows.iter()
+                .map(|row| pick(row).chars().count())
+                .chain([header.chars().count()])
+                .max()
+                .unwrap_or(0)
+        };
+        let codec_width = width(|row| &row.0, "Códec");
+        let encoder_width = width(|row| &row.1, "Codificar");
+        let pad = |text: &str, width: usize| {
+            let mut out = text.to_owned();
+            out.extend(std::iter::repeat_n(
+                ' ',
+                width.saturating_sub(text.chars().count()),
+            ));
+            out
+        };
+        writeln!(
+            f,
+            "{} {} Decodificar",
+            pad("Códec", codec_width),
+            pad("Codificar", encoder_width)
+        )?;
+        for (codec, encoders, decoders) in &rows {
+            writeln!(
+                f,
+                "{} {} {decoders}",
+                pad(codec, codec_width),
+                pad(encoders, encoder_width)
+            )?;
         }
         if !self.unavailable.is_empty() {
             writeln!(f, "Por hardware que no abren en este equipo:")?;
@@ -229,6 +264,48 @@ impl fmt::Display for Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// La columna «Decodificar» queda alineada aunque la lista de codificadores sea larga.
+    #[test]
+    fn the_table_keeps_its_columns_aligned() {
+        let caps = Capabilities::with(
+            vec![
+                (Codec::Av1, Backend::VulkanVideo),
+                (Codec::Av1, Backend::Nvenc),
+                (Codec::Av1, Backend::Software),
+                (Codec::H264, Backend::Software),
+            ],
+            vec![(Codec::Av1, DecoderBackend::Software)],
+        );
+        let text = caps.to_string();
+        let rows: Vec<&str> = text
+            .lines()
+            .skip_while(|line| !line.starts_with("Códec"))
+            .take(4)
+            .collect();
+        assert_eq!(rows.len(), 4, "{text}");
+        let column = |line: &str| {
+            line.char_indices()
+                .map(|(i, _)| i)
+                .find(|&i| {
+                    line[i..].starts_with("Decodificar")
+                        || line[i..].starts_with("dav1d")
+                        || (line[i..].starts_with('—') && line[..i].ends_with(' '))
+                })
+                .map(|byte| line[..byte].chars().count())
+        };
+        let header = column(rows[0]).expect("cabecera");
+        for row in &rows[1..] {
+            let position = row
+                .char_indices()
+                .map(|(i, _)| i)
+                .filter(|&i| row[..i].ends_with(' ') && !row[i..].starts_with(' '))
+                .map(|byte| row[..byte].chars().count())
+                .max()
+                .expect("última columna");
+            assert_eq!(position, header, "fila sin alinear: {row:?} en\n{text}");
+        }
+    }
 
     #[test]
     fn probing_never_fails_and_lists_the_software_codecs() {

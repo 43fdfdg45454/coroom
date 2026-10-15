@@ -46,6 +46,7 @@ fn pattern(frame_id: u64) -> RawFrame {
         data,
         gpu: None,
         color: coroom_codec::ColorSpace::SDR,
+        pool: None,
     }
 }
 

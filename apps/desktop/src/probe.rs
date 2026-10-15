@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use coroom_render::{
     ColorInfo, ColorMatrix, CursorImage, CursorOverlay, ExternalImageState, ExternalImageUpdate,
-    ExternalVulkanImage, NullPresenter, PresentFrame, PresentImage, Presenter, VulkanDeviceShare,
-    VulkanFrame,
+    ExternalVulkanImage, NullPresenter, PlanarImage, PlanarLayout, PlaneBuffer, PresentFrame,
+    PresentImage, Presenter, Recycle, VulkanDeviceShare, VulkanFrame,
 };
 use coroom_session::capture::synthetic::SyntheticCapturer;
 use coroom_session::capture::{self, Capturer, CursorShape};
@@ -17,8 +17,8 @@ use coroom_session::codec::gpu::{
     SharedFeatures, SharedQueueFamily, SharedVulkanDevice, VulkanFrameAccess, VulkanFrameUpdate,
 };
 use coroom_session::codec::{
-    Backend, Codec, ColorSpace, DEFAULT_SLICES, DecodeOutput, DecoderBackend, DecoderSet,
-    EncoderConfig, EncoderSet, GpuImage, PixelFormat, RawFrame,
+    Backend, BufferPool, Codec, ColorSpace, DEFAULT_SLICES, DecodeOutput, DecoderBackend,
+    DecoderSet, EncoderConfig, EncoderSet, GpuImage, PixelFormat, RawFrame,
 };
 use coroom_session::latency::{LatencyLedger, LatencySummary, Stage};
 use coroom_session::loopback::{
@@ -145,6 +145,16 @@ impl ExternalVulkanImage for VulkanBridge {
     }
 }
 
+/// Puente entre el pool de búferes del decodificador (`coroom-codec`) y el búfer de la imagen de
+/// `coroom-render`, que lo devuelve al soltarse.
+struct PoolBridge(Arc<BufferPool>);
+
+impl Recycle for PoolBridge {
+    fn recycle(&self, buffer: Vec<u8>) {
+        self.0.give(buffer);
+    }
+}
+
 /// Dónde debe dejar el decodificador las imágenes para este presentador: en su dispositivo Vulkan
 /// si lo comparte (cero copias), si no en CPU.
 pub fn decode_output_for(share: Option<Arc<VulkanDeviceShare>>) -> DecodeOutput {
@@ -211,8 +221,9 @@ pub fn to_color_info(color: ColorSpace) -> ColorInfo {
 }
 
 /// Convierte un fotograma de `coroom-codec` (I420, NV12, I444 o P010 compacto, o una imagen de
-/// GPU) en uno de `coroom-render`, sin convertir el color (el shader entiende todos) ni copiar las
-/// imágenes de GPU.
+/// GPU) en uno de `coroom-render`, sin convertir el color (el shader entiende todos), sin partir
+/// ni copiar los planos (viajan en su búfer, con sus desplazamientos) y sin copiar las imágenes de
+/// GPU. El búfer vuelve al pool del decodificador cuando la presentación lo suelta.
 pub fn to_present_frame(frame: RawFrame) -> Result<PresentFrame, SinkError> {
     let color = to_color_info(frame.color);
     if frame.format == PixelFormat::Gpu {
@@ -242,82 +253,51 @@ pub fn to_present_frame(frame: RawFrame) -> Result<PresentFrame, SinkError> {
             color,
         });
     }
-    let (w, h) = (frame.width as usize, frame.height as usize);
-    let (cw, ch) = RawFrame::chroma_size(frame.width, frame.height);
-    let (cw, ch) = (cw as usize, ch as usize);
-    // Bytes de luma por fila útil y tamaño de los planos de croma que siguen.
-    let (row, chroma_len) = match frame.format {
-        PixelFormat::I420 | PixelFormat::Nv12 => (w, 2 * cw * ch),
-        PixelFormat::I444 => (w, 2 * w * h),
-        PixelFormat::P010 => (2 * w, 4 * cw * ch),
+    let layout = match frame.format {
+        PixelFormat::I420 => PlanarLayout::I420,
+        PixelFormat::Nv12 => PlanarLayout::Nv12,
+        PixelFormat::I444 => PlanarLayout::I444,
+        PixelFormat::P010 => PlanarLayout::P010,
         other => {
             return Err(SinkError(format!(
                 "se esperaba I420, NV12, I444 o P010 compacto y llegó {other:?}"
             )));
         }
     };
-    if (frame.stride as usize) < row {
+    let extents = layout.plane_extents(frame.width, frame.height);
+    let row = extents[0].0;
+    if frame.stride < row {
         return Err(SinkError(format!(
             "fila de {} bytes demasiado corta para {:?}",
             frame.stride, frame.format
         )));
     }
-    let y_len = frame.stride as usize * h;
+    let chroma_len: usize = extents[1..]
+        .iter()
+        .map(|&(row, rows)| row as usize * rows as usize)
+        .sum();
+    let y_len = frame.stride as usize * frame.height as usize;
     if frame.data.len() < y_len + chroma_len {
         return Err(SinkError("planos de vídeo incompletos".into()));
     }
-    let mut y = frame.data;
-    let image = match frame.format {
-        PixelFormat::Nv12 => {
-            let mut uv = y.split_off(y_len);
-            uv.truncate(chroma_len);
-            PresentImage::Nv12 {
-                y,
-                uv,
-                y_stride: frame.stride,
-                uv_stride: 2 * cw as u32,
-            }
-        }
-        PixelFormat::P010 => {
-            let mut uv = y.split_off(y_len);
-            uv.truncate(chroma_len);
-            PresentImage::P010 {
-                y,
-                uv,
-                y_stride: frame.stride,
-                uv_stride: 4 * cw as u32,
-            }
-        }
-        PixelFormat::I444 => {
-            let mut u = y.split_off(y_len);
-            let mut v = u.split_off(w * h);
-            v.truncate(w * h);
-            PresentImage::I444 {
-                y,
-                u,
-                v,
-                y_stride: frame.stride,
-                uv_stride: frame.width,
-            }
-        }
-        _ => {
-            let mut u = y.split_off(y_len);
-            let mut v = u.split_off(cw * ch);
-            v.truncate(cw * ch);
-            PresentImage::I420 {
-                y,
-                u,
-                v,
-                y_stride: frame.stride,
-                uv_stride: cw as u32,
-            }
-        }
+    let RawFrame {
+        frame_id,
+        width,
+        height,
+        stride,
+        data,
+        pool,
+        ..
+    } = frame;
+    let buffer = match pool {
+        Some(pool) => PlaneBuffer::recycled(data, Arc::new(PoolBridge(pool))),
+        None => PlaneBuffer::new(data),
     };
     Ok(PresentFrame {
-        frame_id: frame.frame_id,
-        width: frame.width,
-        height: frame.height,
-        image,
+        frame_id,
+        width,
+        height,
+        image: PresentImage::Planar(PlanarImage::compact(layout, width, height, stride, buffer)),
         color,
     })
 }
@@ -410,6 +390,9 @@ pub fn start_pipeline_with(
 ) -> Result<LoopbackPipeline, String> {
     let codec = options.codec;
     let encoders = EncoderSet::probe()
+        .with_calibration_cache(Some(
+            crate::remote::default_data_dir().join("calibration.json"),
+        ))
         .only_codec(Some(codec))
         .only_backend(options.encoder);
     if encoders.is_empty() {
@@ -431,8 +414,8 @@ pub fn start_pipeline_with(
         ));
     }
     let c = &options.config;
-    let encoder = encoders
-        .open(&EncoderConfig {
+    let (encoder, calibrated) = encoders
+        .open_calibrated(&EncoderConfig {
             codec,
             width: c.width,
             height: c.height,
@@ -442,6 +425,16 @@ pub fn start_pipeline_with(
             format: c.wanted_format(),
         })
         .map_err(|err| format!("no se pudo abrir el codificador: {err}"))?;
+    if let Some(choice) = calibrated {
+        tracing::info!(
+            backend = %choice.backend,
+            p50_ms = choice.p50.as_secs_f64() * 1000.0,
+            p95_ms = choice.p95.as_secs_f64() * 1000.0,
+            from_cache = choice.from_cache,
+            kbit_s = choice.kbit_s,
+            "codificador «auto» calibrado"
+        );
+    }
     let decoder = decoders
         .open_format(codec, c.wanted_format())
         .map_err(|err| format!("no se pudo abrir el decodificador: {err}"))?;
@@ -489,42 +482,41 @@ mod tests {
     use super::*;
     use coroom_session::loopback::DecodedFrame;
 
-    #[test]
-    fn i420_frames_split_into_planes() {
-        let frame = RawFrame::cpu(4, (4, 2), PixelFormat::I420, 4, (0..12).collect());
-        let present = to_present_frame(frame).unwrap();
-        let PresentImage::I420 {
-            y,
-            u,
-            v,
-            y_stride,
-            uv_stride,
-        } = present.image
-        else {
-            panic!("se esperaba I420");
+    fn planar(present: PresentFrame, layout: PlanarLayout) -> PlanarImage {
+        let PresentImage::Planar(image) = present.image else {
+            panic!("se esperaba una imagen planar");
         };
-        assert_eq!(y, (0..8).collect::<Vec<u8>>());
-        assert_eq!(u, vec![8, 9]);
-        assert_eq!(v, vec![10, 11]);
-        assert_eq!((y_stride, uv_stride), (4, 2));
+        assert_eq!(image.layout, layout);
+        image
+    }
+
+    #[test]
+    fn i420_frames_travel_in_one_buffer_with_plane_offsets() {
+        let frame = RawFrame::cpu(4, (4, 2), PixelFormat::I420, 4, (0..12).collect());
+        let image = planar(to_present_frame(frame).unwrap(), PlanarLayout::I420);
+        assert_eq!(&image.plane(0)[..8], &(0..8).collect::<Vec<u8>>()[..]);
+        assert_eq!(&image.plane(1)[..2], &[8, 9]);
+        assert_eq!(&image.plane(2)[..2], &[10, 11]);
+        assert_eq!(
+            image.planes.map(|p| (p.offset, p.stride)),
+            [(0, 4), (8, 2), (10, 2)]
+        );
+        assert_eq!(image.data.len(), 12, "sin copias ni recortes");
     }
 
     #[test]
     fn nv12_frames_pass_through() {
         let frame = RawFrame::cpu(4, (4, 2), PixelFormat::Nv12, 4, (0..12).collect());
-        let present = to_present_frame(frame).unwrap();
-        let PresentImage::Nv12 {
-            y,
-            uv,
-            y_stride,
-            uv_stride,
-        } = present.image
-        else {
-            panic!("se esperaba NV12");
-        };
-        assert_eq!(y, (0..8).collect::<Vec<u8>>());
-        assert_eq!(uv, vec![8, 9, 10, 11]);
-        assert_eq!((y_stride, uv_stride), (4, 4));
+        let image = planar(to_present_frame(frame).unwrap(), PlanarLayout::Nv12);
+        assert_eq!(&image.plane(0)[..8], &(0..8).collect::<Vec<u8>>()[..]);
+        assert_eq!(image.plane(1), &[8, 9, 10, 11]);
+        assert_eq!(
+            image.planes[..2]
+                .iter()
+                .map(|p| (p.offset, p.stride))
+                .collect::<Vec<_>>(),
+            [(0, 4), (8, 4)]
+        );
     }
 
     #[test]
@@ -533,26 +525,32 @@ mod tests {
             .with_color(ColorSpace::HDR10);
         let present = to_present_frame(p010).unwrap();
         assert_eq!(present.color, ColorInfo::HDR10);
-        let PresentImage::P010 {
-            y,
-            uv,
-            y_stride,
-            uv_stride,
-        } = present.image
-        else {
-            panic!("se esperaba P010");
-        };
-        assert_eq!(
-            (y.len(), uv, y_stride, uv_stride),
-            (8, vec![8, 9, 10, 11], 4, 4)
-        );
+        let image = planar(present, PlanarLayout::P010);
+        assert_eq!(image.plane(0).len(), 12);
+        assert_eq!(image.plane(1), &[8, 9, 10, 11]);
+        assert_eq!((image.planes[0].stride, image.planes[1].stride), (4, 4));
         let i444 = RawFrame::cpu(6, (2, 1), PixelFormat::I444, 2, (0..6).collect());
         let present = to_present_frame(i444).unwrap();
         assert_eq!(present.color, ColorInfo::SDR);
-        let PresentImage::I444 { u, v, .. } = present.image else {
-            panic!("se esperaba I444");
-        };
-        assert_eq!((u, v), (vec![2, 3], vec![4, 5]));
+        let image = planar(present, PlanarLayout::I444);
+        assert_eq!(
+            (&image.plane(1)[..2], image.plane(2)),
+            (&[2, 3][..], &[4, 5][..])
+        );
+    }
+
+    /// El búfer de un fotograma que salió de un pool vuelve a él cuando la presentación lo suelta.
+    #[test]
+    fn pooled_buffers_return_to_the_decoder_pool() {
+        let pool = BufferPool::shared();
+        let frame = RawFrame::cpu(4, (4, 2), PixelFormat::Nv12, 4, pool.take(12))
+            .with_pool(Arc::clone(&pool));
+        assert_eq!(pool.free_count(), 0);
+        let present = to_present_frame(frame).unwrap();
+        drop(present);
+        assert_eq!(pool.free_count(), 1, "devuelto al soltar la imagen");
+        let short = RawFrame::cpu(4, (4, 2), PixelFormat::Nv12, 4, vec![0; 11]);
+        assert!(to_present_frame(short).is_err());
     }
 
     #[test]

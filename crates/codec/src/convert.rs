@@ -44,6 +44,7 @@ pub fn bgra_to_i420(frame: &RawFrame) -> Result<RawFrame, CodecError> {
         data,
         gpu: None,
         color: ColorSpace::SDR,
+        pool: None,
     })
 }
 
@@ -667,6 +668,7 @@ mod tests {
             data,
             gpu: None,
             color: ColorSpace::SDR,
+            pool: None,
         }
     }
 

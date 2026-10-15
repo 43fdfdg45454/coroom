@@ -1060,13 +1060,40 @@ impl LatencyLedger {
         })
     }
 
-    /// Resumen de la ventana actual.
+    /// Resumen de la ventana actual. Bajo el candado solo se copia lo necesario (las marcas de
+    /// la ventana y los contadores); ordenar y calcular percentiles se hace fuera, para no
+    /// retener a los hilos de captura, decodificación y presentación que marcan etapas.
     pub fn summary(&self) -> LatencySummary {
-        let inner = self.lock();
+        let snapshot = {
+            let inner = self.lock();
+            Snapshot {
+                frames: inner.frames.values().copied().collect(),
+                marks_total: inner.marks_total,
+                drops: inner.drops,
+                copies: inner.copies,
+                decode_errors: inner.decode_errors,
+                video: inner.video.clone(),
+                bitrate_kbps: match (inner.encoded.front(), inner.encoded.back()) {
+                    (Some(&(first, _)), Some(&(last, _))) if last > first => {
+                        // Los bytes del primer registro se produjeron antes del intervalo medido.
+                        let bytes: u64 = inner.encoded.iter().skip(1).map(|&(_, n)| n).sum();
+                        bytes as f64 * 8.0 / (last - first).as_secs_f64() / 1000.0
+                    }
+                    _ => 0.0,
+                },
+                input: inner.input.iter().copied().collect(),
+                input_stages: std::array::from_fn(|i| {
+                    inner.input_stages[i].iter().copied().collect()
+                }),
+                input_counts: inner.input_counts,
+                input_report: inner.input_report,
+            }
+        };
+        let inner = &snapshot;
         let stats = |from: Stage, to: Stage| {
             let mut samples: Vec<u64> = inner
                 .frames
-                .values()
+                .iter()
                 .filter_map(|marks| {
                     let (a, b) = (marks[from.index()]?, marks[to.index()]?);
                     // Dos hilos marcan etapas contiguas: el receptor puede completar el fotograma
@@ -1094,21 +1121,13 @@ impl LatencyLedger {
 
         let mut presented: Vec<Instant> = inner
             .frames
-            .values()
+            .iter()
             .filter_map(|marks| marks[Stage::Presented.index()])
             .collect();
         presented.sort_unstable();
         // n presentados cubren n - 1 intervalos.
         let fps = rate(presented.len().saturating_sub(1) as u64, &presented);
-
-        let bitrate_kbps = match (inner.encoded.front(), inner.encoded.back()) {
-            (Some(&(first, _)), Some(&(last, _))) if last > first => {
-                // Los bytes del primer registro se produjeron antes del intervalo medido.
-                let bytes: u64 = inner.encoded.iter().skip(1).map(|&(_, n)| n).sum();
-                bytes as f64 * 8.0 / (last - first).as_secs_f64() / 1000.0
-            }
-            _ => 0.0,
-        };
+        let bitrate_kbps = inner.bitrate_kbps;
 
         let drops: Vec<StageDrops> = Stage::ALL
             .iter()
@@ -1148,17 +1167,12 @@ impl LatencyLedger {
             input: inner.input_report.or_else(|| {
                 let (applied, dropped) = inner.input_counts;
                 (!inner.input.is_empty() || applied + dropped > 0).then(|| {
-                    let p50 = |stage: &VecDeque<u64>| {
-                        let mut sorted: Vec<u64> = stage.iter().copied().collect();
+                    let p50 = |stage: &[u64]| {
+                        let mut sorted: Vec<u64> = stage.to_vec();
                         sorted.sort_unstable();
                         nearest_rank(&sorted, 50.0)
                     };
-                    InputLatency::from_samples(
-                        inner.input.iter().copied().collect(),
-                        applied,
-                        dropped,
-                    )
-                    .with_stages(
+                    InputLatency::from_samples(inner.input.clone(), applied, dropped).with_stages(
                         p50(&inner.input_stages[0]),
                         p50(&inner.input_stages[1]),
                         p50(&inner.input_stages[2]),
@@ -1166,12 +1180,24 @@ impl LatencyLedger {
                     )
                 })
             }),
-            audio: {
-                drop(inner);
-                self.audio_summary()
-            },
+            audio: self.audio_summary(),
         }
     }
+}
+
+/// Copia de lo que hace falta del registro para calcular un [`LatencySummary`] sin el candado.
+struct Snapshot {
+    frames: Vec<[Option<Instant>; STAGES]>,
+    marks_total: [u64; STAGES],
+    drops: [u64; STAGES],
+    copies: [(u64, u64); STAGES],
+    decode_errors: u64,
+    video: Option<String>,
+    bitrate_kbps: f64,
+    input: Vec<u64>,
+    input_stages: [Vec<u64>; 3],
+    input_counts: (u64, u64),
+    input_report: Option<InputLatency>,
 }
 
 /// Eventos por segundo entre el primer y el último instante de `sorted`.

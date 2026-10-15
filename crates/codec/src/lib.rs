@@ -21,9 +21,13 @@
 //! - [`gpu`]: imágenes de GPU que recorren el pipeline sin copias a CPU (DMA-BUF y
 //!   texturas D3D11 a la entrada del codificador, imágenes Vulkan a la salida del decodificador).
 //! - [`slices`]: reparto de cada paquete en sus slices reales (NAL u OBU).
+//! - [`pool`]: búferes de imagen reutilizados entre fotogramas ([`BufferPool`]), para que la salida
+//!   en CPU del decodificador no reserve memoria con cada fotograma.
 
 use std::fmt;
+use std::sync::Arc;
 
+pub mod calibrate;
 pub mod caps;
 pub mod color;
 pub mod convert;
@@ -31,12 +35,15 @@ pub mod convert;
 pub mod ffmpeg;
 pub mod gpu;
 pub mod openh264;
+pub mod pool;
 pub mod select;
 pub mod slices;
 
+pub use calibrate::{CalibrationCache, CalibrationKey, CalibrationResult, calibrate};
 pub use caps::{Capabilities, decoder_supports, encoder_supports};
 pub use color::{Chroma, ColorSpace, VideoFormat};
 pub use gpu::{DecodeOutput, GpuImage, GpuInput};
+pub use pool::BufferPool;
 pub use select::{DecoderSet, EncoderSet};
 
 /// Slices por fotograma que pide la sesión a los codificadores.
@@ -325,6 +332,9 @@ pub struct RawFrame {
     pub gpu: Option<GpuImage>,
     /// Espacio de color de los píxeles YUV (en BGRA y RGBA no se usa).
     pub color: ColorSpace,
+    /// Pool del que salió [`RawFrame::data`], si salió de uno: quien consume el fotograma lo
+    /// devuelve con [`RawFrame::recycle`] (o lo deja caer, y el pool reserva otro).
+    pub pool: Option<Arc<BufferPool>>,
 }
 
 impl RawFrame {
@@ -345,6 +355,7 @@ impl RawFrame {
             data,
             gpu: None,
             color: ColorSpace::SDR,
+            pool: None,
         }
     }
 
@@ -359,6 +370,7 @@ impl RawFrame {
             data: Vec::new(),
             gpu: Some(image),
             color: ColorSpace::SDR,
+            pool: None,
         }
     }
 
@@ -366,6 +378,20 @@ impl RawFrame {
     pub fn with_color(mut self, color: ColorSpace) -> Self {
         self.color = color;
         self
+    }
+
+    /// El mismo fotograma anotando que [`RawFrame::data`] salió de `pool`.
+    pub fn with_pool(mut self, pool: Arc<BufferPool>) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// Devuelve [`RawFrame::data`] a su pool, si salió de uno. Lo llama quien ya no necesita los
+    /// píxeles (la presentación, tras subirlos a la GPU).
+    pub fn recycle(self) {
+        if let Some(pool) = self.pool {
+            pool.give(self.data);
+        }
     }
 
     /// Ancho y alto de cada plano de croma de un fotograma I420.
@@ -472,6 +498,15 @@ impl RawFrame {
     }
 }
 
+/// Lo que [`Encoder::encode_into`] dice del fotograma comprimido que dejó en el búfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodedFrame {
+    /// Identificador del fotograma del que salió el paquete (el primero, si salieron varios).
+    pub frame_id: u64,
+    /// Si el fotograma es intra (decodificable sin referencias).
+    pub keyframe: bool,
+}
+
 /// Slice comprimido, unidad mínima de envío.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncodedSlice {
@@ -563,6 +598,31 @@ pub trait Encoder: Send {
     /// Codifica un fotograma y devuelve sus slices.
     fn encode(&mut self, frame: &RawFrame) -> Result<Vec<EncodedSlice>, CodecError>;
 
+    /// Codifica un fotograma y deja la unidad de acceso completa (sus slices seguidos, tal como
+    /// la recibe el decodificador) en `out`, que vacía antes y cuya memoria reutiliza.
+    /// `Ok(None)` si el codificador se saltó el fotograma. Es la ruta del pipeline: por defecto
+    /// concatena los slices de [`Encoder::encode`]; los backends la redefinen para copiar el
+    /// paquete una sola vez, sin repartirlo en slices.
+    fn encode_into(
+        &mut self,
+        frame: &RawFrame,
+        out: &mut Vec<u8>,
+    ) -> Result<Option<EncodedFrame>, CodecError> {
+        out.clear();
+        let slices = self.encode(frame)?;
+        let Some(first) = slices.first() else {
+            return Ok(None);
+        };
+        let encoded = EncodedFrame {
+            frame_id: first.frame_id,
+            keyframe: slices.iter().any(|slice| slice.keyframe),
+        };
+        for slice in &slices {
+            out.extend_from_slice(&slice.data);
+        }
+        Ok(Some(encoded))
+    }
+
     /// Imágenes de GPU que acepta sin copiarlas a CPU; la sesión se las pide a la
     /// captura. Por defecto, ninguna.
     fn gpu_input(&self) -> GpuInput {
@@ -573,6 +633,13 @@ pub trait Encoder: Send {
     /// color, subida a la GPU…); en la ruta sin copias, 0. Por defecto, una.
     fn cpu_copies(&self) -> u32 {
         1
+    }
+
+    /// Control de tasa con el que quedó abierto, leído del propio codificador tras abrirlo (no
+    /// lo que se pidió): `CBR 10000 kbit/s, VBV 167 kbit`. `None` si el backend no lo sabe
+    /// decir.
+    fn rate_control(&self) -> Option<String> {
+        None
     }
 }
 

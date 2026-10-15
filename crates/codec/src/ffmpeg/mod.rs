@@ -29,6 +29,7 @@ pub(crate) mod filter;
 pub(crate) mod hw;
 pub(crate) mod import;
 pub(crate) mod probe;
+pub mod probe_child;
 pub(crate) mod vulkan;
 
 use std::ffi::{CStr, CString};
@@ -218,6 +219,9 @@ fn device_label(device: ffi::AVHWDeviceType) -> String {
 /// Crea el dispositivo de FFmpeg (`AVHWDeviceContext`) del tipo pedido en el adaptador por defecto.
 pub(crate) fn create_device(device: ffi::AVHWDeviceType) -> Result<AVHWDeviceContext, String> {
     init_logging();
+    if device == ffi::AV_HWDEVICE_TYPE_VAAPI {
+        libva_check()?;
+    }
     AVHWDeviceContext::create(device, None, None, 0).map_err(|err| {
         format!(
             "no se pudo crear el dispositivo {}: {}",
@@ -225,6 +229,55 @@ pub(crate) fn create_device(device: ffi::AVHWDeviceType) -> Result<AVHWDeviceCon
             describe(&err)
         )
     })
+}
+
+/// Versión mínima de libva que enlaza esta FFmpeg: 2.21 trae `vaMapBuffer2`, que FFmpeg 8.1
+/// llama por su *implib* (en una libva más vieja la llamada no resuelve y el proceso **aborta**,
+/// no falla). El síntoma: SIGABRT al abrir cualquier codificador o decodificador VA-API.
+pub const LIBVA_MIN_VERSION: &str = "2.21";
+
+/// Comprueba, sin abrir ningún dispositivo, que la libva del sistema sirve para FFmpeg 8.1:
+/// carga `libva.so.2` y busca `vaMapBuffer2` (libva ≥ 2.21). `Err` con el motivo si falta la
+/// biblioteca o el símbolo; se llama antes de crear el dispositivo VA-API (sondeo y sesión) y lo
+/// enseña `coroom doctor`.
+#[cfg(target_os = "linux")]
+pub fn libva_check() -> Result<(), String> {
+    use std::sync::OnceLock;
+    static RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+    RESULT
+        .get_or_init(|| {
+            // SAFETY: `dlopen` con una ruta C estática solo carga (o cuenta otra referencia de)
+            // libva; `dlsym` busca un símbolo sin llamarlo; `dlclose` suelta la referencia. No se
+            // ejecuta nada de la biblioteca.
+            unsafe {
+                let handle =
+                    libc::dlopen(c"libva.so.2".as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+                if handle.is_null() {
+                    return Err(format!(
+                        "no se encuentra libva.so.2 (hace falta libva ≥ {LIBVA_MIN_VERSION})"
+                    ));
+                }
+                let symbol = libc::dlsym(handle, c"vaMapBuffer2".as_ptr());
+                let found = !symbol.is_null();
+                libc::dlclose(handle);
+                if found {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "la libva del sistema es anterior a {LIBVA_MIN_VERSION} (sin \
+                         `vaMapBuffer2`): FFmpeg 8.1 abortaría al abrir VA-API; actualiza libva o \
+                         usa Vulkan Video"
+                    ))
+                }
+            }
+        })
+        .clone()
+}
+
+/// En otros sistemas no hay VA-API: siempre bien.
+#[cfg(not(target_os = "linux"))]
+pub fn libva_check() -> Result<(), String> {
+    Ok(())
 }
 
 /// Texto de un error de `rsmpeg` con el mensaje de FFmpeg (`av_strerror`).

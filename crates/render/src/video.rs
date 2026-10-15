@@ -18,7 +18,10 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 
 use crate::color::{ColorInfo, OutputMode, yuv_to_rgb};
-use crate::{CursorImage, CursorOverlay, PresentFrame, PresentImage, RenderError};
+use crate::{
+    CursorImage, CursorOverlay, PlanarImage, PlanarLayout as Layout, PresentFrame, PresentImage,
+    RenderError,
+};
 
 /// Lado del cursor de respaldo (cuadrado blanco) en píxeles del destino, cuando todavía no ha
 /// llegado la forma real.
@@ -56,28 +59,30 @@ pub fn video_rect(frame: (u32, u32), target: (u32, u32)) -> [f32; 4] {
     [(tw - w) / 2.0, (th - h) / 2.0, w, h]
 }
 
-/// Disposición de los planos del fotograma en la GPU.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Layout {
-    I420,
-    Nv12,
-    I444,
-    P010,
+/// Bits por muestra y escala de la muestra normalizada al código de la disposición (la de los
+/// planos en la GPU es la misma que la de la imagen, [`PlanarLayout`](crate::PlanarLayout)).
+fn depth(layout: Layout) -> (u8, f32) {
+    match layout {
+        Layout::P010 => (10, 65535.0 / 64.0),
+        _ => (8, 255.0),
+    }
 }
 
-impl Layout {
-    /// Si el croma va entrelazado en una textura de dos canales.
-    fn semiplanar(self) -> bool {
-        matches!(self, Layout::Nv12 | Layout::P010)
-    }
-
-    /// Bits por muestra y escala de la muestra normalizada al código.
-    fn depth(self) -> (u8, f32) {
-        match self {
-            Layout::P010 => (10, 65535.0 / 64.0),
-            _ => (8, 255.0),
-        }
-    }
+/// Si los planos de `image` caben en su búfer para un fotograma de `width × height`.
+fn planar_fits(image: &PlanarImage, width: u32, height: u32) -> bool {
+    let extents = image.layout.plane_extents(width, height);
+    width > 0
+        && extents
+            .iter()
+            .zip(&image.planes)
+            .take(image.layout.planes())
+            .all(|(&(row, rows), region)| {
+                image
+                    .data
+                    .len()
+                    .checked_sub(region.offset)
+                    .is_some_and(|left| plane_fits(left, region.stride, row, rows))
+            })
 }
 
 struct Planes {
@@ -466,6 +471,15 @@ impl VideoPipeline {
         }
     }
 
+    /// Avisa una vez de que los 10 bits se muestran con 8.
+    fn warn_p010(&mut self) {
+        if !std::mem::replace(&mut self.warned_p010, true) {
+            tracing_warn(
+                "el adaptador no tiene texturas de 16 bits: el vídeo de 10 bits se muestra con 8",
+            );
+        }
+    }
+
     /// Sube los planos del fotograma; recrea las texturas si cambió el tamaño o el formato.
     pub(crate) fn upload(
         &mut self,
@@ -481,6 +495,17 @@ impl VideoPipeline {
             )))
         };
         let layout = match &frame.image {
+            PresentImage::Planar(image) => {
+                if !planar_fits(image, width, height) {
+                    return incoherent(&format!("{:?}", image.layout));
+                }
+                if image.layout == Layout::P010 && !self.sixteen_bit {
+                    self.warn_p010();
+                    Layout::Nv12
+                } else {
+                    image.layout
+                }
+            }
             PresentImage::I420 {
                 y,
                 u,
@@ -542,12 +567,7 @@ impl VideoPipeline {
                 if self.sixteen_bit {
                     Layout::P010
                 } else {
-                    if !std::mem::replace(&mut self.warned_p010, true) {
-                        tracing_warn(
-                            "el adaptador no tiene texturas de 16 bits: el vídeo de 10 bits se \
-                             muestra con 8",
-                        );
-                    }
+                    self.warn_p010();
                     Layout::Nv12
                 }
             }
@@ -573,6 +593,32 @@ impl VideoPipeline {
             return Err(RenderError::Backend("sin texturas de vídeo".into()));
         };
         match &frame.image {
+            PresentImage::Planar(image) => {
+                let [y, u, v] = image.planes;
+                if image.layout == Layout::P010 && layout == Layout::Nv12 {
+                    let (y8, uv8) = p010_to_nv12(
+                        image.plane(0),
+                        y.stride,
+                        image.plane(1),
+                        u.stride,
+                        (width, height),
+                    );
+                    write(queue, &planes.y, &y8, width, (width, height));
+                    write(queue, &planes.u, &uv8, 2 * cw, (cw, ch));
+                } else {
+                    // Las texturas se crearon con el tamaño en texeles de cada plano.
+                    let chroma = if image.layout == Layout::I444 {
+                        (width, height)
+                    } else {
+                        (cw, ch)
+                    };
+                    write(queue, &planes.y, image.plane(0), y.stride, (width, height));
+                    write(queue, &planes.u, image.plane(1), u.stride, chroma);
+                    if let Some(plane) = &planes.v {
+                        write(queue, plane, image.plane(2), v.stride, chroma);
+                    }
+                }
+            }
             PresentImage::I420 {
                 y,
                 u,
@@ -708,7 +754,7 @@ impl VideoPipeline {
                 .map_or(Layout::I420, |planes| planes.layout)
         };
         let crop = self.imported.as_ref().map_or([1.0, 1.0], |(_, crop)| *crop);
-        let (bits, scale) = layout.depth();
+        let (bits, scale) = depth(layout);
         let [yuv_r, yuv_g, yuv_b] = yuv_to_rgb(self.color, bits, scale);
         let (hdr, headroom) = match self.output {
             OutputMode::Sdr => (0.0, 1.0),

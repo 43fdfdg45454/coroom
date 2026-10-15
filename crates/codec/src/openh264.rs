@@ -253,6 +253,7 @@ impl Encoder for OpenH264Encoder {
             data: Vec::new(),
             gpu: None,
             color: crate::ColorSpace::SDR,
+            pool: None,
         };
         let (cw, ch) = RawFrame::chroma_size(frame.width, frame.height);
         let y_len = y_stride * frame.height as usize;
@@ -372,6 +373,7 @@ impl Decoder for OpenH264Decoder {
             data,
             gpu: None,
             color: crate::ColorSpace::SDR,
+            pool: None,
         }))
     }
 
@@ -423,6 +425,7 @@ mod tests {
             data,
             gpu: None,
             color: crate::ColorSpace::SDR,
+            pool: None,
         }
     }
 

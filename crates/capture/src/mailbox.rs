@@ -22,7 +22,10 @@ struct MailboxState {
 impl Mailbox {
     pub(crate) fn put(&self, frame: CapturedFrame) {
         let mut state = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
-        state.frame = Some(frame);
+        if let Some(evicted) = state.frame.replace(frame) {
+            // Gana el último: el búfer del que nadie recogió vuelve al pool.
+            crate::pool::recycle_frame(evicted);
+        }
         self.changed.notify_one();
     }
 

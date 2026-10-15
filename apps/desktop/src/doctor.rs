@@ -88,6 +88,15 @@ pub fn report() -> Result<Vec<String>, String> {
         }
         Err(err) => out.push(format!("  dispositivos: no disponibles ({err})")),
     }
+    if cfg!(target_os = "linux") {
+        out.push(match coroom_session::codec::ffmpeg::libva_check() {
+            Ok(()) => format!(
+                "libva: ≥ {} (sirve para el VA-API de FFmpeg 8.1)",
+                coroom_session::codec::ffmpeg::LIBVA_MIN_VERSION
+            ),
+            Err(reason) => format!("libva: {reason}; VA-API queda desactivado"),
+        });
+    }
     out.push("Códecs de vídeo (sondeo real de cada combinación):".to_owned());
     let caps = Capabilities::probe();
     for line in caps.to_string().lines() {

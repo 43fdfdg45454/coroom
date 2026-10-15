@@ -186,6 +186,66 @@ unsafe fn has_extension(hw: *const AVVulkanDeviceContext, name: &CStr) -> bool {
     }
 }
 
+/// Nombre del dispositivo Vulkan y versión de su driver (`NVIDIA GeForce RTX 5070 Ti /
+/// 580.76.5`), la identidad de la GPU para la caché de calibración. `None` si no se puede crear
+/// un dispositivo Vulkan de FFmpeg.
+pub(crate) fn adapter_identity() -> Option<String> {
+    let device = super::create_device(ffi::AV_HWDEVICE_TYPE_VULKAN).ok()?;
+    // SAFETY: `device` es un `AVHWDeviceContext` Vulkan iniciado; su `get_proc_addr`, `inst` y
+    // `phys_dev` son válidos mientras viva, y `vkGetPhysicalDeviceProperties` solo escribe en la
+    // estructura local.
+    unsafe {
+        let ctx = (*device.as_ptr()).data.cast::<ffi::AVHWDeviceContext>();
+        if (*ctx).type_ != ffi::AV_HWDEVICE_TYPE_VULKAN {
+            return None;
+        }
+        let hw = (*ctx).hwctx.cast::<AVVulkanDeviceContext>();
+        let get_proc_addr = (*hw).get_proc_addr?;
+        let static_fn = ash::StaticFn {
+            get_instance_proc_addr: get_proc_addr,
+        };
+        let instance = ash::Instance::load(&static_fn, (*hw).inst);
+        let props = instance.get_physical_device_properties((*hw).phys_dev);
+        let name = props
+            .device_name_as_c_str()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| {
+                format!(
+                    "vendor {:#x} device {:#x}",
+                    props.vendor_id, props.device_id
+                )
+            });
+        Some(format!(
+            "{name} / driver {} / vulkan {}.{}.{}",
+            driver_version_text(props.vendor_id, props.driver_version),
+            vk::api_version_major(props.api_version),
+            vk::api_version_minor(props.api_version),
+            vk::api_version_patch(props.api_version)
+        ))
+    }
+}
+
+/// `driverVersion` en texto, con la codificación de cada fabricante (NVIDIA: 10.8.8.6 bits; los
+/// demás, la de Vulkan).
+fn driver_version_text(vendor_id: u32, version: u32) -> String {
+    if vendor_id == 0x10DE {
+        format!(
+            "{}.{}.{}.{}",
+            version >> 22,
+            (version >> 14) & 0xff,
+            (version >> 6) & 0xff,
+            version & 0x3f
+        )
+    } else {
+        format!(
+            "{}.{}.{}",
+            vk::api_version_major(version),
+            vk::api_version_minor(version),
+            vk::api_version_patch(version)
+        )
+    }
+}
+
 /// Modificadores DRM que el dispositivo Vulkan `device` importa y muestrea para
 /// `VK_FORMAT_B8G8R8A8_UNORM` (el `XRGB8888` de la captura), en el orden del driver y con el lineal
 /// al final. Vacío si el dispositivo no tiene `VK_EXT_image_drm_format_modifier` y

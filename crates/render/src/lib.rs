@@ -7,8 +7,10 @@
 //! imagen decodificada sin copias, escala en GPU, presenta en modo inmediato o *mailbox* (VRR si
 //! existe) y dibuja el cursor en local con los metadatos del anfitrión.
 //!
-//! La imagen llega en memoria de CPU y se sube a la GPU, en I420 ([`PresentImage::I420`], tres
-//! texturas) o en NV12 ([`PresentImage::Nv12`], dos texturas) sin convertir en CPU, o
+//! La imagen llega en memoria de CPU y se sube a la GPU sin convertir en CPU: en un solo búfer
+//! con sus planos por desplazamiento ([`PresentImage::Planar`], lo que entrega el decodificador,
+//! sin partirlo: I420 e I444 en tres texturas, NV12 y P010 en dos; el búfer vuelve a su pool al
+//! soltarse, [`Recycle`]) o en planos sueltos ([`PresentImage::I420`], [`PresentImage::Nv12`]…), o
 //! como imagen Vulkan del decodificador ([`PresentImage::Vulkan`]) creada en el mismo
 //! `VkDevice` del presentador ([`wgpu::WgpuPresenter::vulkan_share`]), que se importa en `wgpu`
 //! sin copia (`texture_from_raw`) y se sincroniza con el semáforo de FFmpeg. El cursor se dibuja
@@ -33,6 +35,7 @@
 use std::any::Any;
 use std::ffi::CString;
 use std::fmt;
+use std::ops::Deref;
 use std::sync::Arc;
 
 pub mod color;
@@ -233,9 +236,186 @@ impl fmt::Debug for VulkanDeviceShare {
     }
 }
 
+/// Disposición de los planos de una imagen de CPU ([`PresentImage::Planar`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PlanarLayout {
+    /// YUV 4:2:0 de 8 bits en tres planos (Y, U, V).
+    I420,
+    /// YUV 4:2:0 de 8 bits semiplanar (Y, UV entrelazado).
+    Nv12,
+    /// YUV 4:4:4 de 8 bits en tres planos del tamaño del fotograma.
+    I444,
+    /// YUV 4:2:0 de 10 bits semiplanar en palabras de 16 bits (HDR).
+    P010,
+}
+
+impl PlanarLayout {
+    /// Número de planos: tres planares, dos semiplanares.
+    pub const fn planes(self) -> usize {
+        if self.semiplanar() { 2 } else { 3 }
+    }
+
+    /// Si el croma va entrelazado en un plano de dos canales.
+    pub const fn semiplanar(self) -> bool {
+        matches!(self, PlanarLayout::Nv12 | PlanarLayout::P010)
+    }
+
+    /// Bytes útiles por fila y filas de cada plano para un fotograma de `width × height`; el
+    /// tercero es `(0, 0)` en los semiplanares.
+    pub const fn plane_extents(self, width: u32, height: u32) -> [(u32, u32); 3] {
+        let (cw, ch) = (width.div_ceil(2), height.div_ceil(2));
+        match self {
+            PlanarLayout::I420 => [(width, height), (cw, ch), (cw, ch)],
+            PlanarLayout::Nv12 => [(width, height), (2 * cw, ch), (0, 0)],
+            PlanarLayout::I444 => [(width, height), (width, height), (width, height)],
+            PlanarLayout::P010 => [(2 * width, height), (4 * cw, ch), (0, 0)],
+        }
+    }
+}
+
+/// Dónde empieza un plano dentro del búfer de una [`PlanarImage`] y cuánto mide cada fila.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PlaneRegion {
+    /// Desplazamiento del plano en el búfer, en bytes.
+    pub offset: usize,
+    /// Bytes por fila.
+    pub stride: u32,
+}
+
+/// A quien vuelve el búfer de una [`PlaneBuffer`] al soltarse (el pool del decodificador, que
+/// vive en otra crate).
+pub trait Recycle: Send + Sync {
+    /// Recibe el búfer para reutilizarlo.
+    fn recycle(&self, buffer: Vec<u8>);
+}
+
+/// Búfer de píxeles que, al soltarse, vuelve a quien lo prestó (si alguien lo prestó).
+pub struct PlaneBuffer {
+    data: Vec<u8>,
+    recycle: Option<Arc<dyn Recycle>>,
+}
+
+impl PlaneBuffer {
+    /// Búfer propio: se libera al soltarse.
+    pub fn new(data: Vec<u8>) -> Self {
+        Self {
+            data,
+            recycle: None,
+        }
+    }
+
+    /// Búfer prestado por `recycle`, que lo recibe de vuelta al soltarse.
+    pub fn recycled(data: Vec<u8>, recycle: Arc<dyn Recycle>) -> Self {
+        Self {
+            data,
+            recycle: Some(recycle),
+        }
+    }
+}
+
+impl Deref for PlaneBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl Drop for PlaneBuffer {
+    fn drop(&mut self) {
+        if let Some(recycle) = self.recycle.take() {
+            recycle.recycle(std::mem::take(&mut self.data));
+        }
+    }
+}
+
+impl fmt::Debug for PlaneBuffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PlaneBuffer")
+            .field("len", &self.data.len())
+            .field("recycled", &self.recycle.is_some())
+            .finish()
+    }
+}
+
+/// La copia es propia (no vuelve al pool del original).
+impl Clone for PlaneBuffer {
+    fn clone(&self) -> Self {
+        Self::new(self.data.clone())
+    }
+}
+
+impl PartialEq for PlaneBuffer {
+    fn eq(&self, other: &Self) -> bool {
+        self.data == other.data
+    }
+}
+
+impl Eq for PlaneBuffer {}
+
+/// Imagen de CPU en un solo búfer con sus planos por desplazamiento y paso: lo que entrega un
+/// decodificador, sin partirlo en copias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanarImage {
+    /// Disposición de los planos.
+    pub layout: PlanarLayout,
+    /// Los píxeles.
+    pub data: PlaneBuffer,
+    /// Dónde está cada plano (el tercero no se usa en los semiplanares).
+    pub planes: [PlaneRegion; 3],
+}
+
+impl PlanarImage {
+    /// Imagen compacta como la entregan los decodificadores: el luma con filas de `y_stride`
+    /// bytes y, seguidos, los planos de croma con la fila justa (`ceil(width / 2)` bytes, el
+    /// doble entrelazados o en 16 bits; `width` en 4:4:4).
+    pub fn compact(
+        layout: PlanarLayout,
+        width: u32,
+        height: u32,
+        y_stride: u32,
+        data: PlaneBuffer,
+    ) -> Self {
+        let extents = layout.plane_extents(width, height);
+        let mut planes = [PlaneRegion::default(); 3];
+        let mut offset = y_stride as usize * height as usize;
+        planes[0] = PlaneRegion {
+            offset: 0,
+            stride: y_stride,
+        };
+        for (plane, (row, rows)) in planes.iter_mut().zip(extents).skip(1) {
+            if rows == 0 {
+                break;
+            }
+            *plane = PlaneRegion {
+                offset,
+                stride: row,
+            };
+            offset += row as usize * rows as usize;
+        }
+        Self {
+            layout,
+            data,
+            planes,
+        }
+    }
+
+    /// Bytes del plano `index` desde su desplazamiento hasta el final del búfer (vacío si el
+    /// desplazamiento se sale).
+    pub fn plane(&self, index: usize) -> &[u8] {
+        self.planes
+            .get(index)
+            .and_then(|region| self.data.get(region.offset..))
+            .unwrap_or(&[])
+    }
+}
+
 /// Imagen de un fotograma decodificado (el espacio de color va en [`PresentFrame::color`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PresentImage {
+    /// Imagen de CPU en un solo búfer con sus planos por desplazamiento (I420, NV12, I444 o
+    /// P010): la ruta del pipeline, sin copias en CPU.
+    Planar(PlanarImage),
     /// YUV 4:2:0 de 8 bits en tres planos de memoria de CPU.
     I420 {
         /// Luma: `height` filas de `y_stride` bytes.

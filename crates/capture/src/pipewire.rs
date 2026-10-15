@@ -19,10 +19,16 @@
 //!   cuando cambia, que se convierte a RGBA).
 //! - **Formatos** (`EnumFormat`), en orden de preferencia: con [`GpuFrames::DmaBuf`],
 //!   `video/raw` BGRx o BGRA con la propiedad `SPA_FORMAT_VIDEO_modifier` marcada
-//!   `MANDATORY | DONT_FIXATE` y la lista de modificadores que importa el codificador (el
-//!   compositor, que reserva los búferes, fija uno, como manda la negociación de DMA-BUF de
-//!   PipeWire); después, siempre, BGRx, BGRA, RGBx o RGBA sin modificador, que el compositor da en
-//!   memoria compartida.
+//!   `MANDATORY | DONT_FIXATE` y la lista de modificadores que importa el codificador; después,
+//!   siempre, BGRx, BGRA, RGBx o RGBA sin modificador, que el compositor da en memoria compartida.
+//!   La negociación de DMA-BUF de PipeWire tiene dos vueltas: el compositor contesta
+//!   (`param_changed`) con la lista de modificadores que él puede reservar, **sin fijar**, y el
+//!   cliente tiene que fijar uno volviendo a anunciar el formato con ese único modificador (y los
+//!   formatos de respaldo detrás) con `update_params` ([`negotiate`]); solo con el formato ya
+//!   fijado se piden los búferes. Si el compositor no consigue reservar con ese modificador,
+//!   vuelve a negociar (otra lista, o memoria compartida) y se repite. Cada estado del flujo,
+//!   formato y búfer se registra a nivel `info`, y si en [`FIRST_FRAME_TIMEOUT`] no llega ningún
+//!   fotograma, la captura falla diciendo en qué estado y formato se quedó.
 //! - **Búferes**: si el formato negociado lleva modificador, `SPA_DATA_DmaBuf`; si no,
 //!   `MemPtr | MemFd`.
 //! - **`process`**: con DMA-BUF, el búfer **no** se devuelve a PipeWire al salir del callback: se
@@ -41,7 +47,8 @@
 #![allow(unsafe_code)]
 
 use std::os::fd::{BorrowedFd, OwnedFd};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -53,6 +60,7 @@ use pw::spa;
 use pw::spa::buffer::meta::{MetaBitmap, MetaCursor};
 use pw::spa::buffer::{ChunkFlags, Data, DataType};
 use pw::spa::param::video::{VideoFormat, VideoInfoRaw};
+use pw::spa::pod::deserialize::PodDeserializer;
 use pw::spa::pod::{ChoiceValue, Object, Pod, Property, PropertyFlags, Value};
 use pw::spa::utils::{Choice, ChoiceEnum, ChoiceFlags, Id};
 
@@ -75,6 +83,17 @@ const PORTAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Espera máxima de una sesión del portal entera, con el diálogo en el que el usuario elige qué
 /// compartir. Si se agota, el diálogo no llegó a mostrarse o nadie lo contestó.
 const DIALOG_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Tiempo sin ningún fotograma desde que arranca el flujo tras el que la captura falla con lo que
+/// se sabe del flujo (estado, formato, búferes), en vez de esperar en silencio. Solo falla si el
+/// flujo no llegó a `Streaming` o no tiene búferes: un flujo en marcha con búferes y sin
+/// fotogramas es una fuente que no se repinta (ventana oculta o sin daños en un compositor que
+/// solo manda cambios), y eso se avisa una vez y se sigue esperando.
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Antigüedad máxima que se acepta en la marca de tiempo del compositor para datar el fotograma
+/// con ella; más vieja (o futura), se usa la llegada.
+const MAX_PTS_AGE: Duration = Duration::from_secs(1);
 
 /// Lado máximo del mapa de bits del cursor que se reserva en los metadatos.
 const CURSOR_BITMAP_SIDE: usize = 64;
@@ -207,17 +226,24 @@ struct ScreenCastOpen {
     size: Option<(i32, i32)>,
 }
 
+/// Lo que devuelve el portal al arrancar la sesión `ScreenCast`, antes de abrir el socket.
+struct Started {
+    node_id: u32,
+    restore_token: Option<String>,
+    area: SharedArea,
+    size: Option<(i32, i32)>,
+}
+
 /// Sesión `ScreenCast` sola: es la que muestra el selector de monitores y ventanas del escritorio.
+/// La sesión se crea fuera del plazo del diálogo ([`screencast_with_timeout`]) para poder
+/// cerrarla si el usuario no contesta.
 async fn open_screencast(
     proxy: &Screencast,
+    session: &Session<Screencast>,
     cursor_mode: CursorMode,
     restore_token: Option<&str>,
     sources: Sources,
-) -> Result<ScreenCastOpen, CaptureError> {
-    let session = proxy
-        .create_session(Default::default())
-        .await
-        .map_err(portal_error)?;
+) -> Result<Started, CaptureError> {
     let mut options = SelectSourcesOptions::default()
         .set_cursor_mode(cursor_mode)
         .set_sources(sources)
@@ -229,13 +255,13 @@ async fn open_screencast(
             .set_restore_token(restore_token);
     }
     proxy
-        .select_sources(&session, options)
+        .select_sources(session, options)
         .await
         .map_err(portal_error)?
         .response()
         .map_err(portal_error)?;
     let streams = proxy
-        .start(&session, None, Default::default())
+        .start(session, None, Default::default())
         .await
         .map_err(portal_error)?
         .response()
@@ -243,25 +269,17 @@ async fn open_screencast(
     let Some(stream) = streams.streams().first() else {
         return Err(CaptureError::PermissionDenied);
     };
-    let node_id = stream.pipe_wire_node_id();
-    let area = shared_area(stream.source_type(), stream.position(), stream.size());
-    let size = stream.size();
-    let restore_token = streams.restore_token().map(str::to_owned);
-    let fd = proxy
-        .open_pipe_wire_remote(&session, Default::default())
-        .await
-        .map_err(portal_error)?;
-    Ok(ScreenCastOpen {
-        node_id,
-        restore_token,
-        fd,
-        session,
-        area,
-        size,
+    Ok(Started {
+        node_id: stream.pipe_wire_node_id(),
+        restore_token: streams.restore_token().map(str::to_owned),
+        area: shared_area(stream.source_type(), stream.position(), stream.size()),
+        size: stream.size(),
     })
 }
 
-/// [`open_screencast`] con [`DIALOG_TIMEOUT`] de límite.
+/// [`open_screencast`] con [`DIALOG_TIMEOUT`] de límite y el socket de PipeWire. Si el plazo se
+/// agota, la sesión del portal se **cierra** antes de devolver el error: así el portal retira el
+/// diálogo y la petición pendiente, y una respuesta tardía no llega a un objeto que ya no existe.
 async fn screencast_with_timeout(
     proxy: &Screencast,
     cursor_mode: CursorMode,
@@ -269,16 +287,59 @@ async fn screencast_with_timeout(
     sources: Sources,
 ) -> Result<ScreenCastOpen, CaptureError> {
     tracing::debug!("portal ScreenCast: abriendo sesión y diálogo");
-    tokio::time::timeout(
+    let session = proxy
+        .create_session(Default::default())
+        .await
+        .map_err(portal_error)?;
+    let started = tokio::time::timeout(
         DIALOG_TIMEOUT,
-        open_screencast(proxy, cursor_mode, restore_token, sources),
+        open_screencast(proxy, &session, cursor_mode, restore_token, sources),
+    )
+    .await;
+    let started = match started {
+        Ok(Ok(started)) => started,
+        Ok(Err(err)) => {
+            let _ = tokio::time::timeout(PORTAL_TIMEOUT, session.close()).await;
+            return Err(err);
+        }
+        Err(_) => {
+            tracing::warn!(
+                "el diálogo del portal ScreenCast no se contestó en {} s; se cierra la sesión",
+                DIALOG_TIMEOUT.as_secs()
+            );
+            let _ = tokio::time::timeout(PORTAL_TIMEOUT, session.close()).await;
+            return Err(backend(format!(
+                "el diálogo del portal ScreenCast no terminó en {} s (¿no se mostró?)",
+                DIALOG_TIMEOUT.as_secs()
+            )));
+        }
+    };
+    let fd = match tokio::time::timeout(
+        PORTAL_TIMEOUT,
+        proxy.open_pipe_wire_remote(&session, Default::default()),
     )
     .await
-    .unwrap_or_else(|_| {
-        Err(backend(format!(
-            "el diálogo del portal ScreenCast no terminó en {} s (¿no se mostró?)",
-            DIALOG_TIMEOUT.as_secs()
-        )))
+    {
+        Ok(Ok(fd)) => fd,
+        Ok(Err(err)) => {
+            let _ = tokio::time::timeout(PORTAL_TIMEOUT, session.close()).await;
+            return Err(portal_error(err));
+        }
+        Err(_) => {
+            let _ = tokio::time::timeout(PORTAL_TIMEOUT, session.close()).await;
+            return Err(backend(format!(
+                "el portal no abrió el socket de PipeWire en {} s",
+                PORTAL_TIMEOUT.as_secs()
+            )));
+        }
+    };
+    Ok(ScreenCastOpen {
+        node_id: started.node_id,
+        restore_token: started.restore_token,
+        fd,
+        session,
+        area: started.area,
+        size: started.size,
     })
 }
 
@@ -509,6 +570,11 @@ struct StreamState {
     format: VideoInfoRaw,
     /// El formato negociado lleva modificador: los búferes son DMA-BUF.
     dmabuf: bool,
+    /// Modificadores DRM ofrecidos al compositor (los que importa el codificador).
+    offered: Vec<u64>,
+    options: CaptureOptions,
+    /// Lo que se sabe del flujo, para el error de arranque sin fotogramas.
+    diag: Arc<StreamDiag>,
     next_id: u64,
     mailbox: Arc<Mailbox>,
     cursor_shape: Option<Arc<CursorShape>>,
@@ -520,6 +586,76 @@ struct StreamState {
     /// la llegada desde `epoch`.
     compositor_pts: Option<bool>,
     epoch: Instant,
+}
+
+/// Lo que se sabe del flujo de PipeWire desde fuera de su hilo: el último estado, el formato
+/// negociado, los búferes añadidos y los fotogramas entregados. Con ello se explica una captura
+/// que arranca y no entrega nada ([`FIRST_FRAME_TIMEOUT`]).
+#[derive(Default)]
+struct StreamDiag {
+    state: Mutex<String>,
+    format: Mutex<String>,
+    buffers: AtomicU32,
+    frames: AtomicU64,
+    /// Si el flujo llegó alguna vez a `Streaming`.
+    streaming: AtomicBool,
+}
+
+impl StreamDiag {
+    fn set_state(&self, state: &str) {
+        *self.state.lock().unwrap_or_else(PoisonError::into_inner) = state.to_owned();
+    }
+
+    fn set_format(&self, format: String) {
+        *self.format.lock().unwrap_or_else(PoisonError::into_inner) = format;
+    }
+
+    /// Resumen para el error de arranque sin fotogramas.
+    fn summary(&self) -> String {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let format = self.format.lock().unwrap_or_else(PoisonError::into_inner);
+        format!(
+            "estado del flujo: {}; formato negociado: {}; búferes añadidos: {}",
+            if state.is_empty() {
+                "sin cambios (el compositor no conectó el nodo)"
+            } else {
+                state.as_str()
+            },
+            if format.is_empty() {
+                "ninguno (el compositor no contestó al formato)"
+            } else {
+                format.as_str()
+            },
+            self.buffers.load(Ordering::Relaxed)
+        )
+    }
+}
+
+/// Texto de un formato negociado: `BGRx 1920×1080, DMA-BUF (modificador 0x…)` o `memoria
+/// compartida`.
+fn describe_format(info: &VideoInfoRaw, dmabuf: bool) -> String {
+    let size = info.size();
+    let memory = if dmabuf {
+        format!("DMA-BUF (modificador {:#x})", info.modifier())
+    } else {
+        "memoria compartida".to_owned()
+    };
+    format!(
+        "{:?} {}×{}, {memory}",
+        info.format(),
+        size.width,
+        size.height
+    )
+}
+
+/// Nombre del tipo de memoria de un plano de `spa_data`.
+fn data_type_name(kind: u32) -> &'static str {
+    match kind {
+        spa::sys::SPA_DATA_MemPtr => "MemPtr",
+        spa::sys::SPA_DATA_MemFd => "MemFd",
+        spa::sys::SPA_DATA_DmaBuf => "DmaBuf",
+        _ => "otro",
+    }
 }
 
 /// Puntero a un `pw_buffer` sacado del flujo, para devolverlo por el canal.
@@ -718,9 +854,9 @@ fn copy_half_float(src: &[u8], width: u32, height: u32, src_stride: usize) -> Op
     if src_stride < row || src.len() < src_stride * (height as usize - 1) + row {
         return None;
     }
-    let mut data = Vec::with_capacity(row * height as usize);
-    for line in src.chunks(src_stride).take(height as usize) {
-        data.extend_from_slice(line.get(..row)?);
+    let mut data = crate::pool::take(row * height as usize);
+    for (dst, line) in data.chunks_exact_mut(row).zip(src.chunks(src_stride)) {
+        dst.copy_from_slice(line.get(..row)?);
     }
     Some(data)
 }
@@ -737,7 +873,8 @@ fn channel_order(format: VideoFormat) -> Option<bool> {
     }
 }
 
-/// Copia un búfer de PipeWire a BGRA compacto.
+/// Copia un búfer de PipeWire a BGRA compacto, en un búfer del pool del proceso
+/// ([`crate::pool`]): sin reservar memoria nueva por fotograma.
 fn copy_frame(
     src: &[u8],
     width: u32,
@@ -749,18 +886,29 @@ fn copy_frame(
     if src_stride < row || src.len() < src_stride * (height as usize - 1) + row {
         return None;
     }
-    let mut data = Vec::with_capacity(row * height as usize);
-    for line in src.chunks(src_stride).take(height as usize) {
-        let pixels = line.get(..row)?;
+    let mut data = crate::pool::take(row * height as usize);
+    for (dst, line) in data.chunks_exact_mut(row).zip(src.chunks(src_stride)) {
+        dst.copy_from_slice(line.get(..row)?);
         if swap_rb {
-            for px in pixels.as_chunks::<4>().0 {
-                data.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+            for px in dst.as_chunks_mut::<4>().0 {
+                px.swap(0, 2);
             }
-        } else {
-            data.extend_from_slice(pixels);
         }
     }
     Some(data)
+}
+
+/// Instante del reloj de `Instant` que corresponde a `pts` (ns de `CLOCK_MONOTONIC`, la marca del
+/// compositor), calculado con la hora monótona de ahora: `now - (ahora_monótono - pts)`. `None`
+/// si `pts` es futuro o más viejo que [`MAX_PTS_AGE`] (otro reloj, o un búfer rezagado).
+fn instant_from_monotonic(pts: Duration, now: Instant) -> Option<Instant> {
+    let ts = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    let mono = Duration::new(
+        u64::try_from(ts.tv_sec).ok()?,
+        u32::try_from(ts.tv_nsec).ok()?,
+    );
+    let age = mono.checked_sub(pts)?;
+    (age <= MAX_PTS_AGE).then(|| now.checked_sub(age)).flatten()
 }
 
 fn serialize(value: Value) -> Result<Vec<u8>, CaptureError> {
@@ -785,10 +933,21 @@ fn drm_fourcc(format: VideoFormat) -> Option<u32> {
     })
 }
 
-/// Objeto `EnumFormat` de vídeo sin comprimir con `formats` (el primero, por defecto) y, si se dan,
-/// los modificadores DRM obligatorios y sin fijar. `fps` es la cadencia que se propone
-/// (`framerate` y `maxFramerate`, hasta 120 si la pantalla los da).
-fn video_format(formats: &[VideoFormat], modifiers: Option<&[u64]>, fps: u32) -> Object {
+/// Modificadores DRM que lleva un `EnumFormat` ([`video_format`]).
+#[derive(Debug, Clone, Copy)]
+enum ModifierOffer<'a> {
+    /// Sin propiedad de modificador: memoria compartida.
+    None,
+    /// La lista que importa el codificador, obligatoria y sin fijar (primera vuelta).
+    Choice(&'a [u64]),
+    /// Un modificador ya fijado (segunda vuelta, tras elegir el compositor).
+    Fixed(u64),
+}
+
+/// Objeto `EnumFormat` de vídeo sin comprimir con `formats` (el primero, por defecto) y los
+/// modificadores DRM de `modifiers`. `fps` es la cadencia que se propone (`framerate` y
+/// `maxFramerate`, hasta 120 si la pantalla los da).
+fn video_format(formats: &[VideoFormat], modifiers: ModifierOffer<'_>, fps: u32) -> Object {
     let fps = fps.clamp(1, 1000);
     use spa::param::format::{FormatProperties, MediaSubtype, MediaType};
     let ids: Vec<Id> = formats.iter().map(|f| Id(f.as_raw())).collect();
@@ -815,23 +974,31 @@ fn video_format(formats: &[VideoFormat], modifiers: Option<&[u64]>, fps: u32) ->
             ))),
         ),
     ];
-    if let Some(modifiers) = modifiers.filter(|m| !m.is_empty()) {
-        let values: Vec<i64> = modifiers.iter().map(|&m| m as i64).collect();
-        properties.push(Property {
+    match modifiers {
+        ModifierOffer::Choice(modifiers) if !modifiers.is_empty() => {
+            let values: Vec<i64> = modifiers.iter().map(|&m| m as i64).collect();
+            properties.push(Property {
+                key: FormatProperties::VideoModifier.as_raw(),
+                // `DONT_FIXATE` (PipeWire ≥ 0.3.33) va por su valor: `libspa` solo nombra la
+                // constante con la feature `v0_3_33`.
+                flags: PropertyFlags::from_bits_retain(
+                    PropertyFlags::MANDATORY.bits() | spa::sys::SPA_POD_PROP_FLAG_DONT_FIXATE,
+                ),
+                value: Value::Choice(ChoiceValue::Long(Choice(
+                    ChoiceFlags::empty(),
+                    ChoiceEnum::Enum {
+                        default: values[0],
+                        alternatives: values,
+                    },
+                ))),
+            });
+        }
+        ModifierOffer::Fixed(modifier) => properties.push(Property {
             key: FormatProperties::VideoModifier.as_raw(),
-            // `DONT_FIXATE` (PipeWire ≥ 0.3.33) va por su valor: `libspa` solo nombra la constante
-            // con la feature `v0_3_33`.
-            flags: PropertyFlags::from_bits_retain(
-                PropertyFlags::MANDATORY.bits() | spa::sys::SPA_POD_PROP_FLAG_DONT_FIXATE,
-            ),
-            value: Value::Choice(ChoiceValue::Long(Choice(
-                ChoiceFlags::empty(),
-                ChoiceEnum::Enum {
-                    default: values[0],
-                    alternatives: values,
-                },
-            ))),
-        });
+            flags: PropertyFlags::MANDATORY,
+            value: Value::Long(modifier as i64),
+        }),
+        ModifierOffer::None | ModifierOffer::Choice(_) => {}
     }
     properties.push(Property::new(
         FormatProperties::VideoSize.as_raw(),
@@ -914,28 +1081,115 @@ fn format_params(
     if options.hdr {
         params.push(serialize(Value::Object(video_format(
             &[VideoFormat::RGBA_F16],
-            None,
+            ModifierOffer::None,
             fps,
         )))?);
     }
     if let Some(modifiers) = modifiers.filter(|m| !m.is_empty() && !options.hdr) {
         params.push(serialize(Value::Object(video_format(
             &[VideoFormat::BGRx, VideoFormat::BGRA],
-            Some(modifiers),
+            ModifierOffer::Choice(modifiers),
             fps,
         )))?);
     }
-    params.push(serialize(Value::Object(video_format(
+    params.push(serialize(Value::Object(shm_format(fps)))?);
+    Ok(params)
+}
+
+/// `EnumFormat` de respaldo en memoria compartida: los cuatro formatos de 32 bits sin modificador.
+fn shm_format(fps: u32) -> Object {
+    video_format(
         &[
             VideoFormat::BGRx,
             VideoFormat::BGRA,
             VideoFormat::RGBx,
             VideoFormat::RGBA,
         ],
-        None,
+        ModifierOffer::None,
         fps,
-    )))?);
-    Ok(params)
+    )
+}
+
+/// Segunda vuelta de la negociación de DMA-BUF: `format` con `modifier` ya fijado y, detrás, el
+/// respaldo en memoria compartida (si el compositor no puede reservar con ese modificador, cae a
+/// él en vez de dejar el flujo sin búferes).
+fn fixated_params(
+    format: VideoFormat,
+    modifier: u64,
+    options: CaptureOptions,
+) -> Result<Vec<Vec<u8>>, CaptureError> {
+    let fps = options.max_fps;
+    Ok(vec![
+        serialize(Value::Object(video_format(
+            &[format],
+            ModifierOffer::Fixed(modifier),
+            fps,
+        )))?,
+        serialize(Value::Object(shm_format(fps)))?,
+    ])
+}
+
+/// Qué toca tras un `param_changed` de formato.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Negotiation {
+    /// El compositor contestó con modificadores sin fijar: hay que volver a anunciar el formato
+    /// con este, el elegido de entre los que él propone.
+    Fixate { modifier: u64 },
+    /// Formato fijado: se piden los búferes (DMA-BUF si lleva modificador).
+    Ready { dmabuf: bool },
+    /// El compositor solo propone (o fijó) modificadores que el codificador no importa, o su
+    /// respuesta no se pudo leer: se vuelve a anunciar solo la memoria compartida.
+    Shm,
+}
+
+/// Lee la propiedad de modificador del formato que contestó el compositor (`format`, el objeto
+/// `Format` deserializado) y decide ([`Negotiation`]). Con una lista sin fijar se elige el que el
+/// compositor prefiere (su valor por defecto) si está entre los `offered`; si no, el primero de su
+/// lista que ofrecimos; si no coincide ninguno (un *tiling* que el codificador no importa ni la CPU
+/// puede leer), [`Negotiation::Shm`]: memoria compartida en vez de fotogramas que fallarían uno a
+/// uno. Un modificador ya fijado que no ofrecimos también va a memoria compartida.
+fn negotiate(format: &Object, offered: &[u64]) -> Negotiation {
+    let modifier = format
+        .properties
+        .iter()
+        .find(|property| property.key == spa::sys::SPA_FORMAT_VIDEO_modifier)
+        .map(|property| &property.value);
+    let pick = |default: i64, alternatives: &[i64]| -> Negotiation {
+        let default = default as u64;
+        if offered.contains(&default) {
+            return Negotiation::Fixate { modifier: default };
+        }
+        alternatives
+            .iter()
+            .map(|&m| m as u64)
+            .find(|m| offered.contains(m))
+            .map_or(Negotiation::Shm, |modifier| Negotiation::Fixate {
+                modifier,
+            })
+    };
+    let fixed = |modifier: i64| {
+        if offered.contains(&(modifier as u64)) {
+            Negotiation::Ready { dmabuf: true }
+        } else {
+            Negotiation::Shm
+        }
+    };
+    match modifier {
+        None => Negotiation::Ready { dmabuf: false },
+        Some(Value::Long(modifier)) => fixed(*modifier),
+        Some(Value::Choice(ChoiceValue::Long(Choice(_, choice)))) => match choice {
+            ChoiceEnum::None(modifier) => fixed(*modifier),
+            ChoiceEnum::Enum {
+                default,
+                alternatives,
+            } => pick(*default, alternatives),
+            ChoiceEnum::Range { default, .. }
+            | ChoiceEnum::Step { default, .. }
+            | ChoiceEnum::Flags { default, .. } => pick(*default, &[]),
+        },
+        // Un modificador de otro tipo no es un formato DMA-BUF que sepamos pedir.
+        Some(_) => Negotiation::Shm,
+    }
 }
 
 /// `Buffers` (DMA-BUF o memoria compartida, de 4 a 16), `Meta` del cursor y `Meta` de la cabecera
@@ -1051,7 +1305,7 @@ fn process(stream: &pw::stream::Stream, state: &mut StreamState) {
     let Some(buffer) = Dequeued::next(stream, &state.release) else {
         return;
     };
-    let captured_at = Instant::now();
+    let arrived = Instant::now();
     let meta = buffer.cursor().filter(|cursor| cursor.is_valid());
     if let Some(meta) = meta
         && let Some(bitmap) = meta.bitmap()
@@ -1098,8 +1352,13 @@ fn process(stream: &pw::stream::Stream, state: &mut StreamState) {
     let compositor = *state.compositor_pts.get_or_insert(pts.is_some());
     let at = match pts {
         Some(pts) if compositor => pts,
-        _ => captured_at.saturating_duration_since(state.epoch),
+        _ => arrived.saturating_duration_since(state.epoch),
     };
+    // La marca `Captured` es la del compositor (cuándo compuso el fotograma) si la pone y es del
+    // reloj monótono; si no, la llegada a este callback.
+    let captured_at = pts
+        .and_then(|pts| instant_from_monotonic(pts, arrived))
+        .unwrap_or(arrived);
     if !state.pacer.accept(at) {
         crate::counters::record_paced_out();
         return;
@@ -1173,6 +1432,15 @@ fn process(stream: &pw::stream::Stream, state: &mut StreamState) {
     };
     let frame_id = state.next_id;
     state.next_id += 1;
+    if state.diag.frames.fetch_add(1, Ordering::Relaxed) == 0 {
+        tracing::info!(
+            width = size.width,
+            height = size.height,
+            dmabuf = cpu_copies == 0,
+            compositor_pts = compositor,
+            "PipeWire: primer fotograma"
+        );
+    }
     state.mailbox.put(CapturedFrame {
         frame_id,
         width: size.width,
@@ -1191,6 +1459,7 @@ fn run_stream(
     node_id: u32,
     (gpu, options): (GpuFrames, CaptureOptions),
     mailbox: Arc<Mailbox>,
+    diag: Arc<StreamDiag>,
     quit: pw::channel::Receiver<()>,
     ready: std::sync::mpsc::Sender<Result<(), CaptureError>>,
 ) {
@@ -1211,9 +1480,16 @@ fn run_stream(
         .map_err(backend)?;
 
         let (release_tx, release_rx) = pw::channel::channel::<BufferPtr>();
+        let offered: Vec<u64> = match &gpu {
+            GpuFrames::DmaBuf { modifiers } => modifiers.clone(),
+            _ => Vec::new(),
+        };
         let state = StreamState {
             format: VideoInfoRaw::default(),
             dmabuf: false,
+            offered,
+            options,
+            diag,
             next_id: 0,
             mailbox: Arc::clone(&mailbox),
             cursor_shape: None,
@@ -1222,15 +1498,23 @@ fn run_stream(
             compositor_pts: None,
             epoch: Instant::now(),
         };
-        let errors = Arc::clone(&mailbox);
         let _listener = stream
             .add_local_listener_with_user_data(state)
-            .state_changed(move |_, _, _, new| match new {
-                pw::stream::StreamState::Error(message) => {
-                    errors.fail(backend(format!("PipeWire: {message}")));
+            .state_changed(|_, state, old, new| {
+                tracing::info!(?old, ?new, "PipeWire: estado del flujo");
+                state.diag.set_state(&format!("{new:?}"));
+                if matches!(new, pw::stream::StreamState::Streaming) {
+                    state.diag.streaming.store(true, Ordering::Relaxed);
                 }
-                pw::stream::StreamState::Unconnected => errors.fail(CaptureError::TargetLost),
-                _ => {}
+                match new {
+                    pw::stream::StreamState::Error(message) => {
+                        state.mailbox.fail(backend(format!("PipeWire: {message}")));
+                    }
+                    pw::stream::StreamState::Unconnected => {
+                        state.mailbox.fail(CaptureError::TargetLost);
+                    }
+                    _ => {}
+                }
             })
             .param_changed(|stream, state, id, param| {
                 let Some(param) = param else {
@@ -1245,31 +1529,103 @@ fn run_stream(
                         .fail(backend("PipeWire negoció un formato ilegible"));
                     return;
                 }
-                if channel_order(state.format.format()).is_none()
-                    && !is_half_float(state.format.format())
-                {
+                let format = state.format.format();
+                if channel_order(format).is_none() && !is_half_float(format) {
                     state.mailbox.fail(CaptureError::Unsupported(format!(
-                        "formato de PipeWire no admitido: {:?}",
-                        state.format.format()
+                        "formato de PipeWire no admitido: {format:?}"
                     )));
                     return;
                 }
-                state.dmabuf = has_modifier(param);
-                match buffer_params(state.dmabuf) {
-                    Ok((buffers, meta, header)) => {
-                        let (Some(buffers), Some(meta), Some(header)) = (
-                            Pod::from_bytes(&buffers),
-                            Pod::from_bytes(&meta),
-                            Pod::from_bytes(&header),
-                        ) else {
-                            return;
-                        };
-                        if let Err(err) = stream.update_params(&mut [buffers, meta, header]) {
-                            state.mailbox.fail(backend(err));
+                // El objeto deserializado dice si el modificador viene fijado o como lista; si no
+                // se puede leer no se adivina: memoria compartida (sin modificador no hay vuelta
+                // de fijación que pueda quedarse a medias).
+                let negotiation = match PodDeserializer::deserialize_from::<Value>(param.as_bytes())
+                {
+                    Ok((_, Value::Object(object))) => negotiate(&object, &state.offered),
+                    _ if has_modifier(param) => Negotiation::Shm,
+                    _ => Negotiation::Ready { dmabuf: false },
+                };
+                let update = |stream: &pw::stream::Stream, params: &[Vec<u8>]| {
+                    let mut pods: Vec<&Pod> = Vec::with_capacity(params.len());
+                    for bytes in params {
+                        pods.push(
+                            Pod::from_bytes(bytes)
+                                .ok_or_else(|| backend("parámetro de PipeWire no válido"))?,
+                        );
+                    }
+                    stream.update_params(&mut pods).map_err(backend)
+                };
+                match negotiation {
+                    Negotiation::Shm => {
+                        tracing::info!(
+                            ?format,
+                            "PipeWire: ningún modificador común con el compositor; se pide memoria \
+                             compartida"
+                        );
+                        state
+                            .diag
+                            .set_format(format!("{format:?}, pidiendo memoria compartida"));
+                        if let Err(err) =
+                            serialize(Value::Object(shm_format(state.options.max_fps)))
+                                .and_then(|shm| update(stream, &[shm]))
+                        {
+                            state.mailbox.fail(err);
                         }
                     }
-                    Err(err) => state.mailbox.fail(err),
+                    Negotiation::Fixate { modifier } => {
+                        tracing::info!(
+                            ?format,
+                            modifier = format_args!("{modifier:#x}"),
+                            "PipeWire: el compositor propone modificadores; se fija uno"
+                        );
+                        state.diag.set_format(format!(
+                            "{format:?}, fijando el modificador {modifier:#x}"
+                        ));
+                        if let Err(err) = fixated_params(format, modifier, state.options)
+                            .and_then(|params| update(stream, &params))
+                        {
+                            state.mailbox.fail(err);
+                        }
+                    }
+                    Negotiation::Ready { dmabuf } => {
+                        state.dmabuf = dmabuf;
+                        let described = describe_format(&state.format, dmabuf);
+                        tracing::info!(format = %described, "PipeWire: formato negociado");
+                        state.diag.set_format(described);
+                        if let Err(err) =
+                            buffer_params(dmabuf).and_then(|(buffers, meta, header)| {
+                                update(stream, &[buffers, meta, header])
+                            })
+                        {
+                            state.mailbox.fail(err);
+                        }
+                    }
                 }
+            })
+            .add_buffer(|_, state, buffer| {
+                let count = state.diag.buffers.fetch_add(1, Ordering::Relaxed) + 1;
+                // SAFETY: `buffer` es el `pw_buffer` que PipeWire acaba de añadir al flujo,
+                // válido durante este callback; solo se lee el tipo de memoria de su primer
+                // plano.
+                let kind = unsafe {
+                    let spa_buffer = (*buffer).buffer;
+                    if spa_buffer.is_null() || (*spa_buffer).n_datas == 0 {
+                        None
+                    } else {
+                        Some((*(*spa_buffer).datas).type_)
+                    }
+                };
+                tracing::info!(
+                    count,
+                    memory = kind.map_or("desconocida", data_type_name),
+                    "PipeWire: búfer añadido"
+                );
+            })
+            .remove_buffer(|_, state, _| {
+                let before = state.diag.buffers.load(Ordering::Relaxed);
+                let left = before.saturating_sub(1);
+                state.diag.buffers.store(left, Ordering::Relaxed);
+                tracing::info!(left, "PipeWire: búfer retirado");
             })
             .process(process)
             .register()
@@ -1331,6 +1687,45 @@ struct Running {
     portal_stop: tokio::sync::oneshot::Sender<()>,
     portal_thread: JoinHandle<()>,
     mailbox: Arc<Mailbox>,
+    diag: Arc<StreamDiag>,
+    /// Cuándo arrancó el flujo; hasta el primer fotograma vigila [`FIRST_FRAME_TIMEOUT`].
+    started: Instant,
+    delivered: bool,
+    /// Ya se avisó de que el flujo va pero la fuente no pinta.
+    quiet_source_noted: bool,
+}
+
+impl Running {
+    /// Si pasó [`FIRST_FRAME_TIMEOUT`] sin ningún fotograma: el error que lo explica (dejado
+    /// también en el buzón para las llamadas siguientes) si el flujo no arrancó o no tiene
+    /// búferes; con el flujo en marcha y búferes, solo un aviso una vez (la fuente no se repinta).
+    fn first_frame_watchdog(&mut self) -> Option<CaptureError> {
+        if self.delivered || self.started.elapsed() < FIRST_FRAME_TIMEOUT {
+            return None;
+        }
+        let streaming = self.diag.streaming.load(Ordering::Relaxed);
+        let buffers = self.diag.buffers.load(Ordering::Relaxed);
+        if streaming && buffers > 0 {
+            if !self.quiet_source_noted {
+                self.quiet_source_noted = true;
+                tracing::info!(
+                    summary = %self.diag.summary(),
+                    "PipeWire: flujo en marcha sin fotogramas en {} s; la fuente no se repinta \
+                     (¿ventana oculta o sin cambios?); se sigue esperando",
+                    FIRST_FRAME_TIMEOUT.as_secs()
+                );
+            }
+            return None;
+        }
+        let err = backend(format!(
+            "PipeWire no entregó ningún fotograma en {} s ({})",
+            FIRST_FRAME_TIMEOUT.as_secs(),
+            self.diag.summary()
+        ));
+        tracing::warn!(%err, "captura sin fotogramas");
+        self.mailbox.fail(err.clone());
+        Some(err)
+    }
 }
 
 /// Capturador por el portal `ScreenCast` y PipeWire.
@@ -1414,14 +1809,36 @@ impl Capturer for PipeWireCapturer {
             self.input_token = portal.input_token;
         }
         let mailbox = Arc::new(Mailbox::default());
+        let diag = Arc::new(StreamDiag::default());
         let (quit, quit_rx) = pw::channel::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let stream_mailbox = Arc::clone(&mailbox);
+        let stream_diag = Arc::clone(&diag);
         let (fd, node_id) = (portal.fd, portal.node_id);
         let setup = (self.gpu.clone(), self.options);
+        tracing::info!(
+            node_id,
+            dmabuf_modifiers = match &self.gpu {
+                GpuFrames::DmaBuf { modifiers } => modifiers.len(),
+                _ => 0,
+            },
+            max_fps = self.options.max_fps,
+            hdr = self.options.hdr,
+            "PipeWire: conectando al nodo del portal"
+        );
         let stream_thread = thread::Builder::new()
             .name("pipewire".into())
-            .spawn(move || run_stream(fd, node_id, setup, stream_mailbox, quit_rx, ready_tx));
+            .spawn(move || {
+                run_stream(
+                    fd,
+                    node_id,
+                    setup,
+                    stream_mailbox,
+                    stream_diag,
+                    quit_rx,
+                    ready_tx,
+                )
+            });
         let stream_thread = match stream_thread {
             Ok(handle) => handle,
             Err(err) => {
@@ -1441,6 +1858,10 @@ impl Capturer for PipeWireCapturer {
             portal_stop,
             portal_thread,
             mailbox,
+            diag,
+            started: Instant::now(),
+            delivered: false,
+            quiet_source_noted: false,
         });
         if let Err(err) = ready {
             self.stop();
@@ -1450,23 +1871,31 @@ impl Capturer for PipeWireCapturer {
     }
 
     fn next_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
-        let Some(running) = &self.running else {
+        let Some(running) = &mut self.running else {
             return Err(backend("la captura no está iniciada"));
         };
-        running
+        let frame = running
             .mailbox
             .take(None)?
-            .ok_or_else(|| backend("la captura terminó"))
+            .ok_or_else(|| backend("la captura terminó"))?;
+        running.delivered = true;
+        Ok(frame)
     }
 
     fn next_frame_timeout(
         &mut self,
         timeout: Duration,
     ) -> Result<Option<CapturedFrame>, CaptureError> {
-        let Some(running) = &self.running else {
+        let Some(running) = &mut self.running else {
             return Err(backend("la captura no está iniciada"));
         };
-        running.mailbox.take(Some(timeout))
+        let frame = running.mailbox.take(Some(timeout))?;
+        if frame.is_some() {
+            running.delivered = true;
+        } else if let Some(err) = running.first_frame_watchdog() {
+            return Err(err);
+        }
+        Ok(frame)
     }
 
     fn stop(&mut self) {
@@ -1659,6 +2088,118 @@ mod tests {
         );
         assert_eq!(drm_fourcc(VideoFormat::BGRx), Some(0x3432_5258));
         assert_eq!(drm_fourcc(VideoFormat::I420), None);
+    }
+
+    /// Deserializa el primer `EnumFormat` de `params` como objeto.
+    fn first_object(params: &[Vec<u8>]) -> Object {
+        match PodDeserializer::deserialize_from::<Value>(&params[0]) {
+            Ok((_, Value::Object(object))) => object,
+            other => panic!("no es un objeto: {other:?}"),
+        }
+    }
+
+    /// La negociación de DMA-BUF en dos vueltas: con la lista sin fijar del compositor se fija el
+    /// que él prefiere si lo ofrecimos (o el primero común); con el modificador fijado o sin
+    /// modificador se piden los búferes.
+    #[test]
+    fn dmabuf_negotiation_fixates_a_common_modifier_and_then_asks_for_buffers() {
+        let offered = [0x0100_0000_0000_0002u64, 0x0100_0000_0000_0005, 0];
+        // Lo que contestaría el compositor: su lista (sin fijar), con el preferido primero.
+        let answer = |modifiers: &[u64]| {
+            serialize(Value::Object(video_format(
+                &[VideoFormat::BGRx],
+                ModifierOffer::Choice(modifiers),
+                60,
+            )))
+            .unwrap()
+        };
+        assert_eq!(
+            negotiate(
+                &first_object(&[answer(&[0x0100_0000_0000_0005, 0])]),
+                &offered
+            ),
+            Negotiation::Fixate {
+                modifier: 0x0100_0000_0000_0005
+            },
+            "el preferido del compositor, si lo ofrecimos"
+        );
+        assert_eq!(
+            negotiate(
+                &first_object(&[answer(&[0x77, 0, 0x0100_0000_0000_0002])]),
+                &offered
+            ),
+            Negotiation::Fixate { modifier: 0 },
+            "si no, el primero de su lista que ofrecimos"
+        );
+        assert_eq!(
+            negotiate(&first_object(&[answer(&[0x77, 0x78])]), &offered),
+            Negotiation::Shm,
+            "sin ninguno común, memoria compartida en vez de DMA-BUF que nadie importa"
+        );
+        // Un modificador fijado por el compositor que no ofrecimos tampoco sirve.
+        let foreign = fixated_params(VideoFormat::BGRx, 0x77, CaptureOptions::default()).unwrap();
+        assert_eq!(
+            negotiate(&first_object(&foreign), &offered),
+            Negotiation::Shm
+        );
+        assert_eq!(
+            negotiate(&first_object(&foreign), &[]),
+            Negotiation::Shm,
+            "sin nada ofrecido, nada de DMA-BUF"
+        );
+        // Segunda vuelta: el formato fijado y el respaldo en memoria compartida.
+        let fixated = fixated_params(
+            VideoFormat::BGRx,
+            0x0100_0000_0000_0005,
+            CaptureOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(fixated.len(), 2);
+        let pod = Pod::from_bytes(&fixated[0]).unwrap();
+        let prop = pod
+            .as_object()
+            .unwrap()
+            .find_prop(Id(spa::sys::SPA_FORMAT_VIDEO_modifier))
+            .expect("modificador");
+        assert!(prop.flags().contains(spa::pod::PodPropFlags::MANDATORY));
+        assert!(
+            !prop.flags().contains(spa::pod::PodPropFlags::DONT_FIXATE),
+            "fijado: ya no es una lista"
+        );
+        assert_eq!(prop.value().get_long(), Ok(0x0100_0000_0000_0005));
+        assert_eq!(
+            negotiate(&first_object(&fixated), &offered),
+            Negotiation::Ready { dmabuf: true }
+        );
+        assert_eq!(
+            negotiate(&first_object(&[fixated[1].clone()]), &offered),
+            Negotiation::Ready { dmabuf: false },
+            "memoria compartida: sin modificador"
+        );
+        assert!(!has_modifier(Pod::from_bytes(&fixated[1]).unwrap()));
+    }
+
+    #[test]
+    fn stream_diagnostics_explain_an_empty_start() {
+        let diag = StreamDiag::default();
+        assert!(diag.summary().contains("no conectó el nodo"));
+        assert!(!diag.streaming.load(Ordering::Relaxed));
+        diag.set_state("Paused");
+        diag.set_format("BGRx 1920×1080, memoria compartida".to_owned());
+        diag.buffers.store(6, Ordering::Relaxed);
+        let summary = diag.summary();
+        assert!(summary.contains("Paused") && summary.contains("1920×1080"));
+        assert!(summary.contains("búferes añadidos: 6"));
+        assert_eq!(data_type_name(spa::sys::SPA_DATA_DmaBuf), "DmaBuf");
+        // Una marca del compositor de hace 2 ms data el fotograma 2 ms antes de la llegada.
+        let now = Instant::now();
+        let ts = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+        let mono = Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32);
+        let dated = instant_from_monotonic(mono - Duration::from_millis(2), now).unwrap();
+        assert!(now.duration_since(dated) >= Duration::from_millis(2));
+        assert!(now.duration_since(dated) < Duration::from_millis(500));
+        assert!(instant_from_monotonic(mono + Duration::from_secs(5), now).is_none());
+        assert!(instant_from_monotonic(mono - Duration::from_secs(5), now).is_none());
     }
 
     #[test]

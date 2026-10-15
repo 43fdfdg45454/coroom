@@ -1,17 +1,21 @@
 //! Vista previa de lo que comparte el anfitrión.
 //!
-//! La interfaz muestra en pequeño lo que se está capturando. [`PreviewTap`] recibe cada fotograma
-//! del hilo `capture` y, como mucho cada [`PreviewTap::period`], reduce la imagen BGRA a
-//! [`PreviewTap::max_width`] píxeles de ancho (promedio por bloques) y la entrega en I420 (la
-//! misma conversión del codificador) a su retrollamada. Con las imágenes de GPU (DMA-BUF, D3D11)
-//! no hay copia en CPU que reducir: la retrollamada recibe `None` una vez para que la interfaz
-//! explique por qué no hay vista previa. Todo ocurre fuera del camino del vídeo: el fotograma
-//! sigue hacia el codificador sin esperar.
+//! La interfaz muestra en pequeño lo que se está capturando. El hilo `encode`, una vez codificado
+//! cada fotograma, se lo ofrece a [`PreviewTap`], que como mucho cada [`PreviewTap::period`] se lo
+//! queda ([`PreviewTap::wants`]); entonces el fotograma (sin copiarlo) pasa al hilo de
+//! [`PreviewWorker`], que reduce la imagen BGRA a [`PreviewTap::max_width`] píxeles de ancho
+//! (promedio por bloques), la entrega en I420 (la misma conversión del codificador) a la
+//! retrollamada y devuelve el fotograma al hilo `encode`, que lo guarda para repetirlo si hace
+//! falta. Reducir una imagen de 1080p cuesta de 2 a 4 ms: fuera de los hilos `capture` y `encode`
+//! no retrasa ningún fotograma. Con las imágenes de GPU (DMA-BUF, D3D11) no hay copia en CPU que
+//! reducir: la retrollamada recibe `None` una vez para que la interfaz explique por qué no hay
+//! vista previa.
 
-use std::sync::Mutex;
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use coroom_capture::{CapturedFrame, FramePixels};
 use coroom_codec::convert::bgra_to_i420;
 use coroom_codec::{PixelFormat, RawFrame};
 
@@ -24,7 +28,7 @@ pub const PREVIEW_WIDTH: u32 = 480;
 /// Retrollamada de la vista previa: una imagen I420 o `None` si la captura va por la GPU.
 pub type PreviewCallback = Box<dyn Fn(Option<RawFrame>) + Send + Sync>;
 
-/// Toma de la vista previa en el hilo de captura.
+/// Toma de la vista previa: decide qué fotogramas se reducen y los entrega.
 pub struct PreviewTap {
     period: Duration,
     max_width: u32,
@@ -74,45 +78,125 @@ impl PreviewTap {
         self.max_width
     }
 
-    /// Mira un fotograma capturado y, si toca, entrega su vista previa.
-    pub(crate) fn offer(&self, frame: &CapturedFrame) {
+    /// Mira un fotograma ya convertido para el codificador y dice si toca sacar su vista previa:
+    /// entonces hay que pasárselo a [`PreviewTap::render`] (en el [`PreviewWorker`]). Con una
+    /// imagen de GPU avisa `None` una vez y devuelve `false`. Barato: va en el hilo `encode`.
+    pub fn wants(&self, frame: &RawFrame) -> bool {
         let now = Instant::now();
-        let gpu = {
+        let gpu = frame.gpu.is_some();
+        {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if state
                 .last
                 .is_some_and(|last| now.duration_since(last) < self.period)
             {
-                return;
+                return false;
             }
             state.last = Some(now);
-            let gpu = frame.pixels.is_gpu();
             if gpu {
                 if state.gpu_reported {
-                    return;
+                    return false;
                 }
                 state.gpu_reported = true;
             } else {
                 state.gpu_reported = false;
             }
-            gpu
-        };
+        }
         if gpu {
             (self.callback)(None);
+            return false;
+        }
+        frame.format == PixelFormat::Bgra
+    }
+
+    /// Reduce `frame` (BGRA de CPU) y lo entrega a la retrollamada. Cuesta unos milisegundos: se
+    /// llama desde el hilo del [`PreviewWorker`].
+    pub fn render(&self, frame: &RawFrame) {
+        if frame.format != PixelFormat::Bgra || frame.gpu.is_some() {
             return;
         }
-        let FramePixels::Bgra { data, stride } = &frame.pixels else {
-            return;
-        };
         if let Some(small) = downscale_bgra(
-            data,
-            *stride,
+            &frame.data,
+            frame.stride,
             (frame.width, frame.height),
             self.max_width,
             frame.frame_id,
         ) && let Ok(i420) = bgra_to_i420(&small)
         {
             (self.callback)(Some(i420));
+        }
+    }
+}
+
+/// Hilo que reduce los fotogramas de la vista previa fuera del camino del vídeo. Recibe el
+/// fotograma entero (sin copiarlo) con su toma, lo entrega y lo devuelve por
+/// [`PreviewWorker::returned`] para que el hilo `encode` lo guarde otra vez. El hilo se crea con
+/// el primer fotograma y termina al soltar el `PreviewWorker`.
+pub(crate) struct PreviewWorker {
+    jobs: Option<SyncSender<(Arc<PreviewTap>, RawFrame)>>,
+    done: Receiver<RawFrame>,
+    done_tx: mpsc::Sender<RawFrame>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl PreviewWorker {
+    pub(crate) fn new() -> Self {
+        let (done_tx, done) = mpsc::channel();
+        Self {
+            jobs: None,
+            done,
+            done_tx,
+            thread: None,
+        }
+    }
+
+    /// Le lleva `frame` para la vista previa de `tap`. Lo devuelve si el hilo aún está con el
+    /// anterior (esta vez no hay vista previa) o no se pudo crear (entonces la hace aquí mismo).
+    pub(crate) fn offer(&mut self, tap: Arc<PreviewTap>, frame: RawFrame) -> Option<RawFrame> {
+        if self.jobs.is_none() {
+            let (tx, rx) = mpsc::sync_channel::<(Arc<PreviewTap>, RawFrame)>(1);
+            let done = self.done_tx.clone();
+            match std::thread::Builder::new()
+                .name("preview".into())
+                .spawn(move || {
+                    for (tap, frame) in rx {
+                        tap.render(&frame);
+                        if done.send(frame).is_err() {
+                            break;
+                        }
+                    }
+                }) {
+                Ok(handle) => {
+                    self.thread = Some(handle);
+                    self.jobs = Some(tx);
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "sin hilo para la vista previa; se reduce aquí");
+                    tap.render(&frame);
+                    return Some(frame);
+                }
+            }
+        }
+        match self.jobs.as_ref()?.try_send((tap, frame)) {
+            Ok(()) => None,
+            Err(TrySendError::Full((_, frame)) | TrySendError::Disconnected((_, frame))) => {
+                Some(frame)
+            }
+        }
+    }
+
+    /// Fotogramas que el hilo ya usó.
+    pub(crate) fn returned(&self) -> Vec<RawFrame> {
+        self.done.try_iter().collect()
+    }
+}
+
+impl Drop for PreviewWorker {
+    fn drop(&mut self) {
+        // Sin emisor, el bucle del hilo termina.
+        self.jobs = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
     }
 }
@@ -202,32 +286,55 @@ mod tests {
 
     #[test]
     fn the_tap_respects_its_period_and_reports_gpu_once() {
-        use coroom_capture::CapturedFrame;
         let seen = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&seen);
-        let tap = PreviewTap::with(
+        let tap = Arc::new(PreviewTap::with(
             Duration::from_secs(3600),
             64,
             Box::new(move |frame| {
                 assert!(frame.is_some_and(|f| f.format == PixelFormat::I420));
                 counter.fetch_add(1, Ordering::SeqCst);
             }),
+        ));
+        let frame = RawFrame::cpu(1, (16, 8), PixelFormat::Bgra, 16 * 4, vec![128; 16 * 8 * 4]);
+        assert!(tap.wants(&frame), "el primero toca");
+        assert!(!tap.wants(&frame), "una por periodo");
+        let mut worker = PreviewWorker::new();
+        assert!(
+            worker.offer(Arc::clone(&tap), frame).is_none(),
+            "se lo lleva"
         );
-        let frame = CapturedFrame {
-            frame_id: 1,
-            width: 16,
-            height: 8,
-            captured_at: Instant::now(),
-            cursor: None,
-            cursor_shape: None,
-            pixels: FramePixels::Bgra {
-                data: vec![128; 16 * 8 * 4],
-                stride: 16 * 4,
-            },
-            cpu_copies: 0,
+        let back = loop {
+            let mut back = worker.returned();
+            if let Some(back) = back.pop() {
+                break back;
+            }
+            std::thread::sleep(Duration::from_millis(5));
         };
-        tap.offer(&frame);
-        tap.offer(&frame);
+        assert_eq!(back.frame_id, 1, "lo devuelve entero");
         assert_eq!(seen.load(Ordering::SeqCst), 1, "una por periodo");
+    }
+
+    #[test]
+    fn gpu_frames_are_reported_once_and_never_rendered() {
+        use coroom_codec::gpu::{GpuImage, OpaqueImage};
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&seen);
+        let tap = PreviewTap::with(
+            Duration::ZERO,
+            64,
+            Box::new(move |frame| {
+                assert!(frame.is_none());
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let image = GpuImage::Opaque(Arc::new(OpaqueImage {
+            kind: "x".into(),
+            keepalive: Arc::new(()),
+        }));
+        let frame = RawFrame::gpu(1, (16, 8), image);
+        assert!(!tap.wants(&frame));
+        assert!(!tap.wants(&frame));
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "avisa una vez");
     }
 }

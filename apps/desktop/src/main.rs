@@ -826,6 +826,11 @@ fn logs_to_file(command: Option<&Command>) -> bool {
 }
 
 fn main() -> ExitCode {
+    // Sondeo de Vulkan Video en un proceso hijo (`coroom doctor` y el arranque): si este proceso es
+    // el hijo, hace su comprobación y termina; si no, activa el sondeo aislado.
+    if coroom_session::codec::ffmpeg::probe_child::run_if_requested() {
+        return ExitCode::SUCCESS;
+    }
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {
