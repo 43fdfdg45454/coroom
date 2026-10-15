@@ -1932,9 +1932,7 @@ fn invite_card(app: &App, real: bool) -> Element<'_, Message> {
             );
         }
         Load::Loaded(friends) => {
-            let mut sorted: Vec<_> = friends.friends.iter().collect();
-            sorted.sort_by_key(|friend| !friend.online);
-            for friend in sorted {
+            for friend in super::home::sorted_friends(friends) {
                 let id = friend.id;
                 let mark: Element<'_, Message> = if friend.online {
                     checkbox(state.invite.contains(&id))
@@ -1949,11 +1947,8 @@ fn invite_card(app: &App, real: bool) -> Element<'_, Message> {
                 } else {
                     ui::secondary(friend.display_name.as_str()).into()
                 };
-                let badge = if friend.online {
-                    ui::status_badge(Tone::Success, t!("host-disponible"))
-                } else {
-                    ui::status_badge(Tone::Neutral, t!("host-desconectado"))
-                };
+                // La misma insignia que en Inicio: disponible, en su sala o jugando.
+                let badge = super::home::activity_badge(friend);
                 list = push(
                     list,
                     container(
@@ -3129,9 +3124,13 @@ pub(crate) mod shots {
         })));
     }
 
-    /// Compartir la pantalla, con Bea marcada para invitarla.
+    /// Compartir la pantalla, con Bea marcada para invitarla y Carla jugando en otra sala.
     pub(crate) fn host_setup(app: &mut App) {
         signed_in(app, Page::Host);
+        app.update(Message::Event(Event::Activity {
+            user: 3,
+            activity: coroom_transport::proto::signal::Activity::Playing,
+        }));
         app.settings.audio.excluded_apps = vec![crate::ui::settings::RememberedApp {
             key: "discord.exe".to_owned(),
             name: "Discord".to_owned(),
