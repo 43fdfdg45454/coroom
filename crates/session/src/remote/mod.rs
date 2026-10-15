@@ -1274,6 +1274,9 @@ impl HostControl {
         let Some((gpu, options)) = setup else {
             return Err(SessionError::Network("la sesión no está en marcha".into()));
         };
+        // Si la sala ya pasó la captura a memoria de CPU (el codificador no leía sus imágenes de
+        // GPU), la nueva arranca así.
+        let gpu = self.core.shared.latest_capture_gpu_frames().unwrap_or(gpu);
         if self.core.ended() {
             return Err(SessionError::Network("la sesión terminó".into()));
         }

@@ -28,7 +28,11 @@
 //!   fijado se piden los búferes. Si el compositor no consigue reservar con ese modificador,
 //!   vuelve a negociar (otra lista, o memoria compartida) y se repite. Cada estado del flujo,
 //!   formato y búfer se registra a nivel `info`, y si en [`FIRST_FRAME_TIMEOUT`] no llega ningún
-//!   fotograma, la captura falla diciendo en qué estado y formato se quedó.
+//!   fotograma, la captura falla diciendo en qué estado y formato se quedó. Si con la captura en
+//!   marcha se piden imágenes de CPU ([`Capturer::set_gpu_frames`] con [`GpuFrames::Off`]: el
+//!   codificador que se negoció no importa DMA-BUF), el flujo vuelve a anunciar solo los formatos
+//!   sin modificador con `update_params` y el compositor renegocia a memoria compartida sin cortar
+//!   la captura ni volver a pasar por el portal.
 //! - **Búferes**: si el formato negociado lleva modificador, `SPA_DATA_DmaBuf`; si no,
 //!   `MemPtr | MemFd`.
 //! - **`process`**: con DMA-BUF, el búfer **no** se devuelve a PipeWire al salir del callback: se
@@ -1581,7 +1585,7 @@ fn run_stream(
     (gpu, options): (GpuFrames, CaptureOptions),
     mailbox: Arc<Mailbox>,
     diag: Arc<StreamDiag>,
-    quit: pw::channel::Receiver<()>,
+    (quit, renegotiate): (pw::channel::Receiver<()>, pw::channel::Receiver<()>),
     ready: std::sync::mpsc::Sender<Result<(), CaptureError>>,
 ) {
     let setup = || -> Result<(), CaptureError> {
@@ -1665,7 +1669,15 @@ fn run_stream(
                 // de fijación que pueda quedarse a medias).
                 let negotiation = match PodDeserializer::deserialize_from::<Value>(param.as_bytes())
                 {
-                    Ok((_, Value::Object(object))) => negotiate(&object, &state.offered),
+                    Ok((_, Value::Object(object))) => {
+                        // Con memoria de CPU pedida en marcha ya no vale ningún modificador.
+                        let offered: &[u64] = if state.mailbox.shm_only() {
+                            &[]
+                        } else {
+                            &state.offered
+                        };
+                        negotiate(&object, offered)
+                    }
                     _ if has_modifier(param) => Negotiation::Shm,
                     _ => Negotiation::Ready { dmabuf: false },
                 };
@@ -1818,6 +1830,18 @@ fn run_stream(
             // desconecta antes de soltarlo).
             unsafe { pw::sys::pw_stream_queue_buffer(raw_stream, buffer.raw) };
         });
+        // Paso a memoria de CPU en marcha: se vuelven a anunciar solo los formatos sin modificador
+        // y el compositor renegocia (retira los DMA-BUF y da búferes en memoria compartida).
+        let shm_params = format_params(None, options)?;
+        let renegotiate_mailbox = Arc::clone(&mailbox);
+        let _renegotiate = renegotiate.attach(main_loop.loop_(), move |()| {
+            tracing::info!(
+                "PipeWire: el codificador no importa DMA-BUF; se renegocia a memoria compartida"
+            );
+            if let Err(err) = update_params_raw(raw_stream, &shm_params) {
+                renegotiate_mailbox.fail(err);
+            }
+        });
         let _ = ready.send(Ok(()));
         main_loop.run();
         let _ = stream.disconnect();
@@ -1829,9 +1853,33 @@ fn run_stream(
     }
 }
 
+/// `pw_stream_update_params` con `params` ya serializados, desde el bucle principal del flujo
+/// (fuera de sus callbacks, donde `Stream::update_params` no está a mano).
+fn update_params_raw(
+    stream: *mut pw::sys::pw_stream,
+    params: &[Vec<u8>],
+) -> Result<(), CaptureError> {
+    let mut pods: Vec<*const spa::sys::spa_pod> = Vec::with_capacity(params.len());
+    for bytes in params {
+        let pod =
+            Pod::from_bytes(bytes).ok_or_else(|| backend("parámetro de PipeWire no válido"))?;
+        pods.push(pod.as_raw_ptr().cast_const());
+    }
+    // SAFETY: `stream` es el flujo de este bucle, vivo mientras `main_loop.run()` no vuelve (este
+    // callback corre dentro de él), y `pods` apunta a pods válidos de `params` durante la llamada.
+    let result =
+        unsafe { pw::sys::pw_stream_update_params(stream, pods.as_mut_ptr(), pods.len() as u32) };
+    if result < 0 {
+        return Err(backend(format!("pw_stream_update_params: {result}")));
+    }
+    Ok(())
+}
+
 /// Partes vivas de una captura en marcha.
 struct Running {
     quit: pw::channel::Sender<()>,
+    /// Pide al flujo que renegocie a memoria compartida ([`Mailbox::request_shm`] antes).
+    renegotiate: pw::channel::Sender<()>,
     stream_thread: JoinHandle<()>,
     portal_stop: tokio::sync::oneshot::Sender<()>,
     portal_thread: JoinHandle<()>,
@@ -1993,6 +2041,7 @@ impl Capturer for PipeWireCapturer {
         let mailbox = Arc::new(Mailbox::default());
         let diag = Arc::new(StreamDiag::default());
         let (quit, quit_rx) = pw::channel::channel::<()>();
+        let (renegotiate, renegotiate_rx) = pw::channel::channel::<()>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let stream_mailbox = Arc::clone(&mailbox);
         let stream_diag = Arc::clone(&diag);
@@ -2017,7 +2066,7 @@ impl Capturer for PipeWireCapturer {
                     setup,
                     stream_mailbox,
                     stream_diag,
-                    quit_rx,
+                    (quit_rx, renegotiate_rx),
                     ready_tx,
                 )
             });
@@ -2036,6 +2085,7 @@ impl Capturer for PipeWireCapturer {
             .unwrap_or_else(|_| Err(backend("el hilo de PipeWire terminó sin responder")));
         self.running = Some(Running {
             quit,
+            renegotiate,
             stream_thread,
             portal_stop,
             portal_thread,
@@ -2090,14 +2140,29 @@ impl Capturer for PipeWireCapturer {
     }
 
     /// Con [`GpuFrames::DmaBuf`] y algún modificador, la próxima captura ofrece DMA-BUF antes que
-    /// memoria compartida (`COROOM_ZERO_COPY=0` lo impide).
+    /// memoria compartida (`COROOM_ZERO_COPY=0` lo impide). Con la captura en marcha en DMA-BUF,
+    /// [`GpuFrames::Off`] la pasa ya a memoria compartida: el flujo renegocia el formato con el
+    /// compositor sin cortarse (el codificador negociado no importa DMA-BUF). Volver a DMA-BUF en
+    /// marcha no: queda para la próxima captura.
     fn set_gpu_frames(&mut self, frames: GpuFrames) -> GpuFrames {
-        self.gpu = match frames {
+        let wanted = match frames {
             GpuFrames::DmaBuf { modifiers } if !modifiers.is_empty() && !zero_copy_disabled() => {
                 GpuFrames::DmaBuf { modifiers }
             }
             _ => GpuFrames::Off,
         };
+        if let Some(running) = &self.running
+            && matches!(self.gpu, GpuFrames::DmaBuf { .. })
+            && wanted == GpuFrames::Off
+        {
+            running.mailbox.request_shm();
+            if running.renegotiate.send(()).is_err() {
+                tracing::warn!(
+                    "PipeWire: el flujo ya no atiende; la memoria compartida espera a la próxima captura"
+                );
+            }
+        }
+        self.gpu = wanted;
         self.gpu.clone()
     }
 
@@ -2543,6 +2608,17 @@ mod tests {
         assert!(now.duration_since(dated) < Duration::from_millis(500));
         assert!(instant_from_monotonic(mono + Duration::from_secs(5), now).is_none());
         assert!(instant_from_monotonic(mono - Duration::from_secs(5), now).is_none());
+    }
+
+    /// Los parámetros del paso a memoria de CPU en marcha no llevan ningún formato con modificador.
+    #[test]
+    fn shared_memory_only_params_carry_no_modifier() {
+        let params = format_params(None, CaptureOptions::default()).unwrap();
+        assert_eq!(params.len(), 1);
+        assert!(
+            !has_modifier(Pod::from_bytes(&params[0]).unwrap()),
+            "solo memoria compartida"
+        );
     }
 
     #[test]

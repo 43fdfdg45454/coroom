@@ -533,6 +533,9 @@ pub struct EncodedSlice {
 pub enum CodecError {
     /// El backend no admite el códec o la configuración pedida.
     Unsupported(String),
+    /// El codificador no puede leer las imágenes de GPU que entrega la captura (ni sin copias ni
+    /// descargándolas): quien captura tiene que pasar a memoria de CPU y volver a intentarlo.
+    GpuImport(String),
     /// Faltan referencias: hace falta un fotograma intra.
     MissingReference,
     /// Error interno del backend.
@@ -559,6 +562,10 @@ impl fmt::Display for CodecError {
                 )
             }
             CodecError::Unsupported(what) => write!(f, "configuración no admitida: {what}"),
+            CodecError::GpuImport(what) => write!(
+                f,
+                "el codificador no puede leer las imágenes de GPU de la captura: {what}"
+            ),
             CodecError::MissingReference => f.write_str("falta un fotograma de referencia"),
             CodecError::Backend(what) => write!(f, "error del backend de vídeo: {what}"),
         }

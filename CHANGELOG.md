@@ -152,6 +152,16 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **La sala ya no se cierra cuando el codificador elegido no lee las imágenes de la captura.**
+  Al abrir la sala, la captura entregaba lo que importa el primer codificador de GPU de la lista
+  (en Linux, DMA-BUF para Vulkan Video); si la calibración elegía otro que no las importa ni las
+  descarga (NVENC, o software con D3D11 en Windows), el primer fotograma fallaba con «no puede
+  leer imágenes DMA-BUF de la captura» y la sala se cerraba. Ahora la captura sigue al codificador
+  real: al negociarlo, si no lee imágenes de GPU, PipeWire renegocia el formato a memoria
+  compartida y WGC copia a CPU, las dos sin reiniciar la captura; y si el fallo aparece al
+  codificar, el hilo de codificación descarta ese fotograma, pide la memoria de CPU y sigue. La
+  captura que se adopta al cambiar de fuente arranca ya en CPU. Error nuevo del códec,
+  `GpuImport`, para distinguirlo de una configuración no admitida.
 - **Al renegociar el códec con la sala abierta se abría el primer codificador de la lista**
   (Vulkan Video en Linux) aunque la calibración hubiera elegido otro: cuando entraba un invitado
   que solo decodifica H.264, una GPU NVIDIA pasaba de AV1 por NVENC a H.264 por Vulkan Video,

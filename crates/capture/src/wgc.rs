@@ -863,7 +863,9 @@ impl FrameCopier {
         if width == 0 || height == 0 {
             return Ok(());
         }
-        if self.gpu {
+        // Si la sesión pidió memoria de CPU en marcha (`set_gpu_frames` con `Off`), la textura
+        // se copia como siempre: el pool y la sesión de WGC siguen igual.
+        if self.gpu && !self.mailbox.shm_only() {
             if let Some(watch) = &self.watch {
                 watch.lock().unwrap_or_else(PoisonError::into_inner).frames += 1;
             }
@@ -1301,7 +1303,8 @@ impl Capturer for WgcCapturer {
     }
 
     /// Con [`GpuFrames::D3D11`], la próxima captura entrega texturas sin copiarlas a CPU
-    /// (`COROOM_ZERO_COPY=0` lo impide).
+    /// (`COROOM_ZERO_COPY=0` lo impide). Con [`GpuFrames::Off`], la captura en marcha pasa a
+    /// copiar a CPU desde el siguiente fotograma, sin reiniciar la sesión de WGC.
     fn set_gpu_frames(&mut self, frames: GpuFrames) -> GpuFrames {
         let disabled = std::env::var("COROOM_ZERO_COPY").is_ok_and(|value| {
             matches!(
@@ -1310,6 +1313,14 @@ impl Capturer for WgcCapturer {
             )
         });
         self.gpu = frames == GpuFrames::D3D11 && !disabled;
+        if let Some(running) = &mut self.running
+            && running.gpu
+            && !self.gpu
+        {
+            tracing::info!("captura WGC: pasa a copias en CPU (el codificador no lee texturas)");
+            running.mailbox.request_shm();
+            running.gpu = false;
+        }
         if self.gpu {
             GpuFrames::D3D11
         } else {

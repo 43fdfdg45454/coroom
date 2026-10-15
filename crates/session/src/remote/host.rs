@@ -59,8 +59,8 @@ use super::{
 };
 use crate::latency::{AudioTrack, Stage};
 use crate::loopback::{
-    CHANNEL_CAPACITY, Compressed, EncodeControl, LoopbackConfig, PipelineError, capture_loop,
-    encode_loop, recv_or_stop, spawn_stage,
+    CHANNEL_CAPACITY, Compressed, EncodeControl, LoopbackConfig, PipelineError, capture_frames_for,
+    capture_loop, encode_loop, recv_or_stop, spawn_stage,
 };
 use crate::stats::{StatsWindow, bump};
 use crate::{GuestId, Permissions, SessionError, SessionState};
@@ -1855,6 +1855,25 @@ async fn renegotiate(ctx: &Arc<HostCtx>, guest: Option<GuestId>) {
             let err = match opened {
                 Ok(Ok((encoder, calibrated))) => {
                     let backend = encoder.backend();
+                    // La captura entrega lo que importa el codificador preferido (al abrir la
+                    // sala); si el que se abrió no lee esas imágenes (NVENC con DMA-BUF, software
+                    // con D3D11), la captura pasa a memoria de CPU antes del primer fotograma. Lo
+                    // que se decide al codificar (importar o descargar) lo pide el hilo `encode`.
+                    let capture = ctx.core.shared.latest_capture_gpu_frames().or_else(|| {
+                        lock(&ctx.core.capture_setup)
+                            .as_ref()
+                            .map(|setup| setup.0.clone())
+                    });
+                    if let Some(capture) = capture
+                        && let Some(frames) = capture_frames_for(&capture, &encoder.gpu_input())
+                    {
+                        debug!(
+                            %backend,
+                            ?capture,
+                            "la captura pasa a memoria de CPU: el codificador no lee sus imágenes"
+                        );
+                        ctx.core.shared.set_capture_gpu_frames(frames);
+                    }
                     let label = encoder_label(codec, backend);
                     // El formato solo se nombra si no es el de siempre (4:2:0 SDR).
                     let label = if format.is_default() {

@@ -189,6 +189,19 @@ pub fn capture_gpu_frames(input: &GpuInput) -> GpuFrames {
     }
 }
 
+/// Si la captura, que entrega `capture`, tiene que pasar a memoria de CPU para un codificador que
+/// acepta `input`: `Some(Off)` cuando entrega imágenes de GPU y el codificador no lee ninguna
+/// (NVENC o software con DMA-BUF, software con D3D11). Con imágenes de GPU en los dos no se decide
+/// aquí: el codificador las importa o las descarga y, si no puede, lo dice al codificar
+/// ([`CodecError::GpuImport`]) y el hilo `encode` pide la memoria de CPU entonces.
+pub fn capture_frames_for(capture: &GpuFrames, input: &GpuInput) -> Option<GpuFrames> {
+    match (capture, input) {
+        (GpuFrames::Off, _) => None,
+        (_, GpuInput::None) => Some(GpuFrames::Off),
+        _ => None,
+    }
+}
+
 /// Convierte un fotograma de la captura en la entrada del codificador moviendo la imagen (sin
 /// copiarla). El tamaño se recorta a par: H.264 y HEVC 4:2:0 lo necesitan.
 pub fn to_raw_frame(frame: CapturedFrame) -> RawFrame {
@@ -377,6 +390,11 @@ pub(crate) struct Shared {
     /// abierta): el hilo `capture` se las pasa a la suya y a la que adopte después.
     capture_options: Mutex<Option<CaptureOptions>>,
     capture_options_pending: AtomicBool,
+    /// Imágenes de GPU nuevas para la captura en marcha ([`GpuFrames::Off`] cuando el codificador
+    /// que se negoció no lee las que entrega, [`capture_frames_for`]): el hilo `capture` se lo
+    /// pasa a la suya y a la que adopte después. Una vez en CPU, la sala sigue en CPU.
+    capture_gpu_frames: Mutex<Option<GpuFrames>>,
+    capture_gpu_frames_pending: AtomicBool,
     /// Tamaño del último fotograma que entregó la captura (lo anota el hilo `encode`): con él y
     /// el tope, la sesión sabe el tamaño del flujo antes de anunciarlo
     /// ([`LoopbackConfig::stream_size`]).
@@ -475,6 +493,35 @@ impl Shared {
             .capture_options
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Pide otras imágenes para la captura en marcha (gana la última).
+    pub(crate) fn set_capture_gpu_frames(&self, frames: GpuFrames) {
+        *self
+            .capture_gpu_frames
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(frames);
+        self.capture_gpu_frames_pending
+            .store(true, Ordering::Release);
+    }
+
+    /// Las imágenes nuevas aún sin aplicar, una vez.
+    pub(crate) fn take_capture_gpu_frames(&self) -> Option<GpuFrames> {
+        if !self
+            .capture_gpu_frames_pending
+            .swap(false, Ordering::AcqRel)
+        {
+            return None;
+        }
+        self.latest_capture_gpu_frames()
+    }
+
+    /// Las últimas imágenes pedidas en marcha, si las hubo (para la captura que se adopta).
+    pub(crate) fn latest_capture_gpu_frames(&self) -> Option<GpuFrames> {
+        self.capture_gpu_frames
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Anota el tamaño del fotograma que acaba de entregar la captura; `true` si cambió.
@@ -1063,6 +1110,9 @@ pub(crate) fn capture_loop(
                 if let Some(options) = shared.latest_capture_options() {
                     next.set_options(options);
                 }
+                if let Some(frames) = shared.latest_capture_gpu_frames() {
+                    next.set_gpu_frames(frames);
+                }
                 capturer = next;
                 shared.request_keyframe();
                 debug!("captura sustituida");
@@ -1071,6 +1121,11 @@ pub(crate) fn capture_loop(
                 // fps o tamaño máximo cambiados con la sala abierta.
                 let applied = capturer.set_options(options);
                 debug!(?applied, "opciones de la captura en marcha");
+            }
+            if let Some(frames) = shared.take_capture_gpu_frames() {
+                // El codificador negociado no lee las imágenes de GPU de la captura.
+                let applied = capturer.set_gpu_frames(frames);
+                debug!(?applied, "imágenes de la captura en marcha");
             }
             let Some(frame) = capturer
                 .next_frame_timeout(POLL)
@@ -1298,6 +1353,9 @@ pub(crate) fn encode_loop(
     // reducción en CPU en marcha, para anunciarlos una vez cuando cambian.
     let mut output_size: Option<(u32, u32)> = None;
     let mut scaling: Option<ScalePair> = None;
+    // Ya se avisó de que el codificador no lee las imágenes de GPU de la captura (se avisa una vez;
+    // los fotogramas de GPU que siguen llegando hasta que la captura pasa a CPU se descartan).
+    let mut gpu_import_warned = false;
     loop {
         if shared.stopping() {
             break;
@@ -1395,11 +1453,16 @@ pub(crate) fn encode_loop(
         // El paquete entero, de una vez, en el búfer que viaja al hilo `send`.
         let mut data = Vec::with_capacity(expected_len);
         let encoded = match &raw {
-            Some(raw) => encoder
-                .encode_into(raw, &mut data)
-                .map_err(PipelineError::Codec)?,
+            Some(raw) => match encoder.encode_into(raw, &mut data) {
+                Ok(encoded) => Ok(encoded),
+                Err(CodecError::GpuImport(what)) => Err(what),
+                Err(err) => return Err(PipelineError::Codec(err)),
+            },
             None => match encoder.repeat_last() {
-                Some(slices) => concat_slices(slices.map_err(PipelineError::Codec)?, &mut data),
+                Some(slices) => Ok(concat_slices(
+                    slices.map_err(PipelineError::Codec)?,
+                    &mut data,
+                )),
                 None => {
                     // Nada que repetir: el intra queda pedido para el siguiente fotograma.
                     if forced {
@@ -1408,6 +1471,31 @@ pub(crate) fn encode_loop(
                     continue;
                 }
             },
+        };
+        let encoded = match encoded {
+            Ok(encoded) => encoded,
+            Err(what) => {
+                // El codificador que se negoció (NVENC, software…) no importa ni descarga las
+                // imágenes de GPU que entrega la captura: la captura pasa a memoria de CPU en
+                // marcha y este fotograma se pierde. Antes la sala se cerraba.
+                if !gpu_import_warned {
+                    gpu_import_warned = true;
+                    warn!(
+                        encoder = %encoder.backend(),
+                        error = %what,
+                        "la captura pasa a memoria de CPU: el codificador no lee sus imágenes"
+                    );
+                }
+                shared.set_capture_gpu_frames(GpuFrames::Off);
+                ledger.record_drop(Stage::Encoded);
+                if forced {
+                    shared.request_keyframe();
+                }
+                if let Some(raw) = raw {
+                    recycle(raw);
+                }
+                continue;
+            }
         };
         if forced {
             bump(&shared.counters.forced_keyframes);
@@ -2238,6 +2326,9 @@ mod tests {
         bitrates: Arc<AtomicU32>,
         keyframes: Arc<Mutex<Vec<(u64, bool)>>>,
         keyframe: bool,
+        /// Fotogramas que rechaza con [`CodecError::GpuImport`] (como NVENC con DMA-BUF) antes
+        /// de codificar normalmente.
+        gpu_import_failures: u32,
     }
 
     impl Encoder for FakeEncoder {
@@ -2271,6 +2362,10 @@ mod tests {
         }
 
         fn encode(&mut self, frame: &RawFrame) -> Result<Vec<EncodedSlice>, CodecError> {
+            if self.gpu_import_failures > 0 {
+                self.gpu_import_failures -= 1;
+                return Err(CodecError::GpuImport("de prueba".into()));
+            }
             let keyframe = std::mem::take(&mut self.keyframe);
             self.keyframes
                 .lock()
@@ -2315,6 +2410,10 @@ mod tests {
 
     impl EncodeHarness {
         fn start(live: bool, kbps: u32) -> Self {
+            Self::start_with(live, kbps, 0)
+        }
+
+        fn start_with(live: bool, kbps: u32, gpu_import_failures: u32) -> Self {
             let shared = Arc::new(Shared::default());
             let control = Arc::new(EncodeControl::new(kbps));
             control.active.store(true, Ordering::SeqCst);
@@ -2325,6 +2424,7 @@ mod tests {
                 bitrates: Arc::clone(&bitrates),
                 keyframes: Arc::clone(&encoded),
                 keyframe: true,
+                gpu_import_failures,
             };
             let (frames, rx) = bounded::<CapturedFrame>(CHANNEL_CAPACITY);
             let (tx, out) = bounded::<Compressed>(4096);
@@ -2395,6 +2495,64 @@ mod tests {
                 assert_eq!(keyframes, 2, "{encoded:?}");
             }
         }
+    }
+
+    /// Un codificador que no lee las imágenes de GPU de la captura (NVENC con DMA-BUF, software
+    /// con D3D11) no cierra la sala: el hilo `encode` pide la captura en memoria de CPU, descarta
+    /// esos fotogramas y sigue con los que llegan después.
+    #[test]
+    fn an_encoder_that_cannot_import_gpu_images_switches_the_capture_to_cpu() {
+        let harness = EncodeHarness::start_with(true, 10_000, 2);
+        assert_eq!(harness.shared.take_capture_gpu_frames(), None);
+        for frame in 0..4 {
+            harness.frames.send(cpu_frame(frame)).unwrap();
+            thread::sleep(Duration::from_millis(10));
+        }
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            harness.shared.take_capture_gpu_frames(),
+            Some(GpuFrames::Off),
+            "pide memoria de CPU para la captura en marcha"
+        );
+        assert_eq!(harness.shared.take_capture_gpu_frames(), None, "una vez");
+        assert_eq!(
+            harness.shared.latest_capture_gpu_frames(),
+            Some(GpuFrames::Off),
+            "y la que se adopte después arranca así"
+        );
+        let (_, encoded) = harness.stop();
+        let ids: Vec<u64> = encoded.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            ids,
+            vec![2, 3],
+            "los dos primeros se pierden; el hilo sigue"
+        );
+    }
+
+    #[test]
+    fn the_capture_leaves_gpu_images_only_for_an_encoder_that_reads_none() {
+        let dmabuf = GpuFrames::DmaBuf { modifiers: vec![0] };
+        assert_eq!(
+            capture_frames_for(&dmabuf, &GpuInput::None),
+            Some(GpuFrames::Off),
+            "NVENC o software con DMA-BUF"
+        );
+        assert_eq!(
+            capture_frames_for(&GpuFrames::D3D11, &GpuInput::None),
+            Some(GpuFrames::Off),
+            "software con D3D11"
+        );
+        assert_eq!(
+            capture_frames_for(&dmabuf, &GpuInput::DmaBuf { modifiers: vec![1] }),
+            None,
+            "con GPU en los dos decide el codificador al importar"
+        );
+        assert_eq!(capture_frames_for(&GpuFrames::Off, &GpuInput::None), None);
+        assert_eq!(
+            capture_frames_for(&GpuFrames::Off, &GpuInput::D3D11),
+            None,
+            "en CPU no hay nada que bajar"
+        );
     }
 
     /// Con la pantalla quieta, un intra pedido sale repitiendo el último fotograma (antes había

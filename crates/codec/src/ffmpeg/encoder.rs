@@ -1394,9 +1394,8 @@ impl FfmpegEncoder {
         let prepared = importer
             .prepare(image, frame.frame_id, pts)
             .map_err(|err| {
-                CodecError::Unsupported(format!(
-                    "no se pudo importar la imagen {} en {}: {err} (COROOM_ZERO_COPY=0 vuelve a \
-                     la captura en memoria de CPU)",
+                CodecError::GpuImport(format!(
+                    "no se pudo importar la imagen {} en {}: {err}",
                     image.kind(),
                     self.backend
                 ))
@@ -1485,9 +1484,8 @@ impl FfmpegEncoder {
             ImportMode::Download,
         )
         .map_err(|err| {
-            CodecError::Unsupported(format!(
-                "{} no puede leer imágenes {} de la captura: {err} (COROOM_ZERO_COPY=0 vuelve a \
-                 la captura en memoria de CPU)",
+            CodecError::GpuImport(format!(
+                "{} no puede leer imágenes {} de la captura: {err}",
                 self.backend,
                 image.kind()
             ))
@@ -2024,8 +2022,12 @@ mod tests {
         let err = encoder
             .encode(&RawFrame::gpu(1, (256, 256), image))
             .unwrap_err();
+        assert!(
+            matches!(err, CodecError::GpuImport(_)),
+            "la sesión pasa la captura a CPU al ver este error: {err}"
+        );
         let text = err.to_string();
-        assert!(text.contains("COROOM_ZERO_COPY=0"), "{text}");
+        assert!(text.contains("DMA-BUF"), "{text}");
         assert!(!encoder.zero_copy());
         assert!(
             encoder.gpu_note().is_some(),

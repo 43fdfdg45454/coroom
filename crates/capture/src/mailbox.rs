@@ -1,7 +1,7 @@
 //! Buzón de un solo hueco entre el hilo de un backend y `Capturer::next_frame`: si llega un
 //! fotograma antes de que se recoja el anterior, gana el último.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -15,6 +15,10 @@ pub(crate) struct Mailbox {
     /// Cadencia nueva para la captura en marcha (0: ninguna pendiente); el hilo del backend la
     /// recoge con [`Mailbox::take_max_fps`] y rehace su selector de fotogramas.
     max_fps: AtomicU32,
+    /// La captura en marcha tiene que pasar a memoria de CPU (`Capturer::set_gpu_frames` con
+    /// [`crate::GpuFrames::Off`]): el codificador negociado no importa sus imágenes de GPU. El
+    /// backend renegocia el formato y, mientras, no acepta ninguna oferta de GPU.
+    shm_only: AtomicBool,
 }
 
 #[derive(Default)]
@@ -35,6 +39,16 @@ impl Mailbox {
             0 => None,
             fps => Some(fps),
         }
+    }
+
+    /// Pide que la captura en marcha deje las imágenes de GPU y entregue memoria de CPU.
+    pub(crate) fn request_shm(&self) {
+        self.shm_only.store(true, Ordering::Release);
+    }
+
+    /// Si se pidió memoria de CPU para la captura en marcha.
+    pub(crate) fn shm_only(&self) -> bool {
+        self.shm_only.load(Ordering::Acquire)
     }
 
     pub(crate) fn put(&self, frame: CapturedFrame) {
@@ -100,6 +114,18 @@ mod tests {
         mailbox.set_max_fps(60);
         assert_eq!(mailbox.take_max_fps(), Some(60), "gana la última");
         assert_eq!(mailbox.take_max_fps(), None);
+    }
+
+    #[test]
+    fn shared_memory_once_requested_stays_requested() {
+        let mailbox = Mailbox::default();
+        assert!(!mailbox.shm_only());
+        mailbox.request_shm();
+        assert!(mailbox.shm_only());
+        assert!(
+            mailbox.shm_only(),
+            "no se consume: vale para toda la captura"
+        );
     }
 
     fn frame(frame_id: u64) -> CapturedFrame {

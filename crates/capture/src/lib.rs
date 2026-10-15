@@ -769,8 +769,11 @@ pub trait Capturer: Send {
     /// Detiene la captura y libera los recursos del backend.
     fn stop(&mut self);
 
-    /// Pide imágenes de GPU en las próximas capturas que se arranquen; los backends que
-    /// no las tienen lo ignoran. Devuelve lo que el backend va a intentar.
+    /// Pide imágenes de GPU en las próximas capturas que se arranquen y, en lo que el backend
+    /// pueda, en la que está en marcha: con [`GpuFrames::Off`], PipeWire y WGC pasan a memoria de
+    /// CPU sin reiniciar la captura (la sesión lo pide cuando el codificador que negoció no lee
+    /// sus imágenes). Los backends que no las tienen lo ignoran. Devuelve lo que el backend va a
+    /// intentar.
     fn set_gpu_frames(&mut self, frames: GpuFrames) -> GpuFrames {
         let _ = frames;
         GpuFrames::Off
