@@ -209,7 +209,14 @@ impl EncoderSet {
                 Ok(encoder)
             }) {
                 Ok(encoder) => return Ok(encoder),
-                Err(err) => last = Some(err),
+                Err(err) => {
+                    // El sondeo lo dio por bueno y no abre: que el próximo arranque vuelva a
+                    // sondear en vez de fiarse de la caché.
+                    if backend.is_hardware() {
+                        Capabilities::forget_cache();
+                    }
+                    last = Some(err);
+                }
             }
         }
         Err(last.unwrap_or_else(|| {
@@ -447,7 +454,13 @@ impl DecoderSet {
         {
             match create_decoder_with(codec, *backend, &output) {
                 Ok(decoder) => return Ok(decoder),
-                Err(err) => last = Some(err),
+                Err(err) => {
+                    // Como en los codificadores: el próximo arranque vuelve a sondear.
+                    if *backend != DecoderBackend::Software {
+                        Capabilities::forget_cache();
+                    }
+                    last = Some(err);
+                }
             }
         }
         Err(last.unwrap_or_else(|| {

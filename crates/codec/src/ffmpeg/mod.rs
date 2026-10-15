@@ -26,6 +26,7 @@
 pub mod decoder;
 pub mod encoder;
 pub(crate) mod filter;
+pub mod fingerprint;
 pub(crate) mod hw;
 pub(crate) mod import;
 pub(crate) mod probe;

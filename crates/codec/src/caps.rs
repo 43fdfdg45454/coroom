@@ -3,9 +3,19 @@
 //! [`Capabilities::probe`] abre cada combinación de códec y backend con un contexto real (ver
 //! `ffmpeg::probe`) y guarda el resultado para todo el proceso. OpenH264 (codificar y decodificar
 //! H.264 por software) está siempre. Sin la feature `ffmpeg` no hay nada más.
+//!
+//! Con un fichero de caché ([`Capabilities::use_cache_file`]) el resultado se guarda en disco con
+//! la huella de la máquina (`ffmpeg::fingerprint`: ejecutable, FFmpeg, GPU, drivers) y el
+//! siguiente arranque lo reutiliza sin abrir nada mientras la huella sea la misma: el sondeo
+//! cuesta unos 13 s en una GPU NVIDIA con Linux. Si un codificador o decodificador que el sondeo
+//! dio por bueno no abre en una sesión, la caché se borra ([`Capabilities::forget_cache`]) y el
+//! siguiente arranque vuelve a sondear.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+use serde::{Deserialize, Serialize};
 
 use crate::color::{Chroma, VideoFormat};
 use crate::{Backend, Codec, DecoderBackend, decoder_label, encoder_label};
@@ -95,6 +105,104 @@ pub struct Capabilities {
 
 static PROBED: OnceLock<Capabilities> = OnceLock::new();
 
+/// Fichero de la caché del sondeo, si la aplicación dio uno.
+static CACHE_FILE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Si el sondeo de este proceso salió de la caché.
+static FROM_CACHE: OnceLock<bool> = OnceLock::new();
+
+/// Lo que se guarda en disco: la huella y las listas, con los identificadores estables de
+/// códecs y backends (`av1`, `vulkan`…).
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedProbe {
+    fingerprint: String,
+    encoders: Vec<(String, String)>,
+    decoders: Vec<(String, String)>,
+    ffmpeg_version: Option<String>,
+    ffmpeg_dir: Option<String>,
+    rejected: Vec<String>,
+    unavailable: Vec<String>,
+}
+
+impl CachedProbe {
+    fn new(fingerprint: String, caps: &Capabilities) -> Self {
+        Self {
+            fingerprint,
+            encoders: caps
+                .encoders
+                .iter()
+                .map(|(codec, backend)| (codec.id().to_owned(), backend.id().to_owned()))
+                .collect(),
+            decoders: caps
+                .decoders
+                .iter()
+                .map(|(codec, backend)| (codec.id().to_owned(), backend.id().to_owned()))
+                .collect(),
+            ffmpeg_version: caps.ffmpeg_version.clone(),
+            ffmpeg_dir: caps.ffmpeg_dir.clone(),
+            rejected: caps.rejected.clone(),
+            unavailable: caps.unavailable.clone(),
+        }
+    }
+
+    /// Las capacidades guardadas, o `None` si algún identificador ya no existe en este binario.
+    fn capabilities(&self) -> Option<Capabilities> {
+        let encoders = self
+            .encoders
+            .iter()
+            .map(|(codec, backend)| Some((Codec::from_id(codec)?, Backend::from_id(backend)?)))
+            .collect::<Option<Vec<_>>>()?;
+        let decoders = self
+            .decoders
+            .iter()
+            .map(|(codec, backend)| {
+                Some((Codec::from_id(codec)?, DecoderBackend::from_id(backend)?))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut caps = Capabilities::with(encoders, decoders);
+        caps.ffmpeg_version = self.ffmpeg_version.clone();
+        caps.ffmpeg_dir = self.ffmpeg_dir.clone();
+        caps.rejected = self.rejected.clone();
+        caps.unavailable = self.unavailable.clone();
+        Some(caps)
+    }
+}
+
+/// Las capacidades guardadas en `path` si su huella es `fingerprint`.
+fn load_cached(path: &Path, fingerprint: &str) -> Option<Capabilities> {
+    let bytes = std::fs::read(path).ok()?;
+    let cached: CachedProbe = serde_json::from_slice(&bytes).ok()?;
+    if cached.fingerprint != fingerprint {
+        return None;
+    }
+    cached.capabilities()
+}
+
+/// Guarda `caps` con su huella en `path` (escribe un temporal y lo renombra: un arranque a la vez
+/// nunca lee un fichero a medias).
+fn store_cached(path: &Path, fingerprint: String, caps: &Capabilities) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_vec_pretty(&CachedProbe::new(fingerprint, caps))
+        .map_err(std::io::Error::other)?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, json)?;
+    std::fs::rename(&temporary, path)
+}
+
+/// Huella de la máquina para la caché (`None`: sin caché en esta plataforma o sin FFmpeg).
+fn fingerprint() -> Option<String> {
+    #[cfg(feature = "ffmpeg")]
+    {
+        crate::ffmpeg::fingerprint::current()
+    }
+    #[cfg(not(feature = "ffmpeg"))]
+    {
+        None
+    }
+}
+
 fn sort<B: Ord + Copy>(entries: &mut Vec<(Codec, B)>) {
     let rank = |codec: Codec| Codec::PREFERENCE.iter().position(|c| *c == codec);
     entries.sort_by_key(|&(codec, backend)| (rank(codec), backend));
@@ -110,10 +218,55 @@ fn sort_encoders(entries: &mut Vec<(Codec, Backend)>) {
 }
 
 impl Capabilities {
-    /// Sondea la máquina la primera vez (unos cientos de milisegundos; hasta unos segundos si un
-    /// driver tarda) y devuelve el resultado guardado las siguientes.
+    /// Sondea la máquina la primera vez (de cientos de milisegundos a unos 13 s, según los
+    /// drivers) y devuelve el resultado guardado las siguientes. Con [`Self::use_cache_file`],
+    /// la primera vez del proceso lee el resultado del disco si la huella de la máquina no cambió.
     pub fn probe() -> Capabilities {
-        PROBED.get_or_init(Self::run_probe).clone()
+        PROBED
+            .get_or_init(|| {
+                let cache = CACHE_FILE
+                    .get()
+                    .and_then(|path| Some((path, fingerprint()?)));
+                if let Some((path, fingerprint)) = &cache
+                    && let Some(caps) = load_cached(path, fingerprint)
+                {
+                    let _ = FROM_CACHE.set(true);
+                    return caps;
+                }
+                let caps = Self::run_probe();
+                let _ = FROM_CACHE.set(false);
+                if let Some((path, fingerprint)) = cache {
+                    // Sin caché solo se vuelve a sondear en el próximo arranque.
+                    let _ = store_cached(path, fingerprint, &caps);
+                }
+                caps
+            })
+            .clone()
+    }
+
+    /// Guarda el sondeo en `path` y lo reutiliza en los arranques siguientes mientras la huella
+    /// de la máquina sea la misma. Hay que darlo antes del primer [`Self::probe`]; después no
+    /// cambia nada.
+    pub fn use_cache_file(path: PathBuf) {
+        let _ = CACHE_FILE.set(path);
+    }
+
+    /// Borra la caché del sondeo: el siguiente arranque vuelve a sondear. Se llama cuando algo que
+    /// el sondeo dio por bueno no abre, y desde `coroom doctor` (que siempre sondea de verdad).
+    pub fn forget_cache() {
+        if let Some(path) = CACHE_FILE.get() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// Si el sondeo de este proceso ya terminó (o salió de la caché): [`Self::probe`] no espera.
+    pub fn is_probed() -> bool {
+        PROBED.get().is_some()
+    }
+
+    /// Si el sondeo de este proceso salió de la caché del disco (`None` si aún no se hizo).
+    pub fn from_cache() -> Option<bool> {
+        FROM_CACHE.get().copied()
     }
 
     fn run_probe() -> Capabilities {

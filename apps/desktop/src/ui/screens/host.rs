@@ -2352,8 +2352,14 @@ fn setup(app: &App) -> Element<'_, Message> {
     }
     let actions: Element<'_, Message> = if state.starting {
         let since = state.starting_since.unwrap_or(app.now);
+        // Sin el sondeo de códecs (primer arranque o drivers nuevos) la sala lo espera: se dice.
+        let label = if coroom_session::codec::Capabilities::is_probed() {
+            t!("host-abriendo-la-sala")
+        } else {
+            t!("host-comprobando-los-codecs")
+        };
         container(ui::progress(
-            t!("host-abriendo-la-sala"),
+            label,
             None,
             app.now.duration_since(since).as_secs_f32() / 1.4,
         ))

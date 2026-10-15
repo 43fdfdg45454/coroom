@@ -136,6 +136,7 @@ host-invitaras-a-n = Invitarás a { $n } amigos. El código de la sala aparece a
 host-abrir-la-sala = Abrir la sala
 host-abrir-la-sala-e-invitar = Abrir la sala e invitar
 host-abriendo-la-sala = Abriendo la sala… (si el sistema lo pide, elige qué compartir en su diálogo)
+host-comprobando-los-codecs = Comprobando qué códecs de vídeo funcionan en este equipo… (solo la primera vez y al cambiar los drivers; unos segundos)
 host-no-se-pudo-abrir-la-sala = No se pudo abrir la sala: { $error }
 
 ## Sala abierta

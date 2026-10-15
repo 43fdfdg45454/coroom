@@ -141,6 +141,14 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **Abrir la primera sala tardaba ~13 s tras arrancar** sin decir por qué: esperaba al sondeo de
+  códecs, que se repetía en cada arranque y en una GPU NVIDIA con Linux crea unos 15 dispositivos
+  Vulkan que el driver no deja crear en paralelo. Ahora el resultado se guarda en
+  `codecs.json` (directorio de datos) con la huella de la máquina (ejecutable, FFmpeg, GPU,
+  núcleo, drivers de Vulkan y VA-API, y en Flatpak los commits del runtime y sus extensiones) y
+  se reutiliza mientras no cambie: `coroom probe` pasa de 14,6 s a 2,0 s en esa máquina. Si algo
+  que el sondeo dio por bueno no abre, la caché se borra; `coroom doctor` siempre sondea de
+  verdad. Mientras se sondea, la sala dice «Comprobando qué códecs de vídeo funcionan…».
 - **La vista previa de la sala no trabaja si no se ve**: en otra página o con la ventana tapada
   o minimizada, la toma no reduce ningún fotograma ni despierta la interfaz (antes, cada 500 ms
   estuvieras donde estuvieras). Al volver a Compartir aparece en medio segundo como mucho.

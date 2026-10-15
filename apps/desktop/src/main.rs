@@ -839,6 +839,15 @@ fn main() -> ExitCode {
         }
     };
     init_logging(logs_to_file(cli.command.as_ref()));
+    // El sondeo de códecs se guarda en el directorio de datos y se reutiliza mientras la máquina
+    // no cambie (unos 13 s menos al abrir la primera sala en una GPU NVIDIA); `doctor` siempre
+    // sondea de verdad y deja la caché al día.
+    coroom_session::codec::Capabilities::use_cache_file(
+        coroom_desktop::remote::default_data_dir().join("codecs.json"),
+    );
+    if matches!(cli.command, Some(Command::Doctor)) {
+        coroom_session::codec::Capabilities::forget_cache();
+    }
     match cli.command {
         Some(Command::Doctor) => doctor(),
         Some(Command::Probe(args)) => probe(&args),
