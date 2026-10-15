@@ -6,6 +6,12 @@
 //! (60 fps pedidos con un monitor de 144 Hz daban 48, un fotograma cada tres refrescos). Con la
 //! marca de tiempo y una cadencia que avanza sola (no desde el último fotograma), los huecos de dos
 //! y tres refrescos se alternan y la media queda en la cadencia pedida.
+//!
+//! Un fotograma se acepta aunque llegue antes de su hueco si el adelanto es menor que la mitad del
+//! intervalo típico de la fuente (medido), con tope de medio periodo: así nunca entra el refresco
+//! anterior de una fuente más rápida (llega un intervalo entero antes), y una fuente al mismo ritmo
+//! cuyas marcas bailan varios milisegundos (KWin con la captura por memoria compartida) no pierde
+//! ninguno. Con un margen fijo de 1/8 de periodo (2,08 ms a 60 fps) se tiraban hasta 7 de cada 60.
 
 use std::time::Duration;
 
@@ -15,6 +21,10 @@ pub(crate) struct FramePacer {
     period: Duration,
     /// Momento ideal del siguiente fotograma, en la escala de las marcas de tiempo.
     next: Option<Duration>,
+    /// Marca del último fotograma ofrecido (aceptado o no).
+    last: Option<Duration>,
+    /// Intervalo típico entre fotogramas de la fuente (media móvil), si ya se midió.
+    interval: Option<Duration>,
 }
 
 impl FramePacer {
@@ -23,18 +33,41 @@ impl FramePacer {
         Self {
             period: Duration::from_secs(1) / fps.max(1),
             next: None,
+            last: None,
+            interval: None,
         }
     }
 
-    /// Margen con el que se acepta un fotograma que llega antes de su momento: el jitter de una
-    /// fuente a la misma frecuencia que la cadencia (que no debe perder fotogramas) sin tomar
-    /// el refresco anterior de una más rápida (hasta 4 veces: 240 Hz para 60 fps).
+    /// Margen con el que se acepta un fotograma que llega antes de su momento: medio intervalo
+    /// típico de la fuente (el refresco anterior de una fuente más rápida llega un intervalo
+    /// entero antes y no entra; el baile de las marcas de una al mismo ritmo, sí), entre 1/8 de
+    /// periodo (sin medida aún: lo seguro con 240 Hz para 60 fps) y medio periodo.
     fn tolerance(&self) -> Duration {
-        self.period / 8
+        let floor = self.period / 8;
+        self.interval.map_or(floor, |interval| {
+            (interval / 2).clamp(floor, self.period / 2)
+        })
+    }
+
+    /// Anota el intervalo desde el fotograma anterior en la media móvil (1/8 por muestra). Las
+    /// pausas (más de 4 periodos: pantalla quieta) no cuentan.
+    fn measure(&mut self, at: Duration) {
+        if let Some(last) = self.last
+            && let Some(gap) = at.checked_sub(last)
+            && !gap.is_zero()
+            && gap <= self.period * 4
+        {
+            self.interval = Some(match self.interval {
+                Some(interval) => (interval * 7 + gap) / 8,
+                None => gap,
+            });
+        }
+        self.last = Some(at);
     }
 
     /// Si se entrega el fotograma con marca de tiempo `at` (creciente, en cualquier origen).
     pub(crate) fn accept(&mut self, at: Duration) -> bool {
+        self.measure(at);
         let Some(next) = self.next else {
             self.next = Some(at + self.period);
             return true;
@@ -100,6 +133,54 @@ mod tests {
     fn a_source_at_the_same_rate_with_jitter_loses_nothing() {
         let got = accepted(60, 60.0, 10.0, Duration::from_micros(800));
         assert_eq!(got, 600);
+    }
+
+    /// Fotogramas que deja pasar de una fuente a `hz` cuyas marcas bailan ±`jitter` al azar
+    /// (determinista), como las de KWin con la captura por memoria compartida.
+    fn accepted_random(fps: u32, hz: f64, seconds: f64, jitter: Duration) -> usize {
+        let mut pacer = FramePacer::new(fps);
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let frames = (hz * seconds) as usize;
+        let spread = jitter.as_secs_f64();
+        (0..frames)
+            .filter(|&i| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let unit = (seed >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0;
+                let at = (i as f64 / hz + spread * unit).max(0.0);
+                pacer.accept(Duration::from_secs_f64(at))
+            })
+            .count()
+    }
+
+    #[test]
+    fn a_source_at_the_same_rate_with_wide_jitter_loses_nothing() {
+        // Lo que dio un anfitrión real: la fuente a 59-60 Hz y 5-7 fotogramas por segundo
+        // «fuera de cadencia» (el margen era 1/8 de periodo, 2,08 ms).
+        for jitter_ms in [2, 3, 4] {
+            let got = accepted_random(60, 60.0, 10.0, Duration::from_millis(jitter_ms));
+            assert!(
+                got >= 598,
+                "60 Hz con ±{jitter_ms} ms: {got} de 600 en 10 s"
+            );
+        }
+        let got = accepted_random(60, 59.94, 10.0, Duration::from_millis(3));
+        assert!(got >= 597, "59,94 Hz con ±3 ms: {got} en 10 s");
+    }
+
+    #[test]
+    fn a_slightly_faster_source_gives_the_requested_cadence() {
+        // También del mismo anfitrión: la fuente a 64-65 Hz daba 49-50 fps en vez de 60.
+        for hz in [61.0, 64.0, 65.0, 75.0] {
+            let got = accepted(60, hz, 10.0, Duration::ZERO);
+            assert!((598..=601).contains(&got), "{hz} Hz: {got} en 10 s");
+            let got = accepted_random(60, hz, 10.0, Duration::from_millis(2));
+            assert!(
+                (595..=601).contains(&got),
+                "{hz} Hz con ±2 ms: {got} en 10 s"
+            );
+        }
     }
 
     #[test]
