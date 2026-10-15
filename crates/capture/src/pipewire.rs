@@ -46,6 +46,7 @@
 // Backend nativo de PipeWire (ver `CLAUDE.md`): retener búferes y duplicar descriptores.
 #![allow(unsafe_code)]
 
+use std::collections::HashMap;
 use std::os::fd::{BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -580,6 +581,10 @@ struct StreamState {
     cursor_shape: Option<Arc<CursorShape>>,
     /// Canal por el que vuelven los búferes DMA-BUF retenidos.
     release: pw::channel::Sender<BufferPtr>,
+    /// Búferes vivos del flujo (ver [`LiveBuffers`]).
+    live: LiveBuffers,
+    /// Identificador del siguiente búfer que añada PipeWire (nunca 0).
+    next_buffer: u64,
     /// Qué fotogramas del compositor se entregan para la cadencia pedida.
     pacer: FramePacer,
     /// Marcas de tiempo: las del compositor si las pone en el primer fotograma (`true`); si no,
@@ -658,8 +663,20 @@ fn data_type_name(kind: u32) -> &'static str {
     }
 }
 
-/// Puntero a un `pw_buffer` sacado del flujo, para devolverlo por el canal.
-struct BufferPtr(*mut pw::sys::pw_buffer);
+/// Puntero a un `pw_buffer` sacado del flujo, para devolverlo por el canal, con el identificador
+/// que le dio `add_buffer` (en `user_data`) al sacarlo.
+struct BufferPtr {
+    raw: *mut pw::sys::pw_buffer,
+    id: u64,
+}
+
+/// Búferes vivos del flujo: dirección del `pw_buffer` → identificador que le dio `add_buffer`.
+/// Al renegociar el formato (redimensionar la ventana compartida) PipeWire retira y libera todos
+/// los búferes, también los que aún tenemos o van por el canal `release`; devolver uno de esos con
+/// `pw_stream_queue_buffer` es un uso después de liberar (SIGSEGV). El bucle principal solo
+/// devuelve los que siguen aquí con el mismo identificador (la dirección se puede reutilizar).
+/// Solo se toca desde el bucle principal (`add_buffer`, `remove_buffer` y el canal `release`).
+type LiveBuffers = Arc<Mutex<HashMap<usize, u64>>>;
 
 // SAFETY: el puntero solo se desreferencia en los hilos de PipeWire de este flujo: el de datos lo
 // saca y lee en `process`, y el bucle principal, que lo recibe por el canal, llama a
@@ -687,6 +704,8 @@ impl Drop for BufferRelease {
 /// retenga ([`Dequeued::retain`]).
 struct Dequeued {
     raw: *mut pw::sys::pw_buffer,
+    /// Identificador del búfer (`user_data`, puesto en `add_buffer`).
+    id: u64,
     /// Por donde vuelve a PipeWire al soltarse (`None` si se retuvo).
     release: Option<pw::channel::Sender<BufferPtr>>,
 }
@@ -699,8 +718,15 @@ impl Dequeued {
         // con `pw_stream_queue_buffer` (por el canal `release`, al soltar `Dequeued` o su
         // `BufferRelease`).
         let raw = unsafe { stream.dequeue_raw_buffer() };
-        (!raw.is_null()).then(|| Self {
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: `raw` es un `pw_buffer` válido recién sacado; `user_data` lo escribe
+        // `add_buffer` antes de que el búfer pueda salir del flujo.
+        let id = unsafe { (*raw).user_data } as u64;
+        Some(Self {
             raw,
+            id,
             release: Some(release.clone()),
         })
     }
@@ -772,7 +798,10 @@ impl Dequeued {
         // Sin `release`, `Drop` ya no lo devuelve: queda a cargo de `BufferRelease`.
         let release = self.release.take()?;
         Some(BufferRelease {
-            buffer: Some(BufferPtr(self.raw)),
+            buffer: Some(BufferPtr {
+                raw: self.raw,
+                id: self.id,
+            }),
             release,
         })
     }
@@ -783,7 +812,10 @@ impl Drop for Dequeued {
         // Vuelve por el canal: `pw_stream_queue_buffer` se llama siempre desde el bucle principal
         // (ver `run_stream`). Si el bucle ya no está, el flujo y sus búferes tampoco.
         if let Some(release) = self.release.take() {
-            let _ = release.send(BufferPtr(self.raw));
+            let _ = release.send(BufferPtr {
+                raw: self.raw,
+                id: self.id,
+            });
         }
     }
 }
@@ -1480,6 +1512,7 @@ fn run_stream(
         .map_err(backend)?;
 
         let (release_tx, release_rx) = pw::channel::channel::<BufferPtr>();
+        let live: LiveBuffers = Arc::default();
         let offered: Vec<u64> = match &gpu {
             GpuFrames::DmaBuf { modifiers } => modifiers.clone(),
             _ => Vec::new(),
@@ -1494,6 +1527,8 @@ fn run_stream(
             mailbox: Arc::clone(&mailbox),
             cursor_shape: None,
             release: release_tx,
+            live: Arc::clone(&live),
+            next_buffer: 1,
             pacer: FramePacer::new(options.max_fps),
             compositor_pts: None,
             epoch: Instant::now(),
@@ -1604,6 +1639,16 @@ fn run_stream(
             })
             .add_buffer(|_, state, buffer| {
                 let count = state.diag.buffers.fetch_add(1, Ordering::Relaxed) + 1;
+                let id = state.next_buffer;
+                state.next_buffer += 1;
+                // SAFETY: `buffer` es el `pw_buffer` que PipeWire acaba de añadir, válido durante
+                // este callback; `user_data` es nuestro (pipewire-rs no lo usa).
+                unsafe { (*buffer).user_data = id as *mut std::ffi::c_void };
+                state
+                    .live
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(buffer as usize, id);
                 // SAFETY: `buffer` es el `pw_buffer` que PipeWire acaba de añadir al flujo,
                 // válido durante este callback; solo se lee el tipo de memoria de su primer
                 // plano.
@@ -1621,7 +1666,12 @@ fn run_stream(
                     "PipeWire: búfer añadido"
                 );
             })
-            .remove_buffer(|_, state, _| {
+            .remove_buffer(|_, state, buffer| {
+                state
+                    .live
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&(buffer as usize));
                 let before = state.diag.buffers.load(Ordering::Relaxed);
                 let left = before.saturating_sub(1);
                 state.diag.buffers.store(left, Ordering::Relaxed);
@@ -1663,11 +1713,21 @@ fn run_stream(
         // Se suelta antes que `stream` (orden inverso de declaración): no llega ningún búfer a
         // un flujo ya destruido.
         let _release = release_rx.attach(main_loop.loop_(), move |buffer: BufferPtr| {
+            // El candado se mantiene hasta devolverlo: `remove_buffer` no puede retirarlo entre
+            // la comprobación y `pw_stream_queue_buffer`.
+            let live = live.lock().unwrap_or_else(PoisonError::into_inner);
+            if live.get(&(buffer.raw as usize)) != Some(&buffer.id) {
+                // PipeWire lo retiró al renegociar el formato: ya no existe.
+                tracing::debug!("PipeWire: búfer devuelto tras retirarse; se descarta");
+                return;
+            }
             // SAFETY: `buffer` es un `pw_buffer` que `process` sacó de este flujo y aún no volvió
-            // (ver `Dequeued`); vuelve siempre desde este bucle, el único que lo devuelve, así que
-            // la cola de devueltos tiene un solo productor; el flujo sigue vivo mientras este
-            // receptor esté enganchado al bucle (se desconecta antes de soltarlo).
-            unsafe { pw::sys::pw_stream_queue_buffer(raw_stream, buffer.0) };
+            // (ver `Dequeued`) y sigue vivo: está en `live` con el mismo identificador y
+            // `remove_buffer` no puede quitarlo mientras tengamos el candado. Vuelve siempre desde
+            // este bucle, el único que lo devuelve, así que la cola de devueltos tiene un solo
+            // productor; el flujo sigue vivo mientras este receptor esté enganchado al bucle (se
+            // desconecta antes de soltarlo).
+            unsafe { pw::sys::pw_stream_queue_buffer(raw_stream, buffer.raw) };
         });
         let _ = ready.send(Ok(()));
         main_loop.run();
