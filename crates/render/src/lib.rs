@@ -19,6 +19,8 @@
 //!   adaptador e importación Vulkan ([`wgpu::VideoImporter`]).
 //! - [`layer`]: [`layer::VideoLayer`], el vídeo dentro de la pasada de la interfaz.
 //! - [`offscreen`]: el mismo dibujo en una textura que se puede leer, para tests.
+//! - [`overlay`]: [`overlay::OverlayBlit`], la textura de la interfaz encima del vídeo (el
+//!   compositor de la ventana dibuja el vídeo en cuanto llega y la interfaz, ya dibujada, encima).
 //! - [`NullPresenter`]: no dibuja; lo usa el modo sin ventana.
 //!
 //! Las estadísticas (el antiguo overlay de `egui`) son ahora un panel de la interfaz.
@@ -37,6 +39,7 @@ pub mod color;
 pub mod hdr;
 pub mod layer;
 pub mod offscreen;
+pub mod overlay;
 mod video;
 pub mod wgpu;
 

@@ -1,18 +1,21 @@
 //! El vídeo dentro de la interfaz.
 //!
 //! - [`VideoFeed`]: el último fotograma de una sesión (o de la vista previa del anfitrión), con su
-//!   cursor. El hilo `present` del pipeline lo deja aquí y espera ([`FeedSink`]) a que la ventana
-//!   lo muestre, como antes esperaba a su presentador: la marca de presentación del registro de
-//!   latencia sigue siendo la de verdad.
-//! - [`video_view`]: *widget* de shader de `iced` que dibuja el fotograma con
-//!   [`coroom_render::layer::VideoLayer`] **en la pasada de la interfaz y con su mismo
-//!   `wgpu::Device`**. Los planos I420/NV12 se suben como siempre (una copia de CPU a GPU); las
+//!   cursor. El hilo `present` del pipeline lo deja aquí ([`FeedSink`]) y, si la fuente está en la
+//!   ventana, el [`Compositor`] lo compone y lo entrega **en ese mismo hilo**, sin esperar a que la
+//!   interfaz se reconstruya: la marca de presentación del registro de latencia es la de la
+//!   entrega real. Sin compositor (capturas de pantalla, tests), espera a que quien dibuje la
+//!   interfaz lo muestre, como antes.
+//! - [`video_view`]: *widget* de `iced` que ocupa el sitio del vídeo. Con compositor solo le dice
+//!   dónde ([`VideoFeed::set_area`]); sin él dibuja el fotograma con
+//!   [`coroom_render::layer::VideoLayer`] en la pasada de la interfaz y con su mismo
+//!   `wgpu::Device`. Los planos I420/NV12 se suben como siempre (una copia de CPU a GPU); las
 //!   imágenes Vulkan del decodificador se importan sin copia con el
 //!   [`coroom_render::wgpu::VideoImporter`] del dispositivo compartido.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use coroom_render::layer::VideoLayer;
@@ -25,6 +28,7 @@ use iced_wgpu::graphics::Viewport;
 use iced_wgpu::primitive::{Pipeline, Primitive};
 use iced_widget::shader;
 
+use super::compose::Compositor;
 use crate::probe::{to_cursor_image, to_present_frame};
 use coroom_ui::Element;
 use iced_wgpu::wgpu;
@@ -45,7 +49,7 @@ pub fn set_hdr_headroom(headroom: f32) {
     HDR_HEADROOM.store(headroom.max(1.0).to_bits(), Ordering::Relaxed);
 }
 
-fn hdr_headroom() -> f32 {
+pub(super) fn hdr_headroom() -> f32 {
     f32::from_bits(HDR_HEADROOM.load(Ordering::Relaxed))
 }
 
@@ -64,6 +68,8 @@ struct FeedState {
     closed: bool,
     /// Copias de CPU del último fotograma subido.
     copies: u32,
+    /// Dónde va el vídeo en la ventana (píxeles físicos), según la interfaz.
+    area: Option<[f32; 4]>,
 }
 
 /// Último fotograma de una fuente de vídeo, entre el pipeline y la ventana.
@@ -73,6 +79,8 @@ pub struct VideoFeed {
     shown: Condvar,
     wake: Wake,
     importer: Option<VideoImporter>,
+    /// El compositor de la ventana, si la fuente se compone en ella.
+    compositor: Option<Weak<Compositor>>,
 }
 
 impl std::fmt::Debug for VideoFeed {
@@ -86,19 +94,56 @@ impl std::fmt::Debug for VideoFeed {
 
 impl VideoFeed {
     /// Fuente nueva que llama a `wake` con cada fotograma; `importer` para las imágenes Vulkan.
-    pub fn new(importer: Option<VideoImporter>, wake: Wake) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(
+        importer: Option<VideoImporter>,
+        wake: Wake,
+        compositor: Option<&Arc<Compositor>>,
+    ) -> Arc<Self> {
+        let feed = Arc::new(Self {
             id: NEXT_FEED.fetch_add(1, Ordering::Relaxed),
-            state: Mutex::new(FeedState::default()),
+            state: Mutex::default(),
             shown: Condvar::new(),
             wake,
             importer,
-        })
+            compositor: compositor.map(Arc::downgrade),
+        });
+        if let Some(compositor) = compositor {
+            compositor.register(&feed);
+        }
+        feed
     }
 
-    /// Fuente sin ventana (capturas de pantalla y tests).
+    /// Fuente sin ventana (capturas de pantalla y tests): quien dibuje la interfaz muestra el
+    /// fotograma.
     pub fn detached() -> Arc<Self> {
-        Self::new(None, Arc::new(|| {}))
+        Self::new(None, Arc::new(|| {}), None)
+    }
+
+    /// Si la fuente se compone en la ventana (el *widget* solo marca su sitio).
+    pub fn is_composited(&self) -> bool {
+        self.compositor.is_some()
+    }
+
+    /// Dónde va el vídeo en la ventana (píxeles físicos), lo que dijo la interfaz la última vez.
+    pub(super) fn area(&self) -> Option<[f32; 4]> {
+        self.lock().area
+    }
+
+    /// La interfaz dice dónde va el vídeo (píxeles físicos); si cambia, se recompone.
+    pub(super) fn set_area(&self, area: [f32; 4]) {
+        let changed = {
+            let mut state = self.lock();
+            let changed = state.area != Some(area);
+            state.area = Some(area);
+            changed
+        };
+        if changed && let Some(compositor) = self.compositor() {
+            compositor.present_video();
+        }
+    }
+
+    fn compositor(&self) -> Option<Arc<Compositor>> {
+        self.compositor.as_ref().and_then(Weak::upgrade)
     }
 
     fn lock(&self) -> MutexGuard<'_, FeedState> {
@@ -110,24 +155,39 @@ impl VideoFeed {
         self.id
     }
 
-    /// Deja `frame` como el último y avisa a la ventana, sin esperar.
+    /// Deja `frame` como el último. Con compositor, lo compone y lo entrega ya; si no, avisa a la
+    /// ventana. La interfaz se despierta solo cuando cambia algo que le importa (el primer fotograma
+    /// o el tamaño), no con cada fotograma.
     pub fn push(
         &self,
         frame: PresentFrame,
         cursor: Option<CursorOverlay>,
         cursor_image: Option<Arc<CursorImage>>,
     ) {
-        {
+        let layout_changed = {
             let mut state = self.lock();
+            let changed = state
+                .frame
+                .as_ref()
+                .is_none_or(|last| (last.width, last.height) != (frame.width, frame.height));
             state.frame = Some(frame);
             state.cursor = cursor;
             state.cursor_image = cursor_image;
+            changed
+        };
+        match self.compositor() {
+            Some(compositor) => {
+                compositor.present_video();
+                if layout_changed {
+                    (self.wake)();
+                }
+            }
+            None => (self.wake)(),
         }
-        (self.wake)();
     }
 
-    /// Como [`VideoFeed::push`], y espera a que la ventana lo muestre (o a `timeout`, o a que se
-    /// cierre). Devuelve si se mostró.
+    /// Como [`VideoFeed::push`] y, sin compositor, espera a que la ventana lo muestre (o a
+    /// `timeout`, o a que se cierre). Devuelve si se mostró.
     pub fn push_and_wait(
         &self,
         frame: PresentFrame,
@@ -137,6 +197,11 @@ impl VideoFeed {
     ) -> bool {
         let frame_id = frame.frame_id;
         self.push(frame, cursor, cursor_image);
+        if self.compositor.is_some() {
+            // Ya se compuso en este hilo: o salió, o la ventana no podía (oculta) y no se espera.
+            let state = self.lock();
+            return !state.closed && state.shown.is_some_and(|shown| shown >= frame_id);
+        }
         let deadline = Instant::now() + timeout;
         let mut state = self.lock();
         loop {
@@ -192,7 +257,12 @@ impl VideoFeed {
     }
 
     /// Sube (o importa) el fotograma pendiente en `layer` y coloca el cursor.
-    fn prepare(&self, layer: &mut VideoLayer, device: &wgpu::Device, queue: &wgpu::Queue) {
+    pub(super) fn prepare(
+        &self,
+        layer: &mut VideoLayer,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
         let mut state = self.lock();
         layer.set_cursor(device, queue, state.cursor, state.cursor_image.clone());
         let Some(frame) = state.frame.as_ref() else {
@@ -265,7 +335,8 @@ impl FrameSink for FeedSink {
     }
 }
 
-/// El *widget* de vídeo: llena su espacio con el fotograma de `feed`, con bandas negras.
+/// El *widget* de vídeo: llena su espacio con el fotograma de `feed`, con bandas negras (con
+/// compositor, el espacio queda transparente y el compositor pone el vídeo debajo).
 pub fn video_view<'a, M: 'a>(feed: &Arc<VideoFeed>) -> Element<'a, M> {
     shader::Shader::new(VideoProgram {
         feed: Arc::clone(feed),
@@ -322,6 +393,17 @@ impl Primitive for VideoPrimitive {
         bounds: &Rectangle,
         viewport: &Viewport,
     ) {
+        let scale = viewport.scale_factor();
+        let area = [
+            bounds.x * scale,
+            bounds.y * scale,
+            bounds.width * scale,
+            bounds.height * scale,
+        ];
+        if self.feed.is_composited() {
+            self.feed.set_area(area);
+            return;
+        }
         let format = pipeline.format;
         let layer = pipeline
             .layers
@@ -333,19 +415,14 @@ impl Primitive for VideoPrimitive {
             });
         }
         self.feed.prepare(layer, device, queue);
-        let scale = viewport.scale_factor();
-        layer.place(
-            queue,
-            [
-                bounds.x * scale,
-                bounds.y * scale,
-                bounds.width * scale,
-                bounds.height * scale,
-            ],
-        );
+        layer.place(queue, area);
     }
 
     fn draw(&self, pipeline: &VideoPipelines, render_pass: &mut wgpu::RenderPass<'_>) -> bool {
+        if self.feed.is_composited() {
+            // El compositor lo dibuja debajo de la interfaz: aquí queda transparente.
+            return true;
+        }
         if let Some(layer) = pipeline.layers.get(&self.feed.id) {
             layer.draw(render_pass);
         }
@@ -375,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn the_present_thread_waits_until_the_window_shows_the_frame() {
+    fn without_a_compositor_the_present_thread_waits_until_the_window_shows_the_frame() {
         let wakes = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&wakes);
         let feed = VideoFeed::new(
@@ -383,7 +460,9 @@ mod tests {
             Arc::new(move || {
                 counter.fetch_add(1, Ordering::SeqCst);
             }),
+            None,
         );
+        assert!(!feed.is_composited());
         // Sin ventana que lo muestre: vence el plazo.
         assert!(!feed.push_and_wait(frame(1), None, None, Duration::from_millis(20)));
         assert_eq!(wakes.load(Ordering::SeqCst), 1);

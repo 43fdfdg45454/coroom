@@ -28,6 +28,7 @@ use coroom_transport::{Endpoint, EndpointOptions, SignalClient};
 use super::app::{
     AccountInfo, App, AudioDevice, Effect, Event, HostRequest, Invitation, Message, VideoSupport,
 };
+use super::compose::Compositor;
 use super::screens::guest::Stats;
 use super::screens::host::{ShareOptions, SourceChoice};
 use super::settings::{CodecChoice, DecoderChoice, ServerEntry, Settings, VoiceMode};
@@ -99,6 +100,8 @@ pub struct Backend {
     local: Arc<Mutex<Option<LocalRun>>>,
     /// Si la ventana puede presentar en HDR.
     hdr_display: Option<bool>,
+    /// El compositor de la ventana, donde se componen las fuentes de vídeo (ninguno sin ventana).
+    compositor: Option<Arc<Compositor>>,
 }
 
 /// Lo que este equipo hace con 4:4:4 y HDR (sondea los códecs la primera vez).
@@ -159,6 +162,7 @@ impl Backend {
         importer: Option<VideoImporter>,
         output: DecodeOutput,
         settings_path: PathBuf,
+        compositor: Option<Arc<Compositor>>,
     ) -> Self {
         Self {
             notify,
@@ -172,7 +176,13 @@ impl Backend {
             lobby: None,
             local: Arc::new(Mutex::new(None)),
             hdr_display: None,
+            compositor,
         }
+    }
+
+    /// Fuente de vídeo nueva, compuesta en la ventana si la hay.
+    fn feed(&self, importer: Option<VideoImporter>) -> Arc<VideoFeed> {
+        VideoFeed::new(importer, Arc::clone(&self.wake), self.compositor.as_ref())
     }
 
     /// Dice si la ventana puede presentar en HDR (para explicarlo en Ajustes).
@@ -598,7 +608,7 @@ impl Backend {
             "abriendo la sala"
         );
         let slot = Arc::clone(&self.host);
-        let preview = VideoFeed::new(None, Arc::clone(&self.wake));
+        let preview = self.feed(None);
         let on_panic: fn(String) -> Event = |reason| Event::HostEnded(Some(reason));
         self.spawn_or("sala", on_panic, move |notify| {
             let prepared =
@@ -668,7 +678,7 @@ impl Backend {
 
     /// Entra en una sala (`identity`: la del equipo si `None`).
     pub fn start_join(&mut self, identity: Option<Identity>, options: JoinOptions) {
-        let feed = VideoFeed::new(self.importer.clone(), Arc::clone(&self.wake));
+        let feed = self.feed(self.importer.clone());
         let output = self.output.clone();
         let slot = Arc::clone(&self.guest);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -759,7 +769,7 @@ impl Backend {
 
     /// `coroom probe` con ventana: el pipeline local presentando en la ventana.
     pub fn start_probe(&mut self, options: ProbeOptions) -> Arc<VideoFeed> {
-        let feed = VideoFeed::new(self.importer.clone(), Arc::clone(&self.wake));
+        let feed = self.feed(self.importer.clone());
         let ledger = Arc::new(LatencyLedger::new());
         let sink = Box::new(FeedSink::new(Arc::clone(&feed)));
         match start_pipeline_with(&options, sink, Arc::clone(&ledger), self.output.clone()) {

@@ -620,6 +620,25 @@ impl App {
         self.theme = Theme::new(self.mode(), self.accent(), self.fonts);
     }
 
+    /// Si la pantalla es el vídeo del invitado (o la prueba local) ya en marcha.
+    pub fn video_in_front(&self) -> bool {
+        self.screen == Screen::Guest
+            && self
+                .guest
+                .as_ref()
+                .is_some_and(|guest| guest.phase == guest::Phase::Video)
+    }
+
+    /// Fondo bajo la interfaz y el vídeo para el compositor de la ventana: el del vídeo con el
+    /// vídeo delante, el de la ventana si no.
+    pub fn backdrop(&self) -> iced_core::Color {
+        if self.video_in_front() {
+            self.theme.palette.video_backdrop.color()
+        } else {
+            self.theme.background()
+        }
+    }
+
     /// Fuentes de vídeo que hay que dar por mostradas tras dibujar.
     pub fn feeds(&self) -> Vec<Arc<VideoFeed>> {
         let mut feeds = Vec::new();
@@ -1025,10 +1044,17 @@ impl App {
             },
             Screen::Main => self.shell(),
         };
+        // Con el vídeo delante la raíz es transparente: el compositor pone el vídeo debajo de la
+        // interfaz y el fondo lo da [`App::backdrop`].
+        let root_class = if self.video_in_front() {
+            coroom_ui::style::ContainerClass::Transparent
+        } else {
+            coroom_ui::style::ContainerClass::Window
+        };
         let content = container(content)
             .width(Length::Fill)
             .height(Length::Fill)
-            .class(coroom_ui::style::ContainerClass::Window);
+            .class(root_class);
         let toasts = self
             .toasts
             .iter()

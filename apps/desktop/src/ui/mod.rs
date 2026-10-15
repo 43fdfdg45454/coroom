@@ -6,6 +6,8 @@
 //! - [`focus`]: `Tab` y `Mayús+Tab` con vuelta al principio (accesibilidad).
 //! - [`backend`]: ejecuta los efectos (API, sesiones, ajustes) en hilos y avisa con mensajes.
 //! - [`runner`]: la ventana (`winit` + `iced_winit` + `iced_wgpu` con el dispositivo del vídeo).
+//! - [`compose`]: el compositor de la ventana: el vídeo se entrega en cuanto llega y la interfaz,
+//!   dibujada en su textura solo cuando cambia, va encima.
 //! - [`video`]: el vídeo como widget de `iced` (fotogramas por canal desde la sesión).
 //! - [`settings`]: `settings.toml` en el directorio de datos.
 //! - [`system`]: tema claro u oscuro, acento y fuente del sistema.
@@ -16,6 +18,7 @@
 
 pub mod app;
 pub mod backend;
+pub mod compose;
 pub mod focus;
 pub mod runner;
 pub mod screens;

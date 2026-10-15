@@ -1,11 +1,12 @@
-//! El vídeo como capa de la interfaz.
+//! El vídeo como capa de una pasada de dibujo.
 //!
-//! [`VideoLayer`] vive en el hilo de la ventana, dentro del `Pipeline` del *widget* de vídeo de la
-//! interfaz (`iced_wgpu`), con el mismo `wgpu::Device` y la misma cola que la interfaz. Antes de la
-//! pasada sube los planos del fotograma (I420 o NV12, una copia de CPU a GPU, como antes) o importa
-//! la imagen Vulkan del decodificador sin copia ([`crate::wgpu::VideoImporter`]); en la pasada de la
-//! interfaz dibuja el vídeo con bandas negras y el cursor del anfitrión dentro del rectángulo del
-//! *widget* ([`VideoLayer::draw`]).
+//! [`VideoLayer`] vive en el compositor de la ventana (una por fuente de vídeo; la pasada que
+//! compone el vídeo y, encima, la textura de la interfaz) o, sin compositor, dentro del `Pipeline`
+//! del *widget* de vídeo de la interfaz (`iced_wgpu`), siempre con el mismo `wgpu::Device` y la
+//! misma cola que la interfaz. Antes de la pasada sube los planos del fotograma (I420 o NV12, una
+//! copia de CPU a GPU) o importa la imagen Vulkan del decodificador sin copia
+//! ([`crate::wgpu::VideoImporter`]); en la pasada dibuja el vídeo ajustado y el cursor del
+//! anfitrión dentro del rectángulo que le dieron ([`VideoLayer::place`], [`VideoLayer::draw`]).
 
 use std::sync::Arc;
 

@@ -10,8 +10,8 @@ Copias de crates de terceros con cambios propios, enlazadas con `[patch.crates-i
 
 ## Por qué hacen falta
 
-La interfaz (`docs/ARQUITECTURA.md` §3, fila «UI») dibuja el vídeo **en la misma pasada y con el
-mismo `wgpu::Device`** que la interfaz: el dispositivo lo abre `coroom-render` con las colas y
+La ventana (`docs/ARQUITECTURA.md` §3, fila «UI») compone el vídeo y la interfaz **con el mismo
+`wgpu::Device`**: el dispositivo lo abre `coroom-render` con las colas y
 extensiones de Vulkan Video para importar sin copias las imágenes del decodificador. Eso obliga a
 que `iced_wgpu` y el presentador usen la misma versión de `wgpu` (30, la que fija el resto del
 workspace). `iced` 0.14.0 (diciembre de 2025, la última publicada) pide `wgpu` 27; la rama

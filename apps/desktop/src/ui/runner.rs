@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use coroom_render::hdr::HdrOutput;
-use coroom_render::wgpu::{Acquired, GpuContext, HdrSurface, acquire, create_instance};
+use coroom_render::wgpu::{GpuContext, HdrSurface, create_instance};
 use coroom_session::input::capture::{Action, CaptureMode, InputCapture, ShortcutKeys};
 use coroom_session::input::gamepad::{ConnectedPad, GamepadCapture, PadLink};
 use coroom_session::input::keymap::keycode_from_name;
@@ -37,7 +37,9 @@ use coroom_transport::crypto::Identity;
 use coroom_ui::font::Fonts;
 use iced_core::clipboard::Kind;
 
-use iced_core::{Event as UiEvent, Font, InputMethod, Pixels, Size, mouse, renderer, window};
+use iced_core::{
+    Color, Event as UiEvent, Font, InputMethod, Pixels, Size, mouse, renderer, window,
+};
 use iced_runtime::user_interface::{self, UserInterface};
 use iced_wgpu::graphics::{Shell, Viewport};
 use iced_wgpu::{Engine, Renderer, wgpu};
@@ -51,6 +53,7 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 use super::app::{App, Effect, Message, Screen, Shortcut};
 use super::backend::{Backend, GuestControls, Notify};
+use super::compose::Compositor;
 use super::screens::guest::{self, Phase};
 use super::screens::settings as settings_screen;
 use super::settings::{self, Settings, Shortcuts};
@@ -101,12 +104,11 @@ struct WindowInput {
 
 struct Ready {
     window: Arc<Window>,
-    surface: wgpu::Surface<'static>,
     gpu: GpuContext,
-    config: wgpu::SurfaceConfiguration,
+    /// La superficie, el vídeo y la textura de la interfaz: compone y entrega.
+    compositor: Arc<Compositor>,
+    /// Formato de la textura en la que dibuja `iced` (el del compositor).
     render_format: wgpu::TextureFormat,
-    /// Salida HDR (textura intermedia y pasada final), con la superficie HDR.
-    hdr: Option<(HdrOutput, HdrSurface)>,
     /// Lo que se pidió en Ajustes la última vez que se configuró la superficie.
     hdr_requested: bool,
     renderer: Renderer,
@@ -231,7 +233,10 @@ fn make_renderer(gpu: &GpuContext, format: wgpu::TextureFormat) -> Renderer {
 }
 
 /// Salida HDR para una superficie HDR (y el margen de la pantalla para el vídeo).
-fn make_hdr(gpu: &GpuContext, surface: Option<HdrSurface>) -> Option<(HdrOutput, HdrSurface)> {
+pub(super) fn make_hdr(
+    gpu: &GpuContext,
+    surface: Option<HdrSurface>,
+) -> Option<(HdrOutput, HdrSurface)> {
     let surface = surface?;
     let output = HdrOutput::new(&gpu.device, coroom_render::hdr::HDR_FORMAT);
     output.set_scale(&gpu.queue, surface.sdr_white_scale);
@@ -272,6 +277,8 @@ impl Runner {
             .map_err(|err| t!("runner-no-se-pudo-preparar-la-ventana", err = err))?;
         surface.configure(&gpu.device, &setup.config);
         let hdr = make_hdr(&gpu, setup.hdr);
+        let hdr_display = gpu.hdr_available(&surface);
+        let compositor = Compositor::new(&gpu, surface, &setup, hdr);
 
         let appearance = system::read();
         let fonts = Fonts::detect(appearance.font.as_deref());
@@ -305,8 +312,9 @@ impl Runner {
             gpu.importer(),
             decode_output_for(gpu.vulkan_share()),
             settings_path,
+            Some(Arc::clone(&compositor)),
         );
-        backend.set_hdr_display(gpu.hdr_available(&surface));
+        backend.set_hdr_display(hdr_display);
         match self.launch.take().unwrap_or(Launch::App) {
             Launch::App => {
                 app.login.restoring = !app.settings.servers.is_empty();
@@ -344,10 +352,8 @@ impl Runner {
         let clipboard = Clipboard::connect(Arc::clone(&window));
         Ok(Ready {
             window,
-            surface,
-            config: setup.config,
+            compositor,
             render_format: setup.render_format,
-            hdr,
             hdr_requested,
             gpu,
             renderer,
@@ -784,9 +790,7 @@ impl Ready {
             Size::new(size.width.max(1), size.height.max(1)),
             self.window.scale_factor() as f32,
         );
-        self.config.width = size.width.max(1);
-        self.config.height = size.height.max(1);
-        self.surface.configure(&self.gpu.device, &self.config);
+        self.compositor.resize(size.width, size.height);
         self.resized = false;
     }
 
@@ -798,28 +802,24 @@ impl Ready {
         }
         self.hdr_requested = wanted;
         let size = self.window.inner_size();
-        let setup =
-            match self
-                .gpu
-                .surface_setup_with(&self.surface, size.width, size.height, wanted)
-            {
-                Ok(setup) => setup,
-                Err(err) => {
-                    tracing::warn!(error = %err, "no se pudo cambiar la superficie");
-                    return;
-                }
-            };
+        let setup = match self
+            .compositor
+            .configure_hdr(&self.gpu, size.width, size.height, wanted)
+        {
+            Ok(setup) => setup,
+            Err(err) => {
+                tracing::warn!(error = %err, "no se pudo cambiar la superficie");
+                return;
+            }
+        };
         if wanted && setup.hdr.is_none() {
             tracing::info!("la pantalla no expone HDR: el vídeo HDR se ve con tone mapping");
         }
-        self.surface.configure(&self.gpu.device, &setup.config);
-        self.config = setup.config;
         if setup.render_format != self.render_format {
             self.render_format = setup.render_format;
             self.renderer = make_renderer(&self.gpu, self.render_format);
             self.cache = user_interface::Cache::new();
         }
-        self.hdr = make_hdr(&self.gpu, setup.hdr);
         self.window.request_redraw();
     }
 
@@ -894,58 +894,14 @@ impl Ready {
         if let Some(method) = ime {
             self.input_method(method);
         }
-        match acquire(&self.surface, &self.gpu.device, &self.config) {
-            Ok(Acquired::Frame(frame)) => {
-                let format = self.render_format;
-                let view = frame.texture.create_view(&wgpu::TextureViewDescriptor {
-                    format: Some(if self.hdr.is_some() {
-                        self.config.format
-                    } else {
-                        format
-                    }),
-                    ..Default::default()
-                });
-                match &mut self.hdr {
-                    Some((output, _)) => {
-                        // HDR: la interfaz y el vídeo a la textura intermedia y, después, la
-                        // pasada final a la superficie lineal.
-                        let target = output
-                            .target(&self.gpu.device, (self.config.width, self.config.height));
-                        let _ = self.renderer.present(
-                            Some(theme.background()),
-                            format,
-                            target,
-                            &self.viewport,
-                        );
-                        let mut encoder = self.gpu.device.create_command_encoder(
-                            &wgpu::CommandEncoderDescriptor {
-                                label: Some("coroom-hdr"),
-                            },
-                        );
-                        output.composite(&mut encoder, &view);
-                        self.gpu.queue.submit([encoder.finish()]);
-                    }
-                    None => {
-                        let _ = self.renderer.present(
-                            Some(theme.background()),
-                            format,
-                            &view,
-                            &self.viewport,
-                        );
-                    }
-                }
-                self.gpu.queue.present(frame);
-                for feed in self.app.feeds() {
-                    feed.commit_shown();
-                }
-            }
-            Ok(Acquired::Skip) => {}
-            Err(err) => {
-                tracing::warn!(error = %err, "no se pudo dibujar la ventana");
-                self.resized = true;
-                self.window.request_redraw();
-            }
-        }
+        // La interfaz va a su textura (transparente donde no dibuja nada: el vídeo se ve
+        // debajo) y el compositor la pone sobre el fondo y el vídeo y entrega.
+        let format = self.render_format;
+        let renderer = &mut self.renderer;
+        let viewport = &self.viewport;
+        self.compositor.draw_ui(self.app.backdrop(), |target| {
+            let _ = renderer.present(Some(Color::TRANSPARENT), format, target, viewport);
+        });
         for message in messages {
             self.dispatch(message);
         }

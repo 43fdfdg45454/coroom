@@ -1411,10 +1411,16 @@ fn shortcuts_line(shortcuts: &crate::ui::settings::Shortcuts) -> String {
 }
 
 fn video<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
+    // Con compositor el vídeo va debajo de la interfaz: la base queda transparente; sin él (las
+    // capturas) el fondo negro de las bandas lo pone el contenedor.
     let base = container(video_view(&state.feed))
         .width(Length::Fill)
         .height(Length::Fill)
-        .class(ContainerClass::Video);
+        .class(if state.feed.is_composited() {
+            ContainerClass::Transparent
+        } else {
+            ContainerClass::Video
+        });
     let mut layers: Vec<Element<'a, Message>> = vec![base.into()];
     let bar_visible = state.bar_visible(app.now);
     let mut overlay = Column::new().spacing(space::S).padding(space::S);
