@@ -942,6 +942,14 @@ fn qa_freezes() {
 /// proporción), cambiar los fps de 15 a 240, una ráfaga alternando los dos y valores que no
 /// valen (0×0, 0 fps), que tienen que devolver error sin tumbar nada. Imprime el tamaño y los fps
 /// que ve el invitado tras cada paso.
+/// Un paso de `qa_live_resolution_fps`: nombre, tope, fps y el tamaño que debe ver el invitado.
+type Step = (
+    &'static str,
+    Option<(u32, u32)>,
+    Option<u32>,
+    Option<(u32, u32)>,
+);
+
 #[test]
 #[ignore = "necesita GPU; QA manual"]
 fn qa_live_resolution_fps() {
@@ -970,7 +978,7 @@ fn qa_live_resolution_fps() {
         std::thread::sleep(Duration::from_secs(2));
         (seen.frames() - before) as f64 / 2.0
     };
-    let steps: [(&str, Option<(u32, u32)>, Option<u32>, Option<(u32, u32)>); 12] = [
+    let steps: [Step; 12] = [
         (
             "tope 1920×1080",
             Some((1920, 1080)),
