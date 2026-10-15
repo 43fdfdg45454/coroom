@@ -1,18 +1,29 @@
 //! Audio por **WASAPI** en Windows (feature `wasapi`) con la crate `wasapi` 0.26 (HEnquist, MIT,
 //! mantenida: publicada en octubre de 2026, sobre `windows` 0.62 como el resto del proyecto).
 //!
-//! Todo en **modo compartido por eventos** y `S16LE` 48 kHz con conversión automática
-//! (`AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`). Cada flujo vive en su hilo (`wasapi-audio`), que
-//! inicializa COM (MTA), espera los eventos del dispositivo y copia entre su búfer y el anillo
-//! compartido con el hilo de audio de la sesión (como el backend de PipeWire).
+//! Todo en **modo compartido por eventos**. El micrófono y la reproducción se abren en el **modo
+//! compartido de baja latencia** de `IAudioClient3` ([`open_shared`]): se pregunta al motor sus
+//! periodos para el formato (`GetSharedModeEnginePeriod`) y se inicializa con el **mínimo**
+//! (`InitializeSharedAudioStream`; 2-3 ms en vez de los 10 ms del periodo por defecto), primero
+//! con nuestro `S16LE` a 48 kHz y, si el motor no lo acepta sin convertir (ese modo no admite
+//! `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`), con su **formato de mezcla** (coma flotante de 32 bits
+//! con los canales del dispositivo, casi siempre) y convertimos nosotros
+//! ([`crate::convert::DeviceFormat`]; solo si mezcla a 48 kHz: no remuestreamos). Si tampoco (un
+//! Windows sin `IAudioClient3`, una mezcla a 44,1 kHz), el modo compartido clásico de
+//! `IAudioClient::Initialize` con conversión automática y el periodo por defecto, como antes. El
+//! periodo obtenido se registra al abrir. El *loopback* (del dispositivo o por proceso) necesita
+//! las banderas de `Initialize` y sigue en el modo clásico. Cada flujo vive en su hilo
+//! (`wasapi-audio`), que inicializa COM (MTA), espera los eventos del dispositivo y copia entre su
+//! búfer y el anillo compartido con el hilo de audio de la sesión (como el backend de PipeWire).
 //!
 //! La reproducción va **a demanda** por defecto ([`AudioSink::start_pull`]): en cada evento se
 //! rellena el búfer del dispositivo hasta el nivel de [`crate::pacing::Pacing`] (un periodo del
-//! motor, el que dice `GetDevicePeriod`, más el margen que se mide en los propios eventos)
-//! pidiendo las tramas a la sesión en ese momento. El motor no consume siempre 480 tramas por
-//! pasada (mezcla a 44,1 kHz, periodos de 512 tramas o de 20 ms en USB y Bluetooth, despertares
-//! tardíos que funden dos eventos): escribir una trama de 10 ms por evento lo dejaba sin audio a
-//! trozos y el sonido era robótico.
+//! motor, el que se obtuvo al abrir, más el margen que se mide en los propios eventos) pidiendo
+//! las tramas a la sesión en ese momento ([`Pull`] reparte cada trama de 10 ms entre los periodos
+//! que hagan falta). El motor no consume siempre 480 tramas por pasada (periodos de 128 o 144
+//! tramas en baja latencia, mezcla a 44,1 kHz, periodos de 512 tramas o de 20 ms en USB y
+//! Bluetooth, despertares tardíos que funden dos eventos): escribir una trama de 10 ms por evento
+//! lo dejaba sin audio a trozos y el sonido era robótico.
 //!
 //! **Cuándo suena cada trama**: con la posición del dispositivo (`IAudioClock::GetPosition`,
 //! convertida con `GetFrequency`), lo escrito y aún no reproducido es «tramas escritas − posición»,
@@ -43,9 +54,10 @@ use std::time::{Duration, Instant};
 
 use wasapi::{
     AudioCaptureClient, AudioClient, AudioClock, AudioRenderClient, DeviceEnumerator, Direction,
-    Handle, SampleType, StreamMode, WaveFormat,
+    Handle, SampleType, StreamMode, TimingMode, WaveFormat,
 };
 
+use crate::convert::{DeviceFormat, Sample as DeviceSample};
 use crate::pacing::{Pacing, hns_to_frames};
 use crate::ring::{Pull, Shared};
 use crate::{
@@ -161,16 +173,62 @@ fn device(
     }
 }
 
-/// Abre el flujo; devuelve también las tramas de silencio escritas antes de arrancar.
-fn open(
-    endpoint: &Endpoint,
-    format: AudioFormat,
-) -> Result<(AudioClient, Handle, Io, u64), AudioError> {
+/// Nuestro formato en el cable: `S16LE` a 48 kHz con los canales de `format`.
+fn pcm16_wave(format: AudioFormat) -> WaveFormat {
+    WaveFormat::new(
+        16,
+        16,
+        &SampleType::Int,
+        SAMPLE_RATE_HZ as usize,
+        usize::from(format.channels),
+        None,
+    )
+}
+
+/// Lo que devuelve [`open`]: el cliente inicializado y arrancado, su evento, el cliente de
+/// captura o de reproducción (con su ritmo), las tramas de silencio escritas antes de arrancar y
+/// el formato de las tramas del dispositivo (el nuestro, o el de mezcla si así se consiguió la
+/// baja latencia).
+struct Opened {
+    client: AudioClient,
+    handle: Handle,
+    io: Io,
+    prefilled: u64,
+    device: DeviceFormat,
+}
+
+/// Abre el flujo.
+fn open(endpoint: &Endpoint, format: AudioFormat) -> Result<Opened, AudioError> {
     let enumerator = DeviceEnumerator::new().map_err(backend)?;
-    let mut client = match endpoint {
+    let wave = pcm16_wave(format);
+    let ours = DeviceFormat::pcm16(usize::from(format.channels));
+    let direction = match endpoint {
+        Endpoint::Render(_) => Direction::Render,
+        _ => Direction::Capture,
+    };
+    // El modo compartido clásico: `Initialize` con conversión automática y el periodo por defecto.
+    let classic = |mut client: AudioClient| -> Result<AudioClient, AudioError> {
+        let mode = StreamMode::EventsShared {
+            autoconvert: true,
+            buffer_duration_hns: match direction {
+                Direction::Render => RENDER_BUFFER_HNS,
+                Direction::Capture => BUFFER_HNS,
+            },
+        };
+        client
+            .initialize_client(&wave, &direction, &mode)
+            .map_err(backend)?;
+        Ok(client)
+    };
+    let (client, device, engine_period) = match endpoint {
+        // El loopback (del proceso o del dispositivo) necesita la bandera de `Initialize`:
+        // `InitializeSharedAudioStream` no lo admite, así que va en el modo clásico.
         Endpoint::AllButSelf => {
             // `false`: EXCLUDE_TARGET_PROCESS_TREE de este proceso.
-            match AudioClient::new_application_loopback_client(std::process::id(), false) {
+            let client = match AudioClient::new_application_loopback_client(
+                std::process::id(),
+                false,
+            ) {
                 Ok(client) => client,
                 Err(err) => {
                     tracing::warn!(
@@ -182,98 +240,247 @@ fn open(
                         .get_iaudioclient()
                         .map_err(backend)?
                 }
-            }
+            };
+            (classic(client)?, ours, None)
         }
         Endpoint::ProcessTree(pid) => {
             // `true`: INCLUDE_TARGET_PROCESS_TREE (con `false` sería todo menos el proceso).
-            AudioClient::new_application_loopback_client(*pid, true).map_err(|err| {
+            let client = AudioClient::new_application_loopback_client(*pid, true).map_err(|err| {
                 AudioError::Unsupported(format!(
                     "no se pudo abrir el loopback del proceso {pid} ({err}); hace falta Windows 10 \
                      20348 o posterior y que el proceso exista"
                 ))
-            })?
+            })?;
+            (classic(client)?, ours, None)
         }
-        Endpoint::Capture(name) => device(&enumerator, Direction::Capture, name.as_deref())?
-            .get_iaudioclient()
-            .map_err(backend)?,
-        Endpoint::Render(name) => device(&enumerator, Direction::Render, name.as_deref())?
-            .get_iaudioclient()
-            .map_err(backend)?,
+        Endpoint::Capture(name) => open_shared(
+            &device(&enumerator, Direction::Capture, name.as_deref())?,
+            &wave,
+            format,
+            direction,
+            classic,
+        )?,
+        Endpoint::Render(name) => open_shared(
+            &device(&enumerator, Direction::Render, name.as_deref())?,
+            &wave,
+            format,
+            direction,
+            classic,
+        )?,
     };
-    let wave = WaveFormat::new(
-        16,
-        16,
-        &SampleType::Int,
-        SAMPLE_RATE_HZ as usize,
-        usize::from(format.channels),
-        None,
-    );
-    let direction = match endpoint {
-        Endpoint::Render(_) => Direction::Render,
-        _ => Direction::Capture,
-    };
-    let mode = StreamMode::EventsShared {
-        autoconvert: true,
-        buffer_duration_hns: match direction {
-            Direction::Render => RENDER_BUFFER_HNS,
-            Direction::Capture => BUFFER_HNS,
-        },
-    };
-    client
-        .initialize_client(&wave, &direction, &mode)
-        .map_err(backend)?;
     let handle = client.set_get_eventhandle().map_err(backend)?;
     let mut prefilled = 0;
     let io = match direction {
         Direction::Render => {
             let render = client.get_audiorenderclient().map_err(backend)?;
-            let mut pacing = render_pacing(&client)?;
+            let mut pacing = render_pacing(&client, engine_period, device)?;
             // Un periodo de silencio antes de arrancar: la primera pasada del motor tiene qué leer
             // y el primer evento ya rellena hasta el objetivo.
             let prefill = pacing.prefill();
-            let silence = vec![0u8; prefill * 2 * usize::from(format.channels)];
+            let silence = vec![0u8; prefill * device.bytes_per_frame()];
             render
                 .write_to_device(prefill, &silence, None)
                 .map_err(backend)?;
             prefilled = prefill as u64;
             Io::Render(render, pacing)
         }
-        Direction::Capture => Io::Capture(client.get_audiocaptureclient().map_err(backend)?),
+        Direction::Capture => {
+            match engine_period {
+                Some(period) => tracing::info!(
+                    period_frames = period,
+                    period_ms = f64::from(period) * 1000.0 / f64::from(SAMPLE_RATE_HZ),
+                    ?device,
+                    "captura WASAPI en modo compartido de baja latencia (IAudioClient3)"
+                ),
+                None => tracing::info!(?device, "captura WASAPI en modo compartido clásico"),
+            }
+            Io::Capture(client.get_audiocaptureclient().map_err(backend)?)
+        }
     };
     client.start_stream().map_err(backend)?;
-    Ok((client, handle, io, prefilled))
+    Ok(Opened {
+        client,
+        handle,
+        io,
+        prefilled,
+        device,
+    })
 }
 
-/// Búfer y periodo de un flujo de reproducción ya inicializado, en tramas de nuestro formato (a
-/// 48 kHz: con la conversión automática, el búfer y el relleno se cuentan en él).
-fn render_pacing(client: &AudioClient) -> Result<Pacing, AudioError> {
+/// Abre un flujo compartido en `device`: en el modo de baja latencia de `IAudioClient3` (el
+/// periodo mínimo del motor, por eventos) con nuestro formato o, si el motor no lo admite sin
+/// convertir, con su formato de mezcla (convertimos nosotros); si tampoco, en el modo compartido
+/// clásico (`classic`) con la conversión automática del motor. Cada intento parte de un
+/// `IAudioClient` nuevo: uno al que le falló `Initialize` no se reutiliza. Devuelve el cliente,
+/// el formato de las tramas del dispositivo y el periodo del motor en tramas si hay baja latencia.
+fn open_shared(
+    device: &wasapi::Device,
+    wave: &WaveFormat,
+    format: AudioFormat,
+    direction: Direction,
+    classic: impl Fn(AudioClient) -> Result<AudioClient, AudioError>,
+) -> Result<(AudioClient, DeviceFormat, Option<u32>), AudioError> {
+    let ours = DeviceFormat::pcm16(usize::from(format.channels));
+    match low_latency(device, wave) {
+        Ok((client, period)) => return Ok((client, ours, Some(period))),
+        Err(reason) => tracing::debug!(
+            ?direction,
+            %reason,
+            "sin baja latencia con S16 a 48 kHz: se prueba el formato de mezcla"
+        ),
+    }
+    let mix = device
+        .get_iaudioclient()
+        .map_err(|err| err.to_string())
+        .and_then(|client| client.get_mixformat().map_err(|err| err.to_string()))
+        .and_then(|mix| mix_device_format(&mix).map(|device| (mix, device)));
+    match mix {
+        Ok((mix, mix_device)) => match low_latency(device, &mix) {
+            Ok((client, period)) => return Ok((client, mix_device, Some(period))),
+            Err(reason) => tracing::debug!(
+                ?direction,
+                %reason,
+                ?mix_device,
+                "sin baja latencia con el formato de mezcla: modo compartido clásico"
+            ),
+        },
+        Err(reason) => tracing::debug!(
+            ?direction,
+            %reason,
+            "el formato de mezcla no se puede convertir aquí: modo compartido clásico"
+        ),
+    }
+    let client = classic(device.get_iaudioclient().map_err(backend)?)?;
+    Ok((client, ours, None))
+}
+
+/// Abre un `IAudioClient` nuevo de `device` en el modo compartido de baja latencia para `wave`
+/// (`IAudioClient3`, por eventos): con el periodo mínimo del motor y, si otro proceso tiene el
+/// periodo del motor fijado (`AUDCLNT_E_ENGINE_PERIODICITY_LOCKED`: un navegador o un cliente de
+/// voz ya con baja latencia), con el periodo que el motor tiene ahora, que sigue siendo menor que
+/// los 10 ms del modo clásico. Cada intento parte de un cliente nuevo (uno al que le falló
+/// `Initialize` no se reutiliza). Devuelve el cliente y el periodo que quedó, en tramas.
+fn low_latency(device: &wasapi::Device, wave: &WaveFormat) -> Result<(AudioClient, u32), String> {
+    let mut client = device
+        .get_iaudioclient()
+        .map_err(|err| format!("IAudioClient: {err}"))?;
+    let periods = client
+        .get_shared_mode_engine_period(wave)
+        .map_err(|err| format!("GetSharedModeEnginePeriod: {err}"))?;
+    if periods.min == 0 {
+        return Err("el motor no dice su periodo mínimo".to_owned());
+    }
+    let locked = client
+        .get_current_shared_mode_engine_period()
+        .ok()
+        .map(|(_, period)| period)
+        .filter(|period| *period > 0 && *period != periods.min);
+    let mut attempts = vec![("mínimo", periods.min)];
+    if let Some(current) = locked {
+        attempts.push(("actual", current));
+    }
+    let mut failures = Vec::new();
+    for (which, requested) in attempts {
+        match client.initialize_shared_audio_stream(wave, TimingMode::Events, requested) {
+            Ok(()) => {
+                let current = client
+                    .get_current_shared_mode_engine_period()
+                    .ok()
+                    .map(|(_, period)| period)
+                    .filter(|period| *period > 0)
+                    .unwrap_or(requested);
+                tracing::debug!(
+                    default = periods.default,
+                    fundamental = periods.fundamental,
+                    min = periods.min,
+                    max = periods.max,
+                    requested,
+                    which,
+                    period = current,
+                    "periodos del motor de audio (tramas)"
+                );
+                return Ok((client, current));
+            }
+            Err(err) => {
+                failures.push(format!(
+                    "InitializeSharedAudioStream con {requested} tramas ({which}): {err}"
+                ));
+                client = device
+                    .get_iaudioclient()
+                    .map_err(|err| format!("IAudioClient: {err}"))?;
+            }
+        }
+    }
+    Err(failures.join("; "))
+}
+
+/// El formato de mezcla del motor como formato de las tramas del dispositivo, si podemos
+/// convertirlo nosotros: a 48 kHz (no remuestreamos) con muestras en coma flotante de 32 bits o
+/// enteras de 16 o 32 bits.
+fn mix_device_format(mix: &WaveFormat) -> Result<DeviceFormat, String> {
+    if mix.get_samplespersec() != SAMPLE_RATE_HZ {
+        return Err(format!("la mezcla va a {} Hz", mix.get_samplespersec()));
+    }
+    let channels = usize::from(mix.get_nchannels());
+    if channels == 0 {
+        return Err("la mezcla no tiene canales".to_owned());
+    }
+    let kind = mix.get_subformat().map_err(|err| err.to_string())?;
+    let sample = match (kind, mix.get_bitspersample()) {
+        (SampleType::Float, 32) => DeviceSample::Float32,
+        (SampleType::Int, 16) => DeviceSample::Int16,
+        (SampleType::Int, 32) => DeviceSample::Int32 {
+            valid_bits: mix.get_validbitspersample(),
+        },
+        (kind, bits) => return Err(format!("muestras {kind:?} de {bits} bits")),
+    };
+    Ok(DeviceFormat { sample, channels })
+}
+
+/// Búfer y periodo de un flujo de reproducción ya inicializado, en tramas a 48 kHz (las del
+/// dispositivo coinciden con las nuestras: el formato de mezcla solo se usa a 48 kHz, y con la
+/// conversión automática el búfer y el relleno se cuentan en nuestro formato). `engine_period` es
+/// el periodo obtenido en baja latencia; sin él, el que dice `GetDevicePeriod`.
+fn render_pacing(
+    client: &AudioClient,
+    engine_period: Option<u32>,
+    device: DeviceFormat,
+) -> Result<Pacing, AudioError> {
     let buffer = client.get_buffer_size().map_err(backend)? as usize;
     let (period_hns, min_period_hns) = client.get_device_period().unwrap_or((0, 0));
-    let pacing = Pacing::new(buffer, hns_to_frames(period_hns));
+    let period = match engine_period {
+        Some(frames) => frames as usize,
+        None => hns_to_frames(period_hns),
+    };
+    let pacing = Pacing::new(buffer, period);
     let latency_hns = stream_latency(client).map_or(0, |latency| latency.as_nanos() / 100);
+    tracing::info!(
+        buffer_frames = buffer,
+        period_frames = pacing.period,
+        period_ms = pacing.period as f64 * 1000.0 / f64::from(SAMPLE_RATE_HZ),
+        target_frames = pacing.target,
+        low_latency = engine_period.is_some(),
+        ?device,
+        latency_hns,
+        "salida WASAPI ({})",
+        if engine_period.is_some() {
+            "modo compartido de baja latencia, IAudioClient3"
+        } else {
+            "modo compartido clásico"
+        }
+    );
     match client.get_mixformat() {
         Ok(mix) => tracing::debug!(
-            buffer_frames = buffer,
             period_hns,
             min_period_hns,
-            period_frames = pacing.period,
-            target_frames = pacing.target,
-            latency_hns,
             mix_rate_hz = mix.get_samplespersec(),
             mix_channels = mix.get_nchannels(),
             mix_bits = mix.get_bitspersample(),
-            "salida WASAPI"
+            "formato de mezcla del motor"
         ),
-        Err(err) => tracing::debug!(
-            buffer_frames = buffer,
-            period_hns,
-            min_period_hns,
-            period_frames = pacing.period,
-            target_frames = pacing.target,
-            latency_hns,
-            error = %err,
-            "salida WASAPI (sin formato de mezcla)"
-        ),
+        Err(err) => {
+            tracing::debug!(period_hns, min_period_hns, error = %err, "sin formato de mezcla")
+        }
     }
     Ok(pacing)
 }
@@ -293,7 +500,13 @@ fn run(
         Err(reason) => tracing::debug!(%reason, "wasapi-audio sin tiempo real"),
     }
     let _ = wasapi::initialize_mta();
-    let (client, handle, mut io, prefilled) = match open(&endpoint, format) {
+    let Opened {
+        client,
+        handle,
+        mut io,
+        prefilled,
+        device,
+    } = match open(&endpoint, format) {
         Ok(opened) => opened,
         Err(err) => {
             shared.fail(err.clone());
@@ -303,7 +516,8 @@ fn run(
     };
     let _ = ready.send(Ok(()));
     let channels = usize::from(format.channels);
-    let bytes_per_frame = 2 * channels;
+    // Las tramas del dispositivo (su formato) y las nuestras: la misma cuenta, a 48 kHz las dos.
+    let bytes_per_frame = device.bytes_per_frame();
     // Búferes reservados una vez: 100 ms o el búfer del dispositivo, lo que sea más.
     let frames_max = match &io {
         Io::Render(_, pacing) => pacing.buffer.max(SAMPLES_PER_CHANNEL * 10),
@@ -311,6 +525,8 @@ fn run(
     };
     let mut bytes = vec![0u8; frames_max * bytes_per_frame];
     let mut samples = vec![0i16; frames_max * channels];
+    // Captura: lo leído del dispositivo, ya en nuestro formato.
+    let mut decoded = Vec::with_capacity(frames_max * channels);
     let mut pull = pull.map(Pull::new);
     let clock = DeviceClock::new(&client);
     let latency = stream_latency(&client);
@@ -349,13 +565,12 @@ fn run(
                             let captured_at = reference
                                 .filter(|_| !info.flags.timestamp_error && info.timestamp > 0)
                                 .and_then(|reference| qpc_to_instant(info.timestamp, reference));
+                            device.decode(&bytes[..len], channels, &mut decoded);
                             shared.push(
                                 format,
-                                bytes[..len]
-                                    .as_chunks::<2>()
-                                    .0
+                                decoded
                                     .iter()
-                                    .map(|&pair| if silent { 0 } else { i16::from_le_bytes(pair) }),
+                                    .map(|&sample| if silent { 0 } else { sample }),
                                 captured_at,
                             );
                         }
@@ -412,15 +627,8 @@ fn run(
                     }
                     None => shared.pop_into(&mut samples[..wanted]),
                 }
-                for (chunk, sample) in bytes[..wanted * 2]
-                    .as_chunks_mut::<2>()
-                    .0
-                    .iter_mut()
-                    .zip(&samples[..wanted])
-                {
-                    *chunk = sample.to_le_bytes();
-                }
-                if let Err(err) = render.write_to_device(frames, &bytes[..wanted * 2], None) {
+                let len = device.encode(&samples[..wanted], channels, &mut bytes);
+                if let Err(err) = render.write_to_device(frames, &bytes[..len], None) {
                     shared.fail(backend(err));
                     return;
                 }

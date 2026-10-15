@@ -8,7 +8,17 @@
 //!
 //! - **Formato**: `SPA_AUDIO_FORMAT_S16LE` a 48 kHz con los canales pedidos (FL, FR o MONO); el
 //!   adaptador de PipeWire convierte si el dispositivo usa otro. Latencia pedida
-//!   `node.latency = 480/48000` (10 ms).
+//!   `node.latency` de [`PLAYBACK_LATENCY`] y [`CAPTURE_LATENCY`] (128 tramas, 2,7 ms): el
+//!   pipeline sigue en tramas de 10 ms, pero el cuanto del grafo es menor y lo que se escribe o
+//!   se lee espera menos en el dispositivo (medidas en los comentarios de las constantes).
+//! - **Lo que pide el grafo**: en cada ciclo de reproducción se escriben justo las tramas que pide
+//!   (`pw_buffer.requested`, feature `v0_3_49` de `pipewire-rs`): lo que le falta al cuanto,
+//!   descontado lo que aún tiene en cola del ciclo anterior. Escribir siempre una trama de 480
+//!   dejaba cola en el flujo: con `480/48000` el cuanto es 256 (PipeWire redondea hacia abajo a
+//!   una potencia de dos), el grafo pedía 32-256 tramas, se saltaba el callback 2-4 ciclos (con
+//!   cuanto 128, huecos de 18-21 ms entre callbacks), lo escrito sonaba hasta 4,7 ms después de lo
+//!   que decía `played_at` y bajar `node.latency` no quitaba nada. Con lo pedido exacto, la cola
+//!   es cero y lo escrito suena a `pw_time.delay` del ciclo. Requiere PipeWire ≥ 0.3.49.
 //! - **Tiempo real**: los flujos se conectan con `PW_STREAM_FLAG_RT_PROCESS`, así `process` corre
 //!   en el hilo de datos de PipeWire, que ya tiene prioridad de tiempo real (`module-rt`, con
 //!   RealtimeKit o el portal), en vez de en el bucle principal de este hilo, que competía con el
@@ -51,6 +61,22 @@ use crate::{
 
 /// Espera máxima a que el hilo de PipeWire conecte el flujo.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// `node.latency` que se pide para reproducir: 128 tramas a 48 kHz (2,7 ms). PipeWire redondea el
+/// cuanto hacia **abajo** a una potencia de dos (480 → 256, 240 → 128, 128 → 128). Medido en un
+/// PC con PipeWire 1.6.9 y auriculares USB (cuanto del grafo 1024, mínimo 32, nodo ALSA con
+/// `api.alsa.headroom = 512` y periodo 512): `pw_time.delay` hasta el dispositivo 16,0 ms con 480
+/// y 13,33 ms con 240 o 128; los 10,67 ms que quedan son el headroom del nodo ALSA, fuera de
+/// coroom. El callback corre cada cuanto (2,7 ms) y pide una trama de 10 ms a la sesión cada
+/// cuatro ciclos ([`Pull`] reparte la trama entre cuantos).
+const PLAYBACK_LATENCY: &str = "128/48000";
+
+/// `node.latency` que se pide para capturar: 128 tramas (2,7 ms). La trama de 10 ms está completa
+/// igual a los 10 ms de su primera muestra, pero el trozo que la completa llega antes: en el mismo
+/// equipo, leer una trama (p50) bajó de 12,7 a 11,3 ms en el monitor de la salida y de 28,7 a
+/// 24,7 ms en el micrófono. Con cuantos menores que la trama llegan varios trozos por trama: el
+/// anillo los junta ([`Shared::read_frame`] espera a tener 480 muestras por canal).
+const CAPTURE_LATENCY: &str = "128/48000";
 
 fn backend(what: impl std::fmt::Display) -> AudioError {
     AudioError::Backend(format!("PipeWire: {what}"))
@@ -145,6 +171,9 @@ fn format_param(format: AudioFormat) -> Result<Vec<u8>, AudioError> {
 /// Tiempos del ciclo actual del grafo: cuánto hace que se calcularon (`pw_time.now` frente a
 /// `pw_stream_get_nsec`, los dos del reloj monótono) y el retardo hasta el dispositivo
 /// (`pw_time.delay`; negativo cuenta como cero). `None` si el grafo aún no los dio.
+///
+/// `pw_stream_get_nsec` existe desde PipeWire 1.1.0 (`\since 1.1.0` en `stream.h`): con la
+/// biblioteca 0.3.65 de Debian 12 la crate no enlaza; con 1.4.2 sí.
 #[allow(unsafe_code)] // `pw_stream_get_nsec` no tiene envoltorio en `pipewire-rs`.
 fn cycle_timing(stream: &pw::stream::Stream) -> Option<(Duration, Duration)> {
     let time = stream.time().ok()?;
@@ -167,71 +196,102 @@ fn cycle_timing(stream: &pw::stream::Stream) -> Option<(Duration, Duration)> {
 
 fn process(stream: &pw::stream::Stream, data: &mut StreamData) {
     let timing = cycle_timing(stream);
-    let Some(mut buffer) = stream.dequeue_buffer() else {
-        return;
-    };
-    let datas = buffer.datas_mut();
-    let Some(first) = datas.first_mut() else {
-        return;
-    };
-    let stride = 2 * data.channels;
     match data.kind {
         Kind::Capture { .. } => {
-            let offset = first.chunk().offset() as usize;
-            let size = first.chunk().size() as usize;
-            let Some(bytes) = first.data() else {
-                return;
-            };
-            let Some(bytes) = bytes.get(offset..offset + size) else {
-                return;
-            };
-            let samples = bytes.as_chunks::<2>().0;
-            // Lo último del búfer se capturó `delay` antes del instante del ciclo; lo primero,
-            // además lo que dura el búfer.
-            let captured_at = timing.and_then(|(age, delay)| {
-                std::time::Instant::now()
-                    .checked_sub(age + delay + data.format.duration_of(samples.len()))
-            });
-            data.shared.push(
-                data.format,
-                samples.iter().map(|&pair| i16::from_le_bytes(pair)),
-                captured_at,
-            );
+            // Todos los búferes listos, no solo uno: el monitor de la salida (`stream.capture.sink`)
+            // se salta ciclos del grafo (medido: dos cuantos entre callbacks 4, 14 y 37 veces en
+            // 10 s con `node.latency` 480, 240 y 128; el micrófono nunca) y entonces hay dos
+            // búferes esperando; con uno por callback el otro se quedaba en cola (latencia) o se
+            // perdía.
+            while let Some(mut buffer) = stream.dequeue_buffer() {
+                let datas = buffer.datas_mut();
+                let Some(first) = datas.first_mut() else {
+                    return;
+                };
+                let offset = first.chunk().offset() as usize;
+                let size = first.chunk().size() as usize;
+                let Some(bytes) = first.data() else {
+                    return;
+                };
+                let Some(bytes) = bytes.get(offset..offset + size) else {
+                    return;
+                };
+                let samples = bytes.as_chunks::<2>().0;
+                // Lo último del búfer se capturó `delay` antes del instante del ciclo; lo primero,
+                // además lo que dura el búfer. Si hay dos búferes, el anillo se queda con la marca
+                // del último (la de la muestra más reciente), que es la que vale. En el monitor de
+                // la salida `pw_time.delay` es siempre 0 (el micrófono sí lo da: 16 o 13,3 ms): el
+                // audio del juego no tiene retardo de dispositivo que descontar.
+                let captured_at = timing.and_then(|(age, delay)| {
+                    std::time::Instant::now()
+                        .checked_sub(age + delay + data.format.duration_of(samples.len()))
+                });
+                data.shared.push(
+                    data.format,
+                    samples.iter().map(|&pair| i16::from_le_bytes(pair)),
+                    captured_at,
+                );
+            }
         }
         Kind::Playback => {
+            let Some(mut buffer) = stream.dequeue_buffer() else {
+                return;
+            };
+            // Lo que el grafo pide en este ciclo: lo que le falta al cuanto, descontado lo que aún
+            // tiene en cola del ciclo anterior (0 si no lo dice: entonces una trama).
+            let requested = usize::try_from(buffer.requested()).unwrap_or(0);
+            let datas = buffer.datas_mut();
+            let Some(first) = datas.first_mut() else {
+                return;
+            };
+            let stride = 2 * data.channels;
             let Some(bytes) = first.data() else {
                 return;
             };
-            // Un cuanto (10 ms con `node.latency`): llenar el búfer entero añadiría latencia.
-            let frames = (bytes.len() / stride).min(crate::SAMPLES_PER_CHANNEL);
-            let wanted = frames * data.channels;
+            let capacity = bytes.len() / stride;
+            let frames = if requested == 0 {
+                crate::SAMPLES_PER_CHANNEL
+            } else {
+                requested
+            }
+            .min(capacity);
             // Lo que se escribe ahora sonará tras el retardo del grafo hasta el dispositivo,
-            // descontado lo que ya pasó desde que se midió. Sin medida aún (los primeros ciclos),
-            // el cuanto que pide el grafo.
+            // descontado lo que ya pasó desde que se midió (como se escribe justo lo pedido, no hay
+            // cola en el flujo que sumar). Sin medida aún (los primeros ciclos), lo que se escribe.
             let delay = match timing {
                 Some((age, delay)) if !delay.is_zero() => delay.saturating_sub(age),
-                _ => data.format.duration_of(wanted),
+                _ => data.format.duration_of(frames * data.channels),
             };
             data.shared
                 .delay_us
                 .store(delay.as_micros() as u64, Ordering::Relaxed);
-            let scratch = &mut data.scratch[..wanted];
-            match &mut data.pull {
-                Some(pull) => pull.fill(scratch, data.channels, delay),
-                None => data.shared.pop_into(scratch),
-            }
-            for (chunk, sample) in bytes[..wanted * 2]
-                .as_chunks_mut::<2>()
-                .0
-                .iter_mut()
-                .zip(scratch.iter())
-            {
-                *chunk = sample.to_le_bytes();
+            // Por trozos de una trama como mucho (el cuanto puede ser mayor si el grafo no atiende
+            // la latencia pedida): cada trozo suena después de los anteriores del mismo ciclo.
+            let mut written = 0;
+            while written < frames {
+                let chunk = (frames - written).min(crate::SAMPLES_PER_CHANNEL);
+                let wanted = chunk * data.channels;
+                let ahead = data.format.duration_of(written * data.channels);
+                let scratch = &mut data.scratch[..wanted];
+                match &mut data.pull {
+                    Some(pull) => pull.fill(scratch, data.channels, delay + ahead),
+                    None => data.shared.pop_into(scratch),
+                }
+                let start = written * stride;
+                for (out, sample) in bytes[start..start + wanted * 2]
+                    .as_chunks_mut::<2>()
+                    .0
+                    .iter_mut()
+                    .zip(scratch.iter())
+                {
+                    *out = sample.to_le_bytes();
+                }
+                written += chunk;
             }
             let chunk = first.chunk_mut();
             *chunk.offset_mut() = 0;
             *chunk.stride_mut() = stride as i32;
-            *chunk.size_mut() = (wanted * 2) as u32;
+            *chunk.size_mut() = (frames * stride) as u32;
         }
     }
 }
@@ -251,15 +311,15 @@ fn run_stream(
         let main_loop = pw::main_loop::MainLoopRc::new(None).map_err(no_daemon)?;
         let context = pw::context::ContextRc::new(&main_loop, None).map_err(no_daemon)?;
         let core = context.connect_rc(None).map_err(no_daemon)?;
-        let (category, role, name) = match &kind {
-            Kind::Capture { role, .. } => ("Capture", *role, "coroom-captura"),
-            Kind::Playback => ("Playback", "Game", "coroom-reproduccion"),
+        let (category, role, name, latency) = match &kind {
+            Kind::Capture { role, .. } => ("Capture", *role, "coroom-captura", CAPTURE_LATENCY),
+            Kind::Playback => ("Playback", "Game", "coroom-reproduccion", PLAYBACK_LATENCY),
         };
         let mut props = pw::properties::properties! {
             *pw::keys::MEDIA_TYPE => "Audio",
             *pw::keys::MEDIA_CATEGORY => category,
             *pw::keys::MEDIA_ROLE => role,
-            *pw::keys::NODE_LATENCY => "480/48000",
+            *pw::keys::NODE_LATENCY => latency,
             *pw::keys::APP_NAME => "coroom",
             *pw::keys::NODE_NAME => name,
         };

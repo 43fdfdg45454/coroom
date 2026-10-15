@@ -1212,6 +1212,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unic-langid",
+ "windows",
  "winit",
  "winreg",
 ]
@@ -1238,6 +1239,7 @@ version = "1.0.0"
 dependencies = [
  "ashpd",
  "pipewire",
+ "rustix 1.1.5",
  "tokio",
  "tracing",
  "windows",
@@ -1248,8 +1250,11 @@ name = "coroom-codec"
 version = "1.0.0"
 dependencies = [
  "ash",
+ "libc",
  "openh264",
  "rsmpeg",
+ "serde",
+ "serde_json",
  "windows",
  "yuv",
 ]

@@ -41,6 +41,11 @@ pub mod synthetic;
 )]
 mod ring;
 
+// La conversión al formato de mezcla del dispositivo la usa WASAPI (modo compartido de baja
+// latencia); en los demás sistemas solo la ejercitan sus tests.
+#[cfg_attr(not(all(target_os = "windows", feature = "wasapi")), allow(dead_code))]
+mod convert;
+
 #[cfg(all(target_os = "linux", feature = "pipewire"))]
 pub mod pipewire;
 

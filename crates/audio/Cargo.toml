@@ -26,7 +26,10 @@ opusic-sys.workspace = true
 # DRED (redundancia profunda de Opus 1.5+) solo en Linux (en Windows, la FEC en banda).
 opusic-c = { workspace = true, features = ["dred"] }
 opusic-sys = { workspace = true, features = ["dred"] }
-pipewire = { workspace = true, optional = true }
+# `v0_3_49`: `pw_buffer.requested`, lo que el grafo pide en cada ciclo (el backend escribe justo
+# eso; sin la feature la crate ni lo lee). La biblioteca tiene que ser más nueva de todos modos:
+# `pw_stream_get_nsec` es de PipeWire 1.1 (ver `pipewire.rs`).
+pipewire = { workspace = true, optional = true, features = ["v0_3_49"] }
 zbus.workspace = true
 libc.workspace = true
 webrtc-audio-processing = { workspace = true, optional = true, features = ["bundled"] }

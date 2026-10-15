@@ -25,10 +25,14 @@
 //! arrancar (los paquetes viajan por el canal por valor, con su carga en un array). La única
 //! asignación por trama es el `Bytes` del datagrama que se entrega a `quinn`, que se queda con él
 //! hasta enviarlo (y que se comparte entre todos los destinos). La reproducción, que a demanda
-//! corre en el hilo de tiempo real del dispositivo, tampoco asigna, ordena ni toma los cerrojos
-//! del registro: las marcas, los contadores, los percentiles de la sincronía, los emisores nuevos
+//! corre en el hilo de tiempo real del dispositivo, tampoco asigna ni toma cerrojos: ni los del
+//! registro (las marcas, los contadores, los percentiles de la sincronía, los emisores nuevos
 //! (preparados de antemano) y los olvidados van y vienen por canales acotados a un hilo de
-//! contadores (el propio `audio-play` a demanda, `audio-stats` con la cola del sumidero).
+//! contadores: el propio `audio-play` a demanda, `audio-stats` con la cola del sumidero), ni el de
+//! las voces silenciadas (huecos atómicos, [`ControlInner::muted_voices`]), ni el del reloj de la
+//! sesión más que una vez cada [`SYNC_TICKS`] tramas para renovar el ancla con la que convierte
+//! las marcas de captura ([`Playout::local_capture`]). Lo único que ordena es la copia de 200
+//! tránsitos del buffer de jitter, en su propia memoria.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -77,6 +81,12 @@ const PULL_WATCH: Duration = Duration::from_millis(20);
 
 /// Emisores de voz como mucho a la vez.
 const MAX_VOICES: usize = 16;
+
+/// Voces que se pueden tener silenciadas a la vez (huecos de [`ControlInner::muted_voices`]).
+const MUTED_SLOTS: usize = 2 * MAX_VOICES;
+
+/// Marca de un hueco de voz silenciada ocupado (el emisor va en los 32 bits bajos).
+const MUTED_USED: u64 = 1 << 32;
 
 /// Fuente del juego en el mezclador.
 const GAME_SOURCE: u32 = u32::MAX;
@@ -160,8 +170,10 @@ struct ControlInner {
     speaking: AtomicBool,
     talkers: Mutex<BTreeSet<u32>>,
     /// Voces que este equipo no quiere oír, por emisor (la hoja SFrame en el invitado, el id del
-    /// invitado en el anfitrión). Solo afecta a lo que se reproduce aquí.
-    muted_voices: Mutex<BTreeSet<u32>>,
+    /// invitado en el anfitrión). Solo afecta a lo que se reproduce aquí. Huecos atómicos
+    /// ([`MUTED_USED`] | emisor, o 0 si está libre) en vez de un conjunto con cerrojo: la
+    /// reproducción los consulta por cada voz y trama desde el hilo del dispositivo.
+    muted_voices: [AtomicU64; MUTED_SLOTS],
 }
 
 /// Mandos del audio que la ventana y la consola tocan en caliente (atajos `Ctrl+Alt+M` y
@@ -248,17 +260,30 @@ impl AudioControl {
     /// invitado ([`super::RoomMember::leaf`]) o el id de un invitado en el anfitrión. Solo cambia lo
     /// que suena en este equipo; los demás le siguen oyendo.
     pub fn set_voice_muted(&self, source: u32, muted: bool) {
-        let mut set = lock(&self.inner.muted_voices);
-        if muted {
-            set.insert(source);
-        } else {
-            set.remove(&source);
+        let key = MUTED_USED | u64::from(source);
+        let slots = &self.inner.muted_voices;
+        if !muted {
+            for slot in slots {
+                let _ = slot.compare_exchange(key, 0, Ordering::AcqRel, Ordering::Acquire);
+            }
+        } else if !slots.iter().any(|slot| slot.load(Ordering::Acquire) == key)
+            && !slots.iter().any(|slot| {
+                slot.compare_exchange(0, key, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            })
+        {
+            debug!(source, "sin sitio para silenciar más voces");
         }
     }
 
-    /// Si la voz de `source` está silenciada aquí.
+    /// Si la voz de `source` está silenciada aquí. Sin cerrojo: se consulta en el hilo del
+    /// dispositivo por cada voz y trama.
     pub fn voice_muted(&self, source: u32) -> bool {
-        lock(&self.inner.muted_voices).contains(&source)
+        let key = MUTED_USED | u64::from(source);
+        self.inner
+            .muted_voices
+            .iter()
+            .any(|slot| slot.load(Ordering::Relaxed) == key)
     }
 
     /// Quién habla en la sala (ids de invitado; 0 = el anfitrión), según `VoiceState`.
@@ -930,6 +955,9 @@ struct Playout {
     render: Option<RenderFeed>,
     packets: Receiver<Packet>,
     to_local: Box<ToLocal>,
+    /// Ancla (marca de captura, instante local) con la que se convierten las marcas entre dos
+    /// renovaciones, y la trama en que se renovó.
+    anchor: Option<(u32, Instant, u32)>,
     channels: u16,
     mixer: Mixer,
     game: Option<Stream>,
@@ -991,6 +1019,28 @@ impl Playout {
         true
     }
 
+    /// Instante local de una marca de captura (reloj del anfitrión). La conversión de la sesión
+    /// (`to_local`) pasa por el cerrojo del reloj del enlace: se llama una vez cada
+    /// [`SYNC_TICKS`] tramas para renovar el ancla y las demás marcas se sitúan respecto a ella
+    /// (las dos van en el mismo reloj; el desfase estimado cambia despacio).
+    fn local_capture(&mut self, capture_us: u32) -> Option<Instant> {
+        let stale = self
+            .anchor
+            .is_none_or(|(_, _, at_tick)| self.ticks.wrapping_sub(at_tick) >= SYNC_TICKS);
+        if stale {
+            let anchored = (self.to_local)(capture_us)?;
+            self.anchor = Some((capture_us, anchored, self.ticks));
+            return Some(anchored);
+        }
+        let (anchor_us, anchored, _) = self.anchor?;
+        let delta = capture_us.wrapping_sub(anchor_us) as i32;
+        if delta >= 0 {
+            anchored.checked_add(Duration::from_micros(u64::from(delta.unsigned_abs())))
+        } else {
+            anchored.checked_sub(Duration::from_micros(u64::from(delta.unsigned_abs())))
+        }
+    }
+
     /// `out`, que [`Playout::fill`] llenó en `decided`, sonará en `played_at`: marcas, sincronía
     /// (cada [`SYNC_TICKS`] tramas) y, cada [`PUBLISH_TICKS`], la foto de los contadores.
     fn played(&mut self, out: &[i16], decided: Instant, played_at: Instant) {
@@ -999,8 +1049,9 @@ impl Playout {
         }
 
         // Marcas de lo que sonó (las tramas reales; lo ocultado no tiene captura).
-        for info in &self.heard {
-            let Some(capture) = info.capture_us.and_then(&self.to_local) else {
+        for index in 0..self.heard.len() {
+            let info = self.heard[index];
+            let Some(capture) = info.capture_us.and_then(|us| self.local_capture(us)) else {
                 continue;
             };
             let mut timeline = AudioTimeline::default();
@@ -1215,6 +1266,7 @@ pub(crate) fn play_loop(
         render,
         packets,
         to_local: Box::new(to_local),
+        anchor: None,
         channels: format.channels,
         mixer: Mixer::new(format.channels),
         game: None,
@@ -1482,6 +1534,40 @@ mod tests {
     }
 
     #[test]
+    fn muted_voices_live_in_atomic_slots() {
+        let control = AudioControl::default();
+        assert!(!control.voice_muted(7));
+        control.set_voice_muted(7, true);
+        control.set_voice_muted(7, true);
+        control.set_voice_muted(u32::MAX, true);
+        assert!(control.voice_muted(7) && control.voice_muted(u32::MAX));
+        assert!(
+            !control.voice_muted(0),
+            "el emisor 0 no se confunde con un hueco libre"
+        );
+        control.set_voice_muted(0, true);
+        assert!(control.voice_muted(0));
+        control.set_voice_muted(7, false);
+        assert!(!control.voice_muted(7) && control.voice_muted(0));
+        // Un solo hueco por emisor: silenciar dos veces y quitar una vez lo deja libre.
+        let used = control
+            .inner
+            .muted_voices
+            .iter()
+            .filter(|slot| slot.load(Ordering::Relaxed) != 0)
+            .count();
+        assert_eq!(used, 2);
+        // Lleno: los que no caben no se silencian, y al liberar vuelve a haber sitio.
+        for source in 100..100 + MUTED_SLOTS as u32 {
+            control.set_voice_muted(source, true);
+        }
+        assert!(!control.voice_muted(100 + MUTED_SLOTS as u32 - 2));
+        control.set_voice_muted(0, false);
+        control.set_voice_muted(999, true);
+        assert!(control.voice_muted(999));
+    }
+
+    #[test]
     fn the_flags_agree_with_the_jitter_buffer() {
         assert_eq!(AudioHeader::DTX, coroom_audio::jitter::DTX);
         assert_eq!(AudioHeader::FEC, coroom_audio::jitter::FEC);
@@ -1553,10 +1639,13 @@ mod tests {
         let base = Instant::now();
         for seq in 0..5u32 {
             let len = encoder.encode(&pcm, &mut packet).expect("codificar");
-            stream.jitter.push(
+            // Como el emisor real: la cabecera declara las dos tramas de 10 ms del paquete, que
+            // es lo que le da al buffer el ritmo de las peticiones.
+            stream.jitter.push_frames(
                 seq,
                 seq * 20_000,
                 0,
+                2,
                 &packet[..len],
                 base + Duration::from_millis(u64::from(seq) * 20),
             );
@@ -1568,8 +1657,12 @@ mod tests {
             {
                 sounded += 1;
                 if offset == 480 {
-                    seconds += 1;
-                    assert!(heard.arrived.is_none() && heard.capture_us.is_some());
+                    // La segunda trama de un paquete (o de la pérdida con que se cierra el
+                    // flujo, sin marca de captura) nunca lleva llegada.
+                    assert!(heard.arrived.is_none());
+                    if heard.capture_us.is_some() {
+                        seconds += 1;
+                    }
                 }
                 assert!(offset <= 480);
             }

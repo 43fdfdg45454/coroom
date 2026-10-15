@@ -279,11 +279,12 @@ fn check_game_audio(guest: &Guest, summary: &LatencySummary) {
     // Latencia propia del audio: de la marca de captura del anfitrión a la hora en que el
     // altavoz del invitado lo reproduce (`played_at` del dispositivo, latencia del motor incluida).
     // Se compone de la trama que se acumula (10 ms), codificar y enviar, la espera en el buffer de
-    // jitter (su objetivo más la fase entre la llegada y la petición del altavoz, de 0 a una
-    // trama) y la latencia del dispositivo. Objetivo de la fase 2: mediana de 30-45 ms; el p95
-    // admite una trama más, la de la fase, que deriva entre los relojes del anfitrión y del
-    // invitado. Las cotas escalan con la carga, porque el objetivo del buffer sale del jitter
-    // medido y la carga lo aumenta.
+    // jitter (su margen, el p99 del jitter, más la fase entre la llegada y la petición del
+    // altavoz, de 0 a una trama) y la latencia del dispositivo. Medido en el equipo de
+    // referencia: mediana de 29 ms (10,7 + 8,6 + 9,9) y p95 de 39 ms; el p95 admite una trama
+    // más, la de la fase, que deriva entre los relojes del anfitrión y del invitado. Las cotas
+    // escalan con la carga, porque el margen del buffer sale del jitter medido y la carga lo
+    // aumenta.
     let total = game.total;
     let (p50, p95) = (total.p50_us as f64 / 1000.0, total.p95_us as f64 / 1000.0);
     println!(
@@ -293,17 +294,17 @@ fn check_game_audio(guest: &Guest, summary: &LatencySummary) {
     assert!(total.samples > 100, "{total:?}");
     let load = common::load_factor();
     assert!(
-        p50 < 45.0 * load,
+        p50 < 40.0 * load,
         "captura → suena p50 {p50:.1} ms (cota {:.1} ms)",
-        45.0 * load
+        40.0 * load
     );
     // Si el hilo del altavoz se paró (racha de más de una trama sin paquete), la cola se llena
     // durante el parón y el p95 mide cuánto tarda en recortarse, no el camino del audio.
     if game.counters.max_gap_frames <= 1 {
         assert!(
-            p95 < 55.0 * load,
+            p95 < 50.0 * load,
             "captura → suena p95 {p95:.1} ms (cota {:.1} ms)",
-            55.0 * load
+            50.0 * load
         );
     }
     let av = audio.av.unwrap_or_else(|| panic!("sin |A−V|:\n{audio}"));
