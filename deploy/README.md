@@ -36,6 +36,18 @@ gestiona certificados: usa el tuyo o uno autofirmado.
 
 - Sin reverse proxy por delante: WebTransport y el relay necesitan el UDP directo. Si se pone uno,
   debe hablar HTTP/3 y pasar UDP; no es la configuración recomendada.
+- **Búferes UDP del núcleo** (recomendado para el relay): el servidor pide 8 MB de recepción y de
+  envío para su socket UDP y Linux los recorta a `net.core.rmem_max` / `net.core.wmem_max`
+  (208 KB por defecto, menos de un fotograma clave; una ráfaga que no cabe se pierde entera y el
+  invitado pide otro intra). En el host de Docker:
+
+  ```bash
+  sudo sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608
+  echo -e "net.core.rmem_max=8388608\nnet.core.wmem_max=8388608" | sudo tee /etc/sysctl.d/90-coroom.conf
+  ```
+
+  El log del servidor dice al arrancar lo que concedió el sistema (`búferes del socket UDP`, con
+  `recv` y `send` en bytes) y avisa si la recepción se queda por debajo de 1 MB.
 
 ## Imagen
 

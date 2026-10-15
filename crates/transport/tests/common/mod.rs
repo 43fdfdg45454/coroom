@@ -146,6 +146,7 @@ pub async fn transmit_with(
         MediaSenderConfig {
             frame_interval: interval,
             rate,
+            pacing: Default::default(),
         },
     ));
     let receiver = Arc::new(MediaReceiver::new(

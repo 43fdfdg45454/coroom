@@ -34,6 +34,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -53,8 +54,9 @@ use crate::TransportError;
 use crate::rate::{Congestion, CongestionShared};
 use crate::tls::{self, Admitted, IdentityKey, PublicKey, ServerTrust};
 
-/// Intervalo de `keep_alive` de todas las conexiones.
-pub const KEEP_ALIVE: Duration = Duration::from_secs(5);
+/// Intervalo de `keep_alive` de todas las conexiones: tres caben en [`IDLE_TIMEOUT`], así una
+/// conexión viva no se da por muerta aunque se pierdan dos seguidos.
+pub const KEEP_ALIVE: Duration = Duration::from_millis(2_500);
 
 /// Retraso máximo de un ACK que se pide al par (extensión ACK frequency de QUIC). Sin ella el par
 /// puede esperar 25 ms antes de confirmar y el PTO los suma: un `Nack` o un `KeyframeRequest` que
@@ -62,8 +64,11 @@ pub const KEEP_ALIVE: Duration = Duration::from_secs(5);
 /// 60-70 ms después con un RTT de 20 ms. Con 5 ms, unos 40 ms.
 pub const MAX_ACK_DELAY: Duration = Duration::from_millis(5);
 
-/// Tiempo sin tráfico tras el que una conexión se da por muerta.
-pub const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Tiempo sin tráfico tras el que una conexión se da por muerta. Con 15 s, un camino caído
+/// (el router de una NAT que olvida la asignación, una VPN que se renegocia) tenía al invitado
+/// 15 s con la imagen congelada antes de reconectar; el vigilante de medios del invitado actúa
+/// antes (3 s sin datagramas ni `Pong`) y este plazo es el respaldo de QUIC.
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Carga UDP inicial y mínima de las conexiones: la justa para datagramas de 1200 bytes
 /// ([`ObjectHeader::MAX_PACKET`]) con la cabecera corta de QUIC.
@@ -249,8 +254,11 @@ fn endpoint_transport_config(
 }
 
 /// Pide [`SOCKET_BUFFER`] de recepción y de envío al socket y anota lo que dio el sistema (Linux
-/// lo recorta a `net.core.rmem_max`/`wmem_max` y devuelve el doble de lo que reserva).
-fn grow_socket_buffers(socket: &socket2::Socket) {
+/// lo recorta a `net.core.rmem_max`/`wmem_max` y devuelve el doble de lo que reserva). Lo usan
+/// los clientes al abrir su `Endpoint` y el servidor con el socket del relay ([`bind_udp_socket`]):
+/// con los búferes por defecto del sistema (208 KB en Linux) el relay perdía el intra entero de
+/// cada ráfaga que no cabía.
+pub fn grow_socket_buffers(socket: &socket2::Socket) {
     if let Err(err) = socket.set_recv_buffer_size(SOCKET_BUFFER) {
         tracing::warn!(error = %err, "no se pudo ampliar el búfer de recepción del socket UDP");
     }
@@ -270,19 +278,24 @@ fn grow_socket_buffers(socket: &socket2::Socket) {
     }
 }
 
-/// Abre el socket UDP: doble pila en `[::]` si se puede; si no, IPv4.
-fn bind_socket(addr: Option<SocketAddr>) -> Result<std::net::UdpSocket, TransportError> {
+/// Abre un socket UDP en `addr` con los búferes de [`grow_socket_buffers`] (doble pila si `addr`
+/// es `[::]`). Es el socket de los `Endpoint` de los clientes y del servidor (`quinn::Endpoint::new`
+/// lo toma tal cual).
+pub fn bind_udp_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
 
-    let bind = |addr: SocketAddr| -> std::io::Result<std::net::UdpSocket> {
-        let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
-        if addr.is_ipv6() && addr.ip().is_unspecified() {
-            socket.set_only_v6(false)?;
-        }
-        grow_socket_buffers(&socket);
-        socket.bind(&addr.into())?;
-        Ok(socket.into())
-    };
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    if addr.is_ipv6() && addr.ip().is_unspecified() {
+        socket.set_only_v6(false)?;
+    }
+    grow_socket_buffers(&socket);
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
+}
+
+/// Abre el socket UDP: doble pila en `[::]` si se puede; si no, IPv4.
+fn bind_socket(addr: Option<SocketAddr>) -> Result<std::net::UdpSocket, TransportError> {
+    let bind = bind_udp_socket;
     match addr {
         Some(addr) => Ok(bind(addr)?),
         None => match bind(SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))) {
@@ -690,10 +703,15 @@ async fn accept_loop(
 /// Stream bidireccional de QUIC (envío y recepción).
 pub type BiStream = (quinn::SendStream, quinn::RecvStream);
 
-/// Cola de datagramas de una pista: gana el más reciente si se llena.
+/// Cola de datagramas de una pista: gana el más reciente si se llena. Cada datagrama lleva el
+/// instante en que `quinn` lo entregó ([`route_datagrams`]), no el de cuando el lector lo saca:
+/// la dispersión de los trenes de sonda y las muestras de OWD se miden con la llegada, y el
+/// receptor de medios puede tardar en leer (al conectar, el invitado medía el RTT un segundo
+/// antes de leer nada y los 96 datagramas de las dos sondas salían de la cola de golpe, con lo
+/// que la sonda medía Gbit/s y el primer intra salía al máximo del usuario).
 #[derive(Debug, Default)]
 struct DatagramQueue {
-    queue: Mutex<VecDeque<Bytes>>,
+    queue: Mutex<VecDeque<(Instant, Bytes)>>,
     notify: Notify,
     /// Para el lector que espera bloqueado ([`DatagramQueue::pop_blocking`]).
     cond: Condvar,
@@ -702,9 +720,9 @@ struct DatagramQueue {
 }
 
 impl DatagramQueue {
-    fn push(&self, datagram: Bytes) {
+    fn push(&self, datagram: Bytes, arrival: Instant) {
         if let Ok(mut queue) = self.queue.lock() {
-            queue.push_back(datagram);
+            queue.push_back((arrival, datagram));
             if queue.len() > DATAGRAM_QUEUE {
                 queue.pop_front();
                 self.dropped
@@ -728,7 +746,7 @@ impl DatagramQueue {
         let deadline = Instant::now() + timeout;
         let mut queue = self.queue.lock().map_err(|_| ())?;
         loop {
-            if let Some(datagram) = queue.pop_front() {
+            if let Some((_, datagram)) = queue.pop_front() {
                 return Ok(Some(datagram));
             }
             if self.closed.load(std::sync::atomic::Ordering::Acquire) {
@@ -746,9 +764,9 @@ impl DatagramQueue {
         }
     }
 
-    /// Siguiente datagrama; `None` si la conexión se cerró y no queda ninguno. Pensada para un
-    /// solo lector a la vez; se puede cancelar sin perder datagramas.
-    async fn pop(&self) -> Option<Bytes> {
+    /// Siguiente datagrama con su instante de llegada; `None` si la conexión se cerró y no queda
+    /// ninguno. Pensada para un solo lector a la vez; se puede cancelar sin perder datagramas.
+    async fn pop(&self) -> Option<(Instant, Bytes)> {
         loop {
             if let Some(datagram) = self.queue.lock().ok().and_then(|mut q| q.pop_front()) {
                 return Some(datagram);
@@ -774,6 +792,8 @@ struct PeerInner {
     input_datagrams: Arc<DatagramQueue>,
     audio_datagrams: Arc<DatagramQueue>,
     control_datagrams: Arc<DatagramQueue>,
+    /// Datagramas recibidos de cualquier pista ([`PeerConnection::datagrams_received`]).
+    received: Arc<AtomicU64>,
     /// Tamaño de la cola de datagramas por enviar (el hueco libre al crearse, con nada en cola).
     send_queue_capacity: usize,
     streams_task: JoinHandle<()>,
@@ -787,23 +807,27 @@ impl Drop for PeerInner {
     }
 }
 
-/// Reparte los datagramas recibidos por pista hasta que la conexión se cierra.
+/// Reparte los datagramas recibidos por pista hasta que la conexión se cierra, cada uno con el
+/// instante en que `quinn` lo entregó.
 async fn route_datagrams(
     conn: quinn::Connection,
     media: Arc<DatagramQueue>,
     input: Arc<DatagramQueue>,
     audio: Arc<DatagramQueue>,
     control: Arc<DatagramQueue>,
+    received: Arc<AtomicU64>,
 ) {
     while let Ok(datagram) = conn.read_datagram().await {
+        let arrival = Instant::now();
+        received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if coroom_proto::input::is_input_datagram(&datagram) {
-            input.push(datagram);
+            input.push(datagram, arrival);
         } else if coroom_proto::audio::is_audio_datagram(&datagram) {
-            audio.push(datagram);
+            audio.push(datagram, arrival);
         } else if coroom_proto::control::is_control_datagram(&datagram) {
-            control.push(datagram);
+            control.push(datagram, arrival);
         } else {
-            media.push(datagram);
+            media.push(datagram, arrival);
         }
     }
     media.close();
@@ -841,16 +865,19 @@ impl PeerConnection {
         let input_datagrams = Arc::new(DatagramQueue::default());
         let audio_datagrams = Arc::new(DatagramQueue::default());
         let control_datagrams = Arc::new(DatagramQueue::default());
+        let received = Arc::new(AtomicU64::new(0));
         let datagrams_task = tokio::spawn(route_datagrams(
             conn.clone(),
             Arc::clone(&media_datagrams),
             Arc::clone(&input_datagrams),
             Arc::clone(&audio_datagrams),
             Arc::clone(&control_datagrams),
+            Arc::clone(&received),
         ));
         let send_queue_capacity = conn.datagram_send_buffer_space();
         Self {
             inner: Arc::new(PeerInner {
+                received,
                 send_queue_capacity,
                 conn,
                 peer_key,
@@ -922,6 +949,14 @@ impl PeerConnection {
 
     /// Siguiente datagrama recibido que no es de entrada (medios). Un solo lector a la vez.
     pub async fn read_datagram(&self) -> Result<Bytes, TransportError> {
+        self.read_datagram_timed()
+            .await
+            .map(|(_, datagram)| datagram)
+    }
+
+    /// Como [`PeerConnection::read_datagram`], con el instante en que `quinn` entregó el
+    /// datagrama (su llegada, aunque el lector lo saque más tarde).
+    pub async fn read_datagram_timed(&self) -> Result<(Instant, Bytes), TransportError> {
         match self.inner.media_datagrams.pop().await {
             Some(datagram) => Ok(datagram),
             None => Err(self.closed_error()),
@@ -931,16 +966,17 @@ impl PeerConnection {
     /// Siguiente datagrama de entrada (pista `Input`). Un solo lector a la vez.
     pub async fn read_input_datagram(&self) -> Result<Bytes, TransportError> {
         match self.inner.input_datagrams.pop().await {
-            Some(datagram) => Ok(datagram),
+            Some((_, datagram)) => Ok(datagram),
             None => Err(self.closed_error()),
         }
     }
 
-    /// Siguiente datagrama de control (pista `Control`: copias de `Nack` y `KeyframeRequest`, ver
-    /// [`coroom_proto::control::control_datagram`]). Un solo lector a la vez.
+    /// Siguiente datagrama de control (pista `Control`: copias de `Nack`, `KeyframeRequest`,
+    /// `Feedback` y `Cursor`, ver [`coroom_proto::control::control_datagram`]). Un solo lector a
+    /// la vez.
     pub async fn read_control_datagram(&self) -> Result<Bytes, TransportError> {
         match self.inner.control_datagrams.pop().await {
-            Some(datagram) => Ok(datagram),
+            Some((_, datagram)) => Ok(datagram),
             None => Err(self.closed_error()),
         }
     }
@@ -948,9 +984,17 @@ impl PeerConnection {
     /// Siguiente datagrama de audio (pistas `Audio` y `Voice`). Un solo lector a la vez.
     pub async fn read_audio_datagram(&self) -> Result<Bytes, TransportError> {
         match self.inner.audio_datagrams.pop().await {
-            Some(datagram) => Ok(datagram),
+            Some((_, datagram)) => Ok(datagram),
             None => Err(self.closed_error()),
         }
+    }
+
+    /// Datagramas recibidos de cualquier pista desde que se abrió la conexión (el vigilante de
+    /// medios del invitado mira si sigue llegando algo).
+    pub fn datagrams_received(&self) -> u64 {
+        self.inner
+            .received
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Como [`PeerConnection::read_audio_datagram`], bloqueando el hilo hasta `timeout` (para un
@@ -1253,7 +1297,7 @@ mod tests {
         let writer = Arc::clone(&queue);
         let sent = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
-            writer.push(Bytes::from_static(b"audio"));
+            writer.push(Bytes::from_static(b"audio"), Instant::now());
         });
         // Se despierta al llegar, sin esperar al plazo.
         let started = Instant::now();
@@ -1261,7 +1305,7 @@ mod tests {
         assert_eq!(got, Ok(Some(Bytes::from_static(b"audio"))));
         assert!(started.elapsed() < Duration::from_secs(2));
         sent.join().unwrap();
-        queue.push(Bytes::from_static(b"queda"));
+        queue.push(Bytes::from_static(b"queda"), Instant::now());
         queue.close();
         // Lo que quedaba se entrega antes del cierre.
         assert_eq!(

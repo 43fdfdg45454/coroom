@@ -288,11 +288,27 @@ impl Server {
             Congestion::Media,
         )));
 
-        let endpoint = match quinn::Endpoint::server(server_config.clone(), config.bind_udp) {
+        // El socket con los búferes ampliados de los clientes (`SO_RCVBUF`/`SO_SNDBUF` de 8 MB,
+        // lo que el sistema conceda: en Linux, `net.core.rmem_max`/`wmem_max`, ver
+        // `deploy/README.md`). Con los 208 KB por defecto, el relay perdía ráfagas enteras (un
+        // intra que llega del anfitrión a la vez que varios invitados piden reenvíos).
+        let runtime = quinn::default_runtime().ok_or_else(|| {
+            ServerError::Config("el servidor necesita un runtime de tokio".into())
+        })?;
+        let open = |addr: SocketAddr, server_config: quinn::ServerConfig| {
+            let socket = coroom_transport::quic::bind_udp_socket(addr)?;
+            quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                Some(server_config),
+                socket,
+                Arc::clone(&runtime),
+            )
+        };
+        let endpoint = match open(config.bind_udp, server_config.clone()) {
             Ok(endpoint) => endpoint,
             Err(err) => match ipv4_fallback(config.bind_udp) {
                 Some(v4) => {
-                    let endpoint = quinn::Endpoint::server(server_config, v4).map_err(|_| {
+                    let endpoint = open(v4, server_config).map_err(|_| {
                         ServerError::io("abrir el socket UDP", config.bind_udp, err)
                     })?;
                     warn!(udp = %v4, "IPv6 no disponible; HTTP/3 escucha solo en IPv4");

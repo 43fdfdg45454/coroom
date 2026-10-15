@@ -5,12 +5,21 @@
 //! objetos de origen de como mucho `max_packet − 16` bytes y se le añaden símbolos de reparación
 //! RaptorQ en la proporción `repair_ratio` (0 % sin pérdida, lineal hasta 30 % con pérdida ≥ 5 %,
 //! actualizada con cada `Feedback`; 10 % hasta el primero, cuando la pérdida aún no se conoce).
-//! Todo sale con **pacing** ([`pacing_duration`]): el fotograma se reparte en lo que tardaría a
-//! 1,25 veces el bitrate objetivo, como mucho 0,8 intervalos (2 intervalos un intra). Antes se
-//! metía en 4 ms: a 120 fps un intra de cientos de KB salía a varios cientos de Mbit/s, llenaba la
-//! cola del camino y el búfer del socket del receptor (64 KB en Windows) y se perdía entero, con lo
-//! que se pedía otro intra igual de grande. Guarda los objetos de origen de los últimos 16 grupos
-//! para responder a los `Nack`; los reenvíos grandes salen con el mismo ritmo.
+//! Todo sale con **pacing** ([`pacing_duration`]): el fotograma se reparte en lo que tardaría al
+//! ritmo medido del enlace ([`MediaSender::pacing_plan`]: 1,25 veces el bitrate objetivo o, si es
+//! más, el 70 % de lo que midió la sonda del enlace o la estimación del control de tasa), como
+//! mucho [`PacingConfig::share`] del intervalo (0,3). Un intra ocupa como mucho
+//! [`PacingConfig::keyframe_intervals`] (2) y, solo si el enlace **midió** al menos
+//! [`KEYFRAME_HEADROOM`] veces lo que ese ritmo necesita, [`PacingConfig::keyframe_intervals_measured`]
+//! (1): la ventana de congestión de medios (`rate.rs`, ≥ 2 s × objetivo) no acota las ráfagas,
+//! así que un intra a un intervalo sin esa holgura medida saldría al doble de ritmo que antes y un
+//! cuello con poco búfer (DSL, 4G, un punto de acceso Wi-Fi) lo perdería en parte. Antes se metía
+//! en 4 ms: a 120 fps un intra de cientos de KB salía a varios cientos de Mbit/s, llenaba la cola
+//! del camino y el búfer del socket del receptor (64 KB en Windows) y se perdía entero, con lo que
+//! se pedía otro intra igual de grande. Después se repartía en 0,8 intervalos al bitrate objetivo
+//! aunque el enlace diese diez veces más: cada fotograma llegaba ~13 ms después de lo necesario a
+//! 60 fps. Guarda los objetos de origen de los últimos 16 grupos para responder a los `Nack`; los
+//! reenvíos grandes salen con el mismo ritmo.
 //!
 //! **Receptor** ([`MediaReceiver`]): reensambla por pista y grupo, con FEC; plazo por grupo de
 //! 1,5 intervalos desde su primer objeto; a mitad de plazo, si faltan objetos que la FEC no puede
@@ -77,11 +86,12 @@ pub const FEEDBACK_INTERVAL: Duration = Duration::from_millis(50);
 /// Periodo de los `Ping` del receptor.
 pub const PING_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Datagramas de cada tren de la sonda del enlace ([`MediaSender::send_probe`]): 48 × 1200 B son
-/// ~58 KB, bastantes para que la dispersión del tren la ponga el cuello del camino y no el jitter
-/// de un par de paquetes, y pocos para que en un enlace de 10 Mbit/s no hagan más de 50 ms de cola
-/// (antes de que haya vídeo).
-pub const PROBE_PACKETS: u16 = 48;
+/// Datagramas de cada tren de la sonda del enlace ([`MediaSender::send_probe`]): 64 × 1200 B son
+/// ~77 KB, bastantes para que la dispersión del tren la ponga el cuello del camino y no el jitter
+/// de un par de paquetes (un tren entero dura al menos ~6 ms a [`PROBE_MAX_PACE_KBPS`], varias
+/// veces la resolución de los temporizadores), y pocos para que en un enlace de 10 Mbit/s no hagan
+/// más de ~60 ms de cola (antes de que haya vídeo).
+pub const PROBE_PACKETS: u16 = 64;
 
 /// Trenes que se envían a cada receptor al conectar, separados [`PROBE_SPACING`]; vale el mejor
 /// (el tráfico ajeno solo puede hacer que un tren mida de menos).
@@ -93,7 +103,16 @@ pub const PROBE_SPACING: Duration = Duration::from_millis(100);
 /// Ritmo máximo al que sale un tren: con el máximo del usuario por encima, el tren sale a este
 /// ritmo y la medida es «al menos esto» (la dispersión solo mide cuellos por debajo del ritmo de
 /// envío).
-pub const PROBE_MAX_PACE_KBPS: u32 = 200_000;
+pub const PROBE_MAX_PACE_KBPS: u32 = 100_000;
+
+/// Un tren que mide más de este múltiplo del ritmo al que salió no midió el camino: sus
+/// datagramas esperaron en una cola del receptor y salieron de golpe (o el reloj del receptor no
+/// vale). Entre el ritmo de envío y este múltiplo la medida se acota al ritmo de envío (la
+/// dispersión no puede ser menor que la de salida; el exceso es jitter de los temporizadores).
+pub const PROBE_PACE_TOLERANCE: f64 = 2.0;
+
+/// Trenes de sonda cuyo ritmo de envío recuerda el emisor para comprobar los resultados.
+const PROBE_PACES_REMEMBERED: usize = 16;
 
 /// Plazo del receptor para dar un tren por terminado desde su primer datagrama (lo que no llegó,
 /// se perdió).
@@ -133,38 +152,131 @@ impl ProbeOutcome {
     pub fn lost(&self) -> u16 {
         self.sent.saturating_sub(self.received)
     }
+
+    /// [`ProbeOutcome::kbps`] comprobado contra el ritmo al que salió el tren, si se conoce: por
+    /// encima de [`PROBE_PACE_TOLERANCE`] veces el ritmo de envío la medida no vale (`None`); entre
+    /// el ritmo de envío y ese múltiplo, vale el ritmo de envío (el camino dio al menos eso).
+    pub fn checked_kbps(&self, pace_kbps: Option<u32>) -> Option<u32> {
+        let kbps = self.kbps()?;
+        let Some(pace) = pace_kbps.filter(|pace| *pace > 0) else {
+            return Some(kbps);
+        };
+        if f64::from(kbps) > f64::from(pace) * PROBE_PACE_TOLERANCE {
+            return None;
+        }
+        Some(kbps.min(pace))
+    }
 }
 
 /// Ritmo del pacing sobre el bitrate objetivo: algo por encima, para que un fotograma algo mayor
 /// que la media no se retrase más de lo que tarda en salir.
 pub const PACING_GAIN: f64 = 1.25;
 
-/// Parte del intervalo que puede ocupar el pacing de un fotograma normal: lo que sobra deja al hilo
-/// `send` ponerse al día si un fotograma llegó tarde.
-pub const FRAME_PACING_SHARE: f64 = 0.8;
+/// Parte del intervalo que puede ocupar el pacing de un fotograma normal
+/// ([`PacingConfig::share`] por defecto): lo que sobra deja al hilo `send` ponerse al día si un
+/// fotograma llegó tarde, y el fotograma no llega más tarde de lo que el enlace obliga.
+pub const FRAME_PACING_SHARE: f64 = 0.3;
 
-/// Intervalos que puede ocupar el pacing de un intra (como mucho dos fotogramas esperan detrás, lo
-/// que cabe en el canal del codificador).
+/// Intervalos que puede ocupar el pacing de un intra ([`PacingConfig::keyframe_intervals`] por
+/// defecto, lo mismo que tolera el receptor): como mucho dos fotogramas esperan detrás en el canal
+/// del codificador.
+pub const DEFAULT_KEYFRAME_PACING_INTERVALS: f64 = 2.0;
+
+/// Intervalos de un intra cuando el enlace midió holgura ([`KEYFRAME_HEADROOM`]);
+/// [`PacingConfig::keyframe_intervals_measured`] por defecto.
+pub const DEFAULT_KEYFRAME_PACING_INTERVALS_MEASURED: f64 = 1.0;
+
+/// Veces que el ritmo medido del enlace ([`MediaSender::pacing_plan`]) tiene que superar
+/// `gain × objetivo` para repartir un intra en [`PacingConfig::keyframe_intervals_measured`] en vez
+/// de [`PacingConfig::keyframe_intervals`].
+pub const KEYFRAME_HEADROOM: f64 = 2.0;
+
+/// Intervalos de pacing de un intra que el **receptor** tolera en su plazo (el emisor puede
+/// configurar hasta esto; con menos, el plazo solo queda holgado).
 pub const KEYFRAME_PACING_INTERVALS: u32 = 2;
 
 /// Objetos de un `Nack` que se reenvían de golpe; los demás, con el ritmo del pacing.
 pub const NACK_BURST: usize = 8;
 
-/// Tiempo en que se reparten los `bytes` de un fotograma: lo que tardan a [`PACING_GAIN`] veces
-/// `target_kbps`, como mucho [`FRAME_PACING_SHARE`] de `interval` (o [`KEYFRAME_PACING_INTERVALS`]
-/// intervalos si es un intra).
+/// Reparto en el tiempo de los fotogramas del emisor. [`PacingConfig::default`] son las
+/// constantes del módulo (sin leer el entorno, para que una variable suelta no cambie los tests);
+/// [`PacingConfig::from_env`] admite `COROOM_PACING_SHARE`, `COROOM_KEYFRAME_PACING_INTERVALS` y
+/// `COROOM_KEYFRAME_PACING_INTERVALS_MEASURED` para comparar A/B con `coroom host` sin recompilar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PacingConfig {
+    /// Ritmo del pacing sobre el bitrate objetivo ([`PACING_GAIN`]).
+    pub gain: f64,
+    /// Parte del intervalo de fotograma que puede ocupar un fotograma normal
+    /// ([`FRAME_PACING_SHARE`]).
+    pub share: f64,
+    /// Intervalos que puede ocupar un intra ([`DEFAULT_KEYFRAME_PACING_INTERVALS`], como mucho
+    /// [`KEYFRAME_PACING_INTERVALS`]).
+    pub keyframe_intervals: f64,
+    /// Intervalos de un intra cuando el enlace midió al menos [`KEYFRAME_HEADROOM`] veces el ritmo
+    /// de pacing ([`DEFAULT_KEYFRAME_PACING_INTERVALS_MEASURED`]).
+    pub keyframe_intervals_measured: f64,
+}
+
+impl Default for PacingConfig {
+    fn default() -> Self {
+        Self {
+            gain: PACING_GAIN,
+            share: FRAME_PACING_SHARE,
+            keyframe_intervals: DEFAULT_KEYFRAME_PACING_INTERVALS,
+            keyframe_intervals_measured: DEFAULT_KEYFRAME_PACING_INTERVALS_MEASURED,
+        }
+    }
+}
+
+impl PacingConfig {
+    /// Los valores por defecto, cambiados por las variables de entorno `COROOM_PACING_SHARE`
+    /// (0,05-1), `COROOM_KEYFRAME_PACING_INTERVALS` y `COROOM_KEYFRAME_PACING_INTERVALS_MEASURED`
+    /// (0,25-[`KEYFRAME_PACING_INTERVALS`]) si están y valen; fuera de rango se ignoran. Solo lo
+    /// usa la aplicación (`coroom host`), nunca los tests.
+    pub fn from_env() -> Self {
+        let env = |name: &str, lo: f64, hi: f64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.trim().parse::<f64>().ok())
+                .filter(|value| value.is_finite() && (lo..=hi).contains(value))
+        };
+        let defaults = Self::default();
+        let max = f64::from(KEYFRAME_PACING_INTERVALS);
+        Self {
+            share: env("COROOM_PACING_SHARE", 0.05, 1.0).unwrap_or(defaults.share),
+            keyframe_intervals: env("COROOM_KEYFRAME_PACING_INTERVALS", 0.25, max)
+                .unwrap_or(defaults.keyframe_intervals),
+            keyframe_intervals_measured: env(
+                "COROOM_KEYFRAME_PACING_INTERVALS_MEASURED",
+                0.25,
+                max,
+            )
+            .unwrap_or(defaults.keyframe_intervals_measured),
+            ..defaults
+        }
+    }
+}
+
+/// Tiempo en que se reparten los `bytes` de un fotograma: lo que tardan a `pace_kbps` (el ritmo
+/// medido del enlace, ver [`MediaSender::pacing_plan`]), como mucho [`PacingConfig::share`] de
+/// `interval`; un intra, [`PacingConfig::keyframe_intervals`] intervalos o, con `headroom` (el
+/// enlace midió [`KEYFRAME_HEADROOM`] veces ese ritmo), [`PacingConfig::keyframe_intervals_measured`].
 pub fn pacing_duration(
     bytes: usize,
-    target_kbps: u32,
+    pace_kbps: u32,
     interval: Duration,
     keyframe: bool,
+    headroom: bool,
+    pacing: &PacingConfig,
 ) -> Duration {
-    let rate_bps = PACING_GAIN * f64::from(target_kbps.max(1)) * 1000.0;
+    let rate_bps = f64::from(pace_kbps.max(1)) * 1000.0;
     let spread = Duration::from_secs_f64(bytes as f64 * 8.0 / rate_bps);
-    let cap = if keyframe {
-        interval * KEYFRAME_PACING_INTERVALS
+    let cap = if keyframe && headroom {
+        interval.mul_f64(pacing.keyframe_intervals_measured)
+    } else if keyframe {
+        interval.mul_f64(pacing.keyframe_intervals)
     } else {
-        interval.mul_f64(FRAME_PACING_SHARE)
+        interval.mul_f64(pacing.share)
     };
     spread.min(cap)
 }
@@ -209,6 +321,19 @@ pub const INITIAL_REPAIR_RATIO: f64 = 0.10;
 /// Proporción máxima de reparación y pérdida a partir de la que se aplica.
 pub const MAX_REPAIR_RATIO: f64 = 0.30;
 const FULL_REPAIR_LOSS: f64 = 0.05;
+
+/// RTT con el invitado, en intervalos de fotograma, a partir del que todo grupo de vídeo de
+/// [`FEC_FLOOR_MIN_OBJECTS`] o más objetos lleva al menos un símbolo de reparación aunque la
+/// ventana de pérdida esté limpia: con un RTT largo, una pérdida aislada sin FEC cuesta un `Nack`
+/// y su ida y vuelta, y como los grupos se entregan en orden, retiene a todos los que vienen
+/// detrás (con 55 ms de RTT a 60 fps, cuatro fotogramas). El símbolo se descuenta del presupuesto
+/// del codificador ([`MediaSender::encoder_target_kbps`]). El RTT es el medido con el invitado
+/// ([`MediaSender::guest_rtt`]), no el de la conexión QUIC (por el relay sería anfitrión↔relay).
+pub const FEC_FLOOR_RTT_INTERVALS: f64 = 2.0;
+
+/// Objetos que tiene que tener un grupo para que el piso de FEC le añada un símbolo: con menos,
+/// el símbolo costaría más de [`MAX_REPAIR_RATIO`] del grupo (uno solo, el 100 %).
+pub const FEC_FLOOR_MIN_OBJECTS: usize = 4;
 
 /// Espera máxima de un grupo de vídeo con `Nack` cuando el RTT no cabe en 4 intervalos.
 pub const MAX_VIDEO_NACK_WAIT: Duration = Duration::from_millis(400);
@@ -352,20 +477,31 @@ impl Clock {
         offsets.get(offsets.len() / 2).copied()
     }
 
-    /// `at` expresado en el reloj remoto y truncado a 32 bits, si ya hay desfase.
+    /// `at` expresado en el reloj remoto y truncado a 32 bits, si el desfase ya es estable: con
+    /// las [`CLOCK_SAMPLES`] muestras de `Pong`. Son las marcas de llegada del `Feedback`, de las
+    /// que el emisor saca el retardo de ida y su cola: con el desfase de una o dos muestras
+    /// (±jitter), la mediana se movía decenas de ms al llegar las siguientes y el control de tasa
+    /// tomaba el salto por una cola que no existía (con 120 ms de RTT y 20 ms de jitter, el bitrate
+    /// caía al mínimo y se quedaba ahí). Hasta entonces el `Feedback` va sin muestras y el control
+    /// de tasa se guía por la pérdida y el caudal. El vídeo arranca sin esperar a esto.
     pub fn remote_us_i32(&self, at: Instant) -> Option<i32> {
+        if self.samples.len() < CLOCK_SAMPLES {
+            return None;
+        }
         let offset = self.offset_us()?;
         Some((self.at_us(at) as i64).wrapping_add(offset) as u32 as i32)
     }
 }
 
 /// Configuración del emisor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MediaSenderConfig {
     /// Intervalo entre fotogramas (1/fps).
     pub frame_interval: Duration,
     /// Límites del control de tasa.
     pub rate: RateConfig,
+    /// Reparto en el tiempo de cada fotograma.
+    pub pacing: PacingConfig,
 }
 
 impl Default for MediaSenderConfig {
@@ -373,6 +509,7 @@ impl Default for MediaSenderConfig {
         Self {
             frame_interval: Duration::from_micros(16_667),
             rate: RateConfig::default(),
+            pacing: PacingConfig::default(),
         }
     }
 }
@@ -416,6 +553,9 @@ struct FeedbackSource {
     last_feedback_ecn: u32,
     /// Mejor tren de sonda que informó este receptor.
     probe: Option<ProbeOutcome>,
+    /// Último `Feedback` procesado: el mismo llega dos veces (por el stream y en un datagrama de
+    /// control) y la copia no se vuelve a aplicar.
+    last_feedback: Option<Feedback>,
 }
 
 impl FeedbackSource {
@@ -431,6 +571,7 @@ impl FeedbackSource {
             last_ecn: 0,
             last_feedback_ecn: 0,
             probe: None,
+            last_feedback: None,
         }
     }
 }
@@ -447,6 +588,12 @@ struct SenderState {
     bytes_sent: u64,
     /// Por grupo enviado: objetos de origen y bytes (cabeceras y reparación) acumulados hasta él.
     cumulative: VecDeque<(u32, u64, u64)>,
+    /// Ritmo (kbit/s) al que salió cada tren de sonda, por identificador, para comprobar lo que
+    /// informe el receptor ([`ProbeOutcome::checked_kbps`]).
+    probe_paces: VecDeque<(u32, u32)>,
+    /// Objetos de origen por fotograma de vídeo, media móvil (para descontar del presupuesto del
+    /// codificador el símbolo de reparación mínimo).
+    video_objects: f64,
 }
 
 impl SenderState {
@@ -510,6 +657,8 @@ impl MediaSender {
                 sources_sent: 0,
                 bytes_sent: 0,
                 cumulative: VecDeque::new(),
+                probe_paces: VecDeque::with_capacity(PROBE_PACES_REMEMBERED + 1),
+                video_objects: 0.0,
             }),
         }
     }
@@ -586,11 +735,71 @@ impl MediaSender {
 
     /// Bitrate para el codificador: el objetivo ([`MediaSender::target_kbps`]) menos la parte que
     /// se lleva la reparación, para que vídeo más FEC sumen el objetivo y no lo pasen (con un 30 %
-    /// de FEC el camino recibía un 30 % más de lo que el control de tasa había decidido).
+    /// de FEC el camino recibía un 30 % más de lo que el control de tasa había decidido). El
+    /// símbolo mínimo por grupo con RTT largo ([`MediaSender::fec_floor`]) también se descuenta,
+    /// con la media de objetos por fotograma.
     pub fn encoder_target_kbps(&self) -> u32 {
         let target = f64::from(self.target_kbps());
-        let ratio = self.repair_ratio();
+        let mut ratio = self.repair_ratio();
+        if self.fec_floor() {
+            let objects = self.state.lock().map_or(0.0, |state| state.video_objects);
+            if objects >= FEC_FLOOR_MIN_OBJECTS as f64 {
+                ratio = ratio.max(1.0 / objects);
+            }
+        }
         ((target / (1.0 + ratio)).round() as u32).max(1)
+    }
+
+    /// Si los grupos de vídeo de [`FEC_FLOOR_MIN_OBJECTS`] o más objetos llevan al menos un
+    /// símbolo de reparación: cuando el RTT medido con el invitado ([`MediaSender::guest_rtt`])
+    /// pasa de [`FEC_FLOOR_RTT_INTERVALS`] intervalos de fotograma (con menos, el `Nack` llega a
+    /// tiempo y la FEC solo gastaría bitrate). Sin medida, no.
+    pub fn fec_floor(&self) -> bool {
+        self.guest_rtt()
+            .is_some_and(|rtt| rtt > self.config.frame_interval.mul_f64(FEC_FLOOR_RTT_INTERVALS))
+    }
+
+    /// RTT con el invitado que limita: en una conexión directa, el de QUIC; por el relay, el doble
+    /// del retardo de ida base que ve su control de tasa (las marcas de llegada del `Feedback`,
+    /// en el reloj del emisor estimado por `Ping`/`Pong`, dan ~RTT/2 sin cola), o `None` hasta
+    /// que haya muestras.
+    pub fn guest_rtt(&self) -> Option<Duration> {
+        if self.conn.path() == crate::Path::Direct {
+            return Some(self.conn.rtt());
+        }
+        let state = self.state.lock().ok()?;
+        let base_us = state.limiting()?.rate.base_owd_us()?;
+        Some(Duration::from_micros(
+            u64::try_from(base_us.max(0)).unwrap_or(0) * 2,
+        ))
+    }
+
+    /// Ritmo al que se reparte un fotograma, en kbit/s, y si el enlace midió holgura para los
+    /// intras: [`PacingConfig::gain`] veces el objetivo o, si el enlace demostró más,
+    /// [`PROBE_START_SHARE`] de lo que midió la sonda del receptor que limita o la estimación de su
+    /// control de tasa (repartir al objetivo cuando el enlace da varias veces más solo retrasa el
+    /// fotograma). La holgura es que lo medido llegue a [`KEYFRAME_HEADROOM`] veces
+    /// `gain × objetivo`; sin ella, los intras se reparten en [`PacingConfig::keyframe_intervals`].
+    pub fn pacing_plan(&self) -> (u32, bool) {
+        let target = f64::from(self.target_kbps()) * self.config.pacing.gain;
+        let measured = self.state.lock().ok().and_then(|state| {
+            let limiting = state.limiting()?;
+            let probe = limiting
+                .probe
+                .and_then(|probe| probe.kbps())
+                .map_or(0.0, |kbps| f64::from(kbps) * PROBE_START_SHARE);
+            Some(probe.max(limiting.rate.estimate_kbps()))
+        });
+        let measured = measured.unwrap_or(0.0);
+        let max = f64::from(self.rate_config().max_kbps).max(target);
+        let pace = target.max(measured).min(max);
+        let headroom = measured >= target * KEYFRAME_HEADROOM;
+        (pace.round().max(1.0) as u32, headroom)
+    }
+
+    /// El ritmo de [`MediaSender::pacing_plan`].
+    pub fn pacing_kbps(&self) -> u32 {
+        self.pacing_plan().0
     }
 
     /// Envía un tren de sonda ([`PROBE_PACKETS`] datagramas de relleno de la pista
@@ -629,8 +838,14 @@ impl MediaSender {
             })
             .collect();
         let bytes: usize = packets.iter().map(Bytes::len).sum();
-        let pace = f64::from(pace_kbps.clamp(1, PROBE_MAX_PACE_KBPS)) * 1000.0;
-        let pacing = Duration::from_secs_f64(bytes as f64 * 8.0 / pace);
+        let pace_kbps = pace_kbps.clamp(1, PROBE_MAX_PACE_KBPS);
+        if let Ok(mut state) = self.state.lock() {
+            state.probe_paces.push_back((train, pace_kbps));
+            while state.probe_paces.len() > PROBE_PACES_REMEMBERED {
+                state.probe_paces.pop_front();
+            }
+        }
+        let pacing = Duration::from_secs_f64(bytes as f64 * 8.0 / (f64::from(pace_kbps) * 1000.0));
         send_paced(&self.conn, packets, pacing, train).await?;
         Ok(train)
     }
@@ -638,10 +853,30 @@ impl MediaSender {
     /// Anota el resultado de un tren de sonda del receptor `source` y, si es el mejor que ha
     /// informado, arranca su control de tasa en [`PROBE_START_SHARE`] de lo medido (solo mientras
     /// no haya llegado ningún `Feedback`: después manda la red en marcha). Devuelve lo medido en
-    /// kbit/s.
+    /// kbit/s, acotado al ritmo al que salió el tren ([`ProbeOutcome::checked_kbps`]); `None` si
+    /// el resultado no vale (más de [`PROBE_PACE_TOLERANCE`] veces ese ritmo: el receptor leyó el
+    /// tren de golpe, no midió el camino).
     pub fn on_probe_result(&self, source: u64, outcome: ProbeOutcome) -> Option<u32> {
-        let kbps = outcome.kbps()?;
         let mut state = self.state.lock().ok()?;
+        let pace = state
+            .probe_paces
+            .iter()
+            .find(|(train, _)| *train == outcome.train)
+            .map(|(_, pace)| *pace);
+        let Some(kbps) = outcome.checked_kbps(pace) else {
+            debug!(
+                train = outcome.train,
+                raw_kbps = outcome.kbps(),
+                pace_kbps = pace,
+                "tren de sonda descartado: midió muy por encima de su ritmo de salida"
+            );
+            return None;
+        };
+        let outcome = ProbeOutcome {
+            // Lo que se guarda ya es coherente con el ritmo de salida.
+            span: span_for(outcome, kbps),
+            ..outcome
+        };
         let index = match state.sources.iter().position(|s| s.id == source) {
             Some(index) => index,
             None => {
@@ -781,13 +1016,16 @@ impl MediaSender {
             ));
         }
 
-        let repair_count = if ratio > 0.0 {
+        let mut repair_count = if ratio > 0.0 {
             ((count as f64 * ratio).ceil() as usize)
                 .min(count)
                 .min(usize::from(u16::MAX))
         } else {
             0
         };
+        if track == Track::Video {
+            repair_count = floor_repairs(count, repair_count, self.fec_floor());
+        }
         let mut repairs = Vec::with_capacity(repair_count);
         if repair_count > 0 {
             data.resize(count * symbol_size, 0);
@@ -814,6 +1052,13 @@ impl MediaSender {
             let sent_us = state.clock.now_us();
             state.sources_sent += count as u64;
             state.bytes_sent += bytes as u64;
+            if track == Track::Video {
+                state.video_objects = if state.video_objects < 1.0 {
+                    count as f64
+                } else {
+                    state.video_objects * 0.9 + count as f64 * 0.1
+                };
+            }
             let (cumulative, cumulative_bytes) = (state.sources_sent, state.bytes_sent);
             state
                 .cumulative
@@ -838,11 +1083,14 @@ impl MediaSender {
             repairs: repairs.len(),
             bytes,
         };
+        let (pace_kbps, headroom) = self.pacing_plan();
         let pacing = pacing_duration(
             report.bytes,
-            self.target_kbps(),
+            pace_kbps,
             self.config.frame_interval,
             keyframe,
+            headroom,
+            &self.config.pacing,
         );
         let all: Vec<Bytes> = sources.into_iter().chain(repairs).collect();
         send_paced(&self.conn, all, pacing, group).await?;
@@ -892,8 +1140,15 @@ impl MediaSender {
             && let Ok(runtime) = runtime
         {
             let bytes = packets.iter().map(Bytes::len).sum();
-            let pacing =
-                pacing_duration(bytes, self.target_kbps(), self.config.frame_interval, true);
+            let (pace_kbps, headroom) = self.pacing_plan();
+            let pacing = pacing_duration(
+                bytes,
+                pace_kbps,
+                self.config.frame_interval,
+                true,
+                headroom,
+                &self.config.pacing,
+            );
             let conn = self.conn.clone();
             let count = packets.len();
             runtime.spawn(async move {
@@ -954,6 +1209,20 @@ impl MediaSender {
             }
         };
         let entry = &mut state.sources[index];
+        // El mismo informe llega dos veces (datagrama y stream) y, si el datagrama de uno se
+        // perdió, su copia del stream llega después de informes más nuevos: solo se aplica lo que
+        // avanza (los contadores son acumulados). Aplicar uno viejo hacía retroceder `last_received`
+        // y el siguiente informe parecía entregar el doble.
+        if let Some(last) = &entry.last_feedback
+            && (last == feedback
+                || feedback.received_bytes < last.received_bytes
+                || feedback.highest_group < last.highest_group)
+        {
+            return state
+                .limiting()
+                .map_or(self.rate_config().start_kbps, |s| s.rate.target_kbps());
+        }
+        entry.last_feedback = Some(feedback.clone());
         let (sources, sent_bytes_total) =
             covered.unwrap_or((entry.last_sources, entry.last_sent_bytes));
         let lost = feedback.lost_objects.saturating_sub(entry.last_lost);
@@ -1081,6 +1350,29 @@ fn datagram(header: ObjectHeader, payload: &[u8]) -> Bytes {
     Bytes::from(out)
 }
 
+/// Símbolos de reparación de un grupo de vídeo de `count` objetos: los `repairs` del ratio de
+/// pérdida y, con el piso de FEC activo ([`FEC_FLOOR_RTT_INTERVALS`]), al menos uno si el grupo
+/// tiene [`FEC_FLOOR_MIN_OBJECTS`] o más objetos (con menos, un símbolo pasaría de
+/// [`MAX_REPAIR_RATIO`] del grupo).
+fn floor_repairs(count: usize, repairs: usize, floor: bool) -> usize {
+    if floor && count >= FEC_FLOOR_MIN_OBJECTS {
+        repairs.max(1).min(count)
+    } else {
+        repairs
+    }
+}
+
+/// Dispersión que corresponde a `kbps` para los bytes de `outcome` (la inversa de
+/// [`ProbeOutcome::kbps`]); la suya si ya coincide.
+fn span_for(outcome: ProbeOutcome, kbps: u32) -> Duration {
+    if outcome.kbps() == Some(kbps) || outcome.received < 2 || kbps == 0 {
+        return outcome.span;
+    }
+    let bytes =
+        f64::from(outcome.bytes) * f64::from(outcome.received - 1) / f64::from(outcome.received);
+    Duration::from_secs_f64(bytes * 8.0 / 1000.0 / f64::from(kbps))
+}
+
 /// Fotograma reensamblado.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompleteFrame {
@@ -1092,6 +1384,8 @@ pub struct CompleteFrame {
     pub keyframe: bool,
     /// Carga útil tal como la pasó el emisor a `send_frame`.
     pub payload: Vec<u8>,
+    /// Llegada del primer objeto del grupo (el reensamblado dura hasta `received_at`).
+    pub first_arrival: Instant,
     /// Momento en que se completó.
     pub received_at: Instant,
 }
@@ -1879,6 +2173,7 @@ impl ReceiverCore {
                     group: next,
                     keyframe: state.keyframe,
                     payload,
+                    first_arrival: state.first,
                     received_at,
                 });
             }
@@ -1944,6 +2239,10 @@ pub struct MediaReceiver {
     /// Último desfase `reloj del emisor − reloj local` en µs ([`NO_OFFSET`] mientras no hay),
     /// para leerlo sin esperar al cerrojo del receptor (lo lee el hilo de entrada por cada paquete).
     offset_us: AtomicI64,
+    /// Último `Pong` del emisor, en µs desde `origin` ([`MediaReceiver::last_pong`]).
+    last_pong_us: AtomicI64,
+    /// Etiqueta de los datagramas de control que envía ([`MediaReceiver::set_control_tag`]).
+    control_tag: AtomicU32,
 }
 
 /// Valor de `MediaReceiver::offset_us` mientras no hay desfase.
@@ -1968,6 +2267,8 @@ impl MediaReceiver {
             control,
             origin: clock.origin(),
             offset_us: AtomicI64::new(NO_OFFSET),
+            last_pong_us: AtomicI64::new(-1),
+            control_tag: AtomicU32::new(0),
             inner: Mutex::new(ReceiverInner {
                 core: ReceiverCore::new(config.frame_interval),
                 clock,
@@ -1981,6 +2282,22 @@ impl MediaReceiver {
     fn atomic_offset(&self) -> Option<i64> {
         let offset = self.offset_us.load(Ordering::Acquire);
         (offset != NO_OFFSET).then_some(offset)
+    }
+
+    /// Cuándo llegó el último `Pong` del emisor (ninguno aún: `None`). Con los `Ping` de cada
+    /// segundo, varios segundos sin `Pong` ni datagramas son un camino muerto.
+    pub fn last_pong(&self) -> Option<Instant> {
+        let us = self.last_pong_us.load(Ordering::Acquire);
+        u64::try_from(us)
+            .ok()
+            .map(|us| self.origin + Duration::from_micros(us))
+    }
+
+    /// Etiqueta que llevan los datagramas de control de este receptor (el `group` de su
+    /// cabecera): detrás del relay, el anfitrión recibe los de todos los invitados por una misma
+    /// conexión y con ella atribuye cada `Feedback` a su invitado (su id de par).
+    pub fn set_control_tag(&self, tag: u32) {
+        self.control_tag.store(tag, Ordering::Release);
     }
 
     /// Fija el intervalo de fotograma de `track` con lo que anuncia el emisor (ver
@@ -2042,8 +2359,14 @@ impl MediaReceiver {
     pub fn handle_control(&self, message: ControlMessage) -> Option<ControlMessage> {
         match message {
             ControlMessage::Pong { t, t_recv } => {
+                let now = Instant::now();
+                self.last_pong_us.store(
+                    i64::try_from(now.saturating_duration_since(self.origin).as_micros())
+                        .unwrap_or(i64::MAX),
+                    Ordering::Release,
+                );
                 if let Ok(mut inner) = self.inner.lock() {
-                    inner.clock.on_pong(Instant::now(), t, t_recv);
+                    inner.clock.on_pong(now, t, t_recv);
                     self.offset_us.store(
                         inner.clock.offset_us().unwrap_or(NO_OFFSET),
                         Ordering::Release,
@@ -2089,9 +2412,10 @@ impl MediaReceiver {
                 wake
             };
             tokio::select! {
-                datagram = self.conn.read_datagram() => {
-                    let datagram = datagram?;
-                    let now = Instant::now();
+                datagram = self.conn.read_datagram_timed() => {
+                    // El instante es el de la llegada a `quinn`, no el de ahora: si esta tarea
+                    // tardó en leer, las sondas y las muestras de OWD siguen midiendo el camino.
+                    let (now, datagram) = datagram?;
                     let messages = match self.inner.lock() {
                         Ok(mut inner) => {
                             let arrival = inner.clock.remote_us_i32(now);
@@ -2146,14 +2470,16 @@ impl MediaReceiver {
         self.send_control(message);
     }
 
-    /// Envía un mensaje por el stream de control y, si corre prisa (`Nack`, `KeyframeRequest`),
-    /// una copia en un datagrama de control: si el paquete del stream se pierde, QUIC no lo
-    /// reenvía hasta su PTO (60-70 ms con un RTT de 20 ms) y lo que viene detrás espera con él.
+    /// Envía un mensaje por el stream de control y, si corre prisa (`Nack`, `KeyframeRequest`,
+    /// `Feedback`), una copia en un datagrama de control: si el paquete del stream se pierde, QUIC
+    /// no lo reenvía hasta su PTO (60-70 ms con un RTT de 20 ms) y lo que viene detrás espera con
+    /// él. El datagrama lleva la etiqueta de [`MediaReceiver::set_control_tag`].
     pub fn send_control(&self, message: &ControlMessage) {
         if let Err(err) = self.control.send(message) {
             debug!(error = %err, "no se pudo enviar un mensaje de control");
         }
-        if let Some(datagram) = coroom_proto::control::control_datagram(message)
+        let tag = self.control_tag.load(Ordering::Acquire);
+        if let Some(datagram) = coroom_proto::control::control_datagram_tagged(message, tag)
             && let Err(err) = self.conn.send_datagram(Bytes::from(datagram))
         {
             debug!(error = %err, "no se pudo enviar un datagrama de control");
@@ -2251,6 +2577,118 @@ mod tests {
         };
         assert_eq!(outcome.kbps(), None);
         assert_eq!(outcome.lost(), 47);
+    }
+
+    /// Un tren que el receptor saca de su cola de golpe (antes de que se leyera nada, los
+    /// 64 datagramas se apilaban y se marcaban al leerlos) mide Gbit/s: con el ritmo al que salió
+    /// se descarta, y uno que mide algo por encima de ese ritmo (jitter de los temporizadores)
+    /// se acota a él. Un tren que mide por debajo del ritmo de salida es el camino y vale tal cual.
+    #[test]
+    fn a_train_drained_in_a_burst_is_rejected_and_a_fast_one_is_clamped() {
+        let mut core = ReceiverCore::new(Duration::from_millis(16));
+        let start = Instant::now();
+        // Los 64 datagramas leídos uno tras otro, a 1 µs.
+        for index in 0..PROBE_PACKETS {
+            let at = start + Duration::from_micros(u64::from(index));
+            core.push(&probe_datagram(1, index, PROBE_PACKETS), at, None);
+        }
+        let drained = core.last_probe().expect("tren informado");
+        let raw = drained.kbps().expect("dos o más datagramas");
+        // 63 × 1016 B en 63 µs: más de 8 Gbit/s.
+        assert!(raw > 1_000_000, "{raw} kbit/s");
+        // El emisor sabe que el tren salió a 100 Mbit/s: la medida no vale.
+        assert_eq!(drained.checked_kbps(Some(PROBE_MAX_PACE_KBPS)), None);
+        // Sin ritmo conocido no hay con qué comparar.
+        assert_eq!(drained.checked_kbps(None), Some(raw));
+
+        // Dispersión algo menor que la de salida: vale el ritmo de salida.
+        let fast = ProbeOutcome {
+            train: 2,
+            sent: PROBE_PACKETS,
+            received: PROBE_PACKETS,
+            bytes: 64 * 1_200,
+            span: Duration::from_micros(4_000),
+        };
+        let fast_raw = fast.kbps().expect("medible");
+        assert!(fast_raw > 100_000 && fast_raw < 200_000, "{fast_raw}");
+        assert_eq!(fast.checked_kbps(Some(100_000)), Some(100_000));
+        assert_eq!(span_for(fast, 100_000), Duration::from_micros(6_048));
+
+        // Un enlace de 20 Mbit/s dispersa el tren a 20 Mbit/s: se acepta tal cual.
+        let slow = ProbeOutcome {
+            train: 3,
+            sent: PROBE_PACKETS,
+            received: PROBE_PACKETS,
+            bytes: 64 * 1_200,
+            span: Duration::from_micros(30_240),
+        };
+        assert_eq!(slow.checked_kbps(Some(100_000)), Some(20_000));
+        assert_eq!(span_for(slow, 20_000), slow.span);
+    }
+
+    /// Un tren entero a [`PROBE_MAX_PACE_KBPS`] dura varias veces la resolución de los
+    /// temporizadores (0,5 ms), así la dispersión medida es la del camino y no la del reloj.
+    #[test]
+    fn a_full_probe_train_spans_several_milliseconds() {
+        let bytes = usize::from(PROBE_PACKETS) * ObjectHeader::MAX_PACKET;
+        let span = bytes as f64 * 8.0 / (f64::from(PROBE_MAX_PACE_KBPS) * 1000.0);
+        assert!(span >= 0.005, "{span:.4} s");
+    }
+
+    /// El pacing reparte el fotograma al ritmo medido, acotado por la parte del intervalo
+    /// configurada; con el enlace rápido el fotograma sale enseguida y no se estira al bitrate
+    /// objetivo.
+    #[test]
+    fn pacing_follows_the_measured_rate_and_the_share_of_the_interval() {
+        let pacing = PacingConfig::default();
+        // 40 KB a 70 Mbit/s: 4,6 ms, por debajo del 30 % de 16,7 ms.
+        let spread = pacing_duration(40_000, 70_000, INTERVAL, false, false, &pacing);
+        assert!((spread.as_micros() as i64 - 4_571).abs() < 20, "{spread:?}");
+        // 40 KB a 10 Mbit/s: 32 ms, acotado al 30 % del intervalo.
+        assert_eq!(
+            pacing_duration(40_000, 10_000, INTERVAL, false, false, &pacing),
+            INTERVAL.mul_f64(FRAME_PACING_SHARE)
+        );
+        // Un intra de 300 KB a 70 Mbit/s: 34 ms. Sin holgura medida, dos intervalos (lo que
+        // tolera el receptor); con ella, uno.
+        assert_eq!(
+            pacing_duration(300_000, 70_000, INTERVAL, true, false, &pacing),
+            INTERVAL * 2
+        );
+        assert_eq!(
+            pacing_duration(300_000, 70_000, INTERVAL, true, true, &pacing),
+            INTERVAL
+        );
+        // La parte es configurable (A/B con `coroom host`).
+        let wide = PacingConfig {
+            share: 0.8,
+            keyframe_intervals: 1.5,
+            ..pacing
+        };
+        assert_eq!(
+            pacing_duration(40_000, 10_000, INTERVAL, false, false, &wide),
+            INTERVAL.mul_f64(0.8)
+        );
+        assert_eq!(
+            pacing_duration(300_000, 70_000, INTERVAL, true, false, &wide),
+            INTERVAL.mul_f64(1.5)
+        );
+        // El receptor tolera hasta KEYFRAME_PACING_INTERVALS: el emisor nunca configura más.
+        assert!(pacing.keyframe_intervals <= f64::from(KEYFRAME_PACING_INTERVALS));
+        assert!(pacing.keyframe_intervals_measured <= pacing.keyframe_intervals);
+    }
+
+    /// El piso de FEC añade un símbolo solo a los grupos con objetos de sobra para que no pase de
+    /// MAX_REPAIR_RATIO; con uno o dos objetos (poco bitrate) no dobla el gasto.
+    #[test]
+    fn the_fec_floor_only_adds_a_symbol_to_groups_of_four_or_more() {
+        assert_eq!(floor_repairs(1, 0, true), 0);
+        assert_eq!(floor_repairs(3, 0, true), 0);
+        assert_eq!(floor_repairs(4, 0, true), 1);
+        assert_eq!(floor_repairs(40, 0, true), 1);
+        assert_eq!(floor_repairs(40, 12, true), 12);
+        assert_eq!(floor_repairs(40, 0, false), 0);
+        assert!(1.0 / FEC_FLOOR_MIN_OBJECTS as f64 <= MAX_REPAIR_RATIO);
     }
 
     const INTERVAL: Duration = Duration::from_micros(16_667);
@@ -2757,32 +3195,50 @@ mod tests {
         clock.on_pong(base + Duration::from_micros(t + 20_000), t, t_recv);
         assert_eq!(clock.rtt(), Some(Duration::from_millis(20)));
         assert_eq!(clock.offset_us(), Some(50_000));
+        // Con una sola muestra el desfase sirve para mostrar, no para las marcas del Feedback.
+        assert_eq!(
+            clock.remote_us_i32(base + Duration::from_micros(100_000)),
+            None
+        );
+        for i in 1..CLOCK_SAMPLES as u64 {
+            let t = 1_000 + i * 100_000;
+            clock.on_pong(
+                base + Duration::from_micros(t + 20_000),
+                t,
+                t + 10_000 + 50_000,
+            );
+        }
         let remote = clock.remote_us_i32(base + Duration::from_micros(100_000));
         assert_eq!(remote, Some(150_000));
     }
 
-    /// El pacing reparte cada fotograma al ritmo de 1,25 veces el objetivo, sin pasar de 0,8
-    /// intervalos (2 en un intra): a 120 fps y 20 Mbit/s, un intra de 400 KB ya no sale en 4 ms.
+    /// El pacing reparte cada fotograma al ritmo que se le da (el medido), sin pasar de la parte
+    /// del intervalo configurada (un intervalo en un intra): a 120 fps y 20 Mbit/s, un intra de
+    /// 400 KB ya no sale en 4 ms.
     #[test]
-    fn pacing_follows_the_target_and_is_capped_per_frame() {
+    fn pacing_follows_the_rate_and_is_capped_per_frame() {
         let interval = Duration::from_micros(8_333);
-        // 20 KB a 20 Mbit/s × 1,25 = 25 Mbit/s: 6,4 ms.
-        let normal = pacing_duration(20_000, 20_000, interval, false);
-        assert!((normal.as_secs_f64() - 0.0064).abs() < 1e-6, "{normal:?}");
-        // 100 KB serían 32 ms: se recorta a 0,8 intervalos.
+        let pacing = PacingConfig::default();
+        // 2 KB a 20 Mbit/s: 0,8 ms.
+        let normal = pacing_duration(2_000, 20_000, interval, false, false, &pacing);
+        assert!((normal.as_secs_f64() - 0.0008).abs() < 1e-6, "{normal:?}");
+        // 100 KB serían 40 ms: se recorta a la parte del intervalo.
         assert_eq!(
-            pacing_duration(100_000, 20_000, interval, false),
+            pacing_duration(100_000, 20_000, interval, false, false, &pacing),
             interval.mul_f64(FRAME_PACING_SHARE)
         );
-        // Un intra de 400 KB: 2 intervalos (16,7 ms) en vez de los 4 ms de antes.
+        // Un intra de 400 KB: dos intervalos (16,7 ms) en vez de los 4 ms de antes.
         assert_eq!(
-            pacing_duration(400_000, 20_000, interval, true),
+            pacing_duration(400_000, 20_000, interval, true, false, &pacing),
             interval * 2
         );
-        // Lo pequeño apenas espera; un objetivo de 0 no divide por cero.
-        assert!(pacing_duration(1_200, 80_000, interval, false) < Duration::from_micros(100));
+        // Lo pequeño apenas espera; un ritmo de 0 no divide por cero.
+        assert!(
+            pacing_duration(1_200, 80_000, interval, false, false, &pacing)
+                < Duration::from_micros(150)
+        );
         assert_eq!(
-            pacing_duration(1_200, 0, interval, false),
+            pacing_duration(1_200, 0, interval, false, false, &pacing),
             interval.mul_f64(FRAME_PACING_SHARE)
         );
     }

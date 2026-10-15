@@ -38,6 +38,19 @@ pub const MAPPING_TIMEOUT: Duration = Duration::from_millis(2000);
 /// Espera antes de volver a intentar una renovación fallida.
 const RENEW_RETRY: Duration = Duration::from_secs(60);
 
+/// Ejecuta `read` en un hilo de bloqueo del runtime (una lectura del sistema que puede tardar),
+/// o en el hilo actual si no hay runtime.
+async fn blocking<T: Send + 'static>(
+    read: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => tokio::task::spawn_blocking(read)
+            .await
+            .unwrap_or_else(|err| Err(format!("la lectura del sistema falló: {err}"))),
+        Err(_) => read(),
+    }
+}
+
 /// Con qué protocolo respondió el router.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MappingProtocol {
@@ -283,9 +296,11 @@ impl Mapper {
     /// consiguió, el [`PortMapping`] solo lleva el informe.
     pub async fn map(&self, internal_port: u16) -> PortMapping {
         let deadline = Instant::now() + self.timeout;
+        // La tabla de rutas se lee con llamadas al sistema que bloquean (netlink, `GetIpForwardTable2`):
+        // fuera de los hilos del runtime, que llevan los medios.
         let gateway = match self.gateway {
             Some(gateway) => gateway,
-            None => match gateway::default_gateway() {
+            None => match blocking(gateway::default_gateway).await {
                 Ok(ip) => SocketAddrV4::new(ip, GATEWAY_PORT),
                 Err(error) => {
                     return PortMapping::unmapped(MappingReport {
@@ -296,7 +311,8 @@ impl Mapper {
                 }
             },
         };
-        let local_ip = match gateway::local_ip_towards(*gateway.ip()) {
+        let gateway_ip = *gateway.ip();
+        let local_ip = match blocking(move || gateway::local_ip_towards(gateway_ip)).await {
             Ok(ip) => ip,
             Err(error) => {
                 return PortMapping::unmapped(MappingReport {

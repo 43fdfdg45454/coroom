@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use coroom_audio::processing::VoiceProcessor;
 use coroom_codec::{DecoderSet, decoder_label};
 use coroom_transport::PeerConnection;
-use coroom_transport::connect::{Connector, RelayInfo};
+use coroom_transport::connect::{Connector, ExtraCandidates, RelayInfo};
 use coroom_transport::crypto::hpke;
 use coroom_transport::crypto::{
     KeyPackageBundle, Processed, RoomGroup, SafetyNumber, sha256_fingerprint,
@@ -36,9 +36,9 @@ use super::host::signal_error;
 use super::negotiate::{GuestCapabilities, codec_from_wire, format_from_wire, shape_from_message};
 use super::wire::{Payload, host_recipient, pairwise_info};
 use super::{
-    Command, Core, GUEST_FRAME_INTERVAL, MAX_RECONNECT_ATTEMPTS, QUALITY_PING_PERIOD, QualityLevel,
-    REPLY_TIMEOUT, RemoteConfig, RoomMember, SessionEvent, Started, advertised_candidates, lock,
-    reconnect_delay,
+    CURSOR_DATAGRAM_FRESH, Command, Core, GUEST_FRAME_INTERVAL, MAX_RECONNECT_ATTEMPTS,
+    MEDIA_WATCHDOG, QUALITY_PING_PERIOD, QualityLevel, REPLY_TIMEOUT, RemoteConfig, RoomMember,
+    SessionEvent, Started, advertised_candidates, lock, reconnect_delay,
 };
 use crate::latency::{AudioTrack, Stage};
 use crate::loopback::{
@@ -395,6 +395,8 @@ struct Room {
     relay_known: bool,
     candidates: Option<Vec<SocketAddr>>,
     connection: Option<tokio::task::JoinHandle<()>>,
+    /// Candidatos del anfitrión que lleguen con la conexión ya en marcha (su dirección WAN).
+    extra_candidates: Option<mpsc::UnboundedSender<Vec<SocketAddr>>>,
     frames: FrameQueue,
     decode: Arc<DecodeControl>,
     disconnected: mpsc::UnboundedSender<Result<(), SessionError>>,
@@ -413,6 +415,14 @@ impl Room {
                 addrs,
                 ..
             } => {
+                if self.connection.is_some() {
+                    // Un segundo anuncio (la WAN que abrió su router): a la apertura en marcha.
+                    if let Some(extra) = &self.extra_candidates {
+                        let _ = extra.send(addrs.clone());
+                    }
+                    self.candidates = Some(addrs);
+                    return Ok(());
+                }
                 self.candidates = Some(addrs);
                 self.maybe_connect();
                 Ok(())
@@ -447,6 +457,30 @@ impl Room {
                     from_name,
                     code,
                 });
+                Ok(())
+            }
+            SignalMessage::JoinRequested {
+                from_user,
+                from_name,
+            } => {
+                self.core.emit(SessionEvent::JoinRequested {
+                    from_user,
+                    from_name,
+                });
+                Ok(())
+            }
+            SignalMessage::JoinDeclined {
+                from_user,
+                from_name,
+            } => {
+                self.core.emit(SessionEvent::JoinDeclined {
+                    from_user,
+                    from_name,
+                });
+                Ok(())
+            }
+            SignalMessage::Activity { user, activity } => {
+                self.core.emit(SessionEvent::Activity { user, activity });
                 Ok(())
             }
             SignalMessage::Presence { user, online } => {
@@ -616,6 +650,7 @@ impl Room {
         // Sin candidatos del anfitrión (fuerza el relay) no se intenta la vía directa, salvo que
         // no haya relay.
         let force_relay = relay.is_some() && (self.config.force_relay || candidates.is_empty());
+        let (extra_tx, extra_rx) = mpsc::unbounded_channel();
         let task = tokio::spawn(connect_and_receive(
             Arc::clone(&self.core),
             self.endpoint.clone(),
@@ -627,8 +662,10 @@ impl Room {
             self.frames.clone(),
             Arc::clone(&self.decode),
             self.disconnected.clone(),
+            extra_rx,
         ));
         self.connection = Some(task);
+        self.extra_candidates = Some(extra_tx);
     }
 }
 
@@ -644,7 +681,7 @@ async fn run_guest(
     let endpoint = Endpoint::bind(&identity, config.bind, EndpointOptions::default())
         .map_err(network("no se pudo abrir el socket UDP"))?;
     let mapping_task = super::start_port_mapping(&config, &endpoint);
-    let mapping_started = std::time::Instant::now();
+    let mut mapping_rx = super::watch_port_mapping(&core, mapping_task);
     let mut signal = tokio::time::timeout(
         REPLY_TIMEOUT,
         SignalClient::connect(&config.server_url, &config.token, &endpoint, &config.trust),
@@ -677,8 +714,10 @@ async fn run_guest(
                 your_peer_id,
                 ..
             }) => {
-                // Para reconocer los mensajes propios del chat (un id nuevo cada vez que entra).
+                // Para reconocer los mensajes propios del chat (un id nuevo cada vez que entra) y
+                // etiquetar los datagramas de control hacia el anfitrión.
                 lock(&core.chat).add_own_guest(your_peer_id);
+                core.own_peer_id.store(your_peer_id, Ordering::Release);
                 break (host_pk, host_name);
             }
             Some(SignalMessage::Error { message, .. }) => {
@@ -712,20 +751,41 @@ async fn run_guest(
     // del invitado arranque, su handshake se rechazaría después de que él lo diese por bueno (en
     // TLS 1.3 el cliente termina antes de que el servidor valide su certificado).
     endpoint.admit(host_pk);
+    // Los candidatos locales y el reflejado salen ya; la WAN del router, cuando este conteste.
+    let observed = signal.observed();
     let candidates = if config.force_relay {
+        mapping_rx = None;
         Vec::new()
     } else {
-        let mapping = super::await_port_mapping(&core, mapping_task, mapping_started).await;
-        advertised_candidates(&config, &endpoint, signal.observed(), mapping.as_ref())
+        advertised_candidates(&config, &endpoint, observed, None)
     };
     signal
         .send(&SignalMessage::Candidates {
             from_peer: 0,
             to_peer: HOST_PEER_ID,
-            addrs: candidates,
+            addrs: candidates.clone(),
         })
         .await
         .map_err(network("señalización"))?;
+    if let Some(rx) = mapping_rx.take() {
+        let (config, endpoint, signal) = (config.clone(), endpoint.clone(), signal.sender());
+        tokio::spawn(async move {
+            let Ok(report) = rx.await else {
+                return;
+            };
+            let with_wan = advertised_candidates(&config, &endpoint, observed, Some(&report));
+            if with_wan != candidates {
+                debug!("el router abrió el puerto: se anuncian los candidatos otra vez");
+                let _ = signal
+                    .send(&SignalMessage::Candidates {
+                        from_peer: 0,
+                        to_peer: HOST_PEER_ID,
+                        addrs: with_wan,
+                    })
+                    .await;
+            }
+        });
+    }
 
     let (disconnected_tx, mut disconnected) = mpsc::unbounded_channel();
     let mut room = Room {
@@ -742,6 +802,7 @@ async fn run_guest(
         relay_known: false,
         candidates: None,
         connection: None,
+        extra_candidates: None,
         frames,
         decode,
         disconnected: disconnected_tx,
@@ -780,6 +841,7 @@ async fn run_guest(
                         Command::Kick(_)
                         | Command::PermissionsChanged(_)
                         | Command::Invite(_)
+                        | Command::DeclineJoin(_)
                         | Command::GamepadMode { .. }
                         | Command::GamepadOutput { .. }
                         | Command::Video(_)
@@ -845,6 +907,7 @@ async fn connect_and_receive(
     frames: FrameQueue,
     decode: Arc<DecodeControl>,
     done: mpsc::UnboundedSender<Result<(), SessionError>>,
+    extra: ExtraCandidates,
 ) {
     let result = receive(
         &core,
@@ -856,6 +919,7 @@ async fn connect_and_receive(
         timeouts,
         &frames,
         decode,
+        extra,
     )
     .await;
     let _ = done.send(result);
@@ -872,12 +936,13 @@ async fn receive(
     (punch_timeout, probe): (Duration, Duration),
     frames: &FrameQueue,
     decode: Arc<DecodeControl>,
+    extra: ExtraCandidates,
 ) -> Result<(), SessionError> {
     let identity_pk = endpoint.public_key();
     let established = Connector::new(endpoint)
         .with_timeout(punch_timeout)
         .force_relay(force_relay)
-        .connect(host_pk, candidates, relay)
+        .connect_with(host_pk, candidates, relay, Some(extra))
         .await
         .map_err(network("no se pudo conectar con el anfitrión"))?;
     let connection = established.connection;
@@ -907,6 +972,8 @@ async fn receive(
             frame_interval: GUEST_FRAME_INTERVAL,
         },
     ));
+    // Detrás del relay, el anfitrión atribuye los `Feedback` en datagrama por esta etiqueta.
+    receiver.set_control_tag(core.own_peer_id.load(Ordering::Acquire));
     {
         let mut link = lock(&core.link);
         link.path = Some(established.path);
@@ -951,24 +1018,11 @@ async fn receive(
         Arc::clone(&receiver),
         Arc::clone(&decode),
     ));
-    // Estimación de calidad: RTT con el anfitrión antes de que arranque el códec (el
-    // anfitrión no lo crea hasta tener las capacidades de este invitado).
-    let rtt_ms = measure_rtt(&receiver, &connection, probe).await;
-    core.emit(SessionEvent::QualityEstimate {
-        rtt_ms,
-        level: QualityLevel::from_rtt_ms(rtt_ms),
-    });
-    // La sonda del enlace que mandó el anfitrión mientras se medía el RTT.
-    if let Some(outcome) = receiver.last_probe()
-        && let Some(kbps) = outcome.kbps()
-    {
-        core.emit(SessionEvent::LinkProbe {
-            guest: None,
-            kbps,
-            lost: outcome.lost(),
-            sent: outcome.sent,
-        });
-    }
+    // Las capacidades salen ya: el anfitrión no abre el codificador ni manda el primer intra
+    // hasta tenerlas (antes se esperaba un segundo de `Ping` aquí, que se sumaba al tiempo hasta
+    // el primer fotograma). La estimación de calidad se mide a la vez, en segundo plano; las
+    // marcas de llegada del `Feedback` esperan a que el reloj tenga sus muestras
+    // (`Clock::remote_us_i32`), así el control de tasa no toma un desfase a medio estimar por cola.
     if let Err(err) = reply.send(&caps.to_message()) {
         control_task.abort();
         if let Some(task) = &audio_task {
@@ -977,6 +1031,30 @@ async fn receive(
         connection.close("capacidades");
         return Err(network("capacidades")(err));
     }
+    let quality_task = {
+        let (core, receiver, connection) =
+            (Arc::clone(core), Arc::clone(&receiver), connection.clone());
+        tokio::spawn(async move {
+            let rtt_ms = measure_rtt(&receiver, &connection, probe).await;
+            core.emit(SessionEvent::QualityEstimate {
+                rtt_ms,
+                level: QualityLevel::from_rtt_ms(rtt_ms),
+            });
+            // La sonda del enlace que mandó el anfitrión al conectar.
+            if let Some(outcome) = receiver.last_probe()
+                && let Some(kbps) = outcome.kbps()
+            {
+                core.emit(SessionEvent::LinkProbe {
+                    guest: None,
+                    kbps,
+                    lost: outcome.lost(),
+                    sent: outcome.sent,
+                });
+            }
+        })
+    };
+    // Las copias en datagrama del control del anfitrión (el cursor numerado).
+    let datagram_task = tokio::spawn(control_datagrams(Arc::clone(core), connection.clone()));
     playing.store(true, Ordering::Release);
     // Entrada: stream y emisor cifrados con el secreto pareja a pareja.
     let input_task = {
@@ -988,8 +1066,10 @@ async fn receive(
             }
         })
     };
-    let result = media_loop(core, &receiver, &reply, frames, &decode).await;
+    let result = media_loop(core, &connection, &receiver, &reply, frames, &decode).await;
     input_task.abort();
+    quality_task.abort();
+    datagram_task.abort();
     if let Some(task) = &audio_task {
         task.stop();
     }
@@ -1098,12 +1178,18 @@ async fn control_loop(
                 visible,
                 shape_id,
             }) => {
-                *lock(&core.shared.cursor) = Some(coroom_capture::CursorState {
-                    x,
-                    y,
-                    visible,
-                    shape_id,
-                });
+                // Va con el siguiente fotograma y, si la ventana compone el cursor entre
+                // fotogramas, se le avisa ya (sin esperar al vídeo). La copia del stream solo
+                // vale si los datagramas del cursor no están llegando: tras una pérdida, el stream
+                // entrega de golpe posiciones ya viejas.
+                if !cursor_datagrams_fresh(&core, Instant::now()) {
+                    core.shared.set_cursor(coroom_capture::CursorState {
+                        x,
+                        y,
+                        visible,
+                        shape_id,
+                    });
+                }
             }
             Some(ControlMessage::CursorShape {
                 shape_id,
@@ -1267,6 +1353,88 @@ const STALL: Duration = Duration::from_millis(500);
 /// ningún otro fotograma que dispare una petición (el invitado se quedaba en «Entrando en la
 /// sala» con audio y entrada funcionando).
 #[derive(Debug)]
+/// Vigilante del camino: si con el códec ya elegido no llega ningún datagrama del anfitrión (de
+/// ninguna pista) ni ningún `Pong` a los `Ping` de cada segundo durante [`MEDIA_WATCHDOG`], el
+/// camino está muerto (la NAT olvidó la asignación, el relay cayó) y se reconecta sin esperar al
+/// `IDLE_TIMEOUT` de QUIC. [`VideoWatch`] solo pide intra; esto reconecta.
+struct MediaWatchdog {
+    datagrams: u64,
+    last_sign: Instant,
+}
+
+impl MediaWatchdog {
+    fn new(now: Instant, datagrams: u64) -> Self {
+        Self {
+            datagrams,
+            last_sign: now,
+        }
+    }
+
+    /// Cuánto lleva el camino sin señales de vida si ya pasa de [`MEDIA_WATCHDOG`].
+    fn dead(
+        &mut self,
+        now: Instant,
+        datagrams: u64,
+        last_pong: Option<Instant>,
+        codec_known: bool,
+    ) -> Option<Duration> {
+        if datagrams != self.datagrams {
+            self.datagrams = datagrams;
+            self.last_sign = now;
+        }
+        if let Some(pong) = last_pong
+            && pong > self.last_sign
+        {
+            self.last_sign = pong;
+        }
+        let silence = now.saturating_duration_since(self.last_sign);
+        (codec_known && silence >= MEDIA_WATCHDOG).then_some(silence)
+    }
+}
+
+/// Lee las copias en datagrama del control del anfitrión. Hoy solo el `Cursor`: llega numerado
+/// (la etiqueta del datagrama) y gana el más reciente; los que llegan desordenados se descartan.
+/// Un datagrama perdido no retiene a los siguientes como en el stream (donde una pérdida
+/// congelaba el cursor ~100 ms y después reproducía las posiciones viejas de golpe).
+async fn control_datagrams(core: Arc<Core>, connection: PeerConnection) {
+    while let Ok(datagram) = connection.read_control_datagram().await {
+        let Ok((seq, message)) =
+            coroom_transport::proto::control::parse_control_datagram_tagged(&datagram)
+        else {
+            continue;
+        };
+        if let ControlMessage::Cursor {
+            x,
+            y,
+            visible,
+            shape_id,
+        } = message
+        {
+            let now = Instant::now();
+            let last = core.cursor_seq.load(Ordering::Acquire);
+            // Con aritmética circular; el primero tras un silencio siempre vale.
+            if cursor_datagrams_fresh(&core, now) && seq.wrapping_sub(last) as i32 <= 0 {
+                continue;
+            }
+            core.cursor_seq.store(seq, Ordering::Release);
+            core.cursor_datagram_us
+                .store(core.clock_us(now).max(1), Ordering::Release);
+            core.shared.set_cursor(coroom_capture::CursorState {
+                x,
+                y,
+                visible,
+                shape_id,
+            });
+        }
+    }
+}
+
+/// Si hace menos de [`CURSOR_DATAGRAM_FRESH`] que llegó un `Cursor` en datagrama.
+fn cursor_datagrams_fresh(core: &Core, now: Instant) -> bool {
+    let at = core.cursor_datagram_us.load(Ordering::Acquire);
+    at != 0 && core.clock_us(now).saturating_sub(at) < CURSOR_DATAGRAM_FRESH.as_micros() as u64
+}
+
 struct VideoWatch {
     decoded: u64,
     decoded_at: Option<Instant>,
@@ -1317,6 +1485,7 @@ impl VideoWatch {
 /// quedó sin decodificadores de un códec.
 async fn media_loop(
     core: &Arc<Core>,
+    connection: &PeerConnection,
     receiver: &MediaReceiver,
     control: &ControlSender,
     (frames, evict): &FrameQueue,
@@ -1328,6 +1497,7 @@ async fn media_loop(
     let mut last_id = None;
     let mut dropped_seen = 0u64;
     let mut last_request: Option<Instant> = None;
+    let mut watchdog = MediaWatchdog::new(Instant::now(), connection.datagrams_received());
     // Último grupo de vídeo recibido: va en los `KeyframeRequest` (el anfitrión ignora las
     // peticiones anteriores al intra que acaba de mandar).
     let mut last_group = 0u32;
@@ -1347,8 +1517,21 @@ async fn media_loop(
                 debug!(?caps, "se vuelven a anunciar las capacidades");
                 let _ = control.send(&caps.to_message());
             }
+            let now = Instant::now();
+            let codec_known = decode.wanted().is_some();
+            if let Some(silence) = watchdog.dead(
+                now,
+                connection.datagrams_received(),
+                receiver.last_pong(),
+                codec_known,
+            ) {
+                return Err(SessionError::Network(format!(
+                    "sin datos del anfitrión desde hace {:.1} s",
+                    silence.as_secs_f64()
+                )));
+            }
             let decoded = shared.counters.decoded.load(Ordering::Relaxed);
-            if watch.stalled(Instant::now(), decoded, decode.wanted().is_some()) {
+            if watch.stalled(now, decoded, codec_known) {
                 shared.request_keyframe();
             }
             let rtt = receiver.clock_rtt().unwrap_or_default();

@@ -842,13 +842,19 @@ fn j_a_guest_reconnects_and_keeps_presenting() {
         assert!(!guest.is_finished(), "{:?}", guest.end_reason());
         guest.summary().frames_presented >= 30
     });
+    // La estimación de calidad se mide en paralelo con el vídeo (un segundo de `Ping`): llega
+    // poco después de los primeros fotogramas, no antes.
     let mut estimate = None;
-    while let Ok(event) = events.try_recv() {
-        if let SessionEvent::QualityEstimate { rtt_ms, level } = event {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while estimate.is_none() && Instant::now() < deadline {
+        if let Ok(SessionEvent::QualityEstimate { rtt_ms, level }) =
+            events.recv_timeout(Duration::from_millis(100))
+        {
             estimate = Some((rtt_ms, level));
         }
+        assert!(!guest.is_finished(), "{:?}", guest.end_reason());
     }
-    let (rtt_ms, level) = estimate.expect("estimación de calidad antes del vídeo");
+    let (rtt_ms, level) = estimate.expect("estimación de calidad con el vídeo en marcha");
     assert!(rtt_ms.is_finite() && rtt_ms >= 0.0, "{rtt_ms}");
     assert_eq!(level, QualityLevel::from_rtt_ms(rtt_ms));
 

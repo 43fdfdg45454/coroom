@@ -106,7 +106,7 @@ use coroom_transport::crypto::hpke::PairwiseSecret;
 use coroom_transport::crypto::sframe::MediaKey;
 use coroom_transport::crypto::{Identity, MediaKeyRing, SafetyNumber, sha256_fingerprint};
 use coroom_transport::media::MediaReceiver;
-use coroom_transport::nat::{MAPPING_TIMEOUT, Mapper, MappingReport, PortMapping};
+use coroom_transport::nat::{Mapper, MappingReport, PortMapping};
 use coroom_transport::quic::ControlSender;
 pub use coroom_transport::{CandidateClass, CandidateOutcome, CandidateReport};
 use coroom_transport::{Endpoint, Path, PeerConnection, ServerTrust};
@@ -135,9 +135,24 @@ pub const CAPABILITIES_TIMEOUT: Duration = Duration::from_secs(3);
 /// Periodo mínimo entre dos `Cursor` (125 Hz, `proto::control::CURSOR_MAX_HZ`).
 pub const CURSOR_PERIOD: Duration = Duration::from_millis(8);
 
-/// Lo que mide el invitado el RTT con el anfitrión antes de pedir el vídeo
-/// ([`SessionEvent::QualityEstimate`]).
+/// Lo que mide el invitado el RTT con el anfitrión para [`SessionEvent::QualityEstimate`]. La
+/// medida va en paralelo con el vídeo (las capacidades se envían nada más conectar; antes se
+/// esperaba este segundo entero antes de pedirlo).
 pub const QUALITY_PROBE: Duration = Duration::from_secs(1);
+
+/// Invitado: con el códec ya elegido, tiempo sin ningún datagrama del anfitrión ni respuesta a los
+/// `Ping` (uno por segundo) tras el que la conexión se da por muerta y se reconecta, sin esperar al
+/// `IDLE_TIMEOUT` de QUIC (8 s). Con la pantalla quieta no hay vídeo, pero los `Pong` siguen.
+pub const MEDIA_WATCHDOG: Duration = Duration::from_secs(3);
+
+/// Invitado: tras un `Cursor` llegado en datagrama, lo que se ignoran las copias del stream (que
+/// podrían ser posiciones viejas retenidas por una pérdida). Varias veces el periodo de la copia
+/// del stream ([`CURSOR_STREAM_PERIOD`]).
+pub const CURSOR_DATAGRAM_FRESH: Duration = Duration::from_millis(400);
+
+/// Anfitrión: periodo mínimo de la copia del `Cursor` por el stream de control (los datagramas
+/// numerados llevan las posiciones a [`CURSOR_PERIOD`]; el stream es el respaldo si no pasan).
+pub const CURSOR_STREAM_PERIOD: Duration = Duration::from_millis(100);
 
 /// Cada cuánto se envía un `Ping` durante la medida.
 pub const QUALITY_PING_PERIOD: Duration = Duration::from_millis(100);
@@ -272,6 +287,9 @@ pub struct RemoteConfig {
     /// Los dos extremos deben ponerlo igual. No existe en release.
     #[cfg(debug_assertions)]
     pub insecure_no_sframe: bool,
+    /// Anfitrión: reparto en el tiempo de cada fotograma. Por defecto las constantes de
+    /// `coroom_transport::media`; `coroom host` lee `PacingConfig::from_env()`.
+    pub pacing: coroom_transport::media::PacingConfig,
 }
 
 impl RemoteConfig {
@@ -297,6 +315,7 @@ impl RemoteConfig {
             accept_hdr: false,
             #[cfg(debug_assertions)]
             insecure_no_sframe: false,
+            pacing: coroom_transport::media::PacingConfig::default(),
         }
     }
 
@@ -447,6 +466,29 @@ pub enum SessionEvent {
         from_name: String,
         /// Código de la sala.
         code: String,
+    },
+    /// Un amigo pide entrar en tu sala (solo al anfitrión): se le deja entrar con
+    /// [`Session::invite`] o se le dice que no con [`Session::decline_join`].
+    JoinRequested {
+        /// Usuario que lo pide.
+        from_user: u64,
+        /// Su nombre visible.
+        from_name: String,
+    },
+    /// El anfitrión al que pediste entrar dijo que ahora no.
+    JoinDeclined {
+        /// Usuario que respondió.
+        from_user: u64,
+        /// Su nombre visible.
+        from_name: String,
+    },
+    /// Qué hace un amigo ahora (abre una sala, juega en una, nada). Llega al conectarse y cada
+    /// vez que cambia; al desconectarse solo llega `Presence`.
+    Activity {
+        /// Usuario.
+        user: u64,
+        /// Su actividad.
+        activity: coroom_transport::proto::signal::Activity,
     },
     /// Un amigo se conectó o desconectó de la señalización (llega también con la sala abierta o
     /// dentro de una, para que la lista de amigos no se congele).
@@ -610,6 +652,15 @@ impl fmt::Display for SessionEvent {
             SessionEvent::Invited {
                 from_name, code, ..
             } => write!(f, "{from_name} te invita a su sala {code}."),
+            SessionEvent::JoinRequested { from_name, .. } => {
+                write!(f, "{from_name} pide entrar en la sala.")
+            }
+            SessionEvent::JoinDeclined { from_name, .. } => {
+                write!(f, "{from_name} no te deja entrar ahora.")
+            }
+            SessionEvent::Activity { user, activity } => {
+                write!(f, "El usuario {user} está {activity:?}.")
+            }
             SessionEvent::Presence { user, online: true } => {
                 write!(f, "El usuario {user} se ha conectado.")
             }
@@ -757,6 +808,8 @@ pub(crate) enum Command {
     Kick(GuestId),
     /// Invitar a un amigo a la sala (`Invite` por la señalización).
     Invite(u64),
+    /// Anfitrión: decir a un amigo que pidió entrar que ahora no (`JoinDecline`).
+    DeclineJoin(u64),
     /// Avisar al invitado de sus permisos nuevos (`InputPermissions`).
     PermissionsChanged(GuestId),
     /// Avisar al invitado de si su mando va tal cual (`GamepadMode`).
@@ -836,6 +889,12 @@ pub(crate) struct Core {
     pub(crate) joined_once: AtomicBool,
     /// Invitado: reintentos de reconexión seguidos sin volver a conectar.
     pub(crate) reconnect_attempts: AtomicU32,
+    /// Invitado: su id de par en la sala (`Joined`), la etiqueta de sus datagramas de control.
+    pub(crate) own_peer_id: AtomicU32,
+    /// Invitado: número de orden del último `Cursor` aplicado desde un datagrama (ver
+    /// [`guest::control_datagrams`]) y cuándo llegó, en µs de `clock_origin` (0: ninguno aún).
+    pub(crate) cursor_seq: AtomicU32,
+    pub(crate) cursor_datagram_us: AtomicU64,
     /// Paquetes de audio hacia `audio-play`, si hay reproducción.
     pub(crate) audio_tx: Mutex<Option<channel::Sender<audio::Packet>>>,
     /// Órdenes a la tarea de red (para el hilo `inject`: modo y salida de los mandos tal cual).
@@ -890,6 +949,9 @@ impl Core {
             chat: Mutex::new(chat::ChatState::default()),
             joined_once: AtomicBool::new(false),
             reconnect_attempts: AtomicU32::new(0),
+            own_peer_id: AtomicU32::new(0),
+            cursor_seq: AtomicU32::new(0),
+            cursor_datagram_us: AtomicU64::new(0),
             port_mapping: Mutex::new(None),
         }
     }
@@ -1076,29 +1138,35 @@ pub(crate) fn start_port_mapping(
     Some(tokio::spawn(async move { mapper.map(port).await }))
 }
 
-/// Espera lo que quede de [`MAPPING_TIMEOUT`] desde `started` a la petición al router, la guarda
-/// en `core` (se renueva sola y se borra con la sesión) y la cuenta. Si el router aún no
-/// respondió, se sigue sin ella y se guarda en cuanto termine.
-pub(crate) async fn await_port_mapping(
+/// Espera en segundo plano a la petición al router, la guarda en `core` (se renueva sola y se
+/// borra con la sesión), la cuenta y entrega su informe por el canal que devuelve. Antes se
+/// esperaba al router (hasta 2,2 s si no contesta nada) **antes** de anunciar ningún candidato,
+/// y esos segundos se sumaban al tiempo hasta el primer fotograma; ahora los candidatos locales y
+/// el reflejado salen enseguida y la dirección WAN que abra el router se anuncia después, con un
+/// segundo `Candidates`, mientras la apertura simultánea sigue en marcha.
+pub(crate) fn watch_port_mapping(
     core: &Arc<Core>,
     task: Option<tokio::task::JoinHandle<PortMapping>>,
-    started: Instant,
-) -> Option<MappingReport> {
-    let mut task = task?;
-    let deadline =
-        tokio::time::Instant::from_std(started + MAPPING_TIMEOUT + Duration::from_millis(200));
-    match tokio::time::timeout_at(deadline, &mut task).await {
-        Ok(Ok(mapping)) => Some(store_port_mapping(core, mapping)),
-        Ok(Err(_)) => None,
-        Err(_) => {
-            let core = Arc::clone(core);
-            tokio::spawn(async move {
-                if let Ok(mapping) = task.await {
-                    store_port_mapping(&core, mapping);
-                }
-            });
-            None
+) -> Option<tokio::sync::oneshot::Receiver<MappingReport>> {
+    let task = task?;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let core = Arc::clone(core);
+    tokio::spawn(async move {
+        if let Ok(mapping) = task.await {
+            let _ = tx.send(store_port_mapping(&core, mapping));
         }
+    });
+    Some(rx)
+}
+
+/// El informe del router cuando llegue; espera para siempre si no se pidió nada (así la rama
+/// del `select!` que lo usa no se dispara).
+pub(crate) async fn mapping_report(
+    rx: &mut Option<tokio::sync::oneshot::Receiver<MappingReport>>,
+) -> Option<MappingReport> {
+    match rx {
+        Some(rx) => rx.await.ok(),
+        None => std::future::pending().await,
     }
 }
 
@@ -1466,6 +1534,16 @@ impl RemoteSession {
         self.commands
             .as_ref()
             .and_then(|commands| commands.send(Command::Invite(user)).ok())
+            .ok_or(SessionError::Network("la sesión no está en marcha".into()))
+    }
+
+    /// Anfitrión: a un amigo `user` que pidió entrar ([`SessionEvent::JoinRequested`]) le dice
+    /// que ahora no; para dejarle entrar basta con [`Session::invite`].
+    pub fn decline_join(&self, user: u64) -> Result<(), SessionError> {
+        self.require_host()?;
+        self.commands
+            .as_ref()
+            .and_then(|commands| commands.send(Command::DeclineJoin(user)).ok())
             .ok_or(SessionError::Network("la sesión no está en marcha".into()))
     }
 

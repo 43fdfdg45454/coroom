@@ -13,7 +13,7 @@ use bytes::Bytes;
 use coroom_server::{Config, Server};
 use coroom_transport::crypto::Identity;
 use coroom_transport::proto::PROTOCOL_VERSION;
-use coroom_transport::proto::control::{ControlMessage, Hello, Role};
+use coroom_transport::proto::control::{self, ControlMessage, Hello, Role};
 use coroom_transport::proto::media::{ObjectHeader, Track};
 use coroom_transport::proto::signal::{ErrorCode, HOST_PEER_ID, SignalMessage, is_valid_room_code};
 use coroom_transport::{
@@ -422,7 +422,7 @@ async fn relay_fans_out_and_answers_nacks_from_its_cache() {
     let mut guest_a = client(&server).await;
     let mut guest_b = client(&server).await;
 
-    let (code, host_token, token_a, _) = room(&mut host, &mut guest_a).await;
+    let (code, host_token, token_a, peer_a) = room(&mut host, &mut guest_a).await;
     guest_b
         .signal
         .send(&SignalMessage::JoinRoom {
@@ -432,10 +432,14 @@ async fn relay_fans_out_and_answers_nacks_from_its_cache() {
         })
         .await
         .expect("JoinRoom");
-    assert!(matches!(
-        next(&mut guest_b).await,
-        SignalMessage::Joined { .. }
-    ));
+    let SignalMessage::Joined {
+        your_peer_id: peer_b,
+        ..
+    } = next(&mut guest_b).await
+    else {
+        panic!("B no entró");
+    };
+    assert_ne!(peer_a, peer_b);
     let token_b = next(&mut guest_b).await;
 
     let host_relay =
@@ -591,6 +595,35 @@ async fn relay_fans_out_and_answers_nacks_from_its_cache() {
         .expect("a tiempo")
         .expect("datagrama");
     assert_eq!(upstream, object(1, 0, 1));
+
+    // Un datagrama de control lleva la etiqueta del invitado (su id de par) y la pone el relay:
+    // A manda un `Feedback` con los contadores al máximo firmado como B; al anfitrión llega como
+    // de A (si no, B se quedaría sin control de tasa: sus informes parecerían viejos).
+    let forged = control::control_datagram_tagged(
+        &ControlMessage::Feedback(control::Feedback {
+            highest_group: u32::MAX,
+            received_bytes: u64::MAX,
+            lost_objects: 0,
+            owd_samples: Vec::new(),
+            ecn_ce: 0,
+        }),
+        peer_b,
+    )
+    .expect("cabe");
+    relay_a
+        .send_datagram(Bytes::from(forged))
+        .expect("datagrama");
+    let (tag, message) = loop {
+        let datagram = tokio::time::timeout(TIMEOUT, host_relay.read_control_datagram())
+            .await
+            .expect("a tiempo")
+            .expect("datagrama");
+        if let Ok(parsed) = control::parse_control_datagram_tagged(&datagram) {
+            break parsed;
+        }
+    };
+    assert_eq!(tag, peer_a, "la etiqueta es la del grant, no la que puso A");
+    assert!(matches!(message, ControlMessage::Feedback(_)));
 
     let health = health(&server).await;
     assert!(health["relay_bytes"].as_u64().unwrap_or(0) > 0, "{health}");

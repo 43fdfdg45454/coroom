@@ -293,6 +293,12 @@ impl RateController {
         self.estimate.min(self.loss_estimate)
     }
 
+    /// Retardo de ida base (el mínimo de la ventana larga de OWD, en µs del reloj del emisor
+    /// estimado por el receptor): sin cola, ~RTT/2 con el receptor. `None` sin muestras.
+    pub fn base_owd_us(&self) -> Option<i64> {
+        self.base.iter().map(|(_, owd)| *owd).min()
+    }
+
     /// Cola estimada (suavizada).
     pub fn queue_delay(&self) -> Duration {
         Duration::from_secs_f64(self.queue_ms.max(0.0) / 1000.0)

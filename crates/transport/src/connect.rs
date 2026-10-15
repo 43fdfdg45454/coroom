@@ -7,7 +7,12 @@
 //! verificada (TLS con la identidad esperada); si en los dos sentidos se establece una, las dos
 //! partes se quedan con la que inició el par de clave menor, con una gracia de
 //! [`PREFER_GRACE`] para que coincidan. Las demás se cierran. Si en [`PUNCH_TIMEOUT`] no hay
-//! ninguna, conecta con el relay del servidor ([`connect_relay`]).
+//! ninguna, se usa el relay del servidor ([`connect_relay`]), cuya conexión se abre y autentica
+//! **a la vez** que la apertura simultánea (desde el primer instante, no al vencer el plazo): si
+//! la directa llega, la del relay se cierra; si no, el relay ya está listo y no se suman sus
+//! idas y vueltas a los 3 s de la apertura. Los candidatos que el otro extremo anuncie después
+//! (la dirección WAN que su router abre al cabo de un par de segundos) entran por
+//! [`Connector::connect_with`] mientras dura la apertura.
 //!
 //! Relay: conexión QUIC al servidor con ALPN `coroom-relay/1`; un primer stream de autenticación
 //! con `Hello` y el `RelayToken` de la señalización. Después los datagramas y el stream de control
@@ -36,6 +41,10 @@ pub const PREFER_GRACE: Duration = Duration::from_millis(250);
 
 /// Separación entre los intentos de cada candidato (en el orden de preferencia).
 const ATTEMPT_STAGGER: Duration = Duration::from_millis(10);
+
+/// Candidatos del otro extremo que llegan con la apertura ya en marcha (un segundo `Candidates`
+/// de la señalización con la dirección WAN del router).
+pub type ExtraCandidates = mpsc::UnboundedReceiver<Vec<SocketAddr>>;
 
 /// Tipo del stream de autenticación hacia el relay (primer byte).
 pub const STREAM_RELAY_AUTH: u8 = 0x03;
@@ -282,25 +291,52 @@ impl Connector {
         self
     }
 
-    /// Conecta con el par `peer` probando `candidates` y, si fallan, `relay`.
-    ///
-    /// Lo primero es admitir a `peer` en el `Endpoint` (`Endpoint::admit`), antes de lanzar ningún
-    /// intento: si el otro extremo llama antes de que arranquen los nuestros, su handshake ya pasa
-    /// la verificación de cliente (en TLS 1.3 el cliente da la conexión por buena antes de que el
-    /// servidor valide su certificado, así que un rechazo tardío rompería la apertura simultánea).
-    /// La sesión también lo admite al anunciar sus candidatos; repetirlo no estorba.
+    /// Conecta con el par `peer` probando `candidates` y, si fallan, `relay`
+    /// ([`Connector::connect_with`] sin candidatos tardíos).
     pub async fn connect(
         &self,
         peer: PublicKey,
         candidates: &[SocketAddr],
         relay: Option<&RelayInfo>,
     ) -> Result<Established, TransportError> {
+        self.connect_with(peer, candidates, relay, None).await
+    }
+
+    /// Conecta con el par `peer` probando `candidates` (y los que lleguen por `extra` mientras
+    /// dura la apertura) y, si fallan, `relay`. La conexión con el relay se abre y autentica desde
+    /// el principio, en paralelo con la apertura simultánea: si la directa gana, se cierra.
+    ///
+    /// Lo primero es admitir a `peer` en el `Endpoint` (`Endpoint::admit`), antes de lanzar ningún
+    /// intento: si el otro extremo llama antes de que arranquen los nuestros, su handshake ya pasa
+    /// la verificación de cliente (en TLS 1.3 el cliente da la conexión por buena antes de que el
+    /// servidor valide su certificado, así que un rechazo tardío rompería la apertura simultánea).
+    /// La sesión también lo admite al anunciar sus candidatos; repetirlo no estorba.
+    pub async fn connect_with(
+        &self,
+        peer: PublicKey,
+        candidates: &[SocketAddr],
+        relay: Option<&RelayInfo>,
+        extra: Option<ExtraCandidates>,
+    ) -> Result<Established, TransportError> {
         self.endpoint.admit(peer);
+        let relay_task = relay.map(|relay| {
+            let endpoint = self.endpoint.clone();
+            let relay = relay.clone();
+            tokio::spawn(async move { connect_relay(&endpoint, &relay).await })
+        });
         let (candidates, relay_reason) = if self.force_relay {
             (Vec::new(), Some("se pidió usar el relay".to_owned()))
         } else {
-            let attempt = self.try_direct(peer, candidates).await;
+            let attempt = self.try_direct_with(peer, candidates, extra).await;
             if let Some(connection) = attempt.connection {
+                if let Some(task) = relay_task {
+                    // La del relay ya no hace falta: se cierra en cuanto termine de abrirse.
+                    tokio::spawn(async move {
+                        if let Ok(Ok(connection)) = task.await {
+                            connection.close("hay conexión directa");
+                        }
+                    });
+                }
                 return Ok(Established {
                     connection,
                     path: Path::Direct,
@@ -311,10 +347,12 @@ impl Connector {
             let reason = attempt.relay_reason();
             (attempt.candidates, Some(reason))
         };
-        let Some(relay) = relay else {
+        let Some(task) = relay_task else {
             return Err(TransportError::Unreachable);
         };
-        let connection = connect_relay(&self.endpoint, relay).await?;
+        let connection = task.await.map_err(|_| {
+            TransportError::Protocol("la conexión con el relay se canceló".into())
+        })??;
         Ok(Established {
             connection,
             path: Path::Relayed,
@@ -326,58 +364,90 @@ impl Connector {
     /// Solo la apertura simultánea, con el resultado de cada candidato (el anfitrión decide por
     /// su cuenta qué hacer con el relay).
     pub async fn try_direct(&self, peer: PublicKey, candidates: &[SocketAddr]) -> DirectAttempt {
+        self.try_direct_with(peer, candidates, None).await
+    }
+
+    /// Como [`Connector::try_direct`], probando también los candidatos que lleguen por `extra`
+    /// antes de que venza el plazo (sin alargarlo: a un candidato que llega a los 2 s le queda
+    /// un segundo, de sobra para el handshake de QUIC).
+    pub async fn try_direct_with(
+        &self,
+        peer: PublicKey,
+        candidates: &[SocketAddr],
+        mut extra: Option<ExtraCandidates>,
+    ) -> DirectAttempt {
         let endpoint = &self.endpoint;
         let mut incoming = endpoint.incoming_from(peer);
         // La conexión preferida es la que inicia el par de clave menor.
         let we_prefer_outgoing = endpoint.public_key() < peer;
 
-        let ordered = order_candidates(candidates);
+        let mut ordered = order_candidates(candidates);
         let (tx, mut outgoing) = mpsc::unbounded_channel();
         let (result_tx, mut results) = mpsc::unbounded_channel::<(usize, CandidateOutcome)>();
-        let attempts: Vec<_> = ordered
+        let spawn_attempt = |i: usize, addr: SocketAddr, stagger: Duration| {
+            let endpoint = endpoint.clone();
+            let tx = tx.clone();
+            let result_tx = result_tx.clone();
+            let timeout = self.timeout;
+            tokio::spawn(async move {
+                tokio::time::sleep(stagger).await;
+                match tokio::time::timeout(timeout, endpoint.connect_peer(addr, peer)).await {
+                    Ok(Ok(connection)) => {
+                        let _ = result_tx.send((i, CandidateOutcome::Duplicate));
+                        let _ = tx.send(connection);
+                    }
+                    Ok(Err(err)) => {
+                        debug!(%addr, error = %err, "candidato fallido");
+                        let _ = result_tx.send((i, CandidateOutcome::Failed(err.to_string())));
+                    }
+                    Err(_) => {
+                        debug!(%addr, "candidato sin respuesta");
+                        let _ = result_tx.send((i, CandidateOutcome::NoResponse));
+                    }
+                }
+            })
+        };
+        let mut attempts: Vec<_> = ordered
             .iter()
             .copied()
             .enumerate()
-            .map(|(i, addr)| {
-                let endpoint = endpoint.clone();
-                let tx = tx.clone();
-                let result_tx = result_tx.clone();
-                let timeout = self.timeout;
-                tokio::spawn(async move {
-                    tokio::time::sleep(ATTEMPT_STAGGER * i as u32).await;
-                    match tokio::time::timeout(timeout, endpoint.connect_peer(addr, peer)).await {
-                        Ok(Ok(connection)) => {
-                            let _ = result_tx.send((i, CandidateOutcome::Duplicate));
-                            let _ = tx.send(connection);
-                        }
-                        Ok(Err(err)) => {
-                            debug!(%addr, error = %err, "candidato fallido");
-                            let _ = result_tx.send((i, CandidateOutcome::Failed(err.to_string())));
-                        }
-                        Err(_) => {
-                            debug!(%addr, "candidato sin respuesta");
-                            let _ = result_tx.send((i, CandidateOutcome::NoResponse));
-                        }
-                    }
-                })
-            })
+            .map(|(i, addr)| spawn_attempt(i, addr, ATTEMPT_STAGGER * i as u32))
             .collect();
-        drop(tx);
-        drop(result_tx);
 
         let mut deadline = tokio::time::Instant::now() + self.timeout;
         let mut held: Option<PeerConnection> = None;
-        let mut extra = Vec::new();
+        let mut duplicates = Vec::new();
         let chosen = loop {
             let (connection, ours) = tokio::select! {
                 Some(connection) = incoming.recv() => (connection, false),
                 Some(connection) = outgoing.recv() => (connection, true),
+                more = recv_extra(&mut extra) => {
+                    match more {
+                        Some(more) => {
+                            let new: Vec<SocketAddr> = order_candidates(&more)
+                                .into_iter()
+                                .filter(|addr| !ordered.contains(addr))
+                                .collect();
+                            for (j, addr) in new.into_iter().enumerate() {
+                                debug!(%addr, "candidato tardío");
+                                ordered.push(addr);
+                                attempts.push(spawn_attempt(
+                                    ordered.len() - 1,
+                                    addr,
+                                    ATTEMPT_STAGGER * j as u32,
+                                ));
+                            }
+                        }
+                        None => extra = None,
+                    }
+                    continue;
+                }
                 () = tokio::time::sleep_until(deadline) => break held.take(),
             };
             let preferred = ours == we_prefer_outgoing;
             if preferred {
                 if let Some(previous) = held.take() {
-                    extra.push(previous);
+                    duplicates.push(previous);
                 }
                 break Some(connection);
             }
@@ -385,9 +455,11 @@ impl Connector {
                 held = Some(connection);
                 deadline = deadline.min(tokio::time::Instant::now() + PREFER_GRACE);
             } else {
-                extra.push(connection);
+                duplicates.push(connection);
             }
         };
+        drop(tx);
+        drop(result_tx);
 
         for attempt in attempts {
             attempt.abort();
@@ -418,7 +490,7 @@ impl Connector {
                 report.outcome = CandidateOutcome::Connected;
             }
         }
-        for connection in extra {
+        for connection in duplicates {
             connection.close("conexión duplicada");
         }
         while let Ok(connection) = outgoing.try_recv() {
@@ -446,6 +518,15 @@ impl Connector {
             connection: chosen,
             candidates: reports,
         }
+    }
+}
+
+/// Siguiente lote de candidatos tardíos; espera para siempre si no hay canal (así la rama del
+/// `select!` que lo usa no se dispara).
+async fn recv_extra(extra: &mut Option<ExtraCandidates>) -> Option<Vec<SocketAddr>> {
+    match extra {
+        Some(extra) => extra.recv().await,
+        None => std::future::pending().await,
     }
 }
 

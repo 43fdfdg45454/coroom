@@ -505,12 +505,22 @@ impl ControlMessage {
     }
 
     /// Si el mensaje puede viajar también en un datagrama de control ([`control_datagram`]): los
-    /// que corren prisa y se pueden repetir sin efecto (`Nack` y `KeyframeRequest`).
+    /// que corren prisa y se pueden repetir sin efecto (`Nack`, `KeyframeRequest` y `Feedback`;
+    /// el emisor no aplica dos veces el mismo `Feedback`).
     pub fn is_urgent(&self) -> bool {
         matches!(
             self,
-            ControlMessage::Nack { .. } | ControlMessage::KeyframeRequest { .. }
+            ControlMessage::Nack { .. }
+                | ControlMessage::KeyframeRequest { .. }
+                | ControlMessage::Feedback(_)
         )
+    }
+
+    /// Si el mensaje puede ir en un datagrama de control: los urgentes y el `Cursor`, que viaja
+    /// en datagramas con número de orden (gana el último; el stream solo lleva una copia a poco
+    /// ritmo por si los datagramas no pasan).
+    pub fn fits_datagram(&self) -> bool {
+        self.is_urgent() || matches!(self, ControlMessage::Cursor { .. })
     }
 }
 
@@ -518,9 +528,21 @@ impl ControlMessage {
 /// [`Track::Control`]: cabecera de medios de un solo objeto con el mensaje en `postcard` como
 /// carga. El mensaje sigue saliendo también por el stream de control; el datagrama solo evita que
 /// una pérdida lo retenga detrás del reenvío de QUIC (su PTO, 60-70 ms con un RTT de 20 ms). `None`
-/// si no es urgente o no cabe en un datagrama.
+/// si no es urgente o no cabe en un datagrama. Es [`control_datagram_tagged`] con etiqueta 0.
 pub fn control_datagram(message: &ControlMessage) -> Option<Vec<u8>> {
     if !message.is_urgent() {
+        return None;
+    }
+    control_datagram_tagged(message, 0)
+}
+
+/// Datagrama de control de cualquier mensaje que quepa en uno ([`ControlMessage::fits_datagram`])
+/// con `tag` en el `group` de su cabecera. La etiqueta la pone quien envía: el invitado detrás del
+/// relay marca sus `Feedback` con su id de par (el anfitrión recibe los de todos por una misma
+/// conexión) y el anfitrión numera sus `Cursor` (el invitado descarta los que llegan desordenados).
+/// `None` si el mensaje no va en datagramas o no cabe.
+pub fn control_datagram_tagged(message: &ControlMessage, tag: u32) -> Option<Vec<u8>> {
+    if !message.fits_datagram() {
         return None;
     }
     let mut out = vec![0; ObjectHeader::LEN];
@@ -532,7 +554,7 @@ pub fn control_datagram(message: &ControlMessage) -> Option<Vec<u8>> {
     let header = ObjectHeader {
         track: Track::Control,
         flags: ObjectHeader::LAST_OBJECT,
-        group: 0,
+        group: tag,
         object: 0,
         object_count: 1,
         payload_len: len,
@@ -549,14 +571,21 @@ pub fn is_control_datagram(bytes: &[u8]) -> bool {
     bytes.len() >= 2 && bytes[0] == ObjectHeader::VERSION && bytes[1] == Track::Control.id()
 }
 
-/// Mensaje de un datagrama de control ([`control_datagram`]); solo se aceptan los urgentes.
+/// Mensaje de un datagrama de control ([`control_datagram`]); solo se aceptan los que van en
+/// datagramas ([`ControlMessage::fits_datagram`]). La etiqueta se ignora
+/// ([`parse_control_datagram_tagged`] la devuelve).
 pub fn parse_control_datagram(bytes: &[u8]) -> Result<ControlMessage, ProtoError> {
+    parse_control_datagram_tagged(bytes).map(|(_, message)| message)
+}
+
+/// Etiqueta y mensaje de un datagrama de control ([`control_datagram_tagged`]).
+pub fn parse_control_datagram_tagged(bytes: &[u8]) -> Result<(u32, ControlMessage), ProtoError> {
     let (header, payload) = ObjectHeader::parse_datagram(bytes)?;
     if header.track != Track::Control || header.object_count != 1 {
         return Err(ProtoError::Inconsistent("no es un datagrama de control"));
     }
     match crate::codec::decode::<ControlMessage>(payload) {
-        Ok(message) if message.is_urgent() => Ok(message),
+        Ok(message) if message.fits_datagram() => Ok((header.group, message)),
         Ok(_) => Err(ProtoError::Inconsistent(
             "mensaje de control que no va en datagramas",
         )),
@@ -600,6 +629,34 @@ mod tests {
             missing: (0..1000).collect(),
         };
         assert_eq!(control_datagram(&huge), None);
+        // Un Feedback con las 64 muestras de OWD cabe, y la etiqueta vuelve con él.
+        let feedback = ControlMessage::Feedback(Feedback {
+            highest_group: u32::MAX,
+            received_bytes: u64::MAX,
+            lost_objects: u32::MAX,
+            owd_samples: (0..64)
+                .map(|i| (u32::MAX - i, i32::MIN + i as i32))
+                .collect(),
+            ecn_ce: u32::MAX,
+        });
+        assert!(feedback.is_urgent());
+        let datagram = control_datagram_tagged(&feedback, 7).expect("cabe");
+        assert_eq!(
+            parse_control_datagram_tagged(&datagram),
+            Ok((7, feedback.clone()))
+        );
+        assert_eq!(parse_control_datagram(&datagram), Ok(feedback));
+        // El cursor va en datagramas numerados, pero no es urgente (no lleva copia automática).
+        let cursor = ControlMessage::Cursor {
+            x: -5,
+            y: 10,
+            visible: true,
+            shape_id: 3,
+        };
+        assert!(!cursor.is_urgent() && cursor.fits_datagram());
+        assert_eq!(control_datagram(&cursor), None);
+        let datagram = control_datagram_tagged(&cursor, 1234).expect("cabe");
+        assert_eq!(parse_control_datagram_tagged(&datagram), Ok((1234, cursor)));
     }
     use proptest::prelude::*;
 

@@ -445,7 +445,11 @@ impl Relay {
             let targets: Vec<quinn::Connection> = match self.inner.lock() {
                 Ok(mut inner) => match inner.rooms.get_mut(&grant.room) {
                     Some(room) => {
-                        if !room.admit(datagram.len()) {
+                        // El límite por sala recorta el vídeo, que es lo que lo llena; el audio,
+                        // el cursor y los datagramas de control pasan (perderlos por una ráfaga de
+                        // vídeo congelaba el audio y retrasaba los `Nack`). La cuota de bytes
+                        // ([`Relay::charge`]) cuenta todo igual.
+                        if header.track == Track::Video && !room.admit(datagram.len()) {
                             continue;
                         }
                         room.cache.insert(&header, datagram.clone());
@@ -492,6 +496,12 @@ impl Relay {
                     if !relay.admit(grant.room, datagram.len()) {
                         continue;
                     }
+                    // Un datagrama de control lleva en `group` la etiqueta del invitado (su id de
+                    // par), con la que el anfitrión atribuye cada `Feedback`. La pone el relay
+                    // (la del grant, autenticado): si no, un invitado podría firmar como otro un
+                    // `Feedback` con los contadores al máximo y dejarlo sin control de tasa (el
+                    // anfitrión descartaría los suyos por viejos).
+                    let datagram = retag_control(datagram, grant.peer);
                     // La copia en datagrama de un `Nack` se responde desde la caché como la del
                     // stream; si no está, sigue hacia el anfitrión.
                     if let Ok(ControlMessage::Nack {
@@ -699,6 +709,20 @@ async fn read_message(
         let chunk = recv.read_chunk(codec::MAX_MESSAGE_LEN, true).await.ok()??;
         buffer.extend(&chunk.bytes);
     }
+}
+
+/// Si `datagram` es de la pista de control con una etiqueta distinta de `peer`, una copia con
+/// `peer` en `group` (bytes 4-8 de la cabecera, ver `ObjectHeader::parse`); si no, tal cual.
+fn retag_control(datagram: Bytes, peer: PeerId) -> Bytes {
+    let Ok((header, _)) = ObjectHeader::parse_datagram(&datagram) else {
+        return datagram;
+    };
+    if header.track != Track::Control || header.group == peer {
+        return datagram;
+    }
+    let mut retagged = datagram.to_vec();
+    retagged[4..8].copy_from_slice(&peer.to_be_bytes());
+    Bytes::from(retagged)
 }
 
 #[cfg(test)]

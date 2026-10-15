@@ -2,7 +2,7 @@
 //! códec, envío cifrado, cursor y audio del juego, voz propia y reenvío de la voz de los
 //! invitados.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use coroom_codec::{
     Backend, Codec, DEFAULT_SLICES, EncoderConfig, EncoderSet, VideoFormat, encoder_label,
 };
 use coroom_input::InputSink;
-use coroom_transport::connect::{self, Connector, RelayInfo};
+use coroom_transport::connect::{self, Connector, ExtraCandidates, RelayInfo};
 use coroom_transport::crypto::hpke::{self, PairwiseOffer};
 use coroom_transport::crypto::sframe::MediaKey;
 use coroom_transport::crypto::{RoomGroup, SafetyNumber, sha256_fingerprint};
@@ -52,8 +52,9 @@ use super::negotiate::{
 };
 use super::wire::{Payload, pairwise_info, require_pq_offer};
 use super::{
-    CAPABILITIES_TIMEOUT, CURSOR_PERIOD, Command, Core, GuestStatus, RATE_PERIOD, REPLY_TIMEOUT,
-    RemoteConfig, SessionEvent, Started, VideoChange, advertised_candidates, lock,
+    CAPABILITIES_TIMEOUT, CURSOR_PERIOD, CURSOR_STREAM_PERIOD, Command, Core, GuestStatus,
+    RATE_PERIOD, REPLY_TIMEOUT, RemoteConfig, SessionEvent, Started, VideoChange,
+    advertised_candidates, lock,
 };
 use crate::latency::{AudioTrack, Stage};
 use crate::loopback::{
@@ -276,6 +277,22 @@ impl Links {
             .collect();
         if let Some(relay) = &self.relay {
             out.push(Arc::clone(&relay.sender));
+        }
+        out
+    }
+
+    /// Conexiones con invitados conectados (la del relay una vez, si tiene alguno): por ellas van
+    /// los datagramas de control del anfitrión (el cursor numerado, que el relay abre en abanico).
+    fn connections(&self) -> Vec<PeerConnection> {
+        let mut out: Vec<PeerConnection> = self
+            .direct
+            .values()
+            .map(|link| link.sender.connection().clone())
+            .collect();
+        if let Some(relay) = &self.relay
+            && !relay.guests.is_empty()
+        {
+            out.push(relay.sender.connection().clone());
         }
         out
     }
@@ -911,6 +928,7 @@ impl HostCtx {
                 // grande ([`super::start_kbps`]).
                 start_kbps: super::start_kbps(max),
             },
+            pacing: self.config.pacing,
         }
     }
 
@@ -1252,25 +1270,30 @@ impl HostCtx {
     }
 }
 
-/// Conecta con el invitado: directo o, si no se puede, deja que llegue por el relay.
+/// Conecta con el invitado: directo o, si no se puede, deja que llegue por el relay. La conexión
+/// con el relay se abre a la vez que la apertura simultánea (si la sala tiene relay): cuando la
+/// apertura falla, el invitado ya está autenticado en el relay y su control llega sin sumar las
+/// idas y vueltas del handshake a los 3 s de la apertura. Los candidatos que el invitado anuncie
+/// después (la WAN que abre su router) entran por `extra`.
 async fn connect_guest(
     ctx: Arc<HostCtx>,
     guest: GuestId,
     key: PublicKey,
     addrs: Vec<std::net::SocketAddr>,
+    extra: ExtraCandidates,
 ) {
     if ctx.config.force_relay {
         ensure_relay(&ctx).await;
         return;
     }
-    if addrs.is_empty() {
-        // El invitado no anuncia candidatos (fuerza el relay o está detrás de un proxy): se le
-        // espera en directo y por el relay a la vez.
+    if lock(&ctx.relay_info).is_some() {
+        // En paralelo y sin avisar si falla: si gana la directa no hacía falta; si no, el intento
+        // de abajo lo repite y avisa.
         let relay_ctx = Arc::clone(&ctx);
-        tokio::spawn(async move { ensure_relay(&relay_ctx).await });
+        tokio::spawn(async move { ensure_relay_with(&relay_ctx, true).await });
     }
     let connector = Connector::new(ctx.endpoint.clone()).with_timeout(ctx.config.punch_timeout);
-    let attempt = connector.try_direct(key, &addrs).await;
+    let attempt = connector.try_direct_with(key, &addrs, Some(extra)).await;
     let relay_reason = attempt.connection.is_none().then(|| attempt.relay_reason());
     if let Some(status) = lock(&ctx.core.guests).get_mut(&guest) {
         status.candidates = attempt.candidates.clone();
@@ -1296,6 +1319,7 @@ async fn connect_guest(
         connection.close("conexión duplicada");
         return;
     }
+    drop_idle_relay(&ctx);
     match tokio::time::timeout(REPLY_TIMEOUT, connection.accept_control(ctx.hello.clone())).await {
         Ok(Ok(control)) if control.peer_hello().identity_pk == key => {
             attach_direct(&ctx, guest, connection, control);
@@ -1379,6 +1403,29 @@ async fn probe_link(ctx: Arc<HostCtx>, sender: Arc<MediaSender>) {
 
 /// Conecta con el relay una sola vez y atiende los controles que abre cada invitado por él.
 async fn ensure_relay(ctx: &Arc<HostCtx>) {
+    ensure_relay_with(ctx, false).await;
+}
+
+/// Cierra la conexión con el relay si no tiene ningún invitado: la que se abrió en paralelo con
+/// una apertura simultánea que acabó en directo. Una sesión solo en LAN no mantiene así una
+/// conexión ociosa con el relay; si otro invitado la necesita, [`ensure_relay`] la vuelve a abrir.
+fn drop_idle_relay(ctx: &Arc<HostCtx>) {
+    let idle = {
+        let mut links = lock(&ctx.links);
+        match &links.relay {
+            Some(relay) if relay.guests.is_empty() => links.relay.take(),
+            _ => None,
+        }
+    };
+    if let Some(relay) = idle {
+        debug!("relay sin invitados: se cierra (hay conexión directa)");
+        relay.sender.connection().close("hay conexión directa");
+    }
+}
+
+/// Conecta con el relay si la sala lo tiene y aún no está. Con `quiet`, un fallo solo se anota
+/// en el log (es el intento en paralelo con la apertura directa).
+async fn ensure_relay_with(ctx: &Arc<HostCtx>, quiet: bool) {
     let _guard = ctx.relay_lock.lock().await;
     if lock(&ctx.links).relay.is_some() {
         return;
@@ -1389,6 +1436,10 @@ async fn ensure_relay(ctx: &Arc<HostCtx>) {
     };
     let connection = match connect::connect_relay(&ctx.endpoint, &relay_info).await {
         Ok(connection) => connection,
+        Err(err) if quiet => {
+            debug!(error = %err, "no se pudo abrir el relay en paralelo");
+            return;
+        }
         Err(err) => {
             ctx.core
                 .warn(format!("no se pudo conectar con el relay: {err}"));
@@ -1478,26 +1529,46 @@ async fn relay_accept_loop(
     debug!("conexión con el relay cerrada");
 }
 
-/// Atiende las copias en datagrama de los `Nack` y `KeyframeRequest` de una conexión (directa o
-/// la del relay, que las trae de todos sus invitados): llegan antes que las del stream de control
-/// cuando este perdió un paquete. Las repetidas no reenvían nada (`MediaSender::on_nack`,
-/// `KeyframeGate`).
+/// Atiende las copias en datagrama de los `Nack`, `KeyframeRequest` y `Feedback` de una conexión
+/// (directa o la del relay, que las trae de todos sus invitados): llegan antes que las del stream
+/// de control cuando este perdió un paquete. Las repetidas no reenvían ni aplican nada
+/// (`MediaSender::on_nack`, `KeyframeGate`, `MediaSender::on_feedback_from`). Por el relay, el
+/// `Feedback` se atribuye por la etiqueta del datagrama (el id de par del invitado), que tiene
+/// que ser el de un invitado conectado por el relay.
 async fn control_datagrams(
     ctx: Arc<HostCtx>,
     connection: PeerConnection,
     sender: Arc<MediaSender>,
 ) {
+    let relayed = connection.path() == Path::Relayed;
     while let Ok(datagram) = connection.read_control_datagram().await {
-        match coroom_transport::proto::control::parse_control_datagram(&datagram) {
-            Ok(ControlMessage::Nack {
-                track,
-                group,
-                missing,
-            }) => {
+        match coroom_transport::proto::control::parse_control_datagram_tagged(&datagram) {
+            Ok((
+                _,
+                ControlMessage::Nack {
+                    track,
+                    group,
+                    missing,
+                },
+            )) => {
                 sender.on_nack(track, group, &missing);
             }
-            Ok(ControlMessage::KeyframeRequest { group }) => {
+            Ok((_, ControlMessage::KeyframeRequest { group })) => {
                 keyframe_request(&ctx, group, connection.rtt());
+            }
+            Ok((tag, ControlMessage::Feedback(feedback))) => {
+                if !relayed {
+                    sender.on_feedback(&feedback);
+                    continue;
+                }
+                let guest = GuestId(tag);
+                let known = lock(&ctx.links)
+                    .relay
+                    .as_ref()
+                    .is_some_and(|relay| relay.guests.contains_key(&guest));
+                if known {
+                    sender.on_feedback_from(u64::from(tag), &feedback);
+                }
             }
             Ok(_) => {}
             Err(err) => debug!(error = %err, "datagrama de control no válido"),
@@ -1658,9 +1729,23 @@ async fn renegotiate(ctx: &Arc<HostCtx>, guest: Option<GuestId>) {
                 format,
             };
             let encoders = encoders.clone();
-            let opened = tokio::task::spawn_blocking(move || encoders.open(&config)).await;
+            // Con varios backends para el códec (modo automático), el de menor latencia medida
+            // (`EncoderSet::open_calibrated`: unas décimas de segundo la primera vez, fuera del
+            // runtime); con uno (ajuste explícito), ese. Solo se mide sin codificador en marcha
+            // (al abrir la sala, antes del primer invitado): con la pantalla ya en el aire, abrir
+            // y medir varios codificadores de GPU la haría tartamudear, así que entonces manda la
+            // lista de preferencia (y lo guardado sirve para la próxima sala).
+            let calibrate = current.is_none();
+            let opened = tokio::task::spawn_blocking(move || {
+                if calibrate {
+                    encoders.open_calibrated(&config)
+                } else {
+                    encoders.open(&config).map(|encoder| (encoder, None))
+                }
+            })
+            .await;
             let err = match opened {
-                Ok(Ok(encoder)) => {
+                Ok(Ok((encoder, calibrated))) => {
                     let backend = encoder.backend();
                     let label = encoder_label(codec, backend);
                     // El formato solo se nombra si no es el de siempre (4:2:0 SDR).
@@ -1669,13 +1754,29 @@ async fn renegotiate(ctx: &Arc<HostCtx>, guest: Option<GuestId>) {
                     } else {
                         format!("{label} · {format}")
                     };
+                    let mut detail = format!("codifica {label}");
+                    if let Some(calibrated) = &calibrated {
+                        for result in &calibrated.results {
+                            debug!(codec = %codec, medida = %result, "calibración del codificador");
+                        }
+                        detail.push_str(&format!(
+                            " ({}calibrado: p95 {:.1} ms)",
+                            if calibrated.from_cache {
+                                ""
+                            } else {
+                                "recién "
+                            },
+                            calibrated.p95.as_secs_f64() * 1000.0
+                        ));
+                    }
+                    if let Some(rate_control) = encoder.rate_control() {
+                        debug!(codec = %codec, %rate_control, "control de tasa del codificador");
+                        detail.push_str(&format!("; {rate_control}"));
+                    }
                     ctx.core.ledger.set_video(format!("{codec} · {label}"));
                     ctx.encode.replace(encoder);
                     *current = Some((codec, backend, format));
-                    ctx.core.emit(SessionEvent::VideoCodec {
-                        codec,
-                        detail: format!("codifica {label}"),
-                    });
+                    ctx.core.emit(SessionEvent::VideoCodec { codec, detail });
                     announce(ctx, codec, format, None);
                     ctx.core.shared.request_keyframe();
                     return;
@@ -1728,34 +1829,48 @@ fn announce(ctx: &HostCtx, codec: Codec, format: VideoFormat, guest: Option<Gues
     }
 }
 
-/// Envía el cursor a cada invitado como mucho a `CURSOR_MAX_HZ` y solo si cambia; la forma, una
-/// vez por forma y por invitado, antes de la primera posición que la usa.
+/// Envía el cursor a cada invitado como mucho a `CURSOR_MAX_HZ` y solo si cambia: cada posición
+/// en un datagrama de control numerado por cada conexión (gana el último; una pérdida no retiene
+/// a los siguientes) y una copia por el stream de control como mucho cada
+/// [`CURSOR_STREAM_PERIOD`] (el respaldo si los datagramas no pasan). Por el stream iba cada
+/// posición y una pérdida congelaba el cursor ~100 ms (el PTO) y después reproducía las posiciones
+/// viejas. La forma, una vez por forma y por invitado, por el stream, antes de la primera posición
+/// que la usa.
 async fn cursor_loop(ctx: Arc<HostCtx>) {
     let mut tick = tokio::time::interval(CURSOR_PERIOD);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut sent: BTreeMap<GuestId, (Option<CursorState>, Option<u64>)> = BTreeMap::new();
+    let mut sent: BTreeMap<GuestId, CursorSent> = BTreeMap::new();
+    let mut seq: u32 = 0;
+    let mut last_datagram: Option<CursorState> = None;
     loop {
         tick.tick().await;
         if ctx.core.ended() {
             break;
         }
         let cursor = *lock(&ctx.core.shared.cursor);
-        let controls = lock(&ctx.links).guest_controls();
+        let (controls, connections) = {
+            let links = lock(&ctx.links);
+            (links.guest_controls(), links.connections())
+        };
         sent.retain(|guest, _| controls.iter().any(|(id, _)| id == guest));
         let Some(cursor) = cursor else {
             continue;
         };
         let shape = ctx.core.shared.cursor_shape(cursor.shape_id);
+        let now = Instant::now();
         for (guest, control) in controls {
-            let (last_cursor, last_shape) = sent.entry(guest).or_default();
+            let last = sent.entry(guest).or_default();
             if let Some(shape) = &shape
-                && *last_shape != Some(shape.shape_id)
+                && last.shape != Some(shape.shape_id)
                 && let Some(message) = shape_to_message(shape)
                 && control.send(&message).is_ok()
             {
-                *last_shape = Some(shape.shape_id);
+                last.shape = Some(shape.shape_id);
             }
-            if *last_cursor != Some(cursor) {
+            let due = last
+                .stream_at
+                .is_none_or(|at| now.saturating_duration_since(at) >= CURSOR_STREAM_PERIOD);
+            if last.cursor != Some(cursor) && due {
                 let message = ControlMessage::Cursor {
                     x: cursor.x,
                     y: cursor.y,
@@ -1763,11 +1878,41 @@ async fn cursor_loop(ctx: Arc<HostCtx>) {
                     shape_id: cursor.shape_id,
                 };
                 if control.send(&message).is_ok() {
-                    *last_cursor = Some(cursor);
+                    last.cursor = Some(cursor);
+                    last.stream_at = Some(now);
                 }
             }
         }
+        if last_datagram != Some(cursor) && !connections.is_empty() {
+            seq = seq.wrapping_add(1);
+            let message = ControlMessage::Cursor {
+                x: cursor.x,
+                y: cursor.y,
+                visible: cursor.visible,
+                shape_id: cursor.shape_id,
+            };
+            if let Some(datagram) =
+                coroom_transport::proto::control::control_datagram_tagged(&message, seq)
+            {
+                let datagram = Bytes::from(datagram);
+                for connection in &connections {
+                    let _ = connection.send_datagram(datagram.clone());
+                }
+            }
+            last_datagram = Some(cursor);
+        }
     }
+}
+
+/// Lo último que recibió un invitado del cursor por el stream de control ([`cursor_loop`]).
+#[derive(Debug, Default)]
+struct CursorSent {
+    /// Última posición enviada por el stream.
+    cursor: Option<CursorState>,
+    /// Última forma enviada.
+    shape: Option<u64>,
+    /// Cuándo salió la última copia por el stream.
+    stream_at: Option<Instant>,
 }
 
 /// Cada cuántos periodos de `rate_loop` se informa a cada invitado de su latencia de entrada.
@@ -1869,7 +2014,8 @@ struct Room {
     code: String,
     candidates: Vec<std::net::SocketAddr>,
     members: BTreeMap<GuestId, Member>,
-    connecting: BTreeSet<GuestId>,
+    /// Invitados con la apertura simultánea en marcha y el canal de sus candidatos tardíos.
+    connecting: BTreeMap<GuestId, mpsc::UnboundedSender<Vec<std::net::SocketAddr>>>,
 }
 
 fn network(what: &str) -> impl Fn(coroom_transport::TransportError) -> SessionError + '_ {
@@ -1898,6 +2044,35 @@ impl Room {
         .await
     }
 
+    /// El router contestó: si abrió el puerto, la dirección WAN se añade a los candidatos y se
+    /// vuelven a anunciar a todos los invitados de la sala (los que estén en la apertura
+    /// simultánea la prueban enseguida).
+    async fn announce_mapping(
+        &mut self,
+        report: &coroom_transport::nat::MappingReport,
+        observed: std::net::SocketAddr,
+    ) -> Result<(), SessionError> {
+        let with_wan =
+            advertised_candidates(&self.ctx.config, &self.ctx.endpoint, observed, Some(report));
+        if with_wan == self.candidates {
+            return Ok(());
+        }
+        self.candidates = with_wan;
+        let members: Vec<GuestId> = self.members.keys().copied().collect();
+        for guest in members {
+            send(
+                &self.ctx.signal,
+                SignalMessage::Candidates {
+                    from_peer: 0,
+                    to_peer: guest.0,
+                    addrs: self.candidates.clone(),
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     async fn on_signal(&mut self, message: SignalMessage) -> Result<(), SessionError> {
         match message {
             SignalMessage::PeerJoined {
@@ -1922,6 +2097,32 @@ impl Room {
                 });
                 Ok(())
             }
+            SignalMessage::JoinRequested {
+                from_user,
+                from_name,
+            } => {
+                self.ctx.core.emit(SessionEvent::JoinRequested {
+                    from_user,
+                    from_name,
+                });
+                Ok(())
+            }
+            SignalMessage::JoinDeclined {
+                from_user,
+                from_name,
+            } => {
+                self.ctx.core.emit(SessionEvent::JoinDeclined {
+                    from_user,
+                    from_name,
+                });
+                Ok(())
+            }
+            SignalMessage::Activity { user, activity } => {
+                self.ctx
+                    .core
+                    .emit(SessionEvent::Activity { user, activity });
+                Ok(())
+            }
             SignalMessage::Presence { user, online } => {
                 self.ctx.core.emit(SessionEvent::Presence { user, online });
                 Ok(())
@@ -1938,16 +2139,24 @@ impl Room {
                 from_peer, addrs, ..
             } => {
                 let guest = GuestId(from_peer);
-                if let Some(member) = self.members.get(&guest)
-                    && self.connecting.insert(guest)
-                {
-                    tokio::spawn(connect_guest(
-                        Arc::clone(&self.ctx),
-                        guest,
-                        member.key,
-                        addrs,
-                    ));
+                let Some(member) = self.members.get(&guest) else {
+                    return Ok(());
+                };
+                if let Some(extra) = self.connecting.get(&guest) {
+                    // Un segundo anuncio (la WAN que abrió su router): a la apertura en marcha,
+                    // si sigue (si no, el canal está cerrado y no pasa nada).
+                    let _ = extra.send(addrs);
+                    return Ok(());
                 }
+                let (extra_tx, extra_rx) = mpsc::unbounded_channel();
+                self.connecting.insert(guest, extra_tx);
+                tokio::spawn(connect_guest(
+                    Arc::clone(&self.ctx),
+                    guest,
+                    member.key,
+                    addrs,
+                    extra_rx,
+                ));
                 Ok(())
             }
             SignalMessage::Mls {
@@ -2286,7 +2495,7 @@ async fn run_host(
     )
     .map_err(network("no se pudo abrir el socket UDP"))?;
     let mapping_task = super::start_port_mapping(&config, &endpoint);
-    let mapping_started = std::time::Instant::now();
+    let mut mapping_rx = super::watch_port_mapping(&core, mapping_task);
     let mut signal = tokio::time::timeout(
         REPLY_TIMEOUT,
         SignalClient::connect(&config.server_url, &config.token, &endpoint, &config.trust),
@@ -2351,11 +2560,14 @@ async fn run_host(
     lock(&core.chat)
         .install(group.chat_key().map_err(crypto("MLS"))?, true)
         .map_err(SessionError::Crypto)?;
+    // Los candidatos locales y el reflejado, ya; la WAN que abra el router se añade cuando
+    // conteste (rama del bucle principal) y se vuelve a anunciar a los invitados.
+    let observed = signal.observed();
     let candidates = if config.force_relay {
+        mapping_rx = None;
         Vec::new()
     } else {
-        let mapping = super::await_port_mapping(&core, mapping_task, mapping_started).await;
-        advertised_candidates(&config, &endpoint, signal.observed(), mapping.as_ref())
+        advertised_candidates(&config, &endpoint, observed, None)
     };
     *lock(&core.room_code) = Some(code.clone());
 
@@ -2397,7 +2609,7 @@ async fn run_host(
         code: code.clone(),
         candidates,
         members: BTreeMap::new(),
-        connecting: BTreeSet::new(),
+        connecting: BTreeMap::new(),
     };
     core.emit(SessionEvent::RoomCreated {
         code,
@@ -2414,6 +2626,14 @@ async fn run_host(
     let mut tick = tokio::time::interval(Duration::from_millis(200));
     let result = loop {
         tokio::select! {
+            report = super::mapping_report(&mut mapping_rx) => {
+                mapping_rx = None;
+                if let Some(report) = report
+                    && let Err(err) = room.announce_mapping(&report, observed).await
+                {
+                    break Err(err);
+                }
+            }
             message = signal.next_event() => match message {
                 Ok(Some(message)) => {
                     if let Err(err) = room.on_signal(message).await {
@@ -2445,6 +2665,12 @@ async fn run_host(
                 Some(Command::Invite(user)) => {
                     let invite = SignalMessage::Invite { to_user: user, code: room.code.clone() };
                     if let Err(err) = send(&ctx.signal, invite).await {
+                        break Err(err);
+                    }
+                }
+                Some(Command::DeclineJoin(user)) => {
+                    let decline = SignalMessage::JoinDecline { to_user: user };
+                    if let Err(err) = send(&ctx.signal, decline).await {
                         break Err(err);
                     }
                 }
