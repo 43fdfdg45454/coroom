@@ -5,10 +5,8 @@
 host-que-compartir = Qué compartir
 host-modo-pantalla = Pantalla
 host-modo-ventana = Ventana
-host-modo-juego = Juego
 host-pantalla-ayuda = Un monitor entero, con el audio de todas las aplicaciones que dejes marcadas.
 host-ventana-ayuda = Una ventana, con el audio de todas las aplicaciones que dejes marcadas.
-host-juego-ayuda = Una ventana, con el audio solo de su aplicación.
 host-ventana-en-negro = Si la ventana se ve en negro (pantalla completa exclusiva), se transmite su monitor.
 host-se-puede-cambiar-dentro = Se puede cambiar dentro de la sala sin cerrarla.
 host-vista-previa-al-abrir = La vista previa aparece al abrir la sala
@@ -119,15 +117,11 @@ host-hdr-pantalla-quiza = Si la pantalla no expone HDR, el vídeo HDR se ve con 
 ## Audio y voz
 
 host-audio-que-se-envia = Audio que se envía
-host-audio-nada = Ninguna aplicación marcada: los invitados no oyen el juego.
 host-este-equipo-no-separa-el-audio = Todo lo que suena: este equipo no separa el audio por aplicación ({ $why }).
 host-ninguna-aplicacion-suena-ahora = Ninguna aplicación suena ahora.
-host-marcada-la-aplicacion-que-elegiste = Marcada, la aplicación que elegiste. Puedes añadir otras.
 host-las-aplicaciones-que-empiecen-a-sonar = Las aplicaciones que empiecen a sonar después entran solas, salvo las que hayas quitado.
 host-sonando = sonando
 host-quitada-siempre = quitada siempre · recordada
-host-la-aplicacion-elegida = la aplicación elegida
-host-la-aplicacion-elegida-aun-sin-sonido = la aplicación elegida · aún sin sonido
 host-coroom-nunca-se-envia-a-si = coroom nunca se envía a sí misma: la voz de la sala no vuelve como eco.
 host-hablar-por-la-sala-con-el = Hablar por la sala con el micrófono
 host-los-invitados-te-oyen-y-hablan = Los invitados te oyen siempre y hablan desde que entran, salvo que entren callados. Es el ajuste de Ajustes → Audio y voz.

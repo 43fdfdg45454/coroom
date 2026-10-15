@@ -27,13 +27,14 @@ sesión de uno que ya no uses.
 
 1. En **Inicio**, pulsa **Compartir mi pantalla**.
 2. Elige **qué compartir**:
-   - **Transmitir pantalla**: un monitor entero. En **Audio que se envía** salen todas las
-     aplicaciones que suenan, marcadas: desmarca las que no quieras (por ejemplo, el programa con
-     el que hablas). Las que quitas se recuerdan, y las que empiezan a sonar después entran solas.
-   - **Transmitir una app**: una sola ventana, con el audio solo de esa aplicación (sale marcada;
-     puedes añadir otras). Si la ventana se ve en negro porque el juego usa pantalla completa
-     exclusiva, se transmite su monitor y el audio sigue siendo solo el del juego.
+   - **Pantalla**: un monitor entero.
+   - **Ventana**: una sola ventana. Si se ve en negro porque el juego usa pantalla completa
+     exclusiva, se transmite su monitor.
    - La **fuente de prueba**, para comprobar la conexión sin enseñar nada tuyo.
+
+   En los dos modos, en **Audio que se envía** salen todas las aplicaciones que suenan, marcadas:
+   desmarca las que no quieras (por ejemplo, el programa con el que hablas). Las que quitas se
+   recuerdan, y las que empiezan a sonar después entran solas.
 
    Si el sistema elige el monitor o la ventana con su propio diálogo, lo eliges al abrir la sala.
    coroom nunca se envía a sí misma, así que la voz de la sala no vuelve como eco. Si el equipo no

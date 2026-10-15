@@ -1,7 +1,7 @@
 //! Pantalla «Compartir» (anfitrión), según el boceto aprobado.
 //!
-//! Antes de abrir la sala: arriba, **Qué compartir** (Pantalla, Ventana o Juego; Juego es una
-//! ventana con el audio solo de su aplicación) con el monitor o la ventana, y **A quién invitar**
+//! Antes de abrir la sala: arriba, **Qué compartir** (Pantalla o Ventana, las dos con el audio de
+//! todas las aplicaciones salvo las quitadas) con el monitor o la ventana, y **A quién invitar**
 //! con la lista de amigos en vivo (los marcados se invitan en cuanto el servidor crea la sala);
 //! debajo, la **calidad** en tres perfiles ([`QualityPreset`]) y **Avanzado** plegado (resolución,
 //! fps, códec y codificador, tope del bitrate Auto, 4:4:4 y HDR), cada fila con «En vivo» o «Al
@@ -56,13 +56,6 @@ use crate::ui::video::{VideoFeed, video_view};
 /// Cada cuánto se vuelve a mirar qué suena y qué se puede compartir.
 pub const REFRESH: Duration = Duration::from_secs(2);
 
-/// Aplicaciones que casi nunca son el juego: no se marcan solas al compartir un juego cuando el
-/// sistema no dice de quién es la ventana.
-const NOT_GAMES: [&str; 16] = [
-    "firefox", "chrome", "chromium", "brave", "msedge", "discord", "vesktop", "steam", "spotify",
-    "telegram", "slack", "teams", "zoom", "obs", "signal", "webcord",
-];
-
 /// Ancho del panel del chat con la sala abierta.
 const CHAT_WIDTH: f32 = 320.0;
 
@@ -106,35 +99,27 @@ pub enum ShareMode {
     Screen,
     /// Una ventana, con el audio de todas las aplicaciones salvo las quitadas.
     Window,
-    /// Una ventana, con el audio solo de su aplicación (y las que se marquen).
-    Game,
     /// La fuente de prueba (un patrón animado).
     Test,
 }
 
 impl ShareMode {
     /// Los del segmentado (la fuente de prueba va aparte, como enlace).
-    pub const PICKER: [ShareMode; 3] = [ShareMode::Screen, ShareMode::Window, ShareMode::Game];
+    pub const PICKER: [ShareMode; 2] = [ShareMode::Screen, ShareMode::Window];
 
     /// Fuente que se captura.
     pub fn source(self) -> SourceChoice {
         match self {
             ShareMode::Screen => SourceChoice::Screen,
-            ShareMode::Window | ShareMode::Game => SourceChoice::App,
+            ShareMode::Window => SourceChoice::App,
             ShareMode::Test => SourceChoice::Synthetic,
         }
-    }
-
-    /// Si solo suena la aplicación elegida (y las marcadas a mano).
-    fn only_its_audio(self) -> bool {
-        self == ShareMode::Game
     }
 
     fn label(self) -> &'static str {
         match self {
             ShareMode::Screen => t!("host-modo-pantalla"),
             ShareMode::Window => t!("host-modo-ventana"),
-            ShareMode::Game => t!("host-modo-juego"),
             ShareMode::Test => t!("host-la-fuente-de-prueba"),
         }
     }
@@ -143,7 +128,6 @@ impl ShareMode {
         match self {
             ShareMode::Screen => t!("host-pantalla-ayuda"),
             ShareMode::Window => t!("host-ventana-ayuda"),
-            ShareMode::Game => t!("host-juego-ayuda"),
             ShareMode::Test => t!("host-fuente-de-prueba-ayuda"),
         }
     }
@@ -152,7 +136,6 @@ impl ShareMode {
         match self {
             ShareMode::Screen => Icon::Monitor,
             ShareMode::Window => Icon::AppWindow,
-            ShareMode::Game => Icon::Gamepad,
             ShareMode::Test => Icon::Activity,
         }
     }
@@ -286,7 +269,7 @@ pub struct JoinRequest {
 /// Estado.
 #[derive(Debug, Clone, Default)]
 pub struct State {
-    /// Qué se comparte (pantalla, ventana, juego o la fuente de prueba).
+    /// Qué se comparte (pantalla, ventana o la fuente de prueba).
     pub mode: ShareMode,
     /// Monitor o ventana elegido (si el sistema deja elegirlo aquí).
     pub target: Option<CaptureTarget>,
@@ -300,11 +283,6 @@ pub struct State {
     pub refreshing: bool,
     /// Cuándo se miró por última vez.
     pub refreshed_at: Option<Instant>,
-    /// Al compartir un juego: las aplicaciones cuyo audio se envía.
-    pub only: Vec<String>,
-    /// Si [`State::only`] lo eligió la aplicación (se rehace al cambiar de ventana o de lo que
-    /// suena) o el usuario.
-    pub only_chosen: bool,
     /// Lista de audio desplegada.
     pub audio_open: bool,
     /// Amigos marcados para invitar al abrir la sala.
@@ -347,8 +325,8 @@ pub struct Sharing {
 }
 
 impl Sharing {
-    /// Si se captura lo mismo (Ventana y Juego solo cambian el audio; el título de una ventana
-    /// puede cambiar sin que cambie la ventana).
+    /// Si se captura lo mismo (el título de una ventana puede cambiar sin que cambie la
+    /// ventana).
     fn same(&self, other: &Sharing) -> bool {
         let targets = match (&self.target, &other.target) {
             (Some(a), Some(b)) => same_target(a, b),
@@ -442,64 +420,13 @@ impl State {
             .is_some_and(|options| options.targets.is_empty() && options.targets_error.is_none())
     }
 
-    /// Clave de la aplicación de la ventana elegida, si el sistema la dice.
-    fn target_app(&self) -> Option<&str> {
-        match &self.target {
-            Some(CaptureTarget::Window { app: Some(app), .. }) => Some(app),
-            _ => None,
-        }
-    }
-
-    /// El juego más probable: la aplicación de la ventana o, si el sistema no la dice, la primera
-    /// que suena y no parece un navegador, un chat o una tienda.
-    fn likely_game(&self) -> Option<String> {
-        self.target_app().map(normalize).or_else(|| {
-            self.playing()?
-                .iter()
-                .find(|app| !NOT_GAMES.iter().any(|word| app.key.contains(word)))
-                .map(|app| app.key.clone())
-        })
-    }
-
-    /// Rehace la selección automática del audio del juego.
-    fn auto_select(&mut self) {
-        // Con la sala abierta, el audio de lo que ya se transmite no cambia solo.
-        let live = self.room.is_some() && !self.source_changed();
-        if self.only_chosen || !self.mode.only_its_audio() || live {
-            return;
-        }
-        self.only = self.likely_game().into_iter().collect();
-    }
-
     /// Filas de la lista de audio, con las aplicaciones quitadas que se recuerdan.
     pub fn audio_rows(&self, excluded: &[RememberedApp]) -> Vec<AudioRow> {
         let playing = self.playing().unwrap_or_default();
         let is_excluded = |key: &str| excluded.iter().any(|app| normalize(&app.key) == key);
-        let mut rows: Vec<AudioRow> = Vec::new();
-        if self.mode.only_its_audio() {
-            let chosen = self.target_app().map(normalize);
-            if let Some(key) = &chosen
-                && !playing.iter().any(|app| &app.key == key)
-            {
-                rows.push(AudioRow {
-                    key: key.clone(),
-                    name: key.trim_end_matches(".exe").to_owned(),
-                    checked: self.only.contains(key),
-                    note: t!("host-la-aplicacion-elegida-aun-sin-sonido"),
-                });
-            }
-            rows.extend(playing.iter().map(|app| AudioRow {
-                key: app.key.clone(),
-                name: app.name.clone(),
-                checked: self.only.contains(&app.key),
-                note: if chosen.as_ref() == Some(&app.key) {
-                    t!("host-la-aplicacion-elegida")
-                } else {
-                    t!("host-sonando")
-                },
-            }));
-        } else {
-            rows.extend(playing.iter().map(|app| {
+        let mut rows: Vec<AudioRow> = playing
+            .iter()
+            .map(|app| {
                 let out = is_excluded(&app.key);
                 AudioRow {
                     key: app.key.clone(),
@@ -511,37 +438,31 @@ impl State {
                         t!("host-sonando")
                     },
                 }
-            }));
-            rows.extend(
-                excluded
-                    .iter()
-                    .filter(|app| !playing.iter().any(|p| p.key == normalize(&app.key)))
-                    .map(|app| AudioRow {
-                        key: normalize(&app.key),
-                        name: app.name.clone(),
-                        checked: false,
-                        note: t!("host-quitada-siempre"),
-                    }),
-            );
-        }
+            })
+            .collect();
+        rows.extend(
+            excluded
+                .iter()
+                .filter(|app| !playing.iter().any(|p| p.key == normalize(&app.key)))
+                .map(|app| AudioRow {
+                    key: normalize(&app.key),
+                    name: app.name.clone(),
+                    checked: false,
+                    note: t!("host-quitada-siempre"),
+                }),
+        );
         rows
     }
 
-    /// Audio del juego que se pide al abrir la sala.
+    /// Audio del juego que se pide al abrir la sala: todas las aplicaciones salvo las quitadas.
     pub fn game_capture(&self, excluded: &[RememberedApp]) -> GameCapture {
         if self.playing().is_none() {
             // Sin audio por aplicación en este equipo: todo lo que suena.
             return GameCapture::System;
         }
-        if self.mode.only_its_audio() {
-            // Aunque no se marque ninguna, la captura por aplicación arranca: así se puede marcar
-            // una con la sala abierta.
-            GameCapture::Apps(AppFilter::Only(self.only.clone()))
-        } else {
-            GameCapture::Apps(AppFilter::AllExcept(
-                excluded.iter().map(|app| normalize(&app.key)).collect(),
-            ))
-        }
+        GameCapture::Apps(AppFilter::AllExcept(
+            excluded.iter().map(|app| normalize(&app.key)).collect(),
+        ))
     }
 }
 
@@ -720,29 +641,16 @@ fn change_video(app: &mut App, custom: bool, change: impl FnOnce(&mut Video)) ->
 pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
     match msg {
         Msg::Mode(mode) => return set_mode(app, mode),
-        Msg::Target(TargetOption(target)) => {
-            app.host.target = Some(target);
-            app.host.only_chosen = false;
-            app.host.auto_select();
-        }
+        Msg::Target(TargetOption(target)) => app.host.target = Some(target),
         Msg::AppAudio(key, name, on) => {
             let key = normalize(&key);
-            let mut effects = Vec::new();
-            if app.host.mode.only_its_audio() {
-                app.host.only.retain(|known| *known != key);
-                if on {
-                    app.host.only.push(key);
-                }
-                app.host.only_chosen = true;
-            } else {
-                // Al compartir la pantalla o una ventana, quitar una aplicación se recuerda.
-                let excluded = &mut app.settings.audio.excluded_apps;
-                excluded.retain(|known| normalize(&known.key) != key);
-                if !on {
-                    excluded.push(RememberedApp { key, name });
-                }
-                effects.extend(app.settings_changed());
+            // Quitar una aplicación se recuerda.
+            let excluded = &mut app.settings.audio.excluded_apps;
+            excluded.retain(|known| normalize(&known.key) != key);
+            if !on {
+                excluded.push(RememberedApp { key, name });
             }
+            let mut effects = app.settings_changed();
             // Con la sala abierta, el audio de lo que se transmite cambia ya (si se está eligiendo
             // otra fuente, va con ella al cambiar).
             if app.host.room.is_some() && !app.host.source_changed() {
@@ -905,24 +813,10 @@ fn set_mode(app: &mut App, mode: ShareMode) -> Vec<Effect> {
     }
     let source = host.source();
     host.mode = mode;
-    host.only_chosen = false;
     if mode.source() != source {
         host.target = None;
         host.picked = None;
-        host.only.clear();
-        host.auto_select();
         return refresh(app);
-    }
-    // Ventana ↔ Juego: la misma ventana con otro audio; con la sala abierta, se aplica ya.
-    host.only = if mode.only_its_audio() {
-        host.likely_game().into_iter().collect()
-    } else {
-        Vec::new()
-    };
-    if host.room.is_some() && !host.source_changed() {
-        return vec![Effect::SetAppAudio(
-            host.game_capture(&app.settings.audio.excluded_apps),
-        )];
     }
     Vec::new()
 }
@@ -1108,7 +1002,6 @@ pub fn on_share_options(app: &mut App, options: ShareOptions) {
         None => options.targets.first().cloned(),
     };
     host.options = Some(options);
-    host.auto_select();
 }
 
 /// Lo elegido en el selector del sistema.
@@ -1127,8 +1020,6 @@ pub fn on_share_picked(
     match picked {
         Ok(Some(picked)) => {
             app.host.picked = Some(picked);
-            app.host.only_chosen = false;
-            app.host.auto_select();
             if app.host.room.is_some() {
                 return apply_source(app);
             }
@@ -1835,7 +1726,7 @@ fn picked_control(state: &State) -> Element<'_, Message> {
     .into()
 }
 
-/// Segmentado Pantalla / Ventana / Juego.
+/// Segmentado Pantalla / Ventana.
 fn mode_picker(state: &State) -> Element<'_, Message> {
     ui::segmented(
         ShareMode::PICKER
@@ -2322,11 +2213,7 @@ fn audio_summary(app: &App) -> String {
         .map(|row| row.name)
         .collect();
     if names.is_empty() {
-        if state.mode.only_its_audio() {
-            t!("host-audio-nada").to_owned()
-        } else {
-            t!("host-ninguna-aplicacion-suena-ahora").to_owned()
-        }
+        t!("host-ninguna-aplicacion-suena-ahora").to_owned()
     } else {
         join_names(&names)
     }
@@ -2368,11 +2255,7 @@ fn audio_box(app: &App, with_voice: bool) -> Element<'_, Message> {
             .current_options()
             .is_some_and(|options| options.apps.is_ok());
         if supported {
-            let subtitle = if state.mode.only_its_audio() {
-                t!("host-marcada-la-aplicacion-que-elegiste")
-            } else {
-                t!("host-las-aplicaciones-que-empiecen-a-sonar")
-            };
+            let subtitle = t!("host-las-aplicaciones-que-empiecen-a-sonar");
             let mut list = Column::new().push(
                 container(ui::caption(subtitle).wrapping(Wrapping::WordOrGlyph)).padding(Padding {
                     top: 8.0,
@@ -3016,13 +2899,14 @@ fn invite_more<'a>(app: &'a App, room: &'a Room) -> Option<Element<'a, Message>>
 /// El chat de la sala, fijo a la derecha (el panel trae su cabecera con «Vaciar el chat»).
 fn chat_panel(app: &App) -> Element<'_, Message> {
     container(chat::panel(app, chat::Surface::Window))
-        .width(Length::Fixed(CHAT_WIDTH + space::M))
+        .width(Length::Fixed(CHAT_WIDTH + space::M + space::S))
         .height(Length::Fill)
         .padding(Padding {
             top: space::M,
             right: space::M,
             bottom: space::M,
-            left: 0.0,
+            // Aire entre la barra de desplazamiento de la página y el chat.
+            left: space::S,
         })
         .into()
 }
@@ -3150,10 +3034,10 @@ pub(crate) mod shots {
         app.toasts.clear();
     }
 
-    /// Un juego, con «Avanzado» desplegado y el perfil personalizado.
+    /// Una ventana, con «Avanzado» desplegado y el perfil personalizado.
     pub(crate) fn host_setup_advanced(app: &mut App) {
         signed_in(app, Page::Host);
-        app.update(Message::Host(Msg::Mode(ShareMode::Game)));
+        app.update(Message::Host(Msg::Mode(ShareMode::Window)));
         windows(app);
         app.update(Message::Host(Msg::Preset(QualityPreset::MinLatency)));
         app.update(Message::Host(Msg::Fps(120)));
@@ -3288,11 +3172,11 @@ pub(crate) mod shots {
         app.toasts.clear();
     }
 
-    /// Con la sala abierta, eligiendo un juego en vez de la pantalla.
+    /// Con la sala abierta, eligiendo la ventana de un juego en vez de la pantalla.
     pub(crate) fn host_room_switch(app: &mut App) {
         host_room(app);
         app.update(Message::Host(Msg::ChangeSource(true)));
-        app.update(Message::Host(Msg::Mode(ShareMode::Game)));
+        app.update(Message::Host(Msg::Mode(ShareMode::Window)));
         // Un título largo, como los de Windows: no debe aplastar el selector.
         let game = coroom_session::capture::CaptureTarget::Window {
             id: 7,
@@ -3484,39 +3368,53 @@ mod tests {
         assert_eq!(app.host.error.as_deref(), Some("no hay pantalla"));
     }
 
+    /// Una ventana manda el audio de todas las aplicaciones salvo las quitadas, y quitar una se
+    /// recuerda (también sin que la ventana diga de qué aplicación es).
     #[test]
-    fn sharing_a_game_sends_only_its_audio() {
+    fn sharing_a_window_sends_every_app_but_the_removed_ones() {
         let mut app = app();
         app.update(Message::Navigate(Page::Host));
         assert_eq!(
-            app.update(Message::Host(Msg::Mode(ShareMode::Game))),
+            app.update(Message::Host(Msg::Mode(ShareMode::Window))),
             [Effect::LoadShareOptions(SourceChoice::App)]
         );
-        // Con ventanas que dicen su aplicación (Windows): se marca la de la ventana.
         let game = window(7, "Juego", Some("juego.exe"));
         app.update(Message::Event(Event::ShareOptions(ShareOptions {
             source: SourceChoice::App,
             targets: vec![game.clone(), window(8, "Navegador", Some("firefox.exe"))],
             targets_error: None,
-            apps: Ok(playing(&["discord.exe", "firefox.exe"])),
+            apps: Ok(playing(&["juego.exe", "discord.exe", "firefox.exe"])),
         })));
         assert_eq!(app.host.target, Some(game.clone()));
-        let rows = app.host.audio_rows(&[]);
-        assert_eq!(rows[0].key, "juego.exe", "aún sin sonido, pero marcada");
-        assert!(rows[0].checked);
-        assert!(rows[1..].iter().all(|row| !row.checked));
+        let rows = app.host.audio_rows(&app.settings.audio.excluded_apps);
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row.checked), "todas marcadas");
+        assert_eq!(
+            app.host.game_capture(&app.settings.audio.excluded_apps),
+            GameCapture::Apps(AppFilter::AllExcept(Vec::new()))
+        );
+        // Quitar una se recuerda, y elegir otra ventana no toca el audio.
+        app.update(Message::Host(Msg::AppAudio(
+            "Discord.exe".into(),
+            "Discord".into(),
+            false,
+        )));
+        assert_eq!(app.flush_settings(), Some(Effect::SaveSettings));
+        assert_eq!(app.settings.audio.excluded_apps[0].key, "discord.exe");
         app.update(Message::Host(Msg::Target(TargetOption(window(
             8,
             "Navegador",
             Some("firefox.exe"),
         )))));
-        assert_eq!(app.host.only, ["firefox.exe"]);
         app.update(Message::Host(Msg::Target(TargetOption(game.clone()))));
-        app.update(Message::Host(Msg::AppAudio(
-            "discord.exe".into(),
-            "discord".into(),
-            true,
-        )));
+        let rows = app.host.audio_rows(&app.settings.audio.excluded_apps);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| !row.checked)
+                .map(|row| row.key.as_str())
+                .collect::<Vec<_>>(),
+            ["discord.exe"]
+        );
         let effects = app.update(Message::Host(Msg::Start));
         assert_eq!(
             effects[0],
@@ -3527,41 +3425,42 @@ mod tests {
                     target: Some(game),
                     restore_token: None,
                 },
-                audio: GameCapture::Apps(AppFilter::Only(vec![
-                    "juego.exe".into(),
-                    "discord.exe".into()
-                ])),
+                audio: GameCapture::Apps(AppFilter::AllExcept(vec!["discord.exe".into()])),
                 voice: app.settings.audio.host_voice,
                 guests_muted: false,
             })
         );
     }
 
-    /// Ventana y Juego capturan lo mismo: cambiar entre ellos solo cambia el audio, sin volver a
-    /// mirar qué se puede compartir.
+    /// Sin audio por aplicación en el equipo (o cuando el sistema elige la ventana), la ventana
+    /// manda lo mismo que la pantalla.
     #[test]
-    fn a_window_sends_every_app_and_a_game_only_its_own() {
+    fn a_window_without_per_app_audio_sends_the_system_mix() {
         let mut app = app();
         app.update(Message::Host(Msg::Mode(ShareMode::Window)));
+        // El sistema elige la ventana (Linux): todo lo que suena, salvo lo quitado.
         app.update(Message::Event(Event::ShareOptions(ShareOptions {
             source: SourceChoice::App,
-            targets: vec![window(7, "Juego", Some("juego.exe"))],
+            targets: Vec::new(),
             targets_error: None,
-            apps: Ok(playing(&["juego.exe", "discord.exe"])),
+            apps: Ok(playing(&["discord", "firefox", "juego"])),
         })));
+        let excluded = [RememberedApp {
+            key: "Discord".into(),
+            name: "Discord".into(),
+        }];
         assert_eq!(
-            app.host.game_capture(&[]),
-            GameCapture::Apps(AppFilter::AllExcept(Vec::new()))
+            app.host.game_capture(&excluded),
+            GameCapture::Apps(AppFilter::AllExcept(vec!["discord".into()]))
         );
-        assert!(
-            app.update(Message::Host(Msg::Mode(ShareMode::Game)))
-                .is_empty(),
-            "la misma lista de ventanas"
-        );
-        assert_eq!(
-            app.host.game_capture(&[]),
-            GameCapture::Apps(AppFilter::Only(vec!["juego.exe".into()]))
-        );
+        // Sin audio por aplicación en el equipo: todo lo que suena.
+        app.update(Message::Event(Event::ShareOptions(ShareOptions {
+            source: SourceChoice::App,
+            targets: Vec::new(),
+            targets_error: None,
+            apps: Err("no".into()),
+        })));
+        assert_eq!(app.host.game_capture(&excluded), GameCapture::System);
     }
 
     #[test]
@@ -3595,49 +3494,6 @@ mod tests {
             Some(true),
             "el aviso de la sala dice cómo entran"
         );
-    }
-
-    #[test]
-    fn without_window_owners_the_likely_game_is_marked() {
-        let mut app = app();
-        app.update(Message::Host(Msg::Mode(ShareMode::Game)));
-        // El sistema elige la ventana (Linux): se adivina el juego entre lo que suena.
-        app.update(Message::Event(Event::ShareOptions(ShareOptions {
-            source: SourceChoice::App,
-            targets: Vec::new(),
-            targets_error: None,
-            apps: Ok(playing(&["discord", "firefox", "juego"])),
-        })));
-        assert_eq!(app.host.only, ["juego"]);
-        app.update(Message::Host(Msg::AppAudio(
-            "juego".into(),
-            "juego".into(),
-            false,
-        )));
-        assert!(app.host.only.is_empty());
-        app.update(Message::Event(Event::ShareOptions(ShareOptions {
-            source: SourceChoice::App,
-            targets: Vec::new(),
-            targets_error: None,
-            apps: Ok(playing(&["discord", "juego", "otro"])),
-        })));
-        assert!(
-            app.host.only.is_empty(),
-            "lo que elige el usuario se respeta"
-        );
-        assert_eq!(
-            app.host.game_capture(&[]),
-            GameCapture::Apps(AppFilter::Only(Vec::new())),
-            "sin nada marcado no suena nada, pero se puede marcar con la sala abierta"
-        );
-        // Sin audio por aplicación en el equipo: todo lo que suena.
-        app.update(Message::Event(Event::ShareOptions(ShareOptions {
-            source: SourceChoice::App,
-            targets: Vec::new(),
-            targets_error: None,
-            apps: Err("no".into()),
-        })));
-        assert_eq!(app.host.game_capture(&[]), GameCapture::System);
     }
 
     #[test]
@@ -4078,7 +3934,7 @@ mod tests {
             targets_error: None,
             apps: Ok(Vec::new()),
         })));
-        app.update(Message::Host(Msg::Mode(ShareMode::Game)));
+        app.update(Message::Host(Msg::Mode(ShareMode::Window)));
         assert!(
             app.host.current_options().is_none(),
             "las de la pantalla no valen"
@@ -4153,7 +4009,7 @@ mod tests {
     fn with_the_room_open_the_source_and_audio_change_live() {
         let mut app = app();
         app.screen = crate::ui::app::Screen::Main;
-        app.update(Message::Host(Msg::Mode(ShareMode::Game)));
+        app.update(Message::Host(Msg::Mode(ShareMode::Window)));
         let game = window(1, "Fatal Fury", Some("fatalfury.exe"));
         let other = window(2, "Otro juego", Some("otro.exe"));
         app.update(Message::Event(Event::ShareOptions(ShareOptions {
@@ -4165,18 +4021,19 @@ mod tests {
         open_room(&mut app);
         assert!(!app.host.source_changed());
 
-        // Audio: marcar una aplicación más se aplica ya a la sala.
+        // Audio: quitar una aplicación se aplica ya a la sala (y se recuerda).
         let effects = app.update(Message::Host(Msg::AppAudio(
             "discord.exe".into(),
             "discord".into(),
-            true,
+            false,
         )));
         assert_eq!(
             effects,
-            [Effect::SetAppAudio(GameCapture::Apps(AppFilter::Only(
-                vec!["fatalfury.exe".into(), "discord.exe".into()]
-            )))]
+            [Effect::SetAppAudio(GameCapture::Apps(
+                AppFilter::AllExcept(vec!["discord.exe".into()])
+            ))]
         );
+        assert_eq!(app.flush_settings(), Some(Effect::SaveSettings));
 
         // Fuente: elegir otra ventana no cambia nada hasta «Compartir esto».
         app.update(Message::Host(Msg::ChangeSource(true)));
@@ -4193,8 +4050,8 @@ mod tests {
         assert_eq!(request.share.target, Some(other.clone()));
         assert_eq!(
             request.audio,
-            GameCapture::Apps(AppFilter::Only(vec!["otro.exe".into()])),
-            "el audio de la ventana nueva va con ella"
+            GameCapture::Apps(AppFilter::AllExcept(vec!["discord.exe".into()])),
+            "el audio va con la ventana nueva"
         );
         assert!(
             app.update(Message::Host(Msg::ApplySource)).is_empty(),
@@ -4222,14 +4079,5 @@ mod tests {
         app.update(Message::Host(Msg::ChangeSource(false)));
         assert!(!app.host.source_changed());
         assert_eq!(app.host.target, Some(other));
-
-        // Juego → Ventana con lo mismo: solo cambia el audio, en vivo.
-        let effects = app.update(Message::Host(Msg::Mode(ShareMode::Window)));
-        assert_eq!(
-            effects,
-            [Effect::SetAppAudio(GameCapture::Apps(
-                AppFilter::AllExcept(Vec::new())
-            ))]
-        );
     }
 }
