@@ -9,11 +9,58 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Añadido
 
-- **Bitrate máximo «Sin límite»** (Ajustes → Vídeo y el panel «Transmisión» de la sala), además
-  de 150 Mbit/s: el control de tasa sube mientras el camino no haga cola, hasta llenar el enlace
-  (techo técnico de 500 Mbit/s). Arranca en 40 Mbit/s como mucho, para no llenar un enlace lento
-  con el primer intra, y si el codificador no acepta un bitrate tan alto, sigue con el que tenía
-  en vez de cortar la sesión.
+- **Audio del juego con 30-45 ms de latencia propia** (medida de captura a altavoz, no
+  estimada). PipeWire captura y reproduce en el hilo de tiempo real (`RT_PROCESS`) y cada trama
+  lleva la hora real en que el dispositivo la capturó (`pw_stream_get_nsec` más el retardo del
+  stream; en Windows, la hora QPC de cada búfer de WASAPI y la posición de `IAudioClock` al
+  reproducir). El búfer de captura guarda como mucho 3 tramas y nunca se queda más de una por
+  detrás de la mezclada; el ritmo de envío se mide con el periodo que informa el dispositivo; la
+  sincronía A/V se recalcula cada 100 ms y nunca retrasa el audio más de 60 ms; el búfer de
+  jitter mide y decide en tramas de 10 ms; y la reproducción ya no asigna memoria ni toma
+  cerrojos: las estadísticas, el emparejamiento con el vídeo y los flujos nuevos van en un hilo
+  aparte. Lo comprueban `crates/audio/tests/latency.rs` (30,7-39,7 ms en el banco) y el test de
+  audio del escritorio (mediana 35-44 ms de extremo a extremo).
+- **El vídeo se presenta en cuanto llega**: el invitado dibuja cada fotograma decodificado al
+  momento, en su propia pasada sobre el mismo dispositivo de la ventana, sin esperar al redibujado
+  de la interfaz.
+- **Chat de texto en la sala** (protocolo 12; hay que actualizar también el servidor), cifrado de
+  extremo a extremo con la clave de la época MLS (`crates/crypto/src/chat.rs`): panel lateral en
+  ventana y superpuesto a pantalla completa (`Ctrl+Alt+C`), burbuja de 5 s con los mensajes
+  nuevos, sonido y notificación de escritorio en Linux (se apagan en Ajustes → Sala), enlaces
+  clicables con el dominio visible, historial de los últimos 50 mensajes para quien entra tarde,
+  también en la sala de espera, 2000 caracteres y 10 mensajes cada 10 s por persona; el anfitrión
+  puede vaciar el historial. En la consola de `join --headless`, `say` y `clear-chat`.
+- **Interfaz nueva** con cinco pantallas rediseñadas (Inicio, Compartir, Sala, Ajustes y
+  Diagnóstico) y una cabecera común con el servidor y su RTT siempre a la vista: Inicio con las
+  invitaciones, las solicitudes y los amigos ordenados por conexión; Compartir con perfiles de
+  calidad (Mínima latencia, Equilibrado, Máxima calidad o Personalizado) y las tarjetas de los
+  invitados; la sala del invitado con barra flotante que se oculta sola a pantalla completa
+  (también la píldora de latencia, 2,5 s con el ratón quieto), panel lateral con Chat, Conexión
+  y Sala, y sincronización vertical opcional; Ajustes en seis páginas que se guardan al cambiarlos
+  (Cuenta y servidor, Audio y voz, Sala, Mandos, Apariencia y Acerca de); y Diagnóstico como
+  panel sobre cualquier pantalla, con la ruta, los candidatos directos, la latencia por etapa y
+  «Copiar informe» sin direcciones ni nombres. Los textos viven en catálogos Fluent por pantalla
+  (`apps/desktop/locales/es/`) y un test comprueba que no queda ninguno fuera.
+- **Bitrate siempre «Auto»**, con un tope opcional («Auto hasta X» o «Auto sin tope», en
+  Compartir y en el panel «Transmisión» de la sala): el control de tasa sube mientras el camino
+  no haga cola, hasta el tope o hasta llenar el enlace (techo técnico de 500 Mbit/s). Antes de
+  arrancar, una **sonda de enlace** (dos trenes de 48 datagramas por la pista Probe) mide lo que
+  cabe y el vídeo arranca al 70 % de lo medido, en vez de a un valor fijo; si el codificador no
+  acepta un bitrate tan alto, sigue con el que tenía en vez de cortar la sesión.
+- **Abrir el puerto en el router** (PCP, NAT-PMP o UPnP, implementados en
+  `coroom_transport::nat`, sin salida a internet): el anfitrión pide al router que deje entrar la
+  conexión directa y anuncia su dirección WAN como candidato; si la red es CGNAT se dice y se va
+  por el relay. Ajuste «Abrir el puerto en el router» (activado por defecto), `--no-port-mapping`
+  y la sección «Router» de `coroom doctor`. El diagnóstico de la conexión dice qué candidato
+  directo se probó y por qué se acabó en el relay.
+- **Toda la entrada por datagramas** (protocolo 11): cada paquete lleva el estado completo de
+  teclado, ratón y mandos, con reconciliación por diferencia ante huecos y repeticiones a 3, 8 y
+  20 ms, así una pérdida no deja una tecla pulsada ni se pierde un clic; la latencia de la entrada
+  se mide por etapas (cola, red, inyección), los mandos se leen a 1 ms (gilrs) y el driver
+  virtual de Windows actualiza a 500 Hz.
+- **Los invitados entran hablando**: todo invitado oye la sala sin pedir permiso y su micrófono
+  se abre al entrar salvo que el anfitrión active «Los invitados entran callados» (Ajustes →
+  Sala); el permiso «Voz» solo gobierna el micrófono.
 - **Más diagnóstico en el registro**: la línea de estadísticas del anfitrión dice cuántos
   fotogramas dio la fuente antes de la cadencia y cuántos sobraban, llegaron solo con el cursor o
   repetían la imagen anterior (`captura 30.0 fps (la fuente da 60.0: …)`); en Windows se anota
@@ -227,6 +274,14 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Cambiado
 
+- El control de tasa del vídeo sigue al enlace medido: VBV de un fotograma que acompaña al
+  bitrate (SVT-AV1 exige al menos 20 ms), tope en 1,25 × lo recibido, un segundo de espera tras
+  cada recorte, vía rápida con dos informes seguidos de 50 ms o más de cola, la FEC descontada
+  del presupuesto y contrapresión entre el codificador y el envío (sin intras por desalojo).
+- El anfitrión Windows usa un solo dispositivo D3D11 para toda la captura, y el sondeo de MTU
+  tiene techo en la MTU del adaptador menos 48 (entre 1252 y 1452), en vez de probar a ciegas.
+- Los atajos del invitado: `Ctrl+Alt+S` abre las estadísticas (antes `Ctrl+Alt+O`) y
+  `Ctrl+Alt+C` el chat; las letras se cambian en Ajustes → Mandos.
 - **El Flatpak usa el FFmpeg del runtime** (8.1.3, el mismo que antes se compilaba aparte) y, al
   ejecutarse, el de la extensión `org.freedesktop.Platform.codecs-extra`, que se instala sola con
   el runtime: los codificadores de Vulkan Video, el decodificador HEVC, VA-API, NVENC/NVDEC, AMF,
@@ -265,6 +320,10 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Eliminado
 
+- El bitrate máximo «Sin límite» y los valores fijos: el único modo es «Auto», con o sin
+  tope.
+- La pantalla «Vídeo» de Ajustes: el códec, el bitrate y la calidad se eligen en Compartir y en
+  el panel «Transmisión» de la sala.
 - `build.ps1 -TestSign` y las instrucciones de firma de prueba y por atestación del driver de
   mando.
 - La gestión automática de certificados por ACME (`COROOM_TLS_MODE=acme`, los retos TLS-ALPN-01 y

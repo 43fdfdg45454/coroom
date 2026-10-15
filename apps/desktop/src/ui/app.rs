@@ -264,6 +264,8 @@ pub enum Event {
     ),
     /// Un efecto no pudo hacerse (aviso para el usuario).
     Failed(String),
+    /// El mensaje del chat no salió: el motivo, para enseñarlo bajo el campo.
+    ChatFailed(String),
 }
 
 /// Micrófono o salida.
@@ -326,6 +328,8 @@ pub enum Message {
     Diagnostics(diagnostics::Msg),
     /// Chat de la sala (anfitrión o invitado).
     Chat(chat::Msg),
+    /// La ventana ganó o perdió el foco del escritorio.
+    WindowFocused(bool),
     /// Resultado de la red o de una sesión.
     Event(Event),
 }
@@ -413,6 +417,17 @@ pub enum Effect {
     SendChat(String),
     /// Anfitrión: vaciar el chat para todos.
     ClearChat,
+    /// Dar el foco al campo del chat (`true`) o quitárselo: lo hace la ventana.
+    FocusChat(bool),
+    /// Notificación del escritorio de un mensaje del chat (con la ventana sin foco).
+    ChatNotify {
+        /// «Ana · Sala de Bea».
+        title: String,
+        /// El texto.
+        body: String,
+    },
+    /// Sonido de mensaje nuevo del chat.
+    ChatSound,
     /// Dejar de oír (o volver a oír) una voz en este equipo: en la sala propia (`host`, por id de
     /// invitado) o en la que se está como invitado (por hoja MLS).
     SetVoiceMuted {
@@ -699,7 +714,6 @@ impl App {
             .any(|toast| self.now.duration_since(toast.shown_at) < quick)
             || self.login.probe.is_checking()
             || self.guest.as_ref().is_some_and(guest::State::animating)
-            || self.settings_page.doctor.is_loading()
             || self.host.starting
     }
 
@@ -722,6 +736,12 @@ impl App {
             consider(at + SETTINGS_SAVE_DELAY);
         }
         if let Some(at) = self.chat.next_tick(self.now) {
+            consider(at);
+        }
+        if let Some(at) = home::next_tick(self) {
+            consider(at);
+        }
+        if let Some(at) = settings_screen::next_tick(self) {
             consider(at);
         }
         if self.page == Page::Host
@@ -791,6 +811,8 @@ impl App {
                     effects.push(Effect::SaveSettings);
                 }
                 self.chat.tick(now);
+                home::tick(self);
+                effects.extend(settings_screen::tick(self));
                 if self.page == Page::Host
                     && self.screen == Screen::Main
                     && self.host.refresh_due(now)
@@ -860,6 +882,9 @@ impl App {
             Message::Settings(msg) => settings_screen::update(self, msg),
             Message::Diagnostics(msg) => diagnostics::update(self, msg),
             Message::Chat(msg) => chat::update(self, msg),
+            Message::WindowFocused(focused) => {
+                chat::update(self, chat::Msg::WindowFocused(focused))
+            }
             Message::Event(event) => self.event(event),
         }
     }
@@ -1021,6 +1046,8 @@ impl App {
     }
 
     fn event(&mut self, event: Event) -> Vec<Effect> {
+        // Inicio anota cuándo llegan las invitaciones y cuándo cambió la lista de amigos.
+        home::on_event(self, &event);
         match event {
             Event::Probed { .. } | Event::SignedIn(_) | Event::NoSavedSession => {
                 login::on_event(self, event)
@@ -1043,6 +1070,7 @@ impl App {
                     Ok(friends) => Load::Loaded(friends),
                     Err(err) => Load::Failed(err),
                 };
+                host::on_friends(self);
                 Vec::new()
             }
             Event::FriendChanged(result) => {
@@ -1066,6 +1094,7 @@ impl App {
                 {
                     friend.online = online;
                 }
+                host::on_friends(self);
                 Vec::new()
             }
             Event::ServerStatus { rtt_ms, online } => {
@@ -1137,6 +1166,7 @@ impl App {
                 self.video_support = Some(support);
                 Vec::new()
             }
+            Event::ChatFailed(_) => chat::on_event(self, &event),
             Event::Failed(err) => {
                 self.toast(Tone::Error, err);
                 Vec::new()
@@ -1235,6 +1265,14 @@ impl App {
         }
     }
 
+    /// Subtítulo bajo el título de la cabecera (Ajustes: «Se guardan al cambiarlos»).
+    pub fn page_subtitle(&self) -> Option<&'static str> {
+        match self.page {
+            Page::Settings => Some(settings_screen::subtitle()),
+            _ => None,
+        }
+    }
+
     /// Insignia del servidor: host y RTT, o que no responde.
     pub fn server_badge_text(&self) -> String {
         let host = self
@@ -1267,7 +1305,11 @@ impl App {
                     t!("app-inicio"),
                     Some(Message::Navigate(Page::Home)),
                 ));
-                left = left.push(ui::heading(title));
+                let mut titles = column![ui::heading(title)];
+                if let Some(subtitle) = self.page_subtitle() {
+                    titles = titles.push(ui::caption(subtitle));
+                }
+                left = left.push(titles);
             }
         }
         let server_tone = match self.server_status.online {

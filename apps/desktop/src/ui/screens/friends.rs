@@ -1,21 +1,17 @@
-//! Pantalla 3: amigos.
+//! Amigos: la lógica de pedir, aceptar, rechazar y quitar amistades.
 //!
-//! Lista con presencia, solicitudes recibidas (aceptar o rechazar) y enviadas (retirar), añadir
-//! por nombre de usuario y quitar con confirmación.
+//! Ya no es una página: la lista, las solicitudes y «Agregar amigo» se dibujan en Inicio
+//! ([`super::home`]); aquí queda su estado (el campo de usuario desplegable) y sus mensajes.
 
-use coroom_ui::Element;
-use coroom_ui::icon::Icon;
 use coroom_ui::theme::Tone;
-use coroom_ui::tokens::{size, space};
-use coroom_ui::widget::{self as ui, Kind};
-use iced_core::{Alignment, Length};
-use iced_widget::{Column, column, container, row};
 
-use crate::ui::app::{App, Dialog, Effect, Load, Message};
+use crate::ui::app::{App, Dialog, Effect, Load};
 
 /// Estado.
 #[derive(Debug, Clone, Default)]
 pub struct State {
+    /// El campo para pedir amistad está desplegado.
+    pub adding: bool,
     /// Nombre que se escribe para pedir amistad.
     pub add_name: String,
     /// Error al pedirla.
@@ -27,6 +23,8 @@ pub struct State {
 /// Mensajes.
 #[derive(Debug, Clone)]
 pub enum Msg {
+    /// Despliega o recoge el campo de «Agregar amigo».
+    ToggleAdd,
     /// Nombre.
     AddName(String),
     /// Pedir amistad.
@@ -50,6 +48,15 @@ pub enum Msg {
 pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
     let state = &mut app.friends_page;
     match msg {
+        Msg::ToggleAdd => {
+            state.adding = !state.adding;
+            // Un error de otra operación (aceptar, rechazar) no se queda bajo el campo.
+            state.add_error = None;
+            if !state.adding {
+                state.add_name.clear();
+            }
+            Vec::new()
+        }
         Msg::AddName(name) => {
             state.add_name = name;
             state.add_error = None;
@@ -58,8 +65,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::Add => {
             let name = state.add_name.trim().to_owned();
             if name.is_empty() {
-                state.add_error =
-                    Some(t!("pantalla-friends-escribe-su-nombre-de-usuario").to_owned());
+                state.add_error = Some(t!("home-write-username").to_owned());
                 return Vec::new();
             }
             if app
@@ -67,7 +73,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 .as_ref()
                 .is_some_and(|account| account.username.eq_ignore_ascii_case(&name))
             {
-                state.add_error = Some(t!("pantalla-friends-ese-eres-tu").to_owned());
+                state.add_error = Some(t!("home-thats-you").to_owned());
                 return Vec::new();
             }
             state.busy = true;
@@ -92,203 +98,27 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
     }
 }
 
-fn on(msg: Msg) -> Message {
-    Message::Friends(msg)
-}
-
-/// Dibuja la página.
-pub fn view(app: &App) -> Element<'_, Message> {
-    let state = &app.friends_page;
-    let subtitle = app.friends.loaded().map(|friends| {
-        let online = friends.friends.iter().filter(|f| f.online).count();
-        match friends.friends.len() {
-            0 => t!("pantalla-friends-todavia-sin-amigos-en-este-servidor").to_owned(),
-            1 => t!("pantalla-friends-1-amigo-online-conectado", online = online),
-            total => t!(
-                "pantalla-friends-total-amigos-online-conectados",
-                total = total,
-                online = online
-            ),
-        }
-    });
-    let header = ui::page_header(
-        t!("pantalla-friends-amigos"),
-        subtitle,
-        vec![ui::icon_button(
-            Icon::Refresh,
-            t!("pantalla-friends-volver-a-cargar"),
-            Some(on(Msg::Reload)),
-        )],
-    );
-    let add = ui::card(
-        column![
-            ui::strong(t!("pantalla-friends-anadir-un-amigo")),
-            row![
-                container(Element::from(
-                    ui::field(t!("pantalla-friends-nombre-de-usuario"), &state.add_name)
-                        .placeholder("bea")
-                        .on_input(|value| on(Msg::AddName(value)))
-                        .on_submit((!state.busy).then(|| on(Msg::Add)))
-                        .error(state.add_error.as_deref())
-                        .id("friend-name")
-                ))
-                .width(Length::Fill),
-                ui::button_with(
-                    Kind::Primary,
-                    t!("pantalla-friends-enviar-solicitud"),
-                    Some(Icon::UserPlus),
-                    (!state.busy).then(|| on(Msg::Add))
-                )
-            ]
-            .spacing(space::XS)
-            .align_y(Alignment::End),
-            ui::caption(t!(
-                "pantalla-friends-cuando-acepte-vereis-quien-esta-conectado"
-            ))
-        ]
-        .spacing(space::XS),
-    );
-    let mut page = Column::new().spacing(space::L).push(header).push(add);
-    match &app.friends {
-        Load::Idle | Load::Loading => {
-            page = page.push(ui::skeleton(t!("pantalla-friends-cargando-tus-amigos"), 3))
-        }
-        Load::Failed(err) => {
-            page = page.push(ui::error_state(
-                t!("pantalla-friends-no-se-pudo-cargar-la-lista"),
-                err.as_str(),
-                Some((t!("pantalla-friends-reintentar"), on(Msg::Reload))),
-            ));
-        }
-        Load::Loaded(friends) => {
-            if !friends.incoming.is_empty() {
-                let rows = friends
-                    .incoming
-                    .iter()
-                    .map(|request| {
-                        ui::list_row(
-                            Some(ui::avatar(
-                                &app.theme,
-                                &request.user.display_name,
-                                size::AVATAR,
-                            )),
-                            request.user.display_name.as_str(),
-                            Some(t!(
-                                "pantalla-friends-quiere-ser-tu-amigo",
-                                username = request.user.username
-                            )),
-                            vec![
-                                ui::flat(
-                                    t!("pantalla-friends-rechazar"),
-                                    Some(on(Msg::Decline(request.id))),
-                                )
-                                .into(),
-                                ui::primary(
-                                    t!("pantalla-friends-aceptar"),
-                                    Some(on(Msg::Accept(request.id))),
-                                )
-                                .into(),
-                            ],
-                        )
-                    })
-                    .collect();
-                page = page.push(ui::section(
-                    t!(
-                        "pantalla-friends-solicitudes-recibidas",
-                        valor = friends.incoming.len()
-                    ),
-                    None,
-                    rows,
-                ));
-            }
-            if friends.friends.is_empty() {
-                page = page.push(ui::empty_state(
-                    Icon::Users,
-                    t!("pantalla-friends-todavia-no-tienes-amigos-en-este"),
-                    t!("pantalla-friends-pide-amistad-con-su-nombre-de"),
-                    None,
-                ));
-            } else {
-                let mut sorted: Vec<_> = friends.friends.iter().collect();
-                sorted.sort_by_key(|friend| (!friend.online, friend.display_name.to_lowercase()));
-                let rows = sorted
-                    .into_iter()
-                    .map(|friend| {
-                        ui::list_row(
-                            Some(ui::avatar(&app.theme, &friend.display_name, size::AVATAR)),
-                            friend.display_name.as_str(),
-                            Some(format!("@{}", friend.username)),
-                            vec![
-                                if friend.online {
-                                    ui::status_badge(
-                                        Tone::Success,
-                                        t!("pantalla-friends-conectado"),
-                                    )
-                                } else {
-                                    ui::status_badge(
-                                        Tone::Neutral,
-                                        t!("pantalla-friends-desconectado"),
-                                    )
-                                },
-                                ui::icon_button(
-                                    Icon::Trash,
-                                    t!("pantalla-friends-quitar-de-tus-amigos"),
-                                    Some(on(Msg::Remove {
-                                        user: friend.id,
-                                        name: friend.display_name.clone(),
-                                    })),
-                                ),
-                            ],
-                        )
-                    })
-                    .collect();
-                page = page.push(ui::section(t!("pantalla-friends-tus-amigos"), None, rows));
-            }
-            if !friends.outgoing.is_empty() {
-                let rows = friends
-                    .outgoing
-                    .iter()
-                    .map(|request| {
-                        ui::list_row(
-                            Some(ui::avatar(
-                                &app.theme,
-                                &request.user.display_name,
-                                size::AVATAR,
-                            )),
-                            request.user.display_name.as_str(),
-                            Some(t!(
-                                "pantalla-friends-pendiente-de-aceptar",
-                                username = request.user.username
-                            )),
-                            vec![
-                                ui::flat(
-                                    t!("pantalla-friends-retirar"),
-                                    Some(on(Msg::Decline(request.id))),
-                                )
-                                .into(),
-                            ],
-                        )
-                    })
-                    .collect();
-                page = page.push(ui::section(
-                    t!("pantalla-friends-solicitudes-enviadas"),
-                    None,
-                    rows,
-                ));
-            }
-        }
+/// Un cambio de amistades terminó (lo mira antes que [`App`], que limpia el campo): si fue bien,
+/// el campo se recoge; si falló con el campo recogido (aceptar o rechazar), el motivo sale en un
+/// aviso, porque bajo el campo no se vería.
+pub fn on_changed(app: &mut App, result: &Result<String, String>) {
+    match result {
+        Ok(_) => app.friends_page.adding = false,
+        Err(err) if !app.friends_page.adding => app.toast(Tone::Error, err.clone()),
+        Err(_) => {}
     }
-    ui::page(page)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::app::{Event, tests::app};
+    use crate::ui::app::{Event, Message, tests::app};
 
     #[test]
     fn adding_friends_validates_and_reloads() {
         let mut app = app();
+        app.update(Message::Friends(Msg::ToggleAdd));
+        assert!(app.friends_page.adding);
         assert!(app.update(Message::Friends(Msg::Add)).is_empty());
         assert!(app.friends_page.add_error.is_some());
         app.update(Message::Friends(Msg::AddName(" bea ".into())));
@@ -302,11 +132,32 @@ mod tests {
         ))));
         assert_eq!(effects, [Effect::LoadFriends]);
         assert!(!app.friends_page.busy && app.friends_page.add_name.is_empty());
+        assert!(!app.friends_page.adding, "el campo se recoge");
         assert_eq!(app.toasts.len(), 1);
+        // Un error al pedir amistad sale bajo el campo desplegado.
+        app.update(Message::Friends(Msg::ToggleAdd));
         app.update(Message::Event(Event::FriendChanged(Err(
             "no existe ningún usuario «carla»".into(),
         ))));
         assert!(app.friends_page.add_error.is_some());
+        assert_eq!(app.toasts.len(), 1);
+    }
+
+    #[test]
+    fn errors_with_the_field_folded_go_to_a_toast() {
+        let mut app = app();
+        app.update(Message::Friends(Msg::Accept(4)));
+        app.update(Message::Event(Event::FriendChanged(Err(
+            "la solicitud ya no existe".into(),
+        ))));
+        assert_eq!(app.toasts.len(), 1);
+        assert_eq!(app.toasts[0].tone, Tone::Error);
+        // Al desplegar el campo, ese error no aparece debajo.
+        app.update(Message::Friends(Msg::ToggleAdd));
+        assert_eq!(app.friends_page.add_error, None);
+        app.update(Message::Friends(Msg::AddName("bea".into())));
+        app.update(Message::Friends(Msg::ToggleAdd));
+        assert!(!app.friends_page.adding && app.friends_page.add_name.is_empty());
     }
 
     #[test]

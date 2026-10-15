@@ -152,7 +152,7 @@ Entre pares, QUIC usa **claves públicas crudas** (RFC 7250) que son la identida
 extremo exige la clave que anunció la señalización. El servidor se fija por la huella de su
 certificado (autofirmado, `ServerTrust::Fingerprint`, con «Confiar» la primera vez) o se valida con
 las raíces del sistema (certificado del operador emitido por una autoridad). El número de seguridad (60 dígitos, SHA-512 de las dos claves
-ordenadas) se ve en el overlay, en la sala y en Ajustes → Dispositivos, y se recuerda por par.
+ordenadas) se ve en el overlay, en la sala y en Ajustes → Cuenta y servidor, y se recuerda por par.
 
 **I-1 (sin corrección completa)**: el servidor es también el directorio de claves (manda la clave
 del anfitrión en `Joined` y la del invitado en `PeerJoined`). Un servidor malicioso puede, en el

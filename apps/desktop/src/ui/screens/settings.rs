@@ -1,92 +1,88 @@
-//! Pantallas 6 y 7: ajustes y diagnóstico.
+//! Ajustes: lo que no depende de una sala.
 //!
-//! Vídeo (códec, bitrate, fps, resolución, 4:4:4 y HDR), audio (dispositivos, modo de voz y su
-//! tecla, supresión de ruido), entrada (atajos editables, ranura de mando preferida), red (forzar
-//! relay, puerto local), dispositivos de la cuenta (con cerrar sesión remota), apariencia (sistema,
-//! claro u oscuro; acento del sistema o fijo), acerca de (versión, licencias, actualizaciones,
-//! huella de la identidad y números de seguridad) y el diagnóstico de `coroom doctor` con "Copiar".
-//! Todo se guarda al cambiarlo en `settings.toml`.
+//! Seis páginas con su navegación lateral: **Cuenta y servidor** (quién eres, el servidor y su
+//! huella, los dispositivos de la cuenta, la red y los números de seguridad), **Audio y voz**
+//! (salida y micrófono con la lista en vivo, la voz como anfitrión y como invitado), **Sala** (cómo
+//! entran los invitados y los avisos del chat), **Mandos** (qué mando envías, la ranura que
+//! ofreces y los atajos `Ctrl+Alt+letra`), **Apariencia** (tema, acento y la fuente del
+//! escritorio) y **Acerca de** (versión, versiones nuevas y licencias). Lo de vídeo y calidad vive
+//! en Compartir y en el panel de la sala; el diagnóstico se abre desde la cabecera y la sala.
+//!
+//! Cada cambio se guarda solo, poco después ([`App::settings_changed`]); las filas cuyo cambio no
+//! llega a la sala abierta lo dicen con una etiqueta («Al abrir la sala», «Al entrar en la sala»).
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use coroom_session::input::gamepad::PadChoice;
 use coroom_transport::proto::PROTOCOL_VERSION;
+use coroom_transport::proto::api::Devices;
 use coroom_ui::Element;
 use coroom_ui::icon::{Icon, icon_with};
 use coroom_ui::style::{ButtonClass, ContainerClass, SvgClass};
+use coroom_ui::tag;
 use coroom_ui::theme::{Accent, Tone};
-use coroom_ui::tokens::{size, space, text as type_size};
+use coroom_ui::tokens::{space, text as type_size};
 use coroom_ui::widget::{self as ui, Kind};
 use iced_core::text::Wrapping;
 use iced_core::{Alignment, Length, Padding};
 use iced_widget::{Column, Row, button, column, container, row, text};
 
-use crate::ui::app::{App, AudioDevice, Dialog, Effect, Event, Load, Message};
-use crate::ui::settings::{
-    BITRATE_CHOICES, CodecChoice, DecoderChoice, EncoderChoice, FPS_CHOICES, Resolution, Shortcuts,
-    ThemeChoice, VoiceMode,
-};
-use crate::ui::stats;
-use coroom_transport::proto::api::Devices;
+use crate::ui::app::{App, AudioDevice, Dialog, Effect, Event, Load, Message, Page, Screen};
+use crate::ui::screens::diagnostics;
+use crate::ui::settings::{Shortcuts, ThemeChoice, VoiceMode};
+
+/// Cada cuánto se vuelve a pedir la lista de micrófonos y salidas con «Audio y voz» abierta.
+pub const AUDIO_REFRESH: Duration = Duration::from_secs(3);
 
 /// Páginas de Ajustes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsPage {
-    /// Vídeo.
+    /// Cuenta, servidor, dispositivos de la cuenta y red.
     #[default]
-    Video,
-    /// Audio.
+    Account,
+    /// Dispositivos de audio y voz.
     Audio,
-    /// Entrada.
-    Input,
-    /// Red.
-    Network,
-    /// Dispositivos.
-    Devices,
-    /// Apariencia.
+    /// Cómo entran los invitados y los avisos del chat.
+    Room,
+    /// Mandos y atajos.
+    Gamepads,
+    /// Tema, acento y fuente.
     Appearance,
-    /// Acerca de.
+    /// Versión, versiones nuevas y licencias.
     About,
-    /// Diagnóstico.
-    Diagnostics,
 }
 
 impl SettingsPage {
-    /// Todas, en el orden de la lista.
-    pub const ALL: [SettingsPage; 8] = [
-        SettingsPage::Video,
+    /// Todas, en el orden de la navegación.
+    pub const ALL: [SettingsPage; 6] = [
+        SettingsPage::Account,
         SettingsPage::Audio,
-        SettingsPage::Input,
-        SettingsPage::Network,
-        SettingsPage::Devices,
+        SettingsPage::Room,
+        SettingsPage::Gamepads,
         SettingsPage::Appearance,
         SettingsPage::About,
-        SettingsPage::Diagnostics,
     ];
 
-    /// Nombre.
+    /// Nombre en la navegación.
     pub fn label(self) -> &'static str {
         match self {
-            SettingsPage::Video => t!("pantalla-settings-video"),
-            SettingsPage::Audio => t!("pantalla-settings-audio"),
-            SettingsPage::Input => t!("pantalla-settings-entrada"),
-            SettingsPage::Network => t!("pantalla-settings-red"),
-            SettingsPage::Devices => t!("pantalla-settings-dispositivos"),
-            SettingsPage::Appearance => t!("pantalla-settings-apariencia"),
-            SettingsPage::About => t!("pantalla-settings-acerca-de"),
-            SettingsPage::Diagnostics => t!("pantalla-settings-diagnostico"),
+            SettingsPage::Account => t!("settings-cuenta-y-servidor"),
+            SettingsPage::Audio => t!("settings-audio-y-voz"),
+            SettingsPage::Room => t!("settings-sala"),
+            SettingsPage::Gamepads => t!("settings-mandos"),
+            SettingsPage::Appearance => t!("settings-apariencia"),
+            SettingsPage::About => t!("settings-acerca-de"),
         }
     }
 
     fn icon(self) -> Icon {
         match self {
-            SettingsPage::Video => Icon::Video,
+            SettingsPage::Account => Icon::UserRound,
             SettingsPage::Audio => Icon::Headphones,
-            SettingsPage::Input => Icon::Keyboard,
-            SettingsPage::Network => Icon::Network,
-            SettingsPage::Devices => Icon::Laptop,
+            SettingsPage::Room => Icon::Users,
+            SettingsPage::Gamepads => Icon::Gamepad,
             SettingsPage::Appearance => Icon::Palette,
             SettingsPage::About => Icon::Info,
-            SettingsPage::Diagnostics => Icon::Stethoscope,
         }
     }
 }
@@ -107,10 +103,20 @@ pub struct State {
     pub page: SettingsPage,
     /// Dispositivos de la cuenta.
     pub devices: Load<Devices>,
-    /// Salida del diagnóstico.
+    /// Salida de `coroom doctor` (la pide y la muestra el diagnóstico; llega aquí con
+    /// [`Event::Doctor`]).
     pub doctor: Load<Vec<String>>,
-    /// Micrófonos y salidas.
+    /// Micrófonos y salidas (la última lista que llegó; no se vacía al volver a pedirla).
     pub audio_devices: Load<Vec<AudioDevice>>,
+    /// La lista de audio está pedida y aún no ha llegado.
+    pub audio_refreshing: bool,
+    /// Cuándo llegó la última respuesta (lista o error): la siguiente se pide
+    /// [`AUDIO_REFRESH`] después.
+    pub audio_answered_at: Option<Instant>,
+    /// Cuándo llegó la última lista («actualizado hace N s»).
+    pub audio_updated_at: Option<Instant>,
+    /// Error de la última petición si ya había una lista (se sigue mostrando la anterior).
+    pub audio_error: Option<String>,
     /// Esperando una tecla.
     pub capturing: Option<Capture>,
     /// Texto del puerto local.
@@ -124,32 +130,45 @@ pub struct State {
 pub enum Msg {
     /// Página.
     Page(SettingsPage),
-    /// Códec.
-    Codec(Choice<CodecChoice>),
-    /// Codificador.
-    Encoder(Choice<EncoderChoice>),
-    /// Decodificador.
-    Decoder(Choice<DecoderChoice>),
-    /// Bitrate.
-    Bitrate(Choice<u32>),
-    /// Fps.
-    Fps(u32),
-    /// Resolución.
-    Resolution(Choice<Resolution>),
-    /// 4:4:4.
-    Chroma444(bool),
-    /// HDR.
-    Hdr(bool),
-    /// Voz por defecto.
-    Voice(bool),
+    /// Volver a cargar los dispositivos de la cuenta.
+    ReloadDevices,
+    /// Desvincular un dispositivo de la cuenta (pide confirmación).
+    Revoke {
+        /// Dispositivo.
+        id: u64,
+        /// Nombre.
+        name: String,
+    },
+    /// Usar siempre el relay.
+    ForceRelay(bool),
+    /// Pedir al router que abra el puerto.
+    PortMapping(bool),
+    /// Puerto local.
+    Port(String),
+    /// Ver el número de seguridad de un par conocido.
+    Peer(usize),
+    /// Salida de audio.
+    Speaker(Choice<Option<String>>),
     /// Micrófono.
     Microphone(Choice<Option<String>>),
-    /// Salida.
-    Speaker(Choice<Option<String>>),
-    /// Modo de voz.
-    VoiceMode(VoiceMode),
-    /// Supresión de ruido.
+    /// Como anfitrión, compartir el micrófono con la sala.
+    HostVoice(bool),
+    /// Como invitado, pulsar para hablar (`false`: micrófono abierto).
+    PushToTalk(bool),
+    /// Supresión de ruido del micrófono.
     NoiseSuppression(bool),
+    /// Los invitados entran callados.
+    GuestsMuted(bool),
+    /// Sonido al llegar un mensaje.
+    ChatSound(bool),
+    /// Notificación del escritorio con la ventana sin foco.
+    ChatNotifications(bool),
+    /// Burbuja sobre el vídeo.
+    ChatBubbles(bool),
+    /// Como invitado, volver a enviar el último mando que se conecte.
+    PadAuto,
+    /// Ranura que se ofrece primero al dar mando.
+    PreferredSlot(Choice<u8>),
     /// Cambiar un atajo.
     Capture(Capture),
     /// La tecla pulsada mientras se cambiaba un atajo (nombre de `winit`, o una letra).
@@ -158,36 +177,13 @@ pub enum Msg {
     CancelCapture,
     /// Atajos por defecto.
     ResetShortcuts,
-    /// Ranura preferida.
-    PreferredSlot(Choice<u8>),
-    /// Forzar relay.
-    ForceRelay(bool),
-    /// Pedir al router que abra el puerto.
-    PortMapping(bool),
-    /// Puerto local.
-    Port(String),
     /// Tema.
     Theme(ThemeChoice),
     /// Acento (`"system"` o una clave).
     Accent(String),
-    /// Cerrar la sesión de un dispositivo (pide confirmación).
-    Revoke {
-        /// Dispositivo.
-        id: u64,
-        /// Nombre.
-        name: String,
-    },
-    /// Volver a cargar los dispositivos.
-    ReloadDevices,
-    /// Volver a pasar el diagnóstico.
-    RunDoctor,
-    /// Copiar el diagnóstico.
-    CopyDoctor,
-    /// Ver el número de seguridad de un par conocido.
-    Peer(usize),
     /// Comprobar ya si hay una versión nueva.
     CheckUpdates,
-    /// Comprobar sola cada cierto tiempo.
+    /// Buscar versiones nuevas cada cierto tiempo.
     UpdateChecks(bool),
     /// Cada cuántas horas.
     UpdateInterval(Choice<u32>),
@@ -215,97 +211,88 @@ fn choice<T>(value: T, label: impl Into<String>) -> Choice<T> {
     }
 }
 
+/// Subtítulo de la cabecera con Ajustes abierto.
+pub fn subtitle() -> &'static str {
+    t!("settings-se-guardan-al-cambiarlos")
+}
+
 /// Lo que se pide al abrir Ajustes.
 pub fn on_open(app: &mut App) -> Vec<Effect> {
     page_effects(app, app.settings_page.page)
 }
 
 fn page_effects(app: &mut App, page: SettingsPage) -> Vec<Effect> {
-    let state = &mut app.settings_page;
     match page {
-        SettingsPage::Devices if !state.devices.is_loading() && app.account.is_some() => {
-            state.devices = Load::Loading;
+        SettingsPage::Account
+            if !app.settings_page.devices.is_loading() && app.account.is_some() =>
+        {
+            app.settings_page.devices = match std::mem::take(&mut app.settings_page.devices) {
+                Load::Loaded(devices) => Load::Loaded(devices),
+                _ => Load::Loading,
+            };
             vec![Effect::LoadDevices]
         }
-        SettingsPage::Diagnostics if matches!(state.doctor, Load::Idle) => {
-            state.doctor = Load::Loading;
-            vec![Effect::RunDoctor]
-        }
-        SettingsPage::Audio if matches!(state.audio_devices, Load::Idle) => {
-            state.audio_devices = Load::Loading;
-            vec![Effect::LoadAudioDevices]
-        }
+        SettingsPage::Audio => request_audio(app),
         _ => Vec::new(),
     }
 }
 
-/// Guarda y, con la sala abierta, le aplica el vídeo nuevo.
-/// Guarda y, con la sala abierta, aplica el códec y el codificador (renegocia).
-fn live_codec(app: &mut App) -> Vec<Effect> {
-    let mut effects = app.settings_changed();
-    if app.host.room.is_some() {
-        let video = &app.settings.video;
-        tracing::info!(codec = ?video.codec, encoder = ?video.encoder, "códec para la sala abierta");
-        effects.push(Effect::SetCodec);
+/// Pide la lista de audio (si no está ya pedida); la anterior se sigue viendo mientras.
+fn request_audio(app: &mut App) -> Vec<Effect> {
+    let state = &mut app.settings_page;
+    if state.audio_refreshing {
+        return Vec::new();
     }
-    effects
-}
-
-/// Guarda y, con la sala abierta, aplica el tope del bitrate (sin renegociar nada).
-fn live_bitrate(app: &mut App) -> Vec<Effect> {
-    let mut effects = app.settings_changed();
-    if app.host.room.is_some() {
-        let kbps = app.settings.video.max_bitrate_kbps;
-        tracing::info!(kbps, "tope del bitrate para la sala abierta");
-        effects.push(Effect::SetMaxBitrate(kbps));
+    state.audio_refreshing = true;
+    if matches!(state.audio_devices, Load::Idle | Load::Failed(_)) {
+        state.audio_devices = Load::Loading;
     }
-    effects
+    vec![Effect::LoadAudioDevices]
 }
 
-/// Códecs del selector, con «Automático».
-pub fn codec_choices() -> Vec<Choice<CodecChoice>> {
-    vec![
-        choice(CodecChoice::Auto, t!("pantalla-settings-automatico")),
-        choice(CodecChoice::Av1, "AV1"),
-        choice(CodecChoice::Hevc, "HEVC"),
-        choice(CodecChoice::H264, "H.264"),
-    ]
+/// Si «Audio y voz» se está viendo (solo entonces se refresca la lista).
+fn audio_visible(app: &App) -> bool {
+    app.screen == Screen::Main
+        && app.page == Page::Settings
+        && app.settings_page.page == SettingsPage::Audio
 }
 
-/// Bitrates máximos del selector.
-pub fn bitrate_choices() -> Vec<Choice<u32>> {
-    BITRATE_CHOICES
-        .iter()
-        .map(|kbps| choice(*kbps, bitrate_label(*kbps)))
-        .collect()
-}
-
-/// El bitrate dentro de una frase: «Auto hasta 80 Mbit/s» o «Auto sin tope». Auto es el único
-/// modo: el control de tasa sube hasta donde la red aguanta y baja antes de que se congele; el
-/// tope solo le pone techo.
-pub fn bitrate_phrase(kbps: u32) -> String {
-    if kbps < coroom_session::remote::UNLIMITED_KBPS {
-        t!(
-            "pantalla-settings-auto-hasta",
-            valor = stats::kbps(f64::from(kbps))
-        )
-    } else {
-        t!("pantalla-settings-auto-sin-tope").to_owned()
+/// Cuándo necesita Ajustes el próximo [`Message::Tick`]: con «Audio y voz» abierta, cada
+/// segundo para «actualizado hace N s» y a los [`AUDIO_REFRESH`] de la última respuesta para
+/// volver a pedir la lista. Nunca una hora pasada mientras la lista está pedida (no hay bucle).
+pub fn next_tick(app: &App) -> Option<Instant> {
+    if !audio_visible(app) {
+        return None;
     }
-}
-
-/// Cómo se nombra un tope en el selector: «80 Mbit/s» o «Sin tope».
-pub fn bitrate_label(kbps: u32) -> String {
-    if kbps >= coroom_session::remote::UNLIMITED_KBPS {
-        t!("pantalla-settings-sin-tope").to_owned()
-    } else {
-        stats::kbps(f64::from(kbps))
+    let state = &app.settings_page;
+    let mut next = state.audio_updated_at.map(|at| {
+        let elapsed = app.now.saturating_duration_since(at).as_secs();
+        at + Duration::from_secs(elapsed + 1)
+    });
+    if !state.audio_refreshing
+        && let Some(at) = state.audio_answered_at
+    {
+        let due = at + AUDIO_REFRESH;
+        next = Some(next.map_or(due, |next| next.min(due)));
     }
+    next
 }
 
-/// Reduce un mensaje.
+/// En cada [`Message::Tick`]: vuelve a pedir la lista de audio si toca.
+pub fn tick(app: &mut App) -> Vec<Effect> {
+    if !audio_visible(app) {
+        return Vec::new();
+    }
+    let due = app
+        .settings_page
+        .audio_answered_at
+        .is_some_and(|at| app.now.saturating_duration_since(at) >= AUDIO_REFRESH);
+    if due { request_audio(app) } else { Vec::new() }
+}
+
+/// Reduce un mensaje. Lo que cambia los ajustes los guarda con retardo
+/// ([`App::settings_changed`]).
 pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
-    let save = vec![Effect::SaveSettings];
     let settings = &mut app.settings;
     match msg {
         Msg::Page(page) => {
@@ -313,88 +300,14 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             app.settings_page.capturing = None;
             return page_effects(app, page);
         }
-        // Con la sala abierta, el códec, el codificador y el bitrate se aplican también a ella.
-        Msg::Codec(choice) => {
-            settings.video.codec = choice.value;
-            return live_codec(app);
+        Msg::ReloadDevices => {
+            app.settings_page.devices = Load::Loading;
+            return vec![Effect::LoadDevices];
         }
-        Msg::Encoder(choice) => {
-            settings.video.encoder = choice.value;
-            return live_codec(app);
-        }
-        Msg::Decoder(choice) => settings.video.decoder = choice.value,
-        Msg::Bitrate(choice) => {
-            settings.video.max_bitrate_kbps = choice.value;
-            return live_bitrate(app);
-        }
-        Msg::Fps(fps) => settings.video.fps = fps,
-        Msg::Resolution(choice) => settings.video.max_resolution = choice.value,
-        Msg::Chroma444(on) => settings.video.chroma_444 = on,
-        Msg::Hdr(on) => settings.video.hdr = on,
-        Msg::Voice(on) => settings.audio.voice = on,
-        Msg::Microphone(choice) => settings.audio.microphone = choice.value,
-        Msg::Speaker(choice) => settings.audio.speaker = choice.value,
-        Msg::VoiceMode(mode) => settings.audio.voice_mode = mode,
-        Msg::NoiseSuppression(on) => settings.audio.noise_suppression = on,
-        Msg::Capture(capture) => {
-            app.settings_page.capturing = Some(capture);
+        Msg::Revoke { id, name } => {
+            app.dialog = Some(Dialog::RevokeDevice { device: id, name });
             return Vec::new();
         }
-        Msg::CancelCapture => {
-            app.settings_page.capturing = None;
-            return Vec::new();
-        }
-        Msg::KeyCaptured(name) => {
-            let Some(capture) = app.settings_page.capturing.take() else {
-                return Vec::new();
-            };
-            match capture {
-                Capture::PushToTalk => {
-                    if coroom_session::input::keymap::keycode_from_name(&name).is_none() {
-                        app.toast(
-                            Tone::Warning,
-                            t!("pantalla-settings-la-tecla-name-no-sirve-para", name = name),
-                        );
-                        return Vec::new();
-                    }
-                    app.settings.audio.push_to_talk_key = name;
-                }
-                Capture::Shortcut(index) => {
-                    let letter = name.chars().next().filter(|_| name.chars().count() == 1);
-                    let Some(letter) = letter.filter(char::is_ascii_alphabetic) else {
-                        app.toast(
-                            Tone::Warning,
-                            t!("pantalla-settings-los-atajos-usan-una-letra-con"),
-                        );
-                        return Vec::new();
-                    };
-                    let mut shortcuts = app.settings.input.shortcuts.clone();
-                    let letter = letter.to_ascii_uppercase();
-                    match index {
-                        0 => shortcuts.immersive = letter,
-                        1 => shortcuts.stats = letter,
-                        2 => shortcuts.chat = letter,
-                        3 => shortcuts.leave = letter,
-                        4 => shortcuts.mic = letter,
-                        5 => shortcuts.game = letter,
-                        _ => shortcuts.pads = letter,
-                    }
-                    if !shortcuts.is_valid() {
-                        app.toast(
-                            Tone::Warning,
-                            t!(
-                                "pantalla-settings-ctrl-alt-letter-ya-es-otro",
-                                letter = letter
-                            ),
-                        );
-                        return Vec::new();
-                    }
-                    app.settings.input.shortcuts = shortcuts;
-                }
-            }
-        }
-        Msg::ResetShortcuts => settings.input.shortcuts = Shortcuts::default(),
-        Msg::PreferredSlot(choice) => settings.input.preferred_slot = choice.value,
         Msg::ForceRelay(on) => settings.network.force_relay = on,
         Msg::PortMapping(on) => settings.network.port_mapping = on,
         Msg::Port(text) => {
@@ -407,7 +320,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                     Ok(port) if port == 0 || port >= 1024 => settings.network.local_port = port,
                     _ => {
                         app.settings_page.port_error =
-                            Some(t!("pantalla-settings-un-puerto-de-1024-a-65535").to_owned());
+                            Some(t!("settings-un-puerto-de-1024-a-65535").to_owned());
                         app.settings_page.port = Some(digits);
                         return Vec::new();
                     }
@@ -415,41 +328,6 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
             app.settings_page.port = Some(digits);
         }
-        Msg::Theme(theme) => {
-            settings.appearance.theme = theme;
-            app.refresh_theme();
-        }
-        Msg::Accent(key) => {
-            settings.appearance.accent = key;
-            app.refresh_theme();
-        }
-        Msg::Revoke { id, name } => {
-            app.dialog = Some(Dialog::RevokeDevice { device: id, name });
-            return Vec::new();
-        }
-        Msg::ReloadDevices => {
-            app.settings_page.devices = Load::Loading;
-            return vec![Effect::LoadDevices];
-        }
-        Msg::RunDoctor => {
-            app.settings_page.doctor = Load::Loading;
-            return vec![Effect::RunDoctor];
-        }
-        Msg::CopyDoctor => {
-            if let Load::Loaded(lines) = &app.settings_page.doctor {
-                let text = lines.join("\n");
-                return app.update(Message::Copy(text));
-            }
-            return Vec::new();
-        }
-        Msg::CheckUpdates => return app.check_updates(true),
-        Msg::UpdateChecks(on) => {
-            settings.updates.check = on;
-            // Al activarla, se comprueba enseguida; al quitarla, no se vuelve a preguntar.
-            let due = on && app.update.available.is_none();
-            app.schedule_update_check(due);
-        }
-        Msg::UpdateInterval(choice) => settings.updates.interval_hours = choice.value,
         Msg::Peer(index) => {
             if let Some(peer) = app.settings.peers.get(index) {
                 app.dialog = Some(Dialog::SafetyNumber {
@@ -460,8 +338,102 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
             return Vec::new();
         }
+        Msg::Speaker(choice) => settings.audio.speaker = choice.value,
+        Msg::Microphone(choice) => settings.audio.microphone = choice.value,
+        Msg::HostVoice(on) => settings.audio.host_voice = on,
+        Msg::PushToTalk(on) => {
+            settings.audio.voice_mode = if on {
+                VoiceMode::PushToTalk
+            } else {
+                VoiceMode::Activity
+            };
+        }
+        Msg::NoiseSuppression(on) => settings.audio.noise_suppression = on,
+        Msg::GuestsMuted(on) => settings.room.guests_muted = on,
+        Msg::ChatSound(on) => settings.room.chat_sound = on,
+        Msg::ChatNotifications(on) => settings.room.chat_notifications = on,
+        Msg::ChatBubbles(on) => settings.room.chat_bubbles = on,
+        Msg::PadAuto => {
+            settings.input.pad = PadChoice::Auto;
+            let mut effects = app.settings_changed();
+            effects.push(Effect::SetPadChoice(PadChoice::Auto));
+            return effects;
+        }
+        Msg::PreferredSlot(choice) => settings.input.preferred_slot = choice.value,
+        Msg::Capture(capture) => {
+            app.settings_page.capturing = Some(capture);
+            return Vec::new();
+        }
+        Msg::CancelCapture => {
+            app.settings_page.capturing = None;
+            return Vec::new();
+        }
+        Msg::KeyCaptured(name) => return key_captured(app, name),
+        Msg::ResetShortcuts => settings.input.shortcuts = Shortcuts::default(),
+        Msg::Theme(theme) => {
+            settings.appearance.theme = theme;
+            app.refresh_theme();
+        }
+        Msg::Accent(key) => {
+            settings.appearance.accent = key;
+            app.refresh_theme();
+        }
+        Msg::CheckUpdates => return app.check_updates(true),
+        Msg::UpdateChecks(on) => {
+            settings.updates.check = on;
+            // Al activarla, se comprueba enseguida; al quitarla, no se vuelve a preguntar.
+            let due = on && app.update.available.is_none();
+            app.schedule_update_check(due);
+        }
+        Msg::UpdateInterval(choice) => settings.updates.interval_hours = choice.value,
     }
-    save
+    app.settings_changed()
+}
+
+/// La tecla que llegó mientras se cambiaba un atajo o la de pulsar para hablar.
+fn key_captured(app: &mut App, name: String) -> Vec<Effect> {
+    let Some(capture) = app.settings_page.capturing.take() else {
+        return Vec::new();
+    };
+    match capture {
+        Capture::PushToTalk => {
+            if coroom_session::input::keymap::keycode_from_name(&name).is_none() {
+                app.toast(
+                    Tone::Warning,
+                    t!("settings-la-tecla-no-sirve-para-hablar", name = name),
+                );
+                return Vec::new();
+            }
+            app.settings.audio.push_to_talk_key = name;
+        }
+        Capture::Shortcut(index) => {
+            let letter = name.chars().next().filter(|_| name.chars().count() == 1);
+            let Some(letter) = letter.filter(char::is_ascii_alphabetic) else {
+                app.toast(Tone::Warning, t!("settings-los-atajos-usan-una-letra"));
+                return Vec::new();
+            };
+            let mut shortcuts = app.settings.input.shortcuts.clone();
+            let letter = letter.to_ascii_uppercase();
+            match index {
+                0 => shortcuts.immersive = letter,
+                1 => shortcuts.stats = letter,
+                2 => shortcuts.chat = letter,
+                3 => shortcuts.leave = letter,
+                4 => shortcuts.mic = letter,
+                5 => shortcuts.game = letter,
+                _ => shortcuts.pads = letter,
+            }
+            if !shortcuts.is_valid() {
+                app.toast(
+                    Tone::Warning,
+                    t!("settings-ya-es-otro-atajo", letter = letter),
+                );
+                return Vec::new();
+            }
+            app.settings.input.shortcuts = shortcuts;
+        }
+    }
+    app.settings_changed()
 }
 
 /// Resultados para Ajustes.
@@ -490,10 +462,24 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
             Vec::new()
         }
         Event::AudioDevices(result) => {
-            app.settings_page.audio_devices = match result {
-                Ok(devices) => Load::Loaded(devices),
-                Err(err) => Load::Failed(err),
-            };
+            let now = app.now;
+            let state = &mut app.settings_page;
+            state.audio_refreshing = false;
+            state.audio_answered_at = Some(now);
+            match result {
+                Ok(devices) => {
+                    state.audio_devices = Load::Loaded(devices);
+                    state.audio_updated_at = Some(now);
+                    state.audio_error = None;
+                }
+                Err(err) => {
+                    if matches!(state.audio_devices, Load::Loaded(_)) {
+                        state.audio_error = Some(err);
+                    } else {
+                        state.audio_devices = Load::Failed(err);
+                    }
+                }
+            }
             Vec::new()
         }
         _ => Vec::new(),
@@ -504,324 +490,467 @@ fn on(msg: Msg) -> Message {
     Message::Settings(msg)
 }
 
-/// Dibuja la página.
+/// Dibuja la página: la navegación a la izquierda y la página elegida a la derecha.
 pub fn view(app: &App) -> Element<'_, Message> {
     let state = &app.settings_page;
-    let nav = Column::with_children(SettingsPage::ALL.iter().map(|page| {
+    let offline = app.server_status.online == Some(false);
+    let entries = Column::with_children(SettingsPage::ALL.iter().map(|page| {
         let selected = state.page == *page;
-        button(
-            row![
-                icon_with(page.icon(), 18.0, SvgClass::Text),
-                text(page.label()).size(type_size::BODY).font(if selected {
+        let mut line = row![
+            icon_with(page.icon(), 18.0, SvgClass::Text),
+            text(page.label())
+                .size(type_size::BODY)
+                .font(if selected {
                     coroom_ui::font::SEMIBOLD
                 } else {
                     coroom_ui::font::UI
                 })
-            ]
-            .spacing(space::S)
-            .align_y(Alignment::Center),
-        )
-        .padding(Padding::from([8.0, 12.0]))
-        .width(Length::Fill)
-        .class(ButtonClass::Nav { selected })
-        .on_press(on(Msg::Page(*page)))
-        .into()
+                .width(Length::Fill)
+        ]
+        .spacing(space::S)
+        .align_y(Alignment::Center);
+        if *page == SettingsPage::Account && offline {
+            line = line.push(ui::dot(Tone::Error));
+        }
+        button(line)
+            .padding(Padding::from([9.0, 12.0]))
+            .width(Length::Fill)
+            .class(ButtonClass::Nav { selected })
+            .on_press(on(Msg::Page(*page)))
+            .into()
     }))
-    .spacing(2)
-    .width(Length::Fixed(200.0));
+    .spacing(2);
+    let nav = container(
+        column![
+            entries,
+            iced_widget::space::vertical(),
+            container(ui::caption(t!("settings-video-esta-en-compartir")).wrapping(Wrapping::Word))
+                .padding(Padding::from([8.0, 12.0]))
+        ]
+        .height(Length::Fill),
+    )
+    .padding(Padding::from([12.0, 8.0]))
+    .width(Length::Fixed(NAV_WIDTH))
+    .height(Length::Fill)
+    .class(ContainerClass::Sidebar);
     let content: Element<'_, Message> = match state.page {
-        SettingsPage::Video => video(app),
+        SettingsPage::Account => account(app),
         SettingsPage::Audio => audio(app),
-        SettingsPage::Input => input(app),
-        SettingsPage::Network => network(app),
-        SettingsPage::Devices => devices(app),
+        SettingsPage::Room => room(app),
+        SettingsPage::Gamepads => gamepads(app),
         SettingsPage::Appearance => appearance(app),
         SettingsPage::About => about(app),
-        SettingsPage::Diagnostics => diagnostics(app),
     };
-    ui::page(
-        column![
-            ui::page_header(
-                t!("pantalla-settings-ajustes"),
-                Some(t!("pantalla-settings-se-guardan-al-cambiarlos").to_owned()),
-                vec![]
-            ),
-            row![nav, container(content).width(Length::Fill)]
-                .spacing(space::L)
-                .align_y(Alignment::Start)
-        ]
-        .spacing(space::L),
-    )
-}
-
-fn video(app: &App) -> Element<'_, Message> {
-    let video = &app.settings.video;
-    let codecs = codec_choices();
-    let codec = codecs.iter().find(|c| c.value == video.codec).cloned();
-    let bitrates = bitrate_choices();
-    let bitrate = bitrates
-        .iter()
-        .find(|c| c.value == video.max_bitrate_kbps)
-        .cloned();
-    let resolutions: Vec<Choice<Resolution>> = Resolution::ALL
-        .iter()
-        .map(|r| {
-            let (w, h) = r.size();
-            choice(*r, format!("{w} × {h}"))
-        })
-        .collect();
-    let resolution = resolutions
-        .iter()
-        .find(|c| c.value == video.max_resolution)
-        .cloned();
-    // Solo los backends que existen en esta plataforma.
-    let mut encoders = vec![choice(
-        EncoderChoice::Auto,
-        t!("pantalla-settings-automatico"),
-    )];
-    encoders.extend(
-        [
-            (EncoderChoice::Nvenc, "NVENC (NVIDIA)"),
-            (EncoderChoice::Amf, "AMF (AMD)"),
-            (EncoderChoice::Qsv, "Quick Sync (Intel)"),
-            (EncoderChoice::Vulkan, "Vulkan Video"),
-            (EncoderChoice::Vaapi, "VA-API"),
-        ]
-        .into_iter()
-        .filter(|(c, _)| cfg!(target_os = "linux") || *c != EncoderChoice::Vaapi)
-        .map(|(c, label)| choice(c, label)),
-    );
-    encoders.push(choice(
-        EncoderChoice::Software,
-        t!("pantalla-settings-por-software"),
-    ));
-    let encoder = encoders.iter().find(|c| c.value == video.encoder).cloned();
-    let decoders = vec![
-        choice(DecoderChoice::Auto, t!("pantalla-settings-automatico")),
-        choice(
-            DecoderChoice::Software,
-            t!("pantalla-settings-por-software"),
-        ),
-    ];
-    let decoder = decoders.iter().find(|c| c.value == video.decoder).cloned();
-    let fps = ui::segmented(
-        FPS_CHOICES
-            .iter()
-            .map(|fps| (fps.to_string(), on(Msg::Fps(*fps)), video.fps == *fps))
-            .collect(),
-    );
-    column![
-        ui::section(
-            t!("pantalla-settings-lo-que-compartes"),
-            Some(t!("pantalla-settings-se-aplica-a-las-salas-que").to_owned()),
-            vec![
-                ui::pref_row(
-                    t!("pantalla-settings-codec-preferido"),
-                    Some(
-                        t!("pantalla-settings-automatico-elige-el-mejor-que-decodifiquen")
-                            .to_owned()
-                    ),
-                    ui::select(codecs, codec, |c| on(Msg::Codec(c))),
-                ),
-                ui::pref_row(
-                    t!("pantalla-settings-bitrate-maximo"),
-                    Some(
-                        if video.max_bitrate_kbps >= coroom_session::remote::UNLIMITED_KBPS {
-                            t!("pantalla-settings-auto-sin-tope-ayuda")
-                        } else {
-                            t!("pantalla-settings-auto-con-tope-ayuda")
-                        }
-                        .to_owned()
-                    ),
-                    ui::select(bitrates, bitrate, |c| on(Msg::Bitrate(c))),
-                ),
-                ui::pref_row(t!("pantalla-settings-fotogramas-por-segundo"), None, fps),
-                ui::pref_row(
-                    t!("pantalla-settings-resolucion-maxima"),
-                    None,
-                    ui::select(resolutions, resolution, |c| on(Msg::Resolution(c))),
-                ),
-            ],
-        ),
-        ui::section(
-            t!("pantalla-settings-calidad-de-imagen"),
-            Some(t!("pantalla-settings-se-usan-si-tu-equipo-y").to_owned()),
-            vec![
-                ui::pref_row(
-                    t!("pantalla-settings-croma-4-4-4"),
-                    Some(chroma_hint(app)),
-                    ui::switch(video.chroma_444, Some(|on_off| on(Msg::Chroma444(on_off)))),
-                ),
-                ui::pref_row(
-                    "HDR",
-                    Some(hdr_hint(app)),
-                    ui::switch(video.hdr, Some(|on_off| on(Msg::Hdr(on_off)))),
-                ),
-            ],
-        ),
-        ui::section(
-            t!("pantalla-settings-avanzado"),
-            Some(t!("pantalla-settings-cambialos-solo-si-el-video").to_owned()),
-            vec![
-                ui::pref_row(
-                    t!("pantalla-settings-codificador"),
-                    Some(t!("pantalla-settings-codificador-ayuda").to_owned()),
-                    ui::select(encoders, encoder, |c| on(Msg::Encoder(c))),
-                ),
-                ui::pref_row(
-                    t!("pantalla-settings-decodificador"),
-                    Some(t!("pantalla-settings-decodificador-ayuda").to_owned()),
-                    ui::select(decoders, decoder, |c| on(Msg::Decoder(c))),
-                ),
-            ],
-        ),
+    row![
+        nav,
+        iced_widget::rule::vertical(1),
+        container(ui::page(content)).width(Length::Fill)
     ]
-    .spacing(space::L)
+    .height(Length::Fill)
     .into()
 }
 
-/// Códec elegido en Ajustes (`None`: automático).
-fn chosen_codec(app: &App) -> Option<coroom_session::codec::Codec> {
-    use coroom_session::codec::Codec;
-    match app.settings.video.codec {
-        CodecChoice::Auto => None,
-        CodecChoice::Av1 => Some(Codec::Av1),
-        CodecChoice::Hevc => Some(Codec::Hevc),
-        CodecChoice::H264 => Some(Codec::H264),
+/// Ancho de la navegación de Ajustes.
+const NAV_WIDTH: f32 = 220.0;
+
+/// Fila de ajuste con una etiqueta de cuándo surte efecto delante del control.
+fn tagged_row<'a>(
+    title: impl text::IntoFragment<'a>,
+    subtitle: Option<String>,
+    when: Option<tag::When>,
+    control: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let mut trailing = Row::new().spacing(space::S).align_y(Alignment::Center);
+    if let Some(when) = when {
+        trailing = trailing.push(tag::tag(
+            when,
+            match when {
+                tag::When::Live => t!("settings-en-vivo"),
+                tag::When::Later => t!("settings-al-abrir-la-sala"),
+            },
+        ));
+    }
+    ui::pref_row(title, subtitle, trailing.push(control))
+}
+
+/// Etiqueta gris con otro texto («Al entrar en la sala»).
+fn later_row<'a>(
+    title: impl text::IntoFragment<'a>,
+    subtitle: Option<String>,
+    label: &'a str,
+    control: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    ui::pref_row(
+        title,
+        subtitle,
+        row![tag::later(label), control.into()]
+            .spacing(space::S)
+            .align_y(Alignment::Center),
+    )
+}
+
+/// Valor monoespaciado con «Copiar», en una fila de ajuste.
+fn copy_row<'a>(title: &'a str, subtitle: Option<String>, value: &'a str) -> Element<'a, Message> {
+    let mut texts = column![ui::body(title)].spacing(2);
+    if let Some(subtitle) = subtitle {
+        texts = texts.push(ui::secondary(subtitle).wrapping(Wrapping::WordOrGlyph));
+    }
+    texts = texts.push(
+        container(ui::mono(value, type_size::SECONDARY).wrapping(Wrapping::WordOrGlyph))
+            .padding(Padding::from([6.0, 10.0]))
+            .width(Length::Fill)
+            .class(ContainerClass::Code),
+    );
+    row![
+        texts.width(Length::Fill),
+        ui::button_with(
+            Kind::Normal,
+            t!("settings-copiar"),
+            Some(Icon::Copy),
+            Some(Message::Copy(value.to_owned())),
+        )
+    ]
+    .spacing(space::M)
+    .align_y(Alignment::Center)
+    .padding(Padding::from([10.0, 16.0]))
+    .into()
+}
+
+// --- Cuenta y servidor ---------------------------------------------------------------------------
+
+fn account(app: &App) -> Element<'_, Message> {
+    let mut page = Column::new().spacing(space::L);
+    if app.server_status.online == Some(false) {
+        let host = app
+            .account
+            .as_ref()
+            .map(crate::ui::app::AccountInfo::host)
+            .unwrap_or_default();
+        page = page.push(ui::banner(
+            Tone::Error,
+            t!("settings-el-servidor-no-responde", host = host),
+            Some((
+                t!("settings-abrir-diagnostico"),
+                Message::Diagnostics(diagnostics::Msg::Open),
+            )),
+        ));
+    }
+    let Some(account) = &app.account else {
+        return page
+            .push(ui::empty_state(
+                Icon::UserRound,
+                t!("settings-sin-sesion"),
+                t!("settings-sin-sesion-texto"),
+                None,
+            ))
+            .into();
+    };
+    let server_status = match (app.server_status.online, app.server_status.rtt_ms) {
+        (Some(false), _) => t!("settings-servidor-no-responde-corto").to_owned(),
+        (_, Some(rtt)) => t!("settings-servidor-responde-en", rtt = rtt.round() as u64),
+        _ => t!("settings-servidor-comprobando").to_owned(),
+    };
+    let mut rows = vec![
+        ui::list_row(
+            Some(ui::avatar(&app.theme, &account.display_name, 36.0)),
+            account.display_name.as_str(),
+            Some(t!(
+                "settings-usuario-en-este-equipo",
+                username = account.username,
+                device = account.device
+            )),
+            vec![
+                ui::button_with(
+                    Kind::DestructiveFlat,
+                    t!("settings-cerrar-sesion"),
+                    Some(Icon::LogOut),
+                    Some(Message::SignOut),
+                )
+                .into(),
+            ],
+        ),
+        ui::list_row(
+            Some(icon_with(Icon::Server, 22.0, SvgClass::Secondary)),
+            account.host(),
+            Some(server_status),
+            vec![
+                ui::normal(
+                    t!("settings-cambiar-de-servidor"),
+                    Some(Message::SwitchServer),
+                )
+                .into(),
+            ],
+        ),
+    ];
+    if let Some(certificate) = &account.server.fingerprint {
+        rows.push(copy_row(
+            t!("settings-certificado-del-servidor"),
+            Some(t!("settings-certificado-del-servidor-ayuda").to_owned()),
+            certificate.as_str(),
+        ));
+    }
+    rows.push(copy_row(
+        t!("settings-identidad-de-este-equipo"),
+        Some(t!("settings-identidad-de-este-equipo-ayuda").to_owned()),
+        account.fingerprint.as_str(),
+    ));
+    page = page.push(ui::section(t!("settings-cuenta"), None, rows));
+    page = page.push(devices(app));
+    page = page.push(network(app));
+    page = page.push(peers(app));
+    page.into()
+}
+
+/// "hace 5 min", "hace 3 h", "hace 2 días".
+pub fn ago(unix: i64, now: i64) -> String {
+    let seconds = (now - unix).max(0);
+    match seconds {
+        0..60 => t!("settings-ahora-mismo").to_owned(),
+        60..3600 => t!("settings-hace-min", valor = seconds / 60),
+        3600..86_400 => t!("settings-hace-h", valor = seconds / 3600),
+        _ => match seconds / 86_400 {
+            1 => t!("settings-ayer").to_owned(),
+            days => t!("settings-hace-dias", days = days),
+        },
     }
 }
 
-/// Explicación de 4:4:4 con lo que hace este equipo.
-pub fn chroma_hint(app: &App) -> String {
-    let lead = t!("pantalla-settings-texto-nitido-en-escritorios-y-juegos");
-    let Some(support) = &app.video_support else {
-        return t!(
-            "pantalla-settings-lead-comprobando-que-codecs-lo-admiten",
-            lead = lead
-        );
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+fn devices(app: &App) -> Element<'_, Message> {
+    let body: Element<'_, Message> = match &app.settings_page.devices {
+        Load::Idle | Load::Loading => ui::skeleton(t!("settings-cargando-los-dispositivos"), 2),
+        Load::Failed(err) => ui::error_state(
+            t!("settings-no-se-pudieron-cargar-los-dispositivos"),
+            err.as_str(),
+            Some((t!("settings-reintentar"), on(Msg::ReloadDevices))),
+        ),
+        Load::Loaded(list) => {
+            let now = now_unix();
+            let rows = list
+                .devices
+                .iter()
+                .map(|device| {
+                    let current = list.current == Some(device.id);
+                    let short: String = device.fingerprint.chars().take(16).collect();
+                    let trailing = if current {
+                        ui::status_badge(Tone::Info, t!("settings-este-equipo"))
+                    } else {
+                        ui::button_with(
+                            Kind::DestructiveFlat,
+                            t!("settings-desvincular"),
+                            Some(Icon::UserX),
+                            Some(on(Msg::Revoke {
+                                id: device.id,
+                                name: device.name.clone(),
+                            })),
+                        )
+                        .into()
+                    };
+                    let seen = if current {
+                        t!("settings-ahora-mismo").to_owned()
+                    } else {
+                        ago(device.last_seen_at, now)
+                    };
+                    ui::list_row(
+                        Some(icon_with(Icon::Laptop, 22.0, SvgClass::Secondary)),
+                        device.name.as_str(),
+                        Some(t!("settings-visto-huella", seen = seen, short = short)),
+                        vec![trailing],
+                    )
+                })
+                .collect();
+            ui::boxed_list(rows)
+        }
     };
-    if support.yuv444.is_empty() {
-        let decode = if support.decode_yuv444.is_empty() {
+    column![
+        column![
+            ui::strong(t!("settings-dispositivos-de-tu-cuenta")),
+            ui::secondary(t!("settings-dispositivos-de-tu-cuenta-ayuda"))
+                .wrapping(Wrapping::WordOrGlyph)
+        ]
+        .spacing(2),
+        body
+    ]
+    .spacing(space::XS)
+    .into()
+}
+
+fn network(app: &App) -> Element<'_, Message> {
+    let net = &app.settings.network;
+    let state = &app.settings_page;
+    let port_text = state.port.clone().unwrap_or_else(|| {
+        if net.local_port == 0 {
             String::new()
         } else {
-            t!(
-                "pantalla-settings-como-invitado-si-lo-recibes-en",
-                valor = join_codecs(support.decode_yuv444.iter().map(ToString::to_string))
-            )
-        };
-        return t!(
-            "pantalla-settings-lead-no-disponible-para-compartir-ningun",
-            lead = lead,
-            decode = decode
-        );
-    }
-    match chosen_codec(app) {
-        Some(codec) if !support.yuv444.iter().any(|(c, _)| *c == codec) => t!(
-            "pantalla-settings-lead-no-disponible-con-este-codec",
-            lead = lead,
-            codec = codec,
-            valor = join_codecs(support.yuv444.iter().map(|(_, label)| label.clone()))
-        ),
-        _ => t!(
-            "pantalla-settings-lead-disponible-con",
-            lead = lead,
-            valor = join_codecs(support.yuv444.iter().map(|(_, label)| label.clone()))
-        ),
-    }
+            net.local_port.to_string()
+        }
+    });
+    let port = container(Element::from(
+        ui::field(t!("settings-puerto-udp"), port_text)
+            .placeholder(t!("settings-cualquiera"))
+            .on_input(|value| on(Msg::Port(value)))
+            .error(state.port_error.as_deref())
+            .id("local-port"),
+    ))
+    .width(Length::Fixed(180.0));
+    ui::section(
+        t!("settings-red"),
+        Some(t!("settings-red-ayuda").to_owned()),
+        vec![
+            ui::pref_row(
+                t!("settings-forzar-el-relay"),
+                Some(t!("settings-forzar-el-relay-ayuda").to_owned()),
+                ui::switch(net.force_relay, Some(|on_off| on(Msg::ForceRelay(on_off)))),
+            ),
+            ui::pref_row(
+                t!("settings-abrir-el-puerto-en-el-router"),
+                Some(t!("settings-abrir-el-puerto-en-el-router-ayuda").to_owned()),
+                ui::switch(
+                    net.port_mapping,
+                    Some(|on_off| on(Msg::PortMapping(on_off))),
+                ),
+            ),
+            ui::pref_row(
+                t!("settings-puerto-local"),
+                Some(t!("settings-puerto-local-ayuda").to_owned()),
+                port,
+            ),
+        ],
+    )
 }
 
-/// Explicación de HDR con lo que hace este equipo.
-pub fn hdr_hint(app: &App) -> String {
-    let Some(support) = &app.video_support else {
-        return t!("pantalla-settings-hdr10-10-bits-bt-2020-pq").to_owned();
-    };
-    let share = if support.hdr10.is_empty() {
-        t!("pantalla-settings-no-disponible-para-compartir-ningun-codificador").to_owned()
+fn peers(app: &App) -> Element<'_, Message> {
+    let rows: Vec<Element<'_, Message>> = if app.settings.peers.is_empty() {
+        vec![
+            container(ui::caption(t!("settings-numeros-de-seguridad-vacio")))
+                .padding(Padding::from([12.0, 16.0]))
+                .into(),
+        ]
     } else {
-        match chosen_codec(app) {
-            Some(codec) if !support.hdr10.iter().any(|(c, _)| *c == codec) => t!(
-                "pantalla-settings-no-disponible-con-este-codec-codec",
-                codec = codec,
-                valor = join_codecs(support.hdr10.iter().map(|(_, label)| label.clone()))
-            ),
-            _ => t!(
-                "pantalla-settings-compartes-en-hdr10-con-cuando-la",
-                valor = join_codecs(support.hdr10.iter().map(|(_, label)| label.clone()))
-            ),
-        }
+        app.settings
+            .peers
+            .iter()
+            .enumerate()
+            .take(8)
+            .map(|(index, peer)| {
+                let preview: String = peer.safety_number.chars().take(17).collect();
+                ui::list_row(
+                    Some(ui::avatar(&app.theme, &peer.name, 28.0)),
+                    peer.name.as_str(),
+                    Some(t!("settings-numero-recortado", preview = preview)),
+                    vec![ui::normal(t!("settings-ver"), Some(on(Msg::Peer(index)))).into()],
+                )
+            })
+            .collect()
     };
-    let display = match support.hdr_display {
-        Some(true) => t!("pantalla-settings-esta-pantalla-muestra-hdr-el-video"),
-        Some(false) => {
-            t!("pantalla-settings-esta-pantalla-no-expone-hdr-a")
-        }
-        None => t!("pantalla-settings-si-la-pantalla-no-expone-hdr"),
-    };
-    format!("{share} {display}")
+    ui::section(
+        t!("settings-numeros-de-seguridad"),
+        Some(t!("settings-numeros-de-seguridad-ayuda").to_owned()),
+        rows,
+    )
 }
 
-fn join_codecs(names: impl Iterator<Item = String>) -> String {
-    let names: Vec<String> = names.collect();
-    match names.as_slice() {
-        [] => String::new(),
-        [one] => one.clone(),
-        [rest @ .., last] => t!(
-            "pantalla-settings-y-last",
-            valor = rest.join(", "),
-            last = last
-        ),
-    }
-}
+// --- Audio y voz ---------------------------------------------------------------------------------
 
-fn device_choices(devices: &[AudioDevice], input: bool) -> Vec<Choice<Option<String>>> {
-    let mut out = vec![choice(None, t!("pantalla-settings-el-del-sistema"))];
+/// Opciones de un selector de audio: «El del sistema», los de la lista y, si el elegido no está
+/// conectado, él también (para que se vea cuál era).
+fn device_choices(
+    devices: &[AudioDevice],
+    input: bool,
+    chosen: &Option<String>,
+) -> Vec<Choice<Option<String>>> {
+    let mut out = vec![choice(None, t!("settings-el-del-sistema"))];
     out.extend(
         devices
             .iter()
             .filter(|device| device.input == input)
             .map(|device| choice(Some(device.name.clone()), device.description.clone())),
     );
+    if let Some(name) = chosen
+        && !out.iter().any(|known| known.value.as_ref() == Some(name))
+    {
+        out.push(choice(
+            Some(name.clone()),
+            t!("settings-no-conectado", name = name),
+        ));
+    }
     out
+}
+
+/// «En vivo: …» con la edad de la lista.
+fn audio_freshness(app: &App) -> String {
+    let state = &app.settings_page;
+    let lead = t!("settings-dispositivos-en-vivo");
+    match state.audio_updated_at {
+        Some(at) => t!(
+            "settings-actualizado-hace",
+            lead = lead,
+            seconds = app.now.saturating_duration_since(at).as_secs()
+        ),
+        None => t!("settings-buscando-dispositivos", lead = lead),
+    }
 }
 
 fn audio(app: &App) -> Element<'_, Message> {
     let audio = &app.settings.audio;
     let state = &app.settings_page;
     let devices: Vec<AudioDevice> = state.audio_devices.loaded().cloned().unwrap_or_default();
-    let mics = device_choices(&devices, true);
-    let mic = mics.iter().find(|c| c.value == audio.microphone).cloned();
-    let speakers = device_choices(&devices, false);
+    let speakers = device_choices(&devices, false, &audio.speaker);
     let speaker = speakers.iter().find(|c| c.value == audio.speaker).cloned();
+    let mics = device_choices(&devices, true, &audio.microphone);
+    let mic = mics.iter().find(|c| c.value == audio.microphone).cloned();
     let mut rows = vec![
         ui::pref_row(
-            t!("pantalla-settings-microfono"),
-            None,
-            ui::select(mics, mic, |c| on(Msg::Microphone(c))),
+            t!("settings-salida"),
+            Some(t!("settings-salida-ayuda").to_owned()),
+            ui::select_fixed(
+                speakers,
+                speaker,
+                |c| on(Msg::Speaker(c)),
+                DEVICE_SELECT_WIDTH,
+            ),
         ),
         ui::pref_row(
-            t!("pantalla-settings-salida"),
-            None,
-            ui::select(speakers, speaker, |c| on(Msg::Speaker(c))),
+            t!("settings-microfono"),
+            Some(t!("settings-microfono-ayuda").to_owned()),
+            ui::select_fixed(mics, mic, |c| on(Msg::Microphone(c)), DEVICE_SELECT_WIDTH),
+        ),
+        later_row(
+            t!("settings-supresion-de-ruido"),
+            Some(t!("settings-supresion-de-ruido-ayuda").to_owned()),
+            t!("settings-en-la-proxima-sala"),
+            ui::switch(
+                audio.noise_suppression,
+                Some(|on_off| on(Msg::NoiseSuppression(on_off))),
+            ),
         ),
     ];
-    if let Load::Failed(err) = &state.audio_devices {
+    let error = match &state.audio_devices {
+        Load::Failed(err) => Some(err.as_str()),
+        _ => state.audio_error.as_deref(),
+    };
+    if let Some(err) = error {
         rows.push(
-            container(ui::caption(t!(
-                "pantalla-settings-no-se-pudieron-listar-los-dispositivos",
-                err = err
-            )))
-            .padding(Padding::from([8.0, 16.0]))
+            container(ui::banner(
+                Tone::Warning,
+                t!("settings-no-se-pudieron-listar-los-dispositivos", err = err),
+                None,
+            ))
+            .padding(Padding::from([8.0, 12.0]))
             .into(),
         );
     }
-    let capturing = state.capturing == Some(Capture::PushToTalk);
-    let ptt: Element<'_, Message> = if capturing {
+    let ptt_on = audio.voice_mode == VoiceMode::PushToTalk;
+    let key: Element<'_, Message> = if state.capturing == Some(Capture::PushToTalk) {
         row![
-            ui::caption(t!("pantalla-settings-pulsa-una-tecla")),
-            ui::flat(
-                t!("pantalla-settings-cancelar"),
-                Some(on(Msg::CancelCapture))
-            )
+            ui::caption(t!("settings-pulsa-una-tecla")),
+            ui::flat(t!("settings-cancelar"), Some(on(Msg::CancelCapture)))
         ]
         .spacing(space::XS)
         .align_y(Alignment::Center)
@@ -830,7 +959,7 @@ fn audio(app: &App) -> Element<'_, Message> {
         row![
             ui::shortcut(&[audio.push_to_talk_key.as_str()]),
             ui::normal(
-                t!("pantalla-settings-cambiar"),
+                t!("settings-cambiar"),
                 Some(on(Msg::Capture(Capture::PushToTalk)))
             )
         ]
@@ -838,40 +967,87 @@ fn audio(app: &App) -> Element<'_, Message> {
         .align_y(Alignment::Center)
         .into()
     };
+    let mic_letter = app.settings.input.shortcuts.mic.to_string();
     column![
-        ui::section(t!("pantalla-settings-dispositivos"), None, rows),
         ui::section(
-            t!("pantalla-settings-voz"),
+            t!("settings-dispositivos"),
+            Some(audio_freshness(app)),
+            rows
+        ),
+        ui::section(
+            t!("settings-voz-como-anfitrion"),
             None,
+            vec![tagged_row(
+                t!("settings-compartir-mi-microfono"),
+                Some(t!("settings-compartir-mi-microfono-ayuda").to_owned()),
+                Some(tag::When::Later),
+                ui::switch(audio.host_voice, Some(|on_off| on(Msg::HostVoice(on_off)))),
+            )],
+        ),
+        ui::section(
+            t!("settings-voz-como-invitado"),
+            None,
+            vec![later_row(
+                t!("settings-pulsar-para-hablar"),
+                Some(t!("settings-pulsar-para-hablar-ayuda", letter = mic_letter)),
+                t!("settings-al-entrar-en-la-sala"),
+                row![
+                    key,
+                    ui::switch(ptt_on, Some(|on_off| on(Msg::PushToTalk(on_off))))
+                ]
+                .spacing(space::S)
+                .align_y(Alignment::Center),
+            )],
+        ),
+    ]
+    .spacing(space::L)
+    .into()
+}
+
+/// Ancho de los selectores de audio (los nombres de los dispositivos son largos).
+const DEVICE_SELECT_WIDTH: f32 = 280.0;
+
+// --- Sala ----------------------------------------------------------------------------------------
+
+fn room(app: &App) -> Element<'_, Message> {
+    let room = &app.settings.room;
+    column![
+        ui::section(
+            t!("settings-como-anfitrion"),
+            None,
+            vec![tagged_row(
+                t!("settings-los-invitados-entran-callados"),
+                Some(t!("settings-los-invitados-entran-callados-ayuda").to_owned()),
+                Some(tag::When::Later),
+                ui::switch(
+                    room.guests_muted,
+                    Some(|on_off| on(Msg::GuestsMuted(on_off)))
+                ),
+            )],
+        ),
+        ui::section(
+            t!("settings-chat-de-la-sala"),
+            Some(t!("settings-chat-de-la-sala-ayuda").to_owned()),
             vec![
                 ui::pref_row(
-                    t!("pantalla-settings-hablar-al-entrar-en-una-sala"),
-                    Some(t!("pantalla-settings-solo-si-el-anfitrion-te-da").to_owned()),
-                    ui::switch(audio.voice, Some(|on_off| on(Msg::Voice(on_off)))),
+                    t!("settings-sonido-al-llegar-un-mensaje"),
+                    Some(t!("settings-sonido-al-llegar-un-mensaje-ayuda").to_owned()),
+                    ui::switch(room.chat_sound, Some(|on_off| on(Msg::ChatSound(on_off)))),
                 ),
                 ui::pref_row(
-                    t!("pantalla-settings-modo"),
-                    None,
-                    ui::segmented(vec![
-                        (
-                            t!("pantalla-settings-al-hablar").to_owned(),
-                            on(Msg::VoiceMode(VoiceMode::Activity)),
-                            audio.voice_mode == VoiceMode::Activity,
-                        ),
-                        (
-                            t!("pantalla-settings-pulsar-para-hablar").to_owned(),
-                            on(Msg::VoiceMode(VoiceMode::PushToTalk)),
-                            audio.voice_mode == VoiceMode::PushToTalk,
-                        ),
-                    ]),
-                ),
-                ui::pref_row(t!("pantalla-settings-tecla-para-hablar"), None, ptt),
-                ui::pref_row(
-                    t!("pantalla-settings-supresion-de-ruido"),
-                    Some(t!("pantalla-settings-quita-el-ruido-de-fondo-del").to_owned()),
+                    t!("settings-notificacion-del-escritorio"),
+                    Some(t!("settings-notificacion-del-escritorio-ayuda").to_owned()),
                     ui::switch(
-                        audio.noise_suppression,
-                        Some(|on_off| on(Msg::NoiseSuppression(on_off)))
+                        room.chat_notifications,
+                        Some(|on_off| on(Msg::ChatNotifications(on_off))),
+                    ),
+                ),
+                ui::pref_row(
+                    t!("settings-burbuja-sobre-el-video"),
+                    Some(t!("settings-burbuja-sobre-el-video-ayuda").to_owned()),
+                    ui::switch(
+                        room.chat_bubbles,
+                        Some(|on_off| on(Msg::ChatBubbles(on_off)))
                     ),
                 ),
             ],
@@ -881,32 +1057,62 @@ fn audio(app: &App) -> Element<'_, Message> {
     .into()
 }
 
-fn input(app: &App) -> Element<'_, Message> {
-    let shortcuts = &app.settings.input.shortcuts;
+// --- Mandos --------------------------------------------------------------------------------------
+
+/// Qué hace cada atajo del invitado, en el orden de [`Shortcuts::letters`].
+fn shortcut_names() -> [&'static str; 7] {
+    [
+        t!("settings-atajo-inmersivo"),
+        t!("settings-atajo-panel-de-conexion"),
+        t!("settings-atajo-chat"),
+        t!("settings-atajo-salir"),
+        t!("settings-atajo-microfono"),
+        t!("settings-atajo-juego"),
+        t!("settings-atajo-mandos"),
+    ]
+}
+
+fn gamepads(app: &App) -> Element<'_, Message> {
+    let input = &app.settings.input;
     let state = &app.settings_page;
-    let names = [
-        t!("pantalla-settings-modo-inmersivo-o-escritorio"),
-        t!("pantalla-settings-panel-de-estadisticas"),
-        t!("pantalla-settings-chat-de-la-sala"),
-        t!("pantalla-settings-salir-de-la-sala"),
-        t!("pantalla-settings-silenciar-el-microfono"),
-        t!("pantalla-settings-silenciar-el-audio-del-juego"),
-        t!("pantalla-settings-panel-de-mandos"),
-    ];
-    let letters = shortcuts.letters();
-    let mut rows: Vec<Element<'_, Message>> = names
+    let pads_letter = input.shortcuts.pads.to_string();
+    let pad_row = match &input.pad {
+        PadChoice::Auto => ui::pref_row(
+            t!("settings-mando-que-envias"),
+            Some(t!("settings-mando-automatico-ayuda", letter = pads_letter)),
+            ui::secondary(t!("settings-el-ultimo-que-conectes")),
+        ),
+        PadChoice::Pad(key) => ui::pref_row(
+            t!("settings-mando-que-envias"),
+            Some(t!(
+                "settings-mando-elegido-ayuda",
+                name = key.name,
+                letter = pads_letter
+            )),
+            ui::normal(
+                t!("settings-usar-el-ultimo-que-conectes"),
+                Some(on(Msg::PadAuto)),
+            ),
+        ),
+    };
+    let max = coroom_session::input::max_gamepads();
+    let mut slots = vec![choice(0u8, t!("settings-la-primera-libre"))];
+    slots.extend((1..=max).map(|slot| choice(slot, t!("settings-ranura", slot = slot))));
+    let slot = slots
         .iter()
+        .find(|c| c.value == input.preferred_slot)
+        .cloned();
+    let letters = input.shortcuts.letters();
+    let mut rows: Vec<Element<'_, Message>> = shortcut_names()
+        .into_iter()
         .zip(letters)
         .enumerate()
         .map(|(index, (name, letter))| {
             let control: Element<'_, Message> = if state.capturing == Some(Capture::Shortcut(index))
             {
                 row![
-                    ui::caption(t!("pantalla-settings-pulsa-una-letra")),
-                    ui::flat(
-                        t!("pantalla-settings-cancelar"),
-                        Some(on(Msg::CancelCapture))
-                    )
+                    ui::caption(t!("settings-pulsa-una-letra")),
+                    ui::flat(t!("settings-cancelar"), Some(on(Msg::CancelCapture)))
                 ]
                 .spacing(space::XS)
                 .align_y(Alignment::Center)
@@ -915,7 +1121,7 @@ fn input(app: &App) -> Element<'_, Message> {
                 row![
                     shortcut_caps(letter),
                     ui::normal(
-                        t!("pantalla-settings-cambiar"),
+                        t!("settings-cambiar"),
                         Some(on(Msg::Capture(Capture::Shortcut(index))))
                     )
                 ]
@@ -923,43 +1129,62 @@ fn input(app: &App) -> Element<'_, Message> {
                 .align_y(Alignment::Center)
                 .into()
             };
-            ui::pref_row(*name, None, control)
+            ui::pref_row(name, None, control)
         })
         .collect();
+    let defaults = input.shortcuts == Shortcuts::default();
     rows.push(
         container(row![
             ui::fill(),
             ui::flat(
-                t!("pantalla-settings-restablecer"),
-                Some(on(Msg::ResetShortcuts))
+                t!("settings-restablecer"),
+                (!defaults).then_some(on(Msg::ResetShortcuts))
             )
         ])
         .padding(Padding::from([4.0, 8.0]))
         .into(),
     );
-    let max = coroom_session::input::max_gamepads();
-    let mut slots = vec![choice(0u8, t!("pantalla-settings-la-primera-libre"))];
-    slots.extend(
-        (1..=max).map(|slot| choice(slot, t!("pantalla-settings-ranura-slot", slot = slot))),
-    );
-    let slot = slots
-        .iter()
-        .find(|c| c.value == app.settings.input.preferred_slot)
-        .cloned();
     column![
+        ui::section(t!("settings-como-invitado"), None, vec![pad_row]),
         ui::section(
-            t!("pantalla-settings-atajos-del-invitado"),
-            Some(t!("pantalla-settings-siempre-con-ctrl-alt-para-no").to_owned()),
+            t!("settings-como-anfitrion"),
+            None,
+            vec![ui::pref_row(
+                t!("settings-ranura-preferida"),
+                Some(t!("settings-ranura-preferida-ayuda").to_owned()),
+                ui::select(slots, slot, |c| on(Msg::PreferredSlot(c))),
+            )],
+        ),
+        ui::section(
+            t!("settings-atajos-del-invitado"),
+            Some(t!("settings-atajos-del-invitado-ayuda").to_owned()),
             rows
         ),
         ui::section(
-            t!("pantalla-settings-mandos"),
+            t!("settings-atajos-de-la-aplicacion"),
             None,
-            vec![ui::pref_row(
-                t!("pantalla-settings-ranura-preferida-al-dar-mando"),
-                Some(t!("pantalla-settings-la-que-se-ofrece-primero-al").to_owned()),
-                ui::select(slots, slot, |c| on(Msg::PreferredSlot(c))),
-            )]
+            vec![
+                ui::pref_row(
+                    t!("settings-atajo-ajustes"),
+                    None,
+                    ui::shortcut(&["Ctrl", ","])
+                ),
+                ui::pref_row(
+                    t!("settings-atajo-pantalla-completa"),
+                    None,
+                    ui::shortcut(&["F11"])
+                ),
+                ui::pref_row(
+                    t!("settings-atajo-cerrar-dialogos"),
+                    None,
+                    ui::shortcut(&["Esc"])
+                ),
+                ui::pref_row(
+                    t!("settings-atajo-salir-de-coroom"),
+                    None,
+                    ui::shortcut(&["Ctrl", "Q"])
+                ),
+            ]
         ),
     ]
     .spacing(space::L)
@@ -979,195 +1204,59 @@ const LETTERS: [&str; 26] = [
     "T", "U", "V", "W", "X", "Y", "Z",
 ];
 
-fn network(app: &App) -> Element<'_, Message> {
-    let net = &app.settings.network;
-    let state = &app.settings_page;
-    let port_text = state.port.clone().unwrap_or_else(|| {
-        if net.local_port == 0 {
-            String::new()
-        } else {
-            net.local_port.to_string()
-        }
-    });
-    let port = container(Element::from(
-        ui::field(t!("pantalla-settings-puerto-udp"), port_text)
-            .placeholder(t!("pantalla-settings-cualquiera"))
-            .on_input(|value| on(Msg::Port(value)))
-            .error(state.port_error.as_deref())
-            .id("local-port"),
-    ))
-    .width(Length::Fixed(180.0));
-    column![ui::section(
-        t!("pantalla-settings-conexion"),
-        None,
-        vec![
-            ui::pref_row(
-                t!("pantalla-settings-usar-siempre-el-relay"),
-                Some(t!("pantalla-settings-sin-intentar-la-conexion-directa-util").to_owned()),
-                ui::switch(net.force_relay, Some(|on_off| on(Msg::ForceRelay(on_off)))),
-            ),
-            ui::pref_row(
-                t!("pantalla-settings-abrir-el-puerto-en-el-router"),
-                Some(t!("pantalla-settings-pide-al-router-que-deje-entrar").to_owned()),
-                ui::switch(
-                    net.port_mapping,
-                    Some(|on_off| on(Msg::PortMapping(on_off)))
-                ),
-            ),
-            ui::pref_row(
-                t!("pantalla-settings-puerto-local"),
-                Some(t!("pantalla-settings-fijalo-si-tu-router-reenvia-un").to_owned()),
-                port,
-            ),
-        ],
-    )]
-    .into()
-}
-
-/// "hace 5 min", "hace 3 h", "hace 2 días".
-pub fn ago(unix: i64, now: i64) -> String {
-    let seconds = (now - unix).max(0);
-    match seconds {
-        0..60 => t!("pantalla-settings-ahora-mismo").to_owned(),
-        60..3600 => t!("pantalla-settings-hace-min", valor = seconds / 60),
-        3600..86_400 => t!("pantalla-settings-hace-h", valor = seconds / 3600),
-        _ => match seconds / 86_400 {
-            1 => "ayer".to_owned(),
-            days => t!("pantalla-settings-hace-days-dias", days = days),
-        },
-    }
-}
-
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs() as i64)
-        .unwrap_or_default()
-}
-
-fn devices(app: &App) -> Element<'_, Message> {
-    let state = &app.settings_page;
-    let body: Element<'_, Message> = match &state.devices {
-        Load::Idle | Load::Loading => ui::skeleton(
-            t!("pantalla-settings-cargando-los-dispositivos-de-tu-cuenta"),
-            2,
-        ),
-        Load::Failed(err) => ui::error_state(
-            t!("pantalla-settings-no-se-pudieron-cargar-los-dispositivos"),
-            err.as_str(),
-            Some((t!("pantalla-settings-reintentar"), on(Msg::ReloadDevices))),
-        ),
-        Load::Loaded(list) => {
-            let now = now_unix();
-            let rows = list
-                .devices
-                .iter()
-                .map(|device| {
-                    let current = list.current == Some(device.id);
-                    let short: String = device.fingerprint.chars().take(16).collect();
-                    let mut trailing = Vec::new();
-                    if current {
-                        trailing.push(ui::status_badge(
-                            Tone::Info,
-                            t!("pantalla-settings-este-equipo"),
-                        ));
-                    } else {
-                        trailing.push(
-                            ui::button_with(
-                                Kind::DestructiveFlat,
-                                t!("pantalla-settings-cerrar-sesion"),
-                                Some(Icon::LogOut),
-                                Some(on(Msg::Revoke {
-                                    id: device.id,
-                                    name: device.name.clone(),
-                                })),
-                            )
-                            .into(),
-                        );
-                    }
-                    ui::list_row(
-                        Some(icon_with(Icon::Laptop, 22.0, SvgClass::Secondary)),
-                        device.name.as_str(),
-                        Some(t!(
-                            "pantalla-settings-huella-short-usado",
-                            short = short,
-                            valor = ago(device.last_seen_at, now)
-                        )),
-                        trailing,
-                    )
-                })
-                .collect();
-            ui::boxed_list(rows)
-        }
-    };
-    column![
-        ui::section(
-            t!("pantalla-settings-dispositivos-de-tu-cuenta"),
-            Some(t!("pantalla-settings-cada-equipo-con-el-que-inicias").to_owned()),
-            vec![]
-        ),
-        body
-    ]
-    .spacing(space::XS)
-    .into()
-}
+// --- Apariencia ----------------------------------------------------------------------------------
 
 fn appearance(app: &App) -> Element<'_, Message> {
     let current = &app.settings.appearance;
     let theme = ui::segmented(vec![
         (
-            t!("pantalla-settings-sistema").to_owned(),
+            t!("settings-del-sistema").to_owned(),
             on(Msg::Theme(ThemeChoice::System)),
             current.theme == ThemeChoice::System,
         ),
         (
-            t!("pantalla-settings-claro").to_owned(),
+            t!("settings-claro").to_owned(),
             on(Msg::Theme(ThemeChoice::Light)),
             current.theme == ThemeChoice::Light,
         ),
         (
-            t!("pantalla-settings-oscuro").to_owned(),
+            t!("settings-oscuro").to_owned(),
             on(Msg::Theme(ThemeChoice::Dark)),
             current.theme == ThemeChoice::Dark,
         ),
     ]);
-    let system_accent = app.system.accent.unwrap_or_default();
-    let mut swatches = Row::new().spacing(space::XS).align_y(Alignment::Center);
-    let swatch = |accent: Accent, key: String, selected: bool, tip: String| {
-        ui::with_tooltip(
-            button(if selected {
-                Element::from(iced_widget::center(icon_with(
-                    Icon::Check,
-                    16.0,
-                    SvgClass::OnAccent,
-                )))
-            } else {
-                ui::gap(0.0)
-            })
-            .width(Length::Fixed(28.0))
-            .height(Length::Fixed(28.0))
-            .padding(0)
-            .class(ButtonClass::Swatch {
-                color: accent.rgb(),
-                selected,
-            })
-            .on_press(on(Msg::Accent(key))),
-            tip,
-        )
+    let theme_hint = match current.theme {
+        ThemeChoice::System => t!(
+            "settings-sigue-al-sistema",
+            valor = match app.system.mode {
+                Some(coroom_ui::theme::Mode::Dark) => t!("settings-ahora-oscuro"),
+                Some(coroom_ui::theme::Mode::Light) => t!("settings-ahora-claro"),
+                None => t!("settings-sin-preferencia-claro"),
+            }
+        ),
+        ThemeChoice::Light => t!("settings-siempre-claro").to_owned(),
+        ThemeChoice::Dark => t!("settings-siempre-oscuro").to_owned(),
     };
-    swatches = swatches.push(ui::normal(
-        t!("pantalla-settings-del-sistema"),
+    let follows_system = current.accent == "system";
+    let mut swatches = Row::new().spacing(space::XS).align_y(Alignment::Center);
+    swatches = swatches.push(ui::button_with(
+        if follows_system {
+            Kind::Primary
+        } else {
+            Kind::Normal
+        },
+        t!("settings-del-sistema"),
+        follows_system.then_some(Icon::Check),
         Some(on(Msg::Accent("system".to_owned()))),
     ));
-    let _ = system_accent;
     for accent in Accent::NAMED {
         let key = accent.key();
         let selected = current.accent == key;
-        swatches = swatches.push(swatch(accent, key, selected, accent.label()));
+        swatches = swatches.push(swatch(accent, key, selected));
     }
-    let accent_subtitle = if current.accent == "system" {
+    let accent_hint = if follows_system {
         t!(
-            "pantalla-settings-del-sistema-2",
+            "settings-acento-del-sistema",
             valor = app.accent().label(),
             source = app.system.source
         )
@@ -1177,92 +1266,67 @@ fn appearance(app: &App) -> Element<'_, Message> {
     let from_desktop = app.system.font.as_deref().is_some_and(|font| {
         coroom_ui::font::family_of(font).eq_ignore_ascii_case(app.fonts.family)
     });
-    let font = if from_desktop {
-        t!(
-            "pantalla-settings-la-del-escritorio",
-            family = app.fonts.family
-        )
+    let font_hint = if from_desktop {
+        t!("settings-fuente-del-escritorio", family = app.fonts.family)
     } else if app.fonts.is_embedded() {
-        t!(
-            "pantalla-settings-incluida-con-coroom",
-            family = app.fonts.family
-        )
+        t!("settings-fuente-incluida", family = app.fonts.family)
     } else {
-        t!(
-            "pantalla-settings-instalada-en-el-sistema",
-            family = app.fonts.family
-        )
+        t!("settings-fuente-instalada", family = app.fonts.family)
     };
-    column![
-        ui::section(
-            t!("pantalla-settings-estilo"),
-            None,
-            vec![
-                ui::pref_row(
-                    t!("pantalla-settings-tema"),
-                    Some(match current.theme {
-                        ThemeChoice::System => t!(
-                            "pantalla-settings-sigue-al-sistema",
-                            valor = match app.system.mode {
-                                Some(coroom_ui::theme::Mode::Dark) =>
-                                    t!("pantalla-settings-ahora-oscuro"),
-                                Some(coroom_ui::theme::Mode::Light) =>
-                                    t!("pantalla-settings-ahora-claro"),
-                                None => t!("pantalla-settings-sin-preferencia-claro"),
-                            }
-                        ),
-                        ThemeChoice::Light => t!("pantalla-settings-siempre-claro").to_owned(),
-                        ThemeChoice::Dark => t!("pantalla-settings-siempre-oscuro").to_owned(),
-                    }),
-                    theme
-                ),
-                container(
-                    column![
-                        ui::body(t!("pantalla-settings-color-de-acento")),
-                        ui::secondary(accent_subtitle),
-                        swatches
-                    ]
-                    .spacing(space::XS)
-                )
-                .padding(Padding::from([10.0, 16.0]))
-                .into(),
-                ui::pref_row(t!("pantalla-settings-fuente"), Some(font), ui::gap(0.0)),
-            ]
-        ),
-        ui::section(
-            t!("pantalla-settings-atajos-de-la-aplicacion"),
-            None,
-            vec![
-                ui::pref_row(
-                    t!("pantalla-settings-salir"),
-                    None,
-                    ui::shortcut(&["Ctrl", "Q"])
-                ),
-                ui::pref_row(
-                    t!("pantalla-settings-ajustes"),
-                    None,
-                    ui::shortcut(&["Ctrl", ","])
-                ),
-                ui::pref_row(
-                    t!("pantalla-settings-pantalla-completa"),
-                    None,
-                    ui::shortcut(&["F11"])
-                ),
-                ui::pref_row(
-                    t!("pantalla-settings-cerrar-dialogos"),
-                    None,
-                    ui::shortcut(&["Esc"])
-                ),
-                ui::pref_row(
-                    t!("pantalla-settings-siguiente-campo"),
-                    None,
-                    ui::shortcut(&["Tab"])
-                ),
-            ]
-        ),
-    ]
-    .spacing(space::L)
+    column![ui::section(
+        t!("settings-apariencia"),
+        None,
+        vec![
+            ui::pref_row(t!("settings-tema"), Some(theme_hint), theme),
+            container(
+                column![
+                    ui::body(t!("settings-color-de-acento")),
+                    ui::secondary(accent_hint),
+                    swatches.wrap()
+                ]
+                .spacing(space::XS)
+            )
+            .padding(Padding::from([10.0, 16.0]))
+            .into(),
+            ui::pref_row(
+                t!("settings-fuente"),
+                Some(font_hint),
+                icon_with(Icon::Lock, 16.0, SvgClass::Secondary)
+            ),
+        ]
+    )]
     .into()
+}
+
+/// Muestra de un acento de GNOME, con su nombre al pasar el ratón.
+fn swatch<'a>(accent: Accent, key: String, selected: bool) -> Element<'a, Message> {
+    ui::with_tooltip(
+        button(if selected {
+            Element::from(iced_widget::center(icon_with(
+                Icon::Check,
+                16.0,
+                SvgClass::OnAccent,
+            )))
+        } else {
+            ui::gap(0.0)
+        })
+        .width(Length::Fixed(28.0))
+        .height(Length::Fixed(28.0))
+        .padding(0)
+        .class(ButtonClass::Swatch {
+            color: accent.rgb(),
+            selected,
+        })
+        .on_press(on(Msg::Accent(key))),
+        accent.label(),
+    )
+}
+
+// --- Acerca de -----------------------------------------------------------------------------------
+
+/// Página de las notas de esta versión.
+pub fn release_page(version: &str) -> String {
+    format!("{}/tag/v{version}", crate::update::RELEASES_PAGE)
 }
 
 fn updates(app: &App) -> Vec<Element<'_, Message>> {
@@ -1271,39 +1335,38 @@ fn updates(app: &App) -> Vec<Element<'_, Message>> {
     let disabled = crate::update::disabled_by_env();
     let status = if disabled {
         t!(
-            "pantalla-settings-desactivado-con-este-paquete-se-actualiza",
+            "settings-desactivado-con-este-paquete",
             valor = crate::update::DISABLE_ENV
         )
     } else if state.checking {
-        t!("pantalla-settings-comprobando-en-las-publicaciones-del-proyecto").to_owned()
+        t!("settings-comprobando-en-las-publicaciones").to_owned()
     } else if let Some(update) = &state.available {
         t!(
-            "pantalla-settings-hay-una-version-nueva-tienes-la",
+            "settings-hay-una-version-nueva",
             version = update.version,
-            version2 = app.version
+            current = app.version
         )
     } else if let Some(err) = &state.error {
-        t!(
-            "pantalla-settings-la-ultima-comprobacion-fallo-err",
-            err = err
-        )
+        t!("settings-la-ultima-comprobacion-fallo", err = err)
     } else if updates.last_check.is_some() {
-        t!("pantalla-settings-tienes-la-ultima-version").to_owned()
+        t!("settings-tienes-la-ultima-version").to_owned()
     } else {
-        t!("pantalla-settings-pregunta-a-las-publicaciones-del-proyecto").to_owned()
+        t!("settings-pregunta-a-las-publicaciones").to_owned()
     };
     let mut action = row![].spacing(space::S).align_y(Alignment::Center);
     if let Some(update) = &state.available {
-        action = action.push(ui::primary(
-            t!("pantalla-settings-ver-la-version"),
+        action = action.push(ui::button_with(
+            Kind::Primary,
+            t!("settings-ver-la-version-nueva"),
+            Some(Icon::ExternalLink),
             Some(Message::OpenUrl(update.url.clone())),
         ));
     }
     action = action.push(ui::normal(
         if state.checking {
-            t!("pantalla-settings-comprobando")
+            t!("settings-comprobando")
         } else {
-            t!("pantalla-settings-comprobar-ahora")
+            t!("settings-comprobar-ahora")
         },
         (!state.checking && !disabled).then_some(on(Msg::CheckUpdates)),
     ));
@@ -1313,9 +1376,9 @@ fn updates(app: &App) -> Vec<Element<'_, Message>> {
             choice(
                 *hours,
                 if *hours == 24 {
-                    t!("pantalla-settings-una-vez-al-dia")
+                    t!("settings-una-vez-al-dia")
                 } else {
-                    t!("pantalla-settings-una-vez-a-la-semana")
+                    t!("settings-una-vez-a-la-semana")
                 },
             )
         })
@@ -1324,20 +1387,22 @@ fn updates(app: &App) -> Vec<Element<'_, Message>> {
         .iter()
         .find(|c| c.value == updates.interval_hours)
         .cloned();
+    let checks = updates.check && !disabled;
     vec![
-        ui::pref_row(t!("pantalla-settings-version-nueva"), Some(status), action),
+        ui::pref_row(t!("settings-version-nueva"), Some(status), action),
         ui::pref_row(
-            t!("pantalla-settings-comprobar-sola"),
-            Some(t!("pantalla-settings-avisa-en-inicio-cuando-hay-una").to_owned()),
-            ui::switch(
-                updates.check && !disabled,
-                (!disabled).then_some(|on_off| on(Msg::UpdateChecks(on_off))),
-            ),
-        ),
-        ui::pref_row(
-            t!("pantalla-settings-frecuencia"),
-            None,
-            ui::select(intervals, interval, |c| on(Msg::UpdateInterval(c))),
+            t!("settings-buscar-versiones-nuevas"),
+            Some(t!("settings-buscar-versiones-nuevas-ayuda").to_owned()),
+            row![]
+                .push(
+                    checks.then(|| ui::select(intervals, interval, |c| on(Msg::UpdateInterval(c)))),
+                )
+                .push(ui::switch(
+                    checks,
+                    (!disabled).then_some(|on_off| on(Msg::UpdateChecks(on_off))),
+                ))
+                .spacing(space::S)
+                .align_y(Alignment::Center),
         ),
     ]
 }
@@ -1347,95 +1412,47 @@ fn license_row<'a>(name: &'a str, license: &'a str) -> Element<'a, Message> {
 }
 
 fn about(app: &App) -> Element<'_, Message> {
-    let fingerprint = app
-        .account
-        .as_ref()
-        .map(|account| account.fingerprint.as_str())
-        .unwrap_or("");
     let header = ui::card(
         row![
             icon_with(Icon::RadioTower, 44.0, SvgClass::Accent),
             column![
                 ui::title("coroom"),
                 ui::secondary(t!(
-                    "pantalla-settings-version-protocolo-protocol-version",
+                    "settings-version-y-protocolo",
                     version = app.version,
-                    PROTOCOL_VERSION = PROTOCOL_VERSION
+                    protocol = PROTOCOL_VERSION
                 )),
-                ui::caption(t!("pantalla-settings-juego-remoto-con-amigos-cifrado-de"))
+                ui::caption(t!("settings-juego-remoto-con-amigos"))
             ]
             .spacing(4)
+            .width(Length::Fill),
+            ui::button_with(
+                Kind::Flat,
+                t!("settings-notas-de-esta-version"),
+                Some(Icon::ExternalLink),
+                Some(Message::OpenUrl(release_page(app.version))),
+            )
         ]
         .spacing(space::M)
         .align_y(Alignment::Center),
     );
-    let peers: Vec<Element<'_, Message>> = if app.settings.peers.is_empty() {
-        vec![
-            container(ui::caption(t!(
-                "pantalla-settings-aparecen-al-entrar-en-una-sala"
-            )))
-            .padding(Padding::from([10.0, 16.0]))
-            .into(),
-        ]
-    } else {
-        app.settings
-            .peers
-            .iter()
-            .enumerate()
-            .take(8)
-            .map(|(index, peer)| {
-                let preview: String = peer.safety_number.chars().take(17).collect();
-                ui::list_row(
-                    Some(ui::avatar(&app.theme, &peer.name, 28.0)),
-                    peer.name.as_str(),
-                    Some(format!("{preview}…")),
-                    vec![
-                        ui::normal(t!("pantalla-settings-ver"), Some(on(Msg::Peer(index)))).into(),
-                    ],
-                )
-            })
-            .collect()
-    };
-    let identity: Element<'_, Message> = if fingerprint.is_empty() {
-        ui::caption(t!("pantalla-settings-inicia-sesion-para-ver-la-identidad")).into()
-    } else {
-        ui::copy_field(fingerprint, Message::Copy(fingerprint.to_owned()))
-    };
     column![
         header,
-        ui::section(t!("pantalla-settings-actualizaciones"), None, updates(app)),
+        ui::section(t!("settings-versiones"), None, updates(app)),
         ui::section(
-            t!("pantalla-settings-identidad-de-este-equipo"),
-            Some(t!("pantalla-settings-tu-clave-ed25519-tus-amigos-ven").to_owned()),
-            vec![
-                container(identity)
-                    .padding(Padding::from([10.0, 16.0]))
-                    .into()
-            ]
-        ),
-        ui::section(t!("pantalla-settings-numeros-de-seguridad"), None, peers),
-        ui::section(
-            t!("pantalla-settings-licencias"),
+            t!("settings-licencias"),
             None,
             vec![
+                license_row("coroom", t!("settings-licencia-coroom")),
+                license_row(t!("settings-servidor"), t!("settings-licencia-servidor")),
+                license_row(t!("settings-iconos-lucide"), "ISC"),
+                license_row(t!("settings-fuentes"), t!("settings-licencia-fuentes")),
+                license_row(t!("settings-interfaz"), t!("settings-licencia-interfaz")),
+                license_row("FFmpeg", t!("settings-licencia-ffmpeg")),
                 license_row(
-                    t!("pantalla-settings-dependencias-de-rust"),
-                    t!("pantalla-settings-mit-apache-2-0-bsd-isc")
+                    t!("settings-dependencias-de-rust"),
+                    t!("settings-licencia-dependencias")
                 ),
-                license_row(
-                    t!("pantalla-settings-ffmpeg"),
-                    t!("pantalla-settings-lgpl-2-1-o-posterior-enlazado")
-                ),
-                license_row(
-                    t!("pantalla-settings-interfaz"),
-                    t!("pantalla-settings-iced-mit-con-wgpu-mit-o")
-                ),
-                license_row(
-                    t!("pantalla-settings-fuente-inter"),
-                    t!("pantalla-settings-sil-open-font-license-1-1")
-                ),
-                license_row(t!("pantalla-settings-iconos-lucide"), "ISC"),
-                license_row("coroom", t!("pantalla-settings-licencia-apache-2-0")),
             ]
         ),
     ]
@@ -1443,71 +1460,25 @@ fn about(app: &App) -> Element<'_, Message> {
     .into()
 }
 
-fn diagnostics(app: &App) -> Element<'_, Message> {
-    let state = &app.settings_page;
-    let body: Element<'_, Message> = match &state.doctor {
-        Load::Idle | Load::Loading => ui::card(ui::progress(
-            t!("pantalla-settings-comprobando-el-sistema-captura-adaptador-grafico"),
-            None,
-            app.now.elapsed().as_secs_f32() / 1.4,
-        )),
-        Load::Failed(err) => ui::banner(Tone::Error, err.as_str(), None),
-        Load::Loaded(lines) => container(
-            Column::with_children(lines.iter().map(|line| {
-                ui::mono(line.as_str(), type_size::CAPTION)
-                    .wrapping(Wrapping::WordOrGlyph)
-                    .into()
-            }))
-            .spacing(2),
-        )
-        .padding(space::M)
-        .width(Length::Fill)
-        .class(ContainerClass::Code)
-        .into(),
-    };
-    let ready = matches!(state.doctor, Load::Loaded(_));
-    column![
-        row![
-            column![
-                ui::heading(t!("pantalla-settings-diagnostico")),
-                ui::secondary(t!("pantalla-settings-lo-mismo-que-coroom-doctor-en"))
-            ]
-            .spacing(2)
-            .width(Length::Fill),
-            ui::button_with(
-                Kind::Normal,
-                t!("pantalla-settings-copiar"),
-                Some(Icon::Copy),
-                ready.then(|| on(Msg::CopyDoctor))
-            ),
-            ui::button_with(
-                Kind::Normal,
-                t!("pantalla-settings-volver-a-comprobar"),
-                Some(Icon::Refresh),
-                (!state.doctor.is_loading()).then(|| on(Msg::RunDoctor))
-            )
-        ]
-        .spacing(space::XS)
-        .align_y(Alignment::Center),
-        body
-    ]
-    .spacing(space::S)
-    .width(Length::Fill)
-    .max_width(size::CONTENT)
-    .into()
-}
-
 /// Escenas de Ajustes para las capturas.
 pub(crate) mod shots {
     use std::time::Duration;
 
+    use coroom_session::input::gamepad::{PadChoice, PadKey};
     use coroom_transport::proto::api::{Device, Devices};
 
     use super::SettingsPage;
-    use crate::ui::app::{App, AudioDevice, Load, Page};
-    use crate::ui::shots::{Builder, sample_doctor, signed_in, unix_ago};
+    use crate::ui::app::{App, AudioDevice, Event, Load, Message, Page};
+    use crate::ui::settings::KnownPeer;
+    use crate::ui::shots::{Builder, signed_in, unix_ago};
+
+    /// Ajustes abierto en `page` con una cuenta, sus dispositivos y la lista de audio.
     pub(crate) fn settings_page(app: &mut App, page: SettingsPage) {
         signed_in(app, Page::Settings);
+        app.update(Message::Event(Event::ServerStatus {
+            rtt_ms: Some(12.0),
+            online: true,
+        }));
         let day = Duration::from_secs(86_400);
         app.settings_page.page = page;
         app.settings_page.devices = Load::Loaded(Devices {
@@ -1531,70 +1502,74 @@ pub(crate) mod shots {
         });
         app.settings_page.audio_devices = Load::Loaded(vec![
             AudioDevice {
-                name: "usb-mic".to_owned(),
-                description: "Micrófono USB".to_owned(),
+                name: "usb-headset-mic".to_owned(),
+                description: "Micrófono de los auriculares".to_owned(),
                 input: true,
+                default: true,
+            },
+            AudioDevice {
+                name: "usb-headset".to_owned(),
+                description: "Auriculares USB".to_owned(),
+                input: false,
                 default: true,
             },
             AudioDevice {
                 name: "builtin-speakers".to_owned(),
                 description: "Altavoces integrados".to_owned(),
                 input: false,
-                default: true,
-            },
-            AudioDevice {
-                name: "headset".to_owned(),
-                description: "Auriculares".to_owned(),
-                input: false,
                 default: false,
             },
         ]);
-        app.settings_page.doctor = Load::Loaded(sample_doctor());
-        // Lo que hace un equipo con NVENC con 4:4:4 y HDR y una comprobación de versión.
-        use coroom_session::codec::Codec;
-        app.video_support = Some(crate::ui::app::VideoSupport {
-            yuv444: vec![
-                (Codec::Hevc, "HEVC (NVENC)".to_owned()),
-                (Codec::H264, "H.264 (NVENC)".to_owned()),
-            ],
-            hdr10: vec![
-                (Codec::Av1, "AV1 (NVENC)".to_owned()),
-                (Codec::Hevc, "HEVC (NVENC)".to_owned()),
-            ],
-            decode_yuv444: vec![Codec::Av1, Codec::Hevc],
-            decode_hdr10: vec![Codec::Av1, Codec::Hevc],
-            hdr_display: Some(true),
-        });
-        app.settings.video.chroma_444 = true;
-        app.settings.video.fps = 120;
+        app.settings_page.audio_refreshing = false;
+        app.settings_page.audio_updated_at = Some(app.now - Duration::from_secs(1));
+        app.settings_page.audio_answered_at = app.settings_page.audio_updated_at;
+        app.settings.audio.speaker = Some("usb-headset".to_owned());
+        app.settings.audio.microphone = Some("usb-headset-mic".to_owned());
         app.settings.updates.last_check = Some(1_790_000_000);
+        app.settings.peers = vec![KnownPeer {
+            name: "Bea".to_owned(),
+            fingerprint: "cd".repeat(32),
+            safety_number: "12345 67890 13579 24680 11223 34455".to_owned(),
+        }];
     }
 
     /// Escenas de esta pantalla.
     pub(crate) const BUILDERS: &[(&str, Builder)] = &[
-        ("16-ajustes-video", |app| {
-            settings_page(app, SettingsPage::Video)
+        ("16-ajustes-cuenta", |app| {
+            settings_page(app, SettingsPage::Account);
+            // Un servidor con certificado propio: se ve la huella en la que se confió.
+            if let Some(account) = &mut app.account {
+                account.server.fingerprint = Some("9c4e".repeat(16));
+            }
+        }),
+        ("16-ajustes-sin-servidor", |app| {
+            settings_page(app, SettingsPage::Account);
+            app.update(Message::Event(Event::ServerStatus {
+                rtt_ms: None,
+                online: false,
+            }));
         }),
         ("17-ajustes-audio", |app| {
-            settings_page(app, SettingsPage::Audio)
+            settings_page(app, SettingsPage::Audio);
+            app.settings.audio.voice_mode = crate::ui::settings::VoiceMode::PushToTalk;
+            app.settings.audio.push_to_talk_key = "V".to_owned();
         }),
-        ("18-ajustes-entrada", |app| {
-            settings_page(app, SettingsPage::Input)
+        ("18-ajustes-sala", |app| {
+            settings_page(app, SettingsPage::Room)
         }),
-        ("19-ajustes-red", |app| {
-            settings_page(app, SettingsPage::Network)
+        ("19-ajustes-mandos", |app| {
+            settings_page(app, SettingsPage::Gamepads);
+            app.settings.input.pad = PadChoice::Pad(PadKey {
+                vendor: 0x045e,
+                product: 0x0b13,
+                name: "Mando inalámbrico Xbox".to_owned(),
+            });
         }),
-        ("20-ajustes-dispositivos", |app| {
-            settings_page(app, SettingsPage::Devices)
-        }),
-        ("21-ajustes-apariencia", |app| {
+        ("20-ajustes-apariencia", |app| {
             settings_page(app, SettingsPage::Appearance)
         }),
-        ("22-ajustes-acerca", |app| {
+        ("21-ajustes-acerca", |app| {
             settings_page(app, SettingsPage::About)
-        }),
-        ("23-diagnostico", |app| {
-            settings_page(app, SettingsPage::Diagnostics)
         }),
     ];
 }
@@ -1604,150 +1579,243 @@ mod tests {
     use super::*;
     use crate::ui::app::tests::app;
 
-    #[test]
-    fn unlimited_bitrate_is_named_as_such() {
-        let unlimited = coroom_session::remote::UNLIMITED_KBPS;
-        assert_eq!(bitrate_label(unlimited), "Sin tope");
-        assert_eq!(bitrate_phrase(unlimited), "Auto sin tope");
-        assert_eq!(
-            bitrate_phrase(80_000),
-            format!("Auto hasta {}", stats::kbps(80_000.0))
-        );
-        assert_eq!(bitrate_label(80_000), stats::kbps(80_000.0));
-        assert_eq!(
-            bitrate_choices().last().map(|c| c.value),
-            Some(unlimited),
-            "«Sin tope» es la última opción"
-        );
+    /// Ajustes abierto en `page`, como tras navegar desde la cabecera.
+    fn open(page: SettingsPage) -> App {
+        let mut app = app();
+        app.screen = Screen::Main;
+        app.page = Page::Settings;
+        app.settings_page.page = page;
+        app
     }
 
-    /// Ajustes explica si 4:4:4 y HDR están disponibles con el códec elegido.
+    /// Cada interruptor cambia el modelo y no guarda en el acto: se guarda en el próximo
+    /// `Tick` pasado el retardo (una ráfaga de cambios es una sola escritura).
     #[test]
-    fn chroma_and_hdr_explain_what_this_machine_does() {
-        use coroom_session::codec::Codec;
-        let mut app = app();
-        assert!(chroma_hint(&app).contains("Comprobando"));
-        app.update(Message::Event(Event::VideoSupport(
-            crate::ui::app::VideoSupport {
-                yuv444: Vec::new(),
-                hdr10: vec![(Codec::Av1, "AV1 (SVT-AV1)".to_owned())],
-                decode_yuv444: vec![Codec::Av1, Codec::Hevc],
-                decode_hdr10: vec![Codec::Av1],
-                hdr_display: Some(false),
-            },
-        )));
-        let chroma = chroma_hint(&app);
-        assert!(chroma.contains("No disponible para compartir"), "{chroma}");
-        assert!(chroma.contains("AV1 y HEVC"), "{chroma}");
-        assert!(hdr_hint(&app).contains("tone mapping"));
-        assert!(hdr_hint(&app).contains("AV1 (SVT-AV1)"));
-        app.settings.video.codec = CodecChoice::H264;
-        assert!(
-            hdr_hint(&app).contains("No disponible con este códec (H.264)"),
-            "{}",
-            hdr_hint(&app)
-        );
-        if let Some(support) = &mut app.video_support {
-            support.yuv444 = vec![(Codec::Hevc, "HEVC (NVENC)".to_owned())];
-            support.hdr_display = Some(true);
-        }
-        assert!(chroma_hint(&app).contains("No disponible con este códec (H.264); sí con HEVC"));
-        app.settings.video.codec = CodecChoice::Auto;
-        assert!(chroma_hint(&app).contains("Disponible con HEVC (NVENC)"));
-        assert!(hdr_hint(&app).contains("muestra HDR"));
-        // Los interruptores se guardan.
-        assert_eq!(
-            app.update(Message::Settings(Msg::Hdr(true))),
-            [Effect::SaveSettings]
-        );
-        assert!(app.settings.video.hdr);
-    }
-
-    #[test]
-    fn every_change_is_saved() {
-        let mut app = app();
-        let saves =
-            |app: &mut App, msg: Msg| app.update(Message::Settings(msg)) == [Effect::SaveSettings];
-        assert!(saves(&mut app, Msg::Fps(120)));
-        assert_eq!(app.settings.video.fps, 120);
-        assert!(saves(&mut app, Msg::ForceRelay(true)));
-        assert!(
-            app.settings.network.port_mapping,
-            "abrir el puerto viene activado"
-        );
-        assert!(saves(&mut app, Msg::PortMapping(false)));
+    fn every_change_is_saved_after_a_delay() {
+        let mut app = open(SettingsPage::Account);
+        let change = |app: &mut App, msg: Msg| {
+            let effects = app.update(Message::Settings(msg));
+            assert!(effects.is_empty(), "{effects:?}");
+        };
+        change(&mut app, Msg::ForceRelay(true));
+        assert!(app.settings.network.force_relay);
+        change(&mut app, Msg::PortMapping(false));
         assert!(!app.settings.network.port_mapping);
-        assert!(saves(&mut app, Msg::Theme(ThemeChoice::Dark)));
+        change(&mut app, Msg::Port("47000".into()));
+        assert_eq!(app.settings.network.local_port, 47_000);
+        change(&mut app, Msg::Port("80".into()));
+        assert!(
+            app.settings_page.port_error.is_some(),
+            "puertos privilegiados no"
+        );
+        assert_eq!(app.settings.network.local_port, 47_000);
+        change(&mut app, Msg::Port(String::new()));
+        assert_eq!(app.settings.network.local_port, 0);
+        change(&mut app, Msg::HostVoice(false));
+        assert!(!app.settings.audio.host_voice);
+        change(&mut app, Msg::PushToTalk(true));
+        assert_eq!(app.settings.audio.voice_mode, VoiceMode::PushToTalk);
+        change(&mut app, Msg::PushToTalk(false));
+        assert_eq!(app.settings.audio.voice_mode, VoiceMode::Activity);
+        change(&mut app, Msg::NoiseSuppression(false));
+        assert!(!app.settings.audio.noise_suppression);
+        change(&mut app, Msg::Speaker(choice(Some("usb".into()), "USB")));
+        assert_eq!(app.settings.audio.speaker.as_deref(), Some("usb"));
+        change(&mut app, Msg::Microphone(choice(None, "Sistema")));
+        assert_eq!(app.settings.audio.microphone, None);
+        change(&mut app, Msg::GuestsMuted(true));
+        assert!(app.settings.room.guests_muted);
+        change(&mut app, Msg::ChatSound(false));
+        assert!(!app.settings.room.chat_sound);
+        change(&mut app, Msg::ChatNotifications(false));
+        assert!(!app.settings.room.chat_notifications);
+        change(&mut app, Msg::ChatBubbles(false));
+        assert!(!app.settings.room.chat_bubbles);
+        change(&mut app, Msg::PreferredSlot(choice(2, "Ranura 2")));
+        assert_eq!(app.settings.input.preferred_slot, 2);
+        change(&mut app, Msg::Theme(ThemeChoice::Dark));
         assert_eq!(
             app.theme.mode(),
             coroom_ui::theme::Mode::Dark,
             "el tema cambia al momento"
         );
-        assert!(saves(&mut app, Msg::Accent("purple".into())));
+        change(&mut app, Msg::Accent("purple".into()));
         assert_eq!(app.theme.palette.accent, Accent::Purple);
-        assert!(saves(&mut app, Msg::Port("47000".into())));
-        assert_eq!(app.settings.network.local_port, 47_000);
-        assert!(
-            app.update(Message::Settings(Msg::Port("80".into())))
-                .is_empty()
+        change(&mut app, Msg::UpdateInterval(choice(168, "Semana")));
+        assert_eq!(app.settings.updates.interval_hours, 168);
+        change(&mut app, Msg::UpdateChecks(false));
+        assert!(!app.settings.updates.check);
+        // Pasado el retardo, el `Tick` guarda una sola vez.
+        app.now += Duration::from_secs(5);
+        let effects = app.update(Message::Tick);
+        assert_eq!(
+            effects
+                .iter()
+                .filter(|effect| **effect == Effect::SaveSettings)
+                .count(),
+            1,
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn actions_ask_for_what_they_need() {
+        let mut app = open(SettingsPage::Account);
+        app.settings.input.pad = PadChoice::Pad(coroom_session::input::gamepad::PadKey {
+            vendor: 1,
+            product: 2,
+            name: "Mando".into(),
+        });
+        assert_eq!(
+            app.update(Message::Settings(Msg::PadAuto)),
+            [Effect::SetPadChoice(PadChoice::Auto)]
+        );
+        assert_eq!(app.settings.input.pad, PadChoice::Auto);
+        assert_eq!(
+            app.update(Message::Settings(Msg::ReloadDevices)),
+            [Effect::LoadDevices]
         );
         assert!(
-            app.settings_page.port_error.is_some(),
-            "puertos privilegiados no"
+            app.update(Message::Settings(Msg::Revoke {
+                id: 2,
+                name: "Sobremesa".into()
+            }))
+            .is_empty()
         );
-        assert!(saves(&mut app, Msg::Port(String::new())));
-        assert_eq!(app.settings.network.local_port, 0);
+        assert!(matches!(
+            app.dialog,
+            Some(Dialog::RevokeDevice { device: 2, .. })
+        ));
+        assert_eq!(
+            app.update(Message::ConfirmDialog),
+            [Effect::RevokeDevice(2)]
+        );
+        assert_eq!(
+            app.update(Message::Settings(Msg::CheckUpdates)),
+            [Effect::CheckUpdates]
+        );
     }
 
     #[test]
     fn shortcuts_are_captured_and_must_not_collide() {
-        let mut app = app();
+        let mut app = open(SettingsPage::Gamepads);
+        assert_eq!(Shortcuts::default().letters().len(), 7);
         app.update(Message::Settings(Msg::Capture(Capture::Shortcut(0))));
-        assert_eq!(
-            app.update(Message::Settings(Msg::KeyCaptured("k".into()))),
-            [Effect::SaveSettings]
-        );
-        assert_eq!(app.settings.input.shortcuts.immersive, 'K');
-        app.update(Message::Settings(Msg::Capture(Capture::Shortcut(1))));
         assert!(
-            app.update(Message::Settings(Msg::KeyCaptured("K".into())))
+            app.update(Message::Settings(Msg::KeyCaptured("k".into())))
                 .is_empty()
         );
+        assert_eq!(app.settings.input.shortcuts.immersive, 'K');
+        // Una letra que ya usa otro atajo se rechaza y lo dice.
+        app.update(Message::Settings(Msg::Capture(Capture::Shortcut(6))));
+        app.update(Message::Settings(Msg::KeyCaptured("K".into())));
+        assert_eq!(app.settings.input.shortcuts.pads, 'J');
         assert!(
             app.toasts
                 .iter()
-                .any(|t| t.text.contains("ya es otro atajo"))
+                .any(|toast| toast.text.contains("ya es otro atajo")),
+            "{:?}",
+            app.toasts
         );
+        // Lo que no es una letra, también.
+        app.update(Message::Settings(Msg::Capture(Capture::Shortcut(2))));
+        app.update(Message::Settings(Msg::KeyCaptured("F5".into())));
+        assert_eq!(app.settings.input.shortcuts.chat, 'C');
+        assert_eq!(app.settings_page.capturing, None);
         app.update(Message::Settings(Msg::Capture(Capture::PushToTalk)));
         app.update(Message::Settings(Msg::KeyCaptured("CapsLock".into())));
         assert_eq!(app.settings.audio.push_to_talk_key, "CapsLock");
+        app.update(Message::Settings(Msg::Capture(Capture::Shortcut(1))));
+        app.update(Message::Settings(Msg::CancelCapture));
         assert_eq!(app.settings_page.capturing, None);
+        app.update(Message::Settings(Msg::ResetShortcuts));
+        assert_eq!(app.settings.input.shortcuts, Shortcuts::default());
     }
 
+    /// La lista de audio se pide al abrir la página y, mientras siga abierta, cada 3 s tras la
+    /// última respuesta; fuera de la página, nunca.
     #[test]
-    fn pages_load_what_they_need() {
-        let mut app = app();
-        assert_eq!(
-            app.update(Message::Settings(Msg::Page(SettingsPage::Diagnostics))),
-            [Effect::RunDoctor]
-        );
-        assert!(app.settings_page.doctor.is_loading());
-        app.update(Message::Event(Event::Doctor(vec!["coroom 0.1.0".into()])));
-        assert!(
-            app.update(Message::Settings(Msg::Page(SettingsPage::Diagnostics)))
-                .is_empty()
-        );
+    fn audio_devices_refresh_every_three_seconds_while_open() {
+        let mut app = open(SettingsPage::Account);
         assert_eq!(
             app.update(Message::Settings(Msg::Page(SettingsPage::Audio))),
             [Effect::LoadAudioDevices]
         );
+        assert!(app.settings_page.audio_devices.is_loading());
+        // Pedida: ningún `Tick` la vuelve a pedir ni hace falta uno ya.
+        assert!(app.update(Message::Tick).is_empty());
+        assert_eq!(next_tick(&app), None);
+        app.update(Message::Event(Event::AudioDevices(Ok(vec![AudioDevice {
+            name: "usb".into(),
+            description: "USB".into(),
+            input: true,
+            default: true,
+        }]))));
+        let answered = app.now;
+        assert_eq!(app.settings_page.audio_updated_at, Some(answered));
+        // «actualizado hace N s» se redibuja cada segundo.
+        assert_eq!(next_tick(&app), Some(answered + Duration::from_secs(1)));
+        app.now = answered + Duration::from_secs(2);
+        assert!(app.update(Message::Tick).is_empty(), "aún no toca");
+        app.now = answered + AUDIO_REFRESH;
+        assert_eq!(app.update(Message::Tick), [Effect::LoadAudioDevices]);
+        assert!(app.settings_page.audio_refreshing);
         assert!(
-            app.update(Message::Settings(Msg::Page(SettingsPage::Devices)))
+            matches!(app.settings_page.audio_devices, Load::Loaded(_)),
+            "la lista anterior sigue a la vista"
+        );
+        assert!(
+            next_tick(&app).is_some_and(|at| at > app.now),
+            "pedida, nunca una hora pasada"
+        );
+        // Un error con lista: se avisa y se mantiene la anterior.
+        app.update(Message::Event(Event::AudioDevices(Err(
+            "sin PipeWire".into()
+        ))));
+        assert!(matches!(app.settings_page.audio_devices, Load::Loaded(_)));
+        assert_eq!(
+            app.settings_page.audio_error.as_deref(),
+            Some("sin PipeWire")
+        );
+        // Con otra página delante, no se pide.
+        app.update(Message::Settings(Msg::Page(SettingsPage::Room)));
+        app.now += Duration::from_secs(10);
+        assert_eq!(next_tick(&app), None);
+        assert!(app.update(Message::Tick).is_empty());
+        app.page = Page::Home;
+        app.settings_page.page = SettingsPage::Audio;
+        assert!(
+            app.update(Message::Tick).is_empty(),
+            "fuera de Ajustes, nunca"
+        );
+    }
+
+    #[test]
+    fn the_account_page_loads_the_devices() {
+        let mut app = open(SettingsPage::Audio);
+        assert!(
+            app.update(Message::Settings(Msg::Page(SettingsPage::Account)))
                 .is_empty(),
             "sin cuenta no hay dispositivos que pedir"
         );
         assert_eq!(ago(100, 100), "ahora mismo");
         assert_eq!(ago(0, 7200), "hace 2 h");
+        assert_eq!(ago(0, 86_400), "ayer");
         assert_eq!(ago(0, 86_400 * 3), "hace 3 días");
+        assert!(release_page("1.2.3").ends_with("/tag/v1.2.3"));
+    }
+
+    #[test]
+    fn a_missing_device_stays_visible() {
+        let devices = [AudioDevice {
+            name: "usb".into(),
+            description: "USB".into(),
+            input: true,
+            default: true,
+        }];
+        let choices = device_choices(&devices, true, &Some("bt".into()));
+        assert_eq!(choices.len(), 3);
+        assert!(choices[2].label.contains("bt"), "{}", choices[2].label);
+        assert_eq!(device_choices(&devices, false, &None).len(), 1);
     }
 }

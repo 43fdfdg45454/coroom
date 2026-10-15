@@ -1,25 +1,34 @@
-//! Pantalla 5: invitado.
+//! Pantalla 3 («Dentro de la sala»), vista del invitado.
 //!
-//! Al entrar, "Conectando" con sus pasos (señalización, claves, conexión directa o por relay,
-//! calidad, códec) y, antes del vídeo, la **estimación de calidad**: el RTT medido con el anfitrión
-//! y su nivel (`docs/ARQUITECTURA.md` §2.1) con para qué juegos va bien. Después el vídeo a toda la ventana
-//! con una barra superior que se oculta sola (nivel, RTT, ruta, códec, bitrate, micrófono, audio
-//! del juego, inmersivo, estadísticas, pantalla completa, salir) y el panel lateral de
-//! estadísticas (el antiguo overlay). Los cambios de permisos llegan como avisos que no bloquean;
-//! la reconexión se ve en una franja con el intento; el final, en un diálogo claro.
+//! Al entrar, la sala de espera con su cabecera: los pasos (señalización, claves, conexión
+//! directa o por relay, calidad, códec) y, antes del vídeo, la **estimación de calidad** (el RTT
+//! medido con el anfitrión y su nivel, `docs/ARQUITECTURA.md` §2.1). El chat ya funciona aquí, en
+//! cuanto llegan las claves. Después, el vídeo a toda la ventana con:
+//!
+//! - una **barra superior** flotante que aparece al mover el ratón y se oculta a los 2,5 s
+//!   (nivel y latencia añadida, sala, ruta, códec, resolución y bitrate; micrófono, audio,
+//!   control, chat con sus no leídos, conexión, pantalla completa y salir);
+//! - la **píldora** de latencia abajo a la izquierda («48 ms · Directa», «82 ms · Relay · CGNAT»,
+//!   «Reconectando · 3 s»): fija en ventana; a pantalla completa se oculta con la barra;
+//! - el **panel lateral** de 340 px con las pestañas Chat · Conexión · Sala (no se oculta solo);
+//! - las **burbujas** de los mensajes del chat con el panel cerrado.
+//!
+//! La latencia añadida es la medida, nunca estimada: la mediana de extremo a extremo del vídeo
+//! (`LatencySummary::total`), la de la entrada y la del audio del juego; sin muestras, «midiendo».
+//! Los cambios de permisos llegan como avisos que no bloquean; el final, en un diálogo claro.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use coroom_session::input::capture::Allowed;
 use coroom_session::input::gamepad::{ConnectedPad, PadChoice, PadKey, PadKind};
-use coroom_session::latency::LatencySummary;
+use coroom_session::latency::{AudioTrack, LatencySummary};
 use coroom_session::remote::{QualityLevel, RoomMember, SessionEvent, talker_label};
 use coroom_transport::Path;
 use coroom_ui::Element;
 use coroom_ui::icon::{Icon, icon_with};
 use coroom_ui::style::{ButtonClass, ContainerClass, SvgClass, TextClass};
-use coroom_ui::theme::Tone;
+use coroom_ui::theme::{Mode, Palette, Tone};
 use coroom_ui::tokens::{motion, size, space, text as type_size};
 use coroom_ui::widget::{self as ui};
 use iced_core::alignment::{Horizontal, Vertical};
@@ -27,13 +36,20 @@ use iced_core::text::Wrapping;
 use iced_core::{Alignment, Length, Padding};
 use iced_widget::{Column, Space, button, center, column, container, row, scrollable, stack, text};
 
-use crate::ui::app::{App, Dialog, Effect, Event, Invitation, Message, Page, Screen, quality_tone};
-use crate::ui::settings::KnownPeer;
+use super::chat::{self, Surface};
+use super::diagnostics;
+use crate::ui::app::{
+    App, Dialog, Effect, Event, HEADERBAR_HEIGHT, Invitation, Message, Page, Screen, quality_tone,
+};
+use crate::ui::settings::{KnownPeer, VoiceMode};
 use crate::ui::stats;
 use crate::ui::video::{VideoFeed, video_view};
 
 /// Lo que se ve de la estimación antes de pasar al vídeo, como poco.
 pub const ESTIMATE_DWELL: Duration = Duration::from_millis(1500);
+
+/// Lo que tarda la barra en aparecer.
+const BAR_IN: Duration = motion::PANEL;
 
 /// Estadísticas del invitado (las manda el backend cada 250 ms).
 #[derive(Debug, Clone, PartialEq)]
@@ -61,6 +77,17 @@ pub enum Phase {
     Connecting,
     /// Vídeo.
     Video,
+}
+
+/// Pestaña del panel lateral de la sala.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    /// Chat de la sala (`Ctrl+Alt+C`).
+    Chat,
+    /// Conexión y calidad (`Ctrl+Alt+S`).
+    Connection,
+    /// Personas y mandos (`Ctrl+Alt+J`).
+    Room,
 }
 
 /// Estimación de calidad.
@@ -108,18 +135,16 @@ pub struct State {
     pub path: Option<Path>,
     /// Dirección del anfitrión (o del relay) por la que va la conexión.
     pub remote: Option<std::net::SocketAddr>,
+    /// Por qué se va por el relay (la frase entera; la píldora lleva el motivo corto).
+    pub relay_reason: Option<String>,
     /// Estimación.
     pub estimate: Option<Estimate>,
     /// Códec.
     pub codec: Option<String>,
     /// Estadísticas.
     pub stats: Option<Stats>,
-    /// Panel de estadísticas abierto.
-    pub stats_open: bool,
-    /// Panel de mandos abierto.
-    pub pads_open: bool,
-    /// Panel de las personas de la sala abierto.
-    pub people_open: bool,
+    /// Pestaña abierta del panel lateral (`None`: cerrado).
+    pub panel: Option<Tab>,
     /// Quién está en la sala (con el anfitrión), según el último `Members`.
     pub members: Vec<RoomMember>,
     /// Hojas MLS de las voces que este equipo no quiere oír.
@@ -130,6 +155,8 @@ pub struct State {
     pub pads_raw: bool,
     /// Hasta cuándo se ve la barra.
     pub bar_until: Instant,
+    /// Cuándo empezó a verse la barra (para su entrada).
+    pub bar_shown_at: Instant,
     /// Modo inmersivo.
     pub immersive: bool,
     /// Reconectando.
@@ -140,6 +167,8 @@ pub struct State {
     pub probe: bool,
     /// Desde cuándo.
     pub started: Instant,
+    /// El último `Tick`.
+    pub now: Instant,
     /// Ventana de errores de decodificación: desde cuándo y cuántos había al empezarla.
     pub decode_window: Option<(Instant, u64)>,
     /// Último aviso de vídeo dañado.
@@ -190,52 +219,70 @@ impl State {
             keys: false,
             path: None,
             remote: None,
+            relay_reason: None,
             estimate: None,
             codec: None,
             stats: None,
-            stats_open: false,
-            pads_open: false,
-            people_open: false,
+            panel: None,
             members: Vec::new(),
             muted: std::collections::BTreeSet::new(),
             pads: None,
             pads_raw: false,
             bar_until: now,
+            bar_shown_at: now,
             immersive: false,
             reconnecting: None,
             leaving: false,
             probe: false,
             started: now,
+            now,
             decode_window: None,
             corrupt_notice_at: None,
         }
     }
 
-    /// Si hay algo animándose.
+    /// Si hay algo animándose (los pasos, la cuenta atrás de la reconexión, la entrada de la
+    /// barra).
     pub fn animating(&self) -> bool {
-        self.phase == Phase::Connecting || self.reconnecting.is_some()
+        self.phase == Phase::Connecting
+            || self.reconnecting.is_some()
+            || (self.bar_visible(self.now) && self.now.duration_since(self.bar_shown_at) < BAR_IN)
     }
 
     /// Próximo momento en que cambia algo sin eventos (la barra se oculta).
     pub fn next_tick(&self) -> Option<Instant> {
-        (self.phase == Phase::Video).then_some(self.bar_until)
+        (self.phase == Phase::Video && self.bar_until > self.now).then_some(self.bar_until)
     }
 
     /// Si la barra se ve.
     pub fn bar_visible(&self, now: Instant) -> bool {
         self.phase == Phase::Video
-            && (now < self.bar_until || self.stats_open || self.reconnecting.is_some())
+            && (now < self.bar_until || self.panel.is_some() || self.reconnecting.is_some())
+    }
+
+    /// Si la píldora se ve: siempre en ventana; a pantalla completa, con la barra.
+    pub fn pill_visible(&self, now: Instant, fullscreen: bool) -> bool {
+        self.phase == Phase::Video && (!fullscreen || self.bar_visible(now))
+    }
+
+    /// Enseña la barra durante [`motion::BAR_HIDE`].
+    fn reveal_bar(&mut self, now: Instant) {
+        if !self.bar_visible(now) {
+            self.bar_shown_at = now;
+        }
+        self.bar_until = now + motion::BAR_HIDE;
     }
 
     /// El ratón se movió.
     pub fn pointer_moved(&mut self, now: Instant) {
         if !self.immersive {
-            self.bar_until = now + motion::BAR_HIDE;
+            self.reveal_bar(now);
         }
     }
 
     /// Pasa el tiempo.
     pub fn tick(&mut self, now: Instant) {
+        self.now = now;
         if self.phase == Phase::Connecting
             && self.feed.has_frame()
             && self
@@ -243,20 +290,157 @@ impl State {
                 .is_none_or(|estimate| now.duration_since(estimate.at) >= ESTIMATE_DWELL)
         {
             self.phase = Phase::Video;
-            self.bar_until = now + motion::BAR_HIDE;
+            self.reveal_bar(now);
         }
+    }
+
+    /// Latencia añadida medida (mediana de extremo a extremo del vídeo), en ms.
+    pub fn added_ms(&self) -> Option<f64> {
+        let total = &self.stats.as_ref()?.summary.total;
+        (total.samples > 0).then(|| total.p50_us as f64 / 1000.0)
+    }
+
+    /// Nivel de la latencia añadida medida.
+    pub fn level(&self) -> Option<QualityLevel> {
+        self.added_ms().map(QualityLevel::from_overhead_ms)
+    }
+}
+
+/// Lo que dice la píldora de latencia.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pill {
+    /// Tono del punto (`None`: gris, sin datos).
+    pub tone: Option<Tone>,
+    /// Reconectando (lleva el icono de recargar).
+    pub reconnecting: bool,
+    /// Primer tramo: «48 ms», «Conectando…», «Reconectando».
+    pub lead: String,
+    /// Ruta: «Directa» o «Relay».
+    pub route: Option<String>,
+    /// Si va por el relay.
+    pub relayed: bool,
+    /// Motivo corto («CGNAT», «pérdida 4 %») o la espera de la reconexión («3 s»).
+    pub reason: Option<String>,
+}
+
+impl Pill {
+    /// Los tramos unidos con « · » (para las pruebas y la accesibilidad).
+    pub fn label(&self) -> String {
+        let mut parts = vec![self.lead.clone()];
+        parts.extend(self.route.clone());
+        parts.extend(self.reason.clone());
+        parts.join(" · ")
+    }
+}
+
+/// Ruta en una palabra.
+fn route_label(path: Path) -> &'static str {
+    match path {
+        Path::Direct => t!("room-directa"),
+        Path::Relayed => t!("room-relay"),
+    }
+}
+
+/// Motivo corto del relay a partir de la frase de la conexión (`DirectAttempt::relay_reason`).
+pub fn short_relay_reason(reason: &str) -> &'static str {
+    if reason.contains("CGNAT") {
+        t!("room-relay-cgnat")
+    } else if reason.contains("red local") {
+        t!("room-relay-red-local")
+    } else if reason.contains("no anunció") {
+        t!("room-relay-sin-direcciones")
+    } else if reason.contains("se pidió") {
+        t!("room-relay-forzado")
+    } else {
+        t!("room-relay-directa-fallo")
+    }
+}
+
+/// Lo que más duele del enlace ahora: la pérdida si llega al 1 %, si no el RTT.
+fn worst(summary: &LatencySummary) -> Option<String> {
+    let link = summary.link.as_ref()?;
+    Some(if link.loss_percent >= 1.0 {
+        t!(
+            "room-perdida-valor",
+            value = stats::number(link.loss_percent, 0)
+        )
+    } else {
+        t!("room-rtt-valor", value = stats::number(link.rtt_ms, 0))
+    })
+}
+
+/// La píldora para el estado de ahora.
+pub fn pill(state: &State, now: Instant) -> Pill {
+    if let Some(reconnecting) = &state.reconnecting {
+        let wait = reconnecting.at.saturating_duration_since(now);
+        return Pill {
+            tone: None,
+            reconnecting: true,
+            lead: t!("room-reconectando").to_owned(),
+            route: None,
+            relayed: false,
+            reason: (!wait.is_zero()).then(|| {
+                t!(
+                    "room-segundos",
+                    secs = format!("{:.0}", wait.as_secs_f64().ceil())
+                )
+            }),
+        };
+    }
+    let route = state.path.map(|path| route_label(path).to_owned());
+    let relayed = state.path == Some(Path::Relayed);
+    let relay_reason = || {
+        relayed.then(|| {
+            state
+                .relay_reason
+                .as_deref()
+                .map_or(t!("room-relay-directa-fallo"), short_relay_reason)
+                .to_owned()
+        })
+    };
+    let (Some(added), Some(stats)) = (state.added_ms(), state.stats.as_ref()) else {
+        return Pill {
+            tone: None,
+            reconnecting: false,
+            lead: if route.is_some() {
+                t!("room-midiendo-corto").to_owned()
+            } else {
+                t!("room-conectando").to_owned()
+            },
+            route,
+            relayed,
+            reason: relay_reason(),
+        };
+    };
+    let level = QualityLevel::from_overhead_ms(added);
+    let reason = if level == QualityLevel::Poor {
+        worst(&stats.summary).or_else(relay_reason)
+    } else {
+        relay_reason()
+    };
+    Pill {
+        tone: Some(quality_tone(level)),
+        reconnecting: false,
+        lead: format!("{} ms", stats::number(added, 0)),
+        route,
+        relayed,
+        reason,
     }
 }
 
 /// Mensajes.
 #[derive(Debug, Clone)]
 pub enum Msg {
-    /// Panel de estadísticas.
+    /// `Ctrl+Alt+S`: abre o cierra el panel en «Conexión».
     ToggleStats,
-    /// Panel de mandos.
+    /// `Ctrl+Alt+J`: abre o cierra el panel en «Sala» (mandos y personas).
     TogglePads,
-    /// Panel de las personas de la sala.
-    TogglePeople,
+    /// Abre el panel en esa pestaña o, si ya estaba en ella, lo cierra.
+    TogglePanel(Tab),
+    /// Cambia de pestaña.
+    ShowTab(Tab),
+    /// Cierra el panel.
+    ClosePanel,
     /// Oír o no a alguien (su hoja MLS) en este equipo.
     Hear(u32, bool),
     /// Mandos conectados y si el que se envía va tal cual.
@@ -269,6 +453,8 @@ pub enum Msg {
     ToggleMic,
     /// Audio del juego.
     ToggleGame,
+    /// VSync de la ventana (ajuste de este equipo, al momento).
+    SetVsync(bool),
     /// Pantalla completa.
     ToggleFullscreen,
     /// Salir (pide confirmación).
@@ -310,6 +496,8 @@ pub fn close(app: &mut App) -> Vec<Effect> {
         state.feed.close();
     }
     app.dialog = None;
+    app.chat.open = false;
+    app.chat.composing = false;
     let mut effects = vec![Effect::SetImmersive(false)];
     if app.fullscreen {
         effects.push(Effect::SetFullscreen(false));
@@ -328,6 +516,24 @@ pub fn close(app: &mut App) -> Vec<Effect> {
     effects
 }
 
+/// Abre el panel en `tab` (`None`: lo cierra); el chat se entera (solo se ve en su pestaña).
+fn set_panel(app: &mut App, tab: Option<Tab>) -> Vec<Effect> {
+    if let Some(state) = app.guest.as_mut() {
+        state.panel = tab;
+        if tab.is_some() {
+            let now = app.now;
+            state.reveal_bar(now);
+        }
+    }
+    chat::tab_changed(app, tab)
+}
+
+/// Abre `tab` o, si ya está abierta, cierra el panel.
+fn toggle_panel(app: &mut App, tab: Tab) -> Vec<Effect> {
+    let open = app.guest.as_ref().and_then(|state| state.panel);
+    set_panel(app, (open != Some(tab)).then_some(tab))
+}
+
 /// Reduce un mensaje.
 pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
     let now = app.now;
@@ -336,21 +542,12 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         return Vec::new();
     };
     match msg {
-        Msg::ToggleStats => {
-            state.stats_open = !state.stats_open;
-            state.pads_open &= !state.stats_open;
-            state.people_open &= !state.stats_open;
-        }
-        Msg::TogglePads => {
-            state.pads_open = !state.pads_open;
-            state.stats_open &= !state.pads_open;
-            state.people_open &= !state.pads_open;
-        }
-        Msg::TogglePeople => {
-            state.people_open = !state.people_open;
-            state.stats_open &= !state.people_open;
-            state.pads_open &= !state.people_open;
-        }
+        Msg::ToggleStats | Msg::TogglePads if state.phase == Phase::Connecting => {}
+        Msg::ToggleStats => return toggle_panel(app, Tab::Connection),
+        Msg::TogglePads => return toggle_panel(app, Tab::Room),
+        Msg::TogglePanel(tab) => return toggle_panel(app, tab),
+        Msg::ShowTab(tab) => return set_panel(app, Some(tab)),
+        Msg::ClosePanel => return set_panel(app, None),
         Msg::Hear(leaf, hear) => {
             if hear {
                 state.muted.remove(&leaf);
@@ -389,11 +586,15 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::ImmersiveChanged(immersive) => {
             state.immersive = immersive;
             if !immersive {
-                state.bar_until = now + motion::BAR_HIDE;
+                state.reveal_bar(now);
             }
         }
         Msg::ToggleMic => return vec![Effect::ToggleMic],
         Msg::ToggleGame => return vec![Effect::ToggleGameAudio],
+        Msg::SetVsync(vsync) => {
+            app.settings.video.vsync = vsync;
+            return app.settings_changed();
+        }
         Msg::ToggleFullscreen => return vec![Effect::SetFullscreen(!fullscreen)],
         Msg::Leave => {
             if state.probe {
@@ -415,7 +616,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::Continue => {
             if state.feed.has_frame() {
                 state.phase = Phase::Video;
-                state.bar_until = now + motion::BAR_HIDE;
+                state.reveal_bar(now);
             }
         }
     }
@@ -431,29 +632,23 @@ fn pads_notice(before: &[ConnectedPad], after: &[ConnectedPad], slot: bool) -> O
         .map(|pad| pad.key.name.as_str());
     let (mut text, connected) = if let Some(pad) = after.iter().find(|p| !has(before, &p.key)) {
         (
-            t!(
-                "pantalla-guest-mando-conectado",
-                name = pad.key.name.as_str()
-            ),
+            t!("room-mando-conectado", name = pad.key.name.as_str()),
             Some(&pad.key),
         )
     } else {
         let pad = before.iter().find(|p| !has(after, &p.key))?;
         (
-            t!(
-                "pantalla-guest-mando-desconectado",
-                name = pad.key.name.as_str()
-            ),
+            t!("room-mando-desconectado", name = pad.key.name.as_str()),
             None,
         )
     };
     if slot {
         let more = match (active, connected) {
             (Some(name), Some(key)) if name != key.name => {
-                t!("pantalla-guest-sigues-enviando", name = name)
+                t!("room-sigues-enviando", name = name)
             }
-            (Some(name), None) => t!("pantalla-guest-ahora-envias", name = name),
-            (None, None) => t!("pantalla-guest-no-envias-ningun-mando").to_owned(),
+            (Some(name), None) => t!("room-ahora-envias", name = name),
+            (None, None) => t!("room-no-envias-ningun-mando").to_owned(),
             _ => String::new(),
         };
         if !more.is_empty() {
@@ -473,28 +668,25 @@ pub fn permissions_notice(before: Allowed, after: Allowed) -> Option<(Tone, Stri
     let text = if gained(before.keyboard_mouse, after.keyboard_mouse) {
         (
             Tone::Success,
-            t!("pantalla-guest-el-anfitrion-te-ha-dado-teclado").to_owned(),
+            t!("room-el-anfitrion-te-ha-dado-teclado").to_owned(),
         )
     } else if before.keyboard_mouse && !after.keyboard_mouse {
         (
             Tone::Warning,
-            t!("pantalla-guest-el-anfitrion-te-ha-quitado-el").to_owned(),
+            t!("room-el-anfitrion-te-ha-quitado-el").to_owned(),
         )
     } else if let (None, Some(slot)) = (before.gamepad_slot, after.gamepad_slot) {
         (
             Tone::Success,
-            t!("pantalla-guest-el-anfitrion-te-ha-dado-el", slot = slot),
+            t!("room-el-anfitrion-te-ha-dado-el", slot = slot),
         )
     } else if after.gamepad_slot.is_none() {
         (
             Tone::Warning,
-            t!("pantalla-guest-el-anfitrion-te-ha-quitado-el-2").to_owned(),
+            t!("room-el-anfitrion-te-ha-quitado-el-2").to_owned(),
         )
     } else {
-        (
-            Tone::Info,
-            t!("pantalla-guest-ahora-puedes", label = after.label()),
-        )
+        (Tone::Info, t!("room-ahora-puedes", label = after.label()))
     };
     Some(text)
 }
@@ -510,7 +702,7 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
         }
         Event::GuestStarted(Err(err)) => {
             app.dialog = Some(Dialog::SessionEnded {
-                title: t!("pantalla-guest-no-se-pudo-entrar-en-la").to_owned(),
+                title: t!("room-no-se-pudo-entrar-en-la").to_owned(),
                 text: err,
             });
         }
@@ -535,10 +727,7 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                 app.toast(tone, text);
             }
             if corrupt {
-                app.toast(
-                    Tone::Warning,
-                    t!("pantalla-guest-el-video-llega-danado").to_owned(),
-                );
+                app.toast(Tone::Warning, t!("room-el-video-llega-danado").to_owned());
             }
         }
         Event::GuestEnded(reason) => {
@@ -549,20 +738,20 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                 None if state.leaving || state.probe => return close(app),
                 None => {
                     app.dialog = Some(Dialog::SessionEnded {
-                        title: t!("pantalla-guest-la-sesion-ha-terminado").to_owned(),
-                        text: t!("pantalla-guest-el-anfitrion-ha-cerrado-la-sala").to_owned(),
+                        title: t!("room-la-sesion-ha-terminado").to_owned(),
+                        text: t!("room-el-anfitrion-ha-cerrado-la-sala").to_owned(),
                     });
                 }
                 Some(reason) => {
                     let lower = reason.to_lowercase();
                     let title = if lower.contains("expulsado") {
-                        t!("pantalla-guest-el-anfitrion-te-ha-expulsado-de")
+                        t!("room-el-anfitrion-te-ha-expulsado-de")
                     } else if lower.contains("cerrado la sala") {
-                        t!("pantalla-guest-el-anfitrion-ha-cerrado-la-sala-2")
+                        t!("room-el-anfitrion-ha-cerrado-la-sala-2")
                     } else if lower.contains("red") || lower.contains("conexión") {
-                        t!("pantalla-guest-se-perdio-la-conexion-con-la")
+                        t!("room-se-perdio-la-conexion-con-la")
                     } else {
-                        t!("pantalla-guest-la-sesion-ha-terminado")
+                        t!("room-la-sesion-ha-terminado")
                     };
                     app.dialog = Some(Dialog::SessionEnded {
                         title: title.to_owned(),
@@ -604,6 +793,7 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
             state.path = Some(path);
             state.remote = Some(remote);
         }
+        SessionEvent::Candidates { relay_reason, .. } => state.relay_reason = relay_reason,
         SessionEvent::QualityEstimate { rtt_ms, level } => {
             state.estimate = Some(Estimate {
                 rtt_ms,
@@ -614,7 +804,7 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
         SessionEvent::VideoCodec { codec, detail } => {
             state.codec = Some(format!(
                 "{codec} ({})",
-                detail.trim_start_matches(t!("pantalla-guest-decodifica"))
+                detail.trim_start_matches(t!("room-decodifica"))
             ));
         }
         SessionEvent::Reconnecting {
@@ -633,12 +823,15 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
         SessionEvent::Reconnected { path } => {
             state.reconnecting = None;
             state.path = Some(path);
-            app.toast(Tone::Success, t!("pantalla-guest-conexion-recuperada"));
+            if path == Path::Direct {
+                state.relay_reason = None;
+            }
+            app.toast(Tone::Success, t!("room-conexion-recuperada"));
         }
         SessionEvent::RelayUnavailable(message) => {
             app.toast(
                 Tone::Warning,
-                t!("pantalla-guest-sin-relay-message", message = message),
+                t!("room-sin-relay-message", message = message),
             );
         }
         SessionEvent::Warning(message) => app.toast(Tone::Warning, message),
@@ -677,6 +870,8 @@ pub fn view<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     }
 }
 
+// --- Sala de espera -------------------------------------------------------------------------------
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mark {
     Done,
@@ -710,13 +905,13 @@ fn quality_card<'a>(estimate: &Estimate) -> Element<'a, Message> {
     let tone = quality_tone(estimate.level);
     ui::card(
         column![
-            ui::caption(t!("pantalla-guest-calidad-esperada-con-este-anfitrion")),
+            ui::caption(t!("room-calidad-esperada-con-este-anfitrion")),
             row![
                 text(format!("{:.0}", estimate.rtt_ms))
                     .size(type_size::DISPLAY)
                     .font(coroom_ui::font::SEMIBOLD),
                 column![
-                    ui::secondary(t!("pantalla-guest-ms-de-rtt")),
+                    ui::secondary(t!("room-ms-de-rtt")),
                     ui::status_badge(tone, estimate.level.label())
                 ]
                 .spacing(4)
@@ -725,7 +920,7 @@ fn quality_card<'a>(estimate: &Estimate) -> Element<'a, Message> {
             .align_y(Alignment::Center),
             ui::body(capitalize(estimate.level.description())).wrapping(Wrapping::WordOrGlyph),
             ui::caption(t!(
-                "pantalla-guest-sumando-el-pipeline-tipico-25-ms",
+                "room-sumando-el-pipeline-tipico-25-ms",
                 valor = format!(
                     "{:.0}",
                     estimate.rtt_ms + coroom_session::remote::TYPICAL_PIPELINE_MS
@@ -743,6 +938,60 @@ fn capitalize(text: &str) -> String {
         Some(first) => first.to_uppercase().chain(chars).collect::<String>() + ".",
         None => String::new(),
     }
+}
+
+/// Título de la sala: «Sala de Bea» (o «Sala» hasta saber de quién es).
+fn room_title(state: &State) -> String {
+    state.host_name.as_ref().map_or_else(
+        || t!("room-sala").to_owned(),
+        |name| t!("room-sala-de-name", name = name),
+    )
+}
+
+/// Cabecera de la sala de espera: volver (cancela la entrada), la sala y el chat.
+fn waiting_header<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
+    let keys = &app.settings.input.shortcuts;
+    let chat_open = state.panel == Some(Tab::Chat);
+    let chat_button = ui::with_tooltip(
+        button(center(icon_with(
+            Icon::Chat,
+            size::ICON,
+            if chat_open {
+                SvgClass::OnAccent
+            } else {
+                SvgClass::Text
+            },
+        )))
+        .width(Length::Fixed(size::CONTROL))
+        .height(Length::Fixed(size::CONTROL))
+        .padding(0)
+        .class(if chat_open {
+            ButtonClass::Primary
+        } else {
+            ButtonClass::Flat
+        })
+        .on_press(on(Msg::TogglePanel(Tab::Chat))),
+        if app.chat.ready {
+            t!("room-chat", key = keys.chat)
+        } else {
+            t!("room-chat-con-las-claves").to_owned()
+        },
+    );
+    container(
+        row![
+            ui::icon_button(Icon::ArrowLeft, t!("room-cancelar"), Some(on(Msg::Cancel))),
+            ui::heading(room_title(state)),
+            ui::fill(),
+            chat::with_unread(chat_button, app.chat.unread, size::CONTROL),
+        ]
+        .spacing(space::XS)
+        .align_y(Alignment::Center),
+    )
+    .height(Length::Fixed(HEADERBAR_HEIGHT))
+    .padding(Padding::from([0.0, space::S]))
+    .center_y(Length::Fixed(HEADERBAR_HEIGHT))
+    .class(ContainerClass::Sidebar)
+    .into()
 }
 
 fn connecting<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
@@ -763,24 +1012,24 @@ fn connecting<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     let mut steps = Column::new().spacing(space::S);
     steps = steps.push(step(
         signal,
-        t!("pantalla-guest-senalizacion"),
+        t!("room-senalizacion"),
         state
             .host_name
             .as_ref()
-            .map(|name| t!("pantalla-guest-dentro-de-la-sala-de-name", name = name)),
+            .map(|name| t!("room-dentro-de-la-sala-de-name", name = name)),
     ));
     steps = steps.push(step(
         keys,
-        t!("pantalla-guest-claves-de-la-sala"),
-        Some(t!("pantalla-guest-cifrado-de-extremo-a-extremo-con").to_owned()),
+        t!("room-claves-de-la-sala"),
+        Some(t!("room-cifrado-de-extremo-a-extremo-con").to_owned()),
     ));
     steps = steps.push(step(
         link,
-        t!("pantalla-guest-conexion-con-el-anfitrion"),
+        t!("room-conexion-con-el-anfitrion"),
         state.path.map(|path| {
             let text = match path {
-                Path::Direct => t!("pantalla-guest-directa-entre-los-dos-equipos"),
-                Path::Relayed => t!("pantalla-guest-por-el-relay-del-servidor"),
+                Path::Direct => t!("room-directa-entre-los-dos-equipos"),
+                Path::Relayed => t!("room-por-el-relay-del-servidor"),
             };
             match state.remote {
                 Some(remote) => format!("{text} · {remote}"),
@@ -790,16 +1039,16 @@ fn connecting<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     ));
     steps = steps.push(step(
         quality,
-        t!("pantalla-guest-calidad-de-la-conexion"),
+        t!("room-calidad-de-la-conexion"),
         state
             .estimate
             .map(|e| format!("{} · {}", stats::ms(e.rtt_ms), e.level.label())),
     ));
-    steps = steps.push(step(video, t!("pantalla-guest-video"), state.codec.clone()));
+    steps = steps.push(step(video, t!("room-video"), state.codec.clone()));
     let mut content = Column::new()
         .spacing(space::M)
         .push(ui::heading(t!(
-            "pantalla-guest-entrando-en-la-sala",
+            "room-entrando-en-la-sala",
             valor = super::host::spaced(&state.code)
         )))
         .push(steps);
@@ -813,38 +1062,62 @@ fn connecting<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     if let Some(estimate) = &state.estimate {
         cards = cards.push(quality_card(estimate));
     }
-    let mut actions = row![ui::flat(
-        t!("pantalla-guest-cancelar"),
-        Some(on(Msg::Cancel))
-    )]
-    .spacing(space::XS);
+    let mut actions = row![ui::flat(t!("room-cancelar"), Some(on(Msg::Cancel)))].spacing(space::XS);
     if state.feed.has_frame() {
-        actions = actions.push(ui::fill()).push(ui::primary(
-            t!("pantalla-guest-ver-ya"),
-            Some(on(Msg::Continue)),
-        ));
+        actions = actions
+            .push(ui::fill())
+            .push(ui::primary(t!("room-ver-ya"), Some(on(Msg::Continue))));
     }
     cards = cards.push(actions);
-    scrollable(
+    let body: Element<'a, Message> = scrollable(
         container(cards)
-            .padding(Padding::from([space::XL * 1.5, space::L]))
+            .padding(Padding::from([space::XL, space::L]))
             .center_x(Length::Fill),
     )
     .height(Length::Fill)
-    .into()
+    .width(Length::Fill)
+    .into();
+    let mut main = row![body].height(Length::Fill);
+    if state.panel == Some(Tab::Chat) {
+        main = main.push(
+            container(chat::panel(app, Surface::Window))
+                .width(Length::Fixed(size::STATS_PANEL))
+                .height(Length::Fill)
+                .padding(Padding {
+                    top: space::S,
+                    right: space::S,
+                    bottom: space::S,
+                    left: 0.0,
+                }),
+        );
+    }
+    let page = column![waiting_header(app, state), main].height(Length::Fill);
+    match chat::bubbles(app) {
+        Some(bubbles) => stack![
+            page,
+            container(bubbles)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(Horizontal::Right)
+                .align_y(Vertical::Bottom)
+                .padding(space::S)
+        ]
+        .into(),
+        None => page.into(),
+    }
 }
 
 fn reconnect_banner<'a>(app: &'a App, reconnecting: &'a Reconnecting) -> Element<'a, Message> {
     let wait = reconnecting.at.saturating_duration_since(app.now);
     let text = if wait.is_zero() {
         t!(
-            "pantalla-guest-se-perdio-la-conexion-reconectando-intento",
+            "room-se-perdio-la-conexion-reconectando-intento",
             attempt = reconnecting.attempt,
             of = reconnecting.of
         )
     } else {
         t!(
-            "pantalla-guest-se-perdio-la-conexion-reconectando-en",
+            "room-se-perdio-la-conexion-reconectando-en",
             valor = format!("{:.0}", wait.as_secs_f64().ceil()),
             attempt = reconnecting.attempt,
             of = reconnecting.of
@@ -853,9 +1126,11 @@ fn reconnect_banner<'a>(app: &'a App, reconnecting: &'a Reconnecting) -> Element
     ui::banner(
         Tone::Warning,
         text,
-        Some((t!("pantalla-guest-reintentar-ya"), on(Msg::Reconnect))),
+        Some((t!("room-reintentar-ya"), on(Msg::Reconnect))),
     )
 }
+
+// --- Sobre el vídeo -------------------------------------------------------------------------------
 
 fn bar_button<'a>(
     glyph: Icon,
@@ -887,50 +1162,83 @@ fn overlay_text<'a>(
         .class(TextClass::OverlaySecondary)
 }
 
-fn top_bar<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
-    let summary = state.stats.as_ref().map(|stats| &stats.summary);
-    let rtt = summary
-        .and_then(|summary| summary.link.as_ref())
-        .map(|link| link.rtt_ms)
-        .or(state.estimate.map(|estimate| estimate.rtt_ms));
-    let level = rtt.map(QualityLevel::from_rtt_ms);
+/// Colores del modo oscuro (el panel y la barra flotan siempre oscuros sobre el vídeo).
+fn dark(app: &App) -> Palette {
+    Palette::new(Mode::Dark, app.accent())
+}
+
+/// Insignia del nivel con la latencia añadida («Buena · 48 ms»), o «Midiendo».
+fn level_badge<'a>(state: &State, dark: &Palette) -> Element<'a, Message> {
+    let (tone, label) = match (state.level(), state.added_ms()) {
+        _ if state.reconnecting.is_some() => (Tone::Neutral, t!("room-reconectando").to_owned()),
+        (Some(level), Some(added)) => (
+            quality_tone(level),
+            t!(
+                "room-nivel-ms",
+                level = level.label(),
+                value = stats::number(added, 0)
+            ),
+        ),
+        _ => (Tone::Neutral, t!("room-midiendo-corto").to_owned()),
+    };
+    // Sobre la barra (siempre oscura), con los colores de la paleta oscura en los dos modos.
+    container(
+        row![
+            ui::dot(tone),
+            text(label)
+                .size(type_size::CAPTION)
+                .font(coroom_ui::font::SEMIBOLD)
+                .class(TextClass::Custom(dark.tone(tone).text.color()))
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    )
+    .padding(Padding::from([3.0, 10.0]))
+    .class(ContainerClass::OverlayBadge(tone))
+    .into()
+}
+
+/// «Directa · AV1 · 1440p60 · 18,4 Mbit/s».
+fn bar_facts(state: &State) -> String {
     let mut facts = Vec::new();
-    if let Some(rtt) = rtt {
-        facts.push(format!("RTT {}", stats::ms(rtt)));
-    }
     if let Some(path) = state.path {
-        let path = match path {
-            Path::Direct => "directo",
-            Path::Relayed => "relay",
-        };
-        facts.push(match state.remote {
-            Some(remote) => format!("{path} {remote}"),
-            None => path.to_owned(),
-        });
+        facts.push(route_label(path).to_owned());
     }
     if let Some(codec) = state.codec.as_ref().and_then(|c| c.split(' ').next()) {
         facts.push(codec.to_owned());
     }
+    let summary = state.stats.as_ref().map(|stats| &stats.summary);
+    if let Some((_, height)) = state.feed.frame_size() {
+        let fps = summary.map_or(0.0, |summary| summary.fps);
+        facts.push(if fps >= 1.0 {
+            format!("{height}p{:.0}", fps)
+        } else {
+            format!("{height}p")
+        });
+    }
     if let Some(summary) = summary {
         facts.push(stats::kbps(summary.bitrate_kbps));
     }
-    let mut left = row![].spacing(space::S).align_y(Alignment::Center);
-    if let Some(level) = level {
-        left = left.push(ui::status_badge(quality_tone(level), level.label()));
-    }
-    left = left.push(
+    facts.join(" · ")
+}
+
+fn top_bar<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
+    let left = row![
+        level_badge(state, &dark(app)),
         column![
-            text(state.host_name.as_ref().map_or_else(
-                || t!("pantalla-guest-sala").to_owned(),
-                |name| t!("pantalla-guest-sala-de-name", name = name)
-            ))
-            .size(type_size::BODY)
-            .font(coroom_ui::font::SEMIBOLD)
-            .class(TextClass::Overlay),
-            overlay_text(facts.join(" · "))
+            text(room_title(state))
+                .size(type_size::BODY)
+                .font(coroom_ui::font::SEMIBOLD)
+                .class(TextClass::Overlay)
+                .wrapping(Wrapping::None),
+            overlay_text(bar_facts(state))
+                .size(type_size::CAPTION)
+                .wrapping(Wrapping::None)
         ]
-        .spacing(1),
-    );
+        .spacing(1)
+    ]
+    .spacing(space::S)
+    .align_y(Alignment::Center);
     let stats_now = state.stats.as_ref();
     let mic_muted = stats_now.is_some_and(|s| s.mic_muted);
     let voice = stats_now.is_some_and(|s| s.voice);
@@ -942,9 +1250,9 @@ fn top_bar<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         buttons = buttons.push(bar_button(
             if mic_muted { Icon::MicOff } else { Icon::Mic },
             if mic_muted {
-                t!("pantalla-guest-activar-el-microfono", key = keys.mic)
+                t!("room-activar-el-microfono", key = keys.mic)
             } else {
-                t!("pantalla-guest-silenciar-el-microfono", key = keys.mic)
+                t!("room-silenciar-el-microfono", key = keys.mic)
             },
             mic_muted,
             on(Msg::ToggleMic),
@@ -957,12 +1265,9 @@ fn top_bar<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
             Icon::Volume
         },
         if game_muted {
-            t!("pantalla-guest-activar-el-audio-del-juego", key = keys.game)
+            t!("room-activar-el-audio-del-juego", key = keys.game)
         } else {
-            t!(
-                "pantalla-guest-silenciar-el-audio-del-juego",
-                key = keys.game
-            )
+            t!("room-silenciar-el-audio-del-juego", key = keys.game)
         },
         game_muted,
         on(Msg::ToggleGame),
@@ -970,28 +1275,26 @@ fn top_bar<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     if allowed.keyboard_mouse {
         buttons = buttons.push(bar_button(
             Icon::Pointer,
-            t!("pantalla-guest-modo-inmersivo", key = keys.immersive),
+            t!("room-modo-inmersivo", key = keys.immersive),
             state.immersive,
             on(Msg::ToggleImmersive),
         ));
     }
-    buttons = buttons.push(bar_button(
-        Icon::Users,
-        t!("pantalla-guest-personas"),
-        state.people_open,
-        on(Msg::TogglePeople),
-    ));
-    buttons = buttons.push(bar_button(
-        Icon::Gamepad,
-        t!("pantalla-guest-mandos", key = keys.pads),
-        state.pads_open,
-        on(Msg::TogglePads),
+    buttons = buttons.push(chat::with_unread(
+        bar_button(
+            Icon::Chat,
+            t!("room-chat", key = keys.chat),
+            state.panel == Some(Tab::Chat),
+            on(Msg::TogglePanel(Tab::Chat)),
+        ),
+        app.chat.unread,
+        size::CONTROL,
     ));
     buttons = buttons.push(bar_button(
         Icon::Activity,
-        t!("pantalla-guest-estadisticas", key = keys.stats),
-        state.stats_open,
-        on(Msg::ToggleStats),
+        t!("room-conexion", key = keys.stats),
+        state.panel == Some(Tab::Connection),
+        on(Msg::TogglePanel(Tab::Connection)),
     ));
     buttons = buttons.push(bar_button(
         if app.fullscreen {
@@ -999,7 +1302,7 @@ fn top_bar<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         } else {
             Icon::Maximize
         },
-        t!("pantalla-guest-pantalla-completa-f11"),
+        t!("room-pantalla-completa-f11"),
         app.fullscreen,
         on(Msg::ToggleFullscreen),
     ));
@@ -1008,7 +1311,7 @@ fn top_bar<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         button(
             row![
                 icon_with(Icon::LogOut, 16.0, SvgClass::OnDestructive),
-                text(t!("pantalla-guest-salir"))
+                text(t!("room-salir"))
                     .size(type_size::BODY)
                     .font(coroom_ui::font::SEMIBOLD)
             ]
@@ -1024,10 +1327,87 @@ fn top_bar<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
             .spacing(space::M)
             .align_y(Alignment::Center),
     )
-    .padding(Padding::from([8.0, 16.0]))
+    .padding(Padding::from([0.0, space::S]))
+    .height(Length::Fixed(size::VIDEO_BAR))
+    .center_y(Length::Fixed(size::VIDEO_BAR))
     .width(Length::Fill)
     .class(ContainerClass::Overlay)
     .into()
+}
+
+/// La píldora de latencia: un clic abre el panel en «Conexión»; el tramo «Relay · motivo», el
+/// diagnóstico.
+fn pill_view<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
+    let pill = pill(state, app.now);
+    let sep = || {
+        text("·")
+            .size(type_size::SECONDARY)
+            .class(TextClass::OverlaySecondary)
+    };
+    let strong = |content: String| {
+        text(content)
+            .size(type_size::SECONDARY)
+            .font(coroom_ui::font::SEMIBOLD)
+            .class(TextClass::Overlay)
+            .wrapping(Wrapping::None)
+    };
+    let dot: Element<'a, Message> = match pill.tone {
+        Some(tone) => ui::dot(tone),
+        None => ui::dot(Tone::Neutral),
+    };
+    let mut lead = row![dot].spacing(space::XS).align_y(Alignment::Center);
+    if pill.reconnecting {
+        lead = lead.push(icon_with(Icon::Refresh, 14.0, SvgClass::Overlay));
+    }
+    lead = lead.push(strong(pill.lead.clone()));
+    let reason = pill.reason.clone().map(|reason| {
+        text(reason)
+            .size(type_size::SECONDARY)
+            .class(TextClass::OverlaySecondary)
+            .wrapping(Wrapping::None)
+    });
+    let segment = |content: Element<'a, Message>, message: Message| {
+        button(content)
+            .padding(Padding::from([4.0, 8.0]))
+            .class(ButtonClass::Overlay { active: false })
+            .on_press(message)
+    };
+    let connection = on(Msg::TogglePanel(Tab::Connection));
+    let content: Element<'a, Message> = if pill.relayed && !pill.reconnecting {
+        // «48 ms» abre el panel; «Relay · CGNAT», el diagnóstico.
+        let mut relay = row![strong(pill.route.clone().unwrap_or_default())]
+            .spacing(space::XS)
+            .align_y(Alignment::Center);
+        if let Some(reason) = reason {
+            relay = relay.push(sep()).push(reason);
+        }
+        row![
+            segment(lead.into(), connection),
+            sep(),
+            ui::with_tooltip(
+                segment(relay.into(), Message::Diagnostics(diagnostics::Msg::Open)),
+                t!("room-por-que-relay")
+            ),
+        ]
+        .spacing(2)
+        .align_y(Alignment::Center)
+        .into()
+    } else {
+        let mut all = lead;
+        if let Some(route) = pill.route.clone() {
+            all = all.push(sep()).push(strong(route));
+        }
+        if let Some(reason) = reason {
+            all = all.push(sep()).push(reason);
+        }
+        segment(all.into(), connection).into()
+    };
+    container(content)
+        .padding(2)
+        .height(Length::Fixed(36.0))
+        .center_y(Length::Fixed(36.0))
+        .class(ContainerClass::OverlayPill)
+        .into()
 }
 
 fn stat_row<'a>(label: impl text::IntoFragment<'a>, value: String) -> Element<'a, Message> {
@@ -1040,21 +1420,49 @@ fn stat_row<'a>(label: impl text::IntoFragment<'a>, value: String) -> Element<'a
             .align_x(Horizontal::Right)
     ]
     .spacing(space::XS)
+    .align_y(Alignment::Center)
     .into()
 }
 
-fn stat_section<'a>(title: &'a str, rows: Vec<Element<'a, Message>>) -> Element<'a, Message> {
-    let mut content = column![
-        text(title)
-            .size(type_size::CAPTION)
+/// Título de sección del panel, en versalitas, con algo a la derecha si hace falta.
+fn section_title<'a>(title: &str, right: Option<Element<'a, Message>>) -> Element<'a, Message> {
+    let mut line = row![
+        text(title.to_uppercase())
+            .size(type_size::CAPTION - 1.0)
             .font(coroom_ui::font::SEMIBOLD)
             .class(TextClass::OverlaySecondary)
+            .width(Length::Fill)
     ]
-    .spacing(4);
+    .align_y(Alignment::Center);
+    if let Some(right) = right {
+        line = line.push(right);
+    }
+    line.into()
+}
+
+fn stat_section<'a>(title: &str, rows: Vec<Element<'a, Message>>) -> Element<'a, Message> {
+    let mut content = column![section_title(title, None)].spacing(6);
     for row in rows {
         content = content.push(row);
     }
     content.into()
+}
+
+/// Fila con un interruptor.
+fn switch_row<'a>(
+    label: impl text::IntoFragment<'a>,
+    value: bool,
+    on_toggle: Option<Message>,
+) -> Element<'a, Message> {
+    row![
+        overlay_text(label)
+            .wrapping(Wrapping::WordOrGlyph)
+            .width(Length::Fill),
+        ui::switch(value, on_toggle.map(|message| move |_| message.clone())),
+    ]
+    .spacing(space::S)
+    .align_y(Alignment::Center)
+    .into()
 }
 
 /// Una opción del panel de mandos.
@@ -1100,10 +1508,9 @@ fn pad_option<'a>(
     .into()
 }
 
-/// Panel de mandos: cuál se envía (automático o uno concreto) entre los conectados.
 /// Quién está en la sala y a quién se oye: cada uno decide en su equipo, sin que cambie nada para
 /// los demás.
-fn people_panel(state: &State) -> Element<'_, Message> {
+fn people_section(state: &State) -> Element<'_, Message> {
     let speaking: Vec<&str> = state
         .stats
         .as_ref()
@@ -1114,18 +1521,18 @@ fn people_panel(state: &State) -> Element<'_, Message> {
     for member in &state.members {
         let talks = speaking.contains(&talker_label(member.guest).as_str());
         let role = if member.guest == 0 {
-            t!("pantalla-guest-anfitrion")
+            t!("room-anfitrion")
         } else {
-            t!("pantalla-guest-invitado")
+            t!("room-invitado")
         };
         let detail = if talks {
-            format!("{role} · {}", t!("pantalla-guest-hablando"))
+            format!("{role} · {}", t!("room-hablando"))
         } else {
             role.to_owned()
         };
         let label = column![
             text(if member.you {
-                t!("pantalla-guest-tu-nombre", name = member.name.as_str())
+                t!("room-tu-nombre", name = member.name.as_str())
             } else {
                 member.name.clone()
             })
@@ -1147,9 +1554,9 @@ fn people_panel(state: &State) -> Element<'_, Message> {
                     Icon::Headphones
                 },
                 if muted {
-                    t!("pantalla-guest-volver-a-oir", name = member.name.as_str())
+                    t!("room-volver-a-oir", name = member.name.as_str())
                 } else {
-                    t!("pantalla-guest-dejar-de-oir", name = member.name.as_str())
+                    t!("room-dejar-de-oir", name = member.name.as_str())
                 },
                 muted,
                 on(Msg::Hear(leaf, muted)),
@@ -1164,42 +1571,43 @@ fn people_panel(state: &State) -> Element<'_, Message> {
     }
     let mut content = Column::new()
         .spacing(space::S)
-        .push(stat_section(t!("pantalla-guest-personas-en-la-sala"), rows));
+        .push(stat_section(t!("room-personas-en-la-sala"), rows));
     if state.members.is_empty() {
-        content = content.push(overlay_text(t!("pantalla-guest-esperando-la-lista")));
+        content = content.push(overlay_text(t!("room-esperando-la-lista")));
     }
-    content = content.push(overlay_text(t!("pantalla-guest-solo-en-tu-equipo")));
-    container(content)
-        .padding(space::M)
-        .width(Length::Fixed(size::STATS_PANEL))
-        .class(ContainerClass::Overlay)
-        .into()
+    content = content.push(
+        overlay_text(t!("room-solo-en-tu-equipo"))
+            .size(type_size::CAPTION)
+            .wrapping(Wrapping::WordOrGlyph),
+    );
+    content.into()
 }
 
-fn pads_panel<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
+/// Mandos: cuál se envía (automático o uno concreto) entre los conectados.
+fn pads_section<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     let choice = &app.settings.input.pad;
     let slot = state.stats.as_ref().and_then(|s| s.allowed.gamepad_slot);
     let pads = state.pads.as_deref().unwrap_or_default();
     let mut options = vec![pad_option(
         *choice == PadChoice::Auto,
-        t!("pantalla-guest-automatico").to_owned(),
-        Some(t!("pantalla-guest-el-ultimo-que-conectes").to_owned()),
+        t!("room-automatico").to_owned(),
+        Some(t!("room-el-ultimo-que-conectes").to_owned()),
         Vec::new(),
         PadChoice::Auto,
     )];
     for pad in pads {
         let detail = if pad.active {
             match slot {
-                Some(slot) => t!("pantalla-guest-enviando-ranura", slot = slot),
-                None => t!("pantalla-guest-sin-ranura").to_owned(),
+                Some(slot) => t!("room-enviando-ranura", slot = slot),
+                None => t!("room-sin-ranura").to_owned(),
             }
         } else {
-            t!("pantalla-guest-conectado").to_owned()
+            t!("room-conectado").to_owned()
         };
         let transport = match &pad.kind {
             PadKind::Hid => "HID",
             PadKind::XInput => "XInput",
-            PadKind::Converted(_) => t!("pantalla-guest-solo-convertido"),
+            PadKind::Converted(_) => t!("room-solo-convertido"),
         };
         let mut badges = vec![format!(
             "{:04x}:{:04x} · {transport}",
@@ -1207,9 +1615,9 @@ fn pads_panel<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         )];
         if pad.active && slot.is_some() {
             badges.push(if state.pads_raw {
-                t!("pantalla-guest-tal-cual").to_owned()
+                t!("room-tal-cual").to_owned()
             } else {
-                t!("pantalla-guest-convertido").to_owned()
+                t!("room-convertido").to_owned()
             });
         }
         options.push(pad_option(
@@ -1227,187 +1635,382 @@ fn pads_panel<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         options.push(pad_option(
             true,
             key.name.clone(),
-            Some(t!("pantalla-guest-desconectado").to_owned()),
+            Some(t!("room-desconectado").to_owned()),
             vec![format!("{:04x}:{:04x}", key.vendor, key.product)],
             choice.clone(),
         ));
     }
     let mut content = Column::new()
         .spacing(space::S)
-        .push(stat_section(t!("pantalla-guest-mando-que-envias"), options));
+        .push(stat_section(t!("room-mando-que-envias"), options));
     if pads.is_empty() {
-        content = content.push(overlay_text(t!("pantalla-guest-no-hay-mandos-conectados")));
+        content = content.push(overlay_text(t!("room-no-hay-mandos-conectados")));
     }
-    content = content.push(overlay_text(t!("pantalla-guest-se-recuerda-la-eleccion")));
-    container(content)
-        .padding(space::M)
-        .width(Length::Fixed(size::STATS_PANEL))
-        .class(ContainerClass::Overlay)
-        .into()
+    content =
+        content.push(overlay_text(t!("room-se-recuerda-la-eleccion")).size(type_size::CAPTION));
+    content.into()
 }
 
-fn stats_panel<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
-    let Some(current) = &state.stats else {
-        return container(overlay_text(t!("pantalla-guest-midiendo")))
-            .padding(space::M)
-            .width(Length::Fixed(size::STATS_PANEL))
-            .class(ContainerClass::Overlay)
-            .into();
+/// Pestaña «Sala»: personas (oír o no) y mandos.
+fn room_tab<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
+    scrollable(
+        column![people_section(state), pads_section(app, state)]
+            .spacing(space::L)
+            .padding(Padding::from([space::S, space::M])),
+    )
+    .height(Length::Fill)
+    .into()
+}
+
+/// Mediana en ms de una latencia en µs, o «midiendo».
+fn median(samples: usize, p50_us: u64) -> String {
+    if samples > 0 {
+        format!("{} ms", stats::number(p50_us as f64 / 1000.0, 0))
+    } else {
+        t!("room-midiendo").to_owned()
+    }
+}
+
+/// Pestaña «Conexión»: latencia añadida por partes, enlace, calidad y lo de este equipo.
+fn connection_tab<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
+    let dark = dark(app);
+    let summary = state.stats.as_ref().map(|stats| &stats.summary);
+    let mut sections = Column::new()
+        .spacing(space::M)
+        .padding(Padding::from([space::S, space::M]));
+
+    // Latencia añadida: la del vídeo de extremo a extremo, con su nivel; y por partes.
+    let headline: Element<'a, Message> = match (state.added_ms(), state.level()) {
+        (Some(added), Some(level)) => text(t!(
+            "room-ms-nivel",
+            value = stats::number(added, 0),
+            level = level.label()
+        ))
+        .size(type_size::SECONDARY)
+        .font(coroom_ui::font::MONO)
+        .class(TextClass::Overlay)
+        .into(),
+        _ => overlay_text(t!("room-midiendo")).into(),
     };
-    let summary = &current.summary;
-    let mut sections = Column::new().spacing(space::M);
-    let mut video = vec![
-        stat_row(
-            t!("pantalla-guest-fotogramas-por-segundo"),
-            format!("{:.0}", summary.fps),
-        ),
-        stat_row(
-            t!("pantalla-guest-bitrate-recibido"),
-            stats::kbps(summary.bitrate_kbps),
-        ),
-    ];
-    if let Some(codec) = &state.codec {
-        video.push(stat_row(t!("pantalla-guest-codec"), codec.clone()));
-    }
-    if !summary.cpu_copies.is_empty() {
-        video.push(stat_row(
-            t!("pantalla-guest-copias-de-cpu-por-fotograma"),
-            format!("{:.1}", summary.cpu_copies_per_frame),
-        ));
-    }
-    video.push(stat_row(
-        t!("pantalla-guest-descartados"),
-        t!(
-            "pantalla-guest-de",
-            drops_total = summary.drops_total,
-            frames_captured = summary.frames_captured
-        ),
-    ));
-    sections = sections.push(stat_section(t!("pantalla-guest-video"), video));
-    let mut latency: Vec<Element<'a, Message>> = summary
-        .spans
-        .iter()
-        .filter(|span| span.samples > 0)
-        .map(|span| {
-            stat_row(
-                format!("{} → {}", span.from.label(), span.to.label()),
-                stats::p50_p95(span.p50_us, span.p95_us),
-            )
-        })
-        .collect();
-    if summary.total.samples > 0 {
-        latency.push(stat_row(
-            t!("pantalla-guest-total-de-extremo-a-extremo"),
-            stats::p50_p95(summary.total.p50_us, summary.total.p95_us),
-        ));
-    }
-    if !latency.is_empty() {
-        sections = sections.push(stat_section(
-            t!("pantalla-guest-latencia-por-etapa-p50-p95"),
-            latency,
-        ));
-    }
-    if let Some(link) = &summary.link {
-        let mut rows = vec![
-            stat_row(t!("pantalla-guest-ruta"), link.path.clone()),
-            stat_row("RTT", stats::ms(link.rtt_ms)),
-            stat_row(
-                t!("pantalla-guest-bitrate-objetivo"),
-                stats::kbps(f64::from(link.target_kbps)),
-            ),
-            stat_row(
-                t!("pantalla-guest-perdida"),
-                stats::percent(link.loss_percent),
-            ),
-            stat_row(
-                t!("pantalla-guest-grupos-recuperados-perdidos"),
-                format!("{} / {}", link.groups_recovered, link.groups_dropped),
-            ),
-            stat_row(t!("pantalla-guest-epoca-mls"), link.epoch.to_string()),
-            stat_row(
-                t!("pantalla-guest-cifrado-de-los-medios"),
-                if link.sframe {
-                    "SFrame".to_owned()
-                } else {
-                    t!("pantalla-guest-sin-sframe-desarrollo").to_owned()
-                },
-            ),
-        ];
-        rows.push(
-            column![
-                overlay_text(t!("pantalla-guest-numero-de-seguridad")),
-                text(link.safety_number.clone())
-                    .size(type_size::CAPTION)
-                    .font(coroom_ui::font::MONO)
-                    .class(TextClass::Overlay)
-                    .wrapping(Wrapping::WordOrGlyph)
-            ]
-            .spacing(2)
-            .into(),
+    let input = summary.and_then(|summary| summary.input).map_or_else(
+        || t!("room-midiendo").to_owned(),
+        |l| median(l.samples, l.p50_us),
+    );
+    let video = summary.map_or_else(
+        || t!("room-midiendo").to_owned(),
+        |summary| median(summary.total.samples, summary.total.p50_us),
+    );
+    // El audio del juego de captura a que suena, si la sesión lo mide; si no, «—».
+    let audio = summary
+        .and_then(|summary| summary.audio.as_ref())
+        .and_then(|audio| audio.track(AudioTrack::Game))
+        .filter(|track| track.total.samples > 0)
+        .map_or_else(
+            || "—".to_owned(),
+            |track| median(track.total.samples, track.total.p50_us),
         );
-        sections = sections.push(stat_section(t!("pantalla-guest-enlace"), rows));
-    }
-    let mut input = vec![stat_row(
-        t!("pantalla-guest-permisos"),
-        current.allowed.label(),
-    )];
-    if let Some(latency) = summary.input.filter(|latency| latency.samples > 0) {
-        input.push(stat_row(
-            t!("pantalla-guest-latencia-de-entrada"),
-            stats::p50_p95(latency.p50_us, latency.p95_us),
-        ));
-    }
-    sections = sections.push(stat_section(t!("pantalla-guest-entrada"), input));
-    if let Some(audio) = &summary.audio {
-        let mut rows = vec![stat_row(
-            t!("pantalla-guest-estado"),
-            current.audio_status.clone(),
-        )];
-        if let Some(av) = audio.av.filter(|av| av.samples > 0) {
-            rows.push(stat_row(
-                t!("pantalla-guest-a-v"),
-                format!("{} / {}", stats::ms(av.p50_ms), stats::ms(av.p95_ms)),
-            ));
-        }
-        if !audio.speaking.is_empty() {
-            rows.push(stat_row(
-                t!("pantalla-guest-hablando"),
-                audio.speaking.join(", "),
-            ));
-        }
-        sections = sections.push(stat_section(t!("pantalla-guest-audio"), rows));
-    }
     sections = sections.push(
         column![
-            overlay_text(t!("pantalla-guest-atajos")),
-            overlay_text(shortcuts_line(&app.settings.input.shortcuts))
+            section_title(t!("room-latencia-anadida"), Some(headline)),
+            stat_row(t!("room-entrada-raton-juego"), input),
+            stat_row(t!("room-video-captura-pantalla"), video),
+            stat_row(t!("room-audio"), audio),
+        ]
+        .spacing(6),
+    );
+
+    // Enlace: la ruta con su motivo, RTT y pérdida, fps y bitrate.
+    let mut link_rows = Vec::new();
+    if let Some(path) = state.path {
+        let (label, tone) = match path {
+            Path::Direct => (route_label(path).to_owned(), Tone::Success),
+            Path::Relayed => (
+                match &state.relay_reason {
+                    Some(reason) => {
+                        format!("{} · {}", route_label(path), short_relay_reason(reason))
+                    }
+                    None => route_label(path).to_owned(),
+                },
+                Tone::Warning,
+            ),
+        };
+        link_rows.push(
+            row![
+                overlay_text(t!("room-ruta")).width(Length::Fill),
+                text(label)
+                    .size(type_size::SECONDARY)
+                    .font(coroom_ui::font::SEMIBOLD)
+                    .class(TextClass::Custom(dark.tone(tone).text.color()))
+            ]
+            .align_y(Alignment::Center)
+            .into(),
+        );
+        if path == Path::Relayed
+            && let Some(reason) = &state.relay_reason
+        {
+            link_rows.push(
+                overlay_text(capitalize(reason))
+                    .size(type_size::CAPTION)
+                    .wrapping(Wrapping::WordOrGlyph)
+                    .into(),
+            );
+        }
+    }
+    if let Some(summary) = summary {
+        if let Some(link) = &summary.link {
+            link_rows.push(stat_row(
+                t!("room-rtt-perdida"),
+                format!(
+                    "{} ms · {}",
+                    stats::number(link.rtt_ms, 0),
+                    stats::percent(link.loss_percent)
+                ),
+            ));
+        }
+        link_rows.push(stat_row(
+            t!("room-fps-bitrate"),
+            format!(
+                "{} · {}",
+                stats::number(summary.fps, 0),
+                stats::kbps(summary.bitrate_kbps)
+            ),
+        ));
+    } else {
+        link_rows.push(overlay_text(t!("room-midiendo")).into());
+    }
+    if state.safety_number.is_some() {
+        link_rows.push(
+            row![
+                overlay_text(t!("room-numero-de-seguridad")).width(Length::Fill),
+                button(
+                    text(t!("room-comprobar"))
+                        .size(type_size::SECONDARY)
+                        .font(coroom_ui::font::SEMIBOLD)
+                        .class(TextClass::Custom(dark.accent_text.color()))
+                )
+                .padding(Padding::from([2.0, 6.0]))
+                .class(ButtonClass::Overlay { active: false })
+                .on_press(on(Msg::Safety)),
+            ]
+            .align_y(Alignment::Center)
+            .into(),
+        );
+    }
+    link_rows.push(
+        row![
+            overlay_text(t!("room-mas-detalle-en")).size(type_size::CAPTION),
+            button(
+                text(t!("room-diagnostico"))
+                    .size(type_size::CAPTION)
+                    .font(coroom_ui::font::SEMIBOLD)
+                    .class(TextClass::Custom(dark.accent_text.color()))
+            )
+            .padding(Padding::from([2.0, 4.0]))
+            .class(ButtonClass::Overlay { active: false })
+            .on_press(Message::Diagnostics(diagnostics::Msg::Open)),
+        ]
+        .spacing(2)
+        .align_y(Alignment::Center)
+        .into(),
+    );
+    sections = sections.push(stat_section(t!("room-enlace"), link_rows));
+
+    // Calidad: la elige el anfitrión (el invitado la ve, no la cambia).
+    let segment = |label: &'static str| {
+        container(
+            text(label)
+                .size(type_size::CAPTION)
+                .font(coroom_ui::font::SEMIBOLD)
+                .class(TextClass::OverlaySecondary)
+                .wrapping(Wrapping::None),
+        )
+        .padding(Padding::from([5.0, 10.0]))
+    };
+    let target = summary
+        .and_then(|summary| summary.link.as_ref())
+        .map(|link| link.target_kbps)
+        .filter(|kbps| *kbps > 0);
+    sections = sections.push(stat_section(
+        t!("room-calidad"),
+        vec![
+            container(
+                row![
+                    segment(t!("room-min-latencia")),
+                    segment(t!("room-equilibrado")),
+                    segment(t!("room-max-calidad")),
+                ]
+                .spacing(2),
+            )
+            .padding(2)
+            .class(ContainerClass::OverlaySegmented)
+            .into(),
+            overlay_text(match target {
+                Some(kbps) => t!(
+                    "room-la-elige-el-anfitrion-objetivo",
+                    value = stats::kbps(f64::from(kbps))
+                ),
+                None => t!("room-la-elige-el-anfitrion").to_owned(),
+            })
+            .size(type_size::CAPTION)
+            .wrapping(Wrapping::WordOrGlyph)
+            .into(),
+        ],
+    ));
+
+    // Tu vídeo: escalado (solo «Ajustar» por ahora) y VSync.
+    sections = sections.push(stat_section(
+        t!("room-tu-video"),
+        vec![
+            row![
+                overlay_text(t!("room-escalado")).width(Length::Fill),
+                container(
+                    row![
+                        text(t!("room-ajustar"))
+                            .size(type_size::SECONDARY)
+                            .class(TextClass::OverlaySecondary),
+                        icon_with(Icon::ChevronDown, 12.0, SvgClass::Overlay),
+                    ]
+                    .spacing(space::XS)
+                    .align_y(Alignment::Center),
+                )
+                .padding(Padding::from([5.0, 10.0]))
+                .class(ContainerClass::OverlaySegmented),
+            ]
+            .align_y(Alignment::Center)
+            .into(),
+            overlay_text(t!("room-escalado-nota"))
                 .size(type_size::CAPTION)
                 .wrapping(Wrapping::WordOrGlyph)
-        ]
-        .spacing(2),
+                .into(),
+            switch_row(
+                t!("room-vsync"),
+                app.settings.video.vsync,
+                Some(on(Msg::SetVsync(!app.settings.video.vsync))),
+            ),
+            overlay_text(t!("room-vsync-nota"))
+                .size(type_size::CAPTION)
+                .wrapping(Wrapping::WordOrGlyph)
+                .into(),
+        ],
+    ));
+
+    // Tu audio: micrófono (con su tecla si es pulsar para hablar) y audio del juego.
+    let stats_now = state.stats.as_ref();
+    let voice = stats_now.is_some_and(|s| s.voice);
+    let mic_label = if app.settings.audio.voice_mode == VoiceMode::PushToTalk {
+        t!(
+            "room-microfono-ptt",
+            key = app.settings.audio.push_to_talk_key.as_str()
+        )
+    } else {
+        t!("room-microfono").to_owned()
+    };
+    let mut audio_rows = vec![switch_row(
+        mic_label,
+        voice && !stats_now.is_some_and(|s| s.mic_muted),
+        voice.then(|| on(Msg::ToggleMic)),
+    )];
+    if !voice && let Some(stats_now) = stats_now {
+        audio_rows.push(
+            overlay_text(capitalize(&stats_now.audio_status))
+                .size(type_size::CAPTION)
+                .wrapping(Wrapping::WordOrGlyph)
+                .into(),
+        );
+    }
+    audio_rows.push(switch_row(
+        t!("room-audio-del-juego"),
+        !stats_now.is_some_and(|s| s.game_muted),
+        Some(on(Msg::ToggleGame)),
+    ));
+    sections = sections.push(stat_section(t!("room-tu-audio"), audio_rows));
+    sections = sections.push(
+        overlay_text(shortcuts_line(&app.settings.input.shortcuts))
+            .size(type_size::CAPTION)
+            .wrapping(Wrapping::WordOrGlyph),
     );
-    container(
-        scrollable(sections)
-            .spacing(space::XS)
-            .height(Length::Shrink),
-    )
-    .padding(space::M)
-    .width(Length::Fixed(size::STATS_PANEL))
-    .class(ContainerClass::Overlay)
-    .into()
+    scrollable(sections).height(Length::Fill).into()
 }
 
 /// Los atajos del vídeo, con las letras de Ajustes → Entrada.
 fn shortcuts_line(shortcuts: &crate::ui::settings::Shortcuts) -> String {
     t!(
-        "pantalla-guest-ctrl-alt-inmersivo-ctrl-alt-estadisticas",
+        "room-atajos-linea",
         immersive = shortcuts.immersive,
         stats = shortcuts.stats,
+        chat = shortcuts.chat,
         mic = shortcuts.mic,
         game = shortcuts.game,
         pads = shortcuts.pads,
         leave = shortcuts.leave
     )
+}
+
+/// El panel lateral: pestañas Chat · Conexión · Sala, el atajo de la pestaña y cerrar.
+fn side_panel<'a>(app: &'a App, state: &'a State, tab: Tab) -> Element<'a, Message> {
+    let keys = &app.settings.input.shortcuts;
+    let tab_button = |label: &'static str, this: Tab| {
+        button(
+            text(label)
+                .size(type_size::SECONDARY)
+                .font(coroom_ui::font::SEMIBOLD)
+                .wrapping(Wrapping::None),
+        )
+        .padding(Padding::from([5.0, 12.0]))
+        .class(ButtonClass::Overlay {
+            active: tab == this,
+        })
+        .on_press(on(Msg::ShowTab(this)))
+    };
+    let tabs = container(
+        row![
+            tab_button(t!("room-tab-chat"), Tab::Chat),
+            tab_button(t!("room-tab-conexion"), Tab::Connection),
+            tab_button(t!("room-tab-sala"), Tab::Room),
+        ]
+        .spacing(2),
+    )
+    .padding(2)
+    .class(ContainerClass::OverlaySegmented);
+    let letter = match tab {
+        Tab::Chat => keys.chat,
+        Tab::Connection => keys.stats,
+        Tab::Room => keys.pads,
+    };
+    let header = container(
+        row![
+            tabs,
+            ui::fill(),
+            overlay_text(format!("Ctrl+Alt+{letter}")).size(type_size::CAPTION),
+            ui::with_tooltip(
+                button(center(icon_with(Icon::Close, 16.0, SvgClass::Overlay)))
+                    .width(Length::Fixed(28.0))
+                    .height(Length::Fixed(28.0))
+                    .padding(0)
+                    .class(ButtonClass::Overlay { active: false })
+                    .on_press(on(Msg::ClosePanel)),
+                t!("room-cerrar-el-panel"),
+            ),
+        ]
+        .spacing(space::XS)
+        .align_y(Alignment::Center),
+    )
+    .padding(Padding {
+        top: space::XS,
+        right: space::XS,
+        bottom: space::XS,
+        left: space::S,
+    });
+    let content: Element<'a, Message> = match tab {
+        Tab::Chat => chat::panel(app, Surface::Overlay),
+        Tab::Connection => connection_tab(app, state),
+        Tab::Room => room_tab(app, state),
+    };
+    container(column![header, content].height(Length::Fill))
+        .width(Length::Fixed(size::STATS_PANEL))
+        .height(Length::Fill)
+        .class(ContainerClass::Overlay)
+        .into()
 }
 
 fn video<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
@@ -1422,53 +2025,71 @@ fn video<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
             ContainerClass::Video
         });
     let mut layers: Vec<Element<'a, Message>> = vec![base.into()];
-    let bar_visible = state.bar_visible(app.now);
-    let mut overlay = Column::new().spacing(space::S).padding(space::S);
+    let now = app.now;
+    let bar_visible = state.bar_visible(now);
+    // La barra entra bajando un poco (200 ms, `ease-out`).
+    let entered = (now.duration_since(state.bar_shown_at).as_secs_f32() / BAR_IN.as_secs_f32())
+        .clamp(0.0, 1.0);
+    let slide = (1.0 - (1.0 - entered) * (1.0 - entered)) * space::S;
+    let mut top = Column::new().spacing(space::S).padding(Padding {
+        top: if bar_visible { slide } else { space::S },
+        right: space::S,
+        bottom: 0.0,
+        left: space::S,
+    });
     if bar_visible {
-        overlay = overlay.push(top_bar(app, state));
+        top = top.push(top_bar(app, state));
     }
     if let Some(reconnecting) = &state.reconnecting {
-        overlay = overlay.push(
+        top = top.push(
             container(reconnect_banner(app, reconnecting))
                 .center_x(Length::Fill)
                 .max_width(640),
         );
     }
-    if state.stats_open {
-        overlay = overlay.push(
-            container(stats_panel(app, state))
-                .width(Length::Fill)
-                .align_x(Horizontal::Right),
-        );
-    }
-    if state.pads_open {
-        overlay = overlay.push(
-            container(pads_panel(app, state))
-                .width(Length::Fill)
-                .align_x(Horizontal::Right),
-        );
-    }
-    if state.people_open {
-        overlay = overlay.push(
-            container(people_panel(state))
-                .width(Length::Fill)
-                .align_x(Horizontal::Right),
-        );
-    }
     layers.push(
-        container(overlay)
+        container(top)
             .width(Length::Fill)
             .height(Length::Fill)
             .align_y(Vertical::Top)
             .into(),
     );
-    if !bar_visible && !state.immersive {
-        // Una franja invisible arriba: acercar el ratón hace volver la barra (mover el ratón en
-        // cualquier sitio también).
+    if let Some(tab) = state.panel {
+        let below_bar = space::S + size::VIDEO_BAR + space::S;
         layers.push(
-            Space::new()
+            container(side_panel(app, state, tab))
                 .width(Length::Fill)
-                .height(Length::Fixed(4.0))
+                .height(Length::Fill)
+                .align_x(Horizontal::Right)
+                .padding(Padding {
+                    top: below_bar,
+                    right: space::S,
+                    bottom: space::S,
+                    left: space::S,
+                })
+                .into(),
+        );
+    }
+    if state.pill_visible(now, app.fullscreen) {
+        layers.push(
+            container(pill_view(app, state))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_y(Vertical::Bottom)
+                .padding(space::S)
+                .into(),
+        );
+    }
+    if state.panel.is_none()
+        && let Some(bubbles) = chat::bubbles(app)
+    {
+        layers.push(
+            container(bubbles)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(Horizontal::Right)
+                .align_y(Vertical::Bottom)
+                .padding(space::S)
                 .into(),
         );
     }
@@ -1481,14 +2102,16 @@ pub(crate) mod shots {
 
     use coroom_session::input::gamepad::{ConnectedPad, PadChoice, PadKey, PadKind};
     use coroom_session::latency::{InputLatency, LatencyLedger, LinkSummary, Stage};
-    use coroom_session::remote::{QualityLevel, SessionEvent};
+    use coroom_session::remote::{QualityLevel, RoomMember, SessionEvent};
     use coroom_transport::quic::Path;
 
-    use super::{Msg, Phase, Stats};
+    use super::{Msg, Phase, Stats, Tab};
     use crate::ui::app::{App, Event, Message, Page};
+    use crate::ui::screens::chat;
     use crate::ui::shots::{Builder, cursor, cursor_image, game_frame, safety, signed_in};
     use crate::ui::video::VideoFeed;
-    /// Entra en la sala de Bea y llega hasta `until`.
+
+    /// Entra en la sala de Bea (con la estimación y el primer fotograma si se piden).
     pub(crate) fn joined(app: &mut App, estimate: bool, frame: bool) {
         signed_in(app, Page::Home);
         app.update(Message::Home(crate::ui::screens::home::Msg::Code(
@@ -1527,12 +2150,16 @@ pub(crate) mod shots {
         app.toasts.clear();
     }
 
+    /// Esperando: las claves ya están (el chat funciona), aún sin conexión con el anfitrión, y el
+    /// chat abierto con la conversación de ejemplo.
     pub(crate) fn guest_connecting(app: &mut App) {
         joined(app, false, false);
         if let Some(state) = app.guest.as_mut() {
-            state.keys = false;
             state.path = None;
         }
+        chat::shots::conversation(app);
+        app.update(Message::Guest(Msg::TogglePanel(Tab::Chat)));
+        app.chat.composing = false;
     }
 
     pub(crate) fn guest_estimate(app: &mut App) {
@@ -1553,6 +2180,15 @@ pub(crate) mod shots {
         if let Some(state) = app.guest.as_mut() {
             state.phase = Phase::Video;
             state.bar_until = app.now + Duration::from_secs(3);
+            // La barra ya entró.
+            state.bar_shown_at = app.now - Duration::from_secs(1);
+        }
+    }
+
+    /// El ratón lleva quieto más de 2,5 s.
+    fn still(app: &mut App) {
+        if let Some(state) = app.guest.as_mut() {
+            state.bar_until = app.now - Duration::from_millis(1);
         }
     }
 
@@ -1560,9 +2196,48 @@ pub(crate) mod shots {
         video(app);
     }
 
-    pub(crate) fn guest_stats(app: &mut App) {
+    pub(crate) fn guest_video_still(app: &mut App) {
+        video(app);
+        still(app);
+    }
+
+    pub(crate) fn guest_fullscreen_still(app: &mut App) {
+        video(app);
+        app.update(Message::FullscreenChanged(true));
+        still(app);
+    }
+
+    pub(crate) fn guest_connection(app: &mut App) {
         video(app);
         app.update(Message::Guest(Msg::ToggleStats));
+    }
+
+    pub(crate) fn guest_chat(app: &mut App) {
+        video(app);
+        chat::shots::conversation(app);
+        app.update(Message::Guest(Msg::TogglePanel(Tab::Chat)));
+        app.chat.composing = false;
+    }
+
+    pub(crate) fn guest_bubbles(app: &mut App) {
+        video(app);
+        chat::shots::conversation(app);
+        let now = app.now;
+        for (guest, name, text) in [
+            (2, "Carla", "yo sin micro hoy, os escribo por aquí 🙃"),
+            (
+                0,
+                "Bea",
+                "Listo, entrad. Guía de la build: coroom.example.com/guia",
+            ),
+        ] {
+            app.update(Message::Event(Event::Guest(SessionEvent::ChatMessage(
+                chat::shots::line(guest, name, text, 4, false),
+            ))));
+        }
+        for bubble in &mut app.chat.bubbles {
+            bubble.at = now;
+        }
     }
 
     pub(crate) fn sample_pad(
@@ -1583,11 +2258,24 @@ pub(crate) mod shots {
         }
     }
 
-    pub(crate) fn guest_pads(app: &mut App) {
+    /// Pestaña «Sala»: personas (a una no se la oye) y mandos.
+    pub(crate) fn guest_room(app: &mut App) {
         video(app);
         if let Some(stats) = app.guest.as_mut().and_then(|state| state.stats.as_mut()) {
             stats.allowed.gamepad_slot = Some(2);
         }
+        let member = |guest: u32, leaf: u32, name: &str, you: bool| RoomMember {
+            guest,
+            leaf,
+            name: name.to_owned(),
+            you,
+        };
+        app.update(Message::Event(Event::Guest(SessionEvent::Members(vec![
+            member(0, 0, "Bea", false),
+            member(1, 1, "Ana", true),
+            member(2, 2, "Carla", false),
+        ]))));
+        app.update(Message::Guest(Msg::Hear(2, false)));
         let eightbitdo = sample_pad(
             0x2dc8,
             0x6012,
@@ -1606,24 +2294,7 @@ pub(crate) mod shots {
         app.update(Message::Guest(Msg::Pads(vec![eightbitdo.clone()], true)));
         app.update(Message::Guest(Msg::Pads(vec![eightbitdo, xbox], true)));
         app.update(Message::Guest(Msg::TogglePads));
-    }
-
-    pub(crate) fn guest_people(app: &mut App) {
-        use coroom_session::remote::RoomMember;
-        guest_video(app);
-        let member = |guest: u32, leaf: u32, name: &str, you: bool| RoomMember {
-            guest,
-            leaf,
-            name: name.to_owned(),
-            you,
-        };
-        app.update(Message::Event(Event::Guest(SessionEvent::Members(vec![
-            member(0, 0, "Bea", false),
-            member(1, 1, "Ana", true),
-            member(2, 2, "Carla", false),
-        ]))));
-        app.update(Message::Guest(Msg::Hear(2, false)));
-        app.update(Message::Guest(Msg::TogglePeople));
+        app.toasts.clear();
     }
 
     pub(crate) fn guest_reconnecting(app: &mut App) {
@@ -1631,9 +2302,33 @@ pub(crate) mod shots {
         app.update(Message::Event(Event::Guest(SessionEvent::Reconnecting {
             attempt: 2,
             of: 5,
-            retry_in: Duration::from_secs(2),
+            retry_in: Duration::from_secs(3),
             reason: "la red dejó de responder".to_owned(),
         })));
+        app.toasts.clear();
+    }
+
+    /// Por el relay detrás de CGNAT, Aceptable: la píldora en ámbar con el motivo.
+    pub(crate) fn guest_relay_cgnat(app: &mut App) {
+        video(app);
+        app.update(Message::Event(Event::Guest(SessionEvent::Candidates {
+            guest: None,
+            candidates: Vec::new(),
+            relay_reason: Some(
+                "ninguna dirección respondió: la NAT de uno de los dos no abre (CGNAT)".to_owned(),
+            ),
+        })));
+        app.update(Message::Event(Event::Guest(SessionEvent::Reconnected {
+            path: Path::Relayed,
+        })));
+        let mut stats = sample_stats();
+        stats.summary.total.p50_us = 82_000;
+        if let Some(link) = stats.summary.link.as_mut() {
+            link.path = "relay".to_owned();
+            link.rtt_ms = 61.0;
+        }
+        app.update(Message::Event(Event::GuestStats(Box::new(stats))));
+        still(app);
         app.toasts.clear();
     }
 
@@ -1657,13 +2352,15 @@ pub(crate) mod shots {
         }
         let mut summary = ledger.summary();
         summary.fps = 60.0;
-        summary.bitrate_kbps = 19_800.0;
+        summary.bitrate_kbps = 18_400.0;
+        // Lo que se ve en el boceto: 48 ms añadidos (Buena).
+        summary.total.p50_us = 48_000;
         summary.link = Some(LinkSummary {
             path: "directo".to_owned(),
             remote: Some("192.0.2.10:4433".to_owned()),
             rtt_ms: 13.8,
-            target_kbps: 24_000,
-            loss_percent: 0.3,
+            target_kbps: 20_000,
+            loss_percent: 0.1,
             groups_dropped: 2,
             groups_recovered: 41,
             epoch: 1,
@@ -1704,10 +2401,14 @@ pub(crate) mod shots {
         ("11-conectando", guest_connecting),
         ("12-estimacion", guest_estimate),
         ("13-video", guest_video),
-        ("14-estadisticas", guest_stats),
-        ("14-mandos", guest_pads),
-        ("14-personas", guest_people),
+        ("13-video-quieto", guest_video_still),
+        ("13-video-pantalla-completa-quieto", guest_fullscreen_still),
+        ("14-conexion", guest_connection),
+        ("14-chat", guest_chat),
+        ("14-burbujas", guest_bubbles),
+        ("14-sala", guest_room),
         ("15-reconectando", guest_reconnecting),
+        ("15-relay-cgnat", guest_relay_cgnat),
     ];
 }
 
@@ -1752,6 +2453,40 @@ mod tests {
         }
     }
 
+    /// Un invitado ya con vídeo y estadísticas de ejemplo.
+    fn watching() -> App {
+        let mut app = app();
+        start(&mut app, "K7Q2MZ".into());
+        let feed = VideoFeed::detached();
+        feed.push(frame(), None, None);
+        app.update(Message::Event(Event::GuestStarted(Ok(feed))));
+        app.update(Message::Event(Event::Guest(SessionEvent::Connected {
+            path: Path::Direct,
+            remote: "192.0.2.10:4433".parse().expect("dirección"),
+        })));
+        app.update(Message::Guest(Msg::Continue));
+        app.update(Message::Event(Event::GuestStats(Box::new(
+            shots::sample_stats(),
+        ))));
+        app
+    }
+
+    fn set_added(app: &mut App, added_ms: u64, loss: f64, rtt: f64) {
+        let mut stats = shots::sample_stats();
+        stats.summary.total.p50_us = added_ms * 1000;
+        if let Some(link) = stats.summary.link.as_mut() {
+            link.loss_percent = loss;
+            link.rtt_ms = rtt;
+        }
+        app.update(Message::Event(Event::GuestStats(Box::new(stats))));
+    }
+
+    fn pill_label(app: &App) -> (String, Option<Tone>) {
+        let state = app.guest.as_ref().expect("invitado");
+        let pill = pill(state, app.now);
+        (pill.label(), pill.tone)
+    }
+
     #[test]
     fn connecting_shows_the_steps_and_waits_for_the_estimate() {
         let mut app = app();
@@ -1794,13 +2529,141 @@ mod tests {
         let state = app.guest.as_ref().expect("invitado");
         assert_eq!(state.phase, Phase::Video);
         assert!(state.bar_visible(app.now), "la barra se ve al empezar");
+        assert!(state.animating(), "y entra con su animación");
         app.now += motion::BAR_HIDE;
+        app.update(Message::Tick);
         assert!(
             !app.guest.as_ref().is_some_and(|g| g.bar_visible(app.now)),
             "y se oculta sola"
         );
+        assert_eq!(
+            app.guest.as_ref().and_then(State::next_tick),
+            None,
+            "oculta, no hace falta despertar (nada de bucles)"
+        );
         app.update(Message::PointerMoved);
         assert!(app.guest.as_ref().is_some_and(|g| g.bar_visible(app.now)));
+    }
+
+    #[test]
+    fn the_pill_follows_route_level_and_reconnection() {
+        let mut app = app();
+        start(&mut app, "K7Q2MZ".into());
+        assert_eq!(pill_label(&app), ("Conectando…".to_owned(), None));
+        let mut app = watching();
+        assert_eq!(
+            pill_label(&app),
+            ("48 ms · Directa".to_owned(), Some(Tone::Success))
+        );
+        // Por el relay detrás de CGNAT, Aceptable.
+        app.update(Message::Event(Event::Guest(SessionEvent::Candidates {
+            guest: None,
+            candidates: Vec::new(),
+            relay_reason: Some(
+                "ninguna dirección respondió: la NAT de uno de los dos no abre (CGNAT)".into(),
+            ),
+        })));
+        app.update(Message::Event(Event::Guest(SessionEvent::Reconnected {
+            path: Path::Relayed,
+        })));
+        set_added(&mut app, 82, 0.2, 40.0);
+        assert_eq!(
+            pill_label(&app),
+            ("82 ms · Relay · CGNAT".to_owned(), Some(Tone::Warning))
+        );
+        // Mala: el motivo pasa a ser lo que más duele.
+        set_added(&mut app, 131, 4.0, 60.0);
+        assert_eq!(
+            pill_label(&app),
+            ("131 ms · Relay · pérdida 4 %".to_owned(), Some(Tone::Error))
+        );
+        set_added(&mut app, 131, 0.2, 95.0);
+        assert_eq!(pill_label(&app).0, "131 ms · Relay · RTT 95 ms");
+        // Reconectando: gris, con la espera.
+        app.update(Message::Event(Event::Guest(SessionEvent::Reconnecting {
+            attempt: 1,
+            of: 5,
+            retry_in: Duration::from_millis(2_400),
+            reason: "red".into(),
+        })));
+        assert_eq!(pill_label(&app), ("Reconectando · 3 s".to_owned(), None));
+        // Sin muestras de latencia: «Midiendo», nunca vacía.
+        let mut app = watching();
+        let mut stats = shots::sample_stats();
+        stats.summary.total.samples = 0;
+        app.update(Message::Event(Event::GuestStats(Box::new(stats))));
+        assert_eq!(pill_label(&app).0, "Midiendo · Directa");
+    }
+
+    #[test]
+    fn the_pill_hides_with_the_bar_only_in_fullscreen() {
+        let mut app = watching();
+        app.now += motion::BAR_HIDE + Duration::from_millis(1);
+        let state = app.guest.as_ref().expect("invitado");
+        assert!(!state.bar_visible(app.now));
+        assert!(state.pill_visible(app.now, false), "en ventana, fija");
+        assert!(
+            !state.pill_visible(app.now, true),
+            "a pantalla completa, se va"
+        );
+        app.update(Message::PointerMoved);
+        let state = app.guest.as_ref().expect("invitado");
+        assert!(
+            state.pill_visible(app.now, true),
+            "y vuelve al mover el ratón"
+        );
+    }
+
+    #[test]
+    fn panel_tabs() {
+        let mut app = watching();
+        assert!(app.update(Message::Guest(Msg::ToggleStats)).is_empty());
+        assert_eq!(
+            app.guest.as_ref().and_then(|g| g.panel),
+            Some(Tab::Connection)
+        );
+        assert!(!app.chat.open);
+        // La pestaña del chat: lo abre y pone el cursor en el campo cuando hay claves.
+        app.update(Message::Event(Event::Guest(SessionEvent::EpochChanged {
+            epoch: 1,
+        })));
+        assert_eq!(
+            app.update(Message::Guest(Msg::ShowTab(Tab::Chat))),
+            [Effect::FocusChat(true)]
+        );
+        assert!(app.chat.open && app.chat.composing);
+        // Otra pestaña: el teclado vuelve al juego.
+        assert_eq!(
+            app.update(Message::Guest(Msg::TogglePads)),
+            [Effect::FocusChat(false)]
+        );
+        assert_eq!(app.guest.as_ref().and_then(|g| g.panel), Some(Tab::Room));
+        assert!(!app.chat.open && !app.chat.composing);
+        app.update(Message::Guest(Msg::TogglePads));
+        assert_eq!(app.guest.as_ref().and_then(|g| g.panel), None);
+        // El panel abierto mantiene la barra.
+        app.update(Message::Guest(Msg::TogglePanel(Tab::Connection)));
+        app.now += motion::BAR_HIDE * 2;
+        assert!(app.guest.as_ref().is_some_and(|g| g.bar_visible(app.now)));
+        app.update(Message::Guest(Msg::ClosePanel));
+        assert_eq!(app.guest.as_ref().and_then(|g| g.panel), None);
+        // VSync es un ajuste de este equipo (se guarda).
+        app.update(Message::Guest(Msg::SetVsync(true)));
+        assert!(app.settings.video.vsync);
+        assert!(app.next_tick().is_some(), "se guarda al poco");
+    }
+
+    #[test]
+    fn short_relay_reasons() {
+        assert_eq!(
+            short_relay_reason("solo había direcciones de red local y ninguna respondió"),
+            "solo red local"
+        );
+        assert_eq!(short_relay_reason("se pidió usar el relay"), "forzado");
+        assert_eq!(
+            short_relay_reason("3 de 4 direcciones fallaron"),
+            "la directa falló"
+        );
     }
 
     #[test]
@@ -1864,5 +2727,13 @@ mod tests {
         assert_eq!(permissions_notice(kbm, kbm), None);
         app.update(Message::Event(Event::GuestEnded(None)));
         assert!(app.guest.is_none(), "salida normal: sin diálogo");
+    }
+
+    #[test]
+    fn colors_are_from_the_palette() {
+        // Los colores del panel salen de la paleta oscura (nada fijo en la pantalla).
+        let app = app();
+        let dark = dark(&app);
+        assert_ne!(dark.accent_text.color(), iced_core::Color::TRANSPARENT);
     }
 }

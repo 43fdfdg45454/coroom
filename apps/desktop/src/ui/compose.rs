@@ -52,6 +52,11 @@ struct Inner {
     /// Hay que reconfigurar la superficie antes de la próxima composición.
     outdated: bool,
     presented: u64,
+    /// Modo de presentación de menor latencia que eligió la configuración de la superficie
+    /// (`Immediate` o `Mailbox` si existen), al que se vuelve al quitar la sincronización vertical.
+    low_latency_mode: wgpu::PresentMode,
+    /// Sincronización vertical pedida (`Fifo`, que toda superficie admite).
+    vsync: bool,
 }
 
 /// El compositor de la ventana (ver el módulo). Se comparte entre la ventana y las fuentes de
@@ -98,11 +103,14 @@ impl Compositor {
                 hdr,
                 blit,
                 ui: None,
-                background: wgpu::Color::BLACK,
+                // Hasta el primer `draw_ui`, que trae el fondo del tema.
+                background: wgpu::Color::TRANSPARENT,
                 feeds: Vec::new(),
                 layers: HashMap::new(),
                 outdated: false,
                 presented: 0,
+                low_latency_mode: setup.config.present_mode,
+                vsync: false,
             }),
         })
     }
@@ -148,8 +156,12 @@ impl Compositor {
     ) -> Result<SurfaceSetup, coroom_render::RenderError> {
         let mut inner = self.lock();
         let setup = gpu.surface_setup_with(&inner.surface, width, height, wanted)?;
-        inner.surface.configure(&self.device, &setup.config);
+        inner.low_latency_mode = setup.config.present_mode;
         inner.config = setup.config.clone();
+        if inner.vsync {
+            inner.config.present_mode = wgpu::PresentMode::Fifo;
+        }
+        inner.surface.configure(&self.device, &inner.config);
         if setup.render_format != inner.render_format {
             inner.render_format = setup.render_format;
             inner.blit = OverlayBlit::new(&self.device, setup.render_format);
@@ -159,6 +171,22 @@ impl Compositor {
         inner.hdr = super::runner::make_hdr(gpu, setup.hdr);
         inner.outdated = false;
         Ok(setup)
+    }
+
+    /// Sincronización vertical (`Fifo`: sin desgarros, hasta un refresco más de latencia) o la
+    /// presentación de menor latencia; la superficie se reconfigura en la siguiente composición.
+    pub fn set_vsync(&self, on: bool) {
+        let mut inner = self.lock();
+        if inner.vsync == on {
+            return;
+        }
+        inner.vsync = on;
+        inner.config.present_mode = if on {
+            wgpu::PresentMode::Fifo
+        } else {
+            inner.low_latency_mode
+        };
+        inner.outdated = true;
     }
 
     /// Una fuente de vídeo que se compone en la ventana (hasta que se suelte).

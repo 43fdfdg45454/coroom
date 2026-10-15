@@ -260,6 +260,9 @@ pub struct Video {
     pub decoder: DecoderChoice,
     /// Perfil de calidad elegido en Compartir.
     pub preset: QualityPreset,
+    /// Como invitado, sincronizar la presentación con el refresco de la pantalla (sin desgarros,
+    /// con hasta un refresco más de latencia). Desactivado: la presentación de menor latencia.
+    pub vsync: bool,
 }
 
 impl Default for Video {
@@ -274,6 +277,7 @@ impl Default for Video {
             encoder: EncoderChoice::Auto,
             decoder: DecoderChoice::Auto,
             preset: QualityPreset::Balanced,
+            vsync: false,
         }
     }
 }
@@ -346,6 +350,9 @@ pub struct Audio {
     pub noise_suppression: bool,
     /// Aplicaciones que se quitan siempre del audio al transmitir la pantalla.
     pub excluded_apps: Vec<RememberedApp>,
+    /// Como anfitrión, compartir el micrófono con la sala (se aplica al abrirla). [`Audio::voice`]
+    /// es lo mismo como invitado.
+    pub host_voice: bool,
 }
 
 /// Aplicación recordada en la lista de audio.
@@ -367,6 +374,7 @@ impl Default for Audio {
             push_to_talk_key: "F12".to_owned(),
             noise_suppression: true,
             excluded_apps: Vec::new(),
+            host_voice: true,
         }
     }
 }
@@ -746,6 +754,13 @@ mod tests {
             "intervalo fuera de las opciones"
         );
         assert!(loaded.updates.check, "se comprueba por defecto");
+        std::fs::write(&path, "[audio]\nvoice = false\n").expect("escribir");
+        let loaded = Settings::load(&path).0;
+        assert!(
+            loaded.audio.host_voice,
+            "sin el campo (ajustes de antes), el anfitrión comparte el micrófono"
+        );
+        assert!(!loaded.audio.voice);
 
         std::fs::write(&path, "esto no es TOML = = =").expect("escribir");
         let (loaded, warning) = Settings::load(&path);

@@ -16,6 +16,10 @@
 //!   llega al anfitrión; con el cursor capturado no llega nada a la interfaz).
 //! - Atajos de la aplicación (`Ctrl+Q`, `Ctrl+,`, `F11`, `Esc`, `Tab` y `Mayús+Tab`), el
 //!   portapapeles (`window_clipboard`) y los métodos de entrada (IME).
+//! - **Chat sobre el vídeo**: mientras su campo tiene el foco, el teclado es de la interfaz y no
+//!   del juego (las teclas pulsadas se sueltan en el anfitrión al enfocarlo); `Esc` devuelve el
+//!   teclado al juego sin cerrar el panel y los atajos `Ctrl+Alt` siguen funcionando.
+//! - **Sincronización vertical** opcional (Ajustes del invitado o panel de Conexión): `Fifo`.
 //! - **HDR**: con HDR en Ajustes y si la superficie lo admite
 //!   ([`GpuContext::hdr_available`]), la superficie va en `Rgba16Float` con `ExtendedSrgbLinear`;
 //!   la interfaz y el vídeo se dibujan en la textura intermedia de
@@ -54,6 +58,7 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 use super::app::{App, Effect, Message, Screen, Shortcut};
 use super::backend::{Backend, GuestControls, Notify};
 use super::compose::Compositor;
+use super::screens::chat;
 use super::screens::guest::{self, Phase};
 use super::screens::settings as settings_screen;
 use super::settings::{self, Settings, Shortcuts};
@@ -111,6 +116,8 @@ struct Ready {
     render_format: wgpu::TextureFormat,
     /// Lo que se pidió en Ajustes la última vez que se configuró la superficie.
     hdr_requested: bool,
+    /// Sincronización vertical que tiene ahora el compositor.
+    vsync_applied: bool,
     renderer: Renderer,
     viewport: Viewport,
     cache: user_interface::Cache,
@@ -250,6 +257,17 @@ pub(super) fn make_hdr(
     Some((output, surface))
 }
 
+/// Si el campo del chat tiene el foco en `interface`.
+fn chat_focused<M, T, R: iced_core::Renderer>(
+    interface: &mut UserInterface<'_, M, T, R>,
+    renderer: &R,
+) -> bool {
+    use iced_core::widget::operation::{self, Operation, Outcome, focusable};
+    let mut op = focusable::is_focused(iced_core::widget::Id::new(chat::INPUT_ID));
+    interface.operate(renderer, &mut operation::black_box(&mut op));
+    matches!(op.finish(), Outcome::Some(true))
+}
+
 impl Runner {
     fn open(&mut self, event_loop: &ActiveEventLoop) -> Result<Ready, String> {
         let attributes = system::window_attributes(
@@ -356,6 +374,7 @@ impl Runner {
             compositor,
             render_format: setup.render_format,
             hdr_requested,
+            vsync_applied: false,
             gpu,
             renderer,
             viewport,
@@ -380,7 +399,7 @@ impl Ready {
     /// Pasa eventos por la interfaz; devuelve qué hizo con cada uno.
     fn process(&mut self, events: &[UiEvent]) -> Vec<iced_core::event::Status> {
         let mut messages = Vec::new();
-        let statuses = {
+        let (statuses, typing) = {
             let mut interface = UserInterface::build(
                 self.app.view(),
                 self.viewport.logical_size(),
@@ -394,14 +413,61 @@ impl Ready {
                 &mut self.clipboard,
                 &mut messages,
             );
+            let typing = chat::active(&self.app) && chat_focused(&mut interface, &self.renderer);
             self.cache = interface.into_cache();
-            statuses
+            (statuses, typing)
         };
         for message in messages {
             self.dispatch(message);
         }
+        self.set_composing(typing);
         self.window.request_redraw();
         statuses
+    }
+
+    /// El campo del chat ganó o perdió el foco (un clic, `Tab`): la aplicación lo sabe y, al
+    /// ganarlo, las teclas que el juego tuviera pulsadas se sueltan.
+    fn set_composing(&mut self, typing: bool) {
+        if typing == self.app.chat.composing {
+            return;
+        }
+        if typing {
+            self.release_game_keys();
+        }
+        self.dispatch(Message::Chat(chat::Msg::Composing(typing)));
+    }
+
+    /// Suelta en el anfitrión las teclas y botones pulsados (y el cursor capturado): el teclado
+    /// pasa a la interfaz.
+    fn release_game_keys(&mut self) {
+        let Some(input) = self.input.as_mut() else {
+            return;
+        };
+        let mut actions = input.capture.on_window_event(&WindowEvent::Focused(false));
+        actions.extend(input.capture.on_window_event(&WindowEvent::Focused(true)));
+        self.apply(actions);
+    }
+
+    /// Enfoca el campo del chat (o le quita el foco), como pide la aplicación.
+    fn focus_chat(&mut self, on: bool) {
+        use iced_core::widget::operation::{Operation, focusable};
+        let mut interface = UserInterface::build(
+            self.app.view(),
+            self.viewport.logical_size(),
+            std::mem::take(&mut self.cache),
+            &mut self.renderer,
+        );
+        let mut op: Box<dyn Operation> = if on {
+            Box::new(focusable::focus(iced_core::widget::Id::new(chat::INPUT_ID)))
+        } else {
+            Box::new(focusable::unfocus())
+        };
+        interface.operate(&self.renderer, op.as_mut());
+        self.cache = interface.into_cache();
+        if on {
+            self.release_game_keys();
+        }
+        self.window.request_redraw();
     }
 
     /// Reduce un mensaje y hace sus efectos.
@@ -431,6 +497,7 @@ impl Ready {
                     self.run_effects(more);
                 }
                 Effect::Quit => self.quit = true,
+                Effect::FocusChat(on) => self.focus_chat(on),
                 Effect::SetImmersive(on) => {
                     if let Some(input) = self.input.as_mut() {
                         let actions = input.capture.set_immersive(on);
@@ -611,7 +678,45 @@ impl Ready {
                 .is_some_and(|guest| guest.phase == Phase::Video)
     }
 
+    /// Atajos `Ctrl+Alt` de la sala con el teclado en la interfaz (escribiendo en el chat): los
+    /// mismos que con el vídeo delante, salvo el inmersivo.
+    fn room_shortcut(&mut self, code: KeyCode) -> bool {
+        if !(self.modifiers.control_key() && self.modifiers.alt_key()) {
+            return false;
+        }
+        let keys = shortcut_keys(&self.app.settings.input.shortcuts);
+        if code == keys.chat && chat::active(&self.app) {
+            self.dispatch(Message::Chat(chat::Msg::Toggle));
+            return true;
+        }
+        if self.app.guest.is_none() {
+            return false;
+        }
+        if code == keys.overlay {
+            self.dispatch(Message::Guest(guest::Msg::ToggleStats));
+        } else if code == keys.pads {
+            self.dispatch(Message::Guest(guest::Msg::TogglePads));
+        } else if code == keys.quit {
+            let effects = guest::leave(&mut self.app);
+            self.run_effects(effects);
+        } else if let Some(input) = self.input.as_ref()
+            && (code == keys.mic || code == keys.game)
+        {
+            if code == keys.mic {
+                input.controls.audio.toggle_mic();
+            } else {
+                input.controls.audio.toggle_game();
+            }
+        } else {
+            return false;
+        }
+        true
+    }
+
     fn shortcut(&mut self, code: KeyCode) -> bool {
+        if self.room_shortcut(code) {
+            return true;
+        }
         let ctrl = self.modifiers.control_key();
         let shift = self.modifiers.shift_key();
         let shortcut = match code {
@@ -627,7 +732,10 @@ impl Ready {
                     &mut self.renderer,
                 );
                 super::focus::move_focus(&mut interface, &self.renderer, shift);
+                let typing =
+                    chat::active(&self.app) && chat_focused(&mut interface, &self.renderer);
                 self.cache = interface.into_cache();
+                self.set_composing(typing);
                 self.window.request_redraw();
                 return true;
             }
@@ -658,6 +766,7 @@ impl Ready {
                 }
             }
             WindowEvent::ScaleFactorChanged { .. } => self.resized = true,
+            WindowEvent::Focused(focused) => self.dispatch(Message::WindowFocused(*focused)),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = mouse::Cursor::Available(conversion::cursor_position(
@@ -705,6 +814,8 @@ impl Ready {
         }
 
         let in_front = self.video_in_front();
+        // Escribiendo en el chat, el teclado es de la interfaz aunque el vídeo esté delante.
+        let typing = in_front && self.app.chat.composing;
         let grabbed = self
             .input
             .as_ref()
@@ -723,7 +834,7 @@ impl Ready {
                     PhysicalKey::Unidentified(_) => None,
                 };
                 let pressed = key.state == ElementState::Pressed;
-                if in_front {
+                if in_front && !typing {
                     to_interface = false;
                     if code == Some(KeyCode::F11) {
                         if pressed && !key.repeat {
@@ -827,8 +938,19 @@ impl Ready {
         self.window.request_redraw();
     }
 
+    /// Sincronización vertical como dice el ajuste.
+    fn apply_vsync(&mut self) {
+        let wanted = self.app.settings.video.vsync;
+        if wanted != self.vsync_applied {
+            self.vsync_applied = wanted;
+            self.compositor.set_vsync(wanted);
+            self.window.request_redraw();
+        }
+    }
+
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         self.apply_hdr();
+        self.apply_vsync();
         if self.resized {
             self.reconfigure();
         }

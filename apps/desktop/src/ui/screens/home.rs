@@ -1,22 +1,35 @@
-//! Pantalla 2: inicio.
+//! Pantalla 1: inicio.
 //!
-//! Dos tarjetas grandes, "Compartir mi pantalla" y "Unirme a una sala" (con el código o las
-//! invitaciones recibidas), los amigos conectados (con "Invitar" mientras se aloja una sala) y los
-//! avisos de cuota del relay.
+//! Una sola pantalla bajo la cabecera: dos tarjetas grandes («Compartir mi pantalla» y «Unirse
+//! con código»), las invitaciones que llegan (con su cuenta atrás de [`INVITATION_TTL`]) y la
+//! lista de amigos, que se actualiza sola con la presencia de la señalización (también con la
+//! sala abierta o desde dentro de una), con las solicitudes pendientes y «Agregar amigo».
 
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use coroom_transport::proto::api::{Friend, Friends};
 use coroom_transport::proto::signal::{ROOM_CODE_LEN, is_valid_room_code};
 use coroom_ui::Element;
+use coroom_ui::font::MONO;
 use coroom_ui::icon::{Icon, icon_with};
-use coroom_ui::style::SvgClass;
+use coroom_ui::style::{ContainerClass, InputClass, SvgClass, TextClass};
 use coroom_ui::theme::Tone;
-use coroom_ui::tokens::{size, space};
+use coroom_ui::tokens::{size, space, text as type_size};
 use coroom_ui::widget::{self as ui, Kind};
-use iced_core::text::Wrapping;
-use iced_core::{Alignment, Length};
-use iced_widget::{Column, column, row};
+use iced_core::text::{LineHeight, Wrapping};
+use iced_core::{Alignment, Length, Padding};
+use iced_widget::{Column, column, container, row, text, text_input};
 
-use crate::ui::app::{App, Effect, Load, Message, Page};
+use crate::ui::app::{App, Effect, Event, Invitation, Load, Message, Page, Screen};
+use crate::ui::screens::friends::{self, Msg as FriendsMsg};
 use crate::ui::screens::guest;
+
+/// Lo que dura una invitación en Inicio: pasado ese tiempo desaparece sola.
+pub const INVITATION_TTL: Duration = Duration::from_secs(60);
+
+/// Invitaciones que se ven a la vez (las más nuevas).
+const INVITATIONS_SHOWN: usize = 3;
 
 /// Estado.
 #[derive(Debug, Clone, Default)]
@@ -25,6 +38,10 @@ pub struct State {
     pub code: String,
     /// Error del código.
     pub code_error: Option<String>,
+    /// Cuándo llegó la invitación de cada amigo (por usuario: una por amigo).
+    pub invited_at: HashMap<u64, Instant>,
+    /// Cuándo llegó la lista de amigos o el último cambio de presencia.
+    pub friends_updated: Option<Instant>,
 }
 
 /// Mensajes.
@@ -34,14 +51,14 @@ pub enum Msg {
     Code(String),
     /// Entrar con el código.
     Join,
-    /// Entrar con una invitación.
+    /// Entrar con una invitación (por su código).
     Accept(String),
-    /// Ir a compartir.
+    /// Descartar la invitación de un amigo.
+    Ignore(u64),
+    /// Ir a compartir (o a la sala abierta).
     Share,
-    /// Invitar a un amigo conectado a la sala abierta.
+    /// Invitar a un amigo: con la sala abierta, la invitación; sin sala, a Compartir.
     Invite(u64),
-    /// Ir a "Amigos" para añadir.
-    AddFriends,
 }
 
 /// Normaliza lo que se escribe en el código: mayúsculas, sin espacios ni guiones, como mucho seis.
@@ -53,6 +70,11 @@ pub fn clean_code(text: &str) -> String {
         .collect()
 }
 
+/// Si el servidor no responde (la cabecera lo dice en rojo): no se puede abrir ni entrar.
+fn server_down(app: &App) -> bool {
+    app.server_status.online == Some(false)
+}
+
 /// Reduce un mensaje.
 pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
     match msg {
@@ -62,15 +84,15 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             Vec::new()
         }
         Msg::Join => {
+            if server_down(app) {
+                return Vec::new();
+            }
             let code = app.home.code.clone();
             if !is_valid_room_code(&code) {
                 app.home.code_error = Some(if code.len() < ROOM_CODE_LEN {
-                    t!(
-                        "pantalla-home-el-codigo-tiene-room-code-len",
-                        ROOM_CODE_LEN = ROOM_CODE_LEN
-                    )
+                    t!("home-code-length", length = ROOM_CODE_LEN)
                 } else {
-                    t!("pantalla-home-ese-codigo-no-es-de-una").to_owned()
+                    t!("home-code-invalid").to_owned()
                 });
                 return Vec::new();
             }
@@ -78,44 +100,164 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             guest::start(app, code)
         }
         Msg::Accept(code) => {
+            if server_down(app) {
+                return Vec::new();
+            }
             app.invitations.retain(|invitation| invitation.code != code);
+            prune_times(app);
             guest::start(app, code)
         }
-        // Por `Navigate`, que pide ya lo que se puede compartir (o la lista de amigos).
-        Msg::Share => app.update(Message::Navigate(Page::Host)),
+        Msg::Ignore(user) => {
+            app.invitations
+                .retain(|invitation| invitation.from_user != user);
+            prune_times(app);
+            Vec::new()
+        }
+        // Por `Navigate`, que pide ya lo que se puede compartir. Con la sala abierta, «Ver mi sala»
+        // va aunque el servidor no responda.
+        Msg::Share => {
+            if server_down(app) && !app.host.is_open() {
+                return Vec::new();
+            }
+            app.update(Message::Navigate(Page::Host))
+        }
         Msg::Invite(user) => {
+            if !app.host.is_open() {
+                // Sin sala no hay a qué invitar: a Compartir, que la abre.
+                return update(app, Msg::Share);
+            }
+            if room_code(app).is_none() {
+                return Vec::new();
+            }
             let name = app
                 .friends
                 .loaded()
                 .and_then(|friends| friends.friends.iter().find(|f| f.id == user))
                 .map(|friend| friend.display_name.clone())
-                .unwrap_or_else(|| t!("pantalla-home-tu-amigo").to_owned());
-            app.toast(
-                Tone::Info,
-                t!("pantalla-home-invitacion-enviada-a-name", name = name),
-            );
+                .unwrap_or_else(|| t!("home-your-friend").to_owned());
+            app.toast(Tone::Info, t!("home-invitation-sent", name = name));
             vec![Effect::Invite(user)]
         }
-        Msg::AddFriends => app.update(Message::Navigate(Page::Home)),
     }
+}
+
+/// Código de la sala abierta, si el servidor ya la creó.
+fn room_code(app: &App) -> Option<&str> {
+    app.host.room.as_ref().and_then(|room| room.code.as_deref())
+}
+
+/// Anota lo que Inicio necesita de los eventos (lo llama [`App`] antes de tratarlos).
+pub fn on_event(app: &mut App, event: &Event) {
+    match event {
+        Event::Invited(invitation) => {
+            app.home.invited_at.insert(invitation.from_user, app.now);
+        }
+        Event::Friends(Ok(_)) | Event::Presence { .. } => {
+            app.home.friends_updated = Some(app.now);
+        }
+        Event::FriendChanged(result) => friends::on_changed(app, result),
+        _ => {}
+    }
+}
+
+/// Cuándo llegó una invitación (si no consta, ahora: la cuenta empieza al verla).
+fn received_at(app: &App, invitation: &Invitation) -> Instant {
+    app.home
+        .invited_at
+        .get(&invitation.from_user)
+        .copied()
+        .unwrap_or(app.now)
+}
+
+/// Olvida las horas de invitaciones que ya no están.
+fn prune_times(app: &mut App) {
+    let invitations = &app.invitations;
+    app.home
+        .invited_at
+        .retain(|user, _| invitations.iter().any(|known| known.from_user == *user));
+}
+
+/// Pasa el tiempo: las invitaciones caducadas desaparecen.
+pub fn tick(app: &mut App) {
+    let now = app.now;
+    let times = &mut app.home.invited_at;
+    for invitation in &app.invitations {
+        times.entry(invitation.from_user).or_insert(now);
+    }
+    app.invitations.retain(|invitation| {
+        times
+            .get(&invitation.from_user)
+            .is_none_or(|at| now.saturating_duration_since(*at) < INVITATION_TTL)
+    });
+    prune_times(app);
+}
+
+/// El siguiente múltiplo de `step` desde `since` que está después de `now`.
+fn next_step(since: Instant, now: Instant, step: Duration) -> Instant {
+    let elapsed = now.saturating_duration_since(since).as_secs();
+    let step_secs = step.as_secs().max(1);
+    since + Duration::from_secs((elapsed / step_secs + 1) * step_secs)
+}
+
+/// Cada cuánto cambia el texto «actualizado hace…».
+fn updated_step(elapsed: Duration) -> Duration {
+    if elapsed < Duration::from_secs(60) {
+        Duration::from_secs(1)
+    } else if elapsed < Duration::from_secs(3600) {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(3600)
+    }
+}
+
+/// Cuándo hace falta el próximo `Tick`: al caducar cada invitación y, con Inicio a la vista,
+/// cuando cambian la cuenta atrás y el «actualizado hace…» (siempre después de `now`).
+pub fn next_tick(app: &App) -> Option<Instant> {
+    let now = app.now;
+    let visible = app.screen == Screen::Main && app.page == Page::Home;
+    let mut next: Option<Instant> = None;
+    let mut consider = |at: Instant| {
+        next = Some(next.map_or(at, |next| next.min(at)));
+    };
+    for invitation in &app.invitations {
+        let at = received_at(app, invitation);
+        consider((at + INVITATION_TTL).max(now + Duration::from_millis(1)));
+        if visible {
+            consider(next_step(at, now, Duration::from_secs(1)));
+        }
+    }
+    if visible && let Some(at) = app.home.friends_updated {
+        let step = updated_step(now.saturating_duration_since(at));
+        consider(next_step(at, now, step));
+    }
+    next
+}
+
+/// Amigos en el orden de la lista: conectados primero y, dentro de cada grupo, por nombre (el
+/// identificador desempata, para que el orden no salte).
+pub fn sorted_friends(friends: &Friends) -> Vec<&Friend> {
+    let mut sorted: Vec<_> = friends.friends.iter().collect();
+    sorted.sort_by_cached_key(|friend| {
+        (
+            !friend.online,
+            friend.display_name.to_lowercase(),
+            friend.id,
+        )
+    });
+    sorted
 }
 
 fn on(msg: Msg) -> Message {
     Message::Home(msg)
 }
 
+fn on_friends(msg: FriendsMsg) -> Message {
+    Message::Friends(msg)
+}
+
 /// Dibuja la página.
 pub fn view(app: &App) -> Element<'_, Message> {
-    let name = app
-        .account
-        .as_ref()
-        .map_or("", |account| account.display_name.as_str());
-    let host = app.account.as_ref().map(|account| account.host());
-    let mut page = Column::new().spacing(space::L).push(ui::page_header(
-        t!("pantalla-home-hola-name", name = name),
-        host.map(|host| t!("pantalla-home-conectado-a-host", host = host)),
-        vec![],
-    ));
+    let mut page = Column::new().spacing(space::M);
     for notice in notices(app) {
         page = page.push(notice);
     }
@@ -123,7 +265,13 @@ pub fn view(app: &App) -> Element<'_, Message> {
         |real| vec![share_card(app, real), join_card(app, real)],
         space::M,
     ));
-    page = page.push(online_friends(app));
+    let mut invitations: Vec<&Invitation> = app.invitations.iter().collect();
+    invitations.sort_by_key(|invitation| std::cmp::Reverse(received_at(app, invitation)));
+    for invitation in invitations.into_iter().take(INVITATIONS_SHOWN) {
+        page = page.push(invitation_card(app, invitation));
+    }
+    page = page.push(ui::gap(space::XXS));
+    page = page.push(friends_section(app));
     ui::page(page)
 }
 
@@ -133,33 +281,16 @@ fn notices(app: &App) -> Vec<Element<'_, Message>> {
         out.push(ui::banner(
             Tone::Info,
             t!(
-                "pantalla-home-hay-una-version-nueva-de-coroom",
+                "home-update-available",
                 version = update.version,
-                version2 = app.version
+                current = app.version
             ),
-            Some((
-                t!("pantalla-home-ver-la-version"),
-                Message::OpenUrl(update.url.clone()),
-            )),
-        ));
-    }
-    if let Some(code) = app.host.room.as_ref().and_then(|room| room.code.as_deref()) {
-        out.push(ui::banner(
-            Tone::Info,
-            t!(
-                "pantalla-home-estas-compartiendo-tu-pantalla-en-la",
-                code = code
-            ),
-            Some((t!("pantalla-home-ver-la-sala"), on(Msg::Share))),
+            Some((t!("home-update-see"), Message::OpenUrl(update.url.clone()))),
         ));
     }
     if let Some(usage) = &app.usage {
         if !usage.relay_enabled {
-            out.push(ui::banner(
-                Tone::Warning,
-                t!("pantalla-home-este-servidor-no-tiene-relay-solo"),
-                None,
-            ));
+            out.push(ui::banner(Tone::Warning, t!("home-relay-disabled"), None));
         } else if let Some(quota) = usage.quota_bytes.filter(|quota| *quota > 0) {
             let used = usage.bytes as f64 / quota as f64;
             if used >= 0.8 {
@@ -170,10 +301,10 @@ fn notices(app: &App) -> Vec<Element<'_, Message>> {
                         Tone::Warning
                     },
                     t!(
-                        "pantalla-home-has-usado-el-0-del-relay",
-                        valor = format!("{:.0}", (used * 100.0).min(100.0)),
-                        valor2 = crate::ui::stats::bytes(usage.bytes),
-                        valor3 = crate::ui::stats::bytes(quota)
+                        "home-relay-usage",
+                        percent = format!("{:.0}", (used * 100.0).min(100.0)),
+                        used = crate::ui::stats::bytes(usage.bytes),
+                        quota = crate::ui::stats::bytes(quota)
                     ),
                     None,
                 ));
@@ -183,13 +314,30 @@ fn notices(app: &App) -> Vec<Element<'_, Message>> {
     out
 }
 
-fn big_card_header<'a>(icon: Icon, title: &'a str, text: &'a str) -> Element<'a, Message> {
-    column![
+/// Cabecera de una tarjeta grande: icono del acento, título y explicación.
+fn big_card_header<'a>(icon: Icon, title: &'a str, explanation: &'a str) -> Element<'a, Message> {
+    row![
         icon_with(icon, size::ICON_LARGE, SvgClass::Accent),
-        ui::heading(title),
-        ui::secondary(text).wrapping(Wrapping::WordOrGlyph)
+        column![
+            ui::heading(title),
+            ui::secondary(explanation).wrapping(Wrapping::WordOrGlyph)
+        ]
+        .spacing(2)
+        .width(Length::Fill)
     ]
-    .spacing(space::XS)
+    .spacing(space::S)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// El motivo de un botón desactivado por el servidor caído.
+fn offline_reason<'a>() -> Element<'a, Message> {
+    row![
+        icon_with(Icon::CloudOff, 14.0, SvgClass::Tone(Tone::Error)),
+        ui::caption(t!("home-offline-reason")).wrapping(Wrapping::WordOrGlyph)
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center)
     .into()
 }
 
@@ -199,198 +347,406 @@ fn card_height(real: bool) -> Length {
     if real { Length::Fill } else { Length::Shrink }
 }
 
+fn big_card<'a>(
+    content: Column<'a, Message, coroom_ui::Theme, coroom_ui::Renderer>,
+    real: bool,
+) -> Element<'a, Message> {
+    container(content.spacing(space::S))
+        .padding(space::M)
+        .width(Length::Fill)
+        .height(card_height(real))
+        .class(ContainerClass::Card)
+        .into()
+}
+
 /// Tarjeta de compartir (`real`: ver [`ui::equal_height_row`]).
 fn share_card(app: &App, real: bool) -> Element<'_, Message> {
     let open = app.host.is_open();
-    iced_widget::container(
-        column![
-            big_card_header(
-                Icon::ShareScreen,
-                t!("pantalla-home-compartir-mi-pantalla"),
-                t!("pantalla-home-crea-una-sala-elige-que-compartir")
-            ),
-            ui::gap(space::XS),
-            ui::button_with(
-                Kind::Primary,
-                if open {
-                    t!("pantalla-home-ver-mi-sala")
-                } else {
-                    t!("pantalla-home-compartir")
-                },
-                Some(Icon::ShareScreen),
-                real.then(|| on(Msg::Share))
-            )
-        ]
-        .spacing(space::XS),
-    )
-    .padding(space::M)
-    .width(Length::Fill)
-    .height(card_height(real))
-    .class(coroom_ui::style::ContainerClass::Card)
-    .into()
+    let blocked = server_down(app) && !open;
+    let mut content = column![
+        big_card_header(
+            Icon::ShareScreen,
+            t!("home-share-title"),
+            t!("home-share-text")
+        ),
+        ui::button_with(
+            Kind::Primary,
+            if open {
+                t!("home-see-room")
+            } else {
+                t!("home-share")
+            },
+            Some(Icon::ShareScreen),
+            (real && !blocked).then(|| on(Msg::Share))
+        )
+    ];
+    if blocked {
+        content = content.push(offline_reason());
+    }
+    big_card(content, real)
+}
+
+/// Campo del código: monoespaciado y grande, para que se lea letra a letra.
+fn code_input(app: &App, real: bool, enabled: bool) -> Element<'_, Message> {
+    let mut input = text_input("K7Q2MZ", &app.home.code)
+        .padding(Padding::from([6.0, 14.0]))
+        .size(20)
+        .line_height(LineHeight::Absolute(ui::px(24.0)))
+        .font(MONO)
+        .class(if app.home.code_error.is_some() {
+            InputClass::Invalid
+        } else {
+            InputClass::Normal
+        });
+    if real {
+        input = input.id("room-code");
+        if enabled {
+            input = input
+                .on_input(|value| on(Msg::Code(value)))
+                .on_submit(on(Msg::Join));
+        }
+    }
+    input.into()
 }
 
 /// Tarjeta de unirse (`real`: ver [`ui::equal_height_row`]; la copia no lleva el `id` del campo
 /// ni mensajes).
 fn join_card(app: &App, real: bool) -> Element<'_, Message> {
-    let state = &app.home;
-    let field = ui::field(t!("pantalla-home-codigo-de-la-sala"), &state.code)
-        .placeholder("K7Q2MZ")
-        .monospace()
-        .error(state.code_error.as_deref());
-    let code_field = Element::from(if real {
-        field
-            .on_input(|value| on(Msg::Code(value)))
-            .on_submit(Some(on(Msg::Join)))
-            .id("room-code")
-    } else {
-        field
-    });
+    let blocked = server_down(app);
     let mut content = column![
-        big_card_header(
-            Icon::LogIn,
-            t!("pantalla-home-unirme-a-una-sala"),
-            t!("pantalla-home-con-el-codigo-que-te-dio")
-        ),
+        big_card_header(Icon::LogIn, t!("home-join-title"), t!("home-join-text")),
         row![
-            iced_widget::container(code_field).width(Length::Fill),
-            ui::primary(t!("pantalla-home-entrar"), real.then(|| on(Msg::Join)))
+            container(code_input(app, real, !blocked)).width(Length::Fill),
+            ui::button_with(
+                Kind::Primary,
+                t!("home-enter"),
+                Some(Icon::LogIn),
+                (real && !blocked).then(|| on(Msg::Join))
+            )
         ]
         .spacing(space::XS)
-        .align_y(Alignment::End)
-    ]
-    .spacing(space::XS);
-    if !app.invitations.is_empty() {
-        let rows = app
-            .invitations
-            .iter()
-            .take(3)
-            .map(|invitation| {
-                ui::list_row(
-                    Some(ui::avatar(&app.theme, &invitation.from_name, 28.0)),
-                    t!("pantalla-home-te-invita", from_name = invitation.from_name),
-                    Some(t!("pantalla-home-sala", code = invitation.code)),
-                    vec![
-                        ui::button_with(
-                            Kind::Primary,
-                            t!("pantalla-home-entrar"),
-                            None,
-                            real.then(|| on(Msg::Accept(invitation.code.clone()))),
-                        )
-                        .into(),
-                    ],
-                )
-            })
-            .collect();
-        content = content
-            .push(ui::gap(space::XXS))
-            .push(ui::caption(t!("pantalla-home-invitaciones")))
-            .push(ui::boxed_list(rows));
+        .align_y(Alignment::Center)
+    ];
+    if let Some(error) = &app.home.code_error {
+        content = content.push(
+            row![
+                icon_with(Icon::CircleAlert, 14.0, SvgClass::Tone(Tone::Error)),
+                text(error.as_str())
+                    .size(type_size::SECONDARY)
+                    .class(TextClass::Tone(Tone::Error))
+                    .wrapping(Wrapping::WordOrGlyph)
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
     }
-    iced_widget::container(content)
-        .padding(space::M)
-        .width(Length::Fill)
-        .height(card_height(real))
-        .class(coroom_ui::style::ContainerClass::Card)
-        .into()
+    if blocked {
+        content = content.push(offline_reason());
+    }
+    big_card(content, real)
 }
 
-fn online_friends(app: &App) -> Element<'_, Message> {
-    let hosting = app
-        .host
-        .room
-        .as_ref()
-        .is_some_and(|room| room.code.is_some());
-    let body: Element<'_, Message> = match &app.friends {
-        Load::Idle | Load::Loading => ui::skeleton(t!("pantalla-home-cargando-tus-amigos"), 2),
-        Load::Failed(err) => ui::banner(
-            Tone::Error,
-            t!("pantalla-home-no-se-pudo-cargar-la-lista", err = err),
-            Some((
-                t!("pantalla-home-reintentar"),
-                Message::Navigate(Page::Home),
-            )),
-        ),
+/// Tarjeta de una invitación que llega, con el borde del acento y su cuenta atrás.
+fn invitation_card<'a>(app: &'a App, invitation: &'a Invitation) -> Element<'a, Message> {
+    let ago = app
+        .now
+        .saturating_duration_since(received_at(app, invitation))
+        .min(INVITATION_TTL);
+    let left = INVITATION_TTL.saturating_sub(ago).as_secs().max(1);
+    let blocked = server_down(app);
+    container(
+        row![
+            ui::avatar(&app.theme, &invitation.from_name, size::AVATAR),
+            column![
+                ui::strong(t!("home-invite-title", name = invitation.from_name))
+                    .wrapping(Wrapping::WordOrGlyph),
+                ui::secondary(t!(
+                    "home-invite-detail",
+                    code = invitation.code,
+                    ago = ago.as_secs(),
+                    left = left
+                ))
+                .wrapping(Wrapping::WordOrGlyph)
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+            ui::flat(
+                t!("home-ignore"),
+                Some(on(Msg::Ignore(invitation.from_user)))
+            ),
+            ui::button_with(
+                Kind::Primary,
+                t!("home-enter"),
+                Some(Icon::LogIn),
+                (!blocked).then(|| on(Msg::Accept(invitation.code.clone())))
+            )
+        ]
+        .spacing(space::S)
+        .align_y(Alignment::Center),
+    )
+    .padding(Padding::from([12.0, 16.0]))
+    .width(Length::Fill)
+    .class(ContainerClass::CardAccent)
+    .into()
+}
+
+/// «3 conectados · actualizado hace 2 s».
+fn friends_summary(app: &App, friends: &Friends) -> String {
+    let online = friends.friends.iter().filter(|f| f.online).count();
+    let count = match online {
+        0 => t!("home-online-none").to_owned(),
+        1 => t!("home-online-one").to_owned(),
+        count => t!("home-online-many", count = count),
+    };
+    let Some(at) = app.home.friends_updated else {
+        return count;
+    };
+    let elapsed = app.now.saturating_duration_since(at).as_secs();
+    let updated = match elapsed {
+        0 => t!("home-updated-now").to_owned(),
+        1..60 => t!("home-updated-seconds", seconds = elapsed),
+        60..3600 => t!("home-updated-minutes", minutes = elapsed / 60),
+        _ => t!("home-updated-hours", hours = elapsed / 3600),
+    };
+    format!("{count} · {updated}")
+}
+
+fn friends_section(app: &App) -> Element<'_, Message> {
+    let state = &app.friends_page;
+    let mut title = row![ui::heading(t!("home-friends"))]
+        .spacing(space::XS)
+        .align_y(Alignment::Center);
+    if let Some(friends) = app.friends.loaded() {
+        title = title.push(ui::caption(friends_summary(app, friends)));
+    }
+    let header = row![
+        title.width(Length::Fill),
+        ui::button_with(
+            Kind::Link,
+            if state.adding {
+                t!("home-add-friend-close")
+            } else {
+                t!("home-add-friend")
+            },
+            (!state.adding).then_some(Icon::UserPlus),
+            Some(on_friends(FriendsMsg::ToggleAdd))
+        )
+    ]
+    .spacing(space::S)
+    .align_y(Alignment::Center);
+    let mut section = column![header].spacing(space::S);
+    if state.adding {
+        section = section.push(add_friend(app));
+    }
+    match &app.friends {
+        Load::Idle | Load::Loading => {
+            section = section.push(ui::skeleton(t!("home-loading"), 3));
+        }
+        Load::Failed(err) => {
+            section = section.push(ui::card(ui::error_state(
+                t!("home-load-failed"),
+                err.as_str(),
+                Some((t!("home-retry"), on_friends(FriendsMsg::Reload))),
+            )));
+        }
         Load::Loaded(friends) => {
-            let online: Vec<_> = friends.friends.iter().filter(|f| f.online).collect();
-            if online.is_empty() {
-                ui::empty_state(
+            if let Some(requests) = requests(app, friends) {
+                section = section.push(requests);
+            }
+            section = section.push(if friends.friends.is_empty() {
+                ui::card(ui::empty_state(
                     Icon::Users,
-                    if friends.friends.is_empty() {
-                        t!("pantalla-home-todavia-no-tienes-amigos-aqui")
-                    } else {
-                        t!("pantalla-home-ninguno-de-tus-amigos-esta-conectado")
-                    },
-                    if friends.friends.is_empty() {
-                        t!("pantalla-home-anadelos-por-su-nombre-de-usuario")
-                    } else {
-                        t!("pantalla-home-cuando-se-conecten-apareceran-aqui-tambien")
-                    },
-                    friends.friends.is_empty().then(|| {
+                    t!("home-empty-title"),
+                    t!("home-empty-text"),
+                    (!state.adding).then(|| {
                         ui::button_with(
                             Kind::Normal,
-                            t!("pantalla-home-anadir-amigos"),
+                            t!("home-add-friend"),
                             Some(Icon::UserPlus),
-                            Some(on(Msg::AddFriends)),
+                            Some(on_friends(FriendsMsg::ToggleAdd)),
                         )
                         .into()
                     }),
-                )
+                ))
             } else {
-                let rows = online
-                    .into_iter()
-                    .map(|friend| {
-                        let invite: Element<'_, Message> = if hosting {
-                            ui::button_with(
-                                Kind::Normal,
-                                t!("pantalla-home-invitar"),
-                                Some(Icon::Mail),
-                                Some(on(Msg::Invite(friend.id))),
-                            )
-                            .into()
-                        } else {
-                            ui::with_tooltip(
-                                ui::button_with(
-                                    Kind::Normal,
-                                    t!("pantalla-home-invitar"),
-                                    Some(Icon::Mail),
-                                    None,
-                                ),
-                                t!("pantalla-home-abre-una-sala-para-invitar"),
-                            )
-                        };
-                        ui::list_row(
-                            Some(ui::avatar(&app.theme, &friend.display_name, size::AVATAR)),
-                            friend.display_name.as_str(),
-                            Some(format!("@{}", friend.username)),
-                            vec![
-                                ui::status_badge(Tone::Success, t!("pantalla-home-conectado")),
-                                invite,
-                            ],
-                        )
-                    })
-                    .collect();
-                ui::boxed_list(rows)
-            }
+                ui::boxed_list(
+                    sorted_friends(friends)
+                        .into_iter()
+                        .map(|friend| friend_row(app, friend))
+                        .collect(),
+                )
+            });
         }
+    }
+    section.into()
+}
+
+/// El campo desplegado de «Agregar amigo».
+fn add_friend(app: &App) -> Element<'_, Message> {
+    let state = &app.friends_page;
+    ui::card(
+        column![
+            row![
+                container(Element::from(
+                    ui::field(t!("home-username"), &state.add_name)
+                        .placeholder("bea")
+                        .on_input(|value| on_friends(FriendsMsg::AddName(value)))
+                        .on_submit((!state.busy).then(|| on_friends(FriendsMsg::Add)))
+                        .error(state.add_error.as_deref())
+                        .id("friend-name")
+                ))
+                .width(Length::Fill),
+                ui::button_with(
+                    Kind::Primary,
+                    t!("home-send-request"),
+                    Some(Icon::UserPlus),
+                    (!state.busy).then(|| on_friends(FriendsMsg::Add))
+                )
+            ]
+            .spacing(space::XS)
+            // Con un error debajo del campo, el botón sigue a la altura del campo.
+            .align_y(if state.add_error.is_some() {
+                Alignment::Center
+            } else {
+                Alignment::End
+            }),
+            ui::caption(t!("home-request-hint")).wrapping(Wrapping::WordOrGlyph)
+        ]
+        .spacing(space::XS),
+    )
+}
+
+/// Solicitudes pendientes: las recibidas (aceptar o rechazar) y las enviadas (retirar).
+fn requests<'a>(app: &'a App, friends: &'a Friends) -> Option<Element<'a, Message>> {
+    if friends.incoming.is_empty() && friends.outgoing.is_empty() {
+        return None;
+    }
+    let busy = app.friends_page.busy;
+    let incoming = friends.incoming.iter().map(|request| {
+        ui::list_row(
+            Some(ui::avatar(
+                &app.theme,
+                &request.user.display_name,
+                size::AVATAR,
+            )),
+            request.user.display_name.as_str(),
+            Some(t!(
+                "home-wants-to-be-friend",
+                username = request.user.username
+            )),
+            vec![
+                ui::flat(
+                    t!("home-decline"),
+                    (!busy).then(|| on_friends(FriendsMsg::Decline(request.id))),
+                )
+                .into(),
+                ui::primary(
+                    t!("home-accept"),
+                    (!busy).then(|| on_friends(FriendsMsg::Accept(request.id))),
+                )
+                .into(),
+            ],
+        )
+    });
+    let outgoing = friends.outgoing.iter().map(|request| {
+        ui::list_row(
+            Some(ui::avatar(
+                &app.theme,
+                &request.user.display_name,
+                size::AVATAR,
+            )),
+            request.user.display_name.as_str(),
+            Some(t!("home-pending", username = request.user.username)),
+            vec![
+                ui::flat(
+                    t!("home-withdraw"),
+                    (!busy).then(|| on_friends(FriendsMsg::Decline(request.id))),
+                )
+                .into(),
+            ],
+        )
+    });
+    Some(
+        column![
+            ui::caption(t!("home-requests")),
+            ui::boxed_list(incoming.chain(outgoing).collect())
+        ]
+        .spacing(space::XS)
+        .into(),
+    )
+}
+
+/// Fila de un amigo: avatar, nombre, usuario, estado, «Invitar» y quitar.
+fn friend_row<'a>(app: &'a App, friend: &'a Friend) -> Element<'a, Message> {
+    let badge = if friend.online {
+        ui::status_badge(Tone::Success, t!("home-available"))
+    } else {
+        ui::status_badge(Tone::Neutral, t!("home-offline"))
     };
-    column![ui::heading(t!("pantalla-home-amigos-conectados")), body]
-        .spacing(space::S)
-        .into()
+    let invite_button = |on_press: Option<Message>| {
+        ui::button_with(Kind::Normal, t!("home-invite"), None, on_press)
+    };
+    let invite: Element<'_, Message> = if !friend.online {
+        ui::with_tooltip(invite_button(None), t!("home-invite-offline-tip"))
+    } else if !app.host.is_open() {
+        ui::with_tooltip(
+            invite_button(Some(on(Msg::Invite(friend.id)))),
+            t!("home-invite-no-room-tip"),
+        )
+    } else if room_code(app).is_none() {
+        ui::with_tooltip(invite_button(None), t!("home-invite-opening-tip"))
+    } else {
+        invite_button(Some(on(Msg::Invite(friend.id)))).into()
+    };
+    ui::list_row(
+        Some(ui::avatar(&app.theme, &friend.display_name, size::AVATAR)),
+        friend.display_name.as_str(),
+        Some(format!("@{}", friend.username)),
+        vec![
+            badge,
+            invite,
+            ui::icon_button(
+                Icon::Trash,
+                t!("home-remove-friend"),
+                Some(on_friends(FriendsMsg::Remove {
+                    user: friend.id,
+                    name: friend.display_name.clone(),
+                })),
+            ),
+        ],
+    )
 }
 
 /// Escenas de Inicio para las capturas.
 pub(crate) mod shots {
-    use crate::ui::app::{App, Invitation, Load, Message, Page};
+    use std::time::Duration;
+
+    use crate::ui::app::{App, Event, Invitation, Message, Page};
     use crate::ui::shots::{Builder, signed_in};
     use coroom_transport::proto::api::Friends;
+
+    /// Hace `secs` segundos (o ahora, si el reloj no llega tan atrás).
+    fn ago(app: &App, secs: u64) -> std::time::Instant {
+        app.now
+            .checked_sub(Duration::from_secs(secs))
+            .unwrap_or(app.now)
+    }
+
+    /// Inicio con una invitación de Bea de hace 8 s, amigos y solicitudes pendientes.
     pub(crate) fn home(app: &mut App) {
         signed_in(app, Page::Home);
+        app.update(Message::Event(Event::ServerStatus {
+            rtt_ms: Some(12.0),
+            online: true,
+        }));
         app.invitations = vec![Invitation {
             from_user: 2,
             from_name: "Bea".to_owned(),
             code: "K7Q2MZ".to_owned(),
         }];
+        app.home.invited_at.insert(2, ago(app, 8));
+        app.home.friends_updated = Some(ago(app, 2));
+        app.home.code = "K7Q2MZ".to_owned();
         // Aviso de versión nueva.
         app.update.available = Some(crate::update::Update {
             version: "0.2.0".to_owned(),
@@ -400,17 +756,30 @@ pub(crate) mod shots {
 
     pub(crate) fn home_empty(app: &mut App) {
         signed_in(app, Page::Home);
-        app.friends = Load::Loaded(Friends {
+        app.update(Message::Event(Event::Friends(Ok(Friends {
             friends: Vec::new(),
             incoming: Vec::new(),
             outgoing: Vec::new(),
-        });
+        }))));
+        app.home.friends_updated = Some(ago(app, 5));
         app.usage = None;
     }
 
-    pub(crate) fn friends_page(app: &mut App) {
+    pub(crate) fn home_offline(app: &mut App) {
         signed_in(app, Page::Home);
+        app.update(Message::Event(Event::ServerStatus {
+            rtt_ms: None,
+            online: false,
+        }));
+        app.home.friends_updated = Some(ago(app, 75));
+    }
+
+    pub(crate) fn add_friend(app: &mut App) {
+        signed_in(app, Page::Home);
+        app.home.friends_updated = Some(ago(app, 2));
+        app.friends_page.adding = true;
         app.friends_page.add_name = "hugo".to_owned();
+        app.friends_page.add_error = Some("No existe ningún usuario «hugo».".to_owned());
     }
 
     /// Escenas de esta pantalla.
@@ -421,20 +790,45 @@ pub(crate) mod shots {
             app.update(Message::ToggleAccountMenu);
         }),
         ("06-inicio-vacio", home_empty),
-        ("07-amigos", friends_page),
+        ("06-inicio-sin-servidor", home_offline),
+        ("07-agregar-amigo", add_friend),
     ];
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::app::{Screen, tests::app};
+    use crate::ui::app::tests::app;
+    use crate::ui::screens::host::SourceChoice;
+
+    fn friend(id: u64, name: &str, online: bool) -> Friend {
+        Friend {
+            id,
+            username: name.to_lowercase(),
+            display_name: name.to_owned(),
+            online,
+        }
+    }
+
+    fn main_app() -> App {
+        let mut app = app();
+        app.screen = Screen::Main;
+        app.page = Page::Home;
+        app
+    }
+
+    fn invited(app: &mut App, user: u64, code: &str) {
+        app.update(Message::Event(Event::Invited(Invitation {
+            from_user: user,
+            from_name: "Bea".into(),
+            code: code.into(),
+        })));
+    }
 
     #[test]
     fn room_codes_are_cleaned_and_validated() {
         assert_eq!(clean_code(" k7q-2mz9 "), "K7Q2MZ");
-        let mut app = app();
-        app.screen = Screen::Main;
+        let mut app = main_app();
         app.update(Message::Home(Msg::Code("k7q".into())));
         assert!(app.update(Message::Home(Msg::Join)).is_empty());
         assert!(
@@ -451,7 +845,9 @@ mod tests {
                 .as_deref()
                 .is_some_and(|e| e.contains("«0»"))
         );
+        // Escribir de nuevo quita el error.
         app.update(Message::Home(Msg::Code("k7q2mz".into())));
+        assert_eq!(app.home.code_error, None);
         let effects = app.update(Message::Home(Msg::Join));
         assert!(
             effects.contains(&Effect::Join("K7Q2MZ".into())),
@@ -463,34 +859,177 @@ mod tests {
 
     #[test]
     fn invitations_join_and_disappear() {
-        let mut app = app();
-        app.screen = Screen::Main;
-        app.invitations.push(crate::ui::app::Invitation {
-            from_user: 3,
-            from_name: "Bea".into(),
-            code: "K7Q2MZ".into(),
-        });
+        let mut app = main_app();
+        invited(&mut app, 3, "K7Q2MZ");
+        assert_eq!(app.home.invited_at.get(&3), Some(&app.now));
         let effects = app.update(Message::Home(Msg::Accept("K7Q2MZ".into())));
         assert!(effects.contains(&Effect::Join("K7Q2MZ".into())));
         assert!(app.invitations.is_empty());
+        assert!(app.home.invited_at.is_empty());
     }
 
-    /// «Compartir pantalla» pasa por `Navigate`: pide ya qué se puede compartir (antes se quedaba
-    /// en «Buscando…»).
+    #[test]
+    fn ignoring_an_invitation_only_drops_it() {
+        let mut app = main_app();
+        invited(&mut app, 3, "K7Q2MZ");
+        invited(&mut app, 4, "BBBBBB");
+        assert!(app.update(Message::Home(Msg::Ignore(3))).is_empty());
+        assert_eq!(app.invitations.len(), 1);
+        assert_eq!(app.invitations[0].from_user, 4);
+        assert!(!app.home.invited_at.contains_key(&3));
+        assert_eq!(app.screen, Screen::Main);
+    }
+
+    #[test]
+    fn invitations_count_down_and_expire() {
+        let mut app = main_app();
+        let start = app.now;
+        invited(&mut app, 3, "K7Q2MZ");
+        app.toasts.clear();
+        // Con Inicio a la vista, un tick por segundo para la cuenta atrás.
+        assert_eq!(app.next_tick(), Some(start + Duration::from_secs(1)));
+        app.now = start + Duration::from_millis(8_400);
+        assert_eq!(app.next_tick(), Some(start + Duration::from_secs(9)));
+        app.update(Message::Tick);
+        assert_eq!(app.invitations.len(), 1);
+        // Fuera de Inicio solo hace falta el de la caducidad.
+        app.page = Page::Settings;
+        assert_eq!(app.next_tick(), Some(start + INVITATION_TTL));
+        app.now = start + INVITATION_TTL;
+        app.update(Message::Tick);
+        assert!(app.invitations.is_empty(), "caducó");
+        assert!(app.home.invited_at.is_empty());
+        assert_eq!(app.next_tick(), None);
+    }
+
+    #[test]
+    fn a_new_invitation_from_the_same_friend_restarts_the_count() {
+        let mut app = main_app();
+        let start = app.now;
+        invited(&mut app, 3, "AAAAAA");
+        app.now = start + Duration::from_secs(50);
+        invited(&mut app, 3, "BBBBBB");
+        app.now = start + Duration::from_secs(70);
+        app.update(Message::Tick);
+        assert_eq!(app.invitations.len(), 1);
+        assert_eq!(app.invitations[0].code, "BBBBBB");
+    }
+
+    #[test]
+    fn friends_update_time_is_recorded_and_ticks_slow_down() {
+        let mut app = main_app();
+        let start = app.now;
+        app.update(Message::Event(Event::Friends(Ok(Friends {
+            friends: vec![friend(2, "Bea", false)],
+            incoming: Vec::new(),
+            outgoing: Vec::new(),
+        }))));
+        assert_eq!(app.home.friends_updated, Some(start));
+        assert_eq!(app.next_tick(), Some(start + Duration::from_secs(1)));
+        app.now = start + Duration::from_secs(90);
+        assert_eq!(app.next_tick(), Some(start + Duration::from_secs(120)));
+        // La presencia también cuenta como actualización (y llega con la sala abierta).
+        app.update(Message::Event(Event::Presence {
+            user: 2,
+            online: true,
+        }));
+        assert_eq!(app.home.friends_updated, Some(app.now));
+        assert!(app.friends.loaded().is_some_and(|f| f.friends[0].online));
+        let summary = friends_summary(&app, app.friends.loaded().unwrap());
+        assert!(summary.starts_with("1 conectado"), "{summary}");
+    }
+
+    #[test]
+    fn friends_sort_online_first_then_by_name() {
+        let friends = Friends {
+            friends: vec![
+                friend(5, "eli", false),
+                friend(3, "Carla", true),
+                friend(4, "Dani", false),
+                friend(2, "bea", true),
+                friend(6, "Bea", true),
+            ],
+            incoming: Vec::new(),
+            outgoing: Vec::new(),
+        };
+        let order: Vec<u64> = sorted_friends(&friends).iter().map(|f| f.id).collect();
+        assert_eq!(order, [2, 6, 3, 4, 5]);
+    }
+
+    /// «Compartir» pasa por `Navigate`: pide ya qué se puede compartir.
     #[test]
     fn share_asks_for_what_can_be_shared() {
-        use crate::ui::screens::host::SourceChoice;
-        let mut app = app();
-        app.screen = Screen::Main;
+        let mut app = main_app();
         assert_eq!(
             app.update(Message::Home(Msg::Share)),
             [Effect::LoadShareOptions(SourceChoice::Screen)]
         );
         assert_eq!(app.page, Page::Host);
         assert!(app.host.refreshing);
+    }
+
+    /// Sin sala, «Invitar» lleva a Compartir; con la sala abierta, invita.
+    #[test]
+    fn invite_needs_an_open_room() {
+        let mut app = main_app();
+        let effects = app.update(Message::Home(Msg::Invite(2)));
+        assert_eq!(effects, [Effect::LoadShareOptions(SourceChoice::Screen)]);
+        assert_eq!(app.page, Page::Host);
+        // Abriéndose (sin código todavía), nada.
         app.page = Page::Home;
-        let effects = app.update(Message::Home(Msg::AddFriends));
+        app.host.starting = true;
+        assert!(app.update(Message::Home(Msg::Invite(2))).is_empty());
         assert_eq!(app.page, Page::Home);
-        assert!(effects.contains(&Effect::LoadFriends), "{effects:?}");
+    }
+
+    #[test]
+    fn server_down_blocks_share_and_join() {
+        let mut app = main_app();
+        app.update(Message::Event(Event::ServerStatus {
+            rtt_ms: None,
+            online: false,
+        }));
+        assert!(app.update(Message::Home(Msg::Share)).is_empty());
+        assert_eq!(app.page, Page::Home);
+        app.update(Message::Home(Msg::Code("K7Q2MZ".into())));
+        assert!(app.update(Message::Home(Msg::Join)).is_empty());
+        invited(&mut app, 3, "K7Q2MZ");
+        assert!(
+            app.update(Message::Home(Msg::Accept("K7Q2MZ".into())))
+                .is_empty()
+        );
+        assert_eq!(app.invitations.len(), 1, "la invitación sigue");
+        // Vuelve el servidor: ya se puede.
+        app.update(Message::Event(Event::ServerStatus {
+            rtt_ms: Some(10.0),
+            online: true,
+        }));
+        assert!(
+            app.update(Message::Home(Msg::Join))
+                .contains(&Effect::Join("K7Q2MZ".into()))
+        );
+    }
+
+    #[test]
+    fn add_friend_toggles_the_field() {
+        let mut app = main_app();
+        app.update(Message::Friends(FriendsMsg::ToggleAdd));
+        assert!(app.friends_page.adding);
+        app.update(Message::Friends(FriendsMsg::AddName("ana".into())));
+        app.account = Some(crate::ui::app::AccountInfo {
+            server: crate::ui::shots::server_entry(),
+            username: "ana".into(),
+            display_name: "Ana".into(),
+            user_id: 1,
+            device: "equipo".into(),
+            fingerprint: "a1".repeat(32),
+        });
+        assert!(app.update(Message::Friends(FriendsMsg::Add)).is_empty());
+        assert!(app.friends_page.add_error.is_some(), "no a uno mismo");
+        app.update(Message::Friends(FriendsMsg::AddName("bea".into())));
+        assert_eq!(
+            app.update(Message::Friends(FriendsMsg::Add)),
+            [Effect::AddFriend("bea".into())]
+        );
     }
 }

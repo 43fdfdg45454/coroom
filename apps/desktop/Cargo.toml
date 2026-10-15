@@ -39,9 +39,10 @@ unic-langid.workspace = true
 winit.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# `settings`: tema y acento del sistema; `open_uri`: abrir la página de una versión nueva
-# y `secret`: la clave del llavero dentro de Flatpak.
-ashpd = { workspace = true, features = ["settings", "open_uri", "secret"] }
+# `settings`: tema y acento del sistema; `open_uri`: abrir la página de una versión nueva;
+# `secret`: la clave del llavero dentro de Flatpak y `notification`: los mensajes del chat con la
+# ventana sin foco.
+ashpd = { workspace = true, features = ["settings", "open_uri", "secret", "notification"] }
 futures-util.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]

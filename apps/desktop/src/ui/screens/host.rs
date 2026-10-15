@@ -1,58 +1,83 @@
-//! Pantalla 4: anfitrión.
+//! Pantalla «Compartir» (anfitrión), según el boceto aprobado.
 //!
-//! Antes de abrir, qué compartir (el boceto aprobado): dos tarjetas, **Transmitir pantalla** (un
-//! monitor, con el audio de todas las aplicaciones salvo las que quites, que se recuerdan) y
-//! **Transmitir una app** (una ventana, con el audio solo de esa aplicación), más la fuente de
-//! prueba como enlace; el monitor o la ventana elegidos con "Cambiar…"; la lista de audio, la voz y
-//! la calidad. La lista de audio es la misma en todos los sistemas: las aplicaciones que suenan,
-//! refrescadas cada [`REFRESH`]. Donde el sistema elige el monitor o la ventana con su propio
-//! selector (el portal en Wayland), "Elegir…" lo abre ya y la elección se repite al empezar con su
-//! token; donde no, se elige aquí de la lista. Después, la sala abierta: el código grande con copiar, la vista previa de lo
-//! que se comparte, los invitados con sus permisos como interruptores (teclado y ratón, mando con
-//! ranura, voz), sus estadísticas (ruta, RTT, bitrate, pérdida, latencia de entrada), pausar a
-//! todos, expulsar, invitar a amigos conectados y "Dejar de compartir".
+//! Antes de abrir la sala: arriba, **Qué compartir** (Pantalla, Ventana o Juego; Juego es una
+//! ventana con el audio solo de su aplicación) con el monitor o la ventana, y **A quién invitar**
+//! con la lista de amigos en vivo (los marcados se invitan en cuanto el servidor crea la sala);
+//! debajo, la **calidad** en tres perfiles ([`QualityPreset`]) y **Avanzado** plegado (resolución,
+//! fps, códec y codificador, tope del bitrate Auto, 4:4:4 y HDR), cada fila con «En vivo» o «Al
+//! abrir la sala» según [`Video::when`]; el audio que se envía y la voz; y «Abrir la sala e
+//! invitar». La vista previa no existe hasta abrir la sala (la captura arranca con ella): hasta
+//! entonces, un marcador. Donde el sistema elige el monitor o la ventana con su propio selector
+//! (el portal en Wayland), «Elegir…» lo abre ya y la elección se repite al abrir con su token;
+//! donde no, se elige aquí de la lista. La lista de audio son las aplicaciones que suenan,
+//! refrescadas cada [`REFRESH`].
+//!
+//! Con la sala abierta (la misma página): la cabecera con el código, los invitados y la ruta; la
+//! fuente con su vista previa y «Cambiar fuente» (el mismo selector, sin cerrar la sala); los
+//! invitados con sus permisos como conmutadores (teclado y ratón, mando, voz), expulsar y número
+//! de seguridad; la calidad en vivo; y, a la derecha, el chat de la sala.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use coroom_session::audio::GameCapture;
 use coroom_session::audio::apps::{AppFilter, PlayingApp, normalize};
 use coroom_session::capture::{CaptureTarget, PickedShare, ShareChoice, ShareKind};
-use coroom_session::remote::{GuestStatus, PadTransport, SessionEvent, permissions_label};
+use coroom_session::remote::{
+    CandidateOutcome, GuestStatus, PadTransport, QualityLevel, SessionEvent, UNLIMITED_KBPS,
+    permissions_label, start_kbps,
+};
 use coroom_session::{GuestId, Permissions};
 use coroom_ui::Element;
 use coroom_ui::icon::{Icon, icon_with};
-use coroom_ui::style::{ButtonClass, ContainerClass, SvgClass};
+use coroom_ui::style::{ButtonClass, ContainerClass, SvgClass, TextClass};
 use coroom_ui::theme::Tone;
 use coroom_ui::tokens::{size, space, text as type_size};
 use coroom_ui::widget::{self as ui, Kind};
 use iced_core::text::Wrapping;
 use iced_core::{Alignment, Length, Padding};
-use iced_widget::{Column, Row, button, checkbox, column, container, row};
+use iced_widget::{Column, Row, button, checkbox, column, container, row, rule};
 
-use crate::ui::app::{App, Dialog, Effect, Event, HostRequest, Load, Message, Page};
-use crate::ui::screens::settings as settings_screen;
-use crate::ui::settings::{CodecChoice, KnownPeer, RememberedApp};
+use super::chat;
+use crate::ui::app::{App, Dialog, Effect, Event, HostRequest, Load, Message, Page, quality_tone};
+use crate::ui::settings::{
+    BITRATE_CHOICES, CodecChoice, EncoderChoice, FPS_CHOICES, KnownPeer, QualityPreset,
+    RememberedApp, Resolution, Video, VideoOption, When,
+};
 use crate::ui::stats;
 use crate::ui::video::{VideoFeed, video_view};
 
 /// Cada cuánto se vuelve a mirar qué suena y qué se puede compartir.
 pub const REFRESH: Duration = Duration::from_secs(2);
 
-/// Aplicaciones que casi nunca son el juego: no se marcan solas al transmitir una app cuando el
+/// Aplicaciones que casi nunca son el juego: no se marcan solas al compartir un juego cuando el
 /// sistema no dice de quién es la ventana.
 const NOT_GAMES: [&str; 16] = [
     "firefox", "chrome", "chromium", "brave", "msedge", "discord", "vesktop", "steam", "spotify",
     "telegram", "slack", "teams", "zoom", "obs", "signal", "webcord",
 ];
 
-/// Fuente.
+/// Ancho del panel del chat con la sala abierta.
+const CHAT_WIDTH: f32 = 320.0;
+
+/// Ancho de la miniatura de la fuente antes de abrir la sala (16:9).
+const THUMB_WIDTH: f32 = 160.0;
+
+/// Ancho de la vista previa con la sala abierta (16:9).
+const PREVIEW_WIDTH: f32 = 192.0;
+
+/// Caracteres de un monitor o una ventana en su desplegable: los títulos de ventana de Windows
+/// son largos y el desplegable va al lado de la miniatura.
+const TARGET_LABEL_CHARS: usize = 34;
+
+/// Fuente de la captura (lo que el backend sabe abrir).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SourceChoice {
-    /// Un monitor entero, con el audio de todas las aplicaciones elegidas.
+    /// Un monitor entero.
     #[default]
     Screen,
-    /// Una ventana, con el audio solo de su aplicación.
+    /// Una ventana.
     App,
     /// Patrón sintético.
     Synthetic,
@@ -68,16 +93,69 @@ impl SourceChoice {
     }
 }
 
+/// Qué se comparte, como lo elige el anfitrión en el segmentado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShareMode {
+    /// Un monitor, con el audio de todas las aplicaciones salvo las quitadas.
+    #[default]
+    Screen,
+    /// Una ventana, con el audio de todas las aplicaciones salvo las quitadas.
+    Window,
+    /// Una ventana, con el audio solo de su aplicación (y las que se marquen).
+    Game,
+    /// La fuente de prueba (un patrón animado).
+    Test,
+}
+
+impl ShareMode {
+    /// Los del segmentado (la fuente de prueba va aparte, como enlace).
+    pub const PICKER: [ShareMode; 3] = [ShareMode::Screen, ShareMode::Window, ShareMode::Game];
+
+    /// Fuente que se captura.
+    pub fn source(self) -> SourceChoice {
+        match self {
+            ShareMode::Screen => SourceChoice::Screen,
+            ShareMode::Window | ShareMode::Game => SourceChoice::App,
+            ShareMode::Test => SourceChoice::Synthetic,
+        }
+    }
+
+    /// Si solo suena la aplicación elegida (y las marcadas a mano).
+    fn only_its_audio(self) -> bool {
+        self == ShareMode::Game
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ShareMode::Screen => t!("host-modo-pantalla"),
+            ShareMode::Window => t!("host-modo-ventana"),
+            ShareMode::Game => t!("host-modo-juego"),
+            ShareMode::Test => t!("host-la-fuente-de-prueba"),
+        }
+    }
+
+    fn help(self) -> &'static str {
+        match self {
+            ShareMode::Screen => t!("host-pantalla-ayuda"),
+            ShareMode::Window => t!("host-ventana-ayuda"),
+            ShareMode::Game => t!("host-juego-ayuda"),
+            ShareMode::Test => t!("host-fuente-de-prueba-ayuda"),
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            ShareMode::Screen => Icon::Monitor,
+            ShareMode::Window => Icon::AppWindow,
+            ShareMode::Game => Icon::Gamepad,
+            ShareMode::Test => Icon::Activity,
+        }
+    }
+}
+
 /// Monitor o ventana en el selector.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetOption(pub CaptureTarget);
-
-/// Caracteres de un monitor o una ventana en su desplegable ([`TARGET_SELECT_WIDTH`]): los títulos
-/// de ventana de Windows son largos.
-const TARGET_LABEL_CHARS: usize = 40;
-
-/// Ancho del desplegable de monitores o ventanas.
-const TARGET_SELECT_WIDTH: f32 = 360.0;
 
 impl std::fmt::Display for TargetOption {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -86,6 +164,28 @@ impl std::fmt::Display for TargetOption {
             CaptureTarget::Window { title, .. } => title,
         };
         f.write_str(&ui::ellipsize(label, TARGET_LABEL_CHARS))
+    }
+}
+
+/// Opción de un desplegable con su texto.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Pick<T> {
+    /// Valor.
+    pub value: T,
+    /// Texto.
+    pub label: String,
+}
+
+impl<T> std::fmt::Display for Pick<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
+}
+
+fn pick<T>(value: T, label: impl Into<String>) -> Pick<T> {
+    Pick {
+        value,
+        label: label.into(),
     }
 }
 
@@ -122,8 +222,8 @@ pub struct PadSlot(pub Option<u8>);
 impl std::fmt::Display for PadSlot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
-            None => f.write_str(t!("pantalla-host-sin-mando")),
-            Some(slot) => write!(f, "{}", t!("pantalla-host-ranura-slot", slot = slot)),
+            None => f.write_str(t!("host-sin-mando")),
+            Some(slot) => write!(f, "{}", t!("host-ranura-slot", slot = slot)),
         }
     }
 }
@@ -135,9 +235,9 @@ pub struct PadMode(pub bool);
 impl std::fmt::Display for PadMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(if self.0 {
-            t!("pantalla-host-tal-cual")
+            t!("host-tal-cual")
         } else {
-            t!("pantalla-host-convertido-a-xbox-360")
+            t!("host-convertido-a-xbox-360")
         })
     }
 }
@@ -149,7 +249,7 @@ pub struct Room {
     pub code: Option<String>,
     /// Huella del anfitrión.
     pub fingerprint: String,
-    /// Códec en uso.
+    /// Códec en uso y con qué se codifica («AV1 por SVT-AV1»).
     pub codec: Option<String>,
     /// Invitados.
     pub guests: Vec<GuestStatus>,
@@ -162,14 +262,16 @@ pub struct Room {
     /// Sin relay (cuota o servidor).
     pub relay: Option<String>,
     /// Invitados cuya voz no se oye en este equipo (decisión del anfitrión, solo para él).
-    pub muted: std::collections::BTreeSet<GuestId>,
+    pub muted: BTreeSet<GuestId>,
+    /// Si los invitados de esta sala entran callados.
+    pub guests_muted: bool,
 }
 
 /// Estado.
 #[derive(Debug, Clone, Default)]
 pub struct State {
-    /// Fuente.
-    pub source: SourceChoice,
+    /// Qué se comparte (pantalla, ventana, juego o la fuente de prueba).
+    pub mode: ShareMode,
     /// Monitor o ventana elegido (si el sistema deja elegirlo aquí).
     pub target: Option<CaptureTarget>,
     /// Lo elegido en el selector del sistema (Wayland), para la fuente actual.
@@ -181,16 +283,22 @@ pub struct State {
     /// Mirando qué se puede compartir.
     pub refreshing: bool,
     /// Cuándo se miró por última vez.
-    pub refreshed_at: Option<std::time::Instant>,
-    /// Al transmitir una app: las aplicaciones cuyo audio se envía.
+    pub refreshed_at: Option<Instant>,
+    /// Al compartir un juego: las aplicaciones cuyo audio se envía.
     pub only: Vec<String>,
     /// Si [`State::only`] lo eligió la aplicación (se rehace al cambiar de ventana o de lo que
     /// suena) o el usuario.
     pub only_chosen: bool,
-    /// Voz.
-    pub voice: bool,
-    /// Los invitados entran callados.
-    pub guests_muted: bool,
+    /// Lista de audio desplegada.
+    pub audio_open: bool,
+    /// Amigos marcados para invitar al abrir la sala.
+    pub invite: BTreeSet<u64>,
+    /// Cuándo llegó la última lista de amigos o un cambio de presencia.
+    pub friends_at: Option<Instant>,
+    /// «Avanzado» desplegado.
+    pub advanced: bool,
+    /// El último tope del bitrate elegido (para volver a él al marcar «Tope»).
+    pub last_cap_kbps: Option<u32>,
     /// Abriendo.
     pub starting: bool,
     /// Cerrando.
@@ -199,6 +307,8 @@ pub struct State {
     pub error: Option<String>,
     /// Sala abierta.
     pub room: Option<Room>,
+    /// Con la sala abierta, el selector de fuente desplegado («Cambiar fuente»).
+    pub changing_source: bool,
     /// Lo que se transmite desde que se abrió la sala (o desde el último cambio).
     pub shared: Option<Sharing>,
     /// Cambiando lo que se comparte con la sala abierta: lo pedido.
@@ -208,8 +318,8 @@ pub struct State {
 /// Fuente y monitor o ventana de una transmisión.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sharing {
-    /// Fuente.
-    pub source: SourceChoice,
+    /// Cómo se eligió.
+    pub mode: ShareMode,
     /// Monitor o ventana de la lista.
     pub target: Option<CaptureTarget>,
     /// Lo elegido en el selector del sistema.
@@ -217,14 +327,15 @@ pub struct Sharing {
 }
 
 impl Sharing {
-    /// Si es lo mismo (el título de una ventana puede cambiar sin que cambie la ventana).
+    /// Si se captura lo mismo (Ventana y Juego solo cambian el audio; el título de una ventana
+    /// puede cambiar sin que cambie la ventana).
     fn same(&self, other: &Sharing) -> bool {
         let targets = match (&self.target, &other.target) {
             (Some(a), Some(b)) => same_target(a, b),
             (None, None) => true,
             _ => false,
         };
-        self.source == other.source && targets && self.picked == other.picked
+        self.mode.source() == other.mode.source() && targets && self.picked == other.picked
     }
 }
 
@@ -232,6 +343,11 @@ impl State {
     /// Si hay una sala abierta (o abriéndose).
     pub fn is_open(&self) -> bool {
         self.room.is_some() || self.starting
+    }
+
+    /// Fuente que se captura.
+    pub fn source(&self) -> SourceChoice {
+        self.mode.source()
     }
 
     /// Vista previa, si hay sala.
@@ -242,7 +358,7 @@ impl State {
     /// Cuándo toca volver a mirar qué se puede compartir (antes de abrir la sala y con ella
     /// abierta, para cambiar de fuente): `now` si nunca se ha mirado, `None` mientras se abre o se
     /// mira. Es el plazo que espera la ventana; [`State::refresh_due`] dice si ya llegó.
-    pub fn next_refresh(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+    pub fn next_refresh(&self, now: Instant) -> Option<Instant> {
         if self.starting || self.refreshing {
             return None;
         }
@@ -250,14 +366,14 @@ impl State {
     }
 
     /// Si toca volver a mirar qué se puede compartir.
-    pub fn refresh_due(&self, now: std::time::Instant) -> bool {
+    pub fn refresh_due(&self, now: Instant) -> bool {
         !self.starting && !self.refreshing && self.refreshed_at.is_none_or(|at| now >= at + REFRESH)
     }
 
     /// Lo elegido ahora en la pantalla.
     pub fn sharing(&self) -> Sharing {
         Sharing {
-            source: self.source,
+            mode: self.mode,
             target: self.target.clone(),
             picked: self.picked.clone(),
         }
@@ -273,7 +389,7 @@ impl State {
     /// Lo que se pide capturar.
     fn share_choice(&self) -> ShareChoice {
         ShareChoice {
-            kind: self.source.kind(),
+            kind: self.source().kind(),
             target: self
                 .picked
                 .as_ref()
@@ -290,7 +406,7 @@ impl State {
     fn current_options(&self) -> Option<&ShareOptions> {
         self.options
             .as_ref()
-            .filter(|options| options.source == self.source)
+            .filter(|options| options.source == self.source())
     }
 
     /// Aplicaciones que suenan, si el audio por aplicación funciona.
@@ -314,21 +430,25 @@ impl State {
         }
     }
 
-    /// Rehace la selección automática de la app: la de la ventana o, si el sistema no la dice,
-    /// la primera que suena y no parece un navegador, un chat o una tienda.
-    fn auto_select(&mut self) {
-        // Con la sala abierta, el audio de lo que ya se transmite no cambia solo.
-        let live = self.room.is_some() && !self.source_changed();
-        if self.only_chosen || self.source != SourceChoice::App || live {
-            return;
-        }
-        let guess = self.target_app().map(normalize).or_else(|| {
+    /// El juego más probable: la aplicación de la ventana o, si el sistema no la dice, la primera
+    /// que suena y no parece un navegador, un chat o una tienda.
+    fn likely_game(&self) -> Option<String> {
+        self.target_app().map(normalize).or_else(|| {
             self.playing()?
                 .iter()
                 .find(|app| !NOT_GAMES.iter().any(|word| app.key.contains(word)))
                 .map(|app| app.key.clone())
-        });
-        self.only = guess.into_iter().collect();
+        })
+    }
+
+    /// Rehace la selección automática del audio del juego.
+    fn auto_select(&mut self) {
+        // Con la sala abierta, el audio de lo que ya se transmite no cambia solo.
+        let live = self.room.is_some() && !self.source_changed();
+        if self.only_chosen || !self.mode.only_its_audio() || live {
+            return;
+        }
+        self.only = self.likely_game().into_iter().collect();
     }
 
     /// Filas de la lista de audio, con las aplicaciones quitadas que se recuerdan.
@@ -336,56 +456,53 @@ impl State {
         let playing = self.playing().unwrap_or_default();
         let is_excluded = |key: &str| excluded.iter().any(|app| normalize(&app.key) == key);
         let mut rows: Vec<AudioRow> = Vec::new();
-        match self.source {
-            SourceChoice::App => {
-                let chosen = self.target_app().map(normalize);
-                if let Some(key) = &chosen
-                    && !playing.iter().any(|app| &app.key == key)
-                {
-                    rows.push(AudioRow {
-                        key: key.clone(),
-                        name: key.trim_end_matches(".exe").to_owned(),
-                        checked: self.only.contains(key),
-                        note: t!("pantalla-host-la-aplicacion-elegida-aun-sin-sonido"),
-                    });
-                }
-                rows.extend(playing.iter().map(|app| AudioRow {
+        if self.mode.only_its_audio() {
+            let chosen = self.target_app().map(normalize);
+            if let Some(key) = &chosen
+                && !playing.iter().any(|app| &app.key == key)
+            {
+                rows.push(AudioRow {
+                    key: key.clone(),
+                    name: key.trim_end_matches(".exe").to_owned(),
+                    checked: self.only.contains(key),
+                    note: t!("host-la-aplicacion-elegida-aun-sin-sonido"),
+                });
+            }
+            rows.extend(playing.iter().map(|app| AudioRow {
+                key: app.key.clone(),
+                name: app.name.clone(),
+                checked: self.only.contains(&app.key),
+                note: if chosen.as_ref() == Some(&app.key) {
+                    t!("host-la-aplicacion-elegida")
+                } else {
+                    t!("host-sonando")
+                },
+            }));
+        } else {
+            rows.extend(playing.iter().map(|app| {
+                let out = is_excluded(&app.key);
+                AudioRow {
                     key: app.key.clone(),
                     name: app.name.clone(),
-                    checked: self.only.contains(&app.key),
-                    note: if chosen.as_ref() == Some(&app.key) {
-                        t!("pantalla-host-la-aplicacion-elegida")
+                    checked: !out,
+                    note: if out {
+                        t!("host-quitada-siempre")
                     } else {
-                        t!("pantalla-host-sonando")
+                        t!("host-sonando")
                     },
-                }));
-            }
-            SourceChoice::Screen | SourceChoice::Synthetic => {
-                rows.extend(playing.iter().map(|app| {
-                    let out = is_excluded(&app.key);
-                    AudioRow {
-                        key: app.key.clone(),
+                }
+            }));
+            rows.extend(
+                excluded
+                    .iter()
+                    .filter(|app| !playing.iter().any(|p| p.key == normalize(&app.key)))
+                    .map(|app| AudioRow {
+                        key: normalize(&app.key),
                         name: app.name.clone(),
-                        checked: !out,
-                        note: if out {
-                            t!("pantalla-host-quitada-siempre")
-                        } else {
-                            t!("pantalla-host-sonando")
-                        },
-                    }
-                }));
-                rows.extend(
-                    excluded
-                        .iter()
-                        .filter(|app| !playing.iter().any(|p| p.key == normalize(&app.key)))
-                        .map(|app| AudioRow {
-                            key: normalize(&app.key),
-                            name: app.name.clone(),
-                            checked: false,
-                            note: t!("pantalla-host-quitada-siempre"),
-                        }),
-                );
-            }
+                        checked: false,
+                        note: t!("host-quitada-siempre"),
+                    }),
+            );
         }
         rows
     }
@@ -396,13 +513,14 @@ impl State {
             // Sin audio por aplicación en este equipo: todo lo que suena.
             return GameCapture::System;
         }
-        match self.source {
+        if self.mode.only_its_audio() {
             // Aunque no se marque ninguna, la captura por aplicación arranca: así se puede marcar
             // una con la sala abierta.
-            SourceChoice::App => GameCapture::Apps(AppFilter::Only(self.only.clone())),
-            SourceChoice::Screen | SourceChoice::Synthetic => GameCapture::Apps(
-                AppFilter::AllExcept(excluded.iter().map(|app| normalize(&app.key)).collect()),
-            ),
+            GameCapture::Apps(AppFilter::Only(self.only.clone()))
+        } else {
+            GameCapture::Apps(AppFilter::AllExcept(
+                excluded.iter().map(|app| normalize(&app.key)).collect(),
+            ))
         }
     }
 }
@@ -410,46 +528,72 @@ impl State {
 /// Mensajes.
 #[derive(Debug, Clone)]
 pub enum Msg {
-    /// Fuente.
-    Source(SourceChoice),
+    /// Qué se comparte.
+    Mode(ShareMode),
     /// Monitor o ventana.
     Target(TargetOption),
     /// Enviar o no el audio de una aplicación (clave, nombre).
     AppAudio(String, String, bool),
-    /// Voz.
+    /// Desplegar o plegar la lista de audio.
+    AudioOpen(bool),
+    /// Voz del anfitrión.
     Voice(bool),
-    /// Los invitados entran callados.
+    /// Los invitados entran callados (en esta sala).
     GuestsMuted(bool),
     /// Abrir el selector del sistema para elegir el monitor o la ventana.
     Pick,
-    /// Volver a Inicio sin abrir la sala.
-    Cancel,
+    /// Marcar o desmarcar un amigo para invitarlo al abrir.
+    Mark(u64, bool),
+    /// Volver a pedir la lista de amigos.
+    ReloadFriends,
+    /// Elegir un perfil de calidad.
+    Preset(QualityPreset),
+    /// Desplegar o plegar «Avanzado».
+    Advanced(bool),
+    /// Resolución máxima.
+    Resolution(Pick<Resolution>),
+    /// Fotogramas por segundo.
+    Fps(u32),
+    /// Códec.
+    Codec(Pick<CodecChoice>),
+    /// Codificador.
+    Encoder(Pick<EncoderChoice>),
+    /// Poner o quitar el tope del bitrate Auto.
+    Capped(bool),
+    /// Tope del bitrate Auto (kbit/s).
+    Cap(Pick<u32>),
+    /// Croma 4:4:4.
+    Chroma444(bool),
+    /// HDR.
+    Hdr(bool),
     /// Abrir la sala.
     Start,
     /// Copiar el código.
     CopyCode,
-    /// Dejar de compartir (pide confirmación).
+    /// Cerrar la sala (pide confirmación).
     Stop,
     /// Pausar o reanudar la entrada de todos.
     Pause(bool),
     /// Teclado y ratón de un invitado.
     Keyboard(GuestId, bool),
-    /// Mando de un invitado.
+    /// Dar o quitar un mando a un invitado (la primera ranura libre).
+    PadOn(GuestId, bool),
+    /// Ranura del mando de un invitado.
     Pad(GuestId, PadSlot),
     /// Si el mando de un invitado va tal cual o convertido.
     PadMode(GuestId, PadMode),
     /// Voz de un invitado.
     GuestVoice(GuestId, bool),
-    /// Expulsar (pide confirmación).
-    Kick(GuestId),
-    /// Invitar a un amigo conectado.
-    Invite(u64),
-    /// Número de seguridad de un invitado.
-    Safety(GuestId),
-    /// Ir a Ajustes → Vídeo.
-    VideoSettings,
     /// Oír o no la voz de un invitado en este equipo.
     Hear(GuestId, bool),
+    /// Expulsar (pide confirmación).
+    Kick(GuestId),
+    /// Número de seguridad de un invitado.
+    Safety(GuestId),
+    /// Invitar a un amigo conectado con la sala abierta.
+    Invite(u64),
+    /// Con la sala abierta: desplegar (o cancelar) el selector de fuente.
+    ChangeSource(bool),
     /// Con la sala abierta: compartir lo elegido en vez de lo de ahora.
     ApplySource,
 }
@@ -476,20 +620,82 @@ fn set_permissions(
     vec![Effect::SetPermissions(id, status.permissions)]
 }
 
+/// Si la ranura `slot` es de otro invitado que `id`.
+fn slot_taken(app: &App, id: GuestId, slot: u8) -> bool {
+    app.host.room.as_ref().is_some_and(|room| {
+        room.guests
+            .iter()
+            .any(|g| g.guest != id && g.permissions.gamepad_slot == Some(slot))
+    })
+}
+
+/// Qué opciones de vídeo cambian de `before` a `after`.
+fn changed_options(before: &Video, after: &Video) -> Vec<VideoOption> {
+    let mut changed = Vec::new();
+    if before.max_resolution != after.max_resolution {
+        changed.push(VideoOption::Resolution);
+    }
+    if before.fps != after.fps {
+        changed.push(VideoOption::Fps);
+    }
+    if before.codec != after.codec || before.encoder != after.encoder {
+        changed.push(VideoOption::Codec);
+    }
+    if before.max_bitrate_kbps != after.max_bitrate_kbps {
+        changed.push(VideoOption::Bitrate);
+    }
+    if before.chroma_444 != after.chroma_444 {
+        changed.push(VideoOption::Chroma444);
+    }
+    if before.hdr != after.hdr {
+        changed.push(VideoOption::Hdr);
+    }
+    changed
+}
+
+/// Cambia el vídeo de los ajustes y lo guarda; con la sala abierta, aplica lo que va en vivo
+/// ([`Video::when`]) y avisa de lo que espera a la próxima sala. `custom`: el cambio viene de
+/// «Avanzado» y el perfil pasa a «Personalizado».
+fn change_video(app: &mut App, custom: bool, change: impl FnOnce(&mut Video)) -> Vec<Effect> {
+    let before = app.settings.video.clone();
+    change(&mut app.settings.video);
+    let changed = changed_options(&before, &app.settings.video);
+    if custom && !changed.is_empty() {
+        app.settings.video.preset = QualityPreset::Custom;
+    }
+    let mut effects = app.settings_changed();
+    if app.host.room.is_none() {
+        return effects;
+    }
+    let mut next_room = false;
+    for option in changed {
+        match (Video::when(option), option) {
+            (When::Live, VideoOption::Codec) => {
+                let video = &app.settings.video;
+                tracing::info!(codec = ?video.codec, encoder = ?video.encoder, "códec para la sala abierta");
+                effects.push(Effect::SetCodec);
+            }
+            (When::Live, VideoOption::Bitrate) => {
+                let kbps = app.settings.video.max_bitrate_kbps;
+                tracing::info!(kbps, "tope del bitrate para la sala abierta");
+                effects.push(Effect::SetMaxBitrate(kbps));
+            }
+            (When::Live, other) => {
+                tracing::warn!(?other, "opción en vivo sin forma de aplicarla a la sala");
+            }
+            (When::NextRoom, _) => next_room = true,
+        }
+    }
+    if next_room {
+        app.toast(Tone::Info, t!("host-guardado-para-la-proxima-sala"));
+    }
+    effects
+}
+
 /// Reduce un mensaje.
 pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
     match msg {
-        Msg::Source(source) => {
-            if app.host.source != source {
-                app.host.source = source;
-                app.host.target = None;
-                app.host.picked = None;
-                app.host.only_chosen = false;
-                app.host.only.clear();
-                app.host.auto_select();
-                return refresh(app);
-            }
-        }
+        Msg::Mode(mode) => return set_mode(app, mode),
         Msg::Target(TargetOption(target)) => {
             app.host.target = Some(target);
             app.host.only_chosen = false;
@@ -498,20 +704,20 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::AppAudio(key, name, on) => {
             let key = normalize(&key);
             let mut effects = Vec::new();
-            if app.host.source == SourceChoice::App {
+            if app.host.mode.only_its_audio() {
                 app.host.only.retain(|known| *known != key);
                 if on {
                     app.host.only.push(key);
                 }
                 app.host.only_chosen = true;
             } else {
-                // Al transmitir la pantalla, quitar una aplicación se recuerda.
+                // Al compartir la pantalla o una ventana, quitar una aplicación se recuerda.
                 let excluded = &mut app.settings.audio.excluded_apps;
                 excluded.retain(|known| normalize(&known.key) != key);
                 if !on {
                     excluded.push(RememberedApp { key, name });
                 }
-                effects.push(Effect::SaveSettings);
+                effects.extend(app.settings_changed());
             }
             // Con la sala abierta, el audio de lo que se transmite cambia ya (si se está eligiendo
             // otra fuente, va con ella al cambiar).
@@ -522,35 +728,67 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
             return effects;
         }
-        Msg::Voice(voice) => app.host.voice = voice,
-        Msg::GuestsMuted(muted) => app.host.guests_muted = muted,
+        Msg::AudioOpen(open) => app.host.audio_open = open,
+        // Los dos son ajustes (Ajustes → Audio y voz, y → Sala): aquí se ven y se cambian igual.
+        Msg::Voice(voice) => {
+            app.settings.audio.host_voice = voice;
+            return app.settings_changed();
+        }
+        Msg::GuestsMuted(muted) => {
+            app.settings.room.guests_muted = muted;
+            return app.settings_changed();
+        }
         Msg::Pick => {
             if app.host.picking || app.host.starting || app.host.switching.is_some() {
                 return Vec::new();
             }
             app.host.picking = true;
-            return vec![Effect::PickShare(app.host.source)];
+            return vec![Effect::PickShare(app.host.source())];
         }
-        Msg::Cancel => return app.update(Message::Navigate(Page::Home)),
-        Msg::Start => {
-            if app.host.is_open() {
-                return Vec::new();
+        Msg::Mark(user, marked) => {
+            if marked {
+                app.host.invite.insert(user);
+            } else {
+                app.host.invite.remove(&user);
             }
-            let audio = app.host.game_capture(&app.settings.audio.excluded_apps);
-            app.host.starting = true;
-            app.host.error = None;
-            app.host.shared = Some(app.host.sharing());
-            app.host.switching = None;
-            // La sala de espera sigue hasta que la sala esté abierta: así los amigos te siguen
-            // viendo conectado mientras arranca (y si no arranca).
-            return vec![Effect::StartHost(HostRequest {
-                source: app.host.source,
-                share: app.host.share_choice(),
-                audio,
-                voice: app.host.voice,
-                guests_muted: app.host.guests_muted,
-            })];
         }
+        Msg::ReloadFriends => {
+            if !app.friends.is_loading() {
+                app.friends = Load::Loading;
+                return vec![Effect::LoadFriends];
+            }
+        }
+        Msg::Preset(preset) => return change_video(app, false, |video| preset.apply(video)),
+        Msg::Advanced(open) => app.host.advanced = open,
+        Msg::Resolution(choice) => {
+            return change_video(app, true, |video| video.max_resolution = choice.value);
+        }
+        Msg::Fps(fps) => return change_video(app, true, |video| video.fps = fps),
+        Msg::Codec(choice) => return change_video(app, true, |video| video.codec = choice.value),
+        Msg::Encoder(choice) => {
+            return change_video(app, true, |video| video.encoder = choice.value);
+        }
+        Msg::Capped(capped) => {
+            let current = app.settings.video.max_bitrate_kbps;
+            let kbps = if capped {
+                app.host
+                    .last_cap_kbps
+                    .unwrap_or(Video::default().max_bitrate_kbps)
+            } else {
+                if current < UNLIMITED_KBPS {
+                    app.host.last_cap_kbps = Some(current);
+                }
+                UNLIMITED_KBPS
+            };
+            return change_video(app, true, |video| video.max_bitrate_kbps = kbps);
+        }
+        Msg::Cap(choice) => {
+            app.host.last_cap_kbps = Some(choice.value);
+            return change_video(app, true, |video| video.max_bitrate_kbps = choice.value);
+        }
+        Msg::Chroma444(on) => return change_video(app, true, |video| video.chroma_444 = on),
+        Msg::Hdr(on) => return change_video(app, true, |video| video.hdr = on),
+        Msg::Start => return start(app),
         Msg::CopyCode => {
             if let Some(code) = app.host.room.as_ref().and_then(|room| room.code.clone()) {
                 return app.update(Message::Copy(code));
@@ -564,48 +802,29 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
         }
         Msg::Keyboard(id, on) => return set_permissions(app, id, |p| p.keyboard_mouse = on),
+        Msg::PadOn(id, on) => {
+            if !on {
+                return set_permissions(app, id, |p| p.gamepad_slot = None);
+            }
+            let max = coroom_session::input::max_gamepads();
+            let free = pad_choices(app.settings.input.preferred_slot, max)
+                .into_iter()
+                .filter_map(|slot| slot.0)
+                .find(|slot| !slot_taken(app, id, *slot));
+            match free {
+                Some(slot) => return set_permissions(app, id, |p| p.gamepad_slot = Some(slot)),
+                None => app.toast(Tone::Warning, t!("host-sin-ranuras-libres")),
+            }
+        }
         Msg::Pad(id, slot) => {
-            let taken = slot.0.is_some_and(|wanted| {
-                app.host.room.as_ref().is_some_and(|room| {
-                    room.guests
-                        .iter()
-                        .any(|g| g.guest != id && g.permissions.gamepad_slot == Some(wanted))
-                })
-            });
-            if taken {
-                app.toast(
-                    Tone::Warning,
-                    t!("pantalla-host-la-slot-ya-es-de-otro", slot = slot),
-                );
+            if slot.0.is_some_and(|wanted| slot_taken(app, id, wanted)) {
+                app.toast(Tone::Warning, t!("host-la-slot-ya-es-de-otro", slot = slot));
                 return Vec::new();
             }
             return set_permissions(app, id, |p| p.gamepad_slot = slot.0);
         }
         Msg::PadMode(id, mode) => return set_permissions(app, id, |p| p.gamepad_raw = mode.0),
         Msg::GuestVoice(id, on) => return set_permissions(app, id, |p| p.voice = on),
-        Msg::Kick(id) => {
-            if let Some(status) = guest(app, id) {
-                app.dialog = Some(Dialog::Kick {
-                    guest: id,
-                    name: status.name.clone(),
-                });
-            }
-        }
-        Msg::Invite(user) => return app.update(Message::Home(super::home::Msg::Invite(user))),
-        Msg::Safety(id) => {
-            if let Some(status) = guest(app, id) {
-                app.dialog = Some(Dialog::SafetyNumber {
-                    name: status.name.clone(),
-                    fingerprint: status.fingerprint.clone(),
-                    number: status.safety_number.to_string(),
-                });
-            }
-        }
-        Msg::VideoSettings => {
-            app.settings_page.page = super::settings::SettingsPage::Video;
-            return app.update(Message::Navigate(Page::Settings));
-        }
-        Msg::ApplySource => return apply_source(app),
         Msg::Hear(id, hear) => {
             if let Some(room) = app.host.room.as_mut() {
                 if hear {
@@ -620,6 +839,105 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 }];
             }
         }
+        Msg::Kick(id) => {
+            if let Some(status) = guest(app, id) {
+                app.dialog = Some(Dialog::Kick {
+                    guest: id,
+                    name: status.name.clone(),
+                });
+            }
+        }
+        Msg::Safety(id) => {
+            if let Some(status) = guest(app, id) {
+                app.dialog = Some(Dialog::SafetyNumber {
+                    name: status.name.clone(),
+                    fingerprint: status.fingerprint.clone(),
+                    number: status.safety_number.to_string(),
+                });
+            }
+        }
+        Msg::Invite(user) => return app.update(Message::Home(super::home::Msg::Invite(user))),
+        Msg::ChangeSource(open) => return change_source(app, open),
+        Msg::ApplySource => return apply_source(app),
+    }
+    Vec::new()
+}
+
+/// Cambia lo que se comparte en el segmentado.
+fn set_mode(app: &mut App, mode: ShareMode) -> Vec<Effect> {
+    let host = &mut app.host;
+    if host.mode == mode {
+        return Vec::new();
+    }
+    let source = host.source();
+    host.mode = mode;
+    host.only_chosen = false;
+    if mode.source() != source {
+        host.target = None;
+        host.picked = None;
+        host.only.clear();
+        host.auto_select();
+        return refresh(app);
+    }
+    // Ventana ↔ Juego: la misma ventana con otro audio; con la sala abierta, se aplica ya.
+    host.only = if mode.only_its_audio() {
+        host.likely_game().into_iter().collect()
+    } else {
+        Vec::new()
+    };
+    if host.room.is_some() && !host.source_changed() {
+        return vec![Effect::SetAppAudio(
+            host.game_capture(&app.settings.audio.excluded_apps),
+        )];
+    }
+    Vec::new()
+}
+
+/// Abre la sala con lo elegido.
+fn start(app: &mut App) -> Vec<Effect> {
+    if app.host.is_open() {
+        return Vec::new();
+    }
+    let audio = app.host.game_capture(&app.settings.audio.excluded_apps);
+    let guests_muted = app.settings.room.guests_muted;
+    let voice = app.settings.audio.host_voice;
+    let host = &mut app.host;
+    host.starting = true;
+    host.error = None;
+    host.shared = Some(host.sharing());
+    host.switching = None;
+    host.changing_source = false;
+    // La sala de espera sigue hasta que la sala esté abierta: así los amigos te siguen viendo
+    // conectado mientras arranca (y si no arranca).
+    vec![Effect::StartHost(HostRequest {
+        source: host.source(),
+        share: host.share_choice(),
+        audio,
+        voice,
+        guests_muted,
+    })]
+}
+
+/// Con la sala abierta, despliega el selector de fuente o lo cancela (vuelve a lo que se
+/// transmite).
+fn change_source(app: &mut App, open: bool) -> Vec<Effect> {
+    let host = &mut app.host;
+    if host.room.is_none() {
+        return Vec::new();
+    }
+    host.changing_source = open;
+    if open || host.switching.is_some() {
+        return Vec::new();
+    }
+    let Some(shared) = host.shared.clone() else {
+        return Vec::new();
+    };
+    let reload = shared.mode.source() != host.source();
+    host.mode = shared.mode;
+    host.target = shared.target;
+    host.picked = shared.picked;
+    if reload {
+        return refresh(app);
     }
     Vec::new()
 }
@@ -632,34 +950,44 @@ fn apply_source(app: &mut App) -> Vec<Effect> {
     }
     host.switching = Some(host.sharing());
     vec![Effect::SwitchSource(HostRequest {
-        source: host.source,
+        source: host.source(),
         share: host.share_choice(),
         audio: host.game_capture(&app.settings.audio.excluded_apps),
-        voice: host.voice,
-        guests_muted: host.guests_muted,
+        voice: app.settings.audio.host_voice,
+        guests_muted: app.settings.room.guests_muted,
     })]
 }
 
-/// Pide mirar otra vez qué se puede compartir.
+/// Pide mirar otra vez qué se puede compartir (y la lista de amigos, si no se tiene).
 pub fn refresh(app: &mut App) -> Vec<Effect> {
     if app.host.starting {
         return Vec::new();
     }
     app.host.refreshing = true;
-    vec![Effect::LoadShareOptions(app.host.source)]
+    let mut effects = vec![Effect::LoadShareOptions(app.host.source())];
+    if matches!(app.friends, Load::Idle) && app.account.is_some() {
+        app.friends = Load::Loading;
+        effects.push(Effect::LoadFriends);
+    }
+    effects
+}
+
+/// Llegó la lista de amigos o un cambio de presencia (para «en vivo · hace N s»).
+pub fn on_friends(app: &mut App) {
+    app.host.friends_at = Some(app.now);
 }
 
 /// Lo que se puede compartir, recién mirado.
 pub fn on_share_options(app: &mut App, options: ShareOptions) {
     app.host.refreshing = false;
     app.host.refreshed_at = Some(app.now);
-    if options.source != app.host.source {
+    if options.source != app.host.source() {
         // Llegó tarde, para la fuente de antes: se vuelve a mirar en el próximo `Tick`.
         app.host.refreshed_at = None;
         return;
     }
     // Si no se pudo listar qué compartir, se avisa una vez (la lista se mira cada pocos
-    // segundos) y la sección lo explica mientras dure.
+    // segundos) y el selector lo explica mientras dure.
     let known = app
         .host
         .current_options()
@@ -668,15 +996,9 @@ pub fn on_share_options(app: &mut App, options: ShareOptions) {
         && known != Some(err)
     {
         let text = if options.source == SourceChoice::App {
-            t!(
-                "pantalla-host-no-se-pudieron-listar-las-ventanas",
-                error = err
-            )
+            t!("host-no-se-pudieron-listar-las-ventanas", error = err)
         } else {
-            t!(
-                "pantalla-host-no-se-pudieron-listar-los-monitores",
-                error = err
-            )
+            t!("host-no-se-pudieron-listar-los-monitores", error = err)
         };
         app.toast(Tone::Warning, text);
     }
@@ -706,7 +1028,7 @@ pub fn on_share_picked(
     picked: Result<Option<PickedShare>, String>,
 ) -> Vec<Effect> {
     app.host.picking = false;
-    if source != app.host.source {
+    if source != app.host.source() {
         return Vec::new();
     }
     match picked {
@@ -721,7 +1043,7 @@ pub fn on_share_picked(
         Ok(None) => {}
         Err(err) => app.toast(
             Tone::Warning,
-            t!("pantalla-host-no-se-pudo-abrir-el-selector", error = err),
+            t!("host-no-se-pudo-abrir-el-selector", error = err),
         ),
     }
     Vec::new()
@@ -750,6 +1072,7 @@ pub fn pad_choices(preferred: u8, max: u8) -> Vec<PadSlot> {
 pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
     match event {
         Event::HostStarted(Ok(preview)) => {
+            let guests_muted = app.settings.room.guests_muted;
             app.host.starting = false;
             app.host.room = Some(Room {
                 code: None,
@@ -760,7 +1083,8 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                 preview,
                 preview_unavailable: false,
                 relay: None,
-                muted: std::collections::BTreeSet::new(),
+                muted: BTreeSet::new(),
+                guests_muted,
             });
             app.page = Page::Host;
             // La sala lleva su propia señalización: la de espera ya sobra.
@@ -784,17 +1108,19 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
         }
         Event::HostEnded(reason) => {
             let was_open = app.host.room.take().is_some();
-            app.host.shared = None;
-            app.host.switching = None;
-            app.host.starting = false;
-            app.host.stopping = false;
+            let host = &mut app.host;
+            host.shared = None;
+            host.switching = None;
+            host.starting = false;
+            host.stopping = false;
+            host.changing_source = false;
             if let Some(reason) = reason {
                 app.toast(
                     Tone::Error,
-                    t!("pantalla-host-la-sala-se-cerro-reason", reason = reason),
+                    t!("host-la-sala-se-cerro-reason", reason = reason),
                 );
             } else if was_open {
-                app.toast(Tone::Info, t!("pantalla-host-has-dejado-de-compartir"));
+                app.toast(Tone::Info, t!("host-has-dejado-de-compartir"));
             }
             if app.page == Page::Host && !was_open {
                 app.page = Page::Home;
@@ -812,16 +1138,14 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                     Ok(Some(kbps)) => app.toast(
                         Tone::Info,
                         t!(
-                            "pantalla-host-video-de-la-sala-cambiado",
-                            valor = settings_screen::bitrate_phrase(kbps)
+                            "host-video-de-la-sala-cambiado",
+                            valor = bitrate_phrase(kbps)
                         ),
                     ),
-                    Ok(None) => {
-                        app.toast(Tone::Info, t!("pantalla-host-codec-de-la-sala-cambiado"))
-                    }
+                    Ok(None) => app.toast(Tone::Info, t!("host-codec-de-la-sala-cambiado")),
                     Err(err) => app.toast(
                         Tone::Warning,
-                        t!("pantalla-host-no-se-pudo-cambiar-el-video", error = err),
+                        t!("host-no-se-pudo-cambiar-el-video", error = err),
                     ),
                 }
             }
@@ -833,14 +1157,15 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
             }
             match result {
                 Ok(()) => {
-                    app.toast(Tone::Info, t!("pantalla-host-ahora-compartes-otra-cosa"));
+                    app.toast(Tone::Info, t!("host-ahora-compartes-otra-cosa"));
                     if requested.is_some() {
                         app.host.shared = requested;
                     }
+                    app.host.changing_source = false;
                 }
                 Err(err) => app.toast(
                     Tone::Warning,
-                    t!("pantalla-host-no-se-pudo-cambiar-la-fuente", error = err),
+                    t!("host-no-se-pudo-cambiar-la-fuente", error = err),
                 ),
             }
         }
@@ -851,13 +1176,16 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
 
 fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
     let mut effects = Vec::new();
-    let Some(room) = app.host.room.as_mut() else {
+    if app.host.room.is_none() {
         return effects;
-    };
+    }
     match event {
         SessionEvent::RoomCreated { code, fingerprint } => {
-            room.code = Some(code);
-            room.fingerprint = fingerprint;
+            if let Some(room) = app.host.room.as_mut() {
+                room.code = Some(code);
+                room.fingerprint = fingerprint;
+            }
+            effects.extend(invite_marked(app));
         }
         SessionEvent::GuestJoined {
             name,
@@ -871,23 +1199,26 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
                 fingerprint,
                 safety_number: safety_number.to_string(),
             });
-            effects.push(Effect::SaveSettings);
+            effects.extend(app.settings_changed());
             app.toast(
                 Tone::Info,
                 t!(
-                    "pantalla-host-name-ha-entrado-en-la-sala",
+                    "host-name-ha-entrado-en-la-sala",
                     name = name,
                     valor = permissions_label(&permissions)
                 ),
             );
         }
         SessionEvent::GuestLeft { guest, kicked } => {
+            let Some(room) = app.host.room.as_mut() else {
+                return effects;
+            };
             let name = room
                 .guests
                 .iter()
                 .find(|status| status.guest == guest)
                 .map_or_else(
-                    || t!("pantalla-host-el-invitado", valor = guest.0),
+                    || t!("host-el-invitado", valor = guest.0),
                     |s| s.name.clone(),
                 );
             room.guests.retain(|status| status.guest != guest);
@@ -895,27 +1226,320 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
             app.toast(
                 Tone::Neutral,
                 if kicked {
-                    t!(
-                        "pantalla-host-name-ha-sido-expulsado-las-claves",
-                        name = name
-                    )
+                    t!("host-name-ha-sido-expulsado-las-claves", name = name)
                 } else {
-                    t!("pantalla-host-name-ha-salido-de-la-sala", name = name)
+                    t!("host-name-ha-salido-de-la-sala", name = name)
                 },
             );
         }
         SessionEvent::VideoCodec { codec, detail } => {
-            room.codec = Some(format!(
-                "{codec} ({})",
-                detail.trim_start_matches(t!("pantalla-host-codifica"))
-            ));
+            if let Some(room) = app.host.room.as_mut() {
+                let encoder = detail
+                    .trim()
+                    .strip_prefix(t!("host-codifica"))
+                    .unwrap_or(detail.trim());
+                room.codec = Some(t!(
+                    "host-codec-por",
+                    codec = codec,
+                    encoder = encoder.trim()
+                ));
+            }
         }
-        SessionEvent::RelayUnavailable(message) => room.relay = Some(message),
+        SessionEvent::RelayUnavailable(message) => {
+            if let Some(room) = app.host.room.as_mut() {
+                room.relay = Some(message);
+            }
+        }
         SessionEvent::Warning(message) => app.toast(Tone::Warning, message),
         _ => {}
     }
     effects
 }
+
+/// Con el código de la sala ya creado, invita a los amigos marcados que sigan conectados.
+fn invite_marked(app: &mut App) -> Vec<Effect> {
+    let marked = std::mem::take(&mut app.host.invite);
+    let Some(friends) = app.friends.loaded() else {
+        return Vec::new();
+    };
+    let invited: Vec<_> = friends
+        .friends
+        .iter()
+        .filter(|friend| friend.online && marked.contains(&friend.id))
+        .map(|friend| (friend.id, friend.display_name.clone()))
+        .collect();
+    if invited.is_empty() {
+        return Vec::new();
+    }
+    let names: Vec<String> = invited.iter().map(|(_, name)| name.clone()).collect();
+    app.toast(
+        Tone::Info,
+        t!("host-invitacion-enviada", names = join_names(&names)),
+    );
+    invited
+        .into_iter()
+        .map(|(user, _)| Effect::Invite(user))
+        .collect()
+}
+
+/// «Bea», «Bea y Carla», «Bea, Carla y Dani».
+fn join_names(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => t!("host-y-last", valor = rest.join(", "), last = last),
+    }
+}
+
+// --- Textos de vídeo ------------------------------------------------------------------------------
+
+/// El bitrate dentro de una frase: «Auto hasta 20 Mbit/s» o «Auto sin tope». Auto es el único
+/// modo: el control de tasa sube hasta donde la red aguanta y baja antes de que se congele; el
+/// tope solo le pone techo.
+pub fn bitrate_phrase(kbps: u32) -> String {
+    if kbps < UNLIMITED_KBPS {
+        t!("host-auto-hasta", valor = cap_label(kbps))
+    } else {
+        t!("host-auto-sin-tope").to_owned()
+    }
+}
+
+/// Un tope en el selector: «20 Mbit/s» (sin decimales si son Mbit/s enteros).
+pub fn cap_label(kbps: u32) -> String {
+    if kbps >= 1000 && kbps.is_multiple_of(1000) {
+        format!("{} Mbit/s", kbps / 1000)
+    } else {
+        stats::kbps(f64::from(kbps))
+    }
+}
+
+/// Resolución máxima, corta («1080p», «Nativa»: la de la fuente hasta 4K).
+fn resolution_short(resolution: Resolution) -> String {
+    match resolution {
+        Resolution::P2160 => t!("host-nativa").to_owned(),
+        other => format!("{}p", other.size().1),
+    }
+}
+
+/// Resolución máxima en el desplegable.
+fn resolution_label(resolution: Resolution) -> String {
+    match resolution {
+        Resolution::P2160 => t!("host-nativa-hasta-4k").to_owned(),
+        other => {
+            let (width, height) = other.size();
+            format!("{height}p ({width} × {height})")
+        }
+    }
+}
+
+/// Lo que fija un perfil: «1080p · 60 fps · Auto hasta 10 Mbit/s».
+fn video_spec(video: &Video) -> String {
+    let mut parts = vec![
+        resolution_short(video.max_resolution),
+        t!("host-fps", fps = video.fps),
+        bitrate_phrase(video.max_bitrate_kbps),
+    ];
+    if video.chroma_444 {
+        parts.push("4:4:4".to_owned());
+    }
+    if video.hdr {
+        parts.push("HDR".to_owned());
+    }
+    parts.join(" · ")
+}
+
+fn preset_name(preset: QualityPreset) -> &'static str {
+    match preset {
+        QualityPreset::MinLatency => t!("host-perfil-min-latencia"),
+        QualityPreset::Balanced => t!("host-perfil-equilibrado"),
+        QualityPreset::MaxQuality => t!("host-perfil-max-calidad"),
+        QualityPreset::Custom => t!("host-perfil-personalizado"),
+    }
+}
+
+fn preset_short(preset: QualityPreset) -> &'static str {
+    match preset {
+        QualityPreset::MinLatency => t!("host-perfil-min-latencia-corto"),
+        QualityPreset::Balanced => t!("host-perfil-equilibrado"),
+        QualityPreset::MaxQuality => t!("host-perfil-max-calidad-corto"),
+        QualityPreset::Custom => t!("host-perfil-personalizado"),
+    }
+}
+
+fn preset_help(preset: QualityPreset) -> &'static str {
+    match preset {
+        QualityPreset::MinLatency => t!("host-perfil-min-latencia-ayuda"),
+        QualityPreset::Balanced => t!("host-perfil-equilibrado-ayuda"),
+        QualityPreset::MaxQuality => t!("host-perfil-max-calidad-ayuda"),
+        QualityPreset::Custom => t!("host-perfil-personalizado-ayuda"),
+    }
+}
+
+fn preset_icon(preset: QualityPreset) -> Icon {
+    match preset {
+        QualityPreset::MinLatency => Icon::Zap,
+        QualityPreset::Balanced => Icon::Gauge,
+        QualityPreset::MaxQuality => Icon::Image,
+        QualityPreset::Custom => Icon::Sliders,
+    }
+}
+
+fn when_label(when: When) -> &'static str {
+    match when {
+        When::Live => t!("host-en-vivo"),
+        When::NextRoom => t!("host-al-abrir-la-sala"),
+    }
+}
+
+fn option_name(option: VideoOption) -> &'static str {
+    match option {
+        VideoOption::Resolution => t!("host-opcion-resolucion"),
+        VideoOption::Fps => t!("host-opcion-fps"),
+        VideoOption::Codec => t!("host-opcion-codec"),
+        VideoOption::Bitrate => t!("host-opcion-bitrate"),
+        VideoOption::Chroma444 => "4:4:4",
+        VideoOption::Hdr => "HDR",
+    }
+}
+
+/// Cuándo se aplica cada opción, agrupado («En vivo: códec y bitrate · Al abrir la sala: …»),
+/// sacado de [`Video::when`].
+fn when_summary() -> String {
+    const ALL: [VideoOption; 6] = [
+        VideoOption::Codec,
+        VideoOption::Bitrate,
+        VideoOption::Resolution,
+        VideoOption::Fps,
+        VideoOption::Chroma444,
+        VideoOption::Hdr,
+    ];
+    [When::Live, When::NextRoom]
+        .into_iter()
+        .filter_map(|when| {
+            let names: Vec<String> = ALL
+                .into_iter()
+                .filter(|option| Video::when(*option) == when)
+                .map(|option| option_name(option).to_owned())
+                .collect();
+            (!names.is_empty()).then(|| {
+                t!(
+                    "host-cuando-grupo",
+                    when = when_label(when),
+                    valor = join_names(&names)
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn codec_choices() -> Vec<Pick<CodecChoice>> {
+    vec![
+        pick(CodecChoice::Auto, t!("host-automatico")),
+        pick(CodecChoice::Av1, "AV1"),
+        pick(CodecChoice::Hevc, "HEVC"),
+        pick(CodecChoice::H264, "H.264"),
+    ]
+}
+
+/// Codificadores de esta plataforma.
+fn encoder_choices() -> Vec<Pick<EncoderChoice>> {
+    let mut encoders = vec![pick(EncoderChoice::Auto, t!("host-automatico"))];
+    encoders.extend(
+        [
+            (EncoderChoice::Nvenc, "NVENC (NVIDIA)"),
+            (EncoderChoice::Amf, "AMF (AMD)"),
+            (EncoderChoice::Qsv, "Quick Sync (Intel)"),
+            (EncoderChoice::Vulkan, "Vulkan Video"),
+            (EncoderChoice::Vaapi, "VA-API"),
+        ]
+        .into_iter()
+        .filter(|(c, _)| cfg!(target_os = "linux") || *c != EncoderChoice::Vaapi)
+        .map(|(c, label)| pick(c, label)),
+    );
+    encoders.push(pick(EncoderChoice::Software, t!("host-por-software")));
+    encoders
+}
+
+/// Topes que se ofrecen con «Tope» marcado (sin el último, que es «sin tope»).
+fn cap_choices() -> Vec<Pick<u32>> {
+    BITRATE_CHOICES
+        .iter()
+        .filter(|kbps| **kbps < UNLIMITED_KBPS)
+        .map(|kbps| pick(*kbps, cap_label(*kbps)))
+        .collect()
+}
+
+/// Códec elegido (`None`: automático).
+fn chosen_codec(app: &App) -> Option<coroom_session::codec::Codec> {
+    use coroom_session::codec::Codec;
+    match app.settings.video.codec {
+        CodecChoice::Auto => None,
+        CodecChoice::Av1 => Some(Codec::Av1),
+        CodecChoice::Hevc => Some(Codec::Hevc),
+        CodecChoice::H264 => Some(Codec::H264),
+    }
+}
+
+fn join_codecs(names: impl Iterator<Item = String>) -> String {
+    let names: Vec<String> = names.collect();
+    join_names(&names)
+}
+
+/// Explicación de 4:4:4 con lo que hace este equipo.
+pub fn chroma_hint(app: &App) -> String {
+    let lead = t!("host-croma-lead");
+    let Some(support) = &app.video_support else {
+        return t!("host-croma-comprobando", lead = lead);
+    };
+    if support.yuv444.is_empty() {
+        let decode = if support.decode_yuv444.is_empty() {
+            String::new()
+        } else {
+            t!(
+                "host-croma-como-invitado",
+                valor = join_codecs(support.decode_yuv444.iter().map(ToString::to_string))
+            )
+        };
+        return t!("host-croma-no-disponible", lead = lead, decode = decode);
+    }
+    let with = join_codecs(support.yuv444.iter().map(|(_, label)| label.clone()));
+    match chosen_codec(app) {
+        Some(codec) if !support.yuv444.iter().any(|(c, _)| *c == codec) => t!(
+            "host-croma-no-con-este-codec",
+            lead = lead,
+            codec = codec,
+            valor = with
+        ),
+        _ => t!("host-croma-disponible-con", lead = lead, valor = with),
+    }
+}
+
+/// Explicación de HDR con lo que hace este equipo.
+pub fn hdr_hint(app: &App) -> String {
+    let Some(support) = &app.video_support else {
+        return t!("host-hdr-comprobando").to_owned();
+    };
+    let share = if support.hdr10.is_empty() {
+        t!("host-hdr-no-disponible").to_owned()
+    } else {
+        let with = join_codecs(support.hdr10.iter().map(|(_, label)| label.clone()));
+        match chosen_codec(app) {
+            Some(codec) if !support.hdr10.iter().any(|(c, _)| *c == codec) => {
+                t!("host-hdr-no-con-este-codec", codec = codec, valor = with)
+            }
+            _ => t!("host-hdr-disponible-con", valor = with),
+        }
+    };
+    let display = match support.hdr_display {
+        Some(true) => t!("host-hdr-pantalla-si"),
+        Some(false) => t!("host-hdr-pantalla-no"),
+        None => t!("host-hdr-pantalla-quiza"),
+    };
+    format!("{share} {display}")
+}
+
+// --- Vista ----------------------------------------------------------------------------------------
 
 fn on(msg: Msg) -> Message {
     Message::Host(msg)
@@ -929,902 +1553,91 @@ pub fn view(app: &App) -> Element<'_, Message> {
     }
 }
 
-/// Tarjeta de una de las dos fuentes, con su icono y el borde de acento si es la elegida. Sin
-/// mensaje es la copia que solo da la altura en [`source_cards`].
-fn choice<'a>(
-    icon: Icon,
-    title: &'a str,
-    subtitle: &'a str,
-    selected: bool,
-    message: Option<Message>,
-) -> Element<'a, Message> {
-    let class = if selected {
-        SvgClass::Accent
-    } else {
-        SvgClass::Secondary
-    };
-    let content = row![
-        icon_with(icon, 28.0, class),
-        column![
-            ui::strong(title),
-            ui::secondary(subtitle).wrapping(Wrapping::WordOrGlyph)
-        ]
-        .spacing(space::XXS)
-        .width(Length::Fill),
-    ]
-    .spacing(space::S)
-    .align_y(Alignment::Start);
-    button(content)
-        .padding(space::M)
+/// Etiqueta «En vivo» (verde) o «Al abrir la sala» (gris) de una opción.
+fn tag<'a>(when: When) -> Element<'a, Message> {
+    match when {
+        When::Live => coroom_ui::tag::live(when_label(when)),
+        When::NextRoom => coroom_ui::tag::later(when_label(when)),
+    }
+}
+
+/// Desplegable que ocupa el ancho que le dejen.
+fn select_fill<'a, T>(
+    options: Vec<T>,
+    selected: Option<T>,
+    on_select: impl Fn(T) -> Message + 'a,
+) -> Element<'a, Message>
+where
+    T: ToString + PartialEq + Clone + 'a,
+{
+    iced_widget::pick_list(options, selected, on_select)
+        .padding(Padding::from([8.0, 12.0]))
+        .text_size(type_size::BODY)
+        .font(coroom_ui::font::UI)
         .width(Length::Fill)
-        .height(if message.is_some() {
-            Length::Fill
-        } else {
-            Length::Shrink
-        })
-        .class(ButtonClass::Choice { selected })
-        .on_press_maybe(message)
         .into()
 }
 
-/// Las dos tarjetas de fuente, igual de altas.
-fn source_cards(state: &State) -> Element<'_, Message> {
-    ui::equal_height_row(
-        |real| {
-            let message = |source| real.then(|| on(Msg::Source(source)));
-            vec![
-                choice(
-                    Icon::Monitor,
-                    t!("pantalla-host-transmitir-pantalla"),
-                    t!("pantalla-host-un-monitor-entero-con-el-audio"),
-                    state.source == SourceChoice::Screen,
-                    message(SourceChoice::Screen),
-                ),
-                choice(
-                    Icon::AppWindow,
-                    t!("pantalla-host-transmitir-una-app"),
-                    t!("pantalla-host-una-sola-ventana-con-el-audio"),
-                    state.source == SourceChoice::App,
-                    message(SourceChoice::App),
-                ),
-            ]
-        },
-        space::S,
-    )
+/// Recuadro 16:9 del vídeo con `content` dentro.
+fn thumb<'a>(content: Element<'a, Message>, width: f32) -> Element<'a, Message> {
+    container(content)
+        .width(Length::Fixed(width))
+        .height(Length::Fixed((width * 9.0 / 16.0).round()))
+        .class(ContainerClass::Video)
+        .into()
 }
 
-fn setup(app: &App) -> Element<'_, Message> {
-    let state = &app.host;
-    let video = &app.settings.video;
-    let (width, height) = video.max_resolution.size();
-    let codec = match video.codec {
-        CodecChoice::Auto => t!("pantalla-host-el-mejor-comun-con-los-invitados"),
-        CodecChoice::Av1 => "AV1",
-        CodecChoice::Hevc => "HEVC",
-        CodecChoice::H264 => "H.264",
-    };
-    let cards = source_cards(state);
-    let test_source: Element<'_, Message> = if state.source == SourceChoice::Synthetic {
-        ui::banner(
-            Tone::Info,
-            t!("pantalla-host-se-transmitira-la-fuente-de-prueba"),
-            Some((
-                t!("pantalla-host-volver-a-la-pantalla"),
-                on(Msg::Source(SourceChoice::Screen)),
-            )),
-        )
-    } else {
-        row![
-            ui::button_with(
-                Kind::Link,
-                t!("pantalla-host-usar-la-fuente-de-prueba"),
-                None,
-                Some(on(Msg::Source(SourceChoice::Synthetic))),
-            ),
-            ui::caption(t!("pantalla-host-un-patron-animado-sirve-para-probar")),
+/// Icono y texto centrados sobre el fondo del vídeo (sin vista previa).
+fn placeholder<'a>(glyph: Icon, label: &'a str) -> Element<'a, Message> {
+    container(
+        column![
+            icon_with(glyph, 24.0, SvgClass::Overlay),
+            iced_widget::text(label)
+                .size(type_size::CAPTION)
+                .class(TextClass::Overlay)
+                .align_x(iced_core::alignment::Horizontal::Center)
+                .wrapping(Wrapping::WordOrGlyph)
         ]
         .spacing(space::XS)
-        .align_y(Alignment::Center)
-        .into()
-    };
-    let source = column![cards, test_source].spacing(space::XS);
-    let target = target_section(state);
-    let audio = audio_section(app);
-    let voice = ui::section(
-        t!("pantalla-host-voz"),
-        None,
-        vec![
-            ui::pref_row(
-                t!("pantalla-host-hablar-por-la-sala-con-el"),
-                Some(t!("pantalla-host-los-invitados-te-oyen-y-hablan").to_owned()),
-                ui::switch(state.voice, Some(|on_off| on(Msg::Voice(on_off)))),
-            ),
-            ui::pref_row(
-                t!("pantalla-host-los-invitados-entran-callados"),
-                Some(t!("pantalla-host-entran-sin-permiso-de-voz").to_owned()),
-                ui::switch(
-                    state.guests_muted,
-                    Some(|on_off| on(Msg::GuestsMuted(on_off))),
-                ),
-            ),
-        ],
-    );
-    let quality = ui::section(
-        t!("pantalla-host-calidad"),
-        None,
-        vec![ui::pref_row(
-            t!("pantalla-host-video"),
-            Some(t!(
-                "pantalla-host-hasta-width-height-a-fps-y",
-                width = width,
-                height = height,
-                fps = video.fps,
-                valor = settings_screen::bitrate_phrase(video.max_bitrate_kbps),
-                codec = codec
-            )),
-            ui::button_with(
-                Kind::Link,
-                t!("pantalla-host-cambiar"),
-                None,
-                Some(on(Msg::VideoSettings)),
-            ),
-        )],
-    );
-    let mut page = Column::new()
-        .spacing(space::L)
-        .push(ui::page_header(
-            t!("pantalla-host-compartir"),
-            Some(t!("pantalla-host-elige-que-ven-y-oyen").to_owned()),
-            vec![],
-        ))
-        .push(source);
-    if let Some(target) = target {
-        page = page.push(target);
-    }
-    let mut page = page.push(audio).push(voice).push(quality);
-    if let Some(error) = &state.error {
-        page = page.push(ui::banner(
-            Tone::Error,
-            t!("pantalla-host-no-se-pudo-abrir-la-sala", error = error),
-            Some((t!("pantalla-host-reintentar"), on(Msg::Start))),
-        ));
-    }
-    let actions: Element<'_, Message> = if state.starting {
-        container(ui::progress(
-            t!("pantalla-host-abriendo-la-sala-en-linux-elige"),
-            None,
-            app.now.elapsed().as_secs_f32(),
-        ))
-        .width(Length::Fixed(420.0))
-        .into()
-    } else {
-        row![
-            ui::button_with(
-                Kind::Normal,
-                t!("app-cancelar"),
-                None,
-                Some(on(Msg::Cancel)),
-            ),
-            ui::button_with(
-                Kind::Primary,
-                t!("pantalla-host-empezar-a-transmitir"),
-                None,
-                (!state.picking).then(|| on(Msg::Start)),
-            ),
-        ]
-        .spacing(space::S)
-        .into()
-    };
-    page = page.push(row![ui::fill(), actions].align_y(Alignment::Center));
-    ui::page(page)
+        .align_x(Alignment::Center),
+    )
+    .padding(space::XS)
+    .center(Length::Fill)
+    .into()
 }
 
-/// Monitor o ventana: lo elegido con "Cambiar…" (el selector del sistema) o la lista de aquí.
-fn target_section(state: &State) -> Option<Element<'_, Message>> {
-    let (title, label) = match state.source {
-        SourceChoice::Screen => (t!("pantalla-host-pantalla"), t!("pantalla-host-monitor")),
-        SourceChoice::App => (t!("pantalla-host-aplicacion"), t!("pantalla-host-ventana")),
-        SourceChoice::Synthetic => return None,
-    };
-    let mut rows = Vec::new();
-    let options = state.current_options();
-    if let Some(err) = options.and_then(|options| options.targets_error.as_ref())
-        && options.is_some_and(|options| options.targets.is_empty())
-    {
-        rows.push(ui::pref_row(
-            if state.source == SourceChoice::App {
-                t!("pantalla-host-no-se-pudieron-listar-las-ventanas-titulo")
-            } else {
-                t!("pantalla-host-no-se-pudieron-listar-los-monitores-titulo")
-            },
-            Some(err.clone()),
-            ui::gap(0.0),
-        ));
-    } else if options.is_none() {
-        // Aún no se ha mirado, o lo que hay es de la otra fuente.
-        rows.push(ui::pref_row(
-            t!("pantalla-host-buscando"),
-            None,
-            ui::gap(0.0),
-        ));
-    } else if state.system_picks() {
-        rows.push(picked_row(state));
+/// Botón de solo icono que se enciende con el acento (un permiso dado).
+fn toggle<'a>(glyph: Icon, active: bool, tip: &'a str, message: Message) -> Element<'a, Message> {
+    let (class, tint) = if active {
+        (ButtonClass::Primary, SvgClass::OnAccent)
     } else {
-        let targets: Vec<TargetOption> = options
-            .iter()
-            .flat_map(|options| options.targets.iter().cloned().map(TargetOption))
-            .collect();
-        let selected = state.target.clone().map(TargetOption);
-        rows.push(ui::pref_row(
-            label,
-            None,
-            ui::select_fixed(
-                targets,
-                selected,
-                |target| on(Msg::Target(target)),
-                TARGET_SELECT_WIDTH,
-            ),
-        ));
-    }
-    if state.source == SourceChoice::App {
-        rows.push(note(t!("pantalla-host-si-la-ventana-se-ve-en-negro")));
-    }
-    Some(ui::section(title, None, rows))
-}
-
-/// Fila de lo elegido en el selector del sistema, con el botón que lo abre.
-fn picked_row(state: &State) -> Element<'_, Message> {
-    let app = state.source == SourceChoice::App;
-    let (text, subtitle) = match (&state.picked, state.picking) {
-        (_, true) => (
-            t!("pantalla-host-elige-en-el-selector-del-sistema").to_owned(),
-            None,
-        ),
-        (Some(picked), false) => (picked_label(&picked.target), None),
-        (None, false) => (
-            if app {
-                t!("pantalla-host-aun-no-has-elegido-ventana")
-            } else {
-                t!("pantalla-host-aun-no-has-elegido-monitor")
-            }
-            .to_owned(),
-            Some(t!("pantalla-host-si-no-eliges-ahora").to_owned()),
-        ),
+        (ButtonClass::Flat, SvgClass::Secondary)
     };
-    let action = match (&state.picked, app) {
-        (None, _) => t!("pantalla-host-elegir"),
-        (Some(_), false) => t!("pantalla-host-cambiar-puntos"),
-        (Some(_), true) => t!("pantalla-host-elegir-otra"),
-    };
-    ui::pref_row(
-        text,
-        subtitle,
-        ui::button_with(
-            Kind::Normal,
-            action,
-            None,
-            (!state.picking).then(|| on(Msg::Pick)),
-        ),
+    ui::with_tooltip(
+        button(
+            container(icon_with(glyph, size::ICON, tint))
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        )
+        .width(Length::Fixed(size::CONTROL))
+        .height(Length::Fixed(size::CONTROL))
+        .padding(0)
+        .class(class)
+        .on_press(message),
+        tip,
     )
 }
 
 /// Cómo se nombra lo elegido en el selector del sistema (Wayland solo da el tamaño).
 fn picked_label(target: &CaptureTarget) -> String {
     match target {
-        CaptureTarget::Monitor { name, .. } if name.is_empty() => {
-            t!("pantalla-host-monitor").to_owned()
-        }
-        CaptureTarget::Monitor { name, .. } => {
-            t!("pantalla-host-monitor-de-size", size = name.as_str())
-        }
-        CaptureTarget::Window { title, .. } => {
-            t!("pantalla-host-ventana-de-size", size = title.as_str())
-        }
+        CaptureTarget::Monitor { name, .. } if name.is_empty() => t!("host-monitor").to_owned(),
+        CaptureTarget::Monitor { name, .. } => t!("host-monitor-de-size", size = name.as_str()),
+        CaptureTarget::Window { title, .. } => t!("host-ventana-de-size", size = title.as_str()),
     }
 }
 
-/// Texto secundario dentro de una sección.
-fn note(content: &str) -> Element<'_, Message> {
-    container(ui::caption(content))
-        .padding(Padding::from([4.0, 16.0]))
-        .into()
-}
-
-/// Fila de la lista de audio: la casilla, el nombre y la nota a la derecha.
-fn audio_row<'a>(
-    name: String,
-    note_text: &'a str,
-    checked: Option<bool>,
-    toggle: Option<Message>,
-) -> Element<'a, Message> {
-    let mark: Element<'a, Message> = match checked {
-        Some(checked) => checkbox(checked)
-            .on_toggle_maybe(toggle.map(|message| move |_| message.clone()))
-            .size(18.0)
-            .into(),
-        None => icon_with(Icon::CircleCheck, 18.0, SvgClass::Accent),
-    };
-    let label: Element<'a, Message> = if checked == Some(false) {
-        ui::secondary(name).into()
-    } else {
-        ui::body(name).into()
-    };
-    row![
-        mark,
-        container(label).width(Length::Fill),
-        ui::caption(note_text)
-    ]
-    .spacing(space::S)
-    .align_y(Alignment::Center)
-    .padding(Padding::from([10.0, 16.0]))
-    .height(Length::Shrink)
-    .into()
-}
-
-/// Audio que se envía: las aplicaciones con su casilla.
-fn audio_section(app: &App) -> Element<'_, Message> {
-    let state = &app.host;
-    let unsupported = state
-        .current_options()
-        .and_then(|options| options.apps.as_ref().err());
-    let subtitle = match state.source {
-        SourceChoice::App => t!("pantalla-host-marcada-la-aplicacion-que-elegiste"),
-        SourceChoice::Screen | SourceChoice::Synthetic => {
-            t!("pantalla-host-las-aplicaciones-que-empiecen-a-sonar")
-        }
-    };
-    let mut rows: Vec<Element<'_, Message>> = Vec::new();
-    if let Some(why) = unsupported {
-        rows.push(ui::pref_row(
-            t!("pantalla-host-todo-lo-que-suena"),
-            Some(t!(
-                "pantalla-host-este-equipo-no-separa-el-audio",
-                why = why
-            )),
-            icon_with(Icon::CircleCheck, 20.0, SvgClass::Accent),
-        ));
-    } else {
-        let audio_rows = state.audio_rows(&app.settings.audio.excluded_apps);
-        if audio_rows.is_empty() {
-            rows.push(ui::pref_row(
-                if state.current_options().is_none() {
-                    t!("pantalla-host-buscando")
-                } else {
-                    t!("pantalla-host-ninguna-aplicacion-suena-ahora")
-                },
-                None,
-                ui::gap(0.0),
-            ));
-        }
-        for row in audio_rows {
-            let AudioRow {
-                key,
-                name,
-                checked,
-                note,
-            } = row;
-            let toggle = on(Msg::AppAudio(key, name.clone(), !checked));
-            rows.push(audio_row(name, note, Some(checked), Some(toggle)));
-        }
-    }
-    let header = row![
-        ui::strong(t!("pantalla-host-audio-que-se-envia")),
-        ui::caption(subtitle).wrapping(Wrapping::WordOrGlyph),
-    ]
-    .spacing(space::XS)
-    .align_y(Alignment::End);
-    column![
-        header,
-        ui::boxed_list(rows),
-        container(ui::caption(t!("pantalla-host-coroom-nunca-se-envia-a-si")))
-            .padding(Padding::from([0.0, 4.0])),
-    ]
-    .spacing(space::XS)
-    .into()
-}
-
-fn code_card<'a>(room: &'a Room) -> Element<'a, Message> {
-    let code: Element<'a, Message> = match &room.code {
-        Some(code) => row![
-            ui::mono(spaced(code), type_size::CODE).font(coroom_ui::font::MONO),
-            ui::fill(),
-            ui::button_with(
-                Kind::Normal,
-                t!("pantalla-host-copiar"),
-                Some(Icon::Copy),
-                Some(on(Msg::CopyCode))
-            )
-        ]
-        .align_y(Alignment::Center)
-        .into(),
-        None => ui::progress(
-            t!("pantalla-host-creando-la-sala-en-el-servidor"),
-            None,
-            0.5,
-        ),
-    };
-    ui::card(
-        column![
-            ui::caption(t!("pantalla-host-codigo-de-la-sala")),
-            code,
-            ui::secondary(t!("pantalla-host-daselo-a-tus-invitados-lo-escriben"))
-                .wrapping(Wrapping::WordOrGlyph)
-        ]
-        .spacing(space::XS),
-    )
-}
-
-/// `K7Q2MZ` → `K7Q 2MZ` (más fácil de dictar).
-pub fn spaced(code: &str) -> String {
-    let (a, b) = code.split_at(code.len().min(3));
-    if b.is_empty() {
-        a.to_owned()
-    } else {
-        format!("{a} {b}")
-    }
-}
-
-fn preview_card(room: &Room) -> Element<'_, Message> {
-    let body: Element<'_, Message> = if room.preview_unavailable {
-        container(
-            column![
-                icon_with(Icon::Monitor, 28.0, SvgClass::Overlay),
-                iced_widget::text(t!("pantalla-host-sin-vista-previa-la-captura-va"))
-                    .size(type_size::SECONDARY)
-                    .class(coroom_ui::style::TextClass::Overlay)
-                    .align_x(iced_core::alignment::Horizontal::Center)
-                    .wrapping(Wrapping::WordOrGlyph)
-            ]
-            .spacing(space::XS)
-            .align_x(Alignment::Center),
-        )
-        .padding(space::M)
-        .center(Length::Fill)
-        .into()
-    } else {
-        video_view(&room.preview)
-    };
-    container(body)
-        .width(Length::Fixed(288.0))
-        .height(Length::Fixed(162.0))
-        .class(ContainerClass::Video)
-        .into()
-}
-
-/// Si el anfitrión silenció en su equipo la voz del invitado `id`.
-fn hears_muted(app: &App, id: GuestId) -> bool {
-    app.host
-        .room
-        .as_ref()
-        .is_some_and(|room| room.muted.contains(&id))
-}
-
-fn guest_card<'a>(app: &'a App, status: &'a GuestStatus) -> Element<'a, Message> {
-    let id = status.guest;
-    let connected = status.path.is_some();
-    let mut facts = Vec::new();
-    if let Some(path) = status.path {
-        let path = match path {
-            coroom_transport::Path::Direct => "directo".to_owned(),
-            coroom_transport::Path::Relayed => t!("pantalla-host-por-el-relay").to_owned(),
-        };
-        facts.push(match status.remote {
-            Some(remote) => format!("{path} {remote}"),
-            None => path,
-        });
-    }
-    if let Some(rtt) = status.rtt_ms {
-        facts.push(format!("RTT {}", stats::ms(rtt)));
-    }
-    if let Some(kbps) = status.target_kbps {
-        facts.push(stats::kbps(f64::from(kbps)));
-    }
-    if status.input.samples > 0 {
-        facts.push(t!(
-            "pantalla-host-entrada",
-            valor = stats::ms(status.input.p50_us as f64 / 1000.0)
-        ));
-    }
-    if facts.is_empty() {
-        facts.push(t!("pantalla-host-conectando").to_owned());
-    }
-    let header = row![
-        ui::avatar(&app.theme, &status.name, size::AVATAR),
-        column![
-            ui::strong(status.name.as_str()),
-            ui::secondary(facts.join(" · "))
-        ]
-        .spacing(2)
-        .width(Length::Fill),
-        if connected {
-            ui::status_badge(Tone::Success, t!("pantalla-host-conectado"))
-        } else {
-            ui::status_badge(Tone::Warning, t!("pantalla-host-conectando-2"))
-        },
-        ui::icon_button(
-            Icon::Fingerprint,
-            t!("pantalla-host-numero-de-seguridad"),
-            Some(on(Msg::Safety(id)))
-        ),
-        ui::button_with(
-            Kind::DestructiveFlat,
-            t!("pantalla-host-expulsar"),
-            Some(Icon::UserX),
-            Some(on(Msg::Kick(id)))
-        )
-    ]
-    .spacing(space::S)
-    .align_y(Alignment::Center);
-    let max = coroom_session::input::max_gamepads();
-    let slots = pad_choices(app.settings.input.preferred_slot, max);
-    let current = PadSlot(status.permissions.gamepad_slot);
-    let permissions = row![
-        row![
-            icon_with(Icon::Keyboard, 18.0, SvgClass::Secondary),
-            ui::body(t!("pantalla-host-teclado-y-raton")),
-            ui::switch(
-                status.permissions.keyboard_mouse,
-                Some(move |on_off| on(Msg::Keyboard(id, on_off)))
-            )
-        ]
-        .spacing(space::XS)
-        .align_y(Alignment::Center),
-        {
-            let mut pad = row![
-                icon_with(Icon::Gamepad, 18.0, SvgClass::Secondary),
-                ui::select(slots, Some(current), move |slot| on(Msg::Pad(id, slot)))
-            ]
-            .spacing(space::XS)
-            .align_y(Alignment::Center);
-            if status.permissions.gamepad_slot.is_some() {
-                pad = pad.push(ui::select(
-                    vec![PadMode(true), PadMode(false)],
-                    Some(PadMode(status.permissions.gamepad_raw)),
-                    move |mode| on(Msg::PadMode(id, mode)),
-                ));
-            }
-            pad
-        },
-        row![
-            icon_with(Icon::Mic, 18.0, SvgClass::Secondary),
-            ui::body(t!("pantalla-host-voz")),
-            ui::switch(
-                status.permissions.voice,
-                Some(move |on_off| on(Msg::GuestVoice(id, on_off)))
-            )
-        ]
-        .spacing(space::XS)
-        .align_y(Alignment::Center),
-        {
-            let muted = hears_muted(app, id);
-            ui::icon_button(
-                if muted {
-                    Icon::HeadphonesOff
-                } else {
-                    Icon::Headphones
-                },
-                if muted {
-                    t!("pantalla-host-volver-a-oir", name = status.name.as_str())
-                } else {
-                    t!("pantalla-host-dejar-de-oir", name = status.name.as_str())
-                },
-                Some(on(Msg::Hear(id, muted))),
-            )
-        },
-    ]
-    .spacing(space::L)
-    .align_y(Alignment::Center);
-    let mut card = column![header, permissions].spacing(space::S);
-    if status.permissions.gamepad_slot.is_some() {
-        card = card.push(pad_line(status));
-    }
-    if !status.input_key
-        && (status.permissions.keyboard_mouse || status.permissions.gamepad_slot.is_some())
-    {
-        card = card.push(ui::caption(t!(
-            "pantalla-host-esperando-la-clave-de-entrada-pareja"
-        )));
-    }
-    ui::card(card)
-}
-
-/// El mando que declara el invitado (nombre, VID:PID y cómo llega) y, si no va tal cual
-/// pudiendo, por qué.
-fn pad_line(status: &GuestStatus) -> Element<'_, Message> {
-    let Some(pad) = &status.gamepad else {
-        return ui::caption(t!("pantalla-host-todavia-no-ha-conectado-ningun-mando")).into();
-    };
-    let transport = match pad.transport {
-        PadTransport::Hid => "HID",
-        PadTransport::XInput => "XInput",
-        PadTransport::Converted => t!("pantalla-host-solo-convertido"),
-    };
-    let mut line = column![
-        row![
-            ui::caption(t!("pantalla-host-su-mando-name", name = pad.name.as_str())),
-            ui::status_badge(
-                Tone::Neutral,
-                format!("{:04x}:{:04x} · {transport}", pad.vendor, pad.product)
-            ),
-        ]
-        .spacing(space::XS)
-        .align_y(Alignment::Center)
-    ]
-    .spacing(2);
-    if let Some(note) = &pad.note {
-        line = line.push(ui::caption(t!(
-            "pantalla-host-va-convertido-note",
-            note = note.as_str()
-        )));
-    }
-    line.into()
-}
-
-fn room_view<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
-    let status = match (&room.codec, room.guests.is_empty()) {
-        (Some(codec), _) => t!("pantalla-host-compartiendo-codec", codec = codec),
-        (None, true) => t!("pantalla-host-esperando-al-primer-invitado-para-elegir").to_owned(),
-        (None, false) => t!("pantalla-host-eligiendo-el-codec-con-tus-invitados").to_owned(),
-    };
-    let pause: Element<'a, Message> = if room.paused {
-        ui::button_with(
-            Kind::Normal,
-            t!("pantalla-host-reanudar-la-entrada"),
-            Some(Icon::Play),
-            Some(on(Msg::Pause(false))),
-        )
-        .into()
-    } else {
-        ui::button_with(
-            Kind::Normal,
-            t!("pantalla-host-pausar-a-todos"),
-            Some(Icon::Pause),
-            Some(on(Msg::Pause(true))),
-        )
-        .into()
-    };
-    let stop: Element<'a, Message> = ui::button_with(
-        Kind::Destructive,
-        t!("pantalla-host-dejar-de-compartir"),
-        Some(Icon::Close),
-        (!app.host.stopping).then(|| on(Msg::Stop)),
-    )
-    .into();
-    let mut page = Column::new().spacing(space::L).push(ui::page_header(
-        t!("pantalla-host-tu-sala"),
-        Some(status),
-        vec![pause, stop],
-    ));
-    if room.paused {
-        page = page.push(ui::banner(
-            Tone::Warning,
-            t!("pantalla-host-la-entrada-de-todos-los-invitados"),
-            Some((t!("pantalla-host-reanudar"), on(Msg::Pause(false)))),
-        ));
-    }
-    if let Some(relay) = &room.relay {
-        page = page.push(ui::banner(
-            Tone::Warning,
-            t!(
-                "pantalla-host-sin-relay-relay-solo-podran-entrar",
-                relay = relay
-            ),
-            None,
-        ));
-    }
-    page = page.push(
-        row![
-            container(code_card(room)).width(Length::Fill),
-            preview_card(room)
-        ]
-        .spacing(space::M)
-        .align_y(Alignment::Start),
-    );
-    page = page.push(transmission(app, room));
-    let guests: Element<'a, Message> = if room.guests.is_empty() {
-        ui::card(ui::empty_state(
-            Icon::Users,
-            t!("pantalla-host-todavia-no-ha-entrado-nadie"),
-            t!("pantalla-host-comparte-el-codigo-de-la-sala"),
-            None,
-        ))
-    } else {
-        Column::with_children(room.guests.iter().map(|status| guest_card(app, status)))
-            .spacing(space::S)
-            .into()
-    };
-    page = page.push(
-        column![
-            ui::heading(t!("pantalla-host-invitados", valor = room.guests.len())),
-            guests
-        ]
-        .spacing(space::S),
-    );
-    page = page.push(invite_friends(app, room));
-    ui::page(page)
-}
-
-/// Qué se comparte, su audio y el vídeo, con la sala abierta: se cambian sin cerrarla.
-fn transmission<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
-    let state = &app.host;
-    let mut rows: Vec<Element<'a, Message>> = Vec::new();
-
-    // Qué compartes: pantalla o aplicación, el monitor o la ventana y, si cambió, el botón.
-    let kinds = ui::segmented(vec![
-        (
-            t!("pantalla-host-pantalla").to_owned(),
-            on(Msg::Source(SourceChoice::Screen)),
-            state.source == SourceChoice::Screen,
-        ),
-        (
-            t!("pantalla-host-aplicacion").to_owned(),
-            on(Msg::Source(SourceChoice::App)),
-            state.source == SourceChoice::App,
-        ),
-    ]);
-    let options = state.current_options();
-    let busy = state.picking || state.switching.is_some();
-    let now = state.shared.as_ref().map(sharing_label).unwrap_or_default();
-    let subtitle = match &state.switching {
-        Some(switching) => t!(
-            "pantalla-host-cambiando-a",
-            que = sharing_label(switching).as_str()
-        ),
-        None if state.source_changed() => t!("pantalla-host-ahora-cambiar", que = now.as_str()),
-        None => t!("pantalla-host-ahora", que = now.as_str()),
-    };
-    rows.push(ui::pref_row(
-        t!("pantalla-host-que-compartes"),
-        Some(subtitle),
-        kinds,
-    ));
-    // El monitor o la ventana, en su fila: con el título de una ventana de Windows al lado del
-    // selector de arriba, el desplegable se quedaba con todo el ancho (una letra por línea).
-    let target: Option<Element<'a, Message>> = match state.source {
-        SourceChoice::Synthetic => None,
-        _ if state.system_picks() => Some(
-            ui::button_with(
-                Kind::Normal,
-                t!("pantalla-host-cambiar-puntos"),
-                None,
-                (!busy).then(|| on(Msg::Pick)),
-            )
-            .into(),
-        ),
-        _ => options
-            .filter(|options| !options.targets.is_empty())
-            .map(|options| {
-                let targets: Vec<TargetOption> =
-                    options.targets.iter().cloned().map(TargetOption).collect();
-                ui::select_fixed(
-                    targets,
-                    state.target.clone().map(TargetOption),
-                    |target| on(Msg::Target(target)),
-                    TARGET_SELECT_WIDTH,
-                )
-            }),
-    };
-    let apply = (state.switching.is_none() && state.source_changed()).then(|| {
-        ui::button_with(
-            Kind::Primary,
-            t!("pantalla-host-compartir-esto"),
-            None,
-            (!busy).then(|| on(Msg::ApplySource)),
-        )
-    });
-    if target.is_some() || apply.is_some() {
-        let mut control = Row::new().spacing(space::S).align_y(Alignment::Center);
-        if let Some(target) = target {
-            control = control.push(target);
-        }
-        if let Some(apply) = apply {
-            control = control.push(apply);
-        }
-        let label = match state.source {
-            SourceChoice::App => t!("pantalla-host-ventana"),
-            _ => t!("pantalla-host-monitor"),
-        };
-        rows.push(ui::pref_row(label, None, control));
-    }
-
-    // Audio: las casillas se aplican al momento.
-    match state
-        .current_options()
-        .and_then(|options| options.apps.as_ref().err())
-    {
-        Some(why) => rows.push(ui::pref_row(
-            t!("pantalla-host-audio"),
-            Some(t!(
-                "pantalla-host-este-equipo-no-separa-el-audio",
-                why = why
-            )),
-            icon_with(Icon::CircleCheck, 20.0, SvgClass::Accent),
-        )),
-        None => {
-            let audio_rows = state.audio_rows(&app.settings.audio.excluded_apps);
-            rows.push(ui::pref_row(
-                t!("pantalla-host-audio"),
-                Some(
-                    if audio_rows.is_empty() {
-                        t!("pantalla-host-ninguna-aplicacion-suena-ahora")
-                    } else {
-                        t!("pantalla-host-marca-lo-que-oyen")
-                    }
-                    .to_owned(),
-                ),
-                ui::gap(0.0),
-            ));
-            for AudioRow {
-                key,
-                name,
-                checked,
-                note,
-            } in audio_rows
-            {
-                let toggle = on(Msg::AppAudio(key, name.clone(), !checked));
-                rows.push(audio_row(name, note, Some(checked), Some(toggle)));
-            }
-        }
-    }
-
-    // Vídeo: códec y bitrate máximo, también en Ajustes.
-    let video = &app.settings.video;
-    let codecs = settings_screen::codec_choices();
-    let codec = codecs.iter().find(|c| c.value == video.codec).cloned();
-    let bitrates = settings_screen::bitrate_choices();
-    let bitrate = bitrates
-        .iter()
-        .find(|c| c.value == video.max_bitrate_kbps)
-        .cloned();
-    let in_use = room.codec.as_ref().map_or_else(
-        || t!("pantalla-host-cambiar-de-codec-corta-un-momento").to_owned(),
-        |codec| t!("pantalla-host-en-uso-codec", codec = codec.as_str()),
-    );
-    rows.push(ui::pref_row(
-        t!("pantalla-settings-codec-preferido"),
-        Some(in_use),
-        ui::select(codecs, codec, |c| {
-            Message::Settings(settings_screen::Msg::Codec(c))
-        }),
-    ));
-    // El objetivo de ahora es el del invitado más lento (el control de tasa lo baja si hace falta).
-    let current = room
-        .guests
-        .iter()
-        .filter_map(|status| status.target_kbps)
-        .min();
-    let bitrate_note = match current {
-        Some(kbps) => t!(
-            "pantalla-host-el-bitrate-se-aplica-ya-ahora",
-            valor = stats::kbps(f64::from(kbps))
-        ),
-        None => t!("pantalla-host-el-bitrate-se-aplica-ya").to_owned(),
-    };
-    rows.push(ui::pref_row(
-        t!("pantalla-settings-bitrate-maximo"),
-        Some(bitrate_note),
-        row![
-            ui::select(bitrates, bitrate, |c| {
-                Message::Settings(settings_screen::Msg::Bitrate(c))
-            }),
-            ui::button_with(
-                Kind::Link,
-                t!("pantalla-host-mas-ajustes-de-video"),
-                None,
-                Some(on(Msg::VideoSettings)),
-            ),
-        ]
-        .spacing(space::S)
-        .align_y(Alignment::Center),
-    ));
-    ui::section(
-        t!("pantalla-host-transmision"),
-        Some(t!("pantalla-host-transmision-ayuda").to_owned()),
-        rows,
-    )
-}
-
-/// Cómo se nombra una transmisión («la pantalla», «Ventana: Fatal Fury»…).
+/// Cómo se nombra una transmisión («Monitor principal · 2560 × 1440», «Fatal Fury»…).
 fn sharing_label(sharing: &Sharing) -> String {
     let target = sharing
         .picked
@@ -1837,73 +1650,1301 @@ fn sharing_label(sharing: &Sharing) -> String {
                 _ => picked_label(target),
             })
         });
-    match (sharing.source, target) {
-        (SourceChoice::Synthetic, _) => t!("pantalla-host-la-fuente-de-prueba").to_owned(),
+    match (sharing.mode, target) {
+        (ShareMode::Test, _) => t!("host-la-fuente-de-prueba").to_owned(),
         (_, Some(target)) => target,
-        (SourceChoice::Screen, None) => t!("pantalla-host-pantalla").to_owned(),
-        (SourceChoice::App, None) => t!("pantalla-host-ventana").to_owned(),
+        (ShareMode::Screen, None) => t!("host-modo-pantalla").to_owned(),
+        (_, None) => t!("host-modo-ventana").to_owned(),
     }
 }
 
-fn invite_friends<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
-    let body: Element<'a, Message> = match &app.friends {
-        Load::Loaded(friends) => {
-            let inside: Vec<u64> = room.guests.iter().map(|status| status.user).collect();
-            let online: Vec<_> = friends
-                .friends
-                .iter()
-                .filter(|friend| friend.online && !inside.contains(&friend.id))
-                .collect();
-            if online.is_empty() {
-                ui::caption(t!("pantalla-host-ninguno-de-tus-amigos-conectados-esta")).into()
+/// El monitor o la ventana: la lista de aquí, lo elegido en el selector del sistema con su botón,
+/// o por qué no se puede.
+fn target_control(state: &State) -> Element<'_, Message> {
+    let window = state.source() == SourceChoice::App;
+    let options = state.current_options();
+    if state.mode == ShareMode::Test {
+        return column![
+            ui::body(t!("host-fuente-de-prueba-ayuda")).wrapping(Wrapping::WordOrGlyph),
+            ui::button_with(
+                Kind::Link,
+                t!("host-volver-a-la-pantalla"),
+                None,
+                Some(on(Msg::Mode(ShareMode::Screen))),
+            ),
+        ]
+        .spacing(space::XXS)
+        .into();
+    }
+    if let Some(err) = options.and_then(|options| options.targets_error.as_ref())
+        && options.is_some_and(|options| options.targets.is_empty())
+    {
+        return column![
+            ui::strong(if window {
+                t!("host-no-se-pudieron-listar-las-ventanas-titulo")
             } else {
-                let rows = online
-                    .into_iter()
-                    .map(|friend| {
-                        ui::list_row(
-                            Some(ui::avatar(&app.theme, &friend.display_name, 28.0)),
-                            friend.display_name.as_str(),
-                            Some(format!("@{}", friend.username)),
-                            vec![
-                                ui::button_with(
-                                    Kind::Normal,
-                                    t!("pantalla-host-invitar"),
-                                    Some(Icon::Mail),
-                                    room.code.as_ref().map(|_| on(Msg::Invite(friend.id))),
-                                )
-                                .into(),
-                            ],
-                        )
-                    })
-                    .collect();
-                ui::boxed_list(rows)
+                t!("host-no-se-pudieron-listar-los-monitores-titulo")
+            }),
+            ui::caption(err.as_str()).wrapping(Wrapping::WordOrGlyph),
+        ]
+        .spacing(2)
+        .into();
+    }
+    let Some(options) = options else {
+        // Aún no se ha mirado, o lo que hay es de la otra fuente.
+        return ui::secondary(t!("host-buscando")).into();
+    };
+    if state.system_picks() {
+        return picked_control(state);
+    }
+    let targets: Vec<TargetOption> = options.targets.iter().cloned().map(TargetOption).collect();
+    select_fill(targets, state.target.clone().map(TargetOption), |target| {
+        on(Msg::Target(target))
+    })
+}
+
+/// Lo elegido en el selector del sistema, con el botón que lo abre.
+fn picked_control(state: &State) -> Element<'_, Message> {
+    let window = state.source() == SourceChoice::App;
+    let busy = state.picking || state.switching.is_some();
+    let (text, subtitle) = match (&state.picked, state.picking) {
+        (_, true) => (t!("host-elige-en-el-selector-del-sistema").to_owned(), None),
+        (Some(picked), false) => (picked_label(&picked.target), None),
+        (None, false) => (
+            if window {
+                t!("host-aun-no-has-elegido-ventana")
+            } else {
+                t!("host-aun-no-has-elegido-monitor")
+            }
+            .to_owned(),
+            (!state.is_open()).then(|| t!("host-si-no-eliges-ahora")),
+        ),
+    };
+    let action = match (&state.picked, window) {
+        (None, _) => t!("host-elegir"),
+        (Some(_), false) => t!("host-cambiar-puntos"),
+        (Some(_), true) => t!("host-elegir-otra"),
+    };
+    let mut texts = column![ui::body(text).wrapping(Wrapping::WordOrGlyph)].spacing(2);
+    if let Some(subtitle) = subtitle {
+        texts = texts.push(ui::caption(subtitle).wrapping(Wrapping::WordOrGlyph));
+    }
+    // En columna: al lado de la miniatura no cabe el texto con el botón a la derecha.
+    column![
+        texts,
+        ui::button_with(Kind::Normal, action, None, (!busy).then(|| on(Msg::Pick))),
+    ]
+    .spacing(space::XS)
+    .into()
+}
+
+/// Segmentado Pantalla / Ventana / Juego.
+fn mode_picker(state: &State) -> Element<'_, Message> {
+    ui::segmented(
+        ShareMode::PICKER
+            .iter()
+            .map(|mode| {
+                (
+                    mode.label().to_owned(),
+                    on(Msg::Mode(*mode)),
+                    state.mode == *mode,
+                )
+            })
+            .collect(),
+    )
+}
+
+/// «Qué compartir» antes de abrir la sala (`real`: la de verdad o la copia que da la altura).
+fn source_card(app: &App, real: bool) -> Element<'_, Message> {
+    let state = &app.host;
+    let head = row![
+        ui::strong(t!("host-que-compartir")),
+        ui::fill(),
+        mode_picker(state)
+    ]
+    .spacing(space::S)
+    .align_y(Alignment::Center);
+    // La vista previa en vivo no existe antes de abrir la sala: la captura arranca con ella.
+    let preview = thumb(
+        placeholder(state.mode.icon(), t!("host-vista-previa-al-abrir")),
+        THUMB_WIDTH,
+    );
+    let mut side = column![target_control(state)].spacing(space::XS);
+    if state.mode != ShareMode::Test {
+        let mut help = column![ui::caption(state.mode.help()).wrapping(Wrapping::WordOrGlyph)];
+        if state.source() == SourceChoice::App {
+            help =
+                help.push(ui::caption(t!("host-ventana-en-negro")).wrapping(Wrapping::WordOrGlyph));
+        }
+        help = help
+            .push(ui::caption(t!("host-se-puede-cambiar-dentro")).wrapping(Wrapping::WordOrGlyph));
+        side = side.push(help.spacing(2));
+    }
+    let body = row![preview, side.width(Length::Fill)]
+        .spacing(space::S)
+        .align_y(Alignment::Center);
+    let card = column![head, body].spacing(space::S);
+    container(card)
+        .padding(Padding::from([space::S, space::M]))
+        .width(Length::Fill)
+        .height(if real { Length::Fill } else { Length::Shrink })
+        .class(ContainerClass::Card)
+        .into()
+}
+
+/// «en vivo · hace N s»: desde la última lista de amigos o el último cambio de presencia.
+fn live_label(app: &App) -> Option<String> {
+    let at = app.host.friends_at?;
+    let secs = app.now.saturating_duration_since(at).as_secs();
+    Some(if secs < 60 {
+        t!("host-en-vivo-hace-segundos", n = secs)
+    } else {
+        t!("host-en-vivo-hace-minutos", n = secs / 60)
+    })
+}
+
+/// `list` con una línea y `element` debajo.
+fn with_separator<'a>(
+    list: Column<'a, Message, coroom_ui::Theme>,
+    element: Element<'a, Message>,
+) -> Column<'a, Message, coroom_ui::Theme> {
+    list.push(rule::horizontal(1)).push(element)
+}
+
+/// «A quién invitar»: los amigos con su casilla (los conectados arriba; los desconectados, sin
+/// casilla).
+fn invite_card(app: &App, real: bool) -> Element<'_, Message> {
+    let state = &app.host;
+    let mut header = row![ui::strong(t!("host-a-quien-invitar")), ui::fill()]
+        .spacing(space::S)
+        .align_y(Alignment::Center);
+    if let Some(label) = live_label(app)
+        && app.friends.loaded().is_some()
+    {
+        header = header.push(ui::caption(label));
+    }
+    let mut list = Column::new().push(container(header).padding(Padding::from([12.0, 16.0])));
+    let push = with_separator;
+    match &app.friends {
+        Load::Loaded(friends) if friends.friends.is_empty() => {
+            list = push(
+                list,
+                container(ui::secondary(t!("host-sin-amigos")).wrapping(Wrapping::WordOrGlyph))
+                    .padding(Padding::from([10.0, 16.0]))
+                    .into(),
+            );
+        }
+        Load::Loaded(friends) => {
+            let mut sorted: Vec<_> = friends.friends.iter().collect();
+            sorted.sort_by_key(|friend| !friend.online);
+            for friend in sorted {
+                let id = friend.id;
+                let mark: Element<'_, Message> = if friend.online {
+                    checkbox(state.invite.contains(&id))
+                        .on_toggle(move |marked| on(Msg::Mark(id, marked)))
+                        .size(18.0)
+                        .into()
+                } else {
+                    ui::gap(18.0)
+                };
+                let name: Element<'_, Message> = if friend.online {
+                    ui::strong(friend.display_name.as_str()).into()
+                } else {
+                    ui::secondary(friend.display_name.as_str()).into()
+                };
+                let badge = if friend.online {
+                    ui::status_badge(Tone::Success, t!("host-disponible"))
+                } else {
+                    ui::status_badge(Tone::Neutral, t!("host-desconectado"))
+                };
+                list = push(
+                    list,
+                    container(
+                        row![
+                            mark,
+                            ui::avatar(&app.theme, &friend.display_name, 28.0),
+                            container(name).width(Length::Fill),
+                            badge
+                        ]
+                        .spacing(space::S)
+                        .align_y(Alignment::Center),
+                    )
+                    .padding(Padding::from([6.0, 16.0]))
+                    .into(),
+                );
             }
         }
-        Load::Failed(err) => ui::banner(Tone::Error, err.as_str(), None),
-        Load::Idle | Load::Loading => ui::skeleton(t!("pantalla-host-cargando-tus-amigos"), 1),
+        Load::Failed(err) => {
+            list = push(
+                list,
+                container(ui::banner(
+                    Tone::Error,
+                    err.as_str(),
+                    Some((t!("host-reintentar"), on(Msg::ReloadFriends))),
+                ))
+                .padding(space::XS)
+                .into(),
+            );
+        }
+        Load::Idle | Load::Loading => {
+            list = push(
+                list,
+                container(ui::skeleton(t!("host-cargando-tus-amigos"), 2))
+                    .padding(Padding::from([10.0, 16.0]))
+                    .into(),
+            );
+        }
+    }
+    container(list)
+        .width(Length::Fill)
+        .height(if real { Length::Fill } else { Length::Shrink })
+        .class(ContainerClass::Card)
+        .into()
+}
+
+/// Tarjeta grande de un perfil de calidad (`real`: la de verdad o la copia que da la altura).
+fn preset_card(video: &Video, preset: QualityPreset, real: bool) -> Element<'_, Message> {
+    let selected = video.preset == preset;
+    let mut values = video.clone();
+    preset.apply(&mut values);
+    let lead = if selected {
+        icon_with(Icon::CircleCheck, 18.0, SvgClass::Accent)
+    } else {
+        icon_with(preset_icon(preset), 18.0, SvgClass::Accent)
     };
-    column![ui::heading(t!("pantalla-host-invitar-amigos")), body]
+    let content = column![
+        row![lead, ui::strong(preset_name(preset)).size(15.0)]
+            .spacing(space::XS)
+            .align_y(Alignment::Center),
+        ui::secondary(preset_help(preset)).wrapping(Wrapping::WordOrGlyph),
+        ui::caption(video_spec(&values)).wrapping(Wrapping::WordOrGlyph),
+    ]
+    .spacing(6)
+    .width(Length::Fill);
+    // «Personalizado» abre Avanzado, donde está lo que lo define.
+    let message = if preset == QualityPreset::Custom {
+        on(Msg::Advanced(true))
+    } else {
+        on(Msg::Preset(preset))
+    };
+    button(content)
+        .padding(14)
+        .width(Length::Fill)
+        .height(if real { Length::Fill } else { Length::Shrink })
+        .class(ButtonClass::Choice { selected })
+        .on_press(message)
+        .into()
+}
+
+/// Los tres perfiles (y «Personalizado» si es el elegido), igual de altos.
+fn preset_cards(app: &App) -> Element<'_, Message> {
+    let video = &app.settings.video;
+    let mut presets = QualityPreset::PRESETS.to_vec();
+    if video.preset == QualityPreset::Custom {
+        presets.push(QualityPreset::Custom);
+    }
+    ui::equal_height_row(
+        |real| {
+            presets
+                .iter()
+                .map(|preset| preset_card(video, *preset, real))
+                .collect()
+        },
+        space::S,
+    )
+}
+
+/// Segmentado compacto de los perfiles (con la sala abierta).
+fn preset_segmented(app: &App) -> Element<'_, Message> {
+    let video = &app.settings.video;
+    let mut options: Vec<(String, Message, bool)> = QualityPreset::PRESETS
+        .iter()
+        .map(|preset| {
+            (
+                preset_short(*preset).to_owned(),
+                on(Msg::Preset(*preset)),
+                video.preset == *preset,
+            )
+        })
+        .collect();
+    if video.preset == QualityPreset::Custom {
+        options.push((
+            preset_short(QualityPreset::Custom).to_owned(),
+            on(Msg::Advanced(true)),
+            true,
+        ));
+    }
+    ui::segmented(options)
+}
+
+/// Fila de «Avanzado»: título, explicación, la etiqueta de cuándo se aplica y el control.
+fn option_row<'a>(
+    title: &'a str,
+    subtitle: Option<String>,
+    option: VideoOption,
+    control: Element<'a, Message>,
+) -> Element<'a, Message> {
+    ui::pref_row(
+        title,
+        subtitle,
+        row![tag(Video::when(option)), control]
+            .spacing(space::S)
+            .align_y(Alignment::Center),
+    )
+}
+
+/// «Avanzado», plegado o desplegado.
+fn advanced(app: &App) -> Element<'_, Message> {
+    let state = &app.host;
+    let video = &app.settings.video;
+    let open = state.advanced;
+    let status = if video.preset == QualityPreset::Custom {
+        preset_name(QualityPreset::Custom).to_owned()
+    } else {
+        t!(
+            "host-avanzado-sin-cambios",
+            perfil = preset_name(video.preset)
+        )
+    };
+    let header = button(
+        row![
+            icon_with(
+                if open {
+                    Icon::ChevronDown
+                } else {
+                    Icon::ChevronRight
+                },
+                size::ICON,
+                SvgClass::Secondary
+            ),
+            column![
+                ui::body(t!("host-avanzado")),
+                ui::secondary(if open {
+                    t!("host-avanzado-desplegado")
+                } else {
+                    t!("host-avanzado-plegado")
+                })
+                .wrapping(Wrapping::WordOrGlyph)
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+            ui::caption(status),
+        ]
         .spacing(space::S)
+        .align_y(Alignment::Center),
+    )
+    .padding(Padding::from([10.0, 16.0]))
+    .width(Length::Fill)
+    .class(ButtonClass::Flat)
+    .on_press(on(Msg::Advanced(!open)));
+    let mut rows: Vec<Element<'_, Message>> = vec![header.into()];
+    if !open {
+        return ui::boxed_list(rows);
+    }
+    let resolutions: Vec<Pick<Resolution>> = Resolution::ALL
+        .iter()
+        .rev()
+        .map(|r| pick(*r, resolution_label(*r)))
+        .collect();
+    let resolution = resolutions
+        .iter()
+        .find(|c| c.value == video.max_resolution)
+        .cloned();
+    rows.push(option_row(
+        t!("host-resolucion-maxima"),
+        Some(t!("host-resolucion-ayuda").to_owned()),
+        VideoOption::Resolution,
+        ui::select(resolutions, resolution, |c| on(Msg::Resolution(c))),
+    ));
+    let fps = ui::segmented(
+        FPS_CHOICES
+            .iter()
+            .map(|fps| (fps.to_string(), on(Msg::Fps(*fps)), video.fps == *fps))
+            .collect(),
+    );
+    rows.push(option_row(
+        t!("host-fotogramas-por-segundo"),
+        None,
+        VideoOption::Fps,
+        fps,
+    ));
+    let codecs = codec_choices();
+    let codec = codecs.iter().find(|c| c.value == video.codec).cloned();
+    let codec_help = match state.room.as_ref().and_then(|room| room.codec.as_ref()) {
+        Some(codec) => t!("host-codec-en-uso", codec = codec.as_str()),
+        None => t!("host-codec-ayuda").to_owned(),
+    };
+    rows.push(option_row(
+        t!("host-codec"),
+        Some(codec_help),
+        VideoOption::Codec,
+        ui::select(codecs, codec, |c| on(Msg::Codec(c))),
+    ));
+    let encoders = encoder_choices();
+    let encoder = encoders.iter().find(|c| c.value == video.encoder).cloned();
+    rows.push(option_row(
+        t!("host-codificador"),
+        Some(t!("host-codificador-ayuda").to_owned()),
+        VideoOption::Codec,
+        ui::select(encoders, encoder, |c| on(Msg::Encoder(c))),
+    ));
+    rows.push(bitrate_row(app));
+    rows.push(option_row(
+        t!("host-croma"),
+        Some(chroma_hint(app)),
+        VideoOption::Chroma444,
+        ui::switch(video.chroma_444, Some(|on_off| on(Msg::Chroma444(on_off)))),
+    ));
+    rows.push(option_row(
+        "HDR",
+        Some(hdr_hint(app)),
+        VideoOption::Hdr,
+        ui::switch(video.hdr, Some(|on_off| on(Msg::Hdr(on_off)))),
+    ));
+    if state.room.is_none() {
+        // La fuente de prueba (sin enseñar nada tuyo), para probar la conexión.
+        let test = state.mode == ShareMode::Test;
+        rows.push(ui::pref_row(
+            t!("host-usar-la-fuente-de-prueba"),
+            Some(t!("host-fuente-de-prueba-fila").to_owned()),
+            ui::switch(
+                test,
+                Some(|on_off| {
+                    on(Msg::Mode(if on_off {
+                        ShareMode::Test
+                    } else {
+                        ShareMode::Screen
+                    }))
+                }),
+            ),
+        ));
+    }
+    ui::boxed_list(rows)
+}
+
+/// Bitrate: siempre Auto; con «Tope», hasta dónde puede subir.
+fn bitrate_row(app: &App) -> Element<'_, Message> {
+    let video = &app.settings.video;
+    let capped = video.max_bitrate_kbps < UNLIMITED_KBPS;
+    let mut cap = row![
+        checkbox(capped)
+            .on_toggle(|on_off| on(Msg::Capped(on_off)))
+            .size(18.0),
+        ui::body(t!("host-tope")),
+    ]
+    .spacing(space::XS)
+    .align_y(Alignment::Center);
+    if capped {
+        let caps = cap_choices();
+        let current = caps
+            .iter()
+            .find(|c| c.value == video.max_bitrate_kbps)
+            .cloned()
+            .unwrap_or_else(|| pick(video.max_bitrate_kbps, cap_label(video.max_bitrate_kbps)));
+        cap = cap.push(ui::select(caps, Some(current), |c| on(Msg::Cap(c))));
+    }
+    // Lo que pide ahora el control de tasa del invitado más lento.
+    let now = app
+        .host
+        .room
+        .as_ref()
+        .and_then(|room| room.guests.iter().filter_map(|g| g.target_kbps).min());
+    let hint = match (capped, now) {
+        (_, Some(kbps)) => t!("host-bitrate-ahora", valor = stats::kbps(f64::from(kbps))),
+        (false, None) => t!(
+            "host-sin-tope-ayuda",
+            valor = cap_label(start_kbps(video.max_bitrate_kbps))
+        ),
+        (true, None) => t!(
+            "host-con-tope-ayuda",
+            valor = cap_label(start_kbps(video.max_bitrate_kbps))
+        ),
+    };
+    cap = cap.push(ui::caption(hint).wrapping(Wrapping::WordOrGlyph));
+    let texts = column![
+        ui::body(t!("host-bitrate")),
+        ui::secondary(t!("host-bitrate-ayuda")).wrapping(Wrapping::WordOrGlyph),
+        container(cap).padding(Padding {
+            top: 6.0,
+            ..Padding::ZERO
+        }),
+    ]
+    .spacing(2)
+    .width(Length::Fill);
+    row![
+        texts,
+        tag(Video::when(VideoOption::Bitrate)),
+        ui::strong(t!("host-auto"))
+    ]
+    .spacing(space::S)
+    .align_y(Alignment::Start)
+    .padding(Padding::from([10.0, 16.0]))
+    .into()
+}
+
+/// Fila de la lista de audio: la casilla, el nombre y la nota a la derecha.
+fn audio_row<'a>(row_data: AudioRow) -> Element<'a, Message> {
+    let AudioRow {
+        key,
+        name,
+        checked,
+        note,
+    } = row_data;
+    let toggle = on(Msg::AppAudio(key, name.clone(), !checked));
+    let label: Element<'a, Message> = if checked {
+        ui::body(name).into()
+    } else {
+        ui::secondary(name).into()
+    };
+    row![
+        checkbox(checked)
+            .on_toggle(move |_| toggle.clone())
+            .size(18.0),
+        container(label).width(Length::Fill),
+        ui::caption(note)
+    ]
+    .spacing(space::S)
+    .align_y(Alignment::Center)
+    .padding(Padding {
+        top: 8.0,
+        right: 16.0,
+        bottom: 8.0,
+        left: 44.0,
+    })
+    .into()
+}
+
+/// Resumen de lo que suena en la sala: «Juego y Firefox», o por qué va todo.
+fn audio_summary(app: &App) -> String {
+    let state = &app.host;
+    let Some(options) = state.current_options() else {
+        return t!("host-buscando").to_owned();
+    };
+    if let Err(why) = &options.apps {
+        return t!("host-este-equipo-no-separa-el-audio", why = why.as_str());
+    }
+    let names: Vec<String> = state
+        .audio_rows(&app.settings.audio.excluded_apps)
+        .into_iter()
+        .filter(|row| row.checked)
+        .map(|row| row.name)
+        .collect();
+    if names.is_empty() {
+        if state.mode.only_its_audio() {
+            t!("host-audio-nada").to_owned()
+        } else {
+            t!("host-ninguna-aplicacion-suena-ahora").to_owned()
+        }
+    } else {
+        join_names(&names)
+    }
+}
+
+/// Audio que se envía (desplegable) y, antes de abrir, la voz.
+fn audio_box(app: &App, with_voice: bool) -> Element<'_, Message> {
+    let state = &app.host;
+    let open = state.audio_open;
+    let header = button(
+        row![
+            icon_with(Icon::Volume, size::ICON, SvgClass::Secondary),
+            column![
+                ui::body(t!("host-audio-que-se-envia")),
+                ui::secondary(audio_summary(app)).wrapping(Wrapping::WordOrGlyph)
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+            icon_with(
+                if open {
+                    Icon::ChevronUp
+                } else {
+                    Icon::ChevronDown
+                },
+                size::ICON,
+                SvgClass::Secondary
+            ),
+        ]
+        .spacing(space::S)
+        .align_y(Alignment::Center),
+    )
+    .padding(Padding::from([10.0, 16.0]))
+    .width(Length::Fill)
+    .class(ButtonClass::Flat)
+    .on_press(on(Msg::AudioOpen(!open)));
+    let mut rows: Vec<Element<'_, Message>> = vec![header.into()];
+    if open {
+        let supported = state
+            .current_options()
+            .is_some_and(|options| options.apps.is_ok());
+        if supported {
+            let subtitle = if state.mode.only_its_audio() {
+                t!("host-marcada-la-aplicacion-que-elegiste")
+            } else {
+                t!("host-las-aplicaciones-que-empiecen-a-sonar")
+            };
+            let mut list = Column::new().push(
+                container(ui::caption(subtitle).wrapping(Wrapping::WordOrGlyph)).padding(Padding {
+                    top: 8.0,
+                    right: 16.0,
+                    bottom: 0.0,
+                    left: 44.0,
+                }),
+            );
+            for audio in state.audio_rows(&app.settings.audio.excluded_apps) {
+                list = list.push(audio_row(audio));
+            }
+            list = list.push(
+                container(ui::caption(t!("host-coroom-nunca-se-envia-a-si"))).padding(Padding {
+                    top: 0.0,
+                    right: 16.0,
+                    bottom: 10.0,
+                    left: 44.0,
+                }),
+            );
+            rows.push(list.into());
+        }
+    }
+    if with_voice {
+        rows.push(ui::pref_row(
+            t!("host-hablar-por-la-sala-con-el"),
+            Some(t!("host-los-invitados-te-oyen-y-hablan").to_owned()),
+            ui::switch(
+                app.settings.audio.host_voice,
+                Some(|on_off| on(Msg::Voice(on_off))),
+            ),
+        ));
+        rows.push(ui::pref_row(
+            t!("host-los-invitados-entran-callados"),
+            Some(t!("host-entran-callados-ayuda").to_owned()),
+            ui::switch(
+                app.settings.room.guests_muted,
+                Some(|on_off| on(Msg::GuestsMuted(on_off))),
+            ),
+        ));
+    }
+    ui::boxed_list(rows)
+}
+
+/// Amigos marcados que se invitarán (los que siguen conectados).
+fn marked_count(app: &App) -> usize {
+    app.friends.loaded().map_or(0, |friends| {
+        friends
+            .friends
+            .iter()
+            .filter(|friend| friend.online && app.host.invite.contains(&friend.id))
+            .count()
+    })
+}
+
+/// Antes de abrir la sala.
+fn setup(app: &App) -> Element<'_, Message> {
+    let state = &app.host;
+    let top = ui::equal_height_row(
+        |real| {
+            vec![
+                container(source_card(app, real))
+                    .width(Length::FillPortion(23))
+                    .height(if real { Length::Fill } else { Length::Shrink })
+                    .into(),
+                container(invite_card(app, real))
+                    .width(Length::FillPortion(20))
+                    .height(if real { Length::Fill } else { Length::Shrink })
+                    .into(),
+            ]
+        },
+        space::M,
+    );
+    let quality_head = row![
+        ui::strong(t!("host-calidad")).size(15.0),
+        ui::caption(t!("host-calidad-ayuda"))
+    ]
+    .spacing(space::XS)
+    .align_y(Alignment::Center);
+    let mut page = column![
+        top,
+        column![quality_head, preset_cards(app)].spacing(space::XS),
+        advanced(app),
+        audio_box(app, true),
+    ]
+    .spacing(space::M);
+    if let Some(error) = &state.error {
+        page = page.push(ui::banner(
+            Tone::Error,
+            t!("host-no-se-pudo-abrir-la-sala", error = error),
+            Some((t!("host-reintentar"), on(Msg::Start))),
+        ));
+    }
+    let actions: Element<'_, Message> = if state.starting {
+        container(ui::progress(
+            t!("host-abriendo-la-sala"),
+            None,
+            app.now.elapsed().as_secs_f32(),
+        ))
+        .width(Length::Fixed(420.0))
+        .into()
+    } else {
+        let marked = marked_count(app);
+        let note = match marked {
+            0 => t!("host-el-codigo-aparece").to_owned(),
+            1 => t!("host-invitaras-a-uno").to_owned(),
+            n => t!("host-invitaras-a-n", n = n),
+        };
+        row![
+            ui::caption(note),
+            ui::button_with(
+                Kind::Primary,
+                if marked > 0 {
+                    t!("host-abrir-la-sala-e-invitar")
+                } else {
+                    t!("host-abrir-la-sala")
+                },
+                Some(Icon::ShareScreen),
+                (!state.picking).then(|| on(Msg::Start)),
+            ),
+        ]
+        .spacing(space::S)
+        .align_y(Alignment::Center)
+        .into()
+    };
+    page = page.push(row![ui::fill(), actions].align_y(Alignment::Center));
+    ui::page(page)
+}
+
+/// `K7Q2MZ` → `K7Q 2MZ` (más fácil de dictar).
+pub fn spaced(code: &str) -> String {
+    let (a, b) = code.split_at(code.len().min(3));
+    if b.is_empty() {
+        a.to_owned()
+    } else {
+        format!("{a} {b}")
+    }
+}
+
+/// «directa», «por relay» o «directa y relay», según cómo llegan los invitados.
+fn route_summary(room: &Room) -> Option<&'static str> {
+    use coroom_transport::Path;
+    let direct = room.guests.iter().any(|g| g.path == Some(Path::Direct));
+    let relayed = room.guests.iter().any(|g| g.path == Some(Path::Relayed));
+    match (direct, relayed) {
+        (true, true) => Some(t!("host-ruta-mixta")),
+        (true, false) => Some(t!("host-ruta-directa")),
+        (false, true) => Some(t!("host-ruta-relay")),
+        (false, false) => None,
+    }
+}
+
+/// Cabecera de la sala: «Sala de Ana», el código, los invitados y la ruta.
+fn room_header<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
+    let title = app.account.as_ref().map_or_else(
+        || t!("host-tu-sala").to_owned(),
+        |account| t!("host-sala-de", name = account.display_name.as_str()),
+    );
+    let mut facts = vec![match &room.code {
+        Some(code) => t!("host-codigo", code = spaced(code)),
+        None => t!("host-creando-la-sala").to_owned(),
+    }];
+    facts.push(match room.guests.len() {
+        0 => t!("host-sin-invitados").to_owned(),
+        1 => t!("host-un-invitado").to_owned(),
+        n => t!("host-n-invitados", n = n),
+    });
+    if let Some(route) = route_summary(room) {
+        facts.push(route.to_owned());
+    }
+    let badge = match (&room.codec, room.guests.is_empty()) {
+        (Some(_), _) => ui::status_badge(Tone::Success, t!("host-transmitiendo")),
+        (None, true) => ui::status_badge(Tone::Neutral, t!("host-esperando-invitados")),
+        (None, false) => ui::status_badge(Tone::Warning, t!("host-eligiendo-codec")),
+    };
+    ui::page_header(
+        title,
+        Some(facts.join(" · ")),
+        vec![
+            badge,
+            ui::icon_button(
+                Icon::Copy,
+                t!("host-copiar-codigo"),
+                room.code.as_ref().map(|_| on(Msg::CopyCode)),
+            ),
+            ui::button_with(
+                Kind::Destructive,
+                t!("host-cerrar-la-sala"),
+                Some(Icon::Close),
+                (!app.host.stopping).then(|| on(Msg::Stop)),
+            )
+            .into(),
+        ],
+    )
+}
+
+/// La fuente con la sala abierta: vista previa, qué es y con qué se codifica, y «Cambiar fuente».
+fn room_source_card<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
+    let state = &app.host;
+    let preview: Element<'a, Message> = if room.preview_unavailable {
+        placeholder(Icon::Monitor, t!("host-sin-vista-previa"))
+    } else {
+        video_view(&room.preview)
+    };
+    let title = match (&state.switching, &state.shared) {
+        (Some(switching), _) => t!("host-cambiando-a", que = sharing_label(switching)),
+        (None, Some(shared)) => sharing_label(shared),
+        (None, None) => String::new(),
+    };
+    let mut facts = Vec::new();
+    match &room.codec {
+        Some(codec) => facts.push(codec.clone()),
+        None if room.guests.is_empty() => {
+            facts.push(t!("host-esperando-al-primer-invitado").to_owned());
+        }
+        None => facts.push(t!("host-eligiendo-el-codec-con-tus-invitados").to_owned()),
+    }
+    if let Some(kbps) = room.guests.iter().filter_map(|g| g.target_kbps).min() {
+        facts.push(stats::kbps(f64::from(kbps)));
+    }
+    let info = column![
+        ui::strong(title).wrapping(Wrapping::WordOrGlyph),
+        ui::secondary(facts.join(" · ")).wrapping(Wrapping::WordOrGlyph),
+    ]
+    .spacing(2)
+    .width(Length::Fill);
+    let change = ui::button_with(
+        Kind::Normal,
+        t!("host-cambiar-fuente"),
+        Some(Icon::ArrowUpDown),
+        (!state.changing_source && state.switching.is_none()).then(|| on(Msg::ChangeSource(true))),
+    );
+    let mut card = column![
+        row![thumb(preview, PREVIEW_WIDTH), info, change]
+            .spacing(space::M)
+            .align_y(Alignment::Center)
+    ]
+    .spacing(space::S);
+    if state.changing_source {
+        card = card.push(rule::horizontal(1)).push(source_picker(app));
+    }
+    ui::card(card)
+}
+
+/// El selector de fuente con la sala abierta: lo mismo que antes de abrirla, más «Compartir
+/// esto».
+fn source_picker(app: &App) -> Element<'_, Message> {
+    let state = &app.host;
+    let busy = state.picking || state.switching.is_some();
+    let head = row![
+        ui::strong(t!("host-que-compartir")),
+        ui::fill(),
+        mode_picker(state)
+    ]
+    .spacing(space::S)
+    .align_y(Alignment::Center);
+    let mut help = column![ui::caption(state.mode.help()).wrapping(Wrapping::WordOrGlyph)];
+    if state.source() == SourceChoice::App {
+        help = help.push(ui::caption(t!("host-ventana-en-negro")).wrapping(Wrapping::WordOrGlyph));
+    }
+    help = help
+        .push(ui::caption(t!("host-al-cambiar-la-ultima-imagen")).wrapping(Wrapping::WordOrGlyph));
+    let actions = row![
+        ui::fill(),
+        ui::button_with(
+            Kind::Normal,
+            t!("app-cancelar"),
+            None,
+            state
+                .switching
+                .is_none()
+                .then(|| on(Msg::ChangeSource(false))),
+        ),
+        ui::button_with(
+            Kind::Primary,
+            t!("host-compartir-esto"),
+            None,
+            (!busy && state.source_changed()).then(|| on(Msg::ApplySource)),
+        ),
+    ]
+    .spacing(space::S)
+    .align_y(Alignment::Center);
+    column![head, target_control(state), help.spacing(2), actions]
+        .spacing(space::S)
+        .into()
+}
+
+/// Si el anfitrión silenció en su equipo la voz del invitado `id`.
+fn hears_muted(room: &Room, id: GuestId) -> bool {
+    room.muted.contains(&id)
+}
+
+/// Motivo corto del relay de un invitado, si se sabe: «CGNAT» cuando ninguna dirección directa
+/// respondió (lo que pasa detrás de la NAT de una operadora).
+fn relay_reason(status: &GuestStatus) -> Option<&'static str> {
+    let silent = !status.candidates.is_empty()
+        && status
+            .candidates
+            .iter()
+            .all(|candidate| matches!(candidate.outcome, CandidateOutcome::NoResponse));
+    silent.then(|| t!("host-cgnat"))
+}
+
+fn quality_label(level: QualityLevel) -> &'static str {
+    match level {
+        QualityLevel::Excellent => t!("host-calidad-excelente"),
+        QualityLevel::Good => t!("host-calidad-buena"),
+        QualityLevel::Acceptable => t!("host-calidad-aceptable"),
+        QualityLevel::Poor => t!("host-calidad-mala"),
+    }
+}
+
+/// Fila de un invitado: quién, cómo llega y qué puede hacer.
+fn guest_row<'a>(app: &'a App, room: &'a Room, status: &'a GuestStatus) -> Element<'a, Message> {
+    use coroom_transport::Path;
+    let id = status.guest;
+    let permissions = status.permissions;
+    let mut facts = Vec::new();
+    match status.path {
+        Some(Path::Direct) => facts.push(t!("host-directa").to_owned()),
+        Some(Path::Relayed) => {
+            facts.push(t!("host-relay").to_owned());
+            if let Some(reason) = relay_reason(status) {
+                facts.push(reason.to_owned());
+            }
+        }
+        None => facts.push(t!("host-conectando").to_owned()),
+    }
+    if let Some(rtt) = status.rtt_ms {
+        facts.push(t!("host-rtt", ms = rtt.round() as u64));
+    }
+    facts.push(permissions_label(&permissions));
+    let mut line = row![
+        ui::avatar(&app.theme, &status.name, size::AVATAR),
+        column![
+            ui::strong(status.name.as_str()),
+            ui::secondary(facts.join(" · ")).wrapping(Wrapping::WordOrGlyph)
+        ]
+        .spacing(2)
+        .width(Length::Fill),
+    ]
+    .spacing(space::S)
+    .align_y(Alignment::Center);
+    // El nivel con lo medido (el RTT de su conexión); sin medida, nada.
+    if let Some(rtt) = status.rtt_ms {
+        let level = QualityLevel::from_overhead_ms(rtt);
+        line = line.push(ui::status_badge(quality_tone(level), quality_label(level)));
+    }
+    let muted = hears_muted(room, id);
+    let kick = ui::with_tooltip(
+        button(
+            container(icon_with(
+                Icon::UserX,
+                size::ICON,
+                SvgClass::Tone(Tone::Error),
+            ))
+            .center_x(Length::Fill)
+            .center_y(Length::Fill),
+        )
+        .width(Length::Fixed(size::CONTROL))
+        .height(Length::Fixed(size::CONTROL))
+        .padding(0)
+        .class(ButtonClass::DestructiveFlat)
+        .on_press(on(Msg::Kick(id))),
+        t!("host-expulsar"),
+    );
+    line = line
+        .push(
+            row![
+                toggle(
+                    Icon::Pointer,
+                    permissions.keyboard_mouse,
+                    if permissions.keyboard_mouse {
+                        t!("host-quitar-teclado-y-raton")
+                    } else {
+                        t!("host-dar-teclado-y-raton")
+                    },
+                    on(Msg::Keyboard(id, !permissions.keyboard_mouse)),
+                ),
+                toggle(
+                    Icon::Gamepad,
+                    permissions.gamepad_slot.is_some(),
+                    if permissions.gamepad_slot.is_some() {
+                        t!("host-quitar-el-mando")
+                    } else {
+                        t!("host-dar-un-mando")
+                    },
+                    on(Msg::PadOn(id, permissions.gamepad_slot.is_none())),
+                ),
+                toggle(
+                    Icon::Mic,
+                    permissions.voice,
+                    if permissions.voice {
+                        t!("host-quitar-la-voz")
+                    } else {
+                        t!("host-dar-la-voz")
+                    },
+                    on(Msg::GuestVoice(id, !permissions.voice)),
+                ),
+            ]
+            .spacing(space::XXS),
+        )
+        .push(ui::icon_button(
+            if muted {
+                Icon::HeadphonesOff
+            } else {
+                Icon::Headphones
+            },
+            if muted {
+                t!("host-volver-a-oir", name = status.name.as_str())
+            } else {
+                t!("host-dejar-de-oir", name = status.name.as_str())
+            },
+            Some(on(Msg::Hear(id, muted))),
+        ))
+        .push(ui::icon_button(
+            Icon::Fingerprint,
+            t!("host-numero-de-seguridad"),
+            Some(on(Msg::Safety(id))),
+        ))
+        .push(kick);
+    let mut card = column![line].spacing(space::XS);
+    if permissions.gamepad_slot.is_some() {
+        card = card.push(pad_line(app, status));
+    }
+    if !status.input_key && (permissions.keyboard_mouse || permissions.gamepad_slot.is_some()) {
+        card = card.push(
+            container(ui::caption(t!("host-esperando-la-clave-de-entrada-pareja"))).padding(
+                Padding {
+                    left: size::AVATAR + space::S,
+                    ..Padding::ZERO
+                },
+            ),
+        );
+    }
+    container(card)
+        .padding(Padding::from([10.0, 16.0]))
+        .width(Length::Fill)
+        .into()
+}
+
+/// El mando de un invitado: la ranura, si va tal cual o convertido, y el mando que declara
+/// (nombre, VID:PID y cómo llega) con, si no va tal cual pudiendo, por qué.
+fn pad_line<'a>(app: &'a App, status: &'a GuestStatus) -> Element<'a, Message> {
+    let id = status.guest;
+    let max = coroom_session::input::max_gamepads();
+    let slots = pad_choices(app.settings.input.preferred_slot, max);
+    let current = PadSlot(status.permissions.gamepad_slot);
+    let mut controls = row![
+        ui::caption(t!("host-mando")),
+        ui::select(slots, Some(current), move |slot| on(Msg::Pad(id, slot))),
+        ui::select(
+            vec![PadMode(true), PadMode(false)],
+            Some(PadMode(status.permissions.gamepad_raw)),
+            move |mode| on(Msg::PadMode(id, mode)),
+        ),
+    ]
+    .spacing(space::XS)
+    .align_y(Alignment::Center);
+    let mut notes = Column::new().spacing(2);
+    match &status.gamepad {
+        None => {
+            notes = notes.push(ui::caption(t!("host-todavia-no-ha-conectado-ningun-mando")));
+        }
+        Some(pad) => {
+            let transport = match pad.transport {
+                PadTransport::Hid => "HID",
+                PadTransport::XInput => "XInput",
+                PadTransport::Converted => t!("host-solo-convertido"),
+            };
+            controls = controls.push(ui::status_badge(
+                Tone::Neutral,
+                format!("{:04x}:{:04x} · {transport}", pad.vendor, pad.product),
+            ));
+            notes = notes.push(ui::caption(t!(
+                "host-su-mando-name",
+                name = pad.name.as_str()
+            )));
+            if let Some(note) = &pad.note {
+                notes = notes.push(ui::caption(t!(
+                    "host-va-convertido-note",
+                    note = note.as_str()
+                )));
+            }
+        }
+    }
+    container(column![controls, notes].spacing(space::XXS))
+        .padding(Padding {
+            left: size::AVATAR + space::S,
+            ..Padding::ZERO
+        })
+        .into()
+}
+
+/// Los invitados, con «Pausar la entrada».
+fn guests_section<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
+    let pause = if room.paused {
+        ui::button_with(
+            Kind::Normal,
+            t!("host-reanudar-la-entrada"),
+            Some(Icon::Play),
+            Some(on(Msg::Pause(false))),
+        )
+    } else {
+        ui::button_with(
+            Kind::Normal,
+            t!("host-pausar-la-entrada"),
+            Some(Icon::Pause),
+            (!room.guests.is_empty()).then(|| on(Msg::Pause(true))),
+        )
+    };
+    let head = row![
+        ui::strong(t!("host-invitados", valor = room.guests.len())).size(15.0),
+        ui::fill(),
+        pause
+    ]
+    .spacing(space::S)
+    .align_y(Alignment::Center);
+    let body: Element<'a, Message> = if room.guests.is_empty() {
+        ui::card(ui::empty_state(
+            Icon::Users,
+            t!("host-todavia-no-ha-entrado-nadie"),
+            t!("host-comparte-el-codigo-de-la-sala"),
+            None,
+        ))
+    } else {
+        ui::boxed_list(
+            room.guests
+                .iter()
+                .map(|status| guest_row(app, room, status))
+                .collect(),
+        )
+    };
+    column![head, body].spacing(space::XS).into()
+}
+
+/// La calidad con la sala abierta: el segmentado de perfiles y «Avanzado».
+fn room_quality(app: &App) -> Element<'_, Message> {
+    let head = row![
+        ui::strong(t!("host-calidad")).size(15.0),
+        ui::fill(),
+        preset_segmented(app)
+    ]
+    .spacing(space::S)
+    .align_y(Alignment::Center);
+    column![
+        head,
+        ui::caption(when_summary()).wrapping(Wrapping::WordOrGlyph),
+        advanced(app)
+    ]
+    .spacing(space::XS)
+    .into()
+}
+
+/// Amigos conectados que aún no están en la sala, para invitarlos (nada si no hay ninguno).
+fn invite_more<'a>(app: &'a App, room: &'a Room) -> Option<Element<'a, Message>> {
+    let friends = app.friends.loaded()?;
+    let inside: Vec<u64> = room.guests.iter().map(|status| status.user).collect();
+    let rows: Vec<Element<'a, Message>> = friends
+        .friends
+        .iter()
+        .filter(|friend| friend.online && !inside.contains(&friend.id))
+        .map(|friend| {
+            ui::list_row(
+                Some(ui::avatar(&app.theme, &friend.display_name, 28.0)),
+                friend.display_name.as_str(),
+                None,
+                vec![
+                    ui::status_badge(Tone::Success, t!("host-disponible")),
+                    ui::button_with(
+                        Kind::Normal,
+                        t!("host-invitar"),
+                        Some(Icon::Mail),
+                        room.code.as_ref().map(|_| on(Msg::Invite(friend.id))),
+                    )
+                    .into(),
+                ],
+            )
+        })
+        .collect();
+    if rows.is_empty() {
+        return None;
+    }
+    Some(
+        column![
+            ui::strong(t!("host-invitar-a-mas-amigos")).size(15.0),
+            ui::boxed_list(rows)
+        ]
+        .spacing(space::XS)
+        .into(),
+    )
+}
+
+/// El chat de la sala, fijo a la derecha (el panel trae su cabecera con «Vaciar el chat»).
+fn chat_panel(app: &App) -> Element<'_, Message> {
+    container(chat::panel(app, chat::Surface::Window))
+        .width(Length::Fixed(CHAT_WIDTH + space::M))
+        .height(Length::Fill)
+        .padding(Padding {
+            top: space::M,
+            right: space::M,
+            bottom: space::M,
+            left: 0.0,
+        })
+        .into()
+}
+
+/// Con la sala abierta.
+fn room_view<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
+    let mut page = Column::new().spacing(space::M).push(room_header(app, room));
+    if room.paused {
+        page = page.push(ui::banner(
+            Tone::Warning,
+            t!("host-la-entrada-de-todos-los-invitados"),
+            Some((t!("host-reanudar"), on(Msg::Pause(false)))),
+        ));
+    }
+    if let Some(relay) = &room.relay {
+        page = page.push(ui::banner(
+            Tone::Warning,
+            t!("host-sin-relay-relay-solo-podran-entrar", relay = relay),
+            None,
+        ));
+    }
+    page = page
+        .push(room_source_card(app, room))
+        .push(guests_section(app, room))
+        .push(ui::banner(
+            Tone::Info,
+            if room.guests_muted {
+                t!("host-voz-entran-callados")
+            } else {
+                t!("host-voz-entran-hablando")
+            },
+            None,
+        ))
+        .push(audio_box(app, false))
+        .push(room_quality(app));
+    if let Some(invite) = invite_more(app, room) {
+        page = page.push(invite);
+    }
+    Row::new()
+        .push(container(ui::page(page)).width(Length::Fill))
+        .push(chat_panel(app))
+        .height(Length::Fill)
         .into()
 }
 
 /// Escenas de Compartir para las capturas.
 pub(crate) mod shots {
     use coroom_session::latency::InputLatency;
-    use coroom_session::remote::{GuestPad, GuestStatus, PadTransport, SessionEvent};
+    use coroom_session::remote::{
+        CandidateClass, CandidateOutcome, CandidateReport, GuestPad, GuestStatus, PadTransport,
+        SessionEvent,
+    };
     use coroom_session::{GuestId, Permissions};
     use coroom_transport::quic::Path;
 
+    use super::{Msg, ShareMode, ShareOptions, SourceChoice, TargetOption};
     use crate::ui::app::{App, Dialog, Event, Message, Page};
+    use crate::ui::settings::QualityPreset;
     use crate::ui::shots::{Builder, game_frame, playing, safety, signed_in};
     use crate::ui::video::VideoFeed;
-    pub(crate) fn host_setup(app: &mut App) {
-        use super::{ShareOptions, SourceChoice};
-        signed_in(app, Page::Host);
-        app.settings.audio.excluded_apps = vec![crate::ui::settings::RememberedApp {
-            key: "discord.exe".to_owned(),
-            name: "Discord".to_owned(),
-        }];
+
+    fn monitors(app: &mut App) {
         app.update(Message::Event(Event::ShareOptions(ShareOptions {
             source: SourceChoice::Screen,
             targets: vec![coroom_session::capture::CaptureTarget::Monitor {
@@ -1919,10 +2960,7 @@ pub(crate) mod shots {
         })));
     }
 
-    pub(crate) fn host_setup_app(app: &mut App) {
-        use super::{Msg, ShareOptions, SourceChoice};
-        signed_in(app, Page::Host);
-        app.update(Message::Host(Msg::Source(SourceChoice::App)));
+    fn windows(app: &mut App) {
         app.update(Message::Event(Event::ShareOptions(ShareOptions {
             source: SourceChoice::App,
             targets: vec![
@@ -1946,14 +2984,42 @@ pub(crate) mod shots {
         })));
     }
 
-    /// Como en Wayland: sin lista de monitores; lo elegido en el selector del sistema.
-    pub(crate) fn host_setup_wayland(app: &mut App) {
-        use super::{ShareOptions, SourceChoice};
+    /// Compartir la pantalla, con Bea marcada para invitarla.
+    pub(crate) fn host_setup(app: &mut App) {
         signed_in(app, Page::Host);
         app.settings.audio.excluded_apps = vec![crate::ui::settings::RememberedApp {
-            key: "discord".to_owned(),
+            key: "discord.exe".to_owned(),
             name: "Discord".to_owned(),
         }];
+        monitors(app);
+        app.update(Message::Host(Msg::Mark(2, true)));
+        app.toasts.clear();
+    }
+
+    /// Una ventana, con dos amigos marcados.
+    pub(crate) fn host_setup_window(app: &mut App) {
+        signed_in(app, Page::Host);
+        app.update(Message::Host(Msg::Mode(ShareMode::Window)));
+        windows(app);
+        app.update(Message::Host(Msg::Mark(2, true)));
+        app.update(Message::Host(Msg::Mark(3, true)));
+        app.toasts.clear();
+    }
+
+    /// Un juego, con «Avanzado» desplegado y el perfil personalizado.
+    pub(crate) fn host_setup_advanced(app: &mut App) {
+        signed_in(app, Page::Host);
+        app.update(Message::Host(Msg::Mode(ShareMode::Game)));
+        windows(app);
+        app.update(Message::Host(Msg::Preset(QualityPreset::MinLatency)));
+        app.update(Message::Host(Msg::Fps(120)));
+        app.update(Message::Host(Msg::Advanced(true)));
+        app.toasts.clear();
+    }
+
+    /// Como en Wayland: sin lista de monitores; lo elegido en el selector del sistema.
+    pub(crate) fn host_setup_wayland(app: &mut App) {
+        signed_in(app, Page::Host);
         app.update(Message::Event(Event::ShareOptions(ShareOptions {
             source: SourceChoice::Screen,
             targets: Vec::new(),
@@ -1974,23 +3040,7 @@ pub(crate) mod shots {
                 restore_token: None,
             })),
         )));
-    }
-
-    /// Como en Wayland, transmitiendo una app todavía sin elegir.
-    pub(crate) fn host_setup_app_wayland(app: &mut App) {
-        use super::{Msg, ShareOptions, SourceChoice};
-        signed_in(app, Page::Host);
-        app.update(Message::Host(Msg::Source(SourceChoice::App)));
-        app.update(Message::Event(Event::ShareOptions(ShareOptions {
-            source: SourceChoice::App,
-            targets: Vec::new(),
-            targets_error: None,
-            apps: Ok(playing(&[
-                ("juego", "Juego"),
-                ("firefox", "Firefox"),
-                ("discord", "Discord"),
-            ])),
-        })));
+        app.toasts.clear();
     }
 
     pub(crate) fn guest_status(
@@ -1999,6 +3049,7 @@ pub(crate) mod shots {
         permissions: Permissions,
         rtt: f64,
     ) -> GuestStatus {
+        let relayed = id != 1;
         GuestStatus {
             guest: GuestId(id),
             user: u64::from(id) + 1,
@@ -2008,17 +3059,26 @@ pub(crate) mod shots {
             safety_number: safety(),
             permissions,
             leaf: id,
-            path: Some(if id == 1 { Path::Direct } else { Path::Relayed }),
+            path: Some(if relayed { Path::Relayed } else { Path::Direct }),
             // Direcciones de documentación (RFC 5737), no de nadie.
-            remote: Some(if id == 1 {
-                "192.0.2.24:50412".parse().expect("dirección")
-            } else {
+            remote: Some(if relayed {
                 "198.51.100.7:4433".parse().expect("dirección")
+            } else {
+                "192.0.2.24:50412".parse().expect("dirección")
             }),
             rtt_ms: Some(rtt),
-            target_kbps: Some(if id == 1 { 24_000 } else { 9_500 }),
-            link_kbps: Some(if id == 1 { 48_000 } else { 21_000 }),
-            candidates: Vec::new(),
+            target_kbps: Some(if relayed { 9_500 } else { 18_400 }),
+            link_kbps: Some(if relayed { 21_000 } else { 48_000 }),
+            // Por el relay: ninguna dirección directa respondió (CGNAT).
+            candidates: if relayed {
+                vec![CandidateReport {
+                    addr: "198.51.100.40:50000".parse().expect("dirección"),
+                    class: CandidateClass::Ipv4Public,
+                    outcome: CandidateOutcome::NoResponse,
+                }]
+            } else {
+                Vec::new()
+            },
             input_key: true,
             input: InputLatency::default(),
             gamepad: None,
@@ -2032,11 +3092,12 @@ pub(crate) mod shots {
         }
     }
 
+    /// La sala abierta con dos invitados: Bea directa y Carla por el relay, con mando.
     pub(crate) fn host_room(app: &mut App) {
         host_setup(app);
         let preview = VideoFeed::detached();
         preview.push(game_frame(1, 640, 360), None, None);
-        app.update(Message::Host(super::Msg::Start));
+        app.update(Message::Host(Msg::Start));
         app.update(Message::Event(Event::HostStarted(Ok(preview))));
         app.update(Message::Event(Event::Host(SessionEvent::RoomCreated {
             code: "K7Q2MZ".to_owned(),
@@ -2068,7 +3129,7 @@ pub(crate) mod shots {
                         voice: false,
                         gamepad_raw: true,
                     },
-                    38.6,
+                    61.4,
                 ),
                 GuestPad {
                     name: "8BitDo Ultimate 2 Wireless Controller".to_owned(),
@@ -2083,12 +3144,12 @@ pub(crate) mod shots {
         app.toasts.clear();
     }
 
-    /// Con la sala abierta, eligiendo una ventana en vez de la pantalla.
+    /// Con la sala abierta, eligiendo un juego en vez de la pantalla.
     pub(crate) fn host_room_switch(app: &mut App) {
-        use super::{Msg, ShareOptions, SourceChoice, TargetOption};
         host_room(app);
-        app.update(Message::Host(Msg::Source(SourceChoice::App)));
-        // Un título largo, como los de Windows: no debe aplastar el selector Pantalla/Aplicación.
+        app.update(Message::Host(Msg::ChangeSource(true)));
+        app.update(Message::Host(Msg::Mode(ShareMode::Game)));
+        // Un título largo, como los de Windows: no debe aplastar el selector.
         let game = coroom_session::capture::CaptureTarget::Window {
             id: 7,
             title: "Fatal Fury: City of the Wolves — Edición especial (DirectX 12)".to_owned(),
@@ -2116,9 +3177,9 @@ pub(crate) mod shots {
     /// Escenas de esta pantalla.
     pub(crate) const BUILDERS: &[(&str, Builder)] = &[
         ("08-compartir", host_setup),
-        ("08-compartir-app", host_setup_app),
+        ("08-compartir-ventana", host_setup_window),
+        ("08-compartir-avanzado", host_setup_advanced),
         ("08-compartir-wayland", host_setup_wayland),
-        ("08-compartir-app-wayland", host_setup_app_wayland),
         ("09-sala-abierta", host_room),
         ("09-sala-cambiar-fuente", host_room_switch),
         ("10-dejar-de-compartir", host_stop_dialog),
@@ -2129,6 +3190,7 @@ pub(crate) mod shots {
 mod tests {
     use super::*;
     use crate::ui::app::tests::app;
+    use coroom_transport::proto::api::{Friend, Friends};
 
     fn status(id: u32, name: &str) -> GuestStatus {
         GuestStatus {
@@ -2181,6 +3243,15 @@ mod tests {
         }
     }
 
+    fn friend(id: u64, name: &str, online: bool) -> Friend {
+        Friend {
+            id,
+            username: name.to_lowercase(),
+            display_name: name.to_owned(),
+            online,
+        }
+    }
+
     #[test]
     fn sharing_the_screen_sends_every_app_but_the_removed_ones() {
         let mut app = app();
@@ -2202,7 +3273,12 @@ mod tests {
             "Discord".into(),
             false,
         )));
-        assert_eq!(effects, [Effect::SaveSettings], "se recuerda");
+        assert!(effects.is_empty(), "se guarda al poco: {effects:?}");
+        assert_eq!(
+            app.flush_settings(),
+            Some(Effect::SaveSettings),
+            "se recuerda"
+        );
         assert_eq!(app.settings.audio.excluded_apps[0].key, "discord.exe");
         // Discord deja de sonar: sigue en la lista, quitado y recordado.
         app.update(Message::Event(Event::ShareOptions(ShareOptions {
@@ -2243,11 +3319,11 @@ mod tests {
     }
 
     #[test]
-    fn sharing_an_app_sends_only_its_audio() {
+    fn sharing_a_game_sends_only_its_audio() {
         let mut app = app();
         app.update(Message::Navigate(Page::Host));
         assert_eq!(
-            app.update(Message::Host(Msg::Source(SourceChoice::App))),
+            app.update(Message::Host(Msg::Mode(ShareMode::Game))),
             [Effect::LoadShareOptions(SourceChoice::App)]
         );
         // Con ventanas que dicen su aplicación (Windows): se marca la de la ventana.
@@ -2289,14 +3365,41 @@ mod tests {
                     "juego.exe".into(),
                     "discord.exe".into()
                 ])),
-                voice: app.host.voice,
-                guests_muted: app.host.guests_muted,
+                voice: app.settings.audio.host_voice,
+                guests_muted: false,
             })
         );
     }
 
+    /// Ventana y Juego capturan lo mismo: cambiar entre ellos solo cambia el audio, sin volver a
+    /// mirar qué se puede compartir.
     #[test]
-    fn guests_enter_talking_unless_the_host_mutes_them() {
+    fn a_window_sends_every_app_and_a_game_only_its_own() {
+        let mut app = app();
+        app.update(Message::Host(Msg::Mode(ShareMode::Window)));
+        app.update(Message::Event(Event::ShareOptions(ShareOptions {
+            source: SourceChoice::App,
+            targets: vec![window(7, "Juego", Some("juego.exe"))],
+            targets_error: None,
+            apps: Ok(playing(&["juego.exe", "discord.exe"])),
+        })));
+        assert_eq!(
+            app.host.game_capture(&[]),
+            GameCapture::Apps(AppFilter::AllExcept(Vec::new()))
+        );
+        assert!(
+            app.update(Message::Host(Msg::Mode(ShareMode::Game)))
+                .is_empty(),
+            "la misma lista de ventanas"
+        );
+        assert_eq!(
+            app.host.game_capture(&[]),
+            GameCapture::Apps(AppFilter::Only(vec!["juego.exe".into()]))
+        );
+    }
+
+    #[test]
+    fn the_voice_switches_are_the_settings() {
         let mut app = app();
         app.screen = crate::ui::app::Screen::Main;
         app.update(Message::Navigate(Page::Host));
@@ -2306,18 +3409,32 @@ mod tests {
             targets_error: None,
             apps: Ok(Vec::new()),
         })));
-        assert!(!app.host.guests_muted, "por defecto entran hablando");
-        app.update(Message::Host(Msg::GuestsMuted(true)));
+        assert!(
+            !app.settings.room.guests_muted,
+            "por defecto entran hablando"
+        );
+        assert!(app.update(Message::Host(Msg::GuestsMuted(true))).is_empty());
+        app.update(Message::Host(Msg::Voice(false)));
+        assert!(app.settings.room.guests_muted && !app.settings.audio.host_voice);
+        assert_eq!(app.flush_settings(), Some(Effect::SaveSettings));
         match app.update(Message::Host(Msg::Start)).as_slice() {
-            [Effect::StartHost(request)] => assert!(request.guests_muted),
+            [Effect::StartHost(request)] => assert!(request.guests_muted && !request.voice),
             other => panic!("se esperaba abrir la sala: {other:?}"),
         }
+        app.update(Message::Event(Event::HostStarted(
+            Ok(VideoFeed::detached()),
+        )));
+        assert_eq!(
+            app.host.room.as_ref().map(|room| room.guests_muted),
+            Some(true),
+            "el aviso de la sala dice cómo entran"
+        );
     }
 
     #[test]
     fn without_window_owners_the_likely_game_is_marked() {
         let mut app = app();
-        app.update(Message::Host(Msg::Source(SourceChoice::App)));
+        app.update(Message::Host(Msg::Mode(ShareMode::Game)));
         // El sistema elige la ventana (Linux): se adivina el juego entre lo que suena.
         app.update(Message::Event(Event::ShareOptions(ShareOptions {
             source: SourceChoice::App,
@@ -2361,7 +3478,6 @@ mod tests {
     fn the_system_picker_choice_is_shown_and_reused_when_starting() {
         let mut app = app();
         app.update(Message::Navigate(Page::Host));
-        app.update(Message::Host(Msg::Source(SourceChoice::Screen)));
         app.update(Message::Event(Event::ShareOptions(ShareOptions {
             source: SourceChoice::Screen,
             targets: Vec::new(),
@@ -2409,7 +3525,7 @@ mod tests {
             },
             restore_token: None,
         });
-        app.update(Message::Host(Msg::Source(SourceChoice::App)));
+        app.update(Message::Host(Msg::Mode(ShareMode::Window)));
         assert_eq!(app.host.picked, None);
         app.update(Message::Event(Event::SharePicked(
             SourceChoice::Screen,
@@ -2428,7 +3544,7 @@ mod tests {
     }
 
     #[test]
-    fn permissions_are_switches_and_slots_are_exclusive() {
+    fn permissions_are_toggles_and_slots_are_exclusive() {
         let mut app = app();
         open_room(&mut app);
         let effects = app.update(Message::Host(Msg::Keyboard(GuestId(1), true)));
@@ -2446,6 +3562,14 @@ mod tests {
                 .is_empty()
         );
         assert!(app.toasts.iter().any(|t| t.text.contains("Ranura 2")));
+        // El conmutador del mando da la primera ranura libre (la preferida, si lo está).
+        let effects = app.update(Message::Host(Msg::PadOn(GuestId(2), true)));
+        let [Effect::SetPermissions(GuestId(2), p)] = effects.as_slice() else {
+            panic!("{effects:?}");
+        };
+        assert!(p.gamepad_slot.is_some() && p.gamepad_slot != Some(2));
+        let effects = app.update(Message::Host(Msg::PadOn(GuestId(2), false)));
+        assert!(matches!(&effects[..], [Effect::SetPermissions(_, p)] if p.gamepad_slot.is_none()));
         app.update(Message::Host(Msg::Kick(GuestId(2))));
         assert!(matches!(&app.dialog, Some(Dialog::Kick { name, .. }) if name == "Carla"));
         assert_eq!(
@@ -2470,9 +3594,10 @@ mod tests {
             safety_number: coroom_transport::crypto::SafetyNumber::between(&[1; 32], &[3; 32]),
             permissions: Permissions::VIEW_ONLY,
         })));
+        assert!(effects.is_empty(), "{effects:?}");
         assert_eq!(
-            effects,
-            [Effect::SaveSettings],
+            app.flush_settings(),
+            Some(Effect::SaveSettings),
             "se recuerda su número de seguridad"
         );
         assert_eq!(app.settings.peers[0].name, "Dani");
@@ -2489,6 +3614,136 @@ mod tests {
         let effects = app.update(Message::Event(Event::HostEnded(None)));
         assert!(app.host.room.is_none());
         assert!(effects.is_empty(), "sin cuenta no hay sala de espera");
+    }
+
+    /// Los amigos marcados se invitan cuando el servidor crea la sala (antes no hay código), y
+    /// solo los que siguen conectados.
+    #[test]
+    fn marked_friends_are_invited_once_the_room_exists() {
+        let mut app = app();
+        app.update(Message::Event(Event::Friends(Ok(Friends {
+            friends: vec![
+                friend(2, "Bea", true),
+                friend(3, "Carla", true),
+                friend(4, "Dani", false),
+            ],
+            incoming: Vec::new(),
+            outgoing: Vec::new(),
+        }))));
+        assert_eq!(app.host.friends_at, Some(app.now), "en vivo · hace 0 s");
+        app.update(Message::Host(Msg::Mark(2, true)));
+        app.update(Message::Host(Msg::Mark(3, true)));
+        app.update(Message::Host(Msg::Mark(3, false)));
+        app.update(Message::Host(Msg::Mark(4, true)));
+        assert_eq!(marked_count(&app), 1, "Dani está desconectado");
+        let effects = app.update(Message::Host(Msg::Start));
+        assert!(!effects.contains(&Effect::Invite(2)), "aún sin sala");
+        app.update(Message::Event(Event::HostStarted(
+            Ok(VideoFeed::detached()),
+        )));
+        let effects = app.update(Message::Event(Event::Host(SessionEvent::RoomCreated {
+            code: "K7Q2MZ".into(),
+            fingerprint: "cd".repeat(32),
+        })));
+        assert_eq!(effects, [Effect::Invite(2)]);
+        assert!(app.toasts.iter().any(|t| t.text.contains("Bea")));
+        assert!(app.host.invite.is_empty(), "una sola vez");
+    }
+
+    /// Elegir una tarjeta aplica el perfil y lo guarda; sin sala no hay efectos de vídeo.
+    #[test]
+    fn choosing_a_preset_applies_it_and_saves() {
+        let mut app = app();
+        assert_eq!(app.settings.video.preset, QualityPreset::Balanced);
+        let effects = app.update(Message::Host(Msg::Preset(QualityPreset::MinLatency)));
+        assert!(effects.is_empty(), "sin sala, nada en vivo: {effects:?}");
+        let video = &app.settings.video;
+        assert_eq!(video.preset, QualityPreset::MinLatency);
+        assert_eq!(
+            (video.max_resolution, video.fps, video.max_bitrate_kbps),
+            (Resolution::P1080, 60, 10_000)
+        );
+        assert_eq!(app.flush_settings(), Some(Effect::SaveSettings));
+        app.update(Message::Host(Msg::Preset(QualityPreset::MaxQuality)));
+        assert_eq!(app.settings.video.max_bitrate_kbps, UNLIMITED_KBPS);
+        assert!(app.settings.video.chroma_444);
+        assert!(app.toasts.is_empty(), "sin sala no hay «próxima sala»");
+    }
+
+    /// Tocar algo en Avanzado pasa el perfil a «Personalizado» (repetir el valor no).
+    #[test]
+    fn touching_advanced_makes_the_preset_custom() {
+        let mut app = app();
+        app.update(Message::Host(Msg::Fps(60)));
+        assert_eq!(
+            app.settings.video.preset,
+            QualityPreset::Balanced,
+            "sin cambio"
+        );
+        for msg in [
+            Msg::Fps(120),
+            Msg::Resolution(pick(Resolution::P1440, "1440p")),
+            Msg::Codec(pick(CodecChoice::Hevc, "HEVC")),
+            Msg::Encoder(pick(EncoderChoice::Software, "software")),
+            Msg::Capped(false),
+            Msg::Chroma444(true),
+            Msg::Hdr(true),
+        ] {
+            app.update(Message::Host(Msg::Preset(QualityPreset::Balanced)));
+            assert!(app.update(Message::Host(msg.clone())).is_empty(), "{msg:?}");
+            assert_eq!(app.settings.video.preset, QualityPreset::Custom, "{msg:?}");
+        }
+        // El tope: quitarlo es «sin tope»; volver a ponerlo recuerda el último.
+        app.update(Message::Host(Msg::Cap(pick(30_000, "30"))));
+        app.update(Message::Host(Msg::Capped(false)));
+        assert_eq!(app.settings.video.max_bitrate_kbps, UNLIMITED_KBPS);
+        app.update(Message::Host(Msg::Capped(true)));
+        assert_eq!(app.settings.video.max_bitrate_kbps, 30_000);
+    }
+
+    /// Con la sala abierta, lo «En vivo» se aplica ya y lo «Al abrir la sala» solo se guarda con
+    /// un aviso.
+    #[test]
+    fn with_the_room_open_live_options_apply_and_the_rest_wait() {
+        let mut app = app();
+        open_room(&mut app);
+        app.toasts.clear();
+        assert_eq!(
+            app.update(Message::Host(Msg::Codec(pick(CodecChoice::Av1, "AV1")))),
+            [Effect::SetCodec]
+        );
+        assert_eq!(
+            app.update(Message::Host(Msg::Cap(pick(10_000, "10")))),
+            [Effect::SetMaxBitrate(10_000)]
+        );
+        assert!(app.toasts.is_empty(), "lo en vivo no avisa de nada");
+        assert!(app.update(Message::Host(Msg::Fps(30))).is_empty());
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.text == "Guardado para la próxima sala")
+        );
+        // Un perfil mezcla las dos cosas: el tope va ya, el resto espera.
+        app.toasts.clear();
+        assert_eq!(
+            app.update(Message::Host(Msg::Preset(QualityPreset::MaxQuality))),
+            [Effect::SetMaxBitrate(UNLIMITED_KBPS)]
+        );
+        assert_eq!(app.toasts.len(), 1);
+        assert_eq!(app.flush_settings(), Some(Effect::SaveSettings));
+    }
+
+    /// Las etiquetas salen de [`Video::when`].
+    #[test]
+    fn the_when_summary_comes_from_the_settings_model() {
+        let summary = when_summary();
+        assert!(summary.starts_with("En vivo: "), "{summary}");
+        assert!(summary.contains("Al abrir la sala: "), "{summary}");
+        assert_eq!(bitrate_phrase(20_000), "Auto hasta 20 Mbit/s");
+        assert_eq!(bitrate_phrase(UNLIMITED_KBPS), "Auto sin tope");
+        let mut video = Video::default();
+        QualityPreset::MinLatency.apply(&mut video);
+        assert_eq!(video_spec(&video), "1080p · 60 fps · Auto hasta 10 Mbit/s");
     }
 
     /// Sin haber mirado nunca (se llegó a la página sin `Navigate`), el `Tick` pide la lista; y
@@ -2543,7 +3798,7 @@ mod tests {
             targets_error: None,
             apps: Ok(Vec::new()),
         })));
-        app.update(Message::Host(Msg::Source(SourceChoice::App)));
+        app.update(Message::Host(Msg::Mode(ShareMode::Game)));
         assert!(
             app.host.current_options().is_none(),
             "las de la pantalla no valen"
@@ -2615,10 +3870,10 @@ mod tests {
     }
 
     #[test]
-    fn with_the_room_open_the_source_audio_and_video_change_live() {
+    fn with_the_room_open_the_source_and_audio_change_live() {
         let mut app = app();
         app.screen = crate::ui::app::Screen::Main;
-        app.update(Message::Host(Msg::Source(SourceChoice::App)));
+        app.update(Message::Host(Msg::Mode(ShareMode::Game)));
         let game = window(1, "Fatal Fury", Some("fatalfury.exe"));
         let other = window(2, "Otro juego", Some("otro.exe"));
         app.update(Message::Event(Event::ShareOptions(ShareOptions {
@@ -2644,6 +3899,8 @@ mod tests {
         );
 
         // Fuente: elegir otra ventana no cambia nada hasta «Compartir esto».
+        app.update(Message::Host(Msg::ChangeSource(true)));
+        assert!(app.host.changing_source);
         assert!(
             app.update(Message::Host(Msg::Target(TargetOption(other.clone()))))
                 .is_empty()
@@ -2665,12 +3922,14 @@ mod tests {
         );
         app.update(Message::Event(Event::SourceSwitched(Ok(()))));
         assert!(!app.host.source_changed());
+        assert!(!app.host.changing_source, "el selector se pliega");
         assert_eq!(
             app.host.shared.as_ref().and_then(|s| s.target.clone()),
-            Some(other)
+            Some(other.clone())
         );
 
         // Si no arranca, sigue lo de antes y se avisa.
+        app.update(Message::Host(Msg::ChangeSource(true)));
         app.update(Message::Host(Msg::Target(TargetOption(game))));
         app.update(Message::Host(Msg::ApplySource));
         app.update(Message::Event(Event::SourceSwitched(Err("no".into()))));
@@ -2679,11 +3938,18 @@ mod tests {
             app.host.source_changed(),
             "lo elegido sigue sin transmitirse"
         );
+        // Cancelar vuelve a lo que se transmite.
+        app.update(Message::Host(Msg::ChangeSource(false)));
+        assert!(!app.host.source_changed());
+        assert_eq!(app.host.target, Some(other));
 
-        // Vídeo: el tope del bitrate de la sala se aplica ya (y se guarda al poco).
-        let bitrate = settings_screen::bitrate_choices()[0].clone();
-        let kbps = bitrate.value;
-        let effects = app.update(Message::Settings(settings_screen::Msg::Bitrate(bitrate)));
-        assert_eq!(effects, [Effect::SetMaxBitrate(kbps)]);
+        // Juego → Ventana con lo mismo: solo cambia el audio, en vivo.
+        let effects = app.update(Message::Host(Msg::Mode(ShareMode::Window)));
+        assert_eq!(
+            effects,
+            [Effect::SetAppAudio(GameCapture::Apps(
+                AppFilter::AllExcept(Vec::new())
+            ))]
+        );
     }
 }

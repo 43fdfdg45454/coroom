@@ -306,6 +306,8 @@ pub enum ContainerClass {
     Sidebar,
     /// Tarjeta.
     Card,
+    /// Tarjeta destacada con el borde del acento (una invitación que llega).
+    CardAccent,
     /// Diálogo modal.
     Dialog,
     /// Aviso en línea del tono.
@@ -337,10 +339,25 @@ pub enum ContainerClass {
     Keycap,
     /// Grupo del selector segmentado.
     Segmented,
+    /// Píldora sobre el vídeo (el indicador de latencia de la sala).
+    OverlayPill,
+    /// Grupo del selector segmentado sobre el vídeo (pestañas del panel de la sala).
+    OverlaySegmented,
+    /// Contador de no leídos (acento, redondo), encima de un botón.
+    Counter,
+    /// Insignia de estado del tono sobre el vídeo (el nivel de la conexión en la barra de la
+    /// sala): el color sólido translúcido, igual en claro y en oscuro.
+    OverlayBadge(Tone),
     /// Barra de pasos completados (verde) o pendientes.
     Step {
         /// Si está hecho.
         done: bool,
+    },
+    /// Tramo de una barra proporcional (la latencia por etapa): el acento, más suave en los
+    /// tramos alternos para que se distingan.
+    BarSegment {
+        /// Si es uno de los alternos.
+        alternate: bool,
     },
 }
 
@@ -371,6 +388,13 @@ impl container::Catalog for Theme {
                 background: fill(p.card.color()),
                 text_color: Some(p.text.color()),
                 border: outline(p.border.color(), 1.0, radius::CARD),
+                shadow: self.shadow(3.0, 1.0, 0.06, 0.0),
+                snap: true,
+            },
+            ContainerClass::CardAccent => container::Style {
+                background: fill(p.card.color()),
+                text_color: Some(p.text.color()),
+                border: outline(p.accent_bg.color(), 1.5, radius::CARD),
                 shadow: self.shadow(3.0, 1.0, 0.06, 0.0),
                 snap: true,
             },
@@ -459,6 +483,29 @@ impl container::Catalog for Theme {
                 border: outline(Color::TRANSPARENT, 0.0, radius::CONTROL),
                 ..none
             },
+            ContainerClass::OverlayPill => container::Style {
+                background: fill(p.overlay.alpha(p.overlay_alpha)),
+                text_color: Some(p.overlay_text.color()),
+                border: outline(p.overlay_text.alpha(0.08), 1.0, radius::PILL),
+                ..none
+            },
+            ContainerClass::OverlaySegmented => container::Style {
+                background: fill(p.overlay_text.alpha(0.10)),
+                border: outline(Color::TRANSPARENT, 0.0, radius::CONTROL),
+                ..none
+            },
+            ContainerClass::OverlayBadge(tone) => container::Style {
+                background: fill(p.tone(tone).solid.alpha(0.22)),
+                text_color: Some(p.overlay_text.color()),
+                border: outline(Color::TRANSPARENT, 0.0, radius::PILL),
+                ..none
+            },
+            ContainerClass::Counter => container::Style {
+                background: fill(p.accent_bg.color()),
+                text_color: Some(p.on_accent.color()),
+                border: outline(p.overlay.alpha(p.overlay_alpha), 2.0, radius::PILL),
+                ..none
+            },
             ContainerClass::Step { done } => container::Style {
                 background: fill(if done {
                     p.success.solid.color()
@@ -466,6 +513,11 @@ impl container::Catalog for Theme {
                     p.border.color()
                 }),
                 border: outline(Color::TRANSPARENT, 0.0, radius::PILL),
+                ..none
+            },
+            ContainerClass::BarSegment { alternate } => container::Style {
+                background: fill(p.accent_bg.alpha(if alternate { 0.62 } else { 0.95 })),
+                border: outline(Color::TRANSPARENT, 0.0, 4.0),
                 ..none
             },
         }
@@ -494,6 +546,9 @@ pub enum TextClass {
     Overlay,
     /// Secundario sobre el vídeo.
     OverlaySecondary,
+    /// Un color de una paleta concreta (el tono o el acento de la paleta oscura sobre el vídeo,
+    /// con la ventana en claro).
+    Custom(Color),
 }
 
 impl core_text::Catalog for Theme {
@@ -514,6 +569,9 @@ impl core_text::Catalog for Theme {
             TextClass::Tone(tone) => Some(p.tone(tone).text),
             TextClass::Overlay => Some(p.overlay_text),
             TextClass::OverlaySecondary => Some(p.overlay_text_secondary),
+            TextClass::Custom(color) => {
+                return core_text::Style { color: Some(color) };
+            }
         };
         core_text::Style {
             color: color.map(Rgb::color),

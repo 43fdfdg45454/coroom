@@ -1922,6 +1922,10 @@ impl Room {
                 });
                 Ok(())
             }
+            SignalMessage::Presence { user, online } => {
+                self.ctx.core.emit(SessionEvent::Presence { user, online });
+                Ok(())
+            }
             SignalMessage::QuotaExceeded { message } => {
                 self.ctx.relay_unavailable(message);
                 Ok(())

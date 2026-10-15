@@ -16,9 +16,11 @@
 //!
 //! No depende de ninguna crate del workspace (`docs/ARQUITECTURA.md` §5): la aplicación le da los datos.
 
+pub mod editor;
 pub mod font;
 pub mod icon;
 pub mod style;
+pub mod tag;
 pub mod theme;
 pub mod tokens;
 pub mod widget;

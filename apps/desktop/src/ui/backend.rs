@@ -316,6 +316,12 @@ impl Backend {
             }),
             Effect::SendChat(text) => self.send_chat(text),
             Effect::ClearChat => self.clear_chat(),
+            Effect::ChatNotify { title, body } => self.spawn("aviso", move |_| {
+                chat_notification(&title, &body);
+            }),
+            Effect::ChatSound => self.spawn("sonido", |_| chat_sound()),
+            // Lo hace la ventana (`runner.rs`): aquí no hay campo que enfocar.
+            Effect::FocusChat(_) => {}
             Effect::SetVoiceMuted {
                 host,
                 source,
@@ -590,19 +596,43 @@ impl Backend {
         });
     }
 
-    /// Un mensaje al chat de la sala propia o de la que se está como invitado.
-    fn send_chat(&self, text: String) {
-        // Se conecta a la sesión cuando el chat llegue a `coroom_session` (misma tarea).
-        let len = text.chars().count();
-        tracing::warn!(len, "chat todavía sin sesión que lo lleve");
-        (self.notify)(Message::Event(Event::Failed(
-            t!("backend-el-chat-aun-no-esta-disponible").to_owned(),
-        )));
+    /// La sesión con chat: la sala propia o aquella en la que se está como invitado.
+    fn chat_session(&self) -> Option<Arc<Mutex<RemoteSession>>> {
+        lock(&self.host).clone().or_else(|| {
+            lock(&self.guest)
+                .as_ref()
+                .map(|run| Arc::clone(&run.session))
+        })
     }
 
-    /// Vaciar el chat de la sala propia.
+    /// Un mensaje al chat de la sala propia o de la que se está como invitado, fuera del hilo de
+    /// la interfaz; lo que no deja salir la sesión («Vas muy rápido…») vuelve como
+    /// [`Event::ChatFailed`]. El mensaje se ve cuando el anfitrión lo reparte.
+    fn send_chat(&self, text: String) {
+        let Some(session) = self.chat_session() else {
+            (self.notify)(Message::Event(Event::ChatFailed(
+                t!("chat-no-hay-sala").to_owned(),
+            )));
+            return;
+        };
+        self.spawn("chat", move |notify| {
+            if let Err(err) = lock(&session).send_chat(&text) {
+                tracing::debug!(error = %err, "mensaje del chat no enviado");
+                notify(Message::Event(Event::ChatFailed(err.to_string())));
+            }
+        });
+    }
+
+    /// Vaciar el chat de la sala propia para todos.
     fn clear_chat(&self) {
-        tracing::warn!("vaciar el chat todavía sin sesión que lo lleve");
+        let Some(session) = lock(&self.host).clone() else {
+            return;
+        };
+        self.spawn("chat", move |notify| {
+            if let Err(err) = lock(&session).clear_chat() {
+                notify(Message::Event(Event::Failed(err.to_string())));
+            }
+        });
     }
 
     fn start_host(&mut self, options: AccountOptions, request: HostRequest, settings: &Settings) {
@@ -925,6 +955,12 @@ fn forward_events(
             reason = ended;
             break;
         }
+        // La presencia de los amigos llega también por la señalización de la sala: Inicio la
+        // sigue aunque la sala esté abierta.
+        if let SessionEvent::Presence { user, online } = event {
+            notify(Message::Event(Event::Presence { user, online }));
+            continue;
+        }
         notify(Message::Event(each(event)));
     }
     reason
@@ -968,6 +1004,91 @@ fn spawn_job(
             "backend-no-se-pudo-arrancar-una-tarea",
             err = err
         ))));
+    }
+}
+
+/// Notificación del escritorio de un mensaje del chat: en Linux por el portal de notificaciones
+/// (GNOME y KDE la muestran con su estilo, también dentro de Flatpak); siempre la misma, así que
+/// una ráfaga de mensajes no apila avisos. En Windows, todavía ninguna (haría falta el sistema de
+/// notificaciones de WinRT, que no está entre las dependencias).
+fn chat_notification(title: &str, body: &str) {
+    #[cfg(target_os = "linux")]
+    {
+        use ashpd::desktop::notification::{Notification, NotificationProxy, Priority};
+        let sent = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| err.to_string())
+            .and_then(|runtime| {
+                runtime.block_on(async {
+                    let send = async {
+                        let proxy = NotificationProxy::new()
+                            .await
+                            .map_err(|err| err.to_string())?;
+                        proxy
+                            .add_notification(
+                                "chat",
+                                Notification::new(title)
+                                    .body(body)
+                                    .priority(Priority::Normal),
+                            )
+                            .await
+                            .map_err(|err| err.to_string())
+                    };
+                    tokio::time::timeout(Duration::from_secs(5), send)
+                        .await
+                        .map_err(|elapsed| elapsed.to_string())?
+                })
+            });
+        if let Err(err) = sent {
+            tracing::debug!(error = %err, "sin notificación del escritorio");
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (title, body);
+        tracing::debug!("notificación del chat: aún no disponible en este sistema");
+    }
+}
+
+/// Sonido de mensaje nuevo: `message-new-instant` del tema de sonido freedesktop con el
+/// reproductor del sistema (`pw-play` o `paplay`). Sin fichero ni reproductor, en silencio (en
+/// Windows, por ahora, nada).
+fn chat_sound() {
+    #[cfg(unix)]
+    {
+        use std::process::{Command, Stdio};
+        const SOUND: &str = "sounds/freedesktop/stereo/message-new-instant.oga";
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(home) = std::env::var_os("XDG_DATA_HOME").filter(|dir| !dir.is_empty()) {
+            dirs.push(PathBuf::from(home));
+        }
+        let shared = std::env::var("XDG_DATA_DIRS")
+            .ok()
+            .filter(|dirs| !dirs.is_empty())
+            .unwrap_or_else(|| "/usr/local/share:/usr/share".to_owned());
+        dirs.extend(shared.split(':').map(PathBuf::from));
+        let Some(file) = dirs
+            .into_iter()
+            .map(|dir| dir.join(SOUND))
+            .find(|path| path.is_file())
+        else {
+            tracing::debug!("sin el sonido message-new-instant del tema");
+            return;
+        };
+        for player in ["pw-play", "paplay"] {
+            let started = Command::new(player)
+                .arg(&file)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            if let Ok(mut child) = started {
+                let _ = child.wait();
+                return;
+            }
+        }
+        tracing::debug!("sin pw-play ni paplay para el sonido del chat");
     }
 }
 

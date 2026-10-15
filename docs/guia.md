@@ -20,7 +20,7 @@ Esta guía es para quien usa la aplicación. Para montar un servidor, mira la
 3. Ponle **nombre a este equipo** («Portátil», «Sobremesa»): tu cuenta puede tener varios equipos y
    cada uno tiene su propia identidad criptográfica, que se guarda en el llavero del sistema.
 
-Tu sesión dura 30 días en cada equipo. En Ajustes → Dispositivos ves tus equipos y puedes cerrar la
+Tu sesión dura 30 días en cada equipo. En Ajustes → Cuenta y servidor ves tus equipos y puedes cerrar la
 sesión de uno que ya no uses.
 
 ## Alojar: compartir tu juego
@@ -59,7 +59,7 @@ En **Transmisión**, debajo del código, cambias sin cerrar la sala (los invitad
   no se puede capturar, sigue la de antes y te lo dice.
 - **Audio**: marca o desmarca aplicaciones; se aplica al momento, sin cortar.
 - **Códec preferido** y **bitrate máximo**: el bitrate se aplica enseguida; cambiar de códec vuelve
-  a negociar con los invitados y corta el vídeo un instante. El codificador de Ajustes → Vídeo
+  a negociar con los invitados y corta el vídeo un instante. El codificador de «Avanzado»
   también se aplica a la sala abierta; la resolución, los fps, 4:4:4 y HDR, a la siguiente.
 
 ## Unirte a una sala
@@ -100,7 +100,7 @@ guarde lo que recibía.
 
 Cada pareja anfitrión–invitado tiene un número de 60 dígitos que solo depende de vuestras dos
 identidades. Comparadlo por otro medio (en persona o por una llamada): si coincide, nadie se ha
-puesto en medio, ni siquiera el servidor. coroom lo recuerda en Ajustes → Dispositivos.
+puesto en medio, ni siquiera el servidor. coroom lo recuerda en Ajustes → Cuenta y servidor.
 
 ## Atajos de teclado
 
@@ -113,13 +113,14 @@ puesto en medio, ni siquiera el servidor. coroom lo recuerda en Ajustes → Disp
 | `Tab` / `Mayús+Tab` | Campo siguiente / anterior (da la vuelta al llegar al final) |
 | `Intro` | Envía el formulario del campo |
 | `Ctrl+Alt+G` | Invitado: modo inmersivo (el ratón se queda en el juego) o escritorio |
-| `Ctrl+Alt+O` | Invitado: estadísticas de la conexión |
+| `Ctrl+Alt+S` | Invitado: estadísticas de la conexión |
+| `Ctrl+Alt+C` | Chat de la sala (también en la sala de espera) |
 | `Ctrl+Alt+M` | Silenciar o activar el micrófono |
 | `Ctrl+Alt+V` | Silenciar o activar el audio del juego |
 | `Ctrl+Alt+Q` | Invitado: salir de la sala |
-| `F12` (pulsar para hablar) | Hablar mientras se mantiene, si lo activas en Ajustes → Audio |
+| `F12` (pulsar para hablar) | Hablar mientras se mantiene, si lo activas en Ajustes → Audio y voz |
 
-Las letras de `Ctrl+Alt` se cambian en Ajustes → Entrada (no pueden coincidir entre sí).
+Las letras de `Ctrl+Alt` se cambian en Ajustes → Mandos (no pueden coincidir entre sí).
 
 ## Ajustes
 
@@ -153,15 +154,15 @@ Las letras de `Ctrl+Alt` se cambian en Ajustes → Entrada (no pueden coincidir 
 | Qué pasa | Qué hacer |
 |---|---|
 | «No se pudo conectar con el servidor» | Comprueba la dirección y tu red. El servidor necesita su puerto **UDP** abierto (HTTP/3); si solo funciona por TCP, avisa al administrador (`/health` dice si el UDP se alcanza desde fuera). |
-| La conexión siempre va «por el relay» | Alguna de las dos redes no deja la conexión directa (NAT simétrica, NAT de la operadora, cortafuegos). Activa UPnP (o NAT-PMP/PCP) en el router de los dos y deja marcado **Abrir el puerto en el router** en Ajustes → Red; `coroom doctor` dice si el router respondió. Funciona igual por el relay, con algo más de latencia y gastando la cuota del relay del anfitrión. |
+| La conexión siempre va «por el relay» | Alguna de las dos redes no deja la conexión directa (NAT simétrica, NAT de la operadora, cortafuegos). Activa UPnP (o NAT-PMP/PCP) en el router de los dos y deja marcado **Abrir el puerto en el router** en Ajustes → Cuenta y servidor; `coroom doctor` dice si el router respondió. Funciona igual por el relay, con algo más de latencia y gastando la cuota del relay del anfitrión. |
 | «El anfitrión agotó su cuota del relay» | Este mes solo funciona la conexión directa; el administrador puede subir la cuota. |
-| El vídeo va a saltos o con poca calidad | Abre las estadísticas (`Ctrl+Alt+O`): pérdida, RTT y bitrate. coroom baja el bitrate solo si hay cola en la red; con wifi, prueba con cable. Por encima de 50 ms de RTT la experiencia ya no es buena para juegos rápidos. |
-| No se oye el juego | Mira el audio elegido al abrir la sala y, en Linux, el nombre de la aplicación en Ajustes → Diagnóstico. El invitado puede haber silenciado el juego (`Ctrl+Alt+V`). |
+| El vídeo va a saltos o con poca calidad | Abre las estadísticas (`Ctrl+Alt+S`): pérdida, RTT y bitrate. coroom baja el bitrate solo si hay cola en la red; con wifi, prueba con cable. Por encima de 50 ms de RTT la experiencia ya no es buena para juegos rápidos. |
+| No se oye el juego | Mira el audio elegido al abrir la sala y, en Linux, el nombre de la aplicación en el diagnóstico (botón del servidor en la cabecera). El invitado puede haber silenciado el juego (`Ctrl+Alt+V`). |
 | El juego no recibe mi teclado o mando | El anfitrión tiene que darte el permiso; mira también si la entrada está en pausa. En Linux, el anfitrión debe aceptar el diálogo de «Control remoto» del sistema; en Windows, el mando necesita el driver de coroom, que se instala con `install.ps1` sin tocar la seguridad de Windows (sin él, `coroom host --gamepad-to-keys` convierte el mando en teclas); si el juego solo usa XInput y el mando va «Tal cual», ponlo en «Convertido a Xbox 360» o lanza el juego desde Steam con Steam Input. Algunos juegos con anti-trampas no aceptan dispositivos virtuales. |
 | Aviso «la clave X-Wing del anfitrión no verifica» | Alguien manipuló el intercambio de claves en el servidor: la entrada se desactiva en esa sala. Avisa al administrador. |
-| «Este equipo no puede decodificar…» | Mira Ajustes → Diagnóstico: los códecs que tu equipo decodifica. coroom elige el mejor que tengáis todos. |
+| «Este equipo no puede decodificar…» | Mira el diagnóstico (botón del servidor en la cabecera): los códecs que tu equipo decodifica. coroom elige el mejor que tengáis todos. |
 | «Demasiados códigos de sala que no existen» | Has probado 10 códigos que no existen en un minuto: espera un minuto y comprueba el código con el anfitrión. |
-| La pantalla compartida sale negra (Linux) | Aceptaste el diálogo del portal con otra pantalla, o el compositor no ofrece la captura: prueba con la fuente de prueba y mira Ajustes → Diagnóstico. |
+| La pantalla compartida sale negra (Linux) | Aceptaste el diálogo del portal con otra pantalla, o el compositor no ofrece la captura: prueba con la fuente de prueba y mira el diagnóstico. |
 
 Con `coroom doctor` en una terminal tienes el mismo diagnóstico en texto, para pegarlo al pedir
 ayuda (no incluye secretos).

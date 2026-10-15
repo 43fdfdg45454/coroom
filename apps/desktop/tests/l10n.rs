@@ -281,8 +281,8 @@ fn code_and_catalog_match() {
 fn texts_render_in_spanish() {
     assert_eq!(coroom_desktop::t!("app-inicio"), "Inicio");
     assert_eq!(
-        coroom_desktop::t!("pantalla-home-hola-name", name = "Ana"),
-        "Hola, Ana"
+        coroom_desktop::t!("home-invite-title", name = "Bea"),
+        "Bea te invita a su sala"
     );
     // Mismo puntero: los textos sin variables se formatean una vez.
     assert!(std::ptr::eq(

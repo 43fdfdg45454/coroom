@@ -448,6 +448,14 @@ pub enum SessionEvent {
         /// Código de la sala.
         code: String,
     },
+    /// Un amigo se conectó o desconectó de la señalización (llega también con la sala abierta o
+    /// dentro de una, para que la lista de amigos no se congele).
+    Presence {
+        /// Usuario.
+        user: u64,
+        /// Si está conectado.
+        online: bool,
+    },
     /// La sala no tiene relay (cuota agotada o servidor sin relay): solo conexión directa.
     RelayUnavailable(String),
     /// Algo no fue bien pero la sesión sigue.
@@ -602,6 +610,13 @@ impl fmt::Display for SessionEvent {
             SessionEvent::Invited {
                 from_name, code, ..
             } => write!(f, "{from_name} te invita a su sala {code}."),
+            SessionEvent::Presence { user, online: true } => {
+                write!(f, "El usuario {user} se ha conectado.")
+            }
+            SessionEvent::Presence {
+                user,
+                online: false,
+            } => write!(f, "El usuario {user} se ha desconectado."),
             SessionEvent::RelayUnavailable(message) => {
                 write!(f, "Sin relay: {message}.")
             }
@@ -1998,5 +2013,15 @@ mod tests {
             level: QualityLevel::Excellent,
         };
         assert!(event.to_string().contains("Excelente"), "{event}");
+        let event = SessionEvent::Presence {
+            user: 7,
+            online: true,
+        };
+        assert_eq!(event.to_string(), "El usuario 7 se ha conectado.");
+        let event = SessionEvent::Presence {
+            user: 7,
+            online: false,
+        };
+        assert_eq!(event.to_string(), "El usuario 7 se ha desconectado.");
     }
 }

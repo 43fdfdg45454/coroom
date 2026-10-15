@@ -213,19 +213,21 @@ COROOM_DATA_DIR=/tmp/coroom-b cargo run --release -p coroom   # perfil aparte: a
 | `F11` | siempre | pantalla completa |
 | `Esc` | siempre | cierra el diálogo o el menú y sale de la pantalla completa; en la sala, pregunta si salir (en el vídeo con teclado permitido, va al juego) |
 | `Tab`, `Mayús+Tab` | formularios | siguiente y anterior campo |
-| `Ctrl+Alt+G/O/M/V/Q` | vídeo | inmersivo, estadísticas, micrófono, audio del juego y salir (las letras se cambian en Ajustes → Entrada) |
+| `Ctrl+Alt+G/S/C/M/V/J/Q` | vídeo | inmersivo, estadísticas, chat, micrófono, audio del juego, mandos y salir (las letras se cambian en Ajustes → Mandos) |
 
-Ajustes → Vídeo explica qué hace este equipo con **4:4:4** y **HDR** (con qué códecs y si la
+«Avanzado» en Compartir explica qué hace este equipo con **4:4:4** y **HDR** (con qué códecs y si la
 pantalla muestra HDR; «no disponible con este códec» si el elegido no lo admite) y los dos
 interruptores sirven también como invitado: dicen si aceptas recibirlo. Con HDR activado y una
 pantalla que lo expone, la ventana pasa a una superficie HDR en caliente. **120 fps** se eligen en
 el mismo sitio; la ventana presenta en modo inmediato.
 
-Los ajustes (vídeo, audio, atajos, red, apariencia, actualizaciones, servidores recientes y números
-de seguridad de los anfitriones) se guardan al cambiarlos en `settings.toml` del directorio de datos
-(`COROOM_DATA_DIR`, o `$XDG_DATA_HOME/coroom`, `%APPDATA%\coroom`). Ajustes → Dispositivos cierra la
-sesión de otros equipos de tu cuenta y Ajustes → Diagnóstico es `coroom doctor` con un botón para
-copiarlo.
+Los ajustes (calidad, audio, atajos, red, apariencia, actualizaciones, servidores recientes y
+números de seguridad de los anfitriones) se guardan al cambiarlos en `settings.toml` del directorio
+de datos (`COROOM_DATA_DIR`, o `$XDG_DATA_HOME/coroom`, `%APPDATA%\coroom`). Ajustes → Cuenta y
+servidor cierra la sesión de otros equipos de tu cuenta, y el diagnóstico (el botón del servidor en
+la cabecera, o la píldora de latencia en la sala) explica la ruta de la sala, los candidatos de
+conexión directa, la latencia por etapa y lo que dice `coroom doctor`, con «Copiar informe» sin
+direcciones ni nombres.
 
 ### Prueba de latencia (`coroom probe`)
 
@@ -368,7 +370,8 @@ derivada del secreto HPKE): ni el relay ni otro invitado pueden leerla ni falsif
 | Atajo | Qué hace |
 |---|---|
 | `Ctrl+Alt+G` | alterna el **modo escritorio** (cursor libre, posición absoluta) y el **modo inmersivo** (cursor capturado y oculto, movimiento relativo, para juegos en primera persona) |
-| `Ctrl+Alt+O` | muestra u oculta el panel de estadísticas (el antiguo overlay) |
+| `Ctrl+Alt+S` | muestra u oculta el panel de estadísticas |
+| `Ctrl+Alt+C` | abre o cierra el chat de la sala |
 | `Ctrl+Alt+M` / `Ctrl+Alt+V` | silencia o reactiva el micrófono / el audio del juego |
 | `Ctrl+Alt+J` | panel de mandos: cuál envías (automático o uno concreto) |
 | `Ctrl+Alt+Q` | sale (con teclado y ratón permitidos, `Esc` va al juego) |
@@ -376,7 +379,7 @@ derivada del secreto HPKE): ni el relay ni otro invitado pueden leerla ni falsif
 Al perder el foco se suelta todo lo pulsado y el cursor. En modo inmersivo, si el cursor se
 suelta, un clic en la ventana lo vuelve a capturar. El overlay dice qué permite el anfitrión
 ("solo mirar", "teclado y ratón", "mando en ranura 2") y la latencia de entrada que mide el
-anfitrión. Las letras se cambian en Ajustes → Entrada.
+anfitrión. Las letras se cambian en Ajustes → Mandos.
 
 **Mandos tal cual.** Con varios mandos conectados, el invitado elige en el panel de mandos cuál
 envía: **Automático** (el último que conectes; si lo desconectas, el siguiente) o uno concreto,

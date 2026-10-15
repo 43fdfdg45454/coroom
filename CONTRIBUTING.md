@@ -64,7 +64,7 @@ Según lo que toques:
   causa.
 - **Nombres de código, módulos y endpoints en inglés; todo lo que ve el usuario en español**, con
   frases completas, la causa y lo que puede hacer («no se pudo abrir la sala: el servidor no
-  responde; comprueba la dirección en Ajustes → Red»).
+  responde; comprueba la dirección en Ajustes → Cuenta y servidor»).
 - Los textos de la aplicación van en `apps/desktop/locales/es/*.ftl` (uno por pantalla) y se usan con
   `t!("id")` o `t!("id", nombre = valor)`; el test `l10n` falla si queda un texto suelto o un
   identificador sin usar. Para traducir coroom, copia los catálogos a `locales/<idioma>/` y añádelos

@@ -449,6 +449,10 @@ impl Room {
                 });
                 Ok(())
             }
+            SignalMessage::Presence { user, online } => {
+                self.core.emit(SessionEvent::Presence { user, online });
+                Ok(())
+            }
             SignalMessage::Error { code, message } => match code {
                 ErrorCode::Kicked => Err(SessionError::Removed),
                 ErrorCode::RoomClosed => Err(SessionError::RoomClosed),

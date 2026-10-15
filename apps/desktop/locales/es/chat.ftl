@@ -1,3 +1,40 @@
 # Textos de la pantalla «chat» (identificadores con el prefijo `chat-`; los comunes están en coroom.ftl).
 chat-titulo = Chat de la sala
 chat-aun-sin-mensajes = Aún no hay mensajes.
+chat-aun-sin-mensajes-detalle = Lo que escribas aquí lo ven todos los de la sala, cifrado de extremo a extremo.
+chat-esperando-las-claves = El chat se abre en cuanto lleguen las claves de la sala.
+chat-esperando-las-claves-corto = Esperando las claves de la sala…
+chat-escribe-un-mensaje = Escribe un mensaje…
+chat-enviar = Enviar (Intro)
+chat-tu = Tú
+chat-anfitrion = Anfitrión
+chat-el-anfitrion = el anfitrión
+chat-vaciar-el-chat = Vaciar el chat
+chat-vaciar-para-todos = ¿Vaciar el chat para todos?
+chat-vaciar = Vaciar
+chat-cancelar = Cancelar
+chat-y-n-mas = y { $count } más
+chat-contador = { $count } / { $max }
+chat-teclas-del-campo = Intro envía · Mayús+Intro, salto de línea · Esc vuelve al juego
+chat-tu-sala = Tu sala
+chat-sala-de-name = Sala de { $name }
+chat-notificacion-titulo = { $name } · { $room }
+chat-aun-no-disponible = El chat aún no está disponible: faltan las claves de la sala.
+chat-no-hay-sala = No estás en ninguna sala.
+
+## Avisos del sistema (solo en tu equipo)
+chat-entraste-a-la-sala = Entraste a la sala
+chat-name-entro-a-la-sala = { $name } entró a la sala
+chat-name-salio-de-la-sala = { $name } salió de la sala
+chat-expulsaste-a-name = Expulsaste a { $name }
+chat-name-te-dio-what = { $name } te dio { $what }
+chat-name-te-quito-what = { $name } te quitó { $what }
+chat-diste-what-a-name = Diste { $what } a { $name }
+chat-quitaste-what-a-name = Quitaste { $what } a { $name }
+chat-teclado-y-raton = teclado y ratón
+chat-el-teclado-y-el-raton = el teclado y el ratón
+chat-el-mando-ranura = el mando (ranura { $slot })
+chat-el-mando = el mando
+chat-la-voz = la voz
+chat-vaciaste-el-chat = Vaciaste el chat para todos
+chat-el-anfitrion-vacio-el-chat = El anfitrión vació el chat
