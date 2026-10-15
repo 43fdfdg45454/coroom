@@ -55,6 +55,18 @@ pub mod evdev {
     pub const KEY_SPACE: u16 = 57;
     /// `KEY_LEFTSHIFT`.
     pub const KEY_LEFTSHIFT: u16 = 42;
+    /// `KEY_RIGHTSHIFT`.
+    pub const KEY_RIGHTSHIFT: u16 = 54;
+    /// `KEY_CAPSLOCK`.
+    pub const KEY_CAPSLOCK: u16 = 58;
+    /// `KEY_NUMLOCK`.
+    pub const KEY_NUMLOCK: u16 = 69;
+    /// `KEY_SCROLLLOCK`.
+    pub const KEY_SCROLLLOCK: u16 = 70;
+    /// `KEY_LEFTMETA`.
+    pub const KEY_LEFTMETA: u16 = 125;
+    /// `KEY_RIGHTMETA`.
+    pub const KEY_RIGHTMETA: u16 = 126;
     /// `KEY_UP`.
     pub const KEY_UP: u16 = 103;
     /// `KEY_LEFT`.

@@ -41,6 +41,35 @@ pub trait InputSink: Send {
     /// Inyecta un evento en nombre de `guest` (ya autorizado por la sesión).
     fn inject(&mut self, event: &InputEvent, guest: GuestId) -> Result<(), InputError>;
 
+    /// Inyecta varios eventos de `guest` de una vez, en orden. Los sumideros que pueden los
+    /// escriben juntos (una trama de uinput o de EI, una llamada a `SendInput`): un paquete con
+    /// `LeftX` y `LeftY` llega al juego como una sola muestra del stick, no como dos a medias.
+    /// Devuelve cuántos se aplicaron y deja en `errors` por qué fallaron los demás (uno por evento
+    /// o uno por todo el grupo). Por defecto, uno a uno con [`InputSink::inject`].
+    fn inject_batch(
+        &mut self,
+        events: &[InputEvent],
+        guest: GuestId,
+        errors: &mut Vec<InputError>,
+    ) -> usize {
+        let mut applied = 0;
+        for event in events {
+            match self.inject(event, guest) {
+                Ok(()) => applied += 1,
+                Err(err) => errors.push(err),
+            }
+        }
+        applied
+    }
+
+    /// Trabajo periódico del sumidero (la repetición automática de teclas donde el sistema no la
+    /// hace, [`KeyRepeat`]): la sesión lo llama en cada vuelta de su hilo y vuelve a llamarlo, como
+    /// tarde, en el instante que devuelva. Por defecto no hay nada.
+    fn tick(&mut self, now: Instant) -> Option<Instant> {
+        let _ = now;
+        None
+    }
+
     /// Suelta todo lo que `guest` tenga pulsado (teclas, botones y su mando, que vuelve al reposo).
     fn release_all(&mut self, guest: GuestId) -> Result<(), InputError>;
 
@@ -263,6 +292,109 @@ impl PressedKeys {
     }
 }
 
+/// Repetición automática de teclas (*typematic*) para los sumideros cuyo sistema no la hace con
+/// la entrada inyectada (Windows: `SendInput` escribe una pulsación y no vuelve a repetirla; los
+/// dispositivos de EI y uinput de Linux la hacen solos). Como un teclado: se repite la **última**
+/// tecla pulsada, tras el retardo inicial y luego a la cadencia; soltarla para la repetición
+/// aunque sigan otras pulsadas, y pulsar otra pasa la repetición a esa. Los modificadores y los
+/// bloqueos no se repiten ([`KeyRepeat::repeats`]). El retardo y la cadencia los da el sistema
+/// ([`KeyRepeat::from_windows_settings`]), no una cifra fija.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyRepeat {
+    delay: Duration,
+    interval: Duration,
+    /// La tecla que se repite y cuándo toca la siguiente repetición.
+    current: Option<(u16, Instant)>,
+}
+
+impl KeyRepeat {
+    /// Repetición con `delay` hasta la primera y `interval` entre las siguientes.
+    pub fn new(delay: Duration, interval: Duration) -> Self {
+        Self {
+            delay,
+            interval: interval.max(Duration::from_millis(1)),
+            current: None,
+        }
+    }
+
+    /// Con los valores de Windows: `SPI_GETKEYBOARDDELAY` (`0..=3`, 250 ms × (n + 1)) y
+    /// `SPI_GETKEYBOARDSPEED` (`0..=31`, de unas 2,5 a unas 30 repeticiones por segundo, lineal).
+    pub fn from_windows_settings(delay: u32, speed: u32) -> Self {
+        let delay_ms = 250 * (u64::from(delay.min(3)) + 1);
+        let per_second = 2.5 + 27.5 * f64::from(speed.min(31)) / 31.0;
+        Self::new(
+            Duration::from_millis(delay_ms),
+            Duration::from_secs_f64(1.0 / per_second),
+        )
+    }
+
+    /// Cambia el retardo y la cadencia (el sistema los cambió) sin tocar la tecla en curso.
+    pub fn set_timing(&mut self, delay: Duration, interval: Duration) {
+        self.delay = delay;
+        self.interval = interval.max(Duration::from_millis(1));
+    }
+
+    /// Retardo hasta la primera repetición y cadencia entre las siguientes.
+    pub fn timing(&self) -> (Duration, Duration) {
+        (self.delay, self.interval)
+    }
+
+    /// Si la tecla evdev `code` se repite al mantenerla pulsada: todas salvo los modificadores
+    /// (Mayús, Ctrl, Alt, Meta) y los bloqueos (Bloq Mayús, Bloq Num, Bloq Despl).
+    pub fn repeats(code: u16) -> bool {
+        !matches!(
+            code,
+            codes::KEY_LEFTSHIFT
+                | codes::KEY_RIGHTSHIFT
+                | codes::KEY_LEFTCTRL
+                | codes::KEY_RIGHTCTRL
+                | codes::KEY_LEFTALT
+                | codes::KEY_RIGHTALT
+                | codes::KEY_LEFTMETA
+                | codes::KEY_RIGHTMETA
+                | codes::KEY_CAPSLOCK
+                | codes::KEY_NUMLOCK
+                | codes::KEY_SCROLLLOCK
+        )
+    }
+
+    /// La tecla `code` acaba de escribirse pulsada en el sistema en `now`. Como en un teclado
+    /// real, la última pulsada es la que se repite, y pulsar un modificador o un bloqueo corta
+    /// la repetición en curso (A mantenida y Mayús después no sigue repitiendo Mayús+A).
+    pub fn pressed(&mut self, code: u16, now: Instant) {
+        self.current = Self::repeats(code).then_some((code, now + self.delay));
+    }
+
+    /// La tecla `code` acaba de soltarse en el sistema.
+    pub fn released(&mut self, code: u16) {
+        if self.current.is_some_and(|(current, _)| current == code) {
+            self.current = None;
+        }
+    }
+
+    /// Para la repetición (todo se soltó o la conexión cambió).
+    pub fn clear(&mut self) {
+        self.current = None;
+    }
+
+    /// La tecla que toca repetir en `now`, si alguna, y la cita siguiente. Como mucho una
+    /// repetición por llamada: si el hilo llegó tarde, la siguiente se cuenta desde `now` (no se
+    /// acumulan repeticiones atrasadas).
+    pub fn due(&mut self, now: Instant) -> Option<u16> {
+        let (code, at) = self.current.as_mut()?;
+        if now < *at {
+            return None;
+        }
+        *at = (*at + self.interval).max(now + self.interval / 2);
+        Some(*code)
+    }
+
+    /// Cuándo toca la siguiente repetición, si hay alguna tecla repitiéndose.
+    pub fn next(&self) -> Option<Instant> {
+        self.current.map(|(_, at)| at)
+    }
+}
+
 /// Estado de los mandos virtuales: quién usa cada ranura, botones pulsados y ejes fuera de reposo.
 #[derive(Debug, Default)]
 pub struct PadTracker {
@@ -438,6 +570,8 @@ struct RecordingState {
     raw: BTreeSet<u8>,
     raw_unsupported: bool,
     outputs: Vec<(u8, Vec<u8>)>,
+    /// Tamaño de cada grupo recibido por [`InputSink::inject_batch`].
+    batches: Vec<usize>,
 }
 
 /// Sumidero de prueba (público para los tests de las demás crates): guarda todo lo que recibe con
@@ -494,6 +628,12 @@ impl RecordingSink {
         self.lock().raw.iter().copied().collect()
     }
 
+    /// Tamaño de cada grupo recibido por [`InputSink::inject_batch`], en orden (los eventos del
+    /// grupo están también en el registro, uno a uno).
+    pub fn batch_sizes(&self) -> Vec<usize> {
+        self.lock().batches.clone()
+    }
+
     /// Como un anfitrión que no recrea mandos tal cual.
     pub fn without_raw(self) -> Self {
         self.lock().raw_unsupported = true;
@@ -534,6 +674,23 @@ impl InputSink for RecordingSink {
             event: *event,
         });
         Ok(())
+    }
+
+    fn inject_batch(
+        &mut self,
+        events: &[InputEvent],
+        guest: GuestId,
+        errors: &mut Vec<InputError>,
+    ) -> usize {
+        self.lock().batches.push(events.len());
+        let mut applied = 0;
+        for event in events {
+            match self.inject(event, guest) {
+                Ok(()) => applied += 1,
+                Err(err) => errors.push(err),
+            }
+        }
+        applied
     }
 
     fn release_all(&mut self, guest: GuestId) -> Result<(), InputError> {
@@ -635,6 +792,8 @@ pub struct GamepadToKeys<S> {
     inner: S,
     /// Teclas que mantiene pulsadas cada ranura por sus ejes.
     axis_keys: BTreeMap<(u8, u16), bool>,
+    /// Lo traducido de un grupo (reutilizado).
+    scratch: Vec<InputEvent>,
 }
 
 impl<S: InputSink> GamepadToKeys<S> {
@@ -643,6 +802,7 @@ impl<S: InputSink> GamepadToKeys<S> {
         Self {
             inner,
             axis_keys: BTreeMap::new(),
+            scratch: Vec::with_capacity(64),
         }
     }
 
@@ -667,36 +827,17 @@ impl<S: InputSink> GamepadToKeys<S> {
         })
     }
 
-    fn set_axis_key(
-        &mut self,
-        slot: u8,
-        code: u16,
-        down: bool,
-        guest: GuestId,
-    ) -> Result<(), InputError> {
-        let previous = self.axis_keys.insert((slot, code), down).unwrap_or(false);
-        if previous != down {
-            self.inner.inject(
-                &InputEvent::Key {
-                    code,
-                    pressed: down,
-                },
-                guest,
-            )?;
-        }
-        Ok(())
-    }
-}
-
-impl<S: InputSink> InputSink for GamepadToKeys<S> {
-    fn inject(&mut self, event: &InputEvent, guest: GuestId) -> Result<(), InputError> {
+    /// Traduce `event` a lo que recibe el sumidero interior y lo añade a `out` (un mando puede no
+    /// producir nada: botones sin tecla, ejes que no cruzan el umbral, conexiones).
+    fn translate(&mut self, event: &InputEvent, out: &mut Vec<InputEvent>) {
         match *event {
             InputEvent::GamepadButton {
                 button, pressed, ..
-            } => match Self::key_for_button(button) {
-                Some(code) => self.inner.inject(&InputEvent::Key { code, pressed }, guest),
-                None => Ok(()),
-            },
+            } => {
+                if let Some(code) = Self::key_for_button(button) {
+                    out.push(InputEvent::Key { code, pressed });
+                }
+            }
             InputEvent::GamepadAxis { slot, axis, value } => {
                 let pairs: &[(u16, bool)] = match axis {
                     GamepadAxis::LeftX => &[
@@ -712,13 +853,50 @@ impl<S: InputSink> InputSink for GamepadToKeys<S> {
                     GamepadAxis::RightX | GamepadAxis::RightY => &[],
                 };
                 for (code, down) in pairs {
-                    self.set_axis_key(slot, *code, *down, guest)?;
+                    let previous = self.axis_keys.insert((slot, *code), *down).unwrap_or(false);
+                    if previous != *down {
+                        out.push(InputEvent::Key {
+                            code: *code,
+                            pressed: *down,
+                        });
+                    }
                 }
-                Ok(())
             }
-            InputEvent::GamepadConnected { .. } | InputEvent::GamepadDisconnected { .. } => Ok(()),
-            _ => self.inner.inject(event, guest),
+            InputEvent::GamepadConnected { .. } | InputEvent::GamepadDisconnected { .. } => {}
+            _ => out.push(*event),
         }
+    }
+}
+
+impl<S: InputSink> InputSink for GamepadToKeys<S> {
+    fn inject(&mut self, event: &InputEvent, guest: GuestId) -> Result<(), InputError> {
+        let mut out = std::mem::take(&mut self.scratch);
+        out.clear();
+        self.translate(event, &mut out);
+        let result = out
+            .iter()
+            .try_for_each(|event| self.inner.inject(event, guest));
+        self.scratch = out;
+        result
+    }
+
+    /// Traduce el grupo entero y se lo pasa junto al sumidero interior (las teclas de un mando
+    /// salen en una sola llamada).
+    fn inject_batch(
+        &mut self,
+        events: &[InputEvent],
+        guest: GuestId,
+        errors: &mut Vec<InputError>,
+    ) -> usize {
+        let mut out = std::mem::take(&mut self.scratch);
+        out.clear();
+        for event in events {
+            self.translate(event, &mut out);
+        }
+        let applied = self.inner.inject_batch(&out, guest, errors);
+        let failed = out.len() - applied;
+        self.scratch = out;
+        events.len().saturating_sub(failed)
     }
 
     fn release_all(&mut self, guest: GuestId) -> Result<(), InputError> {
@@ -743,6 +921,10 @@ impl<S: InputSink> InputSink for GamepadToKeys<S> {
 
     fn replace_eis(&mut self, eis: EisProvider) {
         self.inner.replace_eis(eis);
+    }
+
+    fn tick(&mut self, now: Instant) -> Option<Instant> {
+        self.inner.tick(now)
     }
 
     fn describe(&self) -> String {
@@ -797,6 +979,97 @@ mod tests {
         assert_eq!(buttons, vec![MouseButton::Left]);
         let (keys, _) = pressed.release_guest(TWO);
         assert_eq!(keys, vec![31]);
+    }
+
+    #[test]
+    fn the_last_pressed_key_repeats_at_the_system_cadence() {
+        // Retardo 1 (500 ms) y velocidad 31 (~30 Hz): un intervalo de unos 33 ms.
+        let mut repeat = KeyRepeat::from_windows_settings(1, 31);
+        assert_eq!(repeat.delay, Duration::from_millis(500));
+        assert!(
+            (32..=34).contains(&repeat.interval.as_millis()),
+            "{repeat:?}"
+        );
+        let slow = KeyRepeat::from_windows_settings(0, 0);
+        assert_eq!(slow.delay, Duration::from_millis(250));
+        assert_eq!(slow.interval, Duration::from_millis(400));
+        let clamped = KeyRepeat::from_windows_settings(9, 99);
+        assert_eq!(clamped.delay, Duration::from_millis(1000));
+        assert_eq!(clamped.interval, slow.interval.min(clamped.interval));
+
+        let t0 = Instant::now();
+        assert_eq!(repeat.due(t0), None, "sin tecla no hay repetición");
+        repeat.pressed(codes::KEY_A, t0);
+        assert_eq!(repeat.next(), Some(t0 + Duration::from_millis(500)));
+        assert_eq!(repeat.due(t0 + Duration::from_millis(499)), None);
+        assert_eq!(
+            repeat.due(t0 + Duration::from_millis(500)),
+            Some(codes::KEY_A)
+        );
+        assert_eq!(
+            repeat.due(t0 + Duration::from_millis(501)),
+            None,
+            "una por cita"
+        );
+        assert_eq!(
+            repeat.due(t0 + Duration::from_millis(500) + repeat.interval),
+            Some(codes::KEY_A)
+        );
+        // Muy tarde: no se acumulan repeticiones; la siguiente va desde ahora.
+        let late = t0 + Duration::from_secs(3);
+        assert_eq!(repeat.due(late), Some(codes::KEY_A));
+        assert_eq!(repeat.due(late + Duration::from_millis(1)), None);
+        assert!(repeat.next().unwrap() > late);
+
+        // Otra tecla pulsada: se repite esa, con el retardo entero; soltar la anterior no cambia
+        // nada; soltar la actual para la repetición aunque la otra siga pulsada.
+        repeat.pressed(codes::KEY_S, late);
+        assert_eq!(repeat.due(late + Duration::from_millis(100)), None);
+        repeat.released(codes::KEY_A);
+        assert_eq!(
+            repeat.due(late + Duration::from_millis(500)),
+            Some(codes::KEY_S)
+        );
+        repeat.released(codes::KEY_S);
+        assert_eq!(repeat.next(), None);
+
+        // Los modificadores y los bloqueos no se repiten, y pulsarlos corta la repetición de la
+        // tecla mantenida (A y luego Mayús no sigue escribiendo Mayús+A).
+        repeat.pressed(codes::KEY_A, late);
+        assert_eq!(repeat.next(), Some(late + Duration::from_millis(500)));
+        repeat.pressed(codes::KEY_LEFTSHIFT, late);
+        assert_eq!(repeat.next(), None, "Mayús para la repetición de A");
+        assert_eq!(repeat.due(late + Duration::from_secs(1)), None);
+        repeat.pressed(codes::KEY_CAPSLOCK, late);
+        assert_eq!(repeat.next(), None);
+        assert!(KeyRepeat::repeats(codes::KEY_SPACE) && !KeyRepeat::repeats(codes::KEY_LEFTMETA));
+        repeat.pressed(codes::KEY_SPACE, late);
+        repeat.clear();
+        assert_eq!(repeat.next(), None);
+    }
+
+    /// El agrupado por defecto aplica uno a uno y cuenta lo que falló.
+    #[test]
+    fn the_default_batch_counts_failures() {
+        let mut sink = RecordingSink::new();
+        let mut errors = Vec::new();
+        let events = [
+            InputEvent::Key {
+                code: 30,
+                pressed: true,
+            },
+            InputEvent::GamepadButton {
+                slot: 2,
+                button: GamepadButton::A,
+                pressed: true,
+            },
+            InputEvent::MouseMove { dx: 1, dy: 1 },
+        ];
+        assert_eq!(sink.inject_batch(&events, ONE, &mut errors), 2);
+        assert_eq!(errors, vec![InputError::NoSuchSlot(2)]);
+        assert_eq!(sink.events_of(ONE).len(), 2);
+        assert_eq!(sink.batch_sizes(), vec![3]);
+        assert_eq!(sink.tick(Instant::now()), None);
     }
 
     #[test]
@@ -911,23 +1184,30 @@ mod tests {
         for event in &events {
             sink.inject(event, ONE).unwrap();
         }
-        assert_eq!(
-            recording.events_of(ONE),
-            vec![
-                InputEvent::Key {
-                    code: codes::KEY_SPACE,
-                    pressed: true
-                },
-                InputEvent::Key {
-                    code: codes::KEY_W,
-                    pressed: true
-                },
-                InputEvent::Key {
-                    code: codes::KEY_W,
-                    pressed: false
-                },
-                InputEvent::MouseMove { dx: 3, dy: 4 },
-            ]
-        );
+        let expected = vec![
+            InputEvent::Key {
+                code: codes::KEY_SPACE,
+                pressed: true,
+            },
+            InputEvent::Key {
+                code: codes::KEY_W,
+                pressed: true,
+            },
+            InputEvent::Key {
+                code: codes::KEY_W,
+                pressed: false,
+            },
+            InputEvent::MouseMove { dx: 3, dy: 4 },
+        ];
+        assert_eq!(recording.events_of(ONE), expected);
+
+        // En grupo, lo mismo: los eventos sin tecla cuentan como aplicados.
+        let recording = RecordingSink::new();
+        let mut sink = GamepadToKeys::new(recording.clone());
+        sink.assign_gamepad(1).unwrap();
+        let mut errors = Vec::new();
+        assert_eq!(sink.inject_batch(&events, ONE, &mut errors), events.len());
+        assert!(errors.is_empty());
+        assert_eq!(recording.events_of(ONE), expected);
     }
 }

@@ -1,4 +1,12 @@
-//! Mandos del invitado con `gilrs` en un hilo a 1000 Hz.
+//! Mandos del invitado con `gilrs` en un hilo que espera en los propios mandos.
+//!
+//! El hilo `mandos` se bloquea en `gilrs` (`epoll` sobre los dispositivos en Linux) y despierta con
+//! cada evento: un botón sale al momento, con la hora en que el sistema lo leyó
+//! ([`PadLink::event_at`]), así que la etapa captura → envío incluye el muestreo. Los ejes se
+//! acumulan y salen como mucho a 1000 Hz ([`PERIOD`]). Sin eventos, el hilo mira cada
+//! [`IDLE_POLL`] la ranura, la elección y los informes de salida del anfitrión. Qué mando va a la
+//! ranura se calcula solo al conectar o desconectar uno o al cambiar la elección, y en el bucle no
+//! se reserva memoria.
 //!
 //! Un solo mando va a la ranura que el anfitrión haya asignado a este invitado
 //! ([`GamepadCapture::set_slot`]): el que elija el invitado ([`PadChoice::Pad`]) o, en automático,
@@ -22,10 +30,10 @@
 //! anfitrión (vibración, luces) se escriben en el mando. Sin ranura no se envía nada.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use coroom_proto::input::{GamepadDevice, GamepadTransport, PadData};
 use gilrs::{Axis, Button, EventType, GamepadId, Gilrs, GilrsBuilder};
@@ -50,6 +58,12 @@ pub const RESEND: Duration = Duration::from_millis(100);
 pub trait PadLink: Send + Sync {
     /// Envía un evento convertido.
     fn event(&self, event: InputEvent);
+    /// Envía un evento convertido que ocurrió en `at` (la hora en que el sistema leyó el mando):
+    /// la etapa captura → envío se mide desde ahí. Por defecto, como [`PadLink::event`].
+    fn event_at(&self, event: InputEvent, at: Instant) {
+        let _ = at;
+        self.event(event);
+    }
     /// Envía datos del mando tal cual.
     fn pad(&self, data: PadData);
     /// Si el anfitrión tiene el mando de `slot` tal cual (`GamepadMode`).
@@ -101,8 +115,12 @@ pub struct ConnectedPad {
     pub active: bool,
 }
 
-/// Periodo del hilo de mandos (1000 Hz): un botón espera como mucho 1 ms a que lo lea.
+/// Intervalo mínimo entre dos envíos de ejes (1000 Hz); los botones no esperan.
 pub const PERIOD: Duration = Duration::from_millis(1);
+
+/// Sin eventos, cada cuánto mira el hilo la ranura, la elección y las salidas del anfitrión
+/// (vibración, luces).
+pub const IDLE_POLL: Duration = Duration::from_millis(5);
 
 /// Zona muerta mínima de los sticks (fracción del recorrido).
 pub const AXIS_DEADZONE: f32 = 0.02;
@@ -159,38 +177,67 @@ pub fn trigger_value(value: f32) -> i16 {
     (value.min(1.0) * f32::from(i16::MAX)).round() as i16
 }
 
-/// Ejes pendientes y enviados: solo salen los que cambian.
+/// Ejes pendientes y enviados: solo salen los que cambian. Sin reservar memoria: un hueco por
+/// eje, en el orden de [`GamepadAxis::ALL`].
 #[derive(Debug, Default)]
 pub struct AxisFilter {
-    pending: BTreeMap<GamepadAxis, i16>,
-    sent: BTreeMap<GamepadAxis, i16>,
+    /// Último valor pendiente de cada eje y cuándo llegó el primero desde el último envío.
+    pending: [Option<(i16, Instant)>; 6],
+    sent: [i16; 6],
+}
+
+fn axis_index(axis: GamepadAxis) -> usize {
+    GamepadAxis::ALL
+        .iter()
+        .position(|a| *a == axis)
+        .unwrap_or(0)
 }
 
 impl AxisFilter {
-    /// Anota el último valor de un eje.
+    /// Anota el último valor de un eje, leído ahora.
     pub fn set(&mut self, axis: GamepadAxis, value: i16) {
-        self.pending.insert(axis, value);
+        self.set_at(axis, value, Instant::now());
     }
 
-    /// Ejes que cambiaron desde el último envío (el reposo, 0, siempre sale si no se había
-    /// enviado).
-    pub fn take_changed(&mut self) -> Vec<(GamepadAxis, i16)> {
-        let mut out = Vec::new();
-        for (axis, value) in std::mem::take(&mut self.pending) {
-            let last = self.sent.get(&axis).copied().unwrap_or(0);
+    /// Anota el último valor de un eje, leído en `at` (se conserva la hora del primero pendiente).
+    pub fn set_at(&mut self, axis: GamepadAxis, value: i16, at: Instant) {
+        let slot = &mut self.pending[axis_index(axis)];
+        let first = slot.map_or(at, |(_, first)| first);
+        *slot = Some((value, first));
+    }
+
+    /// Si hay algún eje pendiente.
+    pub fn has_pending(&self) -> bool {
+        self.pending.iter().any(Option::is_some)
+    }
+
+    /// Recorre y vacía los ejes que cambiaron desde el último envío (el reposo, 0, siempre sale
+    /// si no se había enviado), con la hora en que llegó cada uno.
+    pub fn drain_changed(&mut self, mut f: impl FnMut(GamepadAxis, i16, Instant)) {
+        for (index, slot) in self.pending.iter_mut().enumerate() {
+            let Some((value, at)) = slot.take() else {
+                continue;
+            };
+            let last = self.sent[index];
             let moved = (i32::from(value) - i32::from(last)).abs() >= AXIS_EPSILON;
             if moved || (value == 0 && last != 0) {
-                self.sent.insert(axis, value);
-                out.push((axis, value));
+                self.sent[index] = value;
+                f(GamepadAxis::ALL[index], value, at);
             }
         }
+    }
+
+    /// Ejes que cambiaron desde el último envío (como [`AxisFilter::drain_changed`], en un vector).
+    pub fn take_changed(&mut self) -> Vec<(GamepadAxis, i16)> {
+        let mut out = Vec::new();
+        self.drain_changed(|axis, value, _| out.push((axis, value)));
         out
     }
 
     /// Olvida lo enviado (el mando cambia de ranura o se desconecta).
     pub fn reset(&mut self) {
-        self.pending.clear();
-        self.sent.clear();
+        self.pending = [None; 6];
+        self.sent = [0; 6];
     }
 }
 
@@ -199,6 +246,8 @@ pub struct GamepadCapture {
     stop: Arc<AtomicBool>,
     slot: Arc<AtomicU8>,
     choice: Arc<Mutex<PadChoice>>,
+    /// Sube con cada [`GamepadCapture::set_choice`]: el hilo solo mira `choice` cuando cambia.
+    generation: Arc<AtomicU64>,
     pads: Arc<Mutex<Vec<ConnectedPad>>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -210,12 +259,14 @@ impl GamepadCapture {
         let stop = Arc::new(AtomicBool::new(false));
         let slot = Arc::new(AtomicU8::new(0));
         let choice = Arc::new(Mutex::new(choice));
+        let generation = Arc::new(AtomicU64::new(0));
         let pads = Arc::new(Mutex::new(Vec::new()));
         let thread = {
             let shared = Shared {
                 stop: Arc::clone(&stop),
                 slot: Arc::clone(&slot),
                 choice: Arc::clone(&choice),
+                generation: Arc::clone(&generation),
                 pads: Arc::clone(&pads),
                 link,
             };
@@ -228,6 +279,7 @@ impl GamepadCapture {
             stop,
             slot,
             choice,
+            generation,
             pads,
             thread: Some(thread),
         })
@@ -241,6 +293,7 @@ impl GamepadCapture {
     /// Qué mando mandar.
     pub fn set_choice(&self, choice: PadChoice) {
         *self.choice.lock().unwrap_or_else(PoisonError::into_inner) = choice;
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Mandos conectados ahora, para la interfaz.
@@ -265,8 +318,19 @@ struct Shared {
     stop: Arc<AtomicBool>,
     slot: Arc<AtomicU8>,
     choice: Arc<Mutex<PadChoice>>,
+    generation: Arc<AtomicU64>,
     pads: Arc<Mutex<Vec<ConnectedPad>>>,
     link: Arc<dyn PadLink>,
+}
+
+/// El `Instant` que corresponde a la hora `time` de un evento de `gilrs` (la del sistema al
+/// leer el mando): ahora menos lo que ha pasado desde entonces.
+fn instant_of(time: SystemTime) -> Instant {
+    let now = Instant::now();
+    match SystemTime::now().duration_since(time) {
+        Ok(age) => now.checked_sub(age).unwrap_or(now),
+        Err(_) => now,
+    }
 }
 
 fn key_of(gilrs: &Gilrs, id: GamepadId) -> PadKey {
@@ -279,17 +343,19 @@ fn key_of(gilrs: &Gilrs, id: GamepadId) -> PadKey {
 }
 
 /// Índice en `connected` (en orden de conexión) del mando que va a la ranura según `choice`.
-fn pick_index(choice: &PadChoice, connected: &[PadKey]) -> Option<usize> {
+fn pick_index<'a>(
+    choice: &PadChoice,
+    mut connected: impl ExactSizeIterator<Item = &'a PadKey>,
+) -> Option<usize> {
     match choice {
         PadChoice::Auto => connected.len().checked_sub(1),
-        PadChoice::Pad(key) => connected.iter().position(|k| k == key),
+        PadChoice::Pad(key) => connected.position(|k| k == key),
     }
 }
 
 /// El mando que va a la ranura según `choice`.
 fn pick(choice: &PadChoice, connected: &[(GamepadId, PadKey)]) -> Option<GamepadId> {
-    let keys: Vec<PadKey> = connected.iter().map(|(_, key)| key.clone()).collect();
-    pick_index(choice, &keys).map(|index| connected[index].0)
+    pick_index(choice, connected.iter().map(|(_, key)| key)).map(|index| connected[index].0)
 }
 
 /// El mando en crudo de cada sistema, con la misma forma.
@@ -577,8 +643,25 @@ fn run(shared: &Shared) {
     let mut announced: Option<(u8, GamepadId)> = None;
     let mut raw: Option<RawPad> = None;
     let mut axes = AxisFilter::default();
+    // Qué mando elige `choice`: se recalcula al conectar o desconectar uno o al cambiar la
+    // elección, no en cada vuelta.
+    let mut active: Option<GamepadId> = None;
+    let mut repick = true;
+    let mut seen_generation = shared.generation.load(Ordering::Acquire);
+    let mut last_axes: Option<Instant> = None;
+    let mut last_outputs = Instant::now();
     while !shared.stop.load(Ordering::Acquire) {
-        while let Some(event) = gilrs.next_event() {
+        // Espera en los mandos: un botón despierta al momento; con ejes pendientes, hasta que
+        // toque enviarlos; si no, hasta la siguiente mirada a la ranura y las salidas.
+        let now = Instant::now();
+        let axes_due = last_axes.map_or(now, |at| at + PERIOD);
+        let wake = if axes.has_pending() {
+            axes_due
+        } else {
+            now + IDLE_POLL
+        };
+        let mut next = gilrs.next_event_blocking(Some(wake.saturating_duration_since(now)));
+        while let Some(event) = next {
             match event.event {
                 EventType::Connected => {
                     let key = key_of(&gilrs, event.id);
@@ -586,47 +669,57 @@ fn run(shared: &Shared) {
                     connected.retain(|(id, _)| *id != event.id);
                     connected.push((event.id, key));
                     publish = true;
+                    repick = true;
                 }
                 EventType::Disconnected => {
                     connected.retain(|(id, _)| *id != event.id);
                     publish = true;
+                    repick = true;
                 }
                 _ => {}
             }
-            let Some((slot, active)) = announced else {
+            next = gilrs.next_event();
+            let Some((slot, announced_id)) = announced else {
                 continue;
             };
-            if event.id != active || raw.as_ref().is_some_and(|r| r.hid && link.raw(slot)) {
+            if event.id != announced_id || raw.as_ref().is_some_and(|r| r.hid && link.raw(slot)) {
                 continue;
             }
+            let at = instant_of(event.time);
             match event.event {
                 EventType::ButtonPressed(pressed, _) => {
                     if let Some(button) = button(pressed) {
-                        link.event(InputEvent::GamepadButton {
-                            slot,
-                            button,
-                            pressed: true,
-                        });
+                        link.event_at(
+                            InputEvent::GamepadButton {
+                                slot,
+                                button,
+                                pressed: true,
+                            },
+                            at,
+                        );
                     }
                 }
                 EventType::ButtonReleased(released, _) => {
                     if let Some(button) = button(released) {
-                        link.event(InputEvent::GamepadButton {
-                            slot,
-                            button,
-                            pressed: false,
-                        });
+                        link.event_at(
+                            InputEvent::GamepadButton {
+                                slot,
+                                button,
+                                pressed: false,
+                            },
+                            at,
+                        );
                     }
                 }
                 EventType::ButtonChanged(Button::LeftTrigger2, value, _) => {
-                    axes.set(GamepadAxis::LeftTrigger, trigger_value(value));
+                    axes.set_at(GamepadAxis::LeftTrigger, trigger_value(value), at);
                 }
                 EventType::ButtonChanged(Button::RightTrigger2, value, _) => {
-                    axes.set(GamepadAxis::RightTrigger, trigger_value(value));
+                    axes.set_at(GamepadAxis::RightTrigger, trigger_value(value), at);
                 }
                 EventType::AxisChanged(changed, value, _) => {
                     if let Some(axis) = axis(changed) {
-                        axes.set(axis, stick_value(value));
+                        axes.set_at(axis, stick_value(value), at);
                     }
                 }
                 _ => {}
@@ -634,12 +727,13 @@ fn run(shared: &Shared) {
         }
 
         // Qué mando va a qué ranura ahora.
-        let choice = shared
-            .choice
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        let active = pick(&choice, &connected);
+        let generation = shared.generation.load(Ordering::Acquire);
+        if repick || generation != seen_generation {
+            repick = false;
+            seen_generation = generation;
+            let choice = shared.choice.lock().unwrap_or_else(PoisonError::into_inner);
+            active = pick(&choice, &connected);
+        }
         let slot = shared.slot.load(Ordering::Acquire);
         let wanted = active.filter(|_| slot != 0).map(|id| (slot, id));
         if wanted != announced {
@@ -677,21 +771,30 @@ fn run(shared: &Shared) {
             *shared.pads.lock().unwrap_or_else(PoisonError::into_inner) = list;
         }
 
-        // Vibración y luces del anfitrión.
-        for (out_slot, data) in link.outputs() {
-            if let (Some((slot, _)), Some(raw)) = (announced, raw.as_mut())
-                && out_slot == slot
-            {
-                raw.write(&data);
+        let now = Instant::now();
+        // Vibración y luces del anfitrión: solo con un mando tal cual, y no en cada vuelta.
+        if let (Some((slot, _)), Some(raw)) = (announced, raw.as_mut())
+            && raw.hid
+            && now.saturating_duration_since(last_outputs) >= IDLE_POLL
+        {
+            last_outputs = now;
+            for (out_slot, data) in link.outputs() {
+                if out_slot == slot {
+                    raw.write(&data);
+                }
             }
         }
 
-        if let Some((slot, _)) = announced {
-            for (axis, value) in axes.take_changed() {
-                link.event(InputEvent::GamepadAxis { slot, axis, value });
+        // Los ejes, como mucho a 1000 Hz, con la hora en que llegó cada uno.
+        if axes.has_pending() && now >= axes_due {
+            last_axes = Some(now);
+            match announced {
+                Some((slot, _)) => axes.drain_changed(|axis, value, at| {
+                    link.event_at(InputEvent::GamepadAxis { slot, axis, value }, at);
+                }),
+                None => axes.reset(),
             }
         }
-        thread::sleep(PERIOD);
     }
 }
 
@@ -724,6 +827,30 @@ mod tests {
         assert!(filter.take_changed().is_empty());
         filter.set(GamepadAxis::LeftX, 0);
         assert_eq!(filter.take_changed(), vec![(GamepadAxis::LeftX, 0)]);
+        assert!(!filter.has_pending());
+
+        // La hora que sale es la del primer valor pendiente de ese eje (la muestra que empezó el
+        // movimiento), aunque después se actualice.
+        let t0 = Instant::now();
+        filter.set_at(GamepadAxis::RightX, 5000, t0);
+        filter.set_at(GamepadAxis::RightX, 6000, t0 + Duration::from_millis(1));
+        assert!(filter.has_pending());
+        let mut seen = Vec::new();
+        filter.drain_changed(|axis, value, at| seen.push((axis, value, at)));
+        assert_eq!(seen, vec![(GamepadAxis::RightX, 6000, t0)]);
+        filter.reset();
+        assert!(!filter.has_pending());
+        assert_eq!(filter.take_changed(), vec![]);
+    }
+
+    #[test]
+    fn event_times_become_instants() {
+        let now = Instant::now();
+        let at = instant_of(SystemTime::now() - Duration::from_millis(20));
+        assert!(now.saturating_duration_since(at) >= Duration::from_millis(19));
+        assert!(now.saturating_duration_since(at) < Duration::from_millis(500));
+        // Una hora futura (reloj ajustado) no se adelanta.
+        assert!(instant_of(SystemTime::now() + Duration::from_secs(5)) <= Instant::now());
     }
 
     #[test]
@@ -742,18 +869,18 @@ mod tests {
         };
         // En orden de conexión: en automático va el último conectado.
         let pads = keys(&["8BitDo", "DualSense"]);
-        assert_eq!(pick_index(&PadChoice::Auto, &pads), Some(1));
-        assert_eq!(pick_index(&PadChoice::Auto, &[]), None);
+        assert_eq!(pick_index(&PadChoice::Auto, pads.iter()), Some(1));
+        assert_eq!(pick_index(&PadChoice::Auto, [].iter()), None);
         let eightbitdo = PadChoice::Pad(pads[0].clone());
-        assert_eq!(pick_index(&eightbitdo, &pads), Some(0));
+        assert_eq!(pick_index(&eightbitdo, pads.iter()), Some(0));
         // El último se desconecta: en automático, el anterior; el elegido sigue.
         let only = keys(&["8BitDo"]);
-        assert_eq!(pick_index(&PadChoice::Auto, &only), Some(0));
-        assert_eq!(pick_index(&eightbitdo, &only), Some(0));
+        assert_eq!(pick_index(&PadChoice::Auto, only.iter()), Some(0));
+        assert_eq!(pick_index(&eightbitdo, only.iter()), Some(0));
         // El elegido se desconecta: ninguno, y vuelve al reconectarlo.
         let other = keys(&["DualSense"]);
-        assert_eq!(pick_index(&eightbitdo, &other), None);
-        assert_eq!(pick_index(&eightbitdo, &pads), Some(0));
+        assert_eq!(pick_index(&eightbitdo, other.iter()), None);
+        assert_eq!(pick_index(&eightbitdo, pads.iter()), Some(0));
     }
 
     #[test]

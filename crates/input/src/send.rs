@@ -2,7 +2,8 @@
 //!
 //! [`InputSender`] tiene un hilo `entrada` que recibe los eventos con su instante y lleva el
 //! [`InputState`] del invitado (lo que hay pulsado y lo acumulado). Todo sale por **datagramas**
-//! en [`InputPacket`], con los eventos en orden y el estado tal como queda tras ellos:
+//! en [`InputPacket`](coroom_proto::input::InputPacket), con los eventos en orden y el estado tal
+//! como queda tras ellos:
 //!
 //! - Un **cambio de estado** (tecla, botón, rueda, mando que se conecta, [`InputEvent::ReleaseAll`])
 //!   sale al momento, con el movimiento que tuviera delante en el mismo paquete (un clic nunca
@@ -14,7 +15,11 @@
 //!   suman al último.
 //! - Tras un cambio de estado, si no sale ningún otro paquete, el estado se **repite** a los
 //!   plazos de [`REPEATS`]: perder el datagrama de una tecla no la deja pegada ni sin pulsar, el
-//!   anfitrión lo arregla con el estado del siguiente ([`InputState::diff`]).
+//!   anfitrión lo arregla con el estado del siguiente ([`InputState::diff`]). Después, mientras
+//!   no salga nada, el estado se sigue repitiendo cada [`KEEPALIVE_PRESSED`] si hay algo pulsado
+//!   (una ráfaga de pérdidas que se lleve una liberación y sus repeticiones no deja nada pegado
+//!   más que eso) y cada [`KEEPALIVE_IDLE`] si no (señal de vida: el anfitrión suelta lo de un
+//!   invitado del que no sabe nada en `STALE_AFTER`).
 //! - **Mandos tal cual** ([`PadData`]): la declaración del mando ([`PadData::Device`]) va por el
 //!   stream fiable (su descriptor no cabe en un datagrama); los informes HID ([`PadData::Report`])
 //!   van con el movimiento, todos en orden (un informe puede ser la única pulsación de un botón),
@@ -32,8 +37,8 @@ use std::time::{Duration, Instant};
 
 use coroom_crypto::input::{Channel, InputCipher};
 use coroom_proto::input::{
-    InputMessage, InputPacket, InputState, MAX_EVENTS, MAX_PADS, PadData, datagram_header,
-    stream_frame,
+    InputMessage, InputPacketRef, InputState, KEEPALIVE_IDLE, KEEPALIVE_PRESSED, MAX_EVENTS,
+    MAX_PACKET_BYTES, MAX_PADS, PadData, datagram_header, stream_frame,
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use tracing::debug;
@@ -43,8 +48,9 @@ use crate::{InputError, InputEvent};
 /// Intervalo mínimo entre dos datagramas de movimiento.
 pub const BATCH_INTERVAL: Duration = Duration::from_millis(1);
 
-/// Plazos, desde el último cambio de estado, a los que se repite el estado si no salió otro
-/// paquete: cubren una pérdida aislada y una ráfaga corta sin esperar al siguiente movimiento.
+/// Plazos, desde que salió el último cambio de estado, a los que se repite el estado si no salió
+/// otro paquete: cubren una pérdida aislada y una ráfaga corta sin esperar al siguiente
+/// movimiento.
 pub const REPEATS: [Duration; 3] = [
     Duration::from_millis(3),
     Duration::from_millis(8),
@@ -135,6 +141,15 @@ impl Batch {
         self.events.is_empty() && self.pads.is_empty()
     }
 
+    /// Vacía el lote conservando la memoria de sus vectores (el siguiente no reserva).
+    fn clear(&mut self) {
+        self.events.clear();
+        self.pads.clear();
+        self.pad_bytes = 0;
+        self.first = None;
+        self.urgent = false;
+    }
+
     /// Si un informe más de `len` bytes ya no cabe en este datagrama.
     fn pads_full(&self, len: usize) -> bool {
         self.pads.len() >= MAX_PADS || self.pad_bytes + len > MAX_PAD_DATAGRAM_BYTES
@@ -207,6 +222,10 @@ struct Worker {
     link: Arc<dyn InputLink>,
     cipher: Arc<Mutex<InputCipher>>,
     stats: Arc<SenderStats>,
+    /// El paquete en claro, serializado aquí sin reservar memoria.
+    plain: Box<[u8; MAX_PACKET_BYTES]>,
+    /// Cabecera y sellado del datagrama; se entrega al enlace tal cual (una sola reserva por
+    /// datagrama) y se vuelve a reservar con la misma capacidad.
     sealed: Vec<u8>,
     state: InputState,
     /// Último cambio de estado y cuántos paquetes han salido desde entonces (cada uno lleva el
@@ -215,6 +234,8 @@ struct Worker {
     repeated: usize,
     /// El cambio aún no salió: su propio paquete no cuenta como repetición.
     carrying_change: bool,
+    /// Cuándo salió el último datagrama (para el *keepalive*).
+    last_sent: Option<Instant>,
 }
 
 impl Worker {
@@ -227,47 +248,51 @@ impl Worker {
 
     /// Envía lo pendiente (o solo el estado, si no hay nada) como un datagrama.
     fn send_batch(&mut self, batch: &mut Batch, now: Instant) {
-        let events = std::mem::take(&mut batch.events);
-        let pads = std::mem::take(&mut batch.pads);
-        batch.pad_bytes = 0;
-        batch.urgent = false;
-        let first = batch.first.take();
+        let first = batch.first;
         let sent_us = self.remote_us(first.unwrap_or(now));
         let queued_us = first.map_or(0, |first| {
             u16::try_from(now.saturating_duration_since(first).as_micros()).unwrap_or(u16::MAX)
         });
-        let repeat = events.is_empty() && pads.is_empty();
-        let count = (events.len() + pads.len()) as u64;
+        let repeat = batch.is_empty();
+        let count = (batch.events.len() + batch.pads.len()) as u64;
         let mut cipher = self.cipher.lock().unwrap_or_else(PoisonError::into_inner);
         let seq = cipher.next_seq(Channel::Datagram);
         let Ok(seq32) = u32::try_from(seq) else {
             self.stats.errors.fetch_add(1, Ordering::Relaxed);
+            batch.clear();
             return;
         };
-        let packet = InputPacket {
+        let packet = InputPacketRef {
             seq: seq32,
             sent_us,
             queued_us,
-            events,
-            state: self.state.clone(),
-            pads,
+            events: &batch.events,
+            state: &self.state,
+            pads: &batch.pads,
         };
-        let result = packet
-            .to_bytes()
-            .map_err(|err| err.to_string())
-            .and_then(|plain| {
+        // Sin reservar: el paquete se serializa en `plain` y se sella en `sealed`.
+        let sealed = match packet.write_to(&mut self.plain[..]) {
+            Ok(plain) => {
                 self.sealed.clear();
                 self.sealed
                     .extend_from_slice(&datagram_header(cipher.key_id()));
                 cipher
-                    .seal(Channel::Datagram, seq, &plain, &mut self.sealed)
+                    .seal(Channel::Datagram, seq, plain, &mut self.sealed)
                     .map_err(|err| err.to_string())
-            });
+            }
+            Err(err) => Err(err.to_string()),
+        };
         drop(cipher);
-        match result.and_then(|()| {
+        batch.clear();
+        let result = sealed.and_then(|()| {
             let bytes = self.sealed.len() as u64;
-            self.link.send_datagram(self.sealed.clone()).map(|()| bytes)
-        }) {
+            // El enlace se queda con el vector (quinn lo envuelve en `Bytes` sin copiar); aquí
+            // se reserva otro igual para el siguiente.
+            let capacity = self.sealed.capacity();
+            let datagram = std::mem::replace(&mut self.sealed, Vec::with_capacity(capacity));
+            self.link.send_datagram(datagram).map(|()| bytes)
+        });
+        match result {
             Ok(bytes) => {
                 self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
                 self.stats.events.fetch_add(count, Ordering::Relaxed);
@@ -281,8 +306,12 @@ impl Worker {
                 self.stats.errors.fetch_add(1, Ordering::Relaxed);
             }
         }
+        self.last_sent = Some(now);
         if self.carrying_change {
+            // Las repeticiones se cuentan desde que el cambio salió, no desde que ocurrió: si
+            // este hilo llegó tarde, no salen todas seguidas.
             self.carrying_change = false;
+            self.changed_at = Some(now);
         } else if self.changed_at.is_some() {
             self.repeated += 1;
             if self.repeated >= REPEATS.len() {
@@ -364,6 +393,25 @@ impl Worker {
         REPEATS.get(self.repeated).map(|delay| changed + *delay)
     }
 
+    /// Cuándo toca el *keepalive*: [`KEEPALIVE_PRESSED`] desde el último datagrama si hay algo
+    /// pulsado, [`KEEPALIVE_IDLE`] si no. Antes del primer datagrama, nunca.
+    fn next_keepalive(&self) -> Option<Instant> {
+        let period = if self.state.any_pressed() {
+            KEEPALIVE_PRESSED
+        } else {
+            KEEPALIVE_IDLE
+        };
+        self.last_sent.map(|at| at + period)
+    }
+
+    /// Lo primero que toca: una repetición o el *keepalive*.
+    fn next_resend(&self) -> Option<Instant> {
+        match (self.next_repeat(), self.next_keepalive()) {
+            (Some(repeat), Some(keepalive)) => Some(repeat.min(keepalive)),
+            (repeat, keepalive) => repeat.or(keepalive),
+        }
+    }
+
     fn run(mut self, rx: &Receiver<(Instant, Item)>) {
         let mut batch = Batch::default();
         // Hace tiempo que no sale nada: el primer movimiento sale al momento.
@@ -371,7 +419,7 @@ impl Worker {
         loop {
             let now = Instant::now();
             let due = last_batch.map(|at| at + BATCH_INTERVAL);
-            let mut wake = self.next_repeat();
+            let mut wake = self.next_resend();
             if !batch.is_empty() {
                 let batch_due = if batch.urgent {
                     now
@@ -405,7 +453,7 @@ impl Worker {
                     last_batch = Some(now);
                     self.send_batch(&mut batch, now);
                 }
-            } else if self.next_repeat().is_some_and(|at| at <= now) {
+            } else if self.next_resend().is_some_and(|at| at <= now) {
                 last_batch = Some(now);
                 self.send_batch(&mut batch, now);
             }
@@ -440,11 +488,13 @@ impl InputSender {
             link,
             cipher,
             stats: Arc::clone(&stats),
+            plain: Box::new([0u8; MAX_PACKET_BYTES]),
             sealed: Vec::with_capacity(256),
             state: InputState::default(),
             changed_at: None,
             repeated: 0,
             carrying_change: false,
+            last_sent: None,
         };
         let thread = thread::Builder::new()
             .name("entrada".into())
@@ -502,7 +552,7 @@ mod tests {
     use super::*;
     use coroom_crypto::hpke::PairwiseSecret;
     use coroom_crypto::input::Role;
-    use coroom_proto::input::parse_datagram;
+    use coroom_proto::input::{InputPacket, parse_datagram};
 
     #[derive(Default)]
     struct Captured {
@@ -673,6 +723,56 @@ mod tests {
         );
         assert_eq!(packets[4].1.state.motion, (1, 0));
         assert_eq!(sender.stats().repeats, REPEATS.len() as u64);
+    }
+
+    /// Con una tecla pulsada, pasadas las repeticiones cortas el estado sigue saliendo cada
+    /// [`KEEPALIVE_PRESSED`]; al soltarla, nada hasta [`KEEPALIVE_IDLE`].
+    #[test]
+    fn the_state_is_kept_alive_while_something_is_pressed() {
+        let (link, mut sender, mut host) = pair();
+        let start = Instant::now();
+        sender.send(InputEvent::Key {
+            code: 30,
+            pressed: true,
+        });
+        // Tres repeticiones cortas (hasta 20 ms) y luego keepalives a los ~120, ~220 y ~320 ms.
+        std::thread::sleep(Duration::from_millis(360));
+        sender.send(InputEvent::Key {
+            code: 30,
+            pressed: false,
+        });
+        let released = Instant::now();
+        std::thread::sleep(Duration::from_millis(300));
+        sender.stop();
+        let packets = open_all(&link, &mut host);
+        let pressed: Vec<&(Instant, InputPacket)> = packets
+            .iter()
+            .filter(|(_, packet)| packet.state.keys == vec![30])
+            .collect();
+        assert!(
+            (6..=8).contains(&pressed.len()),
+            "{} paquetes con la tecla pulsada",
+            pressed.len()
+        );
+        let keepalives = pressed
+            .iter()
+            .filter(|(at, _)| *at - start > REPEATS[2] + Duration::from_millis(30))
+            .count();
+        assert!((2..=4).contains(&keepalives), "{keepalives} keepalives");
+        for (index, pair) in pressed.windows(2).enumerate() {
+            let gap = pair[1].0 - pair[0].0;
+            assert!(
+                gap <= KEEPALIVE_PRESSED + Duration::from_millis(40),
+                "hueco {index} de {gap:?} con la tecla pulsada"
+            );
+        }
+        // Tras soltarla: el paquete de la liberación, sus tres repeticiones y nada más antes del
+        // keepalive en reposo (500 ms).
+        let after: Vec<&(Instant, InputPacket)> =
+            packets.iter().filter(|(at, _)| *at >= released).collect();
+        assert_eq!(after.len(), 1 + REPEATS.len(), "{after:?}");
+        assert!(after.iter().all(|(_, packet)| packet.state.keys.is_empty()));
+        assert!(after.last().unwrap().0 - released < Duration::from_millis(100));
     }
 
     #[test]

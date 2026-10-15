@@ -301,6 +301,11 @@ fn b_a_1000_hz_mouse_loses_nothing_and_keys_keep_their_order() {
     assert_eq!(typed, keys, "las teclas llegan en orden");
 
     let sent = guest.input().sender_stats().expect("emisor");
+    // Los contadores se publican cada 100 ms: esperar a que el último lote conste.
+    wait_until("los contadores publicados", LIMIT, || {
+        let input = status(&host, id).input;
+        input.applied + input.dropped >= total
+    });
     let input = status(&host, id).input;
     print_latency("(b)", &input);
     println!(

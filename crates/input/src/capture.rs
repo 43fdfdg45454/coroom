@@ -241,6 +241,22 @@ impl InputCapture {
         self.shortcuts = shortcuts;
     }
 
+    /// Ctrl y Alt como los ve el sistema (`WindowEvent::ModifiersChanged`): reajusta lo que esta
+    /// captura deduce de las teclas (que puede quedarse atrás si una pulsación llegó con la
+    /// ventana sin foco) sin enviar nada al anfitrión.
+    pub fn set_modifiers(&mut self, ctrl: bool, alt: bool) {
+        if !ctrl {
+            self.ctrl = [false; 2];
+        } else if !self.ctrl.iter().any(|down| *down) {
+            self.ctrl[0] = true;
+        }
+        if !alt {
+            self.alt = [false; 2];
+        } else if !self.alt.iter().any(|down| *down) {
+            self.alt[0] = true;
+        }
+    }
+
     /// Pasa al modo inmersivo (`true`) o al de escritorio, como `Ctrl+Alt+G` (desde un botón de
     /// la interfaz).
     pub fn set_immersive(&mut self, immersive: bool) -> Vec<Action> {
@@ -698,6 +714,26 @@ mod tests {
         let back = key(&mut capture, KeyCode::KeyG, true);
         assert!(back.contains(&Action::Grab(false)));
         assert_eq!(capture.mode(), CaptureMode::Desktop);
+    }
+
+    #[test]
+    fn the_system_modifiers_reseed_the_shortcut_state_without_sending() {
+        let mut capture = allowed();
+        // El sistema dice que Ctrl y Alt están pulsados aunque las teclas no pasaran por aquí.
+        capture.set_modifiers(true, true);
+        assert_eq!(
+            capture.key(PhysicalKey::Code(KeyCode::KeyS), true, false),
+            vec![Action::ToggleOverlay]
+        );
+        // Y que se soltaron: la S es una tecla más.
+        capture.set_modifiers(false, false);
+        assert_eq!(
+            sent(&capture.key(PhysicalKey::Code(KeyCode::KeyS), true, false)),
+            vec![InputEvent::Key {
+                code: 31,
+                pressed: true
+            }]
+        );
     }
 
     #[test]

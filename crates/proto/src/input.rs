@@ -43,6 +43,7 @@
 //! de los paquetes, aparte de los eventos.
 
 use std::fmt;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +87,24 @@ pub const MAX_FEATURES: usize = 32;
 
 /// Bytes de todos los informes de característica de un mando, como mucho.
 pub const MAX_FEATURE_BYTES: usize = 8 * 1024;
+
+/// Cada cuánto repite el invitado su estado, sin eventos, mientras tiene algo pulsado y no sale
+/// ningún otro paquete: una ráfaga de pérdidas que se lleve una liberación y sus repeticiones
+/// cortas no deja la tecla pegada más que esto. El anfitrión cuenta con estas repeticiones
+/// ([`STALE_AFTER`]).
+pub const KEEPALIVE_PRESSED: Duration = Duration::from_millis(100);
+
+/// Cada cuánto repite el invitado su estado cuando no tiene nada pulsado (señal de vida).
+pub const KEEPALIVE_IDLE: Duration = Duration::from_millis(500);
+
+/// Repeticiones de [`KEEPALIVE_PRESSED`] seguidas que el anfitrión da por perdidas antes de
+/// soltar lo que el invitado tuviera pulsado.
+pub const STALE_KEEPALIVES: u32 = 10;
+
+/// Sin ningún paquete de un invitado en este plazo (derivado de [`KEEPALIVE_PRESSED`]), el
+/// anfitrión suelta lo que ese invitado tuviera pulsado según su vista y reconcilia con el estado
+/// del siguiente paquete que llegue.
+pub const STALE_AFTER: Duration = KEEPALIVE_PRESSED.saturating_mul(STALE_KEEPALIVES);
 
 /// Botón del ratón.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -592,6 +611,15 @@ impl InputState {
         self.buttons & mouse_bit(button) != 0
     }
 
+    /// Si hay algo que soltar: alguna tecla o botón pulsado, o el mando fuera del reposo.
+    pub fn any_pressed(&self) -> bool {
+        !self.keys.is_empty()
+            || self.buttons != 0
+            || self
+                .gamepad
+                .is_some_and(|pad| pad.buttons != 0 || pad.axes != [0; 6])
+    }
+
     /// Eventos que llevan de `self` a `target`, para reconciliar cuando se perdieron paquetes:
     /// primero lo que se suelta (teclas, botones del ratón y del mando), después lo que se pulsa,
     /// el movimiento y la rueda que faltan, la posición absoluta y los ejes. Puede superar
@@ -839,6 +867,50 @@ impl InputPacket {
         Ok(value)
     }
 }
+
+/// Vista prestada de un [`InputPacket`] para serializarlo sin copiar sus partes: produce
+/// exactamente los mismos bytes que [`InputPacket::to_bytes`] (a `postcard` le da igual que una
+/// secuencia sea un `Vec` o un slice), así que el anfitrión lo abre con
+/// [`InputPacket::from_bytes`].
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct InputPacketRef<'a> {
+    /// Como [`InputPacket::seq`].
+    pub seq: u32,
+    /// Como [`InputPacket::sent_us`].
+    pub sent_us: u32,
+    /// Como [`InputPacket::queued_us`].
+    pub queued_us: u16,
+    /// Como [`InputPacket::events`].
+    pub events: &'a [InputEvent],
+    /// Como [`InputPacket::state`].
+    pub state: &'a InputState,
+    /// Como [`InputPacket::pads`].
+    pub pads: &'a [PadData],
+}
+
+impl InputPacketRef<'_> {
+    fn check(&self) -> Result<(), InputWireError> {
+        if self.events.len() > MAX_EVENTS {
+            return Err(InputWireError::TooManyEvents(self.events.len()));
+        }
+        self.state.check()?;
+        check_pads(self.pads)
+    }
+
+    /// Serializa con `postcard` en `buf` (sin reservar memoria) y devuelve los bytes escritos.
+    /// Con un `buf` de [`MAX_PACKET_BYTES`] siempre cabe.
+    pub fn write_to<'b>(&self, buf: &'b mut [u8]) -> Result<&'b [u8], InputWireError> {
+        self.check()?;
+        postcard::to_slice(self, buf)
+            .map(|written| &*written)
+            .map_err(|err| InputWireError::Postcard(err.to_string()))
+    }
+}
+
+/// Bytes en claro de un [`InputPacket`] dentro de los límites, como mucho (holgado): [`MAX_EVENTS`]
+/// eventos de hasta 11 bytes, el estado con [`MAX_PRESSED_KEYS`] teclas, [`MAX_PADS`] informes con
+/// `coroom_input::send::MAX_PAD_DATAGRAM_BYTES` de datos y las cabeceras.
+pub const MAX_PACKET_BYTES: usize = 2048;
 
 impl InputMessage {
     /// Serializa con `postcard`.
@@ -1168,6 +1240,103 @@ mod tests {
             InputPacket::from_bytes(&raw),
             Err(InputWireError::TooManyEvents(_))
         ));
+    }
+
+    /// La vista prestada produce los mismos bytes que el paquete con sus `Vec`, y el peor caso
+    /// dentro de los límites cabe en [`MAX_PACKET_BYTES`].
+    #[test]
+    fn the_borrowed_view_serializes_like_the_packet() {
+        let state = InputState {
+            keys: (0..MAX_PRESSED_KEYS as u16).map(|k| 300 + k * 7).collect(),
+            buttons: 0x1f,
+            motion: (i32::MIN, i32::MAX),
+            wheel: (-120_000, 120_000),
+            absolute: Some((u16::MAX, u16::MAX)),
+            gamepad: Some(GamepadState {
+                slot: 8,
+                kind: GamepadKind::Xbox,
+                buttons: u16::MAX,
+                axes: [i16::MIN, i16::MAX, i16::MIN, i16::MAX, i16::MAX, i16::MIN],
+            }),
+        };
+        let packet = InputPacket {
+            seq: u32::MAX,
+            sent_us: u32::MAX,
+            queued_us: u16::MAX,
+            events: vec![
+                InputEvent::MouseMove {
+                    dx: i32::MIN,
+                    dy: i32::MAX
+                };
+                MAX_EVENTS
+            ],
+            state,
+            // 800 bytes de informes (lo que admite `coroom_input::send` por datagrama).
+            pads: vec![
+                PadData::Report {
+                    slot: 1,
+                    data: vec![0xff; 50],
+                };
+                MAX_PADS
+            ],
+        };
+        let view = InputPacketRef {
+            seq: packet.seq,
+            sent_us: packet.sent_us,
+            queued_us: packet.queued_us,
+            events: &packet.events,
+            state: &packet.state,
+            pads: &packet.pads,
+        };
+        let mut buf = [0u8; MAX_PACKET_BYTES];
+        let written = view.write_to(&mut buf).expect("cabe");
+        assert_eq!(written, packet.to_bytes().unwrap().as_slice());
+        assert_eq!(InputPacket::from_bytes(written).unwrap(), packet);
+        assert!(written.len() < MAX_PACKET_BYTES, "{} bytes", written.len());
+
+        let extra = vec![InputEvent::ReleaseAll; MAX_EVENTS + 1];
+        let too_many = InputPacketRef {
+            events: &extra,
+            ..view
+        };
+        assert_eq!(
+            too_many.write_to(&mut buf).err(),
+            Some(InputWireError::TooManyEvents(MAX_EVENTS + 1))
+        );
+        let mut small = [0u8; 8];
+        assert!(matches!(
+            view.write_to(&mut small),
+            Err(InputWireError::Postcard(_))
+        ));
+    }
+
+    #[test]
+    fn the_stale_threshold_follows_the_keepalive() {
+        assert_eq!(STALE_AFTER, KEEPALIVE_PRESSED * STALE_KEEPALIVES);
+        assert!(KEEPALIVE_PRESSED < KEEPALIVE_IDLE);
+        let mut state = InputState::default();
+        assert!(!state.any_pressed());
+        state.apply(&InputEvent::GamepadConnected {
+            slot: 1,
+            kind: GamepadKind::Xbox,
+        });
+        assert!(
+            !state.any_pressed(),
+            "un mando en reposo no es nada pulsado"
+        );
+        state.apply(&InputEvent::GamepadAxis {
+            slot: 1,
+            axis: GamepadAxis::LeftX,
+            value: 5,
+        });
+        assert!(state.any_pressed());
+        state.release_all();
+        assert!(!state.any_pressed());
+        state.apply(&InputEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed: true,
+        });
+        assert!(state.any_pressed());
     }
 
     #[test]

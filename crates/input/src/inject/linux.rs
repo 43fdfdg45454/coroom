@@ -13,7 +13,10 @@
 //! primer evento): hasta que el usuario acepta el diálogo, los eventos se rechazan con
 //! [`InputError::NotReady`]. Ese hilo hace el *handshake*, se ata a las capacidades `pointer`,
 //! `pointer_absolute`, `keyboard`, `scroll` y `button` del asiento y atiende los dispositivos
-//! (`resumed` → `start_emulating`). Cada evento es una petición más `frame` y `flush`. La posición
+//! (`resumed` → `start_emulating`). Los eventos de un paquete salen juntos
+//! ([`InputSink::inject_batch`]): una petición por evento, un `frame` por dispositivo tocado y un
+//! solo `flush`; igual que un teclado o un ratón reales, que agrupan en una trama lo que pasa a la
+//! vez. La posición
 //! absoluta se escala a la región del dispositivo absoluto que corresponde al monitor capturado
 //! ([`PointerArea::Monitor`]; si no hay datos, la primera). Con una ventana, Wayland no dice dónde
 //! está: la posición absoluta se convierte en movimiento relativo escalado a su tamaño
@@ -24,8 +27,10 @@
 //! vendor/product del mando de Xbox 360 (`045e:028e`) y la disposición del driver `xpad` (A, B,
 //! X = `BTN_NORTH`, Y = `BTN_WEST`, LB, RB, Back, Start, Guide, LS, RS; sticks `ABS_X/Y/RX/RY` en
 //! ±32767 con Y hacia abajo; gatillos `ABS_Z/RZ` en 0..255; cruceta `ABS_HAT0X/Y`), así que SDL,
-//! Steam Input y los juegos lo reconocen. Sin *force feedback*. Si `/dev/uinput` no es accesible,
-//! el error explica la regla udev ([`UINPUT_HELP`]).
+//! Steam Input y los juegos lo reconocen. Los eventos de mando de un paquete van en **una sola
+//! trama** `SYN_REPORT` por ranura: un stick con `X` e `Y` cambiados llega al juego como una
+//! muestra, no como dos a medias. Sin *force feedback*. Si `/dev/uinput` no es accesible, el error
+//! explica la regla udev ([`UINPUT_HELP`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::OwnedFd;
@@ -43,7 +48,7 @@ use tracing::{debug, warn};
 use super::uhid::UhidPad;
 use super::{EisConnection, EisProvider, InputSink, PadTracker, PointerArea, PressedKeys};
 use crate::keymap::evdev as codes;
-use crate::{GamepadAxis, GamepadButton, GuestId, InputError, InputEvent, MouseButton};
+use crate::{EventClass, GamepadAxis, GamepadButton, GuestId, InputError, InputEvent, MouseButton};
 use coroom_proto::input::{GamepadDevice, GamepadTransport};
 
 /// Qué hacer si `/dev/uinput` no es accesible.
@@ -69,6 +74,28 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 fn monotonic_us() -> u64 {
     let now = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     (now.tv_sec as u64).saturating_mul(1_000_000) + (now.tv_nsec as u64) / 1000
+}
+
+/// Escribe `events` o ninguno: `target` resuelve el destino de cada uno (`None`: no va por aquí)
+/// antes de que `queue` escriba el primero, así un destino que falta no deja a medias lo anterior.
+/// Devuelve los destinos tocados, sin repetir y en el orden en que se tocaron.
+fn all_or_nothing<D: PartialEq + Copy>(
+    events: &[InputEvent],
+    target: impl FnMut(&InputEvent) -> Result<Option<D>, InputError>,
+    mut queue: impl FnMut(D, &InputEvent),
+) -> Result<Vec<D>, InputError> {
+    let targets = events.iter().map(target).collect::<Result<Vec<_>, _>>()?;
+    let mut touched = Vec::with_capacity(4);
+    for (device, event) in targets.into_iter().zip(events) {
+        let Some(device) = device else {
+            continue;
+        };
+        queue(device, event);
+        if !touched.contains(&device) {
+            touched.push(device);
+        }
+    }
+    Ok(touched)
 }
 
 // --- libei ------------------------------------------------------------------------------------
@@ -125,123 +152,163 @@ impl EiInput {
         })
     }
 
-    /// Ejecuta `f` con el primer dispositivo activo que tenga `capability` y cierra el `frame`.
-    fn with_device(
-        &self,
-        capability: DeviceCapability,
-        f: impl FnOnce(&reis::event::Device),
-    ) -> Result<(), InputError> {
+    /// Escribe `events` (teclado y ratón, ya filtrados por [`PressedKeys`]) de una vez: una
+    /// petición por evento, un `frame` por dispositivo tocado y un solo `flush`. O salen todos o
+    /// ninguno: el dispositivo de cada evento se resuelve antes de encolar el primero, así un
+    /// dispositivo que no está listo devuelve el error sin dejar nada a medias (quien llama
+    /// deshace sus anotaciones de todo el grupo, y una tecla ya escrita quedaría pulsada).
+    fn inject_many(&self, events: &[InputEvent]) -> Result<(), InputError> {
         let state = lock(&self.state);
         if let Some(reason) = &state.disconnected {
             return Err(InputError::Backend(format!(
                 "el compositor cerró la conexión de EI: {reason}"
             )));
         }
-        let Some((device, _)) = state
-            .devices
-            .iter()
-            .find(|(device, resumed)| *resumed && device.has_capability(capability))
-        else {
-            return Err(InputError::NotReady(format!(
-                "el compositor no ofrece un dispositivo de EI con {capability:?} activo"
-            )));
-        };
         let serial = state
             .connection
             .as_ref()
             .map_or(0, reis::event::Connection::serial);
-        f(device);
-        device.device().frame(serial, monotonic_us());
+        let touched = all_or_nothing(
+            events,
+            |event| Self::target(&state, self.area, event),
+            |device, event| self.queue(device, event),
+        )?;
+        if touched.is_empty() {
+            return Ok(());
+        }
+        let time = monotonic_us();
+        for device in touched {
+            device.device().frame(serial, time);
+        }
         self.context
             .flush()
             .map_err(|err| InputError::Backend(format!("no se pudo escribir en EI: {err}")))
     }
 
-    fn key(&self, code: u16, pressed: bool) -> Result<(), InputError> {
-        self.with_device(DeviceCapability::Keyboard, |device| {
-            if let Some(keyboard) = device.interface::<ei::Keyboard>() {
-                let state = if pressed {
-                    ei::keyboard::KeyState::Press
-                } else {
-                    ei::keyboard::KeyState::Released
-                };
-                keyboard.key(u32::from(code), state);
-            }
-        })
-    }
-
-    fn button(&self, button: MouseButton, pressed: bool) -> Result<(), InputError> {
-        let code = match button {
-            MouseButton::Left => codes::BTN_LEFT,
-            MouseButton::Right => codes::BTN_RIGHT,
-            MouseButton::Middle => codes::BTN_MIDDLE,
-            MouseButton::Back => codes::BTN_SIDE,
-            MouseButton::Forward => codes::BTN_EXTRA,
+    /// El dispositivo de EI al que va `event` (`None` si no va por EI: los mandos), sin
+    /// escribir nada. Falla si el compositor no ofrece uno activo con la capacidad que hace falta.
+    fn target<'s>(
+        state: &'s EiState,
+        area: PointerArea,
+        event: &InputEvent,
+    ) -> Result<Option<&'s reis::event::Device>, InputError> {
+        let capability = match *event {
+            InputEvent::Key { .. } => DeviceCapability::Keyboard,
+            InputEvent::MouseButton { .. } => DeviceCapability::Button,
+            InputEvent::MouseMove { .. } => DeviceCapability::Pointer,
+            InputEvent::MouseMoveAbsolute { .. } => match area {
+                PointerArea::Window { .. } => DeviceCapability::Pointer,
+                _ => DeviceCapability::PointerAbsolute,
+            },
+            InputEvent::Wheel { .. } => DeviceCapability::Scroll,
+            // Los mandos no van por EI.
+            InputEvent::GamepadConnected { .. }
+            | InputEvent::GamepadDisconnected { .. }
+            | InputEvent::GamepadButton { .. }
+            | InputEvent::GamepadAxis { .. }
+            | InputEvent::ReleaseAll => return Ok(None),
         };
-        self.with_device(DeviceCapability::Button, |device| {
-            if let Some(buttons) = device.interface::<ei::Button>() {
-                let state = if pressed {
-                    ei::button::ButtonState::Press
-                } else {
-                    ei::button::ButtonState::Released
+        state
+            .devices
+            .iter()
+            .find(|(device, resumed)| *resumed && device.has_capability(capability))
+            .map(|(device, _)| Some(device))
+            .ok_or_else(|| {
+                InputError::NotReady(format!(
+                    "el compositor no ofrece un dispositivo de EI con {capability:?} activo"
+                ))
+            })
+    }
+
+    /// Pone `event` en la cola de `device`, el que le dio [`EiInput::target`] (sin `frame`).
+    fn queue(&self, device: &reis::event::Device, event: &InputEvent) {
+        match *event {
+            InputEvent::Key { code, pressed } => {
+                if let Some(keyboard) = device.interface::<ei::Keyboard>() {
+                    let state = if pressed {
+                        ei::keyboard::KeyState::Press
+                    } else {
+                        ei::keyboard::KeyState::Released
+                    };
+                    keyboard.key(u32::from(code), state);
+                }
+            }
+            InputEvent::MouseButton { button, pressed } => {
+                let code = match button {
+                    MouseButton::Left => codes::BTN_LEFT,
+                    MouseButton::Right => codes::BTN_RIGHT,
+                    MouseButton::Middle => codes::BTN_MIDDLE,
+                    MouseButton::Back => codes::BTN_SIDE,
+                    MouseButton::Forward => codes::BTN_EXTRA,
                 };
-                buttons.button(u32::from(code), state);
+                if let Some(buttons) = device.interface::<ei::Button>() {
+                    let state = if pressed {
+                        ei::button::ButtonState::Press
+                    } else {
+                        ei::button::ButtonState::Released
+                    };
+                    buttons.button(u32::from(code), state);
+                }
             }
-        })
-    }
-
-    fn motion(&self, dx: i32, dy: i32) -> Result<(), InputError> {
-        self.with_device(DeviceCapability::Pointer, |device| {
-            if let Some(pointer) = device.interface::<ei::Pointer>() {
-                pointer.motion_relative(dx as f32, dy as f32);
+            InputEvent::MouseMove { dx, dy } => Self::motion(device, dx, dy),
+            InputEvent::MouseMoveAbsolute { x, y } => {
+                if let PointerArea::Window { width, height } = self.area {
+                    let last = lock(&self.last_absolute).replace((x, y));
+                    if let Some((dx, dy)) = window_delta(last, (x, y), (width, height)) {
+                        Self::motion(device, dx, dy);
+                    }
+                } else {
+                    self.absolute(device, x, y);
+                }
             }
-        })
-    }
-
-    fn absolute(&self, x: u16, y: u16) -> Result<(), InputError> {
-        if let PointerArea::Window { width, height } = self.area {
-            let last = lock(&self.last_absolute).replace((x, y));
-            let Some((dx, dy)) = window_delta(last, (x, y), (width, height)) else {
-                return Ok(());
-            };
-            return self.motion(dx, dy);
+            InputEvent::Wheel { dx, dy } => {
+                if let Some(scroll) = device.interface::<ei::Scroll>() {
+                    // En EI el positivo es hacia abajo; en el cable, hacia arriba.
+                    scroll.scroll_discrete(dx, dy.saturating_neg());
+                }
+            }
+            InputEvent::GamepadConnected { .. }
+            | InputEvent::GamepadDisconnected { .. }
+            | InputEvent::GamepadButton { .. }
+            | InputEvent::GamepadAxis { .. }
+            | InputEvent::ReleaseAll => {}
         }
+    }
+
+    fn motion(device: &reis::event::Device, dx: i32, dy: i32) {
+        if let Some(pointer) = device.interface::<ei::Pointer>() {
+            pointer.motion_relative(dx as f32, dy as f32);
+        }
+    }
+
+    /// Posición absoluta del invitado (`0..=65535` del fotograma) en la región del monitor
+    /// capturado del dispositivo absoluto `device`.
+    fn absolute(&self, device: &reis::event::Device, x: u16, y: u16) {
+        let Some(pointer) = device.interface::<ei::PointerAbsolute>() else {
+            return;
+        };
         let monitor = match self.area {
             PointerArea::Monitor { x, y } => Some((x, y)),
             _ => None,
         };
-        self.with_device(DeviceCapability::PointerAbsolute, |device| {
-            let Some(pointer) = device.interface::<ei::PointerAbsolute>() else {
-                return;
-            };
-            let regions = device.regions();
-            let (ox, oy, w, h) = monitor
-                .and_then(|(x, y)| {
-                    regions.iter().find(|region| {
-                        i64::from(region.x) == i64::from(x) && i64::from(region.y) == i64::from(y)
-                    })
+        let regions = device.regions();
+        let (ox, oy, w, h) = monitor
+            .and_then(|(x, y)| {
+                regions.iter().find(|region| {
+                    i64::from(region.x) == i64::from(x) && i64::from(region.y) == i64::from(y)
                 })
-                .or_else(|| regions.first())
-                .map(|region| (region.x, region.y, region.width, region.height))
-                .or_else(|| device.dimensions().map(|(w, h)| (0, 0, w, h)))
-                .unwrap_or((0, 0, 1920, 1080));
-            let scale = |value: u16, size: u32| {
-                f64::from(value) / f64::from(u16::MAX) * f64::from(size.saturating_sub(1))
-            };
-            pointer.motion_absolute(
-                (f64::from(ox) + scale(x, w)) as f32,
-                (f64::from(oy) + scale(y, h)) as f32,
-            );
-        })
-    }
-
-    fn wheel(&self, dx: i32, dy: i32) -> Result<(), InputError> {
-        self.with_device(DeviceCapability::Scroll, |device| {
-            if let Some(scroll) = device.interface::<ei::Scroll>() {
-                // En EI el positivo es hacia abajo; en el cable, hacia arriba.
-                scroll.scroll_discrete(dx, dy.saturating_neg());
-            }
-        })
+            })
+            .or_else(|| regions.first())
+            .map(|region| (region.x, region.y, region.width, region.height))
+            .or_else(|| device.dimensions().map(|(w, h)| (0, 0, w, h)))
+            .unwrap_or((0, 0, 1920, 1080));
+        let scale = |value: u16, size: u32| {
+            f64::from(value) / f64::from(u16::MAX) * f64::from(size.saturating_sub(1))
+        };
+        pointer.motion_absolute(
+            (f64::from(ox) + scale(x, w)) as f32,
+            (f64::from(oy) + scale(y, h)) as f32,
+        );
     }
 }
 
@@ -702,25 +769,19 @@ pub fn axis_value(axis: GamepadAxis, value: i16) -> (AbsoluteAxisCode, i32) {
 }
 
 impl VirtualPad {
-    fn emit(&mut self, event: &InputEvent) -> Result<(), InputError> {
-        let write = |device: &mut VirtualDevice, events: &[evdev::InputEvent]| {
-            device
-                .emit(events)
-                .map_err(|err| InputError::Backend(format!("uinput: {err}")))
-        };
+    /// Añade a `out` los eventos evdev de `event` (sin `SYN_REPORT`).
+    fn queue(&mut self, event: &InputEvent, out: &mut Vec<evdev::InputEvent>) {
         match *event {
             InputEvent::GamepadButton {
                 button, pressed, ..
             } => {
                 if let Some(code) = button_code(button) {
-                    return write(
-                        &mut self.device,
-                        &[evdev::InputEvent::new(
-                            EventType::KEY.0,
-                            code.0,
-                            i32::from(pressed),
-                        )],
-                    );
+                    out.push(evdev::InputEvent::new(
+                        EventType::KEY.0,
+                        code.0,
+                        i32::from(pressed),
+                    ));
+                    return;
                 }
                 let index = match button {
                     GamepadButton::DPadUp => 0,
@@ -730,31 +791,44 @@ impl VirtualPad {
                 };
                 self.dpad[index] = pressed;
                 let [up, down, left, right] = self.dpad.map(i32::from);
-                write(
-                    &mut self.device,
-                    &[
-                        evdev::InputEvent::new(
-                            EventType::ABSOLUTE.0,
-                            AbsoluteAxisCode::ABS_HAT0X.0,
-                            right - left,
-                        ),
-                        evdev::InputEvent::new(
-                            EventType::ABSOLUTE.0,
-                            AbsoluteAxisCode::ABS_HAT0Y.0,
-                            down - up,
-                        ),
-                    ],
-                )
+                out.push(evdev::InputEvent::new(
+                    EventType::ABSOLUTE.0,
+                    AbsoluteAxisCode::ABS_HAT0X.0,
+                    right - left,
+                ));
+                out.push(evdev::InputEvent::new(
+                    EventType::ABSOLUTE.0,
+                    AbsoluteAxisCode::ABS_HAT0Y.0,
+                    down - up,
+                ));
             }
             InputEvent::GamepadAxis { axis, value, .. } => {
                 let (code, value) = axis_value(axis, value);
-                write(
-                    &mut self.device,
-                    &[evdev::InputEvent::new(EventType::ABSOLUTE.0, code.0, value)],
-                )
+                out.push(evdev::InputEvent::new(EventType::ABSOLUTE.0, code.0, value));
             }
-            _ => Ok(()),
+            _ => {}
         }
+    }
+
+    /// Escribe `events` en una sola trama (`evdev` añade el `SYN_REPORT`) y la vacía.
+    fn flush(&mut self, events: &mut Vec<evdev::InputEvent>) -> Result<(), InputError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let result = self
+            .device
+            .emit(events)
+            .map_err(|err| InputError::Backend(format!("uinput: {err}")));
+        events.clear();
+        result
+    }
+
+    /// Un evento en su propia trama.
+    #[cfg(test)]
+    fn emit(&mut self, event: &InputEvent) -> Result<(), InputError> {
+        let mut events = Vec::with_capacity(2);
+        self.queue(event, &mut events);
+        self.flush(&mut events)
     }
 }
 
@@ -771,6 +845,10 @@ pub struct LinuxSink {
     xinput: BTreeSet<u8>,
     pressed: PressedKeys,
     pad_state: PadTracker,
+    /// Eventos de teclado y ratón que hay que escribir de un grupo (reutilizado).
+    kbm_scratch: Vec<InputEvent>,
+    /// Eventos evdev de un grupo para una ranura (reutilizado).
+    evdev_scratch: Vec<evdev::InputEvent>,
 }
 
 impl LinuxSink {
@@ -783,65 +861,159 @@ impl LinuxSink {
             xinput: BTreeSet::new(),
             pressed: PressedKeys::default(),
             pad_state: PadTracker::default(),
+            kbm_scratch: Vec::with_capacity(64),
+            evdev_scratch: Vec::with_capacity(32),
         }
     }
 
-    fn pad(&mut self, slot: u8) -> Result<&mut VirtualPad, InputError> {
-        self.pads.get_mut(&slot).ok_or(InputError::NoSuchSlot(slot))
+    /// Un grupo seguido de eventos de teclado y ratón de `guest`: los que cambian algo en el
+    /// sistema según [`PressedKeys`] salen en una trama de EI. Devuelve cuántos se aplicaron (todos
+    /// o ninguno).
+    fn kbm_batch(
+        &mut self,
+        run: &[InputEvent],
+        guest: GuestId,
+        errors: &mut Vec<InputError>,
+    ) -> usize {
+        self.kbm_scratch.clear();
+        for event in run {
+            let write = match *event {
+                InputEvent::Key { code, pressed } => self.pressed.key(guest, code, pressed),
+                InputEvent::MouseButton { button, pressed } => {
+                    self.pressed.button(guest, button, pressed)
+                }
+                _ => true,
+            };
+            if write {
+                self.kbm_scratch.push(*event);
+            }
+        }
+        if self.kbm_scratch.is_empty() {
+            // Otro invitado ya tenía pulsado lo mismo: nada que escribir.
+            return run.len();
+        }
+        let scratch = &self.kbm_scratch;
+        match self.ei.ready().and_then(|ei| ei.inject_many(scratch)) {
+            Ok(()) => run.len(),
+            Err(err) => {
+                // No llegó al sistema: se deshacen las anotaciones, en orden inverso (una tecla
+                // pulsada y soltada en el mismo grupo queda como estaba).
+                for event in self.kbm_scratch.iter().rev() {
+                    match *event {
+                        InputEvent::Key { code, pressed } => {
+                            self.pressed.key(guest, code, !pressed);
+                        }
+                        InputEvent::MouseButton { button, pressed } => {
+                            self.pressed.button(guest, button, !pressed);
+                        }
+                        _ => {}
+                    }
+                }
+                errors.push(err);
+                0
+            }
+        }
+    }
+
+    /// Un grupo seguido de eventos del mando de `slot`: una sola trama `SYN_REPORT`.
+    fn pad_batch(
+        &mut self,
+        slot: u8,
+        run: &[InputEvent],
+        guest: GuestId,
+        errors: &mut Vec<InputError>,
+    ) -> usize {
+        // Con el mando tal cual, lo convertido que quede en vuelo no tiene adónde ir.
+        if self.raw.contains_key(&slot) {
+            return run.len();
+        }
+        let Self {
+            pads,
+            pad_state,
+            evdev_scratch,
+            ..
+        } = self;
+        let Some(pad) = pads.get_mut(&slot) else {
+            errors.push(InputError::NoSuchSlot(slot));
+            return 0;
+        };
+        evdev_scratch.clear();
+        for event in run {
+            match event {
+                InputEvent::GamepadButton { .. } | InputEvent::GamepadAxis { .. } => {
+                    pad.queue(event, evdev_scratch);
+                }
+                InputEvent::GamepadDisconnected { .. } => {
+                    for neutral in pad_state.neutral_events(None, Some(slot)) {
+                        pad.queue(&neutral, evdev_scratch);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Err(err) = pad.flush(evdev_scratch) {
+            errors.push(err);
+            return 0;
+        }
+        for event in run {
+            if matches!(
+                event,
+                InputEvent::GamepadButton { .. } | InputEvent::GamepadAxis { .. }
+            ) {
+                pad_state.note(guest, event);
+            }
+        }
+        run.len()
     }
 }
 
 impl InputSink for LinuxSink {
     fn inject(&mut self, event: &InputEvent, guest: GuestId) -> Result<(), InputError> {
-        match *event {
-            InputEvent::Key { code, pressed } => {
-                if self.pressed.key(guest, code, pressed)
-                    && let Err(err) = self.ei.ready().and_then(|ei| ei.key(code, pressed))
-                {
-                    // No llegó al sistema: se deshace la anotación.
-                    self.pressed.key(guest, code, !pressed);
-                    return Err(err);
-                }
-                Ok(())
-            }
-            InputEvent::MouseButton { button, pressed } => {
-                if self.pressed.button(guest, button, pressed)
-                    && let Err(err) = self.ei.ready().and_then(|ei| ei.button(button, pressed))
-                {
-                    self.pressed.button(guest, button, !pressed);
-                    return Err(err);
-                }
-                Ok(())
-            }
-            InputEvent::MouseMove { dx, dy } => self.ei.ready()?.motion(dx, dy),
-            InputEvent::MouseMoveAbsolute { x, y } => self.ei.ready()?.absolute(x, y),
-            InputEvent::Wheel { dx, dy } => self.ei.ready()?.wheel(dx, dy),
-            // Con el mando tal cual, lo convertido que quede en vuelo no tiene adónde ir.
-            InputEvent::GamepadButton { slot, .. } | InputEvent::GamepadAxis { slot, .. }
-                if self.raw.contains_key(&slot) =>
-            {
-                Ok(())
-            }
-            InputEvent::GamepadButton { slot, .. } | InputEvent::GamepadAxis { slot, .. } => {
-                self.pad(slot)?.emit(event)?;
-                self.pad_state.note(guest, event);
-                Ok(())
-            }
-            InputEvent::GamepadConnected { slot, .. }
-            | InputEvent::GamepadDisconnected { slot }
-                if self.raw.contains_key(&slot) =>
-            {
-                Ok(())
-            }
-            InputEvent::GamepadConnected { slot, .. } => self.pad(slot).map(|_| ()),
-            InputEvent::GamepadDisconnected { slot } => {
-                for neutral in self.pad_state.neutral_events(None, Some(slot)) {
-                    self.pad(slot)?.emit(&neutral)?;
-                }
-                Ok(())
-            }
-            InputEvent::ReleaseAll => self.release_all(guest),
+        let mut errors = Vec::new();
+        if self.inject_batch(std::slice::from_ref(event), guest, &mut errors) == 1 {
+            Ok(())
+        } else {
+            Err(errors
+                .pop()
+                .unwrap_or_else(|| InputError::Backend("evento no aplicado".to_owned())))
         }
+    }
+
+    /// Grupos seguidos de la misma clase (teclado y ratón, o un mando) salen en una trama cada
+    /// uno, en el orden del paquete.
+    fn inject_batch(
+        &mut self,
+        events: &[InputEvent],
+        guest: GuestId,
+        errors: &mut Vec<InputError>,
+    ) -> usize {
+        let mut applied = 0;
+        let mut start = 0;
+        while start < events.len() {
+            let class = events[start].class();
+            let end = start
+                + events[start..]
+                    .iter()
+                    .take_while(|event| event.class() == class)
+                    .count();
+            let run = &events[start..end];
+            applied += match class {
+                EventClass::KeyboardMouse => self.kbm_batch(run, guest, errors),
+                EventClass::Gamepad(slot) => self.pad_batch(slot, run, guest, errors),
+                EventClass::Control => run
+                    .iter()
+                    .filter(|_| match self.release_all(guest) {
+                        Ok(()) => true,
+                        Err(err) => {
+                            errors.push(err);
+                            false
+                        }
+                    })
+                    .count(),
+            };
+            start = end;
+        }
+        applied
     }
 
     fn release_all(&mut self, guest: GuestId) -> Result<(), InputError> {
@@ -850,21 +1022,48 @@ impl InputSink for LinuxSink {
         if (!keys.is_empty() || !buttons.is_empty())
             && let EiBackend::Ready(ei) = &self.ei
         {
-            for code in keys {
-                result = result.and(ei.key(code, false));
-            }
-            for button in buttons {
-                result = result.and(ei.button(button, false));
-            }
+            // Todo lo del invitado en una trama.
+            self.kbm_scratch.clear();
+            self.kbm_scratch
+                .extend(keys.into_iter().map(|code| InputEvent::Key {
+                    code,
+                    pressed: false,
+                }));
+            self.kbm_scratch
+                .extend(buttons.into_iter().map(|button| InputEvent::MouseButton {
+                    button,
+                    pressed: false,
+                }));
+            result = ei.inject_many(&self.kbm_scratch);
         }
-        for neutral in self.pad_state.neutral_events(Some(guest), None) {
-            if let InputEvent::GamepadButton { slot, .. } | InputEvent::GamepadAxis { slot, .. } =
-                neutral
-                && let Some(pad) = self.pads.get_mut(&slot)
-            {
-                result = result.and(pad.emit(&neutral));
+        // Y cada mando suyo al reposo en una trama por ranura.
+        let neutral = self.pad_state.neutral_events(Some(guest), None);
+        let slot_of = |event: &InputEvent| match *event {
+            InputEvent::GamepadButton { slot, .. } | InputEvent::GamepadAxis { slot, .. } => {
+                Some(slot)
             }
+            _ => None,
+        };
+        let mut index = 0;
+        while index < neutral.len() {
+            let Some(slot) = slot_of(&neutral[index]) else {
+                index += 1;
+                continue;
+            };
+            let end = index
+                + neutral[index..]
+                    .iter()
+                    .take_while(|event| slot_of(event) == Some(slot))
+                    .count();
+            if let Some(pad) = self.pads.get_mut(&slot) {
+                for event in &neutral[index..end] {
+                    pad.queue(event, &mut self.evdev_scratch);
+                }
+                result = result.and(pad.flush(&mut self.evdev_scratch));
+            }
+            index = end;
         }
+        self.evdev_scratch.clear();
         result
     }
 
@@ -1000,6 +1199,55 @@ mod tests {
             window_delta(Some((u16::MAX, u16::MAX)), (0, 0), (800, 600)),
             Some((-800, -600))
         );
+    }
+
+    /// Si el destino del segundo evento falla, el primero tampoco se escribe: el grupo sale entero
+    /// o no sale (quien llama deshace sus anotaciones de todo el grupo).
+    #[test]
+    fn a_batch_with_a_missing_device_writes_nothing() {
+        let events = [
+            InputEvent::Key {
+                code: codes::KEY_A,
+                pressed: true,
+            },
+            InputEvent::MouseMove { dx: 1, dy: 0 },
+            InputEvent::Key {
+                code: codes::KEY_A,
+                pressed: false,
+            },
+        ];
+        let mut written = Vec::new();
+        let failing = all_or_nothing(
+            &events,
+            |event| match event {
+                InputEvent::Key { .. } => Ok(Some("teclado")),
+                _ => Err(InputError::NotReady("sin puntero".into())),
+            },
+            |device, event| written.push((device, *event)),
+        );
+        assert_eq!(failing, Err(InputError::NotReady("sin puntero".into())));
+        assert!(written.is_empty(), "nada se escribió a medias: {written:?}");
+
+        let touched = all_or_nothing(
+            &events,
+            |event| match event {
+                InputEvent::Key { .. } => Ok(Some("teclado")),
+                InputEvent::MouseMove { .. } => Ok(Some("puntero")),
+                _ => Ok(None),
+            },
+            |device, event| written.push((device, *event)),
+        );
+        assert_eq!(touched, Ok(vec!["teclado", "puntero"]), "sin repetir");
+        assert_eq!(written.len(), 3);
+        assert_eq!(written[2], ("teclado", events[2]));
+
+        // Lo que no va por EI (mandos) no cuenta como destino ni se escribe.
+        let touched = all_or_nothing(
+            &[InputEvent::ReleaseAll],
+            |_| Ok(None::<&str>),
+            |_, _| unreachable!(),
+        );
+        assert_eq!(touched, Ok(Vec::new()));
     }
 
     #[test]

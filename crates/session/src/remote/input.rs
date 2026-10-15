@@ -17,10 +17,23 @@
 //! ([`InputState::diff`]): nada se queda pulsado ni sin pulsar. Lo más antiguo que lo último
 //! aplicado se descarta.
 //!
+//! Los eventos permitidos de un paquete van al sumidero **agrupados** por clase (teclado y ratón,
+//! o un mando) y en orden ([`InputSink::inject_batch`]): el sumidero los escribe en una sola trama
+//! (uinput, EI) o llamada (`SendInput`), así que un stick con `X` e `Y` cambiados llega al juego
+//! como una muestra.
+//!
+//! **Vigilancia**: el invitado repite su estado cada `KEEPALIVE_PRESSED` mientras tiene algo
+//! pulsado; si de un invitado no llega nada en [`STALE_AFTER`] y su vista tiene algo pulsado (se
+//! perdieron una liberación, sus repeticiones y los *keepalives*, o el enlace murió), se suelta lo
+//! suyo sin esperar al tiempo de inactividad de QUIC, y el siguiente paquete que llegue se
+//! reconcilia con la vista aunque traiga la secuencia seguida.
+//!
 //! **Latencia por etapas**: con `queued_us` del paquete (captura → envío en el invitado),
 //! `recibido − enviado` en el reloj del `MediaSender` de ese invitado (el que contesta a sus
 //! `Ping`) y el tiempo de inyección medido aquí, cada invitado tiene su captura → inyectado
-//! desglosado en su `GuestStatus`, en el resumen y en el `InputReport` que se le devuelve.
+//! desglosado en su `GuestStatus`, en el resumen y en el `InputReport` que se le devuelve. Se
+//! publican cada [`PUBLISH_PERIOD`] (lo que tarda `rate_loop` en leerlas), no con cada paquete:
+//! ordenar las muestras no entra en la etapa de inyección.
 //!
 //! **Invitado** ([`GuestInput`]): con la conexión abierta y su secreto pareja a pareja, abre el
 //! stream de entrada (preámbulo con su `key_id`), crea el [`InputSender`] y lo deja listo para la
@@ -45,7 +58,7 @@ use coroom_transport::crypto::input::{Channel, InputCipher, Role};
 use coroom_transport::media::{MediaReceiver, MediaSender};
 use coroom_transport::proto::hid;
 use coroom_transport::proto::input::{
-    GamepadDevice, GamepadTransport, InputMessage, InputPacket, InputState, PadData,
+    GamepadDevice, GamepadTransport, InputMessage, InputPacket, InputState, PadData, STALE_AFTER,
     STREAM_PREAMBLE_LEN, StreamFrames, parse_datagram, parse_stream_preamble, seq_after,
     stream_preamble,
 };
@@ -65,6 +78,15 @@ const LATENCY_WINDOW: usize = 2048;
 
 /// Un desfase de reloj negativo mayor que esto descarta la muestra (reloj aún sin converger).
 const MAX_NEGATIVE_US: i64 = 2_000;
+
+/// Cada cuánto publica el hilo `inject` la latencia y los contadores de cada invitado en su
+/// `GuestStatus`: lo mismo que tarda `rate_loop` en leerlos (`RATE_PERIOD`). Lo demás (ranura,
+/// permisos, modo del mando) se publica al momento.
+const PUBLISH_PERIOD: Duration = Duration::from_millis(100);
+
+/// Con un mando tal cual, cada cuánto se recogen del sumidero sus informes de salida (vibración,
+/// luces) para el invitado.
+const OUTPUTS_PERIOD: Duration = Duration::from_millis(5);
 
 /// Socket de EI de la captura (`coroom_capture::RemoteDesktopShare`) como proveedor de la inyección:
 /// la captura abre la sesión `RemoteDesktop` después de la suya y dice qué se transmite.
@@ -434,9 +456,12 @@ impl Samples {
     }
 
     fn p50(&self) -> u64 {
-        let mut sorted: Vec<u64> = self.0.iter().copied().collect();
-        sorted.sort_unstable();
-        sorted.get(sorted.len() / 2).copied().unwrap_or(0)
+        if self.0.is_empty() {
+            return 0;
+        }
+        let mut values: Vec<u64> = self.0.iter().copied().collect();
+        let middle = values.len() / 2;
+        *values.select_nth_unstable(middle).1
     }
 }
 
@@ -458,7 +483,14 @@ struct GuestState {
     queue: Samples,
     network: Samples,
     inject: Samples,
+    /// Cambió algo que se publica al momento (permisos, ranura, modo del mando).
     dirty: bool,
+    /// Hay muestras o contadores nuevos desde la última publicación periódica.
+    stats_changed: bool,
+    /// Cuándo llegó su último paquete autenticado (para [`STALE_AFTER`]).
+    last_packet: Option<Instant>,
+    /// Se soltó lo suyo por silencio: el siguiente paquete se reconcilia con la vista.
+    stale: bool,
 }
 
 /// El hilo `inject`: único dueño del sumidero.
@@ -469,10 +501,16 @@ struct Worker {
     paused: bool,
     warned: Vec<String>,
     totals: (u64, u64),
+    /// Última publicación periódica y última recogida de salidas de mandos.
+    last_publish: Instant,
+    last_outputs: Instant,
+    /// Grupo de eventos de la misma clase en curso (reutilizado entre paquetes).
+    run: Vec<InputEvent>,
 }
 
 impl Worker {
     fn new(core: Arc<Core>, sink: Box<dyn InputSink>) -> Self {
+        let now = Instant::now();
         Self {
             core,
             sink,
@@ -480,6 +518,9 @@ impl Worker {
             paused: false,
             warned: Vec::new(),
             totals: (0, 0),
+            last_publish: now,
+            last_outputs: now,
+            run: Vec::with_capacity(64),
         }
     }
 
@@ -495,15 +536,20 @@ impl Worker {
     fn run(mut self, rx: &Receiver<Job>) {
         debug!(backend = self.sink.describe(), "hilo inject");
         loop {
+            let now = Instant::now();
+            // Trabajo periódico del sumidero (repetición de teclas en Windows): se hace y acota la
+            // espera.
+            let tick = self.sink.tick(now);
             // Con un mando tal cual, su vibración sale enseguida aunque no llegue nada.
-            let wait = if self.any_raw() {
-                Duration::from_millis(5)
+            let mut wait = if self.any_raw() {
+                OUTPUTS_PERIOD
             } else {
-                Duration::from_millis(100)
+                PUBLISH_PERIOD
             };
-            let received = rx.recv_timeout(wait);
-            self.forward_outputs();
-            match received {
+            if let Some(tick) = tick {
+                wait = wait.min(tick.saturating_duration_since(now));
+            }
+            match rx.recv_timeout(wait) {
                 Ok(job) => {
                     self.handle(job);
                     for _ in 0..256 {
@@ -512,7 +558,6 @@ impl Worker {
                             Err(_) => break,
                         }
                     }
-                    self.publish();
                     // Con entrada continua nunca vence la espera: se mira aquí también.
                     if self.core.shared.stopping() {
                         break;
@@ -525,13 +570,63 @@ impl Worker {
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
+            self.housekeeping(Instant::now());
         }
         // Al terminar no puede quedar nada pulsado ni ningún mando creado.
         let guests: Vec<GuestId> = self.guests.keys().copied().collect();
         for guest in guests {
             self.gone(guest);
         }
-        self.publish();
+        self.publish(true);
+    }
+
+    /// Lo que no es un trabajo: la vigilancia de invitados callados, las salidas de los mandos
+    /// tal cual (cada [`OUTPUTS_PERIOD`]) y la publicación de estadísticas (cada
+    /// [`PUBLISH_PERIOD`]).
+    fn housekeeping(&mut self, now: Instant) {
+        self.expire_stale(now);
+        if self.any_raw() && now.saturating_duration_since(self.last_outputs) >= OUTPUTS_PERIOD {
+            self.last_outputs = now;
+            self.forward_outputs();
+        }
+        let periodic = now.saturating_duration_since(self.last_publish) >= PUBLISH_PERIOD;
+        if periodic {
+            self.last_publish = now;
+        }
+        self.publish(periodic);
+    }
+
+    /// Suelta lo de los invitados de los que no llega nada desde hace [`STALE_AFTER`] y que,
+    /// según la vista, tienen algo pulsado. Su siguiente paquete se reconcilia con la vista.
+    fn expire_stale(&mut self, now: Instant) {
+        if self.paused {
+            return;
+        }
+        let mut errors = Vec::new();
+        for (guest, state) in &mut self.guests {
+            let Some(last) = state.last_packet else {
+                continue;
+            };
+            if state.stale
+                || !state.view.any_pressed()
+                || now.saturating_duration_since(last) < STALE_AFTER
+            {
+                continue;
+            }
+            debug!(
+                guest = guest.0,
+                "sin entrada del invitado en {STALE_AFTER:?}: se suelta lo suyo"
+            );
+            state.stale = true;
+            state.view.release_all();
+            state.stats_changed = true;
+            if let Err(err) = self.sink.release_all(*guest) {
+                errors.push(err);
+            }
+        }
+        for err in errors {
+            self.warn(&err);
+        }
     }
 
     fn handle(&mut self, job: Job) {
@@ -590,16 +685,21 @@ impl Worker {
     ) -> bool {
         let paused = self.paused;
         let entry = self.guests.entry(guest).or_default();
-        entry.dirty = true;
+        entry.stats_changed = true;
+        entry.last_packet = Some(received);
         // Lo más antiguo que lo último aplicado (o repetido) ya no sirve.
         if entry.last_seq.is_some_and(|last| !seq_after(seq, last)) {
             entry.dropped += events.len() as u64;
             self.totals.1 += events.len() as u64;
             return false;
         }
-        let gap = entry
-            .last_seq
-            .is_some_and(|last| last.wrapping_add(1) != seq);
+        // Tras soltar lo suyo por silencio, la vista ya no es la del invitado: se reconcilia
+        // aunque la secuencia venga seguida.
+        let gap = entry.stale
+            || entry
+                .last_seq
+                .is_some_and(|last| last.wrapping_add(1) != seq);
+        entry.stale = false;
         entry.last_seq = Some(seq);
         if paused {
             entry.dropped += events.len() as u64;
@@ -620,8 +720,14 @@ impl Worker {
         let permissions = entry.permissions;
         let mut errors = Vec::new();
         let (mut applied, mut dropped) = (0u64, 0u64);
+        // Los permitidos van al sumidero agrupados por clase y en orden; `ReleaseAll` y la
+        // desconexión de un mando cierran el grupo en curso antes de aplicarse.
+        let mut run = std::mem::take(&mut self.run);
+        run.clear();
+        let mut run_class: Option<EventClass> = None;
         for event in &events {
-            let allowed = match event.class() {
+            let class = event.class();
+            let allowed = match class {
                 EventClass::KeyboardMouse => permissions.keyboard_mouse,
                 EventClass::Gamepad(slot) => permissions.gamepad_slot == Some(slot),
                 EventClass::Control => true,
@@ -630,21 +736,32 @@ impl Worker {
                 dropped += 1;
                 continue;
             }
-            if let InputEvent::GamepadDisconnected { slot } = event {
-                self.forget_pad(guest, *slot);
-            }
-            let result = match event {
-                InputEvent::ReleaseAll => self.sink.release_all(guest),
-                _ => self.sink.inject(event, guest),
-            };
-            match result {
-                Ok(()) => applied += 1,
-                Err(err) => {
-                    dropped += 1;
-                    errors.push(err);
+            match event {
+                InputEvent::ReleaseAll => {
+                    self.flush_run(guest, &mut run, &mut errors, &mut applied, &mut dropped);
+                    match self.sink.release_all(guest) {
+                        Ok(()) => applied += 1,
+                        Err(err) => {
+                            dropped += 1;
+                            errors.push(err);
+                        }
+                    }
+                    continue;
                 }
+                InputEvent::GamepadDisconnected { slot } => {
+                    self.flush_run(guest, &mut run, &mut errors, &mut applied, &mut dropped);
+                    self.forget_pad(guest, *slot);
+                }
+                _ => {}
             }
+            if run_class != Some(class) {
+                self.flush_run(guest, &mut run, &mut errors, &mut applied, &mut dropped);
+                run_class = Some(class);
+            }
+            run.push(*event);
         }
+        self.flush_run(guest, &mut run, &mut errors, &mut applied, &mut dropped);
+        self.run = run;
         let injected = Instant::now();
         if let Some(entry) = self.guests.get_mut(&guest) {
             entry.view = state;
@@ -673,6 +790,24 @@ impl Worker {
             self.warn(&err);
         }
         true
+    }
+
+    /// Manda al sumidero el grupo en curso (si hay) y lo vacía, contando lo aplicado.
+    fn flush_run(
+        &mut self,
+        guest: GuestId,
+        run: &mut Vec<InputEvent>,
+        errors: &mut Vec<InputError>,
+        applied: &mut u64,
+        dropped: &mut u64,
+    ) {
+        if run.is_empty() {
+            return;
+        }
+        let done = self.sink.inject_batch(run, guest, errors);
+        *applied += done as u64;
+        *dropped += (run.len() - done) as u64;
+        run.clear();
     }
 
     fn permissions(&mut self, guest: GuestId, permissions: Permissions) {
@@ -874,39 +1009,44 @@ impl Worker {
         }
     }
 
-    /// Pasa los contadores y la latencia de los invitados que cambiaron a su `GuestStatus`.
-    fn publish(&mut self) {
-        let dirty: Vec<(GuestId, InputLatency, Option<GuestPad>)> = self
-            .guests
-            .iter_mut()
-            .filter(|(_, state)| state.dirty)
-            .map(|(guest, state)| {
-                state.dirty = false;
-                (
-                    *guest,
-                    InputLatency::from_samples(
-                        state.latencies.0.iter().copied().collect(),
-                        state.applied,
-                        state.dropped,
-                    )
-                    .with_stages(
-                        state.queue.p50(),
-                        state.network.p50(),
-                        state.inject.p50(),
-                        state.repaired,
-                    ),
-                    state.pad.as_ref().map(PadState::status),
+    /// Pasa a los `GuestStatus` lo de los invitados que cambiaron algo inmediato (ranura,
+    /// permisos, modo del mando) y, si `periodic`, también la latencia y los contadores de los que
+    /// tienen muestras nuevas (ordenar [`LATENCY_WINDOW`] muestras por etapa no se hace por
+    /// paquete).
+    fn publish(&mut self, periodic: bool) {
+        let mut updates: Vec<(GuestId, InputLatency, Option<GuestPad>)> = Vec::new();
+        for (guest, state) in &mut self.guests {
+            if !(state.dirty || (periodic && state.stats_changed)) {
+                continue;
+            }
+            state.dirty = false;
+            state.stats_changed = false;
+            updates.push((
+                *guest,
+                InputLatency::from_samples(
+                    state.latencies.0.iter().copied().collect(),
+                    state.applied,
+                    state.dropped,
                 )
-            })
-            .collect();
-        self.core
-            .ledger
-            .set_input_counts(self.totals.0, self.totals.1);
-        if dirty.is_empty() {
+                .with_stages(
+                    state.queue.p50(),
+                    state.network.p50(),
+                    state.inject.p50(),
+                    state.repaired,
+                ),
+                state.pad.as_ref().map(PadState::status),
+            ));
+        }
+        if periodic {
+            self.core
+                .ledger
+                .set_input_counts(self.totals.0, self.totals.1);
+        }
+        if updates.is_empty() {
             return;
         }
         let mut guests = lock(&self.core.guests);
-        for (guest, latency, pad) in dirty {
+        for (guest, latency, pad) in updates {
             if let Some(status) = guests.get_mut(&guest) {
                 status.input = latency;
                 status.gamepad = pad;
@@ -1035,6 +1175,12 @@ impl PadLink for GuestInput {
         GuestInput::send(self, event);
     }
 
+    fn event_at(&self, event: InputEvent, at: Instant) {
+        if let Some(sender) = lock(&self.inner.sender).as_ref() {
+            sender.send_at(event, at);
+        }
+    }
+
     fn pad(&self, data: PadData) {
         self.send_pad(data);
     }
@@ -1143,7 +1289,7 @@ pub(crate) async fn open_guest_input(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coroom_input::inject::RecordingSink;
+    use coroom_input::inject::{Recorded, RecordingSink};
     use coroom_transport::crypto::Identity;
     use coroom_transport::proto::input::MouseButton;
 
@@ -1281,5 +1427,146 @@ mod tests {
         assert_eq!(state.latencies.0.len(), 2);
         assert_eq!(state.queue.p50(), 120);
         assert_eq!(state.network.p50(), 3_000);
+        // La tecla de seq 0 en su grupo y los cuatro eventos de la reconciliación (todos de
+        // teclado y ratón) juntos en uno.
+        assert_eq!(sink.batch_sizes(), vec![1, 4]);
+    }
+
+    /// Los eventos permitidos de un paquete van al sumidero por grupos de la misma clase, en
+    /// orden; `ReleaseAll` cierra el grupo y va aparte; lo no permitido no rompe un grupo.
+    #[test]
+    fn a_packets_events_are_grouped_per_class() {
+        let sink = RecordingSink::new();
+        let mut worker = worker(&sink);
+        let guest = GuestId(1);
+        worker.handle(Job::Permissions {
+            guest,
+            permissions: Permissions {
+                keyboard_mouse: true,
+                gamepad_slot: Some(2),
+                ..Permissions::VIEW_ONLY
+            },
+        });
+        let axis = |axis, value| InputEvent::GamepadAxis {
+            slot: 2,
+            axis,
+            value,
+        };
+        let events = vec![
+            key(30, true),
+            InputEvent::MouseMove { dx: 1, dy: 0 },
+            axis(coroom_input::GamepadAxis::LeftX, 1000),
+            // Otra ranura: no permitido, se descarta sin cerrar el grupo del mando.
+            InputEvent::GamepadAxis {
+                slot: 3,
+                axis: coroom_input::GamepadAxis::LeftX,
+                value: 5,
+            },
+            axis(coroom_input::GamepadAxis::LeftY, -1000),
+            InputEvent::ReleaseAll,
+            key(30, false),
+        ];
+        packet(&mut worker, guest, 0, &InputState::default(), events);
+        // [tecla, ratón] [X, Y] ReleaseAll [tecla].
+        assert_eq!(sink.batch_sizes(), vec![2, 2, 1]);
+        let log = sink.log();
+        assert_eq!(log[0], Recorded::GamepadAssigned { slot: 2 });
+        assert_eq!(log[5], Recorded::ReleaseAll { guest });
+        assert_eq!(
+            log[6],
+            Recorded::Event {
+                guest,
+                event: key(30, false)
+            }
+        );
+        let state = &worker.guests[&guest];
+        assert_eq!(state.applied, 6);
+        assert_eq!(state.dropped, 1);
+    }
+
+    /// Un invitado del que no llega nada en [`STALE_AFTER`] con algo pulsado: se suelta lo suyo y
+    /// su siguiente paquete, aunque siga la secuencia, se reconcilia con la vista (vuelve a
+    /// pulsar lo que de verdad mantiene).
+    #[test]
+    fn a_silent_guest_is_released_and_then_reconciled() {
+        let sink = RecordingSink::new();
+        let mut worker = worker(&sink);
+        let guest = GuestId(1);
+        worker.handle(Job::Permissions {
+            guest,
+            permissions: Permissions {
+                keyboard_mouse: true,
+                ..Permissions::VIEW_ONLY
+            },
+        });
+        let s0 = packet(
+            &mut worker,
+            guest,
+            0,
+            &InputState::default(),
+            vec![key(30, true)],
+        );
+        let received = Instant::now();
+        // Todavía no: ni a mitad de plazo ni sin nada pulsado.
+        worker.expire_stale(received + STALE_AFTER / 2);
+        assert_eq!(sink.len(), 1);
+        worker.expire_stale(received + STALE_AFTER + Duration::from_millis(1));
+        assert_eq!(sink.log().last(), Some(&Recorded::ReleaseAll { guest }));
+        let state = &worker.guests[&guest];
+        assert!(state.stale && !state.view.any_pressed());
+        // Una sola vez.
+        worker.expire_stale(received + STALE_AFTER * 2);
+        assert_eq!(sink.len(), 2);
+
+        // Llega el keepalive (seq 1, sin eventos, la tecla sigue pulsada): se reconcilia.
+        packet(&mut worker, guest, 1, &s0, Vec::new());
+        assert_eq!(sink.events_of(guest), vec![key(30, true), key(30, true)]);
+        let state = &worker.guests[&guest];
+        assert!(!state.stale && state.view.key_pressed(30));
+        assert_eq!(state.repaired, 1);
+
+        // Sin nada pulsado, el silencio no hace nada.
+        let view = state.view.clone();
+        let s2 = packet(&mut worker, guest, 2, &view, vec![key(30, false)]);
+        assert!(!s2.any_pressed());
+        worker.expire_stale(Instant::now() + STALE_AFTER * 3);
+        assert_eq!(sink.len(), 4);
+        assert!(!worker.guests[&guest].stale);
+    }
+
+    /// Las estadísticas se publican con cadencia y lo inmediato (permisos, mando) al momento.
+    #[test]
+    fn stats_are_published_on_a_cadence() {
+        let sink = RecordingSink::new();
+        let mut worker = worker(&sink);
+        let guest = GuestId(1);
+        worker.handle(Job::Permissions {
+            guest,
+            permissions: Permissions {
+                keyboard_mouse: true,
+                ..Permissions::VIEW_ONLY
+            },
+        });
+        assert!(worker.guests[&guest].dirty);
+        worker.publish(false);
+        assert!(
+            !worker.guests[&guest].dirty,
+            "lo inmediato sale sin esperar"
+        );
+        packet(
+            &mut worker,
+            guest,
+            0,
+            &InputState::default(),
+            vec![key(30, true)],
+        );
+        assert!(worker.guests[&guest].stats_changed);
+        worker.publish(false);
+        assert!(
+            worker.guests[&guest].stats_changed,
+            "las muestras esperan a la publicación periódica"
+        );
+        worker.publish(true);
+        assert!(!worker.guests[&guest].stats_changed);
     }
 }
