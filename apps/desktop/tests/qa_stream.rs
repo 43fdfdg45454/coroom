@@ -5,7 +5,10 @@
 //! - `qa_live_changes`: con un invitado viendo, cambios de fuente (resolución y fps), de códec y
 //!   de bitrate en caliente, también en ráfaga;
 //! - `qa_odd_cases`: entrar y salir varias veces, dos invitados con decodificadores distintos,
-//!   expulsar, reconectar, cerrar la sala con el invitado dentro y pérdida de paquetes.
+//!   expulsar, reconectar, cerrar la sala con el invitado dentro y pérdida de paquetes;
+//! - `qa_more`: tamaño impar al abrir, un invitado que solo decodifica H.264 junto a otro con
+//!   todo (el anfitrión baja a H.264 con el codificador calibrado) y 4:4:4;
+//! - `qa_server_dies`: el servidor se cae con la sesión en marcha (imprime lo que pasa).
 //!
 //! Necesitan GPU y tardan minutos: `#[ignore]`. Se lanzan con
 //! `cargo test --release -p coroom --test qa_stream -- --ignored --nocapture --test-threads=1`.
@@ -599,4 +602,180 @@ fn qa_odd_cases() {
         "casos con fallo:\n{}",
         failures.join("\n")
     );
+}
+
+/// Segunda ronda: tamaño impar al abrir, invitados con decodificadores incompatibles y 4:4:4.
+#[test]
+#[ignore = "necesita GPU; QA manual"]
+fn qa_more() {
+    let _serial = serial();
+    let step = Duration::from_secs(20);
+    let mut failures: Vec<String> = Vec::new();
+    let server = TestServer::start();
+
+    // 1. Tamaño impar al abrir la sala: se recorta a par.
+    match try_host(server.config(), 1001, 701, 50) {
+        Ok(mut odd) => {
+            let code = room_code(&odd).expect("sala impar");
+            let seen = Seen::default();
+            let mut viewer = guest(server.config(), &code, None, DecoderSet::probe(), &seen);
+            check(
+                &mut failures,
+                "abrir a 1001×701 (sale 1000×700)",
+                advance(&odd, &viewer, &seen, 50, Some((1000, 700)), step),
+            );
+            viewer.close();
+            odd.close();
+        }
+        Err(err) => {
+            println!("abrir a 1001×701: FALLO {err}");
+            failures.push(err);
+        }
+    }
+
+    // 2. Un invitado que solo decodifica H.264 (OpenH264) y otro con todo: el anfitrión tiene que
+    // bajar a un códec común para los dos, y volver a subir cuando se va el limitado.
+    let mut host2 = host(server.config(), 1920, 1080, 60, EncoderSet::probe());
+    let code = room_code(&host2).expect("sala");
+    let (seen_all, seen_h264) = (Seen::default(), Seen::default());
+    let mut all = guest(server.config(), &code, None, DecoderSet::probe(), &seen_all);
+    check(
+        &mut failures,
+        "invitado con todo",
+        advance(&host2, &all, &seen_all, 60, None, step),
+    );
+    println!("  vídeo con un invitado: {:?}", host2.summary().video);
+    let mut h264 = guest(
+        server.config(),
+        &code,
+        None,
+        DecoderSet::openh264(),
+        &seen_h264,
+    );
+    check(
+        &mut failures,
+        "entra uno que solo decodifica H.264",
+        advance(&host2, &h264, &seen_h264, 60, None, step),
+    );
+    check(
+        &mut failures,
+        "el de todo sigue",
+        advance(&host2, &all, &seen_all, 60, None, step),
+    );
+    println!(
+        "  vídeo con los dos: anfitrión {:?} · todo {:?} · solo H.264 {:?}",
+        host2.summary().video,
+        all.summary().video,
+        h264.summary().video
+    );
+    h264.close();
+    std::thread::sleep(Duration::from_secs(3));
+    check(
+        &mut failures,
+        "se va el de H.264",
+        advance(&host2, &all, &seen_all, 120, None, step),
+    );
+    println!(
+        "  vídeo tras irse: {:?} / invitado {:?}",
+        host2.summary().video,
+        all.summary().video
+    );
+    all.close();
+    host2.close();
+
+    // 3. 4:4:4 si el codificador y el invitado lo admiten (si no, 4:2:0 sin fallar).
+    let host_account = server.config();
+    let mut host3 = RemoteSession::host(
+        host_account.identity,
+        host_account.config,
+        Box::new(SyntheticCapturer::new(1920, 1080, 60)),
+        EncoderSet::probe(),
+        LoopbackConfig {
+            yuv444: true,
+            ..config(1920, 1080, 60, 20_000)
+        },
+        Arc::new(LatencyLedger::new()),
+    );
+    host3.start().expect("anfitrión 4:4:4");
+    let code = room_code(&host3).expect("sala 4:4:4");
+    let seen = Seen::default();
+    let viewer_account = server.config();
+    let mut viewer = RemoteSession::guest(
+        viewer_account.identity,
+        viewer_account.config,
+        &code,
+        DecoderSet::probe(),
+        Box::new(SeenSink(seen.clone())),
+        None,
+        Arc::new(LatencyLedger::new()),
+    );
+    viewer.start().expect("invitado 4:4:4");
+    check(
+        &mut failures,
+        "4:4:4",
+        advance(&host3, &viewer, &seen, 120, None, step),
+    );
+    println!(
+        "  4:4:4: anfitrión {:?} · invitado {}",
+        host3.summary().video,
+        line(&viewer.summary())
+    );
+    viewer.close();
+    host3.close();
+    drop(server);
+
+    assert!(
+        failures.is_empty(),
+        "casos con fallo:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// El servidor se cae con la sesión en marcha: imprime los estados y los eventos del invitado.
+#[test]
+#[ignore = "necesita GPU; QA manual"]
+fn qa_server_dies() {
+    let _serial = serial();
+    let doomed = TestServer::start();
+    let mut host = host(doomed.config(), 1280, 720, 60, EncoderSet::probe());
+    let code = room_code(&host).expect("sala");
+    let seen = Seen::default();
+    let mut viewer = guest(doomed.config(), &code, None, DecoderSet::probe(), &seen);
+    advance(&host, &viewer, &seen, 60, None, Duration::from_secs(20)).expect("vídeo");
+    let events = viewer.events();
+    drop(doomed);
+    let dropped = Instant::now();
+    println!("QA servidor detenido");
+    let mut last = (host.state(), viewer.state());
+    while dropped.elapsed() < Duration::from_secs(120) {
+        while let Ok(event) = events.try_recv() {
+            println!("QA {:?} evento del invitado: {event}", dropped.elapsed());
+        }
+        let now = (host.state(), viewer.state());
+        if now != last {
+            println!(
+                "QA {:?}: anfitrión {:?} · invitado {:?} · fotogramas {}",
+                dropped.elapsed(),
+                now.0,
+                now.1,
+                seen.frames()
+            );
+            last = now;
+        }
+        if viewer.is_finished() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    println!(
+        "QA final a {:?}: anfitrión {:?} {:?} · invitado {:?} {:?} · fotogramas {}",
+        dropped.elapsed(),
+        host.state(),
+        host.end_reason(),
+        viewer.state(),
+        viewer.end_reason(),
+        seen.frames()
+    );
+    viewer.close();
+    host.close();
 }

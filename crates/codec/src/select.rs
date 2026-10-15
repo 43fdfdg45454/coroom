@@ -12,7 +12,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::calibrate::{self, CalibrationCache, CalibrationKey, CalibrationResult};
+use crate::calibrate::{self, CachedChoice, CalibrationCache, CalibrationKey, CalibrationResult};
 use crate::openh264::{OpenH264Decoder, OpenH264Encoder};
 use crate::{
     Backend, Capabilities, Codec, CodecError, DecodeOutput, Decoder, DecoderBackend, Encoder,
@@ -330,6 +330,76 @@ impl EncoderSet {
         // Ninguno midió, o los que midieron ya no abren: la lista de preferencia, como siempre
         // (su error es el que explica por qué, si tampoco abre).
         drop(last);
+        self.open(config).map(|encoder| (encoder, None))
+    }
+
+    /// Como [`EncoderSet::open_calibrated`], pero **sin medir nunca** (con la pantalla ya en el
+    /// aire, abrir y medir varios codificadores de GPU la haría tartamudear): abre lo que se
+    /// calibró para esta clave (misma GPU y driver, códec, clase de resolución y formato) y, si
+    /// ese códec no se calibró, el backend que ganó para otro códec en la misma GPU y formato (la
+    /// latencia depende sobre todo del motor: si NVENC ganó en AV1, gana en H.264); sin nada
+    /// guardado, la lista de preferencia como [`EncoderSet::open`]. Antes, al renegociar a otro
+    /// códec con la sala abierta se abría siempre el primero de la lista (Vulkan Video en Linux),
+    /// aunque la calibración hubiera dado otro.
+    pub fn open_remembered(
+        &self,
+        config: &EncoderConfig,
+    ) -> Result<(Box<dyn Encoder>, Option<Calibrated>), CodecError> {
+        let candidates = self.candidates(config);
+        if candidates.len() < 2 {
+            return self.open(config).map(|encoder| (encoder, None));
+        }
+        let key = CalibrationKey::of(config);
+        let mut choices = calibrate::remembered_all();
+        choices.extend(
+            CalibrationCache::load(self.calibration_cache.as_deref())
+                .entries()
+                .iter()
+                .cloned(),
+        );
+        // 0: esta misma clave; 1: otro códec, misma clase de resolución; 2: otra clase.
+        let mut ranked: Vec<(u8, CachedChoice)> = choices
+            .into_iter()
+            .filter(|choice| {
+                choice.key.adapter == key.adapter && choice.key.pixel_format == key.pixel_format
+            })
+            .map(|choice| {
+                let rank = if choice.key == key {
+                    0
+                } else if choice.key.resolution_class == key.resolution_class {
+                    1
+                } else {
+                    2
+                };
+                (rank, choice)
+            })
+            .collect();
+        ranked.sort_by_key(|(rank, choice)| (*rank, choice.p95_us));
+        let mut tried = Vec::new();
+        for (rank, choice) in ranked {
+            let Some(backend) = choice.backend() else {
+                continue;
+            };
+            if !candidates.contains(&backend) || tried.contains(&backend) {
+                continue;
+            }
+            tried.push(backend);
+            let opened = create_encoder(config.codec, backend).and_then(|mut encoder| {
+                encoder.configure(config)?;
+                Ok(encoder)
+            });
+            if let Ok(encoder) = opened {
+                let calibrated = (rank == 0).then(|| Calibrated {
+                    backend,
+                    p95: choice.p95(),
+                    p50: choice.p50(),
+                    kbit_s: choice.kbit_s,
+                    from_cache: true,
+                    results: Vec::new(),
+                });
+                return Ok((encoder, calibrated));
+            }
+        }
         self.open(config).map(|encoder| (encoder, None))
     }
 }

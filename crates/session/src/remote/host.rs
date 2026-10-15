@@ -360,16 +360,17 @@ pub(crate) fn start(
     commands: mpsc::UnboundedReceiver<Command>,
 ) -> Result<Started, SessionError> {
     let media = |err: &dyn std::fmt::Display| SessionError::Media(err.to_string());
-    if video.width == 0
-        || video.height == 0
-        || !video.width.is_multiple_of(2)
-        || !video.height.is_multiple_of(2)
-        || video.fps == 0
-        || video.bitrate_kbps == 0
-    {
+    // Los códecs necesitan un tamaño par: uno impar se recorta una columna o una fila, como cada
+    // fotograma de la captura (una ventana de 1199×808 sale a 1198×808), en vez de no abrir.
+    let video = LoopbackConfig {
+        width: video.width & !1,
+        height: video.height & !1,
+        ..video
+    };
+    if video.width == 0 || video.height == 0 || video.fps == 0 || video.bitrate_kbps == 0 {
         return Err(media(&PipelineError::Codec(
             coroom_codec::CodecError::Unsupported(format!(
-                "el vídeo necesita un tamaño par y no nulo, fps y bitrate, no {}×{} a {} fps y \
+                "el vídeo necesita al menos 2×2 píxeles, fps y bitrate, no {}×{} a {} fps y \
                  {} kbit/s",
                 video.width, video.height, video.fps, video.bitrate_kbps
             )),
@@ -1733,14 +1734,15 @@ async fn renegotiate(ctx: &Arc<HostCtx>, guest: Option<GuestId>) {
             // (`EncoderSet::open_calibrated`: unas décimas de segundo la primera vez, fuera del
             // runtime); con uno (ajuste explícito), ese. Solo se mide sin codificador en marcha
             // (al abrir la sala, antes del primer invitado): con la pantalla ya en el aire, abrir
-            // y medir varios codificadores de GPU la haría tartamudear, así que entonces manda la
-            // lista de preferencia (y lo guardado sirve para la próxima sala).
+            // y medir varios codificadores de GPU la haría tartamudear, así que entonces se abre
+            // lo ya calibrado en esta GPU sin medir (`open_remembered`; sin nada guardado, la
+            // lista de preferencia).
             let calibrate = current.is_none();
             let opened = tokio::task::spawn_blocking(move || {
                 if calibrate {
                     encoders.open_calibrated(&config)
                 } else {
-                    encoders.open(&config).map(|encoder| (encoder, None))
+                    encoders.open_remembered(&config)
                 }
             })
             .await;

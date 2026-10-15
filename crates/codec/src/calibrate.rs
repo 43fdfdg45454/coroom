@@ -432,6 +432,14 @@ pub(crate) fn remembered(key: &CalibrationKey) -> Option<CachedChoice> {
         .cloned()
 }
 
+/// Todas las calibraciones recordadas en este proceso.
+pub(crate) fn remembered_all() -> Vec<CachedChoice> {
+    process_cache()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+}
+
 pub(crate) fn forget_remembered(key: &CalibrationKey) {
     process_cache()
         .lock()

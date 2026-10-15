@@ -141,6 +141,13 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **Al renegociar el códec con la sala abierta se abría el primer codificador de la lista**
+  (Vulkan Video en Linux) aunque la calibración hubiera elegido otro: cuando entraba un invitado
+  que solo decodifica H.264, una RTX 5070 Ti pasaba de AV1 por NVENC a H.264 por Vulkan Video,
+  que allí da menos de la mitad del bitrate. Sin medir en el aire, ahora se abre lo calibrado
+  para ese códec o, si no se calibró, el backend que ganó para otro códec en la misma GPU.
+- **Una resolución impar al abrir la sala** (`--width 1001`) ya no impide abrirla: se recorta a
+  par, como cada fotograma de una ventana impar.
 - **El invitado se caía a más de 125 fps** (144, 165, 240 Hz): el hilo de red entraba en pánico
   («min <= max» de `clamp`) al calcular cuándo pedir un paquete perdido, porque el cuarto de
   intervalo (o, desde 167 fps, el medio) quedaba por debajo del mínimo de 2 ms (3 ms). A 144 y
