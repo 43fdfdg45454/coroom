@@ -174,6 +174,10 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
   ese momento aparecía o se iba un toast, y también al abrir o cerrar el menú de la cuenta o el
   diagnóstico: la raíz de la interfaz cambiaba de forma e iced tiraba el desplazamiento. Ahora la
   forma es siempre la misma.
+- El aviso «Los invitados entran con la voz permitida» de Compartir va en tono neutro: el tono
+  de información lleva el color de acento del sistema y con un acento rojo se leía como error.
+- «Audio que se envía» muestra el nombre del ejecutable («kodi») cuando PipeWire solo da el
+  envoltorio genérico de pipewire-alsa («ALSA plug-in [kodi.bin]»).
 - **Cabecera pegada a la barra de título** del sistema (KDE): la cabecera (también la de la
   sala del invitado) lleva ahora el tono de las tarjetas, 56 px de alto con el título centrado y
   una línea fina por encima y por debajo, así no se funde con la barra gris de KDE.

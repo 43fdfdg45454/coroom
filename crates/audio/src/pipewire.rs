@@ -763,13 +763,7 @@ fn resolve_app(name: &str) -> Result<String, AudioError> {
         .ok_or_else(|| {
             let playing: Vec<String> = streams
                 .iter()
-                .map(|node| {
-                    if node.app.is_empty() {
-                        node.name.clone()
-                    } else {
-                        node.app.clone()
-                    }
-                })
+                .map(|node| app_display_name(&node.app, &node.binary, &node.name))
                 .collect();
             AudioError::NoSuchDevice(if playing.is_empty() {
                 format!("{name} (ninguna aplicación reproduce audio ahora)")
@@ -777,6 +771,41 @@ fn resolve_app(name: &str) -> Result<String, AudioError> {
                 format!("{name} (reproducen ahora: {})", playing.join(", "))
             })
         })
+}
+
+/// Nombre de la aplicación para mostrar: `application.name`, salvo cuando es el envoltorio
+/// genérico de pipewire-alsa («ALSA plug-in [kodi.bin]»), que no dice nada al usuario; entonces
+/// el nombre del ejecutable sin ruta ni extensión (`kodi`), y si no hay, el nombre del nodo.
+fn app_display_name(app: &str, binary: &str, name: &str) -> String {
+    let app = app.trim();
+    let wrapper = app.is_empty() || app.to_lowercase().starts_with("alsa plug-in");
+    if !wrapper {
+        return app.to_owned();
+    }
+    let binary = binary
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches(".exe")
+        .trim_end_matches(".bin")
+        .trim_end_matches(".x86_64")
+        .trim_end_matches(".sh");
+    if !binary.is_empty() {
+        return binary.to_owned();
+    }
+    // «ALSA plug-in [kodi.bin]» sin binario: lo que va entre corchetes.
+    if let Some((_, rest)) = app.split_once('[')
+        && let Some((inner, _)) = rest.split_once(']')
+        && !inner.trim().is_empty()
+    {
+        return app_display_name("", inner, name);
+    }
+    if app.is_empty() {
+        name.to_owned()
+    } else {
+        app.to_owned()
+    }
 }
 
 /// Si el nodo es de coroom (por el proceso o por el nombre: en Flatpak el PID es otro).
@@ -802,11 +831,7 @@ impl crate::apps::AppBackend for AppStreams {
                         .find(|field| !field.is_empty())
                         .cloned()
                         .unwrap_or_default();
-                    let name = if node.app.is_empty() {
-                        key.clone()
-                    } else {
-                        node.app.clone()
-                    };
+                    let name = app_display_name(&node.app, &node.binary, &node.name);
                     let stream = if node.serial.is_empty() {
                         node.name
                     } else {
@@ -846,8 +871,8 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>, AudioError> {
                 "Stream/Output/Audio" => DeviceKind::Application,
                 _ => return None,
             };
-            let name = if kind == DeviceKind::Application && !node.app.is_empty() {
-                node.app.clone()
+            let name = if kind == DeviceKind::Application {
+                app_display_name(&node.app, &node.binary, &node.name)
             } else {
                 node.name.clone()
             };
@@ -870,6 +895,22 @@ mod tests {
     use super::*;
 
     fn assert_send<T: Send>() {}
+
+    #[test]
+    fn the_alsa_wrapper_shows_the_executable_instead() {
+        assert_eq!(app_display_name("Firefox", "firefox", "n"), "Firefox");
+        assert_eq!(
+            app_display_name("ALSA plug-in [kodi.bin]", "kodi.bin", "n"),
+            "kodi"
+        );
+        assert_eq!(app_display_name("ALSA plug-in [kodi.bin]", "", "n"), "kodi");
+        assert_eq!(app_display_name("", "/usr/bin/game.x86_64", "n"), "game");
+        assert_eq!(
+            app_display_name("", "", "alsa_playback.kodi"),
+            "alsa_playback.kodi"
+        );
+        assert_eq!(app_display_name("  ", "", "n"), "n");
+    }
 
     #[test]
     fn backends_are_send_and_describe_themselves() {
