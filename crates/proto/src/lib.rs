@@ -32,8 +32,10 @@ pub mod signal;
 /// paquetes y mensajes de entrada, `GamepadMode` y `GamepadOutput`); la 9, los miembros de la
 /// sala con su nombre (`Members`), para que cada uno silencie a quien quiera; la 10, la sonda del
 /// enlace (pista [`media::Track::Probe`] y `ProbeResult`), con la que el anfitrión arranca el
-/// bitrate en lo que el camino entrega en vez de en una cifra fija.
-pub const PROTOCOL_VERSION: u16 = 10;
+/// bitrate en lo que el camino entrega en vez de en una cifra fija; la 11, la entrada entera por
+/// datagramas con el estado completo en cada paquete ([`input::InputState`], `queued_us`), el
+/// stream solo para declarar mandos y el `InputReport` por etapas.
+pub const PROTOCOL_VERSION: u16 = 11;
 
 /// Identificadores ALPN (RFC 7301) que el socket QUIC usa para demultiplexar conexiones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

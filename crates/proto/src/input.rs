@@ -1,12 +1,18 @@
 //! Entrada del invitado: eventos, paquetes y su formato en el cable.
 //!
-//! Los eventos ([`InputEvent`]) viajan en dos canales:
+//! Todo lo que el invitado pulsa o mueve viaja por **datagramas** de la pista [`Track::Input`], en
+//! [`InputPacket`]: los eventos ([`InputEvent`]) en orden y, detrás, el **estado completo**
+//! ([`InputState`]: teclas y botones pulsados, movimiento y rueda acumulados, última posición
+//! absoluta y el mando de la ranura) tal como queda tras esos eventos. Con el estado en cada
+//! paquete, perder un datagrama no deja una tecla pegada ni un clic sin soltar: el anfitrión aplica
+//! los eventos cuando la secuencia viene seguida y, si falta alguna, reconcilia su vista con el
+//! estado que llega ([`InputState::diff`]); el invitado además repite el estado unas veces tras
+//! cada cambio (`coroom_input::send`). Los datagramas más antiguos que el último aplicado se
+//! descartan. Así ninguna tecla espera a una retransmisión, como pasaba con un stream fiable.
 //!
-//! - **Estado** (teclas, botones, rueda, conexión de mando, [`InputEvent::ReleaseAll`]) por el
-//!   *stream* de entrada fiable de QUIC, en [`InputMessage`].
-//! - **Continuo** (movimiento del ratón relativo y absoluto, ejes de mando) por **datagramas** de la
-//!   pista [`Track::Input`], en [`InputPacket`]; el anfitrión descarta los que lleguen más antiguos
-//!   que el último aplicado.
+//! Lo único que sigue yendo por el **stream** fiable de entrada es la declaración de un mando tal
+//! cual ([`InputMessage`] con [`PadData::Device`]: su descriptor HID no cabe en un datagrama y no
+//! tiene prisa).
 //!
 //! Los dos se serializan con `postcard` y se cifran con la clave pareja a pareja
 //! (`coroom_crypto::input`). Esta crate solo fija el formato en claro que los rodea:
@@ -21,6 +27,10 @@
 //! pareja a pareja (y con ella al invitado) cuando varios invitados llegan por el relay en una sola
 //! conexión; no es secreto ni hace falta autenticarlo aparte: con otra clave el sellado no abre.
 //!
+//! Cada paquete lleva dos marcas para medir por etapas: `sent_us`, la hora de su primer evento en
+//! el reloj del anfitrión (el anfitrión obtiene `recibido − capturado`), y `queued_us`, lo que ese
+//! evento esperó en el invitado hasta salir (captura → envío).
+//!
 //! **Teclas**: códigos **evdev** de Linux (`KEY_*`). **Ratón**: botones por nombre, movimiento
 //! relativo en unidades del ratón, posición absoluta en `0..=65535` del fotograma del anfitrión y
 //! rueda en 1/120 de muesca (positivo = hacia arriba y a la derecha, como `WHEEL_DELTA`).
@@ -29,8 +39,8 @@
 //!
 //! **Mandos tal cual** ([`PadData`]): el invitado declara su mando físico ([`GamepadDevice`]: nombre,
 //! VID/PID y, si es HID, su descriptor y sus informes de característica) por el stream, y manda
-//! cada informe de entrada HID sin tocar ([`PadData::Report`]) por datagrama. Van en el campo
-//! `pads` de los paquetes y mensajes, aparte de los eventos.
+//! cada informe de entrada HID sin tocar ([`PadData::Report`]) por datagrama, en el campo `pads`
+//! de los paquetes, aparte de los eventos.
 
 use std::fmt;
 
@@ -52,6 +62,9 @@ pub const MAX_STREAM_FRAME: usize = 16 * 1024;
 
 /// Eventos como mucho por paquete o mensaje (el emisor agrupa o suma por encima).
 pub const MAX_EVENTS: usize = 64;
+
+/// Teclas pulsadas a la vez que caben en el estado de un paquete.
+pub const MAX_PRESSED_KEYS: usize = 32;
 
 /// Ranuras de mando por defecto.
 pub const DEFAULT_GAMEPAD_SLOTS: u8 = 4;
@@ -423,6 +436,285 @@ impl InputEvent {
     }
 }
 
+/// El mando de la ranura del invitado dentro de [`InputState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GamepadState {
+    /// Ranura (desde 1).
+    pub slot: u8,
+    /// Tipo.
+    pub kind: GamepadKind,
+    /// Botones pulsados: un bit por posición en [`GamepadButton::ALL`].
+    pub buttons: u16,
+    /// Ejes, en el orden de [`GamepadAxis::ALL`].
+    pub axes: [i16; 6],
+}
+
+impl GamepadState {
+    /// Mando recién conectado: nada pulsado, ejes en reposo.
+    pub const fn neutral(slot: u8, kind: GamepadKind) -> Self {
+        Self {
+            slot,
+            kind,
+            buttons: 0,
+            axes: [0; 6],
+        }
+    }
+
+    /// Si `button` está pulsado.
+    pub fn pressed(&self, button: GamepadButton) -> bool {
+        self.buttons & button_bit(button) != 0
+    }
+}
+
+fn button_bit(button: GamepadButton) -> u16 {
+    let index = GamepadButton::ALL
+        .iter()
+        .position(|b| *b == button)
+        .unwrap_or(0);
+    1 << index
+}
+
+fn mouse_bit(button: MouseButton) -> u8 {
+    let index = MouseButton::ALL
+        .iter()
+        .position(|b| *b == button)
+        .unwrap_or(0);
+    1 << index
+}
+
+fn axis_index(axis: GamepadAxis) -> usize {
+    GamepadAxis::ALL
+        .iter()
+        .position(|a| *a == axis)
+        .unwrap_or(0)
+}
+
+/// Todo lo que el invitado tiene pulsado o movido, tal como queda tras los eventos de un paquete.
+/// Lo acumulado (movimiento y rueda) da vuelta en `i32`: lo que importa es la diferencia entre dos
+/// estados, no el valor.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub struct InputState {
+    /// Teclas pulsadas (códigos evdev), ordenadas y sin repetir; como mucho
+    /// [`MAX_PRESSED_KEYS`] (las demás no se anotan).
+    pub keys: Vec<u16>,
+    /// Botones del ratón pulsados: un bit por posición en [`MouseButton::ALL`].
+    pub buttons: u8,
+    /// Movimiento relativo acumulado (suma de todos los `MouseMove`), con vuelta.
+    pub motion: (i32, i32),
+    /// Rueda acumulada (suma de todos los `Wheel`), con vuelta.
+    pub wheel: (i32, i32),
+    /// Última posición absoluta enviada.
+    pub absolute: Option<(u16, u16)>,
+    /// El mando de la ranura, si está conectado.
+    pub gamepad: Option<GamepadState>,
+}
+
+impl InputState {
+    /// Avanza el estado con `event`.
+    pub fn apply(&mut self, event: &InputEvent) {
+        match *event {
+            InputEvent::Key { code, pressed } => {
+                let at = self.keys.binary_search(&code);
+                match (at, pressed) {
+                    (Err(at), true) if self.keys.len() < MAX_PRESSED_KEYS => {
+                        self.keys.insert(at, code);
+                    }
+                    (Ok(at), false) => {
+                        self.keys.remove(at);
+                    }
+                    _ => {}
+                }
+            }
+            InputEvent::MouseButton { button, pressed } => {
+                if pressed {
+                    self.buttons |= mouse_bit(button);
+                } else {
+                    self.buttons &= !mouse_bit(button);
+                }
+            }
+            InputEvent::MouseMove { dx, dy } => {
+                self.motion = (
+                    self.motion.0.wrapping_add(dx),
+                    self.motion.1.wrapping_add(dy),
+                );
+            }
+            InputEvent::MouseMoveAbsolute { x, y } => self.absolute = Some((x, y)),
+            InputEvent::Wheel { dx, dy } => {
+                self.wheel = (self.wheel.0.wrapping_add(dx), self.wheel.1.wrapping_add(dy));
+            }
+            InputEvent::GamepadConnected { slot, kind } => {
+                self.gamepad = Some(GamepadState::neutral(slot, kind));
+            }
+            InputEvent::GamepadDisconnected { slot } => {
+                if self.gamepad.is_some_and(|pad| pad.slot == slot) {
+                    self.gamepad = None;
+                }
+            }
+            InputEvent::GamepadButton {
+                slot,
+                button,
+                pressed,
+            } => {
+                if let Some(pad) = self.gamepad.as_mut().filter(|pad| pad.slot == slot) {
+                    if pressed {
+                        pad.buttons |= button_bit(button);
+                    } else {
+                        pad.buttons &= !button_bit(button);
+                    }
+                }
+            }
+            InputEvent::GamepadAxis { slot, axis, value } => {
+                if let Some(pad) = self.gamepad.as_mut().filter(|pad| pad.slot == slot) {
+                    pad.axes[axis_index(axis)] = value;
+                }
+            }
+            InputEvent::ReleaseAll => self.release_all(),
+        }
+    }
+
+    /// Suelta todo: teclas, botones y el mando (que sigue conectado, en reposo).
+    pub fn release_all(&mut self) {
+        self.keys.clear();
+        self.buttons = 0;
+        if let Some(pad) = self.gamepad.as_mut() {
+            pad.buttons = 0;
+            pad.axes = [0; 6];
+        }
+    }
+
+    /// Si `code` está pulsada.
+    pub fn key_pressed(&self, code: u16) -> bool {
+        self.keys.binary_search(&code).is_ok()
+    }
+
+    /// Si `button` está pulsado.
+    pub fn mouse_pressed(&self, button: MouseButton) -> bool {
+        self.buttons & mouse_bit(button) != 0
+    }
+
+    /// Eventos que llevan de `self` a `target`, para reconciliar cuando se perdieron paquetes:
+    /// primero lo que se suelta (teclas, botones del ratón y del mando), después lo que se pulsa,
+    /// el movimiento y la rueda que faltan, la posición absoluta y los ejes. Puede superar
+    /// [`MAX_EVENTS`]: no se serializa, se aplica en el anfitrión.
+    pub fn diff(&self, target: &InputState) -> Vec<InputEvent> {
+        let mut out = Vec::new();
+        for &code in &self.keys {
+            if !target.key_pressed(code) {
+                out.push(InputEvent::Key {
+                    code,
+                    pressed: false,
+                });
+            }
+        }
+        for button in MouseButton::ALL {
+            if self.mouse_pressed(button) && !target.mouse_pressed(button) {
+                out.push(InputEvent::MouseButton {
+                    button,
+                    pressed: false,
+                });
+            }
+        }
+        let same_pad = match (self.gamepad, target.gamepad) {
+            (Some(a), Some(b)) => a.slot == b.slot && a.kind == b.kind,
+            _ => false,
+        };
+        if let Some(pad) = self.gamepad {
+            if same_pad {
+                let target_pad = target.gamepad.expect("mismo mando");
+                for button in GamepadButton::ALL {
+                    if pad.pressed(button) && !target_pad.pressed(button) {
+                        out.push(InputEvent::GamepadButton {
+                            slot: pad.slot,
+                            button,
+                            pressed: false,
+                        });
+                    }
+                }
+            } else {
+                out.push(InputEvent::GamepadDisconnected { slot: pad.slot });
+            }
+        }
+        for &code in &target.keys {
+            if !self.key_pressed(code) {
+                out.push(InputEvent::Key {
+                    code,
+                    pressed: true,
+                });
+            }
+        }
+        for button in MouseButton::ALL {
+            if target.mouse_pressed(button) && !self.mouse_pressed(button) {
+                out.push(InputEvent::MouseButton {
+                    button,
+                    pressed: true,
+                });
+            }
+        }
+        let (dx, dy) = (
+            target.motion.0.wrapping_sub(self.motion.0),
+            target.motion.1.wrapping_sub(self.motion.1),
+        );
+        if dx != 0 || dy != 0 {
+            out.push(InputEvent::MouseMove { dx, dy });
+        }
+        if let Some((x, y)) = target.absolute
+            && target.absolute != self.absolute
+        {
+            out.push(InputEvent::MouseMoveAbsolute { x, y });
+        }
+        let (wx, wy) = (
+            target.wheel.0.wrapping_sub(self.wheel.0),
+            target.wheel.1.wrapping_sub(self.wheel.1),
+        );
+        if wx != 0 || wy != 0 {
+            out.push(InputEvent::Wheel { dx: wx, dy: wy });
+        }
+        if let Some(pad) = target.gamepad {
+            let before = if same_pad {
+                self.gamepad.expect("mismo mando")
+            } else {
+                out.push(InputEvent::GamepadConnected {
+                    slot: pad.slot,
+                    kind: pad.kind,
+                });
+                GamepadState::neutral(pad.slot, pad.kind)
+            };
+            for button in GamepadButton::ALL {
+                if pad.pressed(button) && !before.pressed(button) {
+                    out.push(InputEvent::GamepadButton {
+                        slot: pad.slot,
+                        button,
+                        pressed: true,
+                    });
+                }
+            }
+            for (index, axis) in GamepadAxis::ALL.iter().enumerate() {
+                if pad.axes[index] != before.axes[index] {
+                    out.push(InputEvent::GamepadAxis {
+                        slot: pad.slot,
+                        axis: *axis,
+                        value: pad.axes[index],
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Comprueba los límites: teclas ordenadas, sin repetir y como mucho [`MAX_PRESSED_KEYS`].
+    pub fn check(&self) -> Result<(), InputWireError> {
+        if self.keys.len() > MAX_PRESSED_KEYS {
+            return Err(InputWireError::TooManyKeys(self.keys.len()));
+        }
+        if self.keys.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(InputWireError::Postcard(
+                "las teclas del estado no van ordenadas".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Error del formato de entrada.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputWireError {
@@ -436,6 +728,8 @@ pub enum InputWireError {
     BadFrameLength(usize),
     /// Más de [`MAX_EVENTS`] eventos.
     TooManyEvents(usize),
+    /// Más de [`MAX_PRESSED_KEYS`] teclas en el estado.
+    TooManyKeys(usize),
     /// Datos de mando tal cual fuera de sus límites ([`PadData::check`]) o más de [`MAX_PADS`].
     Pad(String),
     /// El cuerpo no es un `postcard` válido.
@@ -456,6 +750,10 @@ impl fmt::Display for InputWireError {
             InputWireError::TooManyEvents(count) => write!(
                 f,
                 "{count} eventos en un mensaje de entrada (como mucho {MAX_EVENTS})"
+            ),
+            InputWireError::TooManyKeys(count) => write!(
+                f,
+                "{count} teclas pulsadas en el estado (como mucho {MAX_PRESSED_KEYS})"
             ),
             InputWireError::Pad(what) => write!(f, "mando tal cual: {what}"),
             InputWireError::Postcard(err) => write!(f, "mensaje de entrada no válido: {err}"),
@@ -481,30 +779,31 @@ fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, InputWireError> 
     Ok(value)
 }
 
-/// Paquete de movimiento continuo (datagrama).
+/// Paquete de entrada (datagrama): los eventos en orden y el estado completo tras ellos.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputPacket {
     /// Secuencia del canal de datagramas (la misma que autentica el sellado).
     pub seq: u32,
     /// Hora del primer evento en µs del reloj del anfitrión (estimado por `Ping`/`Pong`, truncado
-    /// a 32 bits); `0` si aún no se conoce el desfase.
+    /// a 32 bits); `0` si aún no se conoce el desfase. Sin eventos (una repetición del estado),
+    /// la hora de envío.
     pub sent_us: u32,
+    /// µs que el primer evento esperó en el invitado hasta salir (captura → envío), saturado.
+    pub queued_us: u16,
     /// Eventos, en orden.
     pub events: Vec<InputEvent>,
+    /// Estado completo tras `events`.
+    pub state: InputState,
     /// Informes de mandos tal cual ([`PadData::Report`]).
     pub pads: Vec<PadData>,
 }
 
-/// Mensaje de cambios de estado (stream fiable).
+/// Mensaje del stream fiable: declaraciones de mandos tal cual ([`PadData::Device`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputMessage {
     /// Secuencia del canal del stream.
     pub seq: u32,
-    /// Como [`InputPacket::sent_us`].
-    pub sent_us: u32,
-    /// Eventos, en orden.
-    pub events: Vec<InputEvent>,
-    /// Mandos tal cual que se conectan ([`PadData::Device`]).
+    /// Mandos que se declaran.
     pub pads: Vec<PadData>,
 }
 
@@ -518,33 +817,43 @@ fn check_pads(pads: &[PadData]) -> Result<(), InputWireError> {
     pads.iter().try_for_each(PadData::check)
 }
 
-macro_rules! impl_bytes {
-    ($ty:ty) => {
-        impl $ty {
-            /// Serializa con `postcard`.
-            pub fn to_bytes(&self) -> Result<Vec<u8>, InputWireError> {
-                if self.events.len() > MAX_EVENTS {
-                    return Err(InputWireError::TooManyEvents(self.events.len()));
-                }
-                check_pads(&self.pads)?;
-                encode(self)
-            }
-
-            /// Inverso de `to_bytes`; rechaza bytes sobrantes y más de [`MAX_EVENTS`] eventos.
-            pub fn from_bytes(bytes: &[u8]) -> Result<Self, InputWireError> {
-                let value: Self = decode(bytes)?;
-                if value.events.len() > MAX_EVENTS {
-                    return Err(InputWireError::TooManyEvents(value.events.len()));
-                }
-                check_pads(&value.pads)?;
-                Ok(value)
-            }
+impl InputPacket {
+    fn check(&self) -> Result<(), InputWireError> {
+        if self.events.len() > MAX_EVENTS {
+            return Err(InputWireError::TooManyEvents(self.events.len()));
         }
-    };
+        self.state.check()?;
+        check_pads(&self.pads)
+    }
+
+    /// Serializa con `postcard`.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, InputWireError> {
+        self.check()?;
+        encode(self)
+    }
+
+    /// Inverso de `to_bytes`; rechaza bytes sobrantes y lo que pase de los límites.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, InputWireError> {
+        let value: Self = decode(bytes)?;
+        value.check()?;
+        Ok(value)
+    }
 }
 
-impl_bytes!(InputPacket);
-impl_bytes!(InputMessage);
+impl InputMessage {
+    /// Serializa con `postcard`.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, InputWireError> {
+        check_pads(&self.pads)?;
+        encode(self)
+    }
+
+    /// Inverso de `to_bytes`; rechaza bytes sobrantes y más de [`MAX_PADS`] mandos.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, InputWireError> {
+        let value: Self = decode(bytes)?;
+        check_pads(&value.pads)?;
+        Ok(value)
+    }
+}
 
 /// Cabecera en claro de un datagrama de entrada con la clave `key_id`.
 pub fn datagram_header(key_id: u32) -> [u8; DATAGRAM_HEADER_LEN] {
@@ -741,22 +1050,57 @@ mod tests {
         prop::collection::vec(pad(), 0..4)
     }
 
+    /// Un estado cualquiera: el que resulta de aplicar eventos al vacío.
+    fn state() -> impl Strategy<Value = InputState> {
+        events().prop_map(|events| {
+            let mut state = InputState::default();
+            for event in &events {
+                state.apply(event);
+            }
+            state
+        })
+    }
+
     proptest! {
         #[test]
-        fn packets_round_trip(seq in any::<u32>(), sent_us in any::<u32>(), events in events(), pads in pads()) {
-            let packet = InputPacket { seq, sent_us, events, pads };
+        fn packets_round_trip(seq in any::<u32>(), sent_us in any::<u32>(), queued_us in any::<u16>(), events in events(), state in state(), pads in pads()) {
+            let packet = InputPacket { seq, sent_us, queued_us, events, state, pads };
             let bytes = packet.to_bytes().expect("serializar");
             prop_assert_eq!(InputPacket::from_bytes(&bytes), Ok(packet));
         }
 
         #[test]
-        fn messages_round_trip(seq in any::<u32>(), sent_us in any::<u32>(), events in events(), pads in pads()) {
-            let message = InputMessage { seq, sent_us, events, pads };
+        fn messages_round_trip(seq in any::<u32>(), pads in pads()) {
+            let message = InputMessage { seq, pads };
             let bytes = message.to_bytes().expect("serializar");
             prop_assert_eq!(InputMessage::from_bytes(&bytes), Ok(message.clone()));
             if bytes.len() > 1 {
                 prop_assert!(InputMessage::from_bytes(&bytes[..bytes.len() - 1]).is_err());
             }
+        }
+
+        /// Aplicar a un estado los eventos de su diferencia con otro lo deja igual que el otro:
+        /// así el anfitrión reconcilia lo que se perdió.
+        #[test]
+        fn applying_the_diff_reaches_the_target(from in state(), to in state()) {
+            let mut state = from.clone();
+            for event in from.diff(&to) {
+                state.apply(&event);
+            }
+            // La posición absoluta no se «desconoce»: sin una nueva, queda la que había.
+            let mut expected = to.clone();
+            if expected.absolute.is_none() {
+                expected.absolute = from.absolute;
+            }
+            prop_assert_eq!(state, expected);
+            prop_assert!(from.diff(&from).is_empty(), "sin cambios no hay eventos");
+        }
+
+        /// Un estado mantiene las teclas ordenadas y sin repetir, y nunca más de las que caben.
+        #[test]
+        fn states_stay_within_limits(state in state()) {
+            prop_assert!(state.check().is_ok());
+            prop_assert!(state.keys.len() <= MAX_PRESSED_KEYS);
         }
 
         #[test]
@@ -810,7 +1154,9 @@ mod tests {
         let packet = InputPacket {
             seq: 1,
             sent_us: 0,
+            queued_us: 0,
             events: vec![InputEvent::ReleaseAll; MAX_EVENTS + 1],
+            state: InputState::default(),
             pads: Vec::new(),
         };
         assert_eq!(
@@ -871,8 +1217,6 @@ mod tests {
         // Con la trama de stream más grande posible, cabe.
         let big = InputMessage {
             seq: 1,
-            sent_us: 1,
-            events: Vec::new(),
             pads: vec![device(GamepadTransport::Hid {
                 descriptor: vec![0xAB; crate::hid::MAX_DESCRIPTOR],
                 features: vec![(1, vec![0xCD; 256]); MAX_FEATURE_BYTES / 256],
@@ -883,7 +1227,9 @@ mod tests {
         let too_many = InputPacket {
             seq: 1,
             sent_us: 0,
+            queued_us: 0,
             events: Vec::new(),
+            state: InputState::default(),
             pads: vec![report(8); MAX_PADS + 1],
         };
         assert!(matches!(too_many.to_bytes(), Err(InputWireError::Pad(_))));

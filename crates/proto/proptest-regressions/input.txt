@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e2f414401f2ebce8b6f863034724f1be8704383db1d0b96a91b325fbca493eb9 # shrinks to from = InputState { keys: [], buttons: 0, motion: (0, 0), wheel: (0, 0), absolute: Some((0, 0)), gamepad: None }, to = InputState { keys: [], buttons: 0, motion: (0, 0), wheel: (0, 0), absolute: None, gamepad: None }

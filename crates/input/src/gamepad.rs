@@ -1,4 +1,4 @@
-//! Mandos del invitado con `gilrs` en un hilo a 250 Hz.
+//! Mandos del invitado con `gilrs` en un hilo a 1000 Hz.
 //!
 //! Un solo mando va a la ranura que el anfitrión haya asignado a este invitado
 //! ([`GamepadCapture::set_slot`]): el que elija el invitado ([`PadChoice::Pad`]) o, en automático,
@@ -7,7 +7,7 @@
 //! al anterior que siga conectado); la lista para la interfaz está en [`GamepadCapture::pads`]. Conexión y
 //! desconexión, y cambio de ranura, se anuncian con `GamepadConnected`/`GamepadDisconnected`.
 //!
-//! **Convertido**: botones por evento (al momento), ejes a 250 Hz y solo si cambian más de
+//! **Convertido**: botones por evento (al momento), ejes a 1000 Hz y solo si cambian más de
 //! [`AXIS_EPSILON`], con una zona muerta mínima ([`AXIS_DEADZONE`]) además de los filtros de
 //! `gilrs`, en el vocabulario de Xbox. Los mandos que la base de SDL no trae para Linux se
 //! añaden en [`MAPPINGS`].
@@ -101,8 +101,8 @@ pub struct ConnectedPad {
     pub active: bool,
 }
 
-/// Periodo del hilo de mandos (250 Hz).
-pub const PERIOD: Duration = Duration::from_millis(4);
+/// Periodo del hilo de mandos (1000 Hz): un botón espera como mucho 1 ms a que lo lea.
+pub const PERIOD: Duration = Duration::from_millis(1);
 
 /// Zona muerta mínima de los sticks (fracción del recorrido).
 pub const AXIS_DEADZONE: f32 = 0.02;

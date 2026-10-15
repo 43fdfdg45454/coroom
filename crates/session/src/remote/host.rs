@@ -1678,6 +1678,10 @@ fn send_input_reports(ctx: &HostCtx, sent: &mut BTreeMap<GuestId, (u64, u64)>) {
                     p95_us: clamp(input.p95_us),
                     applied: input.applied,
                     dropped: input.dropped,
+                    queue_p50_us: clamp(input.queue_p50_us),
+                    network_p50_us: clamp(input.network_p50_us),
+                    inject_p50_us: clamp(input.inject_p50_us),
+                    repaired: input.repaired,
                 },
                 (input.applied, input.dropped),
             )

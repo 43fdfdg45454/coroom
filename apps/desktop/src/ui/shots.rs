@@ -939,6 +939,10 @@ fn sample_stats() -> Stats {
         max_us: 22_500,
         applied: 840,
         dropped: 0,
+        queue_p50_us: 300,
+        network_p50_us: 8_100,
+        inject_p50_us: 800,
+        repaired: 2,
     });
     Stats {
         summary,

@@ -27,8 +27,8 @@ use coroom_session::transport::proto::audio::AudioHeader;
 use coroom_session::transport::proto::codec;
 use coroom_session::transport::proto::control::ControlMessage;
 use coroom_session::transport::proto::input::{
-    GamepadDevice, GamepadTransport, InputEvent, InputMessage, InputPacket, MouseButton, PadData,
-    datagram_header, stream_frame,
+    GamepadDevice, GamepadTransport, InputEvent, InputMessage, InputPacket, InputState,
+    MouseButton, PadData, datagram_header, stream_frame,
 };
 
 /// Descriptor HID de un mando sencillo: 8 botones y dos ejes, con informe 1.
@@ -237,10 +237,17 @@ fn fuzz_seeds() {
     seeds.write("audio_jitter", "vuelta-de-secuencia", &wrap);
 
     // --- proto_input, crypto_input -----------------------------------------------------------------
+    let events = events();
+    let mut state = InputState::default();
+    for event in &events {
+        state.apply(event);
+    }
     let packet = InputPacket {
         seq: 4,
         sent_us: 1_000,
-        events: events(),
+        queued_us: 250,
+        events,
+        state,
         pads: vec![PadData::Report {
             slot: 1,
             data: vec![0x01, 0x80, 0x80, 0x80, 0x80, 0x08, 0x00, 0x00],
@@ -248,8 +255,6 @@ fn fuzz_seeds() {
     };
     let message = InputMessage {
         seq: 2,
-        sent_us: 900,
-        events: events(),
         pads: vec![PadData::Device {
             slot: 1,
             device: GamepadDevice {

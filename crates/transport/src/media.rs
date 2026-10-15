@@ -40,7 +40,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -1939,7 +1939,15 @@ pub struct MediaReceiver {
     conn: PeerConnection,
     control: ControlSender,
     inner: Mutex<ReceiverInner>,
+    /// Origen del reloj local (copia de `Clock::origin`, que no cambia).
+    origin: Instant,
+    /// Último desfase `reloj del emisor − reloj local` en µs ([`NO_OFFSET`] mientras no hay),
+    /// para leerlo sin esperar al cerrojo del receptor (lo lee el hilo de entrada por cada paquete).
+    offset_us: AtomicI64,
 }
+
+/// Valor de `MediaReceiver::offset_us` mientras no hay desfase.
+const NO_OFFSET: i64 = i64::MIN;
 
 impl std::fmt::Debug for MediaReceiver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1954,16 +1962,25 @@ impl MediaReceiver {
     /// Receptor sobre `conn` que responde por `control`.
     pub fn new(conn: PeerConnection, control: ControlSender, config: MediaReceiverConfig) -> Self {
         let now = Instant::now();
+        let clock = Clock::new();
         Self {
             conn,
             control,
+            origin: clock.origin(),
+            offset_us: AtomicI64::new(NO_OFFSET),
             inner: Mutex::new(ReceiverInner {
                 core: ReceiverCore::new(config.frame_interval),
-                clock: Clock::new(),
+                clock,
                 next_feedback: now + FEEDBACK_INTERVAL,
                 next_ping: now,
             }),
         }
+    }
+
+    /// Desfase publicado por el último `Pong`, sin cerrojo.
+    fn atomic_offset(&self) -> Option<i64> {
+        let offset = self.offset_us.load(Ordering::Acquire);
+        (offset != NO_OFFSET).then_some(offset)
     }
 
     /// Fija el intervalo de fotograma de `track` con lo que anuncia el emisor (ver
@@ -1994,10 +2011,7 @@ impl MediaReceiver {
 
     /// Desfase estimado `reloj del emisor − reloj local`, en µs.
     pub fn clock_offset_us(&self) -> Option<i64> {
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|inner| inner.clock.offset_us())
+        self.atomic_offset()
     }
 
     /// Instante local que corresponde a `remote_us` del reloj del emisor
@@ -2019,9 +2033,9 @@ impl MediaReceiver {
     /// `Ping`/`Pong`; `None` mientras no hay desfase. Sirve para que la entrada del invitado lleve
     /// la hora de envío en el reloj del anfitrión.
     pub fn remote_us(&self, at: Instant) -> Option<u64> {
-        let inner = self.inner.lock().ok()?;
-        let offset = inner.clock.offset_us()?;
-        u64::try_from((inner.clock.at_us(at) as i64).checked_add(offset)?).ok()
+        let offset = self.atomic_offset()?;
+        let local_us = at.saturating_duration_since(self.origin).as_micros() as i64;
+        u64::try_from(local_us.checked_add(offset)?).ok()
     }
 
     /// Atiende `Ping` y `Pong`; devuelve los demás mensajes.
@@ -2030,6 +2044,10 @@ impl MediaReceiver {
             ControlMessage::Pong { t, t_recv } => {
                 if let Ok(mut inner) = self.inner.lock() {
                     inner.clock.on_pong(Instant::now(), t, t_recv);
+                    self.offset_us.store(
+                        inner.clock.offset_us().unwrap_or(NO_OFFSET),
+                        Ordering::Release,
+                    );
                 }
                 None
             }

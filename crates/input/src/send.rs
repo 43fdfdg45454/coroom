@@ -1,26 +1,29 @@
-//! Envío de la entrada del invitado: agrupa, reparte en los dos canales, cifra y envía.
+//! Envío de la entrada del invitado: agrupa, cifra y envía, con el estado completo en cada paquete.
 //!
-//! [`InputSender`] tiene un hilo `entrada` que recibe los eventos con su instante:
+//! [`InputSender`] tiene un hilo `entrada` que recibe los eventos con su instante y lleva el
+//! [`InputState`] del invitado (lo que hay pulsado y lo acumulado). Todo sale por **datagramas**
+//! en [`InputPacket`], con los eventos en orden y el estado tal como queda tras ellos:
 //!
-//! - **Estado** (teclas, botones, rueda, mandos conectados, [`InputEvent::ReleaseAll`]): sale al
-//!   momento por el stream fiable en un [`InputMessage`] (con los demás de estado que ya estén en
-//!   cola). Antes se vacía el movimiento pendiente, para no adelantar un clic al movimiento que lo
-//!   precede.
-//! - **Continuo** (ratón y ejes): se agrupa en un [`InputPacket`] y sale como mucho cada
-//!   [`BATCH_INTERVAL`] (≤ 500 datagramas/s); el primero tras una pausa sale al momento. Dentro
-//!   del paquete los `MouseMove` se conservan uno a uno (el anfitrión los inyecta todos, en orden);
-//!   las posiciones absolutas y los ejes se quedan con el último valor. Por encima de
-//!   [`MAX_EVENTS`] eventos, los movimientos relativos se suman al último.
-//!
-//! - **Mandos tal cual** ([`PadData`]): la declaración del mando ([`PadData::Device`]) sale por el
-//!   stream como lo de estado; los informes HID ([`PadData::Report`]) van con el movimiento, todos
-//!   en orden (un informe puede ser la única pulsación de un botón), hasta [`MAX_PADS`] o
-//!   [`MAX_PAD_DATAGRAM_BYTES`] por datagrama.
+//! - Un **cambio de estado** (tecla, botón, rueda, mando que se conecta, [`InputEvent::ReleaseAll`])
+//!   sale al momento, con el movimiento que tuviera delante en el mismo paquete (un clic nunca
+//!   adelanta al movimiento que lo precede).
+//! - El **movimiento** (ratón y ejes) se agrupa como mucho [`BATCH_INTERVAL`] (≤ 1000 datagramas/s);
+//!   el primero tras una pausa sale al momento. Dentro del paquete los `MouseMove` se conservan uno
+//!   a uno (el anfitrión los inyecta todos, en orden); las posiciones absolutas y los ejes se
+//!   quedan con el último valor. Por encima de [`MAX_EVENTS`] eventos, los movimientos relativos se
+//!   suman al último.
+//! - Tras un cambio de estado, si no sale ningún otro paquete, el estado se **repite** a los
+//!   plazos de [`REPEATS`]: perder el datagrama de una tecla no la deja pegada ni sin pulsar, el
+//!   anfitrión lo arregla con el estado del siguiente ([`InputState::diff`]).
+//! - **Mandos tal cual** ([`PadData`]): la declaración del mando ([`PadData::Device`]) va por el
+//!   stream fiable (su descriptor no cabe en un datagrama); los informes HID ([`PadData::Report`])
+//!   van con el movimiento, todos en orden (un informe puede ser la única pulsación de un botón),
+//!   hasta [`MAX_PADS`] o [`MAX_PAD_DATAGRAM_BYTES`] por datagrama.
 //!
 //! Cada paquete lleva `sent_us`, la hora de su primer evento en el reloj del anfitrión
-//! ([`InputLink::remote_clock_us`]), para medir la latencia de entrada en el anfitrión. Se cifra con
-//! [`InputCipher`] (canal y secuencia propios de cada canal) y sale por el [`InputLink`] que da la
-//! sesión (la conexión QUIC).
+//! ([`InputLink::remote_clock_us`]), y `queued_us`, lo que ese evento esperó aquí hasta salir: el
+//! anfitrión mide así cada etapa. Se cifra con [`InputCipher`] (canal y secuencia propios de cada
+//! canal) y sale por el [`InputLink`] que da la sesión (la conexión QUIC).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -29,7 +32,8 @@ use std::time::{Duration, Instant};
 
 use coroom_crypto::input::{Channel, InputCipher};
 use coroom_proto::input::{
-    InputMessage, InputPacket, MAX_EVENTS, MAX_PADS, PadData, datagram_header, stream_frame,
+    InputMessage, InputPacket, InputState, MAX_EVENTS, MAX_PADS, PadData, datagram_header,
+    stream_frame,
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use tracing::debug;
@@ -37,10 +41,19 @@ use tracing::debug;
 use crate::{InputError, InputEvent};
 
 /// Intervalo mínimo entre dos datagramas de movimiento.
-pub const BATCH_INTERVAL: Duration = Duration::from_millis(2);
+pub const BATCH_INTERVAL: Duration = Duration::from_millis(1);
 
-/// Bytes de informes de mando por datagrama, como mucho (con lo demás, por debajo del MTU).
-pub const MAX_PAD_DATAGRAM_BYTES: usize = 900;
+/// Plazos, desde el último cambio de estado, a los que se repite el estado si no salió otro
+/// paquete: cubren una pérdida aislada y una ráfaga corta sin esperar al siguiente movimiento.
+pub const REPEATS: [Duration; 3] = [
+    Duration::from_millis(3),
+    Duration::from_millis(8),
+    Duration::from_millis(20),
+];
+
+/// Bytes de informes de mando por datagrama, como mucho (con el estado y lo demás, por debajo del
+/// MTU).
+pub const MAX_PAD_DATAGRAM_BYTES: usize = 800;
 
 /// Lo que llega al hilo `entrada`.
 #[derive(Debug)]
@@ -64,6 +77,7 @@ pub trait InputLink: Send + Sync {
 pub struct SenderStats {
     events: AtomicU64,
     datagrams: AtomicU64,
+    repeats: AtomicU64,
     messages: AtomicU64,
     bytes: AtomicU64,
     merged: AtomicU64,
@@ -75,9 +89,11 @@ pub struct SenderStats {
 pub struct SenderSnapshot {
     /// Eventos enviados.
     pub events: u64,
-    /// Datagramas (movimiento).
+    /// Datagramas (con eventos, informes o solo el estado).
     pub datagrams: u64,
-    /// Mensajes del stream (estado).
+    /// Datagramas que solo repiten el estado.
+    pub repeats: u64,
+    /// Mensajes del stream (declaraciones de mandos).
     pub messages: u64,
     /// Bytes enviados (cabeceras y etiquetas incluidas).
     pub bytes: u64,
@@ -94,6 +110,7 @@ impl SenderStats {
         SenderSnapshot {
             events: load(&self.events),
             datagrams: load(&self.datagrams),
+            repeats: load(&self.repeats),
             messages: load(&self.messages),
             bytes: load(&self.bytes),
             merged: load(&self.merged),
@@ -102,13 +119,15 @@ impl SenderStats {
     }
 }
 
-/// Movimiento continuo pendiente de enviar.
+/// Lo pendiente de salir en el siguiente datagrama.
 #[derive(Debug, Default)]
 struct Batch {
     events: Vec<InputEvent>,
     pads: Vec<PadData>,
     pad_bytes: usize,
     first: Option<Instant>,
+    /// Hay un cambio de estado: sale ya.
+    urgent: bool,
 }
 
 impl Batch {
@@ -121,6 +140,11 @@ impl Batch {
         self.pads.len() >= MAX_PADS || self.pad_bytes + len > MAX_PAD_DATAGRAM_BYTES
     }
 
+    /// Si un evento más que no se funde con otro ya no cabe.
+    fn events_full(&self) -> bool {
+        self.events.len() >= MAX_EVENTS
+    }
+
     fn push_pad(&mut self, pad: PadData, at: Instant) {
         self.first.get_or_insert(at);
         if let PadData::Report { data, .. } = &pad {
@@ -129,8 +153,9 @@ impl Batch {
         self.pads.push(pad);
     }
 
-    fn push(&mut self, event: InputEvent, at: Instant, stats: &SenderStats) {
-        self.first.get_or_insert(at);
+    /// Añade `event` (que ya se aplicó al estado). Lo continuo se funde con el último de su clase;
+    /// lo demás marca el paquete como urgente. Devuelve `false` si no cabía (hay que enviar antes).
+    fn push(&mut self, event: InputEvent, at: Instant, stats: &SenderStats) -> bool {
         match event {
             InputEvent::MouseMoveAbsolute { .. } => {
                 if let Some(last) = self
@@ -139,19 +164,21 @@ impl Batch {
                     .rev()
                     .find(|e| matches!(e, InputEvent::MouseMoveAbsolute { .. }))
                 {
+                    self.first.get_or_insert(at);
                     *last = event;
-                    return;
+                    return true;
                 }
             }
             InputEvent::GamepadAxis { slot, axis, .. } => {
                 if let Some(last) = self.events.iter_mut().rev().find(|e| {
                     matches!(e, InputEvent::GamepadAxis { slot: s, axis: a, .. } if *s == slot && *a == axis)
                 }) {
+                    self.first.get_or_insert(at);
                     *last = event;
-                    return;
+                    return true;
                 }
             }
-            InputEvent::MouseMove { dx, dy } if self.events.len() >= MAX_EVENTS => {
+            InputEvent::MouseMove { dx, dy } if self.events_full() => {
                 if let Some(InputEvent::MouseMove { dx: ldx, dy: ldy }) = self
                     .events
                     .iter_mut()
@@ -161,14 +188,18 @@ impl Batch {
                     *ldx = ldx.saturating_add(dx);
                     *ldy = ldy.saturating_add(dy);
                     stats.merged.fetch_add(1, Ordering::Relaxed);
-                    return;
+                    return true;
                 }
             }
             _ => {}
         }
-        if self.events.len() < MAX_EVENTS {
-            self.events.push(event);
+        if self.events_full() {
+            return false;
         }
+        self.first.get_or_insert(at);
+        self.urgent |= !event.is_continuous();
+        self.events.push(event);
+        true
     }
 }
 
@@ -177,23 +208,35 @@ struct Worker {
     cipher: Arc<Mutex<InputCipher>>,
     stats: Arc<SenderStats>,
     sealed: Vec<u8>,
+    state: InputState,
+    /// Último cambio de estado y cuántos paquetes han salido desde entonces (cada uno lleva el
+    /// estado, así que cuenta como repetición).
+    changed_at: Option<Instant>,
+    repeated: usize,
+    /// El cambio aún no salió: su propio paquete no cuenta como repetición.
+    carrying_change: bool,
 }
 
 impl Worker {
-    fn sent_us(&self, at: Option<Instant>) -> u32 {
-        at.and_then(|at| self.link.remote_clock_us(at))
+    fn remote_us(&self, at: Instant) -> u32 {
+        self.link
+            .remote_clock_us(at)
             // 0 significa "sin hora": un 0 de verdad se manda como 1 µs.
             .map_or(0, |us| (us as u32).max(1))
     }
 
-    fn send_batch(&mut self, batch: &mut Batch) {
-        if batch.is_empty() {
-            return;
-        }
+    /// Envía lo pendiente (o solo el estado, si no hay nada) como un datagrama.
+    fn send_batch(&mut self, batch: &mut Batch, now: Instant) {
         let events = std::mem::take(&mut batch.events);
         let pads = std::mem::take(&mut batch.pads);
         batch.pad_bytes = 0;
-        let sent_us = self.sent_us(batch.first.take());
+        batch.urgent = false;
+        let first = batch.first.take();
+        let sent_us = self.remote_us(first.unwrap_or(now));
+        let queued_us = first.map_or(0, |first| {
+            u16::try_from(now.saturating_duration_since(first).as_micros()).unwrap_or(u16::MAX)
+        });
+        let repeat = events.is_empty() && pads.is_empty();
         let count = (events.len() + pads.len()) as u64;
         let mut cipher = self.cipher.lock().unwrap_or_else(PoisonError::into_inner);
         let seq = cipher.next_seq(Channel::Datagram);
@@ -204,7 +247,9 @@ impl Worker {
         let packet = InputPacket {
             seq: seq32,
             sent_us,
+            queued_us,
             events,
+            state: self.state.clone(),
             pads,
         };
         let result = packet
@@ -227,29 +272,35 @@ impl Worker {
                 self.stats.datagrams.fetch_add(1, Ordering::Relaxed);
                 self.stats.events.fetch_add(count, Ordering::Relaxed);
                 self.stats.bytes.fetch_add(bytes, Ordering::Relaxed);
+                if repeat {
+                    self.stats.repeats.fetch_add(1, Ordering::Relaxed);
+                }
             }
             Err(err) => {
                 debug!(error = %err, "no se pudo enviar un datagrama de entrada");
                 self.stats.errors.fetch_add(1, Ordering::Relaxed);
             }
         }
+        if self.carrying_change {
+            self.carrying_change = false;
+        } else if self.changed_at.is_some() {
+            self.repeated += 1;
+            if self.repeated >= REPEATS.len() {
+                self.changed_at = None;
+            }
+        }
     }
 
-    fn send_message(&mut self, events: Vec<InputEvent>, pads: Vec<PadData>, at: Instant) {
-        let sent_us = self.sent_us(Some(at));
-        let count = (events.len() + pads.len()) as u64;
+    /// Declara un mando por el stream.
+    fn send_message(&mut self, pads: Vec<PadData>) {
+        let count = pads.len() as u64;
         let mut cipher = self.cipher.lock().unwrap_or_else(PoisonError::into_inner);
         let seq = cipher.next_seq(Channel::Stream);
         let Ok(seq32) = u32::try_from(seq) else {
             self.stats.errors.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        let message = InputMessage {
-            seq: seq32,
-            sent_us,
-            events,
-            pads,
-        };
+        let message = InputMessage { seq: seq32, pads };
         let result = message
             .to_bytes()
             .map_err(|err| err.to_string())
@@ -277,75 +328,86 @@ impl Worker {
         }
     }
 
+    /// Mete `item` en `batch`, enviando antes si no cabe. Un evento que cambia el estado reinicia
+    /// las repeticiones.
+    fn accept(&mut self, batch: &mut Batch, at: Instant, item: Item) {
+        match item {
+            Item::Event(event) => {
+                self.state.apply(&event);
+                if !event.is_continuous() {
+                    self.changed_at = Some(at);
+                    self.repeated = 0;
+                    self.carrying_change = true;
+                }
+                if !batch.push(event, at, &self.stats) {
+                    self.send_batch(batch, Instant::now());
+                    batch.push(event, at, &self.stats);
+                }
+            }
+            Item::Pad(pad @ PadData::Report { .. }) => {
+                let len = match &pad {
+                    PadData::Report { data, .. } => data.len(),
+                    PadData::Device { .. } => 0,
+                };
+                if batch.pads_full(len) {
+                    self.send_batch(batch, Instant::now());
+                }
+                batch.push_pad(pad, at);
+            }
+            Item::Pad(pad @ PadData::Device { .. }) => self.send_message(vec![pad]),
+        }
+    }
+
+    /// Cuándo toca repetir el estado, si queda alguna repetición.
+    fn next_repeat(&self) -> Option<Instant> {
+        let changed = self.changed_at?;
+        REPEATS.get(self.repeated).map(|delay| changed + *delay)
+    }
+
     fn run(mut self, rx: &Receiver<(Instant, Item)>) {
         let mut batch = Batch::default();
         // Hace tiempo que no sale nada: el primer movimiento sale al momento.
         let mut last_batch: Option<Instant> = None;
         loop {
+            let now = Instant::now();
             let due = last_batch.map(|at| at + BATCH_INTERVAL);
-            let wait = if batch.is_empty() {
-                Duration::from_millis(250)
-            } else {
-                due.map_or(Duration::ZERO, |due| {
-                    due.saturating_duration_since(Instant::now())
-                })
-            };
+            let mut wake = self.next_repeat();
+            if !batch.is_empty() {
+                let batch_due = if batch.urgent {
+                    now
+                } else {
+                    due.unwrap_or(now)
+                };
+                wake = Some(wake.map_or(batch_due, |wake| wake.min(batch_due)));
+            }
+            let wait = wake.map_or(Duration::from_millis(250), |wake| {
+                wake.saturating_duration_since(now)
+            });
             match rx.recv_timeout(wait) {
-                Ok((at, Item::Event(event))) if event.is_continuous() => {
-                    batch.push(event, at, &self.stats);
-                }
-                Ok((at, Item::Pad(pad @ PadData::Report { .. }))) => {
-                    let len = match &pad {
-                        PadData::Report { data, .. } => data.len(),
-                        PadData::Device { .. } => 0,
-                    };
-                    if batch.pads_full(len) {
-                        last_batch = Some(Instant::now());
-                        self.send_batch(&mut batch);
-                    }
-                    batch.push_pad(pad, at);
-                }
                 Ok((at, item)) => {
-                    // Lo de estado sale ya, con el movimiento anterior por delante.
-                    if !batch.is_empty() {
-                        last_batch = Some(Instant::now());
-                        self.send_batch(&mut batch);
+                    self.accept(&mut batch, at, item);
+                    // Lo que ya esté en cola va en el mismo paquete.
+                    while let Ok((at, item)) = rx.try_recv() {
+                        self.accept(&mut batch, at, item);
                     }
-                    let (mut events, mut pads) = (Vec::new(), Vec::new());
-                    match item {
-                        Item::Event(event) => events.push(event),
-                        Item::Pad(pad) => pads.push(pad),
-                    }
-                    while events.len() < MAX_EVENTS && pads.len() < MAX_PADS {
-                        match rx.try_recv() {
-                            Ok((at, Item::Event(event))) if event.is_continuous() => {
-                                batch.push(event, at, &self.stats);
-                            }
-                            Ok((at, Item::Pad(pad @ PadData::Report { .. }))) => {
-                                batch.push_pad(pad, at);
-                            }
-                            Ok((_, Item::Event(event))) => events.push(event),
-                            Ok((_, Item::Pad(pad))) => pads.push(pad),
-                            Err(_) => break,
-                        }
-                    }
-                    self.send_message(events, pads, at);
-                    if !batch.is_empty() {
-                        last_batch = Some(Instant::now());
-                        self.send_batch(&mut batch);
-                    }
-                    continue;
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
-                    self.send_batch(&mut batch);
+                    if !batch.is_empty() {
+                        self.send_batch(&mut batch, Instant::now());
+                    }
                     return;
                 }
             }
             let now = Instant::now();
-            if !batch.is_empty() && due.is_none_or(|due| now >= due) {
+            if !batch.is_empty() {
+                if batch.urgent || due.is_none_or(|due| now >= due) {
+                    last_batch = Some(now);
+                    self.send_batch(&mut batch, now);
+                }
+            } else if self.next_repeat().is_some_and(|at| at <= now) {
                 last_batch = Some(now);
-                self.send_batch(&mut batch);
+                self.send_batch(&mut batch, now);
             }
         }
     }
@@ -379,6 +441,10 @@ impl InputSender {
             cipher,
             stats: Arc::clone(&stats),
             sealed: Vec::with_capacity(256),
+            state: InputState::default(),
+            changed_at: None,
+            repeated: 0,
+            carrying_change: false,
         };
         let thread = thread::Builder::new()
             .name("entrada".into())
@@ -467,16 +533,42 @@ mod tests {
         PairwiseSecret::new([3u8; 32])
     }
 
-    #[test]
-    fn moves_are_batched_and_state_goes_on_the_stream() {
+    fn pair() -> (Arc<Captured>, InputSender, InputCipher) {
         let link = Arc::new(Captured::default());
         let guest = InputCipher::from_pairwise(&secret(), Role::Guest).unwrap();
-        let mut host = InputCipher::from_pairwise(&secret(), Role::Host).unwrap();
-        let mut sender = InputSender::spawn(
+        let host = InputCipher::from_pairwise(&secret(), Role::Host).unwrap();
+        let sender = InputSender::spawn(
             Arc::clone(&link) as Arc<dyn InputLink>,
             Arc::new(Mutex::new(guest)),
         )
         .unwrap();
+        (link, sender, host)
+    }
+
+    /// Abre los datagramas capturados, comprobando la clave, el canal y la secuencia seguida.
+    fn open_all(link: &Captured, host: &mut InputCipher) -> Vec<(Instant, InputPacket)> {
+        let datagrams = link.datagrams.lock().unwrap();
+        let mut out = Vec::new();
+        let mut last_seq = None;
+        datagrams
+            .iter()
+            .map(|(at, datagram)| {
+                let (key_id, sealed) = parse_datagram(datagram).unwrap();
+                assert_eq!(key_id, host.key_id());
+                let opened = host.open(sealed, &mut out).unwrap();
+                assert_eq!(opened.channel, Channel::Datagram);
+                let packet = InputPacket::from_bytes(opened.plaintext).unwrap();
+                assert_eq!(u64::from(packet.seq), opened.seq);
+                assert!(last_seq.is_none_or(|last| packet.seq == last + 1));
+                last_seq = Some(packet.seq);
+                (*at, packet)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn moves_are_batched_and_a_key_goes_at_once_with_the_state() {
+        let (link, mut sender, mut host) = pair();
         let start = Instant::now();
         for i in 0..200 {
             sender.send(InputEvent::MouseMove { dx: i + 1, dy: 0 });
@@ -493,63 +585,135 @@ mod tests {
         sender.stop();
         let stats = sender.stats();
         assert_eq!(stats.events, 201);
-        assert_eq!(stats.messages, 1);
+        assert_eq!(stats.messages, 0, "nada va por el stream");
         assert_eq!(stats.merged, 0);
 
-        let datagrams = link.datagrams.lock().unwrap();
-        // ≤ 500 paquetes/s: con 200 ms de movimiento, unos 100 (más alguno por el mensaje).
+        let packets = open_all(&link, &mut host);
+        // ≤ 1000 paquetes/s: con 200 ms de movimiento, unos 200 (más alguna repetición).
         assert!(
-            datagrams.len() <= 110 && datagrams.len() >= 60,
+            (100..=215).contains(&packets.len()),
             "{} datagramas",
-            datagrams.len()
+            packets.len()
         );
-        let gaps: Vec<Duration> = datagrams
+        let gaps: Vec<Duration> = packets
             .windows(2)
             .map(|pair| pair[1].0 - pair[0].0)
             .collect();
         let fast = gaps
             .iter()
-            .filter(|gap| **gap < Duration::from_micros(1500))
+            .filter(|gap| **gap < Duration::from_micros(700))
             .count();
         assert!(
             fast <= 3,
-            "{fast} datagramas a menos de 1,5 ms del anterior"
+            "{fast} datagramas a menos de 0,7 ms del anterior"
         );
 
         let mut moves = Vec::new();
-        let mut out = Vec::new();
-        let mut last_seq = None;
-        for (_, datagram) in datagrams.iter() {
-            let (key_id, sealed) = parse_datagram(datagram).unwrap();
-            assert_eq!(key_id, host.key_id());
-            let opened = host.open(sealed, &mut out).unwrap();
-            assert_eq!(opened.channel, Channel::Datagram);
-            let packet = InputPacket::from_bytes(opened.plaintext).unwrap();
-            assert_eq!(u64::from(packet.seq), opened.seq);
-            assert!(last_seq.is_none_or(|last| packet.seq == last + 1));
-            last_seq = Some(packet.seq);
+        let mut key_seen = false;
+        for (_, packet) in &packets {
             assert_eq!(packet.sent_us, 1234);
-            for event in packet.events {
-                if let InputEvent::MouseMove { dx, .. } = event {
-                    moves.push(dx);
+            for event in &packet.events {
+                match event {
+                    InputEvent::MouseMove { dx, .. } => moves.push(*dx),
+                    InputEvent::Key { code: 30, pressed } => {
+                        assert!(*pressed);
+                        key_seen = true;
+                    }
+                    other => panic!("evento inesperado {other:?}"),
                 }
             }
+            assert_eq!(packet.state.keys, if key_seen { vec![30] } else { vec![] });
+            assert_eq!(
+                packet.state.motion.0,
+                moves.iter().sum::<i32>(),
+                "el acumulado sigue a los eventos"
+            );
         }
         assert_eq!(moves, (1..=200).collect::<Vec<_>>(), "todos y en orden");
+        assert!(key_seen);
+        assert!(link.frames.lock().unwrap().is_empty());
+    }
 
+    #[test]
+    fn a_state_change_is_repeated_when_nothing_else_goes_out() {
+        let (link, mut sender, mut host) = pair();
+        sender.send(InputEvent::Key {
+            code: 30,
+            pressed: true,
+        });
+        std::thread::sleep(Duration::from_millis(60));
+        sender.send(InputEvent::MouseMove { dx: 1, dy: 0 });
+        std::thread::sleep(Duration::from_millis(60));
+        sender.stop();
+        let packets = open_all(&link, &mut host);
+        // La tecla, sus tres repeticiones y el movimiento (que no es cambio de estado: sin
+        // repeticiones).
+        assert_eq!(packets.len(), 1 + REPEATS.len() + 1, "{packets:?}");
+        assert_eq!(
+            packets[0].1.events,
+            vec![InputEvent::Key {
+                code: 30,
+                pressed: true
+            }]
+        );
+        for (index, (at, packet)) in packets.iter().enumerate().take(REPEATS.len() + 1).skip(1) {
+            assert!(packet.events.is_empty(), "repetición {index}: {packet:?}");
+            assert_eq!(packet.state.keys, vec![30]);
+            let since = *at - packets[0].0;
+            let expected = REPEATS[index - 1];
+            assert!(
+                since + Duration::from_millis(1) >= expected
+                    && since < expected + Duration::from_millis(15),
+                "repetición {index} a los {since:?} (se esperaba {expected:?})"
+            );
+        }
+        assert_eq!(
+            packets[4].1.events,
+            vec![InputEvent::MouseMove { dx: 1, dy: 0 }]
+        );
+        assert_eq!(packets[4].1.state.motion, (1, 0));
+        assert_eq!(sender.stats().repeats, REPEATS.len() as u64);
+    }
+
+    #[test]
+    fn a_pad_declaration_goes_on_the_stream_and_reports_by_datagram() {
+        let (link, mut sender, mut host) = pair();
+        let device = coroom_proto::input::GamepadDevice {
+            name: "Mando".to_owned(),
+            vendor: 1,
+            product: 2,
+            version: 3,
+            bus: 3,
+            transport: coroom_proto::input::GamepadTransport::XInput,
+        };
+        sender.send_pad(PadData::Device { slot: 1, device });
+        sender.send_pad(PadData::Report {
+            slot: 1,
+            data: vec![1, 2, 3],
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        sender.stop();
         let frames = link.frames.lock().unwrap();
         assert_eq!(frames.len(), 1);
         let mut buffer = coroom_proto::input::StreamFrames::new();
         buffer.extend(&frames[0]);
         let sealed = buffer.next_frame().unwrap().unwrap();
+        let mut out = Vec::new();
         let opened = host.open(&sealed, &mut out).unwrap();
         assert_eq!(opened.channel, Channel::Stream);
         let message = InputMessage::from_bytes(opened.plaintext).unwrap();
+        assert!(matches!(
+            message.pads[..],
+            [PadData::Device { slot: 1, .. }]
+        ));
+        drop(frames);
+        let packets = open_all(&link, &mut host);
+        assert_eq!(packets.len(), 1);
         assert_eq!(
-            message.events,
-            vec![InputEvent::Key {
-                code: 30,
-                pressed: true
+            packets[0].1.pads,
+            vec![PadData::Report {
+                slot: 1,
+                data: vec![1, 2, 3]
             }]
         );
     }
@@ -590,9 +754,10 @@ mod tests {
                 }
             ]
         );
+        assert!(!batch.urgent);
         let mut full = Batch::default();
         for _ in 0..MAX_EVENTS + 5 {
-            full.push(InputEvent::MouseMove { dx: 1, dy: 2 }, now, &stats);
+            assert!(full.push(InputEvent::MouseMove { dx: 1, dy: 2 }, now, &stats));
         }
         assert_eq!(full.events.len(), MAX_EVENTS);
         assert_eq!(
@@ -600,5 +765,14 @@ mod tests {
             Some(&InputEvent::MouseMove { dx: 6, dy: 12 })
         );
         assert_eq!(stats.snapshot().merged, 5);
+        // Una tecla no se funde: con el paquete lleno hay que enviar antes.
+        assert!(!full.push(
+            InputEvent::Key {
+                code: 1,
+                pressed: true
+            },
+            now,
+            &stats
+        ));
     }
 }

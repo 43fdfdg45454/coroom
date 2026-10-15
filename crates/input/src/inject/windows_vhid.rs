@@ -19,7 +19,7 @@
 //!   descriptor, el INF y los scripts del driver y comprueban que este módulo dice lo mismo.
 //! - **Ranuras**: las del cable van de 1 a 8; los mandos HID del driver, de 0 a 7 (la ranura
 //!   menos uno), y los Xbox 360, de 0 a 3 (el primero libre).
-//! - **Ritmo** (mandos convertidos): un informe en cada cambio, con tope de 250 Hz
+//! - **Ritmo** (mandos convertidos): un informe en cada cambio, con tope de 500 Hz
 //!   ([`REPORT_INTERVAL`]) para los ejes; los botones y la cruceta salen siempre al momento. Un
 //!   hilo (`coroom-vhid`) manda lo que esperaba su turno y repite el estado cada
 //!   [`KEEPALIVE_INTERVAL`]: si el driver pasa [`WATCHDOG`] sin noticias, deja el mando en
@@ -143,8 +143,8 @@ pub const GENERIC_DESCRIPTOR: [u8; 85] = [
     0x45, 0x00, 0x81, 0x03, 0xC0,
 ];
 
-/// Tope de ritmo de los informes de ejes por mando: 250 Hz.
-pub const REPORT_INTERVAL: Duration = Duration::from_millis(4);
+/// Tope de ritmo de los informes de ejes por mando: 500 Hz.
+pub const REPORT_INTERVAL: Duration = Duration::from_millis(2);
 
 /// Sin informes durante este tiempo, el driver deja el mando en reposo
 /// (`COROOM_VHID_WATCHDOG_MS`).
@@ -2433,7 +2433,7 @@ mod tests {
     }
 
     #[test]
-    fn the_pacer_caps_axes_at_250_hz_but_never_delays_buttons() {
+    fn the_pacer_caps_axes_at_500_hz_but_never_delays_buttons() {
         let t0 = Instant::now();
         let ms = |n: u64| t0 + Duration::from_millis(n);
         let mut pacer = ReportPacer::default();
@@ -2451,26 +2451,27 @@ mod tests {
         );
         assert_eq!(pacer.deadline(), None);
 
-        // Ejes antes de 4 ms: esperan, y el más nuevo sustituye al anterior.
+        // Ejes antes de 2 ms: esperan, y el más nuevo sustituye al anterior.
+        let us = |n: u64| t0 + Duration::from_micros(n);
         pad.set_axis(GamepadAxis::LeftX, 100);
-        assert_eq!(pacer.offer(hid(&pad), ms(1)), None);
+        assert_eq!(pacer.offer(hid(&pad), us(500)), None);
         pad.set_axis(GamepadAxis::LeftX, 200);
-        assert_eq!(pacer.offer(hid(&pad), ms(2)), None);
-        assert_eq!(pacer.deadline(), Some(ms(4)));
-        assert_eq!(pacer.take_due(ms(3)), None);
-        let due = pacer.take_due(ms(4)).expect("vence a los 4 ms");
+        assert_eq!(pacer.offer(hid(&pad), ms(1)), None);
+        assert_eq!(pacer.deadline(), Some(ms(2)));
+        assert_eq!(pacer.take_due(us(1_500)), None);
+        let due = pacer.take_due(ms(2)).expect("vence a los 2 ms");
         assert_eq!(hat_of(due), pad.to_bytes(), "el último valor");
-        pacer.sent(due, ms(4));
+        pacer.sent(due, ms(2));
         assert_eq!(pacer.deadline(), None);
 
-        // Un botón sale al momento aunque no hayan pasado 4 ms, con los ejes al día.
+        // Un botón sale al momento aunque no hayan pasado 2 ms, con los ejes al día.
         pad.set_axis(GamepadAxis::LeftX, 300);
-        assert_eq!(pacer.offer(hid(&pad), ms(5)), None);
+        assert_eq!(pacer.offer(hid(&pad), us(2_500)), None);
         pad.set_button(GamepadButton::A, true);
-        let now = pacer.offer(hid(&pad), ms(5)).expect("botón");
+        let now = pacer.offer(hid(&pad), us(2_500)).expect("botón");
         assert_eq!(hat_of(now), pad.to_bytes());
         assert_eq!(pacer.deadline(), None, "lo pendiente iba incluido");
-        pacer.sent(now, ms(5));
+        pacer.sent(now, us(2_500));
         pad.set_button(GamepadButton::A, false);
         assert!(
             pacer.offer(hid(&pad), ms(5)).is_some(),

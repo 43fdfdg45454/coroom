@@ -4,14 +4,23 @@
 //! [`InputCipher`] indexado por su `key_id`. Por cada conexión (la directa de cada invitado y la del
 //! relay, que trae a varios) hay dos tareas: una lee los datagramas de la pista `Input` (separados
 //! de los de medios por la propia conexión) y otra acepta los streams de entrada que abre el
-//! invitado. Las dos abren el sellado (que autentica al invitado: sin su clave no abre), miden la
-//! latencia `recibido − enviado` con el reloj del `MediaSender` de ese invitado (el que contesta a
-//! sus `Ping`) y pasan los eventos al hilo `inject`, el único que toca el [`InputSink`]. Ese hilo
-//! lleva el estado autoritativo de permisos y pausa, así que todo pasa en orden: lo no permitido se
-//! descarta y se cuenta, la pausa descarta todo y suelta lo pulsado (`release_all`), al quitar o
-//! cambiar la ranura se destruye o crea el mando, y al expulsar o perder a un invitado se suelta
-//! lo suyo y se libera su ranura. Los datagramas más antiguos que el último aplicado se descartan.
-//! Los contadores y la latencia de cada invitado salen en su `GuestStatus` y en el resumen.
+//! invitado (solo declaraciones de mandos). Las dos abren el sellado (que autentica al invitado:
+//! sin su clave no abre) y pasan lo que llega al hilo `inject`, el único que toca el [`InputSink`].
+//! Ese hilo lleva el estado autoritativo de permisos y pausa, así que todo pasa en orden: lo no
+//! permitido se descarta y se cuenta, la pausa descarta todo y suelta lo pulsado (`release_all`),
+//! al quitar o cambiar la ranura se destruye o crea el mando, y al expulsar o perder a un invitado
+//! se suelta lo suyo y se libera su ranura.
+//!
+//! Cada paquete trae los eventos y el estado completo del invitado ([`InputState`]). Con la
+//! secuencia seguida se aplican los eventos en orden; si falta alguna (se perdió un datagrama), el
+//! hilo compara su vista del invitado con el estado que llega y aplica la diferencia
+//! ([`InputState::diff`]): nada se queda pulsado ni sin pulsar. Lo más antiguo que lo último
+//! aplicado se descarta.
+//!
+//! **Latencia por etapas**: con `queued_us` del paquete (captura → envío en el invitado),
+//! `recibido − enviado` en el reloj del `MediaSender` de ese invitado (el que contesta a sus
+//! `Ping`) y el tiempo de inyección medido aquí, cada invitado tiene su captura → inyectado
+//! desglosado en su `GuestStatus`, en el resumen y en el `InputReport` que se le devuelve.
 //!
 //! **Invitado** ([`GuestInput`]): con la conexión abierta y su secreto pareja a pareja, abre el
 //! stream de entrada (preámbulo con su `key_id`), crea el [`InputSender`] y lo deja listo para la
@@ -36,8 +45,9 @@ use coroom_transport::crypto::input::{Channel, InputCipher, Role};
 use coroom_transport::media::{MediaReceiver, MediaSender};
 use coroom_transport::proto::hid;
 use coroom_transport::proto::input::{
-    GamepadDevice, GamepadTransport, InputMessage, InputPacket, PadData, STREAM_PREAMBLE_LEN,
-    StreamFrames, parse_datagram, parse_stream_preamble, seq_after, stream_preamble,
+    GamepadDevice, GamepadTransport, InputMessage, InputPacket, InputState, PadData,
+    STREAM_PREAMBLE_LEN, StreamFrames, parse_datagram, parse_stream_preamble, seq_after,
+    stream_preamble,
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use tracing::debug;
@@ -84,15 +94,22 @@ fn pointer_area(area: coroom_capture::SharedArea) -> PointerArea {
 
 /// Trabajo del hilo `inject`.
 pub(crate) enum Job {
-    /// Eventos de un invitado ya autenticados.
+    /// Paquete de un invitado ya autenticado.
     Packet {
         guest: GuestId,
-        datagram: bool,
         seq: u32,
+        /// Cuándo llegó el datagrama.
+        received: Instant,
+        /// Captura → envío en el invitado, en µs.
+        queued_us: u16,
+        /// Captura → recibido, en µs (con el reloj sincronizado), si se conoce.
+        network_us: Option<u64>,
         events: Vec<InputEvent>,
+        state: InputState,
         pads: Vec<PadData>,
-        latency_us: Option<u64>,
     },
+    /// Declaraciones de mandos tal cual de un invitado (por el stream).
+    Declare { guest: GuestId, pads: Vec<PadData> },
     /// Permisos nuevos.
     Permissions {
         guest: GuestId,
@@ -196,7 +213,6 @@ impl HostInput {
             Arc::clone(core),
             conn.clone(),
             only,
-            Arc::clone(clock),
         ));
     }
 }
@@ -248,10 +264,12 @@ async fn datagram_reader(
         };
         input.job(Job::Packet {
             guest,
-            datagram: true,
             seq: packet.seq,
-            latency_us: latency_us(&clock, received, packet.sent_us),
+            received,
+            queued_us: packet.queued_us,
+            network_us: latency_us(&clock, received, packet.sent_us),
             events: packet.events,
+            state: packet.state,
             pads: packet.pads,
         });
     }
@@ -262,7 +280,6 @@ async fn stream_acceptor(
     core: Arc<Core>,
     conn: PeerConnection,
     only: Option<GuestId>,
-    clock: Arc<MediaSender>,
 ) {
     while let Ok((send, recv)) = conn.accept_input().await {
         tokio::spawn(stream_reader(
@@ -271,7 +288,6 @@ async fn stream_acceptor(
             send,
             recv,
             only,
-            Arc::clone(&clock),
         ));
     }
 }
@@ -282,7 +298,6 @@ async fn stream_reader(
     _send: coroom_transport::SendStream,
     mut recv: coroom_transport::RecvStream,
     only: Option<GuestId>,
-    clock: Arc<MediaSender>,
 ) {
     let mut preamble = [0u8; STREAM_PREAMBLE_LEN];
     match tokio::time::timeout(KEY_WAIT, recv.read_exact(&mut preamble)).await {
@@ -319,7 +334,6 @@ async fn stream_reader(
             Ok(Some(chunk)) => chunk,
             Ok(None) | Err(_) => return,
         };
-        let received = Instant::now();
         frames.extend(&chunk.bytes);
         loop {
             let sealed = match frames.next_frame() {
@@ -345,12 +359,8 @@ async fn stream_reader(
                 input.rejected.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
-            input.job(Job::Packet {
+            input.job(Job::Declare {
                 guest,
-                datagram: false,
-                seq: message.seq,
-                latency_us: latency_us(&clock, received, message.sent_us),
-                events: message.events,
                 pads: message.pads,
             });
         }
@@ -411,15 +421,43 @@ fn check_device(device: &GamepadDevice, permissions: &Permissions) -> Result<(),
     }
 }
 
+/// Muestras de una etapa, las últimas [`LATENCY_WINDOW`].
+#[derive(Default)]
+struct Samples(VecDeque<u64>);
+
+impl Samples {
+    fn push(&mut self, us: u64) {
+        self.0.push_back(us);
+        while self.0.len() > LATENCY_WINDOW {
+            self.0.pop_front();
+        }
+    }
+
+    fn p50(&self) -> u64 {
+        let mut sorted: Vec<u64> = self.0.iter().copied().collect();
+        sorted.sort_unstable();
+        sorted.get(sorted.len() / 2).copied().unwrap_or(0)
+    }
+}
+
 /// Estado de entrada de un invitado en el hilo `inject`.
 #[derive(Default)]
 struct GuestState {
     permissions: Permissions,
     pad: Option<PadState>,
-    last_datagram: Option<u32>,
+    /// Última secuencia aplicada.
+    last_seq: Option<u32>,
+    /// Lo que el invitado tiene pulsado y acumulado, según lo aplicado hasta ahora.
+    view: InputState,
     applied: u64,
     dropped: u64,
-    latencies: VecDeque<u64>,
+    /// Huecos de secuencia reconciliados con el estado.
+    repaired: u64,
+    /// Captura → inyectado.
+    latencies: Samples,
+    queue: Samples,
+    network: Samples,
+    inject: Samples,
     dirty: bool,
 }
 
@@ -500,15 +538,19 @@ impl Worker {
         match job {
             Job::Packet {
                 guest,
-                datagram,
                 seq,
+                received,
+                queued_us,
+                network_us,
                 events,
+                state,
                 pads,
-                latency_us,
             } => {
-                self.packet(guest, datagram, seq, &events, latency_us);
-                self.pads(guest, pads);
+                if self.packet(guest, seq, received, queued_us, network_us, events, state) {
+                    self.pads(guest, pads);
+                }
             }
+            Job::Declare { guest, pads } => self.pads(guest, pads),
             Job::Permissions { guest, permissions } => self.permissions(guest, permissions),
             Job::Eis(eis) => self.sink.replace_eis(eis),
             Job::Paused(paused) => {
@@ -534,46 +576,51 @@ impl Worker {
         }
     }
 
+    /// Aplica un paquete; devuelve `false` si se descartó entero (antiguo o en pausa).
+    #[allow(clippy::too_many_arguments)]
     fn packet(
         &mut self,
         guest: GuestId,
-        datagram: bool,
         seq: u32,
-        events: &[InputEvent],
-        latency_us: Option<u64>,
-    ) {
+        received: Instant,
+        queued_us: u16,
+        network_us: Option<u64>,
+        events: Vec<InputEvent>,
+        state: InputState,
+    ) -> bool {
         let paused = self.paused;
-        let state = self.guests.entry(guest).or_default();
-        state.dirty = true;
-        if let Some(us) = latency_us {
-            state.latencies.push_back(us);
-            while state.latencies.len() > LATENCY_WINDOW {
-                state.latencies.pop_front();
-            }
-            self.core.ledger.record_input_latency(us);
+        let entry = self.guests.entry(guest).or_default();
+        entry.dirty = true;
+        // Lo más antiguo que lo último aplicado (o repetido) ya no sirve.
+        if entry.last_seq.is_some_and(|last| !seq_after(seq, last)) {
+            entry.dropped += events.len() as u64;
+            self.totals.1 += events.len() as u64;
+            return false;
         }
-        let count = events.len() as u64;
+        let gap = entry
+            .last_seq
+            .is_some_and(|last| last.wrapping_add(1) != seq);
+        entry.last_seq = Some(seq);
         if paused {
-            state.dropped += count;
-            self.totals.1 += count;
-            return;
+            entry.dropped += events.len() as u64;
+            self.totals.1 += events.len() as u64;
+            // En pausa no se inyecta, pero la vista sigue al invitado: al reanudar no se
+            // reconstruye lo que pulsó durante la pausa.
+            entry.view = state;
+            return false;
         }
-        if datagram {
-            // El movimiento más antiguo que el último aplicado ya no sirve.
-            if state
-                .last_datagram
-                .is_some_and(|last| !seq_after(seq, last))
-            {
-                state.dropped += count;
-                self.totals.1 += count;
-                return;
-            }
-            state.last_datagram = Some(seq);
-        }
-        let permissions = state.permissions;
+        // Con hueco, los eventos de este paquete presuponen los perdidos: se aplica la diferencia
+        // entre la vista y el estado que llega, que los incluye.
+        let events = if gap {
+            entry.repaired += 1;
+            entry.view.diff(&state)
+        } else {
+            events
+        };
+        let permissions = entry.permissions;
         let mut errors = Vec::new();
         let (mut applied, mut dropped) = (0u64, 0u64);
-        for event in events {
+        for event in &events {
             let allowed = match event.class() {
                 EventClass::KeyboardMouse => permissions.keyboard_mouse,
                 EventClass::Gamepad(slot) => permissions.gamepad_slot == Some(slot),
@@ -598,15 +645,34 @@ impl Worker {
                 }
             }
         }
-        if let Some(state) = self.guests.get_mut(&guest) {
-            state.applied += applied;
-            state.dropped += dropped;
+        let injected = Instant::now();
+        if let Some(entry) = self.guests.get_mut(&guest) {
+            entry.view = state;
+            entry.applied += applied;
+            entry.dropped += dropped;
+            if !events.is_empty() {
+                let inject_us = injected.saturating_duration_since(received).as_micros() as u64;
+                entry.inject.push(inject_us);
+                entry.queue.push(u64::from(queued_us));
+                if let Some(network_us) = network_us {
+                    entry.network.push(network_us);
+                    let total = network_us + inject_us;
+                    entry.latencies.push(total);
+                    self.core.ledger.record_input_latency(
+                        total,
+                        u64::from(queued_us),
+                        network_us,
+                        inject_us,
+                    );
+                }
+            }
         }
         self.totals.0 += applied;
         self.totals.1 += dropped;
         for err in errors {
             self.warn(&err);
         }
+        true
     }
 
     fn permissions(&mut self, guest: GuestId, permissions: Permissions) {
@@ -819,9 +885,15 @@ impl Worker {
                 (
                     *guest,
                     InputLatency::from_samples(
-                        state.latencies.iter().copied().collect(),
+                        state.latencies.0.iter().copied().collect(),
                         state.applied,
                         state.dropped,
+                    )
+                    .with_stages(
+                        state.queue.p50(),
+                        state.network.p50(),
+                        state.inject.p50(),
+                        state.repaired,
                     ),
                     state.pad.as_ref().map(PadState::status),
                 )
@@ -1066,4 +1138,148 @@ pub(crate) async fn open_guest_input(
         .map_err(|err| err.to_string())?;
     core.guest_input.set_sender(Some(sender));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coroom_input::inject::RecordingSink;
+    use coroom_transport::crypto::Identity;
+    use coroom_transport::proto::input::MouseButton;
+
+    use crate::Role;
+    use crate::latency::LatencyLedger;
+
+    fn worker(sink: &RecordingSink) -> Worker {
+        let core = Arc::new(Core::new(
+            Role::Host,
+            Identity::generate().expect("identidad"),
+            Arc::new(LatencyLedger::default()),
+            true,
+        ));
+        Worker::new(core, Box::new(sink.clone()))
+    }
+
+    fn key(code: u16, pressed: bool) -> InputEvent {
+        InputEvent::Key { code, pressed }
+    }
+
+    /// Un paquete con `events` y el estado que resulta de aplicarlos a `before`.
+    fn packet(
+        worker: &mut Worker,
+        guest: GuestId,
+        seq: u32,
+        before: &InputState,
+        events: Vec<InputEvent>,
+    ) -> InputState {
+        let mut state = before.clone();
+        for event in &events {
+            state.apply(event);
+        }
+        worker.handle(Job::Packet {
+            guest,
+            seq,
+            received: Instant::now(),
+            queued_us: 120,
+            network_us: Some(3_000),
+            events,
+            state: state.clone(),
+            pads: Vec::new(),
+        });
+        state
+    }
+
+    /// Con la secuencia seguida se aplican los eventos; con un hueco, la diferencia entre la
+    /// vista y el estado que llega (lo que se perdió incluido); lo antiguo se descarta y una
+    /// repetición sin cambios no inyecta nada.
+    #[test]
+    fn lost_packets_are_reconciled_from_the_state() {
+        let sink = RecordingSink::new();
+        let mut worker = worker(&sink);
+        let guest = GuestId(1);
+        let kbm = Permissions {
+            keyboard_mouse: true,
+            ..Permissions::VIEW_ONLY
+        };
+        worker.handle(Job::Permissions {
+            guest,
+            permissions: kbm,
+        });
+
+        // seq 0: A abajo. Llega y se aplica tal cual.
+        let s0 = packet(
+            &mut worker,
+            guest,
+            0,
+            &InputState::default(),
+            vec![key(30, true)],
+        );
+        assert_eq!(sink.events_of(guest), vec![key(30, true)]);
+
+        // seq 1 (se perderá): A arriba, clic izquierdo abajo y 5 px de movimiento.
+        let mut s1 = s0.clone();
+        for event in [
+            key(30, false),
+            InputEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: true,
+            },
+            InputEvent::MouseMove { dx: 5, dy: 0 },
+        ] {
+            s1.apply(&event);
+        }
+        // seq 2: B abajo y 2 px más, sobre el estado de seq 1. Llega con hueco.
+        packet(
+            &mut worker,
+            guest,
+            2,
+            &s1,
+            vec![key(48, true), InputEvent::MouseMove { dx: 2, dy: 0 }],
+        );
+        let events = sink.events_of(guest);
+        assert_eq!(
+            events,
+            vec![
+                key(30, true),
+                // Reconciliación: lo que se suelta, lo que se pulsa (teclas y luego botones), el
+                // movimiento que falta.
+                key(30, false),
+                key(48, true),
+                InputEvent::MouseButton {
+                    button: MouseButton::Left,
+                    pressed: true,
+                },
+                InputEvent::MouseMove { dx: 7, dy: 0 },
+            ]
+        );
+
+        // seq 1 llega tarde: se descarta entero.
+        let late = s1.clone();
+        worker.handle(Job::Packet {
+            guest,
+            seq: 1,
+            received: Instant::now(),
+            queued_us: 0,
+            network_us: None,
+            events: vec![key(30, false)],
+            state: late,
+            pads: Vec::new(),
+        });
+        assert_eq!(sink.events_of(guest).len(), 5, "lo antiguo no se aplica");
+
+        // seq 3: repetición del estado sin eventos: nada que inyectar.
+        let s2 = worker.guests[&guest].view.clone();
+        packet(&mut worker, guest, 3, &s2, Vec::new());
+        assert_eq!(sink.events_of(guest).len(), 5);
+
+        let state = &worker.guests[&guest];
+        assert_eq!(state.repaired, 1);
+        assert_eq!(state.applied, 5);
+        assert_eq!(state.dropped, 1, "el paquete tardío");
+        assert_eq!(state.last_seq, Some(3));
+        // Dos paquetes con eventos aplicados: dos muestras por etapa.
+        assert_eq!(state.latencies.0.len(), 2);
+        assert_eq!(state.queue.p50(), 120);
+        assert_eq!(state.network.p50(), 3_000);
+    }
 }

@@ -314,9 +314,10 @@ fn b_a_1000_hz_mouse_loses_nothing_and_keys_keep_their_order() {
     );
     assert_eq!(sent.merged, 0);
     assert!(
-        sent.datagrams as f64 / report.elapsed.as_secs_f64() <= 520.0,
-        "como mucho un datagrama cada 2 ms"
+        sent.datagrams as f64 / report.elapsed.as_secs_f64() <= 1_040.0,
+        "como mucho un datagrama cada ms"
     );
+    assert_eq!(sent.messages, 0, "nada va por el stream");
     assert_eq!(input.dropped, 0, "{input:?}");
     assert_eq!(input.applied, total);
     guest.close();
@@ -687,7 +688,7 @@ fn g_input_through_the_relay_arrives_complete() {
         sink.events_of(id).len() >= 1002
     });
     let events = sink.events_of(id);
-    // El stream y los datagramas no se ordenan entre sí; dentro de cada canal, sí.
+    // Todo va por datagramas, en orden.
     let keys: Vec<InputEvent> = events
         .iter()
         .copied()

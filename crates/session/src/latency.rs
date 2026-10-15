@@ -544,10 +544,18 @@ pub struct InputLatency {
     pub applied: u64,
     /// Eventos descartados (permisos, pausa, antigüedad o el sistema no los aceptó).
     pub dropped: u64,
+    /// Mediana de captura → envío en el invitado, en µs.
+    pub queue_p50_us: u64,
+    /// Mediana de envío → recibido en el anfitrión (red, con el reloj sincronizado), en µs.
+    pub network_p50_us: u64,
+    /// Mediana de recibido → inyectado en el anfitrión, en µs.
+    pub inject_p50_us: u64,
+    /// Huecos de secuencia (datagramas perdidos) reconciliados con el estado del paquete.
+    pub repaired: u64,
 }
 
 impl InputLatency {
-    /// Estadísticas de unas muestras en µs (se ordenan aquí).
+    /// Estadísticas de unas muestras de captura → inyectado en µs (se ordenan aquí).
     pub fn from_samples(mut samples: Vec<u64>, applied: u64, dropped: u64) -> InputLatency {
         samples.sort_unstable();
         InputLatency {
@@ -558,7 +566,26 @@ impl InputLatency {
             max_us: samples.last().copied().unwrap_or(0),
             applied,
             dropped,
+            queue_p50_us: 0,
+            network_p50_us: 0,
+            inject_p50_us: 0,
+            repaired: 0,
         }
+    }
+
+    /// Añade el desglose por etapas (medianas en µs) y los huecos reparados.
+    pub fn with_stages(
+        mut self,
+        queue_p50_us: u64,
+        network_p50_us: u64,
+        inject_p50_us: u64,
+        repaired: u64,
+    ) -> InputLatency {
+        self.queue_p50_us = queue_p50_us;
+        self.network_p50_us = network_p50_us;
+        self.inject_p50_us = inject_p50_us;
+        self.repaired = repaired;
+        self
     }
 }
 
@@ -566,15 +593,20 @@ impl fmt::Display for InputLatency {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Entrada: p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms · máx {:.2} ms ({} muestras) · {} \
-             eventos aplicados, {} descartados",
+            "Entrada (captura → inyectado): p50 {:.2} ms · p95 {:.2} ms · p99 {:.2} ms · máx {:.2} \
+             ms ({} muestras) · etapas p50: cola {:.2} ms, red {:.2} ms, inyección {:.2} ms · {} \
+             eventos aplicados, {} descartados, {} huecos reparados",
             ms(self.p50_us),
             ms(self.p95_us),
             ms(self.p99_us),
             ms(self.max_us),
             self.samples,
+            ms(self.queue_p50_us),
+            ms(self.network_p50_us),
+            ms(self.inject_p50_us),
             self.applied,
-            self.dropped
+            self.dropped,
+            self.repaired
         )
     }
 }
@@ -743,8 +775,10 @@ struct Inner {
     video: Option<String>,
     /// Copias a CPU por etapa: fotogramas contados y copias.
     copies: [(u64, u64); STAGES],
-    /// Latencias de entrada en µs (las últimas [`LatencyLedger::WINDOW`]).
+    /// Latencias de entrada captura → inyectado en µs (las últimas [`LatencyLedger::WINDOW`]).
     input: VecDeque<u64>,
+    /// Etapas de la entrada en µs: cola en el invitado, red e inyección.
+    input_stages: [VecDeque<u64>; 3],
     /// Eventos de entrada aplicados y descartados.
     input_counts: (u64, u64),
     /// Latencia de entrada que informa el anfitrión (en el invitado).
@@ -878,12 +912,23 @@ impl LatencyLedger {
         }
     }
 
-    /// Anota una latencia de entrada (`recibido − enviado`) en µs.
-    pub fn record_input_latency(&self, us: u64) {
+    /// Anota una latencia de entrada captura → inyectado en µs, con sus etapas (cola en el
+    /// invitado, red e inyección).
+    pub fn record_input_latency(&self, us: u64, queue_us: u64, network_us: u64, inject_us: u64) {
         let mut inner = self.lock();
         inner.input.push_back(us);
         while inner.input.len() > Self::WINDOW {
             inner.input.pop_front();
+        }
+        for (stage, value) in inner
+            .input_stages
+            .iter_mut()
+            .zip([queue_us, network_us, inject_us])
+        {
+            stage.push_back(value);
+            while stage.len() > Self::WINDOW {
+                stage.pop_front();
+            }
         }
     }
 
@@ -1103,10 +1148,21 @@ impl LatencyLedger {
             input: inner.input_report.or_else(|| {
                 let (applied, dropped) = inner.input_counts;
                 (!inner.input.is_empty() || applied + dropped > 0).then(|| {
+                    let p50 = |stage: &VecDeque<u64>| {
+                        let mut sorted: Vec<u64> = stage.iter().copied().collect();
+                        sorted.sort_unstable();
+                        nearest_rank(&sorted, 50.0)
+                    };
                     InputLatency::from_samples(
                         inner.input.iter().copied().collect(),
                         applied,
                         dropped,
+                    )
+                    .with_stages(
+                        p50(&inner.input_stages[0]),
+                        p50(&inner.input_stages[1]),
+                        p50(&inner.input_stages[2]),
+                        0,
                     )
                 })
             }),

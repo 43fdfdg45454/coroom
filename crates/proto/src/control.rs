@@ -341,6 +341,14 @@ pub enum ControlMessage {
         applied: u64,
         /// Eventos descartados por permisos, pausa o antigüedad (acumulado).
         dropped: u64,
+        /// Mediana de captura → envío en el invitado, en µs (lo que dijo cada paquete).
+        queue_p50_us: u32,
+        /// Mediana de envío → recibido (red), en µs.
+        network_p50_us: u32,
+        /// Mediana de recibido → inyectado, en µs.
+        inject_p50_us: u32,
+        /// Huecos de secuencia reconciliados con el estado (acumulado).
+        repaired: u64,
     },
     /// Anfitrión → invitado: formato de una pista de audio (`Audio` o `Voice`), al conectar y si
     /// cambia.
@@ -665,13 +673,27 @@ mod tests {
             ),
             any::<[u32; 2]>()
                 .prop_map(|[width, height]| ControlMessage::HostFrameSize { width, height }),
-            (any::<[u32; 3]>(), any::<[u64; 2]>()).prop_map(
-                |([samples, p50_us, p95_us], [applied, dropped])| ControlMessage::InputReport {
+            (any::<[u32; 6]>(), any::<[u64; 3]>()).prop_map(
+                |(
+                    [
+                        samples,
+                        p50_us,
+                        p95_us,
+                        queue_p50_us,
+                        network_p50_us,
+                        inject_p50_us,
+                    ],
+                    [applied, dropped, repaired],
+                )| ControlMessage::InputReport {
                     samples,
                     p50_us,
                     p95_us,
                     applied,
                     dropped,
+                    queue_p50_us,
+                    network_p50_us,
+                    inject_p50_us,
+                    repaired,
                 }
             ),
             (track(), any::<u32>(), any::<[u8; 2]>(), any::<u32>()).prop_map(

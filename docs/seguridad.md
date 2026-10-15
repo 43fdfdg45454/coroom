@@ -286,7 +286,7 @@ señalización no deja salas abiertas al cerrarse la sesión.
 |---|---|---:|---:|
 | `proto_media` | Cabecera de objetos v2 | 63,4 M | 42 |
 | `proto_audio` | Cabecera de audio | 76,7 M | 18 |
-| `proto_input` | `InputPacket`, `InputMessage`, datagramas y stream de entrada | 24,6 M | 523 |
+| `proto_input` | `InputPacket` (con `InputState` y su reconciliación), `InputMessage`, datagramas y stream de entrada | 24,6 M | 523 |
 | `proto_hid` | Descriptores HID del mando tal cual | 2,4 M | — |
 | `proto_control` | Mensajes de control enmarcados, en trozos | 11,0 M | 1 197 |
 | `proto_signal` | Mensajes de señalización con el máximo del servidor | 8,2 M | 759 |

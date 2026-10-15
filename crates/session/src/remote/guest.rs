@@ -1105,6 +1105,10 @@ async fn control_loop(
                 p95_us,
                 applied,
                 dropped,
+                queue_p50_us,
+                network_p50_us,
+                inject_p50_us,
+                repaired,
             }) => {
                 let report = crate::latency::InputLatency {
                     samples: samples as usize,
@@ -1114,6 +1118,10 @@ async fn control_loop(
                     max_us: u64::from(p95_us),
                     applied,
                     dropped,
+                    queue_p50_us: u64::from(queue_p50_us),
+                    network_p50_us: u64::from(network_p50_us),
+                    inject_p50_us: u64::from(inject_p50_us),
+                    repaired,
                 };
                 core.guest_input.set_report(report);
                 core.ledger.set_input_report(report);
