@@ -717,6 +717,14 @@ pub fn extend_frame_id(last: Option<u64>, low: u32) -> u64 {
         .unwrap_or(base)
 }
 
+/// Si `image` trae otro tamaño que el último decodificado (y lo anota); el primero no cuenta.
+fn resized(last: &mut Option<(u32, u32)>, image: &RawFrame) -> bool {
+    let size = (image.width, image.height);
+    let changed = last.is_some_and(|known| known != size);
+    *last = Some(size);
+    changed
+}
+
 /// Fotograma comprimido en tránsito.
 #[derive(Debug)]
 pub(crate) struct Compressed {
@@ -1659,6 +1667,10 @@ pub(crate) fn decode_loop(
     // hardware no avisan) y artefactos que se arrastran en H.264 y HEVC.
     let mut need_keyframe = control.is_some();
     let mut last_none_request: Option<Instant> = None;
+    // Tamaño de lo último decodificado. Cuando el anfitrión cambia la resolución en vivo (mismo
+    // códec), el decodificador de hardware sigue con el contexto de imágenes del tamaño anterior
+    // en algunos backends y presenta basura sin dar error: se vuelve a abrir.
+    let mut decoded_size: Option<(u32, u32)> = None;
     while let Some(frame) = recv_or_stop(&rx, shared) {
         let now = Instant::now();
         if control.is_some() {
@@ -1677,6 +1689,8 @@ pub(crate) fn decode_loop(
         {
             decoder = None;
             opened_format = None;
+            // El decodificador nuevo ya empieza con el tamaño que traiga.
+            decoded_size = None;
             match control.open(codec, format) {
                 Ok(opened) => {
                     set_decoder_label(ledger, codec, format, opened.backend());
@@ -1718,6 +1732,21 @@ pub(crate) fn decode_loop(
         let result = current.decode(std::slice::from_ref(&slice));
         shared.counters.record_decode(now.elapsed());
         match result {
+            Ok(Some(image)) if control.is_some() && resized(&mut decoded_size, &image) => {
+                // Este fotograma ya viene del decodificador viejo: se tira, se abre otro (en la
+                // vuelta siguiente, con el mismo códec y formato) y se espera un intra.
+                debug!(
+                    width = image.width,
+                    height = image.height,
+                    "cambió el tamaño del vídeo: se vuelve a abrir el decodificador"
+                );
+                ledger.record_drop(Stage::Decoded);
+                decoder = None;
+                opened_format = None;
+                need_keyframe = true;
+                shared.request_keyframe();
+                continue;
+            }
             Ok(Some(mut image)) => {
                 health = DecodeHealth::default();
                 ledger.mark(frame.frame_id, Stage::Decoded, Instant::now());
