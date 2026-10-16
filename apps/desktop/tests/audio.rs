@@ -670,7 +670,19 @@ fn f_devices_and_the_voice_volume_change_live() {
                 && level(&listener.speaker, HOST_VOICE_HZ) < ABSENT
         }),
     );
-    let full = level(&listener.speaker, OTHER_MIC_HZ);
+    // El control automático de ganancia del procesado se adapta al micrófono nuevo durante unos
+    // segundos: la referencia se toma cuando el nivel deja de moverse, no al primer oírlo.
+    let mut full = level(&listener.speaker, OTHER_MIC_HZ);
+    wait(
+        "que se asiente el micrófono nuevo",
+        Box::new(|| {
+            std::thread::sleep(Duration::from_millis(250));
+            let now = level(&listener.speaker, OTHER_MIC_HZ);
+            let settled = (now / full - 1.0).abs() < 0.05;
+            full = now;
+            settled
+        }),
+    );
     println!("tras cambiar de micrófono: {OTHER_MIC_HZ} Hz a {full:.3}");
     // La voz a la mitad: llega a la mitad.
     host.session.audio().set_mic_gain(0.5);
