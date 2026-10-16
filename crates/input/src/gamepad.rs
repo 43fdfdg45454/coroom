@@ -847,8 +847,18 @@ mod tests {
     fn event_times_become_instants() {
         let now = Instant::now();
         let at = instant_of(SystemTime::now() - Duration::from_millis(20));
-        assert!(now.saturating_duration_since(at) >= Duration::from_millis(19));
-        assert!(now.saturating_duration_since(at) < Duration::from_millis(500));
+        let after = Instant::now();
+        // Funcional: la hora de hace 20 ms queda al menos 20 ms antes de ahora.
+        assert!(
+            after.saturating_duration_since(at) >= Duration::from_millis(20),
+            "{:?}",
+            after.saturating_duration_since(at)
+        );
+        let age = now.saturating_duration_since(at);
+        coroom_testkit::timing_assert!(
+            age < Duration::from_millis(500),
+            "una hora de hace 20 ms sale con {age:?}: el hilo se quedó parado"
+        );
         // Una hora futura (reloj ajustado) no se adelanta.
         assert!(instant_of(SystemTime::now() + Duration::from_secs(5)) <= Instant::now());
     }

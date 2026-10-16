@@ -33,6 +33,7 @@ coroom-input = { path = "crates/input", version = "1.0.0" }
 coroom-render = { path = "crates/render", version = "1.0.0" }
 coroom-session = { path = "crates/session", version = "1.0.0" }
 coroom-ui = { path = "crates/ui", version = "1.0.0" }
+coroom-testkit = { path = "crates/testkit", version = "1.0.0" }
 
 # Criptografía de identidad.
 ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["fast", "zeroize", "alloc", "pkcs8"] }
@@ -202,6 +203,29 @@ opt-level = 3
 opt-level = 3
 
 [profile.dev.package.aws-lc-sys]
+opt-level = 3
+
+# El PNG de las capturas (`COROOM_SHOTS_DIR=dir cargo test -p coroom --test shots`) sin optimizar
+# tardaba 42 de los 51 s del test en comprimir.
+[profile.dev.package.png]
+opt-level = 3
+
+[profile.dev.package.fdeflate]
+opt-level = 3
+
+[profile.dev.package.flate2]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.crc32fast]
+opt-level = 3
+
+[profile.dev.package.adler2]
+opt-level = 3
+
+[profile.dev.package.simd-adler32]
 opt-level = 3
 
 # Información de depuración solo con tablas de líneas: trazas legibles con una fracción del tamaño

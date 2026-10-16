@@ -15,6 +15,9 @@ use coroom_transport::nat::{
 
 const EXTERNAL: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 9);
 const INTERNAL_PORT: u16 = 47_000;
+/// Plazo de lo que tiene que llegar: el router falso contesta enseguida, así que solo se agota si
+/// algo está roto.
+const TIMEOUT: Duration = Duration::from_secs(20);
 
 fn v4(addr: SocketAddr) -> SocketAddrV4 {
     match addr {
@@ -90,7 +93,7 @@ async fn wait_for(
     what: &str,
     accept: impl Fn(&[u8]) -> bool,
 ) -> Vec<u8> {
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(TIMEOUT, async {
         loop {
             let request = requests.recv().await.expect("servidor vivo");
             if accept(&request) {
@@ -110,7 +113,7 @@ async fn a_pcp_gateway_maps_the_port_and_the_mapping_is_deleted_on_drop() {
     let mapper = Mapper::new()
         .with_gateway(gateway)
         .with_ssdp(closed_udp_port())
-        .with_timeout(Duration::from_secs(3));
+        .with_timeout(TIMEOUT);
     let mapping = mapper.map(INTERNAL_PORT).await;
     let report = mapping.report().clone();
     let granted = report.mapping().unwrap_or_else(|| panic!("{report}"));
@@ -143,7 +146,7 @@ async fn b_a_nat_pmp_only_gateway_answers_the_fallback() {
     let mapper = Mapper::new()
         .with_gateway(gateway)
         .with_ssdp(closed_udp_port())
-        .with_timeout(Duration::from_secs(3));
+        .with_timeout(TIMEOUT);
     let mapping = mapper.map(INTERNAL_PORT).await;
     let report = mapping.report().clone();
     let granted = report.mapping().unwrap_or_else(|| panic!("{report}"));
@@ -151,7 +154,10 @@ async fn b_a_nat_pmp_only_gateway_answers_the_fallback() {
     assert_eq!(granted.external, SocketAddrV4::new(EXTERNAL, 0xC000));
     assert_eq!(granted.lifetime, Some(Duration::from_secs(3600)));
     // Primero PCP, después las dos peticiones NAT-PMP.
-    let first = requests.recv().await.expect("primera");
+    let first = tokio::time::timeout(TIMEOUT, requests.recv())
+        .await
+        .expect("primera a tiempo")
+        .expect("primera");
     assert!(
         parse_pcp_map(&pcp_granted(&first)).is_ok(),
         "primero se prueba PCP"
@@ -288,6 +294,13 @@ async fn upnp_server() -> (SocketAddrV4, mpsc::UnboundedReceiver<(String, String
     (ssdp, actions)
 }
 
+async fn next_action(actions: &mut mpsc::UnboundedReceiver<(String, String)>) -> (String, String) {
+    tokio::time::timeout(TIMEOUT, actions.recv())
+        .await
+        .expect("acción a tiempo")
+        .expect("acción")
+}
+
 fn xml_value(body: &str, tag: &str) -> String {
     coroom_transport::nat::xml_text(body, tag)
         .unwrap_or_default()
@@ -300,7 +313,7 @@ async fn c_upnp_maps_when_the_gateway_has_no_pcp() {
     let mapper = Mapper::new()
         .with_gateway(closed_udp_port())
         .with_ssdp(ssdp)
-        .with_timeout(Duration::from_secs(4));
+        .with_timeout(TIMEOUT);
     let mapping = mapper.map(INTERNAL_PORT).await;
     let report = mapping.report().clone();
     let granted = report.mapping().unwrap_or_else(|| panic!("{report}"));
@@ -313,9 +326,9 @@ async fn c_upnp_maps_when_the_gateway_has_no_pcp() {
     );
     assert_eq!(granted.lifetime, Some(Duration::from_secs(7200)));
 
-    let (first, _) = actions.recv().await.expect("acción");
+    let (first, _) = next_action(&mut actions).await;
     assert_eq!(first, "GetExternalIPAddress");
-    let (second, body) = actions.recv().await.expect("acción");
+    let (second, body) = next_action(&mut actions).await;
     assert_eq!(second, "AddPortMapping");
     assert_eq!(
         xml_value(&body, "NewExternalPort"),
@@ -327,7 +340,7 @@ async fn c_upnp_maps_when_the_gateway_has_no_pcp() {
     );
     assert_eq!(xml_value(&body, "NewInternalClient"), "127.0.0.1");
     assert_eq!(xml_value(&body, "NewProtocol"), "UDP");
-    let (third, body) = actions.recv().await.expect("acción");
+    let (third, body) = next_action(&mut actions).await;
     assert_eq!(third, "AddPortMapping");
     assert_eq!(
         xml_value(&body, "NewExternalPort"),
@@ -335,10 +348,7 @@ async fn c_upnp_maps_when_the_gateway_has_no_pcp() {
     );
 
     drop(mapping);
-    let (deleted, body) = tokio::time::timeout(Duration::from_secs(3), actions.recv())
-        .await
-        .expect("borrado a tiempo")
-        .expect("acción");
+    let (deleted, body) = next_action(&mut actions).await;
     assert_eq!(deleted, "DeletePortMapping");
     assert_eq!(
         xml_value(&body, "NewExternalPort"),
@@ -354,10 +364,12 @@ async fn d_without_any_answer_the_report_says_so() {
         .with_timeout(Duration::from_millis(400));
     let started = std::time::Instant::now();
     let mapping = mapper.map(INTERNAL_PORT).await;
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "{:?}",
-        started.elapsed()
+    // Se rinde al plazo de 400 ms: muy por encima, es que alguna espera no lo respeta.
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    coroom_testkit::timing_assert!(
+        elapsed < Duration::from_secs(2),
+        "sin respuesta tardó {elapsed:?}"
     );
     assert_eq!(mapping.report().outcome, MappingOutcome::NoResponse);
     assert!(mapping.mapping().is_none());

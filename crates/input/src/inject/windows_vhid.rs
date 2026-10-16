@@ -2568,7 +2568,7 @@ mod tests {
         }
 
         fn wait_for(&self, condition: impl Fn(&[Call]) -> bool) -> bool {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(20);
             while Instant::now() < deadline {
                 if condition(&self.calls.lock().unwrap()) {
                     return true;
@@ -2702,7 +2702,8 @@ mod tests {
             .unwrap();
         assert_eq!(device.calls().len(), 2, "el ratón no manda nada");
 
-        // Una ráfaga de ejes: el último valor llega, sin pasar de 250 Hz.
+        // Una ráfaga de ejes: el último valor llega, sin pasar de un informe por
+        // [`REPORT_INTERVAL`] (500 Hz).
         let start = Instant::now();
         for value in 1..=50 {
             pads.inject(&axis(2, GamepadAxis::LeftX, value * 100), ONE)
@@ -2712,7 +2713,7 @@ mod tests {
         let last = Call::State(0, pressed.to_xusb());
         assert!(device.wait_for(|calls| calls.last() == Some(&last)));
         let reports = device.calls().len() - 2;
-        let allowed = start.elapsed().as_millis() / 4 + 2;
+        let allowed = start.elapsed().as_millis() / REPORT_INTERVAL.as_millis() + 2;
         assert!(
             reports as u128 <= allowed,
             "{reports} informes en {:?}",

@@ -1303,7 +1303,11 @@ mod tests {
         let started = Instant::now();
         let got = queue.pop_blocking(Duration::from_secs(5));
         assert_eq!(got, Ok(Some(Bytes::from_static(b"audio"))));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        let waited = started.elapsed();
+        coroom_testkit::timing_assert!(
+            waited < Duration::from_secs(2),
+            "se despertó a los {waited:?}"
+        );
         sent.join().unwrap();
         queue.push(Bytes::from_static(b"queda"), Instant::now());
         queue.close();

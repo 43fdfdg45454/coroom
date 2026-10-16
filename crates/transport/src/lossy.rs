@@ -354,17 +354,33 @@ mod tests {
         for i in 0..200u8 {
             client.send_to(&[i], proxy.addr()).await.expect("envío");
         }
-        let mut received = 0;
+        // Se recibe hasta que el proxy haya decidido los 200 (reenviado o perdido) y haya llegado
+        // todo lo reenviado; el plazo solo se agota si algo está roto.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut received = 0u64;
         let mut buffer = [0u8; 16];
-        while let Ok(Ok((_, from))) =
-            tokio::time::timeout(Duration::from_millis(200), server.recv_from(&mut buffer)).await
+        while proxy.stats().forwarded() + proxy.stats().dropped() < 200
+            || received < proxy.stats().forwarded()
         {
-            assert_eq!(from, proxy.addr());
-            received += 1;
+            assert!(
+                Instant::now() < deadline,
+                "a los 20 s: {received} recibidos, {} reenviados, {} perdidos",
+                proxy.stats().forwarded(),
+                proxy.stats().dropped()
+            );
+            if let Ok(result) =
+                tokio::time::timeout(Duration::from_millis(20), server.recv_from(&mut buffer)).await
+            {
+                let (_, from) = result.expect("recepción");
+                assert_eq!(from, proxy.addr());
+                received += 1;
+            }
         }
         assert!(start.elapsed() >= Duration::from_millis(5));
-        assert!((60..140).contains(&received), "{received}");
         assert_eq!(proxy.stats().forwarded() + proxy.stats().dropped(), 200);
+        assert_eq!(received, proxy.stats().forwarded());
+        // La semilla fija la pérdida: cerca de la mitad.
+        assert!((60..140).contains(&received), "{received}");
 
         // La respuesta vuelve al cliente.
         for _ in 0..16 {

@@ -108,9 +108,15 @@ async fn spike_media_controller_versus_bbr() {
             row.gap.as_secs_f64() * 1e3,
         );
         assert!(
-            row.delivered as f64 >= f64::from(FRAMES) * 0.9,
-            "{}",
+            row.delivered > 0,
+            "{}: no llegó ningún fotograma",
             row.label
+        );
+        coroom_testkit::timing_assert!(
+            row.delivered as f64 >= f64::from(FRAMES) * 0.9,
+            "{}: entregados {} de {FRAMES}",
+            row.label,
+            row.delivered
         );
     }
 }

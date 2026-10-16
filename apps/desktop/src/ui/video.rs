@@ -638,7 +638,8 @@ mod tests {
             shower.lock().uploaded = Some(2);
             shower.commit_shown();
         });
-        assert!(feed.push_and_wait(frame(2), None, None, Duration::from_secs(5)));
+        // Plazo amplio: solo cuenta si la ventana no llega a entregarlo.
+        assert!(feed.push_and_wait(frame(2), None, None, Duration::from_secs(20)));
         window.join().expect("hilo");
         // Al cerrar no se espera.
         feed.close();

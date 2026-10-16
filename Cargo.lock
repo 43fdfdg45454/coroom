@@ -1191,6 +1191,7 @@ dependencies = [
  "coroom-render",
  "coroom-server",
  "coroom-session",
+ "coroom-testkit",
  "coroom-transport",
  "coroom-ui",
  "crossbeam-channel",
@@ -1222,6 +1223,7 @@ name = "coroom-audio"
 version = "1.0.0"
 dependencies = [
  "bytemuck",
+ "coroom-testkit",
  "libc",
  "opusic-c",
  "opusic-sys",
@@ -1239,6 +1241,7 @@ version = "1.0.0"
 dependencies = [
  "ashpd",
  "coroom-proto",
+ "coroom-testkit",
  "pipewire",
  "rustix 1.1.5",
  "tokio",
@@ -1252,6 +1255,7 @@ version = "1.0.0"
 dependencies = [
  "ash",
  "coroom-proto",
+ "coroom-testkit",
  "libc",
  "openh264",
  "rsmpeg",
@@ -1267,6 +1271,7 @@ version = "1.0.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
+ "coroom-testkit",
  "criterion",
  "ed25519-dalek 3.0.0",
  "getrandom 0.4.3",
@@ -1290,6 +1295,7 @@ dependencies = [
  "ashpd",
  "coroom-crypto",
  "coroom-proto",
+ "coroom-testkit",
  "crossbeam-channel",
  "evdev",
  "gilrs",
@@ -1365,6 +1371,7 @@ dependencies = [
  "coroom-capture",
  "coroom-codec",
  "coroom-input",
+ "coroom-testkit",
  "coroom-transport",
  "crossbeam-channel",
  "serde",
@@ -1374,12 +1381,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "coroom-testkit"
+version = "1.0.0"
+
+[[package]]
 name = "coroom-transport"
 version = "1.0.0"
 dependencies = [
  "bytes",
  "coroom-crypto",
  "coroom-proto",
+ "coroom-testkit",
  "coroom-transport",
  "getrandom 0.4.3",
  "h3",

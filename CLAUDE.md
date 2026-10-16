@@ -55,6 +55,7 @@ crates/input      captura en el invitado; inyección libei / uinput / SendInput 
 crates/render     dispositivo wgpu (Vulkan), capa de vídeo, importación sin copias, cursor local
 crates/session    máquinas de estado anfitrión/invitado, permisos, reloj
 crates/ui         sistema de diseño para iced (coroom-ui): tokens, tema, fuentes, iconos, componentes
+crates/testkit    ayudas de prueba (solo dev-dependencies): timing_assert! para umbrales de tiempo
 apps/desktop      binario `coroom` (anfitrión + invitado), aplicación iced en src/ui
 apps/desktop/locales/  catálogos Fluent de los textos de la aplicación
 vendor/           iced_wgpu y cryoglyph parcheados a wgpu 30 (ver vendor/README.md)
@@ -76,7 +77,7 @@ workspace; `transport` solo de ellas; `session` orquesta el resto; `ui` no depen
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo nextest run --workspace              # las pruebas en paralelo (.config/nextest.toml); también vale cargo test --workspace
 cargo deny check
 tools/check-locks.sh [--fix]               # Cargo.lock del workspace y de fuzz/, y cargo-sources.json del Flatpak
 git config core.hooksPath .githooks        # una vez por clon: el pre-push ejecuta tools/check-locks.sh
@@ -104,7 +105,13 @@ cd deploy && cp .env.sample .env && docker compose up -d
 - Toda latencia es medible: las etapas del pipeline llevan marcas de tiempo y los umbrales de
   `docs/ARQUITECTURA.md` §2 se comprueban con benches y tests, no con estimaciones.
 - Tests: unitarios junto al código; integración en `tests/` de cada crate; `proptest` en `proto`;
-  benches `criterion` con umbral en `crypto`.
+  benches `criterion` con umbral en `crypto`. **Dos clases**: las funcionales (`assert!`) prueban que
+  la aplicación funciona y hacen fallar la CI; los umbrales que dependen de la velocidad de la
+  máquina (latencias, p95, fps o Mbit/s logrados, huecos, cuotas entregadas en tiempo real) van con
+  `coroom_testkit::timing_assert!`, que avisa sin fallar, siempre junto a un mínimo funcional (que
+  llegue y esté entero). La CI publica los avisos en «Avisos de tiempo»; `COROOM_TIMING_STRICT=1` los
+  vuelve fallos para medir en una máquina tranquila. Nada de esperas fijas como sincronización:
+  sondear hasta un plazo holgado.
 - Toolchain fijado en `rust-toolchain.toml`: CI, Dockerfile y desarrollo usan la misma versión; se
   sube cuando sale una stable nueva y pasa clippy.
 - Licencias: Apache-2.0 salvo `apps/server` (AGPL-3.0-or-later).

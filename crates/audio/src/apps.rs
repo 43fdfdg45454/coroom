@@ -503,12 +503,17 @@ mod tests {
         let started = Instant::now();
         while open(&source) != ["b"] {
             assert!(
-                started.elapsed() < RESCAN / 2,
-                "sin esperar a la siguiente pasada: {:?}",
+                started.elapsed() < Duration::from_secs(10),
+                "el filtro nuevo no se aplica: {:?}",
                 open(&source)
             );
             thread::sleep(Duration::from_millis(5));
         }
+        let elapsed = started.elapsed();
+        coroom_testkit::timing_assert!(
+            elapsed < RESCAN / 2,
+            "el filtro tardó {elapsed:?} en aplicarse: parece que esperó a la siguiente pasada"
+        );
         assert!(source.describe().contains("solo voz"));
         let mut frame = Vec::new();
         source.read(&mut frame).expect("la mezcla sigue");

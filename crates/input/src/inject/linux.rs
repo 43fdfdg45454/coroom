@@ -1291,7 +1291,7 @@ mod tests {
         // Soltar sin haber pulsado nada no necesita EI.
         assert_eq!(sink.release_all(GuestId(1)), Ok(()));
         // Con un proveedor que falla, el primer evento de teclado lo cuenta (tras conectar).
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
             match sink.inject(
                 &InputEvent::Key {

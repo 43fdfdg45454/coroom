@@ -50,3 +50,6 @@ windows = { workspace = true, features = [
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+coroom-testkit.workspace = true

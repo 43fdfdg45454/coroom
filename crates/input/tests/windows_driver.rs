@@ -132,7 +132,7 @@ fn the_installed_driver_creates_raw_xbox_and_generic_pads() {
         GUEST,
     )
     .expect("A");
-    wait_for("A pulsado en XInput", Duration::from_secs(5), || {
+    wait_for("A pulsado en XInput", Duration::from_secs(20), || {
         xinput_pads()
             .into_iter()
             .find(|(i, state)| *i == index && state.Gamepad.wButtons.contains(XINPUT_GAMEPAD_A))
@@ -163,7 +163,7 @@ fn the_installed_driver_creates_raw_xbox_and_generic_pads() {
     let mut buffer = [0u8; 16];
     let read = wait_for(
         "el informe de entrada",
-        Duration::from_secs(5),
+        Duration::from_secs(20),
         || match hid.read_timeout(&mut buffer, 200) {
             Ok(len) if len > 0 && buffer[0] == 1 && buffer[1] == 0x81 => Some(len),
             _ => {
@@ -176,7 +176,7 @@ fn the_installed_driver_creates_raw_xbox_and_generic_pads() {
 
     // Lo que el sistema le escribe vuelve para el invitado, con su identificador.
     hid.write(&[5, 0x40, 0x41, 0x42]).expect("salida");
-    let outputs = wait_for("la salida", Duration::from_secs(5), || {
+    let outputs = wait_for("la salida", Duration::from_secs(20), || {
         let outputs = pads.take_outputs();
         (!outputs.is_empty()).then_some(outputs)
     });

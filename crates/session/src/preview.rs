@@ -336,11 +336,16 @@ mod tests {
             worker.offer(Arc::clone(&tap), frame).is_none(),
             "se lo lleva"
         );
+        let deadline = Instant::now() + Duration::from_secs(20);
         let back = loop {
             let mut back = worker.returned();
             if let Some(back) = back.pop() {
                 break back;
             }
+            assert!(
+                Instant::now() < deadline,
+                "el hilo de la vista previa no devolvió el fotograma"
+            );
             std::thread::sleep(Duration::from_millis(5));
         };
         assert_eq!(back.frame_id, 1, "lo devuelve entero");

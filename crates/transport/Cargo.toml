@@ -49,6 +49,7 @@ windows = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+coroom-testkit.workspace = true
 bytes.workspace = true
 quinn.workspace = true
 rustls.workspace = true

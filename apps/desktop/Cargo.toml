@@ -58,6 +58,7 @@ windows = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+coroom-testkit.workspace = true
 # Tests de extremo a extremo (`tests/remote.rs`): servidor real en proceso y proxy con pérdida.
 coroom-server = { path = "../server" }
 coroom-transport = { workspace = true, features = ["test-util"] }

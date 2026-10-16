@@ -2268,7 +2268,7 @@ mod tests {
     }
 
     fn wait_for(what: &str, mut condition: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(20);
         while !condition() {
             assert!(Instant::now() < deadline, "tiempo agotado: {what}");
             std::thread::sleep(Duration::from_millis(10));
@@ -2368,9 +2368,8 @@ mod tests {
         assert!(control.voice_enabled());
         // A volumen cero, como silenciado: no sale nada más.
         control.set_mic_gain(0.0);
-        std::thread::sleep(Duration::from_millis(50));
+        wait_for("silenciado", || !control.speaking());
         let muted = out.sent.load(Ordering::Acquire);
-        assert!(!control.speaking());
         std::thread::sleep(Duration::from_millis(100));
         assert!(
             out.sent.load(Ordering::Acquire) <= muted + 1,

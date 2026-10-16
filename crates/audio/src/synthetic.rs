@@ -451,6 +451,7 @@ mod tests {
             sink.wait_ready().expect("sitio");
             let now = Instant::now();
             let played = sink.write(&[1; 480]).expect("escritura").played_at_estimate;
+            let after = Instant::now();
             lead.push(played - now);
             if i < 2 {
                 continue;
@@ -462,7 +463,13 @@ mod tests {
             assert!(now >= ready_at, "no vuelve antes de tiempo: {lead:?}");
             let lateness = now - ready_at;
             let full = FRAME_DURATION + sink.latency;
-            assert!(lead[i] <= full + Duration::from_millis(1), "{lead:?}");
+            // La cota alta se mide desde después de escribir: si la cola se vació porque el hilo
+            // se quedó parado entre `now` y la escritura, el sumidero fecha con su propia hora.
+            assert!(
+                played - after <= full + Duration::from_millis(1),
+                "más de una trama en cola: {:?} desde la escritura; {lead:?}",
+                played - after
+            );
             assert!(
                 lead[i] + lateness + Duration::from_millis(1) >= full,
                 "{lead:?}, despertó {lateness:?} tarde"

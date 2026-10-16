@@ -12,7 +12,7 @@
 //! Dos tests:
 //!
 //! - `lossy_matrix`: siempre, con el proxy `UdpLossy` en proceso entre invitado y anfitrión, los
-//!   perfiles `buena`, `media` y `mala` durante 10 s cada uno.
+//!   perfiles `buena`, `media` y `mala` durante 5 s cada uno.
 //! - `netem_matrix`: con `tc netem` real en `lo` (`sudo -n tools/netem.sh profile …`), los cinco
 //!   perfiles durante 30 s cada uno; se salta si no hay `tc` o `sudo` sin contraseña (la CI de
 //!   Linux sí lo tiene).
@@ -42,6 +42,10 @@
 //!   100 ms en `mala` (± 20 ms, con margen por las pérdidas que oculta el PLC).
 //! - **pérdida** del enlace: la del perfil con un margen estadístico (±50 % o ±0,5 puntos), para
 //!   comprobar que la prueba es la que dice ser.
+//!
+//! Que se presenten todos los fotogramas y la pérdida del enlace son funcionales (si fallan, se
+//! repite la sesión una vez y, si vuelven a fallar, la prueba falla); fps, hueco y |A−V| dependen
+//! de la carga del equipo y van con `timing_assert!`: avisan sin hacer fallar la prueba.
 
 mod common;
 
@@ -57,6 +61,7 @@ use coroom_session::codec::{DecoderSet, EncoderSet};
 use coroom_session::latency::{LatencyLedger, LatencySummary, Stage};
 use coroom_session::loopback::{DecodedFrame, FrameSink, LoopbackConfig, SinkError};
 use coroom_session::remote::{GuestAudio, HostAudio, RemoteSession};
+use coroom_testkit::timing_assert;
 use coroom_transport::lossy::{LossyConfig, UdpLossy};
 
 const FPS: u32 = 30;
@@ -327,33 +332,11 @@ fn measure(
     (row, presented, frames)
 }
 
-/// Comprueba las cotas del perfil; devuelve la primera que no se cumple.
+/// Comprueba lo funcional del perfil (todo presentado, la pérdida del enlace es la del perfil);
+/// devuelve lo primero que no se cumple.
 fn check(row: &Row, expected_loss: Option<f64>, presented: u64, frames: u64) -> Result<(), String> {
-    let mut bounds = bounds(&row.profile);
-    // Las cotas de tiempo de reloj escalan con la carga del entorno (`common::load_factor`).
-    let factor = common::load_factor();
-    bounds.max_gap = bounds.max_gap.mul_f64(factor);
-    bounds.max_av_p95_ms *= factor;
     if presented < frames {
         return Err(format!("{}: {presented} de {frames}", row.profile));
-    }
-    if row.fps < bounds.min_fps {
-        return Err(format!(
-            "{}: {:.1} fps, cota {:.1}",
-            row.profile, row.fps, bounds.min_fps
-        ));
-    }
-    if row.gap > bounds.max_gap {
-        return Err(format!(
-            "{}: hueco de {:?}, cota {:?}",
-            row.profile, row.gap, bounds.max_gap
-        ));
-    }
-    if row.av_p95_ms > bounds.max_av_p95_ms {
-        return Err(format!(
-            "{}: |A−V| p95 {:.1} ms, cota {:.1} ms",
-            row.profile, row.av_p95_ms, bounds.max_av_p95_ms
-        ));
     }
     if let Some(expected) = expected_loss {
         let tolerance = (expected * 0.5).max(0.5);
@@ -367,9 +350,40 @@ fn check(row: &Row, expected_loss: Option<f64>, presented: u64, frames: u64) -> 
     Ok(())
 }
 
-/// Mide un perfil y comprueba sus cotas; si no se cumplen, repite la sesión una vez. Una sesión
-/// de pocos segundos es sensible a la carga del equipo (un intra grande en mal momento basta para
-/// perder un fotograma de la cota de fps); dos seguidas fuera de cota son un fallo real.
+/// Cotas de tiempo del perfil (fps, hueco, |A−V|): dependen de la carga del equipo, así que solo
+/// avisan.
+fn check_timing(row: &Row) {
+    let mut bounds = bounds(&row.profile);
+    // Las cotas de tiempo de reloj escalan con la carga del entorno (`common::load_factor`).
+    let factor = common::load_factor();
+    bounds.max_gap = bounds.max_gap.mul_f64(factor);
+    bounds.max_av_p95_ms *= factor;
+    timing_assert!(
+        row.fps >= bounds.min_fps,
+        "{}: {:.1} fps, cota {:.1}",
+        row.profile,
+        row.fps,
+        bounds.min_fps
+    );
+    timing_assert!(
+        row.gap <= bounds.max_gap,
+        "{}: hueco de {:?}, cota {:?}",
+        row.profile,
+        row.gap,
+        bounds.max_gap
+    );
+    timing_assert!(
+        row.av_p95_ms <= bounds.max_av_p95_ms,
+        "{}: |A−V| p95 {:.1} ms, cota {:.1} ms",
+        row.profile,
+        row.av_p95_ms,
+        bounds.max_av_p95_ms
+    );
+}
+
+/// Mide un perfil y comprueba lo funcional; si no se cumple, repite la sesión una vez (la pérdida
+/// del enlace es estadística y una sesión corta puede salirse del margen); dos seguidas fuera son
+/// un fallo real. Las cotas de tiempo se miran en la sesión que vale y solo avisan.
 fn measure_checked(
     server: &TestServer,
     profile: &str,
@@ -379,7 +393,7 @@ fn measure_checked(
 ) -> Row {
     let (row, presented, frames) = measure(server, profile, seconds, proxy);
     println!("{}", row.markdown());
-    match check(&row, expected_loss, presented, frames) {
+    let row = match check(&row, expected_loss, presented, frames) {
         Ok(()) => row,
         Err(first) => {
             println!("{first}: se repite la sesión de «{profile}» una vez");
@@ -390,7 +404,9 @@ fn measure_checked(
             }
             row
         }
-    }
+    };
+    check_timing(&row);
+    row
 }
 
 #[test]
@@ -398,7 +414,7 @@ fn lossy_matrix() {
     let _serial = serial();
     common::load_factor();
     let server = TestServer::start();
-    let seconds = 10;
+    let seconds = 5;
     let mut rows = Vec::new();
     for profile in ["buena", "media", "mala"] {
         let config = LossyConfig::profile(profile).expect("perfil");

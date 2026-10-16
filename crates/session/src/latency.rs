@@ -1292,21 +1292,48 @@ mod tests {
             at += Duration::from_micros(8_333);
         }
         // 30 fps en el último segundo, a 5 kB.
-        for i in 0..30u64 {
+        let slow: Vec<Instant> = (0..30u64)
+            .map(|i| now - Duration::from_millis(990) + Duration::from_micros(33_333 * i))
+            .collect();
+        for &at in &slow {
             id += 1;
-            let at = now - Duration::from_millis(990) + Duration::from_micros(33_333 * i);
             ledger.mark(id, Stage::Presented, at);
             ledger.record_encoded_bytes_at(5_000, at);
         }
         let summary = ledger.summary();
+        let after = Instant::now();
+        // El último segundo se cuenta desde que se pide el resumen, que es antes de `after`: entra
+        // al menos todo lo posterior a `after - RECENT`, y nunca lo de 120 fps (anterior a
+        // `now - RECENT`). Si el hilo se para, el primero de los 30 queda fuera; el valor exacto,
+        // abajo.
+        let window = LatencyLedger::RECENT.as_secs_f64();
+        let surely_recent = slow
+            .iter()
+            .filter(|&&at| at > after - LatencyLedger::RECENT)
+            .count() as f64;
         assert!(
+            summary.fps_recent < summary.fps
+                && summary.fps_recent >= surely_recent / window
+                && summary.fps_recent <= 30.5,
+            "en vivo {} (al menos {}) y en la ventana {}",
+            summary.fps_recent,
+            surely_recent / window,
+            summary.fps
+        );
+        let surely_kbps = surely_recent * 5_000.0 * 8.0 / window / 1000.0;
+        assert!(
+            summary.bitrate_recent_kbps >= surely_kbps && summary.bitrate_recent_kbps <= 1_220.0,
+            "{} kbit/s en vivo (al menos {surely_kbps})",
+            summary.bitrate_recent_kbps
+        );
+        coroom_testkit::timing_assert!(
             (summary.fps_recent - 30.0).abs() < 0.5,
-            "{}",
+            "{} fps en vivo, se esperaban 30",
             summary.fps_recent
         );
-        assert!(
+        coroom_testkit::timing_assert!(
             (summary.bitrate_recent_kbps - 1_200.0).abs() < 1.0,
-            "{}",
+            "{} kbit/s en vivo, se esperaban 1200",
             summary.bitrate_recent_kbps
         );
         assert!(summary.fps > 70.0, "la ventana mezcla: {}", summary.fps);

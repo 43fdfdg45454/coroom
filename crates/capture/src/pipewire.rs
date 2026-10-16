@@ -2604,8 +2604,12 @@ mod tests {
         let ts = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
         let mono = Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32);
         let dated = instant_from_monotonic(mono - Duration::from_millis(2), now).unwrap();
-        assert!(now.duration_since(dated) >= Duration::from_millis(2));
-        assert!(now.duration_since(dated) < Duration::from_millis(500));
+        let age = now.duration_since(dated);
+        assert!(age >= Duration::from_millis(2), "{age:?}");
+        coroom_testkit::timing_assert!(
+            age < Duration::from_millis(500),
+            "la marca de hace 2 ms sale con {age:?}: el hilo se quedó parado entre las dos horas"
+        );
         assert!(instant_from_monotonic(mono + Duration::from_secs(5), now).is_none());
         assert!(instant_from_monotonic(mono - Duration::from_secs(5), now).is_none());
     }

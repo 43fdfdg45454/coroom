@@ -1,0 +1,10 @@
+[package]
+name = "coroom-testkit"
+description = "Ayudas de prueba de coroom: comprobaciones de tiempo que avisan sin hacer fallar."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

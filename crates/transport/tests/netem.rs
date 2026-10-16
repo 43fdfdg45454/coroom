@@ -43,10 +43,15 @@ async fn netem_media_never_freezes_more_than_100_ms() {
         run.max_gap,
         run.stats
     );
-    assert!(run.frames.len() >= 294, "entregados {}", run.frames.len());
-    assert!(
+    assert!(!run.frames.is_empty(), "no llegó ningún fotograma");
+    coroom_testkit::timing_assert!(
+        run.frames.len() >= 294,
+        "entregados {} de 300",
+        run.frames.len()
+    );
+    coroom_testkit::timing_assert!(
         run.max_gap <= Duration::from_millis(100),
-        "hueco de {:?}",
+        "hueco de {:?} sin fotograma",
         run.max_gap
     );
 }

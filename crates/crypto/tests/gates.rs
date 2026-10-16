@@ -1,8 +1,10 @@
 //! Puertas de coste del E2EE (`docs/ARQUITECTURA.md` §2.3) y del cifrado de
 //! la entrada.
 //!
-//! Miden con `Instant` la mediana de 200 iteraciones y fallan si supera el umbral. Solo tienen
-//! sentido optimizadas, por eso están marcadas `#[ignore]` y se corren así (CI en Linux):
+//! Miden con `Instant` la mediana de 200 iteraciones y avisan si supera el umbral
+//! ([`timing_assert!`]: depende de la máquina, no hace fallar la CI); lo que sí falla es que el
+//! cifrado no dé la vuelta. Solo tienen sentido optimizadas, por eso están marcadas `#[ignore]` y
+//! se corren así (CI en Linux):
 //!
 //! ```text
 //! cargo test --release -p coroom-crypto -- --ignored --nocapture
@@ -16,6 +18,7 @@ use std::time::{Duration, Instant};
 use coroom_crypto::hpke::{self, PairwiseSecret, RecipientKey};
 use coroom_crypto::input::{Channel, InputCipher, Role};
 use coroom_crypto::{Identity, KeyPackageBundle, MediaKey, MediaKeyRing, RoomGroup};
+use coroom_testkit::timing_assert;
 
 const ITERATIONS: usize = 200;
 
@@ -43,7 +46,7 @@ fn report(name: &str, samples: Vec<Duration>, limit: Duration) {
     };
     let median = median(samples);
     eprintln!("{name}: mediana {median:?}, p90 {p90:?} (umbral {limit:?})");
-    assert!(
+    timing_assert!(
         median < limit,
         "{name}: la mediana {median:?} supera el umbral {limit:?}"
     );

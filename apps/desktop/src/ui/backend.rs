@@ -1942,6 +1942,7 @@ fn codec_preference(choice: CodecChoice) -> Option<coroom_session::codec::Codec>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coroom_testkit::timing_assert;
 
     /// Un `notify` que guarda los mensajes en un canal.
     fn recorder() -> (Notify, crossbeam_channel::Receiver<Message>) {
@@ -1988,11 +1989,18 @@ mod tests {
         on_time.watch(Duration::from_millis(200), notify, || {
             Event::HostStarted(Err("plazo".into()))
         });
-        assert!(on_time.settle());
-        assert!(
-            rx.recv_timeout(Duration::from_millis(500)).is_err(),
-            "sin aviso"
-        );
+        // Liquidar antes de que venza el plazo de 200 ms depende de que este hilo no se pare: si
+        // llega tarde, el aviso sí sale y no se comprueba su ausencia.
+        let settled = on_time.settle();
+        if timing_assert!(
+            settled,
+            "el arranque a tiempo llegó después del plazo de 200 ms"
+        ) {
+            assert!(
+                rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "sin aviso"
+            );
+        }
     }
 
     /// La sesión que termina sola sale del hueco, pero no se lleva la que ya la sustituyó.
@@ -2015,7 +2023,11 @@ mod tests {
             thread::sleep(Duration::from_secs(5));
         });
         assert!(result.is_none());
-        assert!(started.elapsed() < Duration::from_secs(4));
+        let elapsed = started.elapsed();
+        timing_assert!(
+            elapsed < Duration::from_secs(4),
+            "cerrar con un plazo de 50 ms tardó {elapsed:?}"
+        );
         assert_eq!(close_within(Duration::from_secs(5), || 7), Some(7));
     }
 }

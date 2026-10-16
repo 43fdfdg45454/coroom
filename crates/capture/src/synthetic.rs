@@ -486,9 +486,11 @@ mod tests {
         assert_eq!(*stride, 320 * 4);
         assert_eq!(data.len(), 320 * 4 * 180);
         let next = capturer.next_frame().unwrap();
-        assert!(
-            next.captured_at - frame.captured_at >= Duration::from_millis(19),
-            "cadencia de 20 ms"
+        let gap = next.captured_at - frame.captured_at;
+        assert!(next.captured_at > frame.captured_at, "fotogramas en orden");
+        coroom_testkit::timing_assert!(
+            gap >= Duration::from_millis(19),
+            "cadencia de 20 ms, hubo {gap:?}"
         );
         // Un máximo mayor que el propio no amplía; sin máximo, el propio.
         capturer.set_options(CaptureOptions {
@@ -532,14 +534,22 @@ mod tests {
             };
             assert_eq!(*stride, 320 * 4);
             assert_eq!(data.len(), 320 * 4 * 180);
+            assert!(frame.captured_at > last, "fotogramas en orden");
             let gap = frame.captured_at - last;
-            assert!(
+            coroom_testkit::timing_assert!(
                 gap >= Duration::from_millis(9),
                 "cadencia de 10 ms, hubo {gap:?}"
             );
             last = frame.captured_at;
             assert!(frame.captured_at <= Instant::now());
         }
+        // Funcional: ningún fotograma sale antes de su tick, así que los nueve siguientes al
+        // primero ocupan más de ocho periodos aunque el hilo se retrase.
+        assert!(
+            last - first.captured_at >= capturer.period() * 8,
+            "cadencia de 10 ms: 9 fotogramas en {:?}",
+            last - first.captured_at
+        );
         capturer.stop();
         assert!(capturer.next_frame().is_err());
     }

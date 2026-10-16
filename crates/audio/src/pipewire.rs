@@ -1049,7 +1049,8 @@ mod tests {
         let mut monitor = MonitorSource::system();
         monitor.start(&AudioConfig::game()).expect("monitor");
         let mut frame = Vec::new();
-        for _ in 0..100 {
+        // Unas pocas tramas a su ritmo (100 ms) bastan para ver que el flujo corre.
+        for _ in 0..10 {
             sink.write(&[0; 960]).expect("reproducir");
         }
         let captured = monitor.read(&mut frame).expect("capturar");

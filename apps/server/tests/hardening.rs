@@ -24,7 +24,7 @@ async fn slow_headers_are_cut_and_normal_requests_still_work() {
         .await
         .expect("petición");
     let mut response = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), normal.read_to_end(&mut response))
+    tokio::time::timeout(Duration::from_secs(20), normal.read_to_end(&mut response))
         .await
         .expect("respuesta a tiempo")
         .expect("respuesta");
@@ -41,7 +41,7 @@ async fn slow_headers_are_cut_and_normal_requests_still_work() {
         .expect("cabeceras a medias");
     let started = Instant::now();
     let mut buffer = [0u8; 1024];
-    let closed = tokio::time::timeout(HEADER_TIMEOUT + Duration::from_secs(5), async {
+    let closed = tokio::time::timeout(HEADER_TIMEOUT + Duration::from_secs(20), async {
         loop {
             match slow.read(&mut buffer).await {
                 Ok(0) | Err(_) => break,

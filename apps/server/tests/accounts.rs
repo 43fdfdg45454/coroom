@@ -838,16 +838,30 @@ async fn the_monthly_quota_cuts_the_relay_and_new_rooms_go_direct() {
         .await
         .expect("invitado en el relay");
 
-    // El anfitrión envía hasta que el relay corta (a los ~20 kB reenviados).
-    let received = tokio::spawn(async move {
-        let mut bytes = 0usize;
-        while let Ok(Ok(datagram)) =
-            tokio::time::timeout(Duration::from_secs(5), guest.read_datagram()).await
-        {
-            bytes += datagram.len();
-        }
-        bytes
-    });
+    // El anfitrión envía hasta que el relay corta (a los ~20 kB reenviados). El invitado lee
+    // hasta que, cortado el anfitrión, pasa 1 s sin que llegue nada más.
+    let cut = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let received = {
+        let cut = std::sync::Arc::clone(&cut);
+        tokio::spawn(async move {
+            let mut bytes = 0usize;
+            let deadline = Instant::now() + TIMEOUT;
+            loop {
+                match tokio::time::timeout(Duration::from_secs(1), guest.read_datagram()).await {
+                    Ok(Ok(datagram)) => bytes += datagram.len(),
+                    Ok(Err(_)) => break,
+                    Err(_)
+                        if cut.load(std::sync::atomic::Ordering::Acquire)
+                            || Instant::now() >= deadline =>
+                    {
+                        break;
+                    }
+                    Err(_) => {}
+                }
+            }
+            bytes
+        })
+    };
     let deadline = Instant::now() + TIMEOUT;
     let mut group = 0u32;
     while host.quinn().close_reason().is_none() && Instant::now() < deadline {
@@ -857,6 +871,7 @@ async fn the_monthly_quota_cuts_the_relay_and_new_rooms_go_direct() {
         group += 1;
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    cut.store(true, std::sync::atomic::Ordering::Release);
     assert!(
         host.quinn().close_reason().is_some(),
         "el relay debe cortar al agotar la cuota"

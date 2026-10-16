@@ -49,3 +49,6 @@ windows = { workspace = true, optional = true, features = [
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+coroom-testkit.workspace = true

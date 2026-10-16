@@ -288,13 +288,20 @@ mod tests {
             })
             .collect();
         assert_eq!(moves, (1..=50).collect::<Vec<_>>());
+        // Funcional: las esperas se respetan (5 ms, 49 periodos de 1 ms y uno de 2 ms); nada sale
+        // antes de su hora, aunque el hilo se retrase.
+        assert!(
+            report.elapsed >= Duration::from_millis(5 + 49 + 2),
+            "{:?}",
+            report.elapsed
+        );
         // 50 movimientos a 1000 Hz: unos 49 ms entre el primero y el último.
         let first = events[1].0;
         let last = events[50].0;
         let span = last - first;
-        assert!(
+        coroom_testkit::timing_assert!(
             span >= Duration::from_millis(48) && span < Duration::from_millis(80),
-            "{span:?}"
+            "50 movimientos a 1000 Hz en {span:?}"
         );
         assert_eq!(events.last().map(|(_, e)| *e), Some(InputEvent::ReleaseAll));
     }

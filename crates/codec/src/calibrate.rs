@@ -766,7 +766,18 @@ mod tests {
             }) as Box<dyn Encoder>)
         });
         assert!(measured.opened, "{measured}");
-        assert_eq!(measured.samples, FRAMES - WARMUP);
+        // Funcional: cuenta lo de después del calentamiento y al menos el mínimo. Todas, si la
+        // máquina no se paró tanto como para agotar el presupuesto de codificación.
+        assert!(
+            (MIN_SAMPLES as u32..=FRAMES - WARMUP).contains(&measured.samples),
+            "{measured}"
+        );
+        coroom_testkit::timing_assert!(
+            measured.samples == FRAMES - WARMUP,
+            "{} muestras de {}: se agotó el presupuesto de codificación",
+            measured.samples,
+            FRAMES - WARMUP
+        );
         assert!(measured.p50 >= Duration::from_millis(1));
         assert!(measured.p95 >= measured.p50);
         // 2000 bytes × 8 × 60 fps = 960 kbit/s.
@@ -778,16 +789,18 @@ mod tests {
         assert!(!failed.opened);
         assert!(failed.note.as_deref().unwrap_or("").contains("sin GPU"));
         // Un driver que se cuelga al abrir no detiene la calibración: se descarta al pasar el
-        // límite y el hilo que lo abre termina por su cuenta.
-        let stuck = open_within(Duration::from_millis(50), || {
-            std::thread::sleep(Duration::from_millis(300));
+        // límite y el hilo que lo abre termina por su cuenta (aquí, cuando se le suelta después
+        // de comprobarlo).
+        let (release, hang) = std::sync::mpsc::channel::<()>();
+        let stuck = open_within(Duration::from_millis(50), move || {
+            let _ = hang.recv();
             Err("tarde".to_owned())
         });
-        let reason = match stuck {
-            Ok(_) => panic!("no debía abrir"),
-            Err(reason) => reason,
+        let Err(reason) = stuck else {
+            panic!("no debía abrir");
         };
         assert!(reason.contains("se abandona"), "{reason}");
+        drop(release);
         assert!(pick(&[failed, measured.clone()]).is_some_and(|r| r.backend == Backend::Software));
     }
 }

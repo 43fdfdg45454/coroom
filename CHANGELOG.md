@@ -528,6 +528,18 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Cambiado
 
+- **Pruebas en dos clases** (decisión del propietario): las funcionales (que el vídeo, el audio y la
+  entrada lleguen y estén enteros) hacen fallar la CI; los umbrales que dependen de la velocidad de
+  la máquina (latencias, p95, fps o Mbit/s logrados, huecos) van con `timing_assert!` de la crate
+  nueva `coroom-testkit` y solo avisan, en el paso «Avisos de tiempo» de la CI. Las esperas fijas
+  que hacían de sincronización pasan a sondeos con plazo, y las pruebas largas se acortaron donde lo
+  que prueban se sostiene.
+- **La suite tarda menos de la mitad**: cargo-nextest corre los binarios en paralelo
+  (`.config/nextest.toml`, con un grupo para las pruebas en tiempo real) y las sesiones de prueba
+  son más cortas. En un equipo de 4 núcleos, de unos 8 minutos de ejecución a 100-130 s; la de
+  capturas, de 51 a 10 s (solo escribe los PNG con `COROOM_SHOTS_DIR`, y el PNG se compila
+  optimizado).
+
 - **El codificador gasta lo que pide la imagen**, no el objetivo entero, en todos los backends: el
   objetivo del control de tasa es solo el techo de cada fotograma. NVENC va en VBR con suelo de
   QP; SVT-AV1, Vulkan Video (AV1 y H.264), AMF y QSV (H.264 y HEVC), en CBR con suelo de QP y sin

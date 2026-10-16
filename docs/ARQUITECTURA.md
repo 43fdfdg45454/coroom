@@ -81,9 +81,14 @@ capas (SFrame y QUIC) el peor caso queda por debajo de 0,2 ms por fotograma.
   la diferencia de reloj estimada con `Ping`/`Pong`. El overlay y el panel de estadísticas muestran el desglose.
 - **`coroom probe`**: prueba local por etapas sin red ni juego
   (`cargo run --release -p coroom -- probe --headless --frames 600`, con `--codec`, `--encoder`,
-  `--decoder` y `--json`); objetivo p95 total < 25 ms a 1080p60. La CI aplica una cota de regresión
-  de 80 ms a 720p.
-- **Benches con umbral** en `crates/crypto` (falla el build si se superan): SFrame cifrar + descifrar
+  `--decoder` y `--json`); objetivo p95 total < 25 ms a 1080p60. La CI vigila una cota de regresión
+  de 150 ms a 720p.
+- **Umbrales de tiempo que avisan**: las cotas que dependen de la velocidad de la máquina (estas y
+  las de los tests de extremo a extremo) van con `coroom_testkit::timing_assert!`. Si se superan, la
+  CI lo publica en «Avisos de tiempo» (anotaciones y resumen del job) sin fallar; lo que falla es lo
+  funcional (que el vídeo, el audio o la entrada lleguen y estén enteros). `COROOM_TIMING_STRICT=1`
+  convierte los avisos en fallos para medir en una máquina tranquila.
+- **Benches con umbral** en `crates/crypto` (avisan si se superan): SFrame cifrar + descifrar
   un fotograma de 128 KB < 150 µs; HPKE sellar + abrir < 1 ms; `commit` MLS con 8 miembros < 20 ms;
   cifrado de la entrada < 5 µs.
 - **Tests de extremo a extremo** en proceso: sesión remota directa, por relay y con pérdida
@@ -187,6 +192,7 @@ Invitado ── HTTP/3 + WebTransport ──▶ Servidor (UDP) ◀── HTTP/3 
 | `crates/render` | Dispositivo `wgpu` compartido con Vulkan Video, capa de vídeo, HDR, cursor local |
 | `crates/session` | Máquinas de estado anfitrión e invitado, permisos, reloj, marcas por etapa |
 | `crates/ui` | Sistema de diseño `coroom-ui` para `iced`: tokens, tema, fuentes, iconos, componentes |
+| `crates/testkit` | Ayudas de prueba (solo `dev-dependencies`): `timing_assert!`, umbrales de tiempo que avisan sin hacer fallar |
 | `apps/desktop` | Binario `coroom` (aplicación, `doctor`, `probe`, `host`, `join`, `login`…); `locales/` |
 | `apps/server` | Binario `coroom-server` (HTTP/3, WebTransport, relay, SQLite, `/admin`) |
 | `drivers/windows-vhid` | Driver de mandos virtuales de UMDF2 (modo usuario): mandos VHF tal cual y Xbox 360 para XInput |

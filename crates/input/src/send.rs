@@ -607,6 +607,7 @@ mod tests {
     use coroom_crypto::hpke::PairwiseSecret;
     use coroom_crypto::input::Role;
     use coroom_proto::input::{InputPacket, parse_datagram};
+    use coroom_testkit::timing_assert;
 
     #[derive(Default)]
     struct Captured {
@@ -670,6 +671,24 @@ mod tests {
             .collect()
     }
 
+    /// Si los movimientos `1, 2, 3…` salieron en orden aunque se sumaran algunos (el emisor solo
+    /// funde uno con el último pendiente): la suma tras cada uno recibido es `n(n+1)/2`, con `n`
+    /// creciente.
+    fn assert_triangular_prefixes(moves: &[i32]) {
+        let mut sum = 0i64;
+        let mut last_n = 0i64;
+        for (index, dx) in moves.iter().enumerate() {
+            sum += i64::from(*dx);
+            // n(n+1)/2 = sum → n = (√(8·sum+1) − 1)/2.
+            let n = ((((8 * sum + 1) as f64).sqrt() - 1.0) / 2.0).round() as i64;
+            assert!(
+                n * (n + 1) / 2 == sum && n > last_n,
+                "movimiento {index}: suma {sum} no sigue a la anterior (n = {last_n}): {moves:?}"
+            );
+            last_n = n;
+        }
+    }
+
     #[test]
     fn moves_are_batched_and_a_key_goes_at_once_with_the_state() {
         let (link, mut sender, mut host) = pair();
@@ -690,13 +709,25 @@ mod tests {
         let stats = sender.stats();
         assert_eq!(stats.events, 201);
         assert_eq!(stats.messages, 0, "nada va por el stream");
-        assert_eq!(stats.merged, 0);
+        // Si el hilo del emisor se queda parado, los movimientos se suman en un paquete: no se
+        // pierde nada (lo comprueba la suma de abajo), pero es cosa del planificador.
+        timing_assert!(
+            stats.merged == 0,
+            "{} movimientos sumados a otro",
+            stats.merged
+        );
 
         let packets = open_all(&link, &mut host);
-        // ≤ 1000 paquetes/s: con 200 ms de movimiento, unos 200 (más alguna repetición).
+        // ≤ 1000 paquetes/s: con 200 ms de movimiento, unos 200 (más alguna repetición). Más que
+        // eventos y repeticiones no puede haber; menos, si el emisor juntó movimientos.
         assert!(
-            (100..=215).contains(&packets.len()),
+            (1..=215).contains(&packets.len()),
             "{} datagramas",
+            packets.len()
+        );
+        timing_assert!(
+            packets.len() >= 100,
+            "solo {} datagramas en 200 ms de movimiento a 1000 Hz",
             packets.len()
         );
         let gaps: Vec<Duration> = packets
@@ -707,7 +738,7 @@ mod tests {
             .iter()
             .filter(|gap| **gap < Duration::from_micros(700))
             .count();
-        assert!(
+        timing_assert!(
             fast <= 3,
             "{fast} datagramas a menos de 0,7 ms del anterior"
         );
@@ -733,26 +764,46 @@ mod tests {
                 "el acumulado sigue a los eventos"
             );
         }
-        assert_eq!(moves, (1..=200).collect::<Vec<_>>(), "todos y en orden");
+        // Funcional: no se pierde ni sobra movimiento, y la tecla salió.
+        assert_eq!(moves.iter().sum::<i32>(), 20_100, "suma de los movimientos");
+        assert_eq!(
+            packets.last().map(|(_, packet)| packet.state.motion.0),
+            Some(20_100),
+            "el acumulado final"
+        );
         assert!(key_seen);
+        // En orden y sin perder ninguno aunque el emisor parado sume alguno; que salgan uno a uno
+        // depende del planificador.
+        assert_triangular_prefixes(&moves);
+        timing_assert!(
+            moves == (1..=200).collect::<Vec<_>>(),
+            "los movimientos no salieron uno a uno: {} paquetes de movimiento",
+            moves.len()
+        );
         assert!(link.frames.lock().unwrap().is_empty());
     }
 
     #[test]
     fn a_state_change_is_repeated_when_nothing_else_goes_out() {
         let (link, mut sender, mut host) = pair();
+        // Antes de mandar la tecla: el emisor cuenta los plazos desde que sale su paquete, que es
+        // después de esto (y antes de que el enlace lo apunte).
+        let pressed_at = Instant::now();
         sender.send(InputEvent::Key {
             code: 30,
             pressed: true,
         });
         std::thread::sleep(Duration::from_millis(60));
+        // Al menos una repetición antes del movimiento, aunque el emisor se haya quedado parado.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while sender.stats().repeats == 0 {
+            assert!(Instant::now() < deadline, "el estado no se repite");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         sender.send(InputEvent::MouseMove { dx: 1, dy: 0 });
         std::thread::sleep(Duration::from_millis(60));
         sender.stop();
         let packets = open_all(&link, &mut host);
-        // La tecla, sus tres repeticiones y el movimiento (que no es cambio de estado: sin
-        // repeticiones).
-        assert_eq!(packets.len(), 1 + REPEATS.len() + 1, "{packets:?}");
         assert_eq!(
             packets[0].1.events,
             vec![InputEvent::Key {
@@ -760,23 +811,65 @@ mod tests {
                 pressed: true
             }]
         );
-        for (index, (at, packet)) in packets.iter().enumerate().take(REPEATS.len() + 1).skip(1) {
-            assert!(packet.events.is_empty(), "repetición {index}: {packet:?}");
+        let moved = packets
+            .iter()
+            .position(|(_, packet)| {
+                packet
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, InputEvent::MouseMove { .. }))
+            })
+            .expect("sale el movimiento");
+        assert_eq!(
+            packets[moved].1.events,
+            vec![InputEvent::MouseMove { dx: 1, dy: 0 }]
+        );
+        assert_eq!(packets[moved].1.state.motion, (1, 0));
+        assert!(
+            moved >= 2,
+            "ninguna repetición antes del movimiento: {packets:?}"
+        );
+        // Lo demás son repeticiones del estado: sin eventos y con la tecla pulsada.
+        for (index, (_, packet)) in packets.iter().enumerate().skip(1) {
+            if index != moved {
+                assert!(packet.events.is_empty(), "repetición {index}: {packet:?}");
+            }
             assert_eq!(packet.state.keys, vec![30]);
+        }
+        for (index, (at, _)) in packets
+            .iter()
+            .enumerate()
+            .take(moved.min(REPEATS.len() + 1))
+            .skip(1)
+        {
             let since = *at - packets[0].0;
             let expected = REPEATS[index - 1];
+            // Desde `pressed_at` es una cota segura: un parón al sellar el paquete de la tecla
+            // retrasa `packets[0].0`, no el plazo, y acortaría `since`.
+            let since_pressed = *at - pressed_at;
             assert!(
-                since + Duration::from_millis(1) >= expected
-                    && since < expected + Duration::from_millis(15),
+                since_pressed >= expected,
+                "repetición {index} antes de tiempo, a los {since_pressed:?} de la tecla (se \
+                 esperaba {expected:?})"
+            );
+            timing_assert!(
+                since < expected + Duration::from_millis(15),
                 "repetición {index} a los {since:?} (se esperaba {expected:?})"
             );
         }
-        assert_eq!(
-            packets[4].1.events,
-            vec![InputEvent::MouseMove { dx: 1, dy: 0 }]
+        // La tecla, sus tres repeticiones y el movimiento (que no es cambio de estado: sin
+        // repeticiones).
+        timing_assert!(
+            packets.len() == 1 + REPEATS.len() + 1 && moved == REPEATS.len() + 1,
+            "{} datagramas, el movimiento en el {moved}: {packets:?}",
+            packets.len()
         );
-        assert_eq!(packets[4].1.state.motion, (1, 0));
-        assert_eq!(sender.stats().repeats, REPEATS.len() as u64);
+        let repeats = sender.stats().repeats;
+        timing_assert!(
+            repeats == REPEATS.len() as u64,
+            "{repeats} repeticiones, se esperaban {}",
+            REPEATS.len()
+        );
     }
 
     /// Con una tecla pulsada, pasadas las repeticiones cortas el estado sigue saliendo cada
@@ -789,14 +882,46 @@ mod tests {
             code: 30,
             pressed: true,
         });
-        // Tres repeticiones cortas (hasta 20 ms) y luego keepalives a los ~120, ~220 y ~320 ms.
-        std::thread::sleep(Duration::from_millis(360));
+        // Tres repeticiones cortas (hasta 20 ms) y luego keepalives a los ~120 y ~220 ms; se
+        // suelta cuando ha salido al menos un keepalive (con un emisor parado, más tarde).
+        let sent = || link.datagrams.lock().unwrap().len();
+        std::thread::sleep(Duration::from_millis(250));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while sent() < 2 + REPEATS.len() {
+            assert!(
+                Instant::now() < deadline,
+                "no sale ningún keepalive: {}",
+                sent()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Antes de mandarla: todo paquete sin la tecla sale después.
+        let released = Instant::now();
         sender.send(InputEvent::Key {
             code: 30,
             pressed: false,
         });
-        let released = Instant::now();
+        // La liberación y sus tres repeticiones (hasta 20 ms); el margen, para ver que no sale
+        // nada más antes del keepalive en reposo (500 ms).
         std::thread::sleep(Duration::from_millis(300));
+        // Paquetes sin la tecla desde `released` (con un descifrador nuevo en cada vuelta: el de
+        // la prueba no puede abrir dos veces el mismo número).
+        let released_packets = || {
+            let mut host = InputCipher::from_pairwise(&secret(), Role::Host).unwrap();
+            open_all(&link, &mut host)
+                .into_iter()
+                .filter(|(at, packet)| *at >= released && packet.state.keys.is_empty())
+                .collect::<Vec<_>>()
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while released_packets().len() < 1 + REPEATS.len() {
+            assert!(
+                Instant::now() < deadline,
+                "la liberación no se repite: {:?}",
+                released_packets()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         sender.stop();
         let packets = open_all(&link, &mut host);
         let pressed: Vec<&(Instant, InputPacket)> = packets
@@ -804,7 +929,12 @@ mod tests {
             .filter(|(_, packet)| packet.state.keys == vec![30])
             .collect();
         assert!(
-            (6..=8).contains(&pressed.len()),
+            pressed.len() > REPEATS.len(),
+            "{} paquetes con la tecla pulsada",
+            pressed.len()
+        );
+        timing_assert!(
+            (5..=7).contains(&pressed.len()),
             "{} paquetes con la tecla pulsada",
             pressed.len()
         );
@@ -812,21 +942,72 @@ mod tests {
             .iter()
             .filter(|(at, _)| *at - start > REPEATS[2] + Duration::from_millis(30))
             .count();
-        assert!((2..=4).contains(&keepalives), "{keepalives} keepalives");
+        assert!(keepalives >= 1, "ningún keepalive con la tecla pulsada");
+        timing_assert!((1..=3).contains(&keepalives), "{keepalives} keepalives");
         for (index, pair) in pressed.windows(2).enumerate() {
             let gap = pair[1].0 - pair[0].0;
-            assert!(
+            timing_assert!(
                 gap <= KEEPALIVE_PRESSED + Duration::from_millis(40),
                 "hueco {index} de {gap:?} con la tecla pulsada"
             );
         }
         // Tras soltarla: el paquete de la liberación, sus tres repeticiones y nada más antes del
-        // keepalive en reposo (500 ms).
+        // keepalive en reposo. Las repeticiones no se saltan aunque el emisor se pare (salen
+        // tarde, una tras otra) y el keepalive se cuenta desde la última, que salió después de
+        // `released`: sale como pronto a `released + KEEPALIVE_IDLE`, pase lo que pase.
+        let empty: Vec<&(Instant, InputPacket)> = packets
+            .iter()
+            .filter(|(at, packet)| *at >= released && packet.state.keys.is_empty())
+            .collect();
+        assert!(empty.len() > REPEATS.len(), "{empty:?}");
+        assert_eq!(
+            empty[0].1.events,
+            vec![InputEvent::Key {
+                code: 30,
+                pressed: false
+            }],
+            "el primero sin la tecla es el de la liberación: {empty:?}"
+        );
+        assert!(
+            empty[1..=REPEATS.len()]
+                .iter()
+                .all(|(_, packet)| packet.events.is_empty()),
+            "luego, sus repeticiones: {empty:?}"
+        );
+        assert!(
+            empty[1 + REPEATS.len()..]
+                .iter()
+                .all(|(at, _)| *at - released >= KEEPALIVE_IDLE),
+            "sale algo más antes del keepalive en reposo: {empty:?}"
+        );
+        timing_assert!(
+            empty
+                .iter()
+                .filter(|(at, _)| *at - released < KEEPALIVE_IDLE / 2)
+                .count()
+                == 1 + REPEATS.len(),
+            "la liberación y sus repeticiones no salieron en {:?}: {empty:?}",
+            KEEPALIVE_IDLE / 2
+        );
+        // Un keepalive con la tecla que saliera a la vez que se soltaba puede caer detrás de
+        // `released`; el último paquete ya va sin ella.
         let after: Vec<&(Instant, InputPacket)> =
             packets.iter().filter(|(at, _)| *at >= released).collect();
-        assert_eq!(after.len(), 1 + REPEATS.len(), "{after:?}");
-        assert!(after.iter().all(|(_, packet)| packet.state.keys.is_empty()));
-        assert!(after.last().unwrap().0 - released < Duration::from_millis(100));
+        assert!(after.len() > REPEATS.len(), "{after:?}");
+        assert!(
+            after.last().unwrap().1.state.keys.is_empty(),
+            "la tecla sigue pulsada: {after:?}"
+        );
+        timing_assert!(
+            after.len() == 1 + REPEATS.len()
+                && after.iter().all(|(_, packet)| packet.state.keys.is_empty()),
+            "tras soltar: {after:?}"
+        );
+        let last = after.last().unwrap().0 - released;
+        timing_assert!(
+            last < Duration::from_millis(100),
+            "la última repetición de la liberación a los {last:?}"
+        );
     }
 
     #[test]

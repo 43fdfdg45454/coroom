@@ -1,0 +1,40 @@
+# Ejecución de las pruebas con cargo-nextest (`cargo nextest run --workspace`): cada prueba en su
+# propio proceso y los binarios en paralelo, en lugar de un binario detrás de otro.
+#
+# Las pruebas que mueven medios en tiempo real (sesiones completas, voz, entrada a 1 kHz, la matriz
+# de red) van en el grupo `realtime`: como mucho dos a la vez, para que se repartan la CPU con el
+# resto sin ahogarse. Las de medios de `coroom-transport` van de una en una en su propio grupo: la
+# de 80 Mbit/s le quita búfer de socket a las demás aunque no haya red de por medio. Sus umbrales de tiempo avisan sin hacer fallar (`coroom_testkit::timing_assert!`);
+# lo que se comprueba aquí es que funcionen.
+
+[test-groups]
+realtime = { max-threads = 2 }
+transport-media = { max-threads = 1 }
+
+[profile.default]
+# Una prueba colgada se corta a los 5 minutos en lugar de dejar la CI esperando.
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+[[profile.default.overrides]]
+filter = '''
+binary_id(=coroom::remote) | binary_id(=coroom::audio) | binary_id(=coroom::chat)
+  | binary_id(=coroom::input) | binary_id(=coroom::matrix) | binary_id(=coroom::pacing)
+  | binary_id(=coroom::probe) | binary_id(=coroom::soak) | binary_id(=coroom::qa_stream)
+  | binary_id(=coroom-transport::netem) | binary_id(=coroom-transport::spike)
+  | binary_id(=coroom-audio::latency)
+'''
+test-group = "realtime"
+
+[[profile.default.overrides]]
+filter = 'binary_id(=coroom-transport::media)'
+test-group = "transport-media"
+
+# Las ignoradas largas (`soak`, horas; la QA de vídeo, minutos) no se cortan si se piden con
+# `--run-ignored`.
+[[profile.default.overrides]]
+filter = 'binary_id(=coroom::soak) | binary_id(=coroom::qa_stream)'
+slow-timeout = { period = "60s" }
+
+[profile.ci]
+# En la CI se ven todos los fallos de una vez.
+fail-fast = false

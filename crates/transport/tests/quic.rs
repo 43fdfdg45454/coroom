@@ -79,7 +79,10 @@ async fn peers_connect_with_raw_public_keys() {
         .send(&ControlMessage::Bye)
         .expect("envío");
     assert_eq!(
-        guest_control.receiver.recv().await.expect("mensaje"),
+        tokio::time::timeout(TIMEOUT, guest_control.receiver.recv())
+            .await
+            .expect("a tiempo")
+            .expect("mensaje"),
         Some(ControlMessage::Bye)
     );
 
@@ -134,7 +137,7 @@ async fn a_client_that_is_not_admitted_is_rejected() {
     // El cliente puede completar su lado del handshake antes de recibir el rechazo: en ese caso
     // la conexión muere enseguida.
     if let Ok(connection) = result {
-        let closed = tokio::time::timeout(Duration::from_secs(5), connection.closed()).await;
+        let closed = tokio::time::timeout(TIMEOUT, connection.closed()).await;
         assert!(closed.is_ok(), "el servidor debe cerrar la conexión");
     }
     // Y nunca llega al anfitrión.
@@ -160,7 +163,7 @@ async fn revoked_peers_can_no_longer_connect() {
     .await
     .expect("a tiempo");
     if let Ok(connection) = result {
-        let closed = tokio::time::timeout(Duration::from_secs(5), connection.closed()).await;
+        let closed = tokio::time::timeout(TIMEOUT, connection.closed()).await;
         assert!(closed.is_ok());
     }
 }

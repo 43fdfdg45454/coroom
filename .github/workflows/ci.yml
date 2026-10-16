@@ -143,16 +143,28 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.148
+
+      # Dos clases de pruebas (crates/testkit): las funcionales hacen fallar la CI; los umbrales de
+      # tiempo (`timing_assert!`: latencias, ritmos, huecos) solo dejan un aviso en el informe, que
+      # «Avisos de tiempo» publica al final. nextest corre los binarios en paralelo
+      # (.config/nextest.toml); los ejemplos de la documentación van aparte con `cargo test --doc`.
       # Si falla, los tests que fallan salen también como anotaciones: se ven en la API pública de
       # las comprobaciones sin descargar el registro.
       - name: Tests
         shell: bash
+        env:
+          COROOM_TIMING_REPORT: ${{ runner.temp }}/timing.txt
         run: |
           set -o pipefail
-          cargo test --workspace --locked 2>&1 | tee test-output.txt || {
-            grep -E -A2 "^test .* FAILED|panicked at" test-output.txt | tr -d '\r' | head -40 | sed 's/^/::error::/'
+          cargo nextest run --workspace --locked --profile ci 2>&1 | tee test-output.txt || {
+            grep -E "^ +(FAIL|TIMEOUT|ABORT|LEAK[A-Z-]*|SIG[A-Z]+) |panicked at" test-output.txt | tr -d '\r' | head -40 | sed 's/^ */::error::/'
             exit 1
           }
+          cargo test --workspace --doc --locked
 
       # Firma híbrida Ed25519 + ML-DSA-65, tras su `feature` desactivada por defecto.
       - name: Firma híbrida (pq-sign)
@@ -169,6 +181,8 @@ jobs:
       # Puertas de coste del E2EE (docs/ARQUITECTURA.md §2.3): SFrame, MLS y HPKE optimizados.
       - name: Puertas E2EE (release)
         if: runner.os == 'Linux'
+        env:
+          COROOM_TIMING_REPORT: ${{ runner.temp }}/timing.txt
         run: cargo test --release -p coroom-crypto --locked -- --ignored --nocapture
 
       # Medios con pérdida y jitter reales (tc netem en lo: 2 %, 10 ms ± 5 ms). Los tests `netem_*`
@@ -179,6 +193,8 @@ jobs:
       - name: netem
         if: runner.os == 'Linux'
         continue-on-error: true
+        env:
+          COROOM_TIMING_REPORT: ${{ runner.temp }}/timing.txt
         run: |
           sudo modprobe sch_netem || true
           if ! sudo tools/netem.sh apply; then
@@ -197,9 +213,18 @@ jobs:
       - name: Matriz de red (netem)
         if: runner.os == 'Linux'
         continue-on-error: true
+        env:
+          COROOM_TIMING_REPORT: ${{ runner.temp }}/timing.txt
         run: |
           sudo modprobe sch_netem || true
           cargo test -p coroom --test matrix --locked -- --ignored netem_matrix --nocapture
+
+      # Los umbrales de tiempo que se salieron en cualquiera de los pasos anteriores, como avisos y
+      # en el resumen del job. No falla nunca.
+      - name: Avisos de tiempo
+        if: always()
+        shell: bash
+        run: tools/timing-report.sh "$(cygpath -u "$RUNNER_TEMP" 2>/dev/null || echo "$RUNNER_TEMP")/timing.txt"
 
       - name: cargo deny
         if: runner.os == 'Linux'

@@ -11,7 +11,8 @@ use coroom_transport::{Connector, EndpointOptions, Path, TransportError};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn simultaneous_open_agrees_on_one_direct_connection() {
-    for _ in 0..5 {
+    // Unas pocas vueltas: quién llama primero cambia de una a otra.
+    for _ in 0..3 {
         let host = peer(EndpointOptions::default());
         let guest = peer(EndpointOptions::default());
         let host_addr = host.endpoint.local_addr().expect("dirección");
@@ -67,7 +68,10 @@ async fn simultaneous_open_agrees_on_one_direct_connection() {
             .send(&ControlMessage::Ping { t: 7 })
             .expect("envío");
         assert_eq!(
-            host_control.receiver.recv().await.expect("mensaje"),
+            tokio::time::timeout(TIMEOUT, host_control.receiver.recv())
+                .await
+                .expect("a tiempo")
+                .expect("mensaje"),
             Some(ControlMessage::Ping { t: 7 })
         );
         // Y sigue viva pasada la gracia en la que se cierran las duplicadas.

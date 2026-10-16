@@ -2021,6 +2021,7 @@ mod tests {
     use super::*;
     use coroom_capture::synthetic::SyntheticCapturer;
     use coroom_codec::openh264::{OpenH264Decoder, OpenH264Encoder};
+    use coroom_testkit::timing_assert;
 
     /// Las opciones nuevas de la captura se recogen una vez (gana la última) y la que se adopte
     /// después las encuentra.
@@ -2551,6 +2552,15 @@ mod tests {
         }
     }
 
+    /// Sondea `condition` hasta que se cumpla; el plazo de 20 s solo se agota si algo está roto.
+    fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !condition() {
+            assert!(Instant::now() < deadline, "tiempo agotado: {what}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// Lanza `encode_loop` con un `FakeEncoder` y un `EncodeControl` activo.
     struct EncodeHarness {
         shared: Arc<Shared>,
@@ -2608,6 +2618,18 @@ mod tests {
             }
         }
 
+        /// Espera (hasta 20 s) a que el hilo haya codificado `times` veces el fotograma
+        /// `frame_id`.
+        fn wait_encoded(&self, frame_id: u64, times: usize) {
+            wait_until(
+                &format!("el fotograma {frame_id} codificado {times} veces"),
+                || {
+                    let encoded = self.encoded.lock().unwrap();
+                    encoded.iter().filter(|(id, _)| *id == frame_id).count() >= times
+                },
+            );
+        }
+
         fn stop(self) -> (u32, Vec<(u64, bool)>) {
             self.shared.stop.store(true, Ordering::SeqCst);
             drop(self.frames);
@@ -2619,34 +2641,60 @@ mod tests {
 
     /// Con un objetivo que oscila (como el del control de tasa: pasos del 10 % y alguno grande),
     /// un codificador sin bitrate en caliente se reabre pocas veces; uno con él lo sigue siempre.
+    /// Cada fotograma se manda cuando el anterior ya salió: el hilo no los junta y ve cada objetivo.
     #[test]
     fn a_fluctuating_target_reopens_a_non_live_encoder_a_bounded_number_of_times() {
+        const PER_TARGET: usize = 3;
         for live in [false, true] {
             let harness = EncodeHarness::start(live, 10_000);
             let targets = [
                 10_000, 11_000, 12_100, 11_000, 7_000, 15_000, 10_000, 16_000,
             ];
             let mut changes = 0;
-            for (i, frame) in (0..80u64).enumerate() {
-                let target = targets[(i / 10) % targets.len()];
+            let started = Instant::now();
+            for (i, frame) in (0..(targets.len() * PER_TARGET) as u64).enumerate() {
+                let target = targets[(i / PER_TARGET) % targets.len()];
                 let previous = harness.control.bitrate_kbps.swap(target, Ordering::SeqCst);
                 if previous != target {
                     changes += 1;
                 }
                 harness.frames.send(cpu_frame(frame)).unwrap();
-                thread::sleep(Duration::from_millis(10));
+                harness.wait_encoded(frame, 1);
             }
-            thread::sleep(Duration::from_millis(50));
+            let elapsed = started.elapsed();
             let (bitrates, encoded) = harness.stop();
+            let bitrates = bitrates as usize;
             let keyframes = encoded.iter().filter(|(_, keyframe)| *keyframe).count();
             if live {
-                // El primero y cada cambio.
-                assert_eq!(bitrates as usize, changes + 1, "{encoded:?}");
+                // El primero y cada cambio: el objetivo cambia antes de mandar cada fotograma y el
+                // hilo lo lee al codificarlo, así que no depende del ritmo.
+                assert_eq!(
+                    bitrates,
+                    changes + 1,
+                    "{bitrates} cambios de bitrate de {changes}: {encoded:?}"
+                );
             } else {
                 // El primero y la bajada de ≥ 20 % (a 7 000); los pasos del 10 % no, y las subidas
-                // tampoco: no han pasado 4 s desde la apertura. Un intra por cada uno.
-                assert_eq!(bitrates, 2, "{bitrates} reaperturas de {changes} cambios");
-                assert_eq!(keyframes, 2, "{encoded:?}");
+                // tampoco: no han pasado 4 s desde la apertura. Un intra por cada uno. Si el bucle
+                // tardó más que eso (el hilo se paró), puede entrar alguna subida.
+                assert!(
+                    bitrates >= 2 && bitrates < changes + 1,
+                    "{bitrates} reaperturas de {changes} cambios"
+                );
+                assert!(keyframes >= 2, "{encoded:?}");
+                if elapsed < REOPEN_INCREASE_PERIOD {
+                    assert_eq!(bitrates, 2, "{bitrates} reaperturas de {changes} cambios");
+                    assert_eq!(keyframes, 2, "{keyframes} intras: {encoded:?}");
+                } else {
+                    timing_assert!(
+                        bitrates == 2,
+                        "{bitrates} reaperturas de {changes} cambios en {elapsed:?}"
+                    );
+                    timing_assert!(
+                        keyframes == 2,
+                        "{keyframes} intras en {elapsed:?}: {encoded:?}"
+                    );
+                }
             }
         }
     }
@@ -2662,7 +2710,21 @@ mod tests {
             harness.frames.send(cpu_frame(frame)).unwrap();
             thread::sleep(Duration::from_millis(10));
         }
-        thread::sleep(Duration::from_millis(50));
+        // Si el hilo se paró y juntó fotogramas, los que se pierden pueden ser los últimos: se
+        // sigue mandando (uno cada 100 ms, sin adelantar al normal) hasta que salga alguno.
+        let mut next = 4;
+        let mut sent_at = Instant::now();
+        wait_until("un fotograma codificado", || {
+            if !harness.encoded.lock().unwrap().is_empty() {
+                return true;
+            }
+            if sent_at.elapsed() >= Duration::from_millis(100) {
+                harness.frames.send(cpu_frame(next)).unwrap();
+                next += 1;
+                sent_at = Instant::now();
+            }
+            false
+        });
         assert_eq!(
             harness.shared.take_capture_gpu_frames(),
             Some(GpuFrames::Off),
@@ -2676,10 +2738,13 @@ mod tests {
         );
         let (_, encoded) = harness.stop();
         let ids: Vec<u64> = encoded.iter().map(|(id, _)| *id).collect();
-        assert_eq!(
-            ids,
-            vec![2, 3],
-            "los dos primeros se pierden; el hilo sigue"
+        assert!(
+            !ids.is_empty() && ids.iter().all(|&id| id >= 2),
+            "los dos primeros se pierden; el hilo sigue: {ids:?}"
+        );
+        timing_assert!(
+            ids == [2, 3],
+            "codificados {ids:?}: el hilo juntó fotogramas"
         );
     }
 
@@ -2718,12 +2783,17 @@ mod tests {
             harness.frames.send(cpu_frame(frame)).unwrap();
             thread::sleep(Duration::from_millis(10));
         }
-        thread::sleep(Duration::from_millis(100));
+        harness.wait_encoded(2, 1);
         harness.shared.request_keyframe();
-        thread::sleep(IDLE_KEYFRAME + Duration::from_millis(300));
+        // Pasados `IDLE_KEYFRAME` sin fotograma nuevo, el último sale otra vez.
+        harness.wait_encoded(2, 2);
         let (_, encoded) = harness.stop();
-        assert_eq!(encoded.len(), 4, "{encoded:?}");
-        assert_eq!(encoded[3], (2, true), "el último otra vez, intra");
+        assert_eq!(
+            encoded.last(),
+            Some(&(2, true)),
+            "el último otra vez, intra"
+        );
+        timing_assert!(encoded.len() == 4, "el hilo juntó fotogramas: {encoded:?}");
     }
 
     /// Lo mismo con DMA-BUF de PipeWire: la ventana capturada que deja de redibujarse (oculta o en
@@ -2759,17 +2829,24 @@ mod tests {
             harness.frames.send(dmabuf_frame(frame)).unwrap();
             thread::sleep(Duration::from_millis(10));
         }
-        thread::sleep(Duration::from_millis(100));
+        harness.wait_encoded(2, 1);
+        wait_until("los búferes anteriores devueltos", || {
+            released.load(Ordering::SeqCst) >= 2
+        });
         assert_eq!(
             released.load(Ordering::SeqCst),
             2,
             "solo se retiene el último"
         );
         harness.shared.request_keyframe();
-        thread::sleep(IDLE_KEYFRAME + Duration::from_millis(300));
+        harness.wait_encoded(2, 2);
         let (_, encoded) = harness.stop();
-        assert_eq!(encoded.len(), 4, "{encoded:?}");
-        assert_eq!(encoded[3], (2, true), "el último otra vez, intra");
+        assert_eq!(
+            encoded.last(),
+            Some(&(2, true)),
+            "el último otra vez, intra"
+        );
+        timing_assert!(encoded.len() == 4, "el hilo juntó fotogramas: {encoded:?}");
         assert_eq!(released.load(Ordering::SeqCst), 3, "al parar se devuelve");
     }
 

@@ -282,9 +282,11 @@ fn the_cpu_encoders_reduce_frames_larger_than_the_cap() {
             .cpu_scale()
             .unwrap_or_else(|| panic!("{name}: reducción medida"));
         assert_eq!((scale.from, scale.to), ((1280, 720), (640, 360)), "{name}");
-        assert!(
-            scale.took > Duration::ZERO && scale.took < Duration::from_secs(1),
-            "{name}"
+        assert!(scale.took > Duration::ZERO, "{name}: reducción sin medir");
+        coroom_testkit::timing_assert!(
+            scale.took < Duration::from_secs(1),
+            "{name}: la reducción en CPU tardó {:?}",
+            scale.took
         );
         println!("{name}: reducción en CPU {scale}");
         let reference = halved_luma(&big);

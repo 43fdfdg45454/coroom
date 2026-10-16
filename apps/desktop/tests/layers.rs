@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use toml::Table;
 
 /// Crates de `crates/` que deben existir.
-const LIBRARY_CRATES: [&str; 10] = [
+const LIBRARY_CRATES: [&str; 11] = [
     "proto",
     "crypto",
     "transport",
@@ -28,6 +28,7 @@ const LIBRARY_CRATES: [&str; 10] = [
     "render",
     "session",
     "ui",
+    "testkit",
 ];
 
 /// Aplicaciones de `apps/` que deben existir.

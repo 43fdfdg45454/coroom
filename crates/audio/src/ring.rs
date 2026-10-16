@@ -356,10 +356,16 @@ mod tests {
         let mut device = [0i16; 600];
         shared.pop_into(&mut device);
         assert_eq!((device[0], device[519], device[520]), (480, 999, 0));
+        let before = Instant::now();
         let played = shared
             .write_frame(AudioFormat::VOICE, &[7; 480], Duration::from_millis(10))
             .expect("encolar");
-        assert!(played.played_at_estimate > Instant::now());
+        // Funcional: suena como pronto una latencia después de escribirla.
+        assert!(played.played_at_estimate >= before + Duration::from_millis(10));
+        coroom_testkit::timing_assert!(
+            played.played_at_estimate > Instant::now(),
+            "la hora estimada ya pasó al volver de escribir: el hilo se quedó parado más de 10 ms"
+        );
         shared.pop_into(&mut device[..480]);
         assert!(device[..480].iter().all(|s| *s == 7));
         // Sin nada que leer: silencio en 40 ms.
@@ -483,6 +489,7 @@ mod tests {
             }
         }));
         let delay = Duration::from_millis(10);
+        let before = Instant::now();
         let mut heard = Vec::new();
         for _ in 0..15 {
             let mut quantum = [0i16; 256 * 2];
@@ -496,7 +503,7 @@ mod tests {
         assert_eq!(calls.len(), 8);
         // Una trama pedida a mitad de cuanto suena después de lo que ya se escribió en él.
         let first = calls[0];
-        assert!(first >= Instant::now() - Duration::from_secs(1));
+        assert!(first >= before + delay, "{calls:?}");
         assert!(calls[1] > first, "{calls:?}");
     }
 

@@ -16,7 +16,8 @@ use coroom_transport::proto::media::Track;
 use coroom_transport::rate::RateConfig;
 use coroom_transport::{Endpoint, EndpointOptions, PeerConnection};
 
-pub const TIMEOUT: Duration = Duration::from_secs(10);
+/// Plazo de lo que tiene que pasar: solo se agota si algo está roto.
+pub const TIMEOUT: Duration = Duration::from_secs(20);
 
 /// `127.0.0.1:0`: los tests no dependen de que el sistema tenga IPv6.
 pub fn localhost() -> SocketAddr {
@@ -187,9 +188,11 @@ pub async fn transmit_with(
 
     let start = Instant::now();
     let send_times = Arc::new(std::sync::Mutex::new(vec![start; frames as usize]));
+    let sent_all = Arc::new(std::sync::OnceLock::new());
     let send_task = {
         let sender = Arc::clone(&sender);
         let send_times = Arc::clone(&send_times);
+        let sent_all = Arc::clone(&sent_all);
         tokio::spawn(async move {
             let t0 = tokio::time::Instant::now();
             for group in 0..frames {
@@ -203,15 +206,31 @@ pub async fn transmit_with(
                     .await
                     .expect("envío");
             }
+            let _ = sent_all.set(Instant::now());
         })
     };
 
     let mut received = Vec::new();
     let mut last = Instant::now();
     let mut max_gap = Duration::ZERO;
-    let deadline = start + interval * frames + Duration::from_secs(2);
-    while let Ok(Ok(frame)) = tokio::time::timeout_at(deadline.into(), receiver.recv_frame()).await
-    {
+    // Se recibe hasta el último fotograma o hasta 2 s después de enviarlo todo: si el emisor va
+    // más lento que el reloj (un runner cargado), se le espera en lugar de cortar la recepción.
+    let paced_end = start + interval * frames;
+    let give_up = paced_end + TIMEOUT;
+    let tail = Duration::from_secs(2);
+    loop {
+        let deadline = match sent_all.get() {
+            Some(&sent) => sent.max(paced_end) + tail,
+            None => (paced_end + tail).max(Instant::now() + Duration::from_millis(200)),
+        }
+        .min(give_up);
+        let frame = match tokio::time::timeout_at(deadline.into(), receiver.recv_frame()).await {
+            Ok(Ok(frame)) => frame,
+            Ok(Err(_)) => break,
+            // Plazo agotado con el emisor aún mandando: se sigue esperando.
+            Err(_) if sent_all.get().is_none() && Instant::now() < give_up => continue,
+            Err(_) => break,
+        };
         let now = Instant::now();
         if !received.is_empty() {
             max_gap = max_gap.max(now - last);

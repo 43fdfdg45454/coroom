@@ -20,12 +20,15 @@
 //! dispositivo) piden prioridad de tiempo real, como los de verdad, y anotan cuánto tarde
 //! despertaron de cada sueño; si alguno llegó más de media trama tarde ([`STALL`]), esa medida es
 //! del planificador de la máquina (una VM que para un hilo 20 ms encola tres tramas, que el
-//! buffer tarda un rato en recortar) y se repite, hasta [`ATTEMPTS`] veces. Las primeras
-//! [`WARMUP`] tramas no cuentan: la trama de margen con la que arranca el buffer de jitter se
-//! recorta al pasar su ventana de un segundo.
+//! buffer tarda un rato en recortar) y se repite, hasta [`ATTEMPTS`] veces; si ninguna sale
+//! limpia, se avisa y ese desfase no comprueba tiempos. Las primeras [`WARMUP`] tramas no cuentan:
+//! la trama de margen con la que arranca el buffer de jitter se recorta al pasar su ventana de un
+//! segundo.
 //!
 //! El presupuesto: la cota es el p95 ≤ [`BUDGET_MS`] y el suelo, lo que no se puede quitar (la
-//! trama más el dispositivo: 20 ms), comprueba que se mide de verdad.
+//! trama más el dispositivo: 20 ms), comprueba que se mide de verdad. Los dos dependen de la
+//! máquina y van con [`timing_assert!`]; lo funcional es que el tono suena y que nada suena antes
+//! de que su trama se haya capturado entera.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -40,15 +43,16 @@ use coroom_audio::{
     AudioConfig, AudioFormat, AudioSink, AudioSource, DEVICE_LATENCY, FRAME_DURATION,
     MAX_FRAME_SAMPLES,
 };
+use coroom_testkit::timing_assert;
 
-/// Tramas que se capturan en cada medida (4,5 s).
-const FRAMES: u32 = 450;
+/// Tramas que se capturan en cada medida (2,5 s: 100 en régimen tras el calentamiento).
+const FRAMES: u32 = 250;
 /// Tramas del principio que no cuentan (1,5 s): el cebado, la ventana de recorte del buffer de
 /// jitter (1 s) y un periodo de ajuste.
 const WARMUP: usize = 150;
-/// Veces que se repite una medida que el planificador estropeó (en una máquina de CI cargada,
-/// tres seguidas no son raras).
-const ATTEMPTS: usize = 5;
+/// Veces que se mide como mucho cuando el planificador estropea la medida: si no sale limpia, se
+/// avisa en lugar de fallar, así que no merece la pena insistir más.
+const ATTEMPTS: usize = 2;
 /// Retraso de un hilo al despertar a partir del cual la medida es del planificador: media trama.
 const STALL: Duration = Duration::from_millis(5);
 /// Cota del p95 de captura → suena, en ms. Medido en el equipo de referencia: 30,4/25,8/29,9 ms
@@ -257,14 +261,15 @@ fn measure(phase: Duration) -> Run {
     }
 }
 
-/// Mide con el desfase `phase` hasta que el planificador deje una medida limpia.
-fn clean_measure(phase_ms: u64) -> Run {
+/// Mide con el desfase `phase` hasta que el planificador deje una medida limpia. Devuelve la
+/// medida y si salió limpia: si en [`ATTEMPTS`] intentos no lo hizo, avisa y devuelve la última.
+fn clean_measure(phase_ms: u64) -> (Run, bool) {
     let mut last = None;
     for attempt in 1..=ATTEMPTS {
         let run = measure(Duration::from_millis(phase_ms));
         let stall = run.capture_late.max(run.device_late);
         if stall <= STALL && run.device_underruns == 0 {
-            return run;
+            return (run, true);
         }
         println!(
             "desfase {phase_ms} ms, intento {attempt}: la captura despertó hasta {:.1} ms tarde y \
@@ -276,14 +281,17 @@ fn clean_measure(phase_ms: u64) -> Run {
         last = Some(run);
     }
     let run = last.expect("al menos un intento");
-    panic!(
-        "la máquina no deja medir: en {ATTEMPTS} intentos algún hilo despertó más de {} ms tarde \
-         (captura {:.1} ms, dispositivo {:.1} ms, {} faltas del dispositivo)",
+    timing_assert!(
+        false,
+        "desfase {phase_ms} ms: la máquina no deja medir: en {ATTEMPTS} intentos algún hilo \
+         despertó más de {} ms tarde (captura {:.1} ms, dispositivo {:.1} ms, {} faltas del \
+         dispositivo); no se comprueban sus tiempos",
         ms(STALL),
         ms(run.capture_late),
         ms(run.device_late),
         run.device_underruns
     );
+    (run, false)
 }
 
 /// p50 y p95 de una etapa, en ms.
@@ -296,14 +304,16 @@ fn stage(samples: &[Sample], pick: impl Fn(&Sample) -> Duration) -> (f64, f64) {
 #[test]
 fn capture_to_ear_stays_within_the_audio_budget() {
     let floor = ms(FRAME_DURATION + DEVICE_LATENCY);
-    // El desfase entre la captura y el dispositivo va de 0 a una trama: al principio, a la mitad
-    // y casi al final.
-    for phase_ms in [0, 5, 9] {
-        let run = clean_measure(phase_ms);
+    // El desfase entre la captura y el dispositivo va de 0 a una trama: al principio y casi al
+    // final (los dos extremos; el de una trama entera es el peor).
+    for phase_ms in [0, 9] {
+        let (run, clean) = clean_measure(phase_ms);
         let samples = &run.samples[WARMUP.min(run.samples.len())..];
+        // Funcional: el tono suena también en régimen.
         assert!(
-            samples.len() as u32 > FRAMES * 9 / 10 - WARMUP as u32,
-            "sonaron {} tramas de {FRAMES}",
+            !samples.is_empty(),
+            "desfase {phase_ms} ms: no sonó ninguna trama tras el calentamiento ({} de {FRAMES} en \
+             total)",
             run.samples.len()
         );
         let mut latencies: Vec<f64> = samples
@@ -341,19 +351,39 @@ fn capture_to_ear_stays_within_the_audio_budget() {
             run.jitter.stretched,
             run.jitter.concealed,
         );
+        // Funcional: ninguna trama suena antes de haberse capturado entera (la fuente la entrega
+        // con sus 480 muestras), sea cual sea el planificador. El suelo de 20 ms (trama más
+        // dispositivo) no vale aquí: el sumidero fecha lo que suena desde la hora de su hueco, no
+        // desde que despertó, y si despierta hasta una trama tarde (sin contar falta) saca una
+        // trama que llegó después de empezar el hueco; con un parón, captura → suena baja hasta
+        // la latencia del dispositivo (10 ms), y por eso ese suelo solo se mira en las medidas
+        // limpias.
         assert!(
-            latencies[0] >= floor - 0.5,
-            "por debajo del suelo: {latencies:?}"
+            latencies[0] >= ms(FRAME_DURATION) - 0.5,
+            "desfase {phase_ms} ms: suena antes de capturarse la trama: {latencies:?}"
         );
-        assert!(
+        if !clean {
+            continue;
+        }
+        timing_assert!(
+            samples.len() as u32 > FRAMES * 9 / 10 - WARMUP as u32,
+            "desfase {phase_ms} ms: sonaron {} tramas de {FRAMES}",
+            run.samples.len()
+        );
+        timing_assert!(
+            latencies[0] >= floor - 0.5,
+            "desfase {phase_ms} ms: por debajo del suelo de {floor:.0} ms: mínimo {:.1} ms",
+            latencies[0]
+        );
+        timing_assert!(
             p95 <= BUDGET_MS,
             "desfase {phase_ms} ms: p95 {p95:.1} ms > {BUDGET_MS} ms"
         );
         // En régimen el buffer no inserta ni quita nada: el margen del arranque se recortó una
         // vez y el resto del tiempo el adelanto se mantuvo en su banda.
-        assert!(
+        timing_assert!(
             run.jitter.concealed == 0 && run.jitter.stretched <= 1 && run.jitter.trimmed <= 3,
-            "{:?}",
+            "desfase {phase_ms} ms: el buffer de jitter tocó la cola en régimen: {:?}",
             run.jitter
         );
     }

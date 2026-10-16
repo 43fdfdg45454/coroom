@@ -182,10 +182,11 @@ fn a_messages_reach_everyone_with_the_right_author() {
     let host_events = host.events();
     let code = room_code(&host);
 
-    // Sala de espera: el primer invitado mide la calidad 5 s antes de pedir el vídeo, así que el
-    // anfitrión aún no codifica nada; el chat ya funciona.
+    // Sala de espera: el primer invitado mide la calidad 30 s antes de pedir el vídeo (no lo
+    // necesita en todo el test, y así ningún runner lento lo ve llegar antes que el mensaje), de
+    // modo que el anfitrión aún no codifica nada; el chat ya funciona.
     let mut first_account = server.config();
-    first_account.quality_probe = Duration::from_secs(5);
+    first_account.quality_probe = Duration::from_secs(30);
     let mut first = guest(first_account, &code);
     let first_events = first.events();
     assert!(chat_history(&first_events).is_empty());
