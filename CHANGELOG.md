@@ -205,6 +205,22 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 - El altavoz propio del anfitrión ya no parpadea al silenciarse, y su fila ya no dice «sin
   micrófono» al abrir la sala.
 
+- Un micrófono o una salida que se desconecta (o que no abre al entrar) ya no deja la sala sin voz
+  o sin sonido hasta reconectar: se avisa una vez y elegir otro en la sala lo recupera.
+- Cambiar de micrófono con la sala abierta ya no corta la voz mientras se abre el nuevo (hasta 5 s
+  si no responde): se abre aparte y la voz sigue con el anterior hasta tenerlo.
+- Si el micrófono o la salida elegidos con la sala abierta no abren, se vuelve al anterior (también
+  en los ajustes guardados) y se explica por qué, en vez de quedarse elegido sin funcionar.
+- La prueba del micrófono sigue el volumen de tu voz mientras se arrastra el deslizador.
+- Con una sala abierta, «Oírte» en la prueba del micrófono queda desactivado (con el porqué): tu
+  voz salía por la salida, volvía a entrar por el micrófono de la sala y los demás oían eco. El
+  nivel sigue funcionando.
+- Los avisos de los dispositivos de audio y los errores de la prueba del micrófono, en textos de la
+  interfaz y sin el error interno tal cual.
+- Con el volumen de tu voz al 0 % ya no se envía nada ni sales como «Hablando».
+- Dejar de oír a alguien en la sala se recuerda por su nombre, como su volumen: sigue así si
+  reconecta, vuelve a entrar o la sala pasa a otro.
+- En «Integrantes» del invitado, la fila propia también dice «Hablando».
 - Los micrófonos de Windows salían todos como «Micrófono»: ahora con su nombre (el producto).
 - Cambiar la resolución con la sala abierta dejaba la imagen del invitado corrupta hasta cambiar de
   códec con algunos decodificadores por hardware: el decodificador se vuelve a abrir al cambiar el

@@ -14,8 +14,10 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use coroom_session::audio::AudioError;
 use coroom_session::capture::ShareKind;
 use coroom_session::input::gamepad::PadChoice;
+use coroom_session::remote::audio::{AudioIssue, DeviceSwitchError};
 use coroom_transport::proto::PROTOCOL_VERSION;
 use coroom_transport::proto::api::Devices;
 use coroom_ui::Element;
@@ -33,7 +35,7 @@ use iced_widget::{Column, Row, button, column, container, progress_bar, row, tex
 
 use crate::portal::{REMEMBERS_SHARE_PERMISSION, RestoreTokens};
 use crate::ui::app::{
-    App, AudioDevice, Dialog, Effect, Event, Load, Message, MicTest, Page, Screen,
+    App, AudioDevice, Dialog, Effect, Event, Load, Message, MicTest, MicTestError, Page, Screen,
 };
 use crate::ui::screens::diagnostics;
 use crate::ui::settings::{
@@ -141,6 +143,8 @@ pub struct State {
     pub mic_test: Option<f32>,
     /// Oírse durante la prueba del micrófono.
     pub mic_test_hear: bool,
+    /// La prueba en marcha suena por la salida (con una sala abierta, nunca).
+    pub mic_test_hearing: bool,
     /// Por qué paró la última prueba del micrófono.
     pub mic_test_error: Option<String>,
 }
@@ -379,19 +383,19 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             return Vec::new();
         }
         Msg::Speaker(choice) => {
-            settings.audio.speaker = choice.value.clone();
-            let mut effects = switch_device(app, false, choice.value);
-            if app.settings_page.mic_test.is_some() && app.settings_page.mic_test_hear {
-                effects.push(Effect::MicTest(Some(mic_test(app))));
+            let previous = std::mem::replace(&mut settings.audio.speaker, choice.value.clone());
+            let mut effects = switch_device(app, false, choice.value, previous);
+            if app.settings_page.mic_test.is_some() && app.settings_page.mic_test_hearing {
+                effects.push(start_mic_test(app));
             }
             return effects;
         }
         Msg::Microphone(choice) => {
-            settings.audio.microphone = choice.value.clone();
-            let mut effects = switch_device(app, true, choice.value);
+            let previous = std::mem::replace(&mut settings.audio.microphone, choice.value.clone());
+            let mut effects = switch_device(app, true, choice.value, previous);
             // La prueba sigue con el micrófono nuevo.
             if app.settings_page.mic_test.is_some() {
-                effects.push(Effect::MicTest(Some(mic_test(app))));
+                effects.push(start_mic_test(app));
             }
             return effects;
         }
@@ -448,13 +452,20 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::MicTest(on) => {
             app.settings_page.mic_test_error = None;
             app.settings_page.mic_test = on.then_some(0.0);
-            return vec![Effect::MicTest(on.then(|| mic_test(app)))];
+            if !on {
+                return vec![Effect::MicTest(None)];
+            }
+            return vec![start_mic_test(app)];
         }
         Msg::MicTestHear(hear) => {
+            if room_open(app) {
+                // Con una sala abierta no se puede oírse (ver `mic_test`).
+                return Vec::new();
+            }
             app.settings_page.mic_test_hear = hear;
             // Se vuelve a abrir con la salida o sin ella.
             if app.settings_page.mic_test.is_some() {
-                return vec![Effect::MicTest(Some(mic_test(app)))];
+                return vec![start_mic_test(app)];
             }
             return Vec::new();
         }
@@ -467,6 +478,11 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                     host: app.host.room.is_some(),
                     gain,
                 });
+            }
+            // La prueba en marcha suena con el volumen nuevo (el backend lo cambia en caliente,
+            // sin volver a abrir los dispositivos).
+            if app.settings_page.mic_test.is_some() {
+                effects.push(start_mic_test(app));
             }
             return effects;
         }
@@ -593,15 +609,37 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                         app.settings_page.mic_test = None;
                         return vec![Effect::MicTest(None)];
                     }
+                    // Se abrió una sala mientras se oía: se deja de oír (la voz volvería a
+                    // entrar por el micrófono de la sala).
+                    if app.settings_page.mic_test_hearing && room_open(app) {
+                        return vec![start_mic_test(app)];
+                    }
                 }
                 Err(err) => {
                     state.mic_test = None;
-                    state.mic_test_error = Some(err);
+                    state.mic_test_error = Some(match &err {
+                        MicTestError::Mic(err) => t!(
+                            "settings-la-prueba-paro-microfono",
+                            err = audio_error_text(err)
+                        ),
+                        MicTestError::Speaker(err) => {
+                            t!(
+                                "settings-la-prueba-paro-salida",
+                                err = audio_error_text(err)
+                            )
+                        }
+                    });
                     return vec![Effect::MicTest(None)];
                 }
             }
             Vec::new()
         }
+        Event::AudioDeviceSwitched {
+            input,
+            device,
+            previous,
+            result,
+        } => device_switched(app, input, device, previous, result),
         Event::AudioDevices(result) => {
             let now = app.now;
             let state = &mut app.settings_page;
@@ -999,20 +1037,40 @@ fn peers(app: &App) -> Element<'_, Message> {
 
 // --- Audio y voz ---------------------------------------------------------------------------------
 
-/// La prueba del micrófono con lo elegido ahora en Ajustes.
+/// Hay una sala abierta (compartiendo o de invitado).
+fn room_open(app: &App) -> bool {
+    app.host.room.is_some() || app.guest.is_some()
+}
+
+/// La prueba del micrófono con lo elegido ahora en Ajustes. Con una sala abierta no se oye uno
+/// mismo: lo que suena por la salida volvería a entrar por el micrófono de la sala, y la
+/// cancelación de eco no lo conoce (los demás oirían eco).
 fn mic_test(app: &App) -> MicTest {
     let audio = &app.settings.audio;
     MicTest {
         mic: audio.microphone.clone(),
         speaker: audio.speaker.clone(),
-        hear: app.settings_page.mic_test_hear,
+        hear: app.settings_page.mic_test_hear && !room_open(app),
         gain: voice_gain(audio.mic_volume),
     }
 }
 
+/// Arranca (o actualiza) la prueba del micrófono con lo elegido ahora, y anota si se oye.
+fn start_mic_test(app: &mut App) -> Effect {
+    let test = mic_test(app);
+    app.settings_page.mic_test_hearing = test.hear;
+    Effect::MicTest(Some(test))
+}
+
 /// Guarda el micrófono o la salida elegidos y, con una sala abierta (compartiendo o de invitado),
-/// los cambia en ella al momento, sin reconectar.
-fn switch_device(app: &mut App, input: bool, device: Option<String>) -> Vec<Effect> {
+/// los cambia en ella al momento, sin reconectar. Si allí no abre, se vuelve a `previous`
+/// ([`Event::AudioDeviceSwitched`]).
+fn switch_device(
+    app: &mut App,
+    input: bool,
+    device: Option<String>,
+    previous: Option<String>,
+) -> Vec<Effect> {
     let mut effects = app.settings_changed();
     let host = app.host.room.is_some();
     if host || app.guest.is_some() {
@@ -1020,9 +1078,111 @@ fn switch_device(app: &mut App, input: bool, device: Option<String>) -> Vec<Effe
             host,
             input,
             device,
+            previous,
         });
     }
     effects
+}
+
+/// La sala dijo si usa el dispositivo elegido. Si no abrió, se vuelve al anterior (en los ajustes
+/// y en el selector, si nadie eligió otro mientras) y se explica por qué.
+fn device_switched(
+    app: &mut App,
+    input: bool,
+    device: Option<String>,
+    previous: Option<String>,
+    result: Result<(), DeviceSwitchError>,
+) -> Vec<Effect> {
+    let err = match result {
+        Ok(()) => return Vec::new(),
+        Err(DeviceSwitchError::NotRunning) => {
+            // La sala no usa ese dispositivo: queda elegido para la próxima.
+            app.toast(
+                Tone::Info,
+                if input {
+                    t!("settings-microfono-para-la-proxima")
+                } else {
+                    t!("settings-salida-para-la-proxima")
+                },
+            );
+            return Vec::new();
+        }
+        Err(err) => err,
+    };
+    let reason = match &err {
+        DeviceSwitchError::Open(err) => audio_error_text(err),
+        DeviceSwitchError::Incompatible => t!("settings-salida-de-otro-tipo").to_owned(),
+        DeviceSwitchError::Timeout | DeviceSwitchError::NotRunning => {
+            t!("settings-cambio-sin-respuesta").to_owned()
+        }
+    };
+    app.toast(
+        Tone::Error,
+        if input {
+            t!("settings-no-se-pudo-usar-el-microfono", error = reason)
+        } else {
+            t!("settings-no-se-pudo-usar-la-salida", error = reason)
+        },
+    );
+    let audio = &mut app.settings.audio;
+    let chosen = if input {
+        &mut audio.microphone
+    } else {
+        &mut audio.speaker
+    };
+    if *chosen != device {
+        // Ya se eligió otro: manda ese.
+        return Vec::new();
+    }
+    *chosen = previous;
+    let mut effects = app.settings_changed();
+    if app.settings_page.mic_test.is_some() && (input || app.settings_page.mic_test_hearing) {
+        effects.push(start_mic_test(app));
+    }
+    effects
+}
+
+/// Un error de un dispositivo de audio, en palabras de la interfaz.
+pub(crate) fn audio_error_text(err: &AudioError) -> String {
+    match err {
+        AudioError::DeviceLost => t!("settings-audio-error-desconectado").to_owned(),
+        AudioError::NoSuchDevice(name) => {
+            t!("settings-audio-error-no-existe", name = name.as_str())
+        }
+        AudioError::Stopped => t!("settings-audio-error-parado").to_owned(),
+        AudioError::Unsupported(detail) => {
+            t!(
+                "settings-audio-error-no-disponible",
+                detail = detail.as_str()
+            )
+        }
+        AudioError::Codec(detail) => t!("settings-audio-error-codec", detail = detail.as_str()),
+        AudioError::Backend(detail) => {
+            t!("settings-audio-error-sistema", detail = detail.as_str())
+        }
+        AudioError::BufferTooSmall { .. } => t!("settings-audio-error-interno").to_owned(),
+    }
+}
+
+/// El aviso de un micrófono o una salida que no funciona en la sala.
+pub(crate) fn audio_issue_text(issue: &AudioIssue) -> String {
+    match issue {
+        AudioIssue::MicUnavailable(err) => {
+            t!("settings-microfono-no-abrio", error = audio_error_text(err))
+        }
+        AudioIssue::MicLost(err) => {
+            t!(
+                "settings-microfono-se-detuvo",
+                error = audio_error_text(err)
+            )
+        }
+        AudioIssue::SpeakerUnavailable(err) => {
+            t!("settings-salida-no-abrio", error = audio_error_text(err))
+        }
+        AudioIssue::SpeakerLost(err) => {
+            t!("settings-salida-se-detuvo", error = audio_error_text(err))
+        }
+    }
 }
 
 /// Opciones de un selector de audio: «El del sistema», los de la lista y, si el elegido no está
@@ -1229,10 +1389,13 @@ fn mic_test_row(app: &App) -> Element<'_, Message> {
         } else {
             Tone::Success
         }));
+    // Con una sala abierta no se puede oírse: la voz saldría por la salida y volvería a entrar
+    // por el micrófono de la sala (eco para los demás). El nivel sigue funcionando.
+    let in_room = room_open(app);
     let hear = row![
         ui::switch(
-            state.mic_test_hear,
-            Some(|on_off| on(Msg::MicTestHear(on_off)))
+            state.mic_test_hear && !in_room,
+            (!in_room).then_some(|on_off| on(Msg::MicTestHear(on_off)))
         ),
         ui::caption(t!("settings-oirte")),
     ]
@@ -1242,9 +1405,14 @@ fn mic_test_row(app: &App) -> Element<'_, Message> {
         ui::secondary(t!("settings-probar-el-microfono-ayuda")).wrapping(Wrapping::WordOrGlyph)
     ]
     .spacing(2);
+    if in_room {
+        help = help.push(
+            ui::caption(t!("settings-oirte-con-sala-abierta")).wrapping(Wrapping::WordOrGlyph),
+        );
+    }
     if let Some(err) = &state.mic_test_error {
         help = help.push(
-            ui::caption(t!("settings-la-prueba-paro", err = err.as_str()))
+            ui::caption(err.as_str())
                 .class(TextClass::Tone(Tone::Error))
                 .wrapping(Wrapping::WordOrGlyph),
         );
@@ -2060,6 +2228,163 @@ mod tests {
                 .count(),
             1,
             "{effects:?}"
+        );
+    }
+
+    /// Una sala de invitado abierta (sin cambiar de pantalla).
+    fn in_a_room(app: &mut App) {
+        app.guest = Some(crate::ui::screens::guest::State::new(
+            "K7Q2MZ".to_owned(),
+            crate::ui::video::VideoFeed::detached(),
+            app.now,
+        ));
+    }
+
+    fn started(effects: &[Effect]) -> &MicTest {
+        match effects {
+            [.., Effect::MicTest(Some(test))] => test,
+            _ => panic!("sin prueba: {effects:?}"),
+        }
+    }
+
+    #[test]
+    fn the_mic_test_follows_the_volume_and_never_hears_itself_in_a_room() {
+        let mut app = open(SettingsPage::Audio);
+        app.update(Message::Settings(Msg::MicTestHear(true)));
+        let effects = app.update(Message::Settings(Msg::MicTest(true)));
+        let test = started(&effects);
+        assert!(test.hear && test.gain == 1.0, "{test:?}");
+        // El volumen llega a la prueba en marcha (el backend lo cambia en caliente).
+        let effects = app.update(Message::Settings(Msg::MicVolume(50)));
+        let test = started(&effects);
+        assert!(test.hear && test.gain == 0.5, "{test:?}");
+        // Se abre una sala mientras se oye: deja de oírse en el siguiente nivel.
+        in_a_room(&mut app);
+        let effects = app.update(Message::Event(Event::MicLevel(Ok(0.3))));
+        assert!(!started(&effects).hear, "{effects:?}");
+        assert!(!app.settings_page.mic_test_hearing);
+        assert!(
+            app.update(Message::Event(Event::MicLevel(Ok(0.3))))
+                .is_empty(),
+            "una sola vez"
+        );
+        // Con la sala abierta, «Oírte» no se puede encender, y cambiar de volumen o de
+        // micrófono sigue sin oírse.
+        assert!(
+            app.update(Message::Settings(Msg::MicTestHear(true)))
+                .is_empty()
+        );
+        let effects = app.update(Message::Settings(Msg::MicVolume(80)));
+        assert!(!started(&effects).hear);
+        // Sin sala, vuelve a oírse como estaba elegido.
+        app.guest = None;
+        let effects = app.update(Message::Settings(Msg::MicVolume(90)));
+        assert!(started(&effects).hear);
+    }
+
+    #[test]
+    fn mic_test_failures_are_explained_in_spanish() {
+        use coroom_session::audio::AudioError;
+        let mut app = open(SettingsPage::Audio);
+        app.update(Message::Settings(Msg::MicTest(true)));
+        let effects = app.update(Message::Event(Event::MicLevel(Err(MicTestError::Mic(
+            AudioError::NoSuchDevice("Micrófono de ejemplo".into()),
+        )))));
+        assert_eq!(effects, [Effect::MicTest(None)]);
+        assert_eq!(
+            app.settings_page.mic_test_error.as_deref(),
+            Some(
+                "La prueba se paró por el micrófono: no hay ningún dispositivo llamado \
+                 «Micrófono de ejemplo»"
+            )
+        );
+        app.update(Message::Settings(Msg::MicTest(true)));
+        app.update(Message::Event(Event::MicLevel(Err(MicTestError::Speaker(
+            AudioError::DeviceLost,
+        )))));
+        assert_eq!(
+            app.settings_page.mic_test_error.as_deref(),
+            Some("La prueba se paró por la salida: el dispositivo ya no está conectado")
+        );
+    }
+
+    #[test]
+    fn a_device_that_does_not_open_in_the_room_is_reverted_and_explained() {
+        use coroom_session::audio::AudioError;
+        let mut app = open(SettingsPage::Audio);
+        app.settings.audio.microphone = Some("mic-a".into());
+        in_a_room(&mut app);
+        let effects = app.update(Message::Settings(Msg::Microphone(choice(
+            Some("mic-b".into()),
+            "Micrófono de ejemplo",
+        ))));
+        assert!(
+            effects.contains(&Effect::SwitchAudioDevice {
+                host: false,
+                input: true,
+                device: Some("mic-b".into()),
+                previous: Some("mic-a".into()),
+            }),
+            "{effects:?}"
+        );
+        assert_eq!(app.settings.audio.microphone.as_deref(), Some("mic-b"));
+        app.flush_settings();
+        // No abre: vuelve el anterior, se guarda y se explica.
+        app.update(Message::Event(Event::AudioDeviceSwitched {
+            input: true,
+            device: Some("mic-b".into()),
+            previous: Some("mic-a".into()),
+            result: Err(DeviceSwitchError::Open(AudioError::DeviceLost)),
+        }));
+        assert_eq!(app.settings.audio.microphone.as_deref(), Some("mic-a"));
+        assert_eq!(app.flush_settings(), Some(Effect::SaveSettings));
+        let toast = app.toasts.last().expect("aviso");
+        assert_eq!(toast.tone, Tone::Error);
+        assert_eq!(
+            toast.text,
+            "No se pudo usar ese micrófono: el dispositivo ya no está conectado. Vuelve a estar \
+             elegido el anterior."
+        );
+        // Si mientras tanto se eligió otro, manda ese.
+        app.update(Message::Settings(Msg::Speaker(choice(
+            Some("out-b".into()),
+            "Salida de ejemplo",
+        ))));
+        app.update(Message::Settings(Msg::Speaker(choice(
+            Some("out-c".into()),
+            "Otra salida de ejemplo",
+        ))));
+        app.update(Message::Event(Event::AudioDeviceSwitched {
+            input: false,
+            device: Some("out-b".into()),
+            previous: None,
+            result: Err(DeviceSwitchError::Timeout),
+        }));
+        assert_eq!(app.settings.audio.speaker.as_deref(), Some("out-c"));
+        // La sala no usa micrófono: queda elegido para la próxima, y se dice.
+        app.update(Message::Event(Event::AudioDeviceSwitched {
+            input: true,
+            device: Some("mic-a".into()),
+            previous: None,
+            result: Err(DeviceSwitchError::NotRunning),
+        }));
+        assert_eq!(app.settings.audio.microphone.as_deref(), Some("mic-a"));
+        assert_eq!(app.toasts.last().expect("aviso").tone, Tone::Info);
+    }
+
+    #[test]
+    fn audio_issues_in_the_room_read_in_spanish() {
+        use coroom_session::audio::AudioError;
+        assert_eq!(
+            audio_issue_text(&AudioIssue::MicLost(AudioError::DeviceLost)),
+            "El micrófono dejó de funcionar: el dispositivo ya no está conectado. Elige otro en \
+             Ajustes o en el panel de la sala para que te sigan oyendo."
+        );
+        assert!(
+            audio_issue_text(&AudioIssue::SpeakerUnavailable(AudioError::Backend(
+                "sin respuesta".into()
+            )))
+            .contains("el sistema de audio dio un error (sin respuesta)")
         );
     }
 

@@ -6,7 +6,7 @@
 //! aplicación sin arrancar. Se escribe entero en un fichero temporal y se renombra (nunca queda a
 //! medias). No guarda secretos: las credenciales van al llavero ([`crate::account`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use coroom_session::input::gamepad::PadChoice;
@@ -354,6 +354,11 @@ pub struct Audio {
     /// sala, se comparta o se esté de invitado.
     #[serde(default)]
     pub voice_volumes: BTreeMap<String, u8>,
+    /// Participantes cuya voz no se oye en este equipo, por su nombre de cuenta (como
+    /// [`Audio::voice_volumes`]): se vuelven a silenciar al aparecer en la sala, también al
+    /// reconectar o al pasar a otra sala.
+    #[serde(default)]
+    pub voice_muted: BTreeSet<String>,
     /// Volumen del audio del juego como invitado, en porcentaje (0-200; 100 lo normal), aparte
     /// del de cada voz y de silenciarlo. Se aplica al entrar en una sala.
     pub game_volume: u8,
@@ -391,6 +396,20 @@ impl Audio {
             self.voice_volumes.insert(name.to_owned(), percent);
         }
     }
+
+    /// Si la voz de `name` está silenciada en este equipo.
+    pub fn voice_muted(&self, name: &str) -> bool {
+        self.voice_muted.contains(name)
+    }
+
+    /// Recuerda (o olvida) que la voz de `name` no se oye en este equipo.
+    pub fn set_voice_muted(&mut self, name: &str, muted: bool) {
+        if muted {
+            self.voice_muted.insert(name.to_owned());
+        } else {
+            self.voice_muted.remove(name);
+        }
+    }
 }
 
 /// Aplicación recordada en la lista de audio.
@@ -414,6 +433,7 @@ impl Default for Audio {
             excluded_apps: Vec::new(),
             host_voice: true,
             voice_volumes: BTreeMap::new(),
+            voice_muted: BTreeSet::new(),
             game_volume: DEFAULT_VOICE_VOLUME,
             mic_volume: DEFAULT_VOICE_VOLUME,
         }
@@ -879,6 +899,28 @@ mod tests {
         let sane = edited.sanitized();
         assert_eq!(sane.audio.voice_volumes.get("Ana"), None);
         assert_eq!(sane.audio.voice_volumes.get("Bea"), Some(&200));
+    }
+
+    #[test]
+    fn local_mutes_are_remembered_by_name() {
+        let mut audio = Audio::default();
+        assert!(!audio.voice_muted("Bea"), "por defecto, nadie");
+        audio.set_voice_muted("Bea", true);
+        audio.set_voice_muted("Carla", true);
+        audio.set_voice_muted("Carla", false);
+        assert!(audio.voice_muted("Bea") && !audio.voice_muted("Carla"));
+        assert_eq!(audio.voice_muted.len(), 1);
+        // Ida y vuelta por TOML, junto a los volúmenes; sin la clave (ajustes de antes), nadie.
+        audio.set_voice_volume("Bea", 150);
+        let settings = Settings {
+            audio,
+            ..Settings::default()
+        };
+        let text = toml::to_string_pretty(&settings).expect("escribir");
+        let loaded: Settings = toml::from_str(&text).expect("leer");
+        assert_eq!(loaded, settings, "{text}");
+        let old: Settings = toml::from_str("[audio]\nvoice = true\n").expect("leer");
+        assert!(old.audio.voice_muted.is_empty());
     }
 
     #[test]

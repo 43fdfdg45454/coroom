@@ -71,6 +71,8 @@ pub struct Stats {
     pub game_muted: bool,
     /// Voz activa (micrófono abierto y con permiso).
     pub voice: bool,
+    /// Ahora se envía la voz propia (el anfitrión no la devuelve en `VoiceState`).
+    pub speaking: bool,
     /// Estado del audio en palabras.
     pub audio_status: String,
     /// Copias de CPU del vídeo en la ventana.
@@ -684,11 +686,22 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             } else {
                 state.muted.insert(leaf);
             }
-            return vec![Effect::SetVoiceMuted {
+            let mut effects = vec![Effect::SetVoiceMuted {
                 host: false,
                 source: leaf,
                 muted: !hear,
             }];
+            // Se recuerda por su nombre, como el volumen: vale al volver o en otra sala.
+            if let Some(member) = state
+                .members
+                .iter()
+                .find(|member| member.leaf == leaf && !member.you)
+            {
+                let name = member.name.clone();
+                app.settings.audio.set_voice_muted(&name, !hear);
+                effects.extend(app.settings_changed());
+            }
+            return effects;
         }
         Msg::Volume(leaf, percent) => {
             if state
@@ -1066,6 +1079,7 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
             );
         }
         SessionEvent::Warning(message) => app.toast(Tone::Warning, message),
+        SessionEvent::Audio(issue) => app.toast(Tone::Warning, settings::audio_issue_text(&issue)),
         SessionEvent::HandoffOffered => {
             let host = state
                 .host_name
@@ -1138,17 +1152,44 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
             }
         }
         SessionEvent::Members(members) => {
-            // Quien ya no está deja de contar como silenciado ni conserva su volumen (su hoja
-            // puede volver a usarse).
-            state
-                .muted
-                .retain(|leaf| members.iter().any(|member| member.leaf == *leaf));
-            state
-                .volumes
-                .retain(|leaf, _| members.iter().any(|member| member.leaf == *leaf));
-            // A quien llega se le aplica el volumen recordado por su nombre (una vez: lo que se
-            // toque después manda). Nunca a uno mismo.
+            // Quien ya no está deja de contar como silenciado ni conserva su volumen, también en
+            // el audio (su hoja puede volver a usarla otra persona).
             let mut effects = Vec::new();
+            let present = |leaf: u32| members.iter().any(|member| member.leaf == leaf);
+            for leaf in state.muted.iter().copied().filter(|leaf| !present(*leaf)) {
+                effects.push(Effect::SetVoiceMuted {
+                    host: false,
+                    source: leaf,
+                    muted: false,
+                });
+            }
+            for leaf in state.volumes.keys().copied().filter(|leaf| !present(*leaf)) {
+                effects.push(Effect::SetVoiceGain {
+                    host: false,
+                    source: leaf,
+                    gain: voice_gain(DEFAULT_VOICE_VOLUME),
+                });
+            }
+            state.muted.retain(|leaf| present(*leaf));
+            state.volumes.retain(|leaf, _| present(*leaf));
+            // A quien está se le aplica lo recordado por su nombre: el silencio (que se guarda al
+            // tocarlo) siempre, y el volumen al llegar (una vez: lo que se toque después manda).
+            // Nunca a uno mismo.
+            for member in members.iter().filter(|member| !member.you) {
+                let muted = app.settings.audio.voice_muted(&member.name);
+                if muted != state.muted.contains(&member.leaf) {
+                    if muted {
+                        state.muted.insert(member.leaf);
+                    } else {
+                        state.muted.remove(&member.leaf);
+                    }
+                    effects.push(Effect::SetVoiceMuted {
+                        host: false,
+                        source: member.leaf,
+                        muted,
+                    });
+                }
+            }
             for member in members.iter().filter(|member| !member.you) {
                 if state.volumes.contains_key(&member.leaf) {
                     continue;
@@ -1917,6 +1958,23 @@ fn mute_button<'a>(muted: bool, message: Message) -> Element<'a, Message> {
     )
 }
 
+/// Si `member` habla ahora («Hablando» en «Integrantes»). El anfitrión no devuelve a cada uno su
+/// propio `VoiceState`: la fila propia mira el audio de este equipo.
+fn member_talks(state: &State, member: &RoomMember) -> bool {
+    let Some(stats) = state.stats.as_ref() else {
+        return false;
+    };
+    if member.you {
+        return stats.speaking;
+    }
+    let label = talker_label(member.guest);
+    stats
+        .summary
+        .audio
+        .as_ref()
+        .is_some_and(|audio| audio.speaking.contains(&label))
+}
+
 /// Orden de «Integrantes»: tú, el anfitrión y los demás por orden de llegada.
 fn member_order(member: &RoomMember) -> u8 {
     if member.you {
@@ -1932,17 +1990,11 @@ fn member_order(member: &RoomMember) -> u8 {
 /// el deslizador es lo alto que se le oye en este equipo y el altavoz deja de oírle aquí (los
 /// demás le siguen oyendo); en la propia, lo alto que te oyen y el altavoz te silencia para todos.
 fn people_section<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
-    let speaking: Vec<&str> = state
-        .stats
-        .as_ref()
-        .and_then(|stats| stats.summary.audio.as_ref())
-        .map(|audio| audio.speaking.iter().map(String::as_str).collect())
-        .unwrap_or_default();
     let mut members: Vec<&RoomMember> = state.members.iter().collect();
     members.sort_by_key(|member| member_order(member));
     let mut rows: Vec<Element<'_, Message>> = Vec::new();
     for member in members {
-        let talks = speaking.contains(&talker_label(member.guest).as_str());
+        let talks = member_talks(state, member);
         let role = if member.guest == 0 {
             t!("room-anfitrion")
         } else {
@@ -3057,6 +3109,7 @@ pub(crate) mod shots {
             mic_muted: false,
             game_muted: false,
             voice: true,
+            speaking: false,
             audio_status: "micrófono activo".to_owned(),
             window_copies: 0,
         }
@@ -3687,6 +3740,121 @@ mod tests {
         let state = app.guest.as_ref().expect("invitado");
         assert!(!state.volumes.contains_key(&2));
         assert_eq!(state.volume(0), 150);
+    }
+
+    #[test]
+    fn local_mutes_are_remembered_by_name_across_reconnections() {
+        let mut app = app();
+        shots::video(&mut app);
+        let member = |leaf: u32, name: &str, you: bool| RoomMember {
+            guest: leaf,
+            leaf,
+            name: name.to_owned(),
+            you,
+        };
+        app.update(Message::Event(Event::Guest(SessionEvent::Members(vec![
+            member(0, "Bea", false),
+            member(1, "Ana", true),
+            member(2, "Carla", false),
+        ]))));
+        // Dejar de oír a Carla se aplica y se recuerda por su nombre.
+        let effects = app.update(Message::Guest(Msg::Hear(2, false)));
+        assert_eq!(
+            effects,
+            [Effect::SetVoiceMuted {
+                host: false,
+                source: 2,
+                muted: true,
+            }]
+        );
+        assert!(app.settings.audio.voice_muted("Carla"));
+        assert_eq!(app.flush_settings(), Some(Effect::SaveSettings));
+        // Se va: su hoja queda libre también en el audio.
+        let effects = app.update(Message::Event(Event::Guest(SessionEvent::Members(vec![
+            member(0, "Bea", false),
+            member(1, "Ana", true),
+        ]))));
+        assert_eq!(
+            effects,
+            [Effect::SetVoiceMuted {
+                host: false,
+                source: 2,
+                muted: false,
+            }]
+        );
+        // Vuelve con otra hoja (o en otra sala): sigue sin oírse.
+        let effects = app.update(Message::Event(Event::Guest(SessionEvent::Members(vec![
+            member(0, "Bea", false),
+            member(1, "Ana", true),
+            member(4, "Carla", false),
+        ]))));
+        assert_eq!(
+            effects,
+            [Effect::SetVoiceMuted {
+                host: false,
+                source: 4,
+                muted: true,
+            }]
+        );
+        assert!(app.guest.as_ref().expect("invitado").muted.contains(&4));
+        // Volver a oírla lo olvida.
+        app.update(Message::Guest(Msg::Hear(4, true)));
+        assert!(!app.settings.audio.voice_muted("Carla"));
+        assert!(
+            app.update(Message::Event(Event::Guest(SessionEvent::Members(vec![
+                member(0, "Bea", false),
+                member(1, "Ana", true),
+                member(4, "Carla", false),
+            ]))))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn your_own_row_says_you_are_talking_from_the_local_audio() {
+        let mut app = app();
+        shots::video(&mut app);
+        let members = vec![
+            RoomMember {
+                guest: 0,
+                leaf: 0,
+                name: "Bea".to_owned(),
+                you: false,
+            },
+            RoomMember {
+                guest: 1,
+                leaf: 1,
+                name: "Ana".to_owned(),
+                you: true,
+            },
+        ];
+        app.update(Message::Event(Event::Guest(SessionEvent::Members(
+            members.clone(),
+        ))));
+        let state = app.guest.as_mut().expect("invitado");
+        let stats = state.stats.as_mut().expect("estadísticas");
+        // El anfitrión dice que habla «invitado 1» (no lo hace, pero da igual): la fila propia
+        // no le hace caso; manda el audio de aquí.
+        stats.summary.audio = Some(coroom_session::latency::AudioSummary {
+            tracks: Vec::new(),
+            av: None,
+            speaking: vec!["anfitrión".to_owned(), "invitado 1".to_owned()],
+            status: String::new(),
+        });
+        stats.speaking = false;
+        let state = app.guest.as_ref().expect("invitado");
+        assert!(
+            member_talks(state, &members[0]),
+            "el anfitrión, por VoiceState"
+        );
+        assert!(!member_talks(state, &members[1]));
+        app.guest
+            .as_mut()
+            .and_then(|state| state.stats.as_mut())
+            .expect("estadísticas")
+            .speaking = true;
+        let state = app.guest.as_ref().expect("invitado");
+        assert!(member_talks(state, &members[1]), "uno mismo, por su audio");
     }
 
     #[test]

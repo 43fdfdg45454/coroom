@@ -28,7 +28,7 @@ use coroom_transport::{Endpoint, EndpointOptions, SignalClient};
 
 use super::app::{
     AccountInfo, App, AudioDevice, Effect, Event, GuestEnd, HostRequest, HostVoice, Invitation,
-    Message, MicTest, VideoSupport,
+    Message, MicTest, MicTestError, VideoSupport,
 };
 use super::compose::Compositor;
 use super::screens::guest::Stats;
@@ -121,7 +121,51 @@ pub struct Backend {
     /// escribiendo el mismo temporal) y al cerrar (para que el último llegue al disco).
     settings_save: Option<thread::JoinHandle<()>>,
     /// La prueba del micrófono en marcha: se para poniendo el aviso.
-    mic_test: Option<Arc<AtomicBool>>,
+    mic_test: Option<Arc<RunningMicTest>>,
+}
+
+/// La prueba del micrófono en marcha: con qué dispositivos, su aviso de parar y el volumen, que
+/// se cambia en caliente.
+struct RunningMicTest {
+    mic: Option<String>,
+    speaker: Option<String>,
+    hear: bool,
+    stop: AtomicBool,
+    gain: std::sync::atomic::AtomicU32,
+}
+
+impl RunningMicTest {
+    fn new(request: &MicTest) -> Self {
+        let test = Self {
+            mic: request.mic.clone(),
+            speaker: request.speaker.clone(),
+            hear: request.hear,
+            stop: AtomicBool::new(false),
+            gain: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()),
+        };
+        test.set_gain(request.gain);
+        test
+    }
+
+    /// Si `request` usa los mismos dispositivos (solo cambia el volumen).
+    fn same_devices(&self, request: &MicTest) -> bool {
+        self.mic == request.mic
+            && self.hear == request.hear
+            && (!self.hear || self.speaker == request.speaker)
+    }
+
+    fn set_gain(&self, gain: f32) {
+        let gain = if gain.is_finite() {
+            gain.clamp(0.0, 2.0)
+        } else {
+            1.0
+        };
+        self.gain.store(gain.to_bits(), Ordering::Release);
+    }
+
+    fn gain(&self) -> f32 {
+        f32::from_bits(self.gain.load(Ordering::Acquire))
+    }
 }
 
 /// Lo que este equipo hace con 4:4:4 y HDR (sondea los códecs la primera vez).
@@ -470,30 +514,38 @@ impl Backend {
                 host,
                 input,
                 device,
+                previous,
             } => {
                 let Some(audio) = self.room_audio(host) else {
                     return;
                 };
+                // Abrir un dispositivo tarda (segundos, si falla): en un hilo aparte, que espera
+                // a que la sala lo adopte y dice si lo usa.
                 self.spawn("dispositivo", move |notify| {
+                    use coroom_session::remote::audio::DeviceSwitchError;
                     let result = if input {
                         coroom_session::audio::mic_source(device.as_deref())
-                            .map(|mic| audio.replace_mic(mic))
-                            .map_err(|err| err.to_string())
+                            .map_err(DeviceSwitchError::Open)
+                            .and_then(|mic| audio.replace_mic(mic))
                     } else {
                         match audio.speaker_format() {
                             Some(format) => {
                                 coroom_session::audio::playback_sink(device.as_deref(), format)
-                                    .map(|sink| audio.replace_speaker(sink))
-                                    .map_err(|err| err.to_string())
+                                    .map_err(DeviceSwitchError::Open)
+                                    .and_then(|sink| audio.replace_speaker(sink))
                             }
-                            // Sin salida en marcha no hay nada que cambiar: se usará al entrar.
-                            None => Ok(()),
+                            None => Err(DeviceSwitchError::NotRunning),
                         }
                     };
-                    if let Err(err) = result {
+                    if let Err(err) = &result {
                         tracing::warn!(error = %err, input, "no se pudo cambiar de dispositivo");
-                        notify(Message::Event(Event::Failed(err)));
                     }
+                    notify(Message::Event(Event::AudioDeviceSwitched {
+                        input,
+                        device,
+                        previous,
+                        result,
+                    }));
                 });
             }
             Effect::SetGameGain { gain } => {
@@ -599,14 +651,22 @@ impl Backend {
                 notify(Message::Event(Event::Doctor(lines)));
             }),
             Effect::MicTest(request) => {
-                if let Some(stop) = self.mic_test.take() {
-                    stop.store(true, Ordering::Release);
+                // Con los mismos dispositivos, solo cambia el volumen: en caliente, sin volver a
+                // abrirlos.
+                if let (Some(running), Some(request)) = (&self.mic_test, &request)
+                    && running.same_devices(request)
+                {
+                    running.set_gain(request.gain);
+                    return;
+                }
+                if let Some(running) = self.mic_test.take() {
+                    running.stop.store(true, Ordering::Release);
                 }
                 if let Some(request) = request {
-                    let stop = Arc::new(AtomicBool::new(false));
-                    self.mic_test = Some(Arc::clone(&stop));
+                    let running = Arc::new(RunningMicTest::new(&request));
+                    self.mic_test = Some(Arc::clone(&running));
                     self.spawn("prueba-micro", move |notify| {
-                        run_mic_test(&request, &stop, &notify);
+                        run_mic_test(&request, &running, &notify);
                     });
                 }
             }
@@ -1105,6 +1165,7 @@ impl Backend {
                             mic_muted: false,
                             game_muted: false,
                             voice: false,
+                            speaking: false,
                             audio_status: t!("backend-sin-audio-en-la-prueba-local").to_owned(),
                             window_copies: stats_feed.cpu_copies(),
                         }))));
@@ -1167,6 +1228,7 @@ fn stats(summary: LatencySummary, controls: &GuestControls, feed: &VideoFeed) ->
         mic_muted: audio.mic_muted(),
         game_muted: audio.game_muted(),
         voice: audio.voice_enabled() && audio.voice_allowed(),
+        speaking: audio.speaking(),
         audio_status: audio.status_label(),
         window_copies: feed.cpu_copies(),
     }
@@ -1406,15 +1468,15 @@ pub fn mic_level(samples: &[i16]) -> f32 {
 
 /// La prueba del micrófono: lee el micrófono con el volumen propio, avisa del nivel cada
 /// [`MIC_LEVEL_PERIOD`] y, si se pide, lo saca por la salida, hasta que se pare o falle.
-fn run_mic_test(request: &MicTest, stop: &AtomicBool, notify: &Notify) {
+fn run_mic_test(request: &MicTest, running: &RunningMicTest, notify: &Notify) {
     use coroom_session::audio::{AudioConfig, AudioFormat, DEVICE_LATENCY};
-    let fail = |err: String| notify(Message::Event(Event::MicLevel(Err(err))));
+    let fail = |err: MicTestError| notify(Message::Event(Event::MicLevel(Err(err))));
     let mut mic = match coroom_session::audio::mic_source(request.mic.as_deref()) {
         Ok(mic) => mic,
-        Err(err) => return fail(err.to_string()),
+        Err(err) => return fail(MicTestError::Mic(err)),
     };
     if let Err(err) = mic.start(&AudioConfig::voice()) {
-        return fail(err.to_string());
+        return fail(MicTestError::Mic(err));
     }
     let mut speaker = None;
     if request.hear {
@@ -1429,19 +1491,20 @@ fn run_mic_test(request: &MicTest, stop: &AtomicBool, notify: &Notify) {
             Ok(sink) => speaker = Some(sink),
             Err(err) => {
                 mic.stop();
-                return fail(err.to_string());
+                return fail(MicTestError::Speaker(err));
             }
         }
     }
-    let gain = request.gain.clamp(0.0, 2.0);
     let mut frame = Vec::new();
     let mut peak = 0.0f32;
     let mut last = Instant::now();
-    while !stop.load(Ordering::Acquire) {
+    while !running.stop.load(Ordering::Acquire) {
         if let Err(err) = mic.read(&mut frame) {
-            fail(err.to_string());
+            fail(MicTestError::Mic(err));
             break;
         }
+        // El volumen se lee en cada trama: el deslizador lo cambia en caliente.
+        let gain = running.gain();
         if gain != 1.0 {
             for sample in &mut frame {
                 *sample = (f32::from(*sample) * gain).clamp(-32768.0, 32767.0) as i16;
@@ -1451,7 +1514,7 @@ fn run_mic_test(request: &MicTest, stop: &AtomicBool, notify: &Notify) {
         if let Some(sink) = speaker.as_mut()
             && let Err(err) = sink.write(&frame)
         {
-            fail(err.to_string());
+            fail(MicTestError::Speaker(err));
             break;
         }
         if last.elapsed() >= MIC_LEVEL_PERIOD {

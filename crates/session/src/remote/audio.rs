@@ -48,16 +48,17 @@ use coroom_audio::mix::Mixer;
 use coroom_audio::processing::{ProcessingOptions, RenderFeed, VoiceProcessor};
 use coroom_audio::sync::{AvSync, RECOMMEND_PERIOD};
 use coroom_audio::{
-    AudioConfig, AudioFormat, AudioSink, AudioSource, DeviceCounters, MAX_FRAME_SAMPLES, Render,
+    AudioConfig, AudioError, AudioFormat, AudioSink, AudioSource, DeviceCounters,
+    MAX_FRAME_SAMPLES, Render,
 };
 use coroom_transport::PeerConnection;
 use coroom_transport::crypto::sframe::FrameEncryptor;
 use coroom_transport::proto::audio::{AUDIO_HEADER_LEN, AudioHeader};
 use coroom_transport::proto::media::Track;
-use crossbeam_channel::{Receiver, Sender, TryRecvError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use tracing::debug;
 
-use super::{Core, lock};
+use super::{Core, SessionEvent, lock};
 use crate::latency::{
     AudioCounters, AudioSide, AudioStage, AudioTimeline, AudioTrack, AvSummary, LatencyLedger,
 };
@@ -109,6 +110,77 @@ pub const DEFAULT_GAME_BITRATE: u32 = 128_000;
 
 /// Bitrate por defecto de la voz (bit/s).
 pub const DEFAULT_VOICE_BITRATE: u32 = 32_000;
+
+/// Sin dispositivo que funcione, cada cuánto se mira si ya se eligió otro.
+const DEAD_DEVICE_POLL: Duration = Duration::from_millis(20);
+
+/// Cada cuánto mira quien pide un cambio de dispositivo si el hilo de audio sigue ahí.
+const SWITCH_POLL: Duration = Duration::from_millis(50);
+
+/// Lo que se espera a que el hilo de audio recoja el dispositivo nuevo (lo mira en cada trama).
+const SWITCH_PICKUP: Duration = Duration::from_secs(2);
+
+/// Lo que se espera, como mucho, a que el hilo de audio diga si la salida nueva abrió (abrirla
+/// tarda hasta 5 s con WASAPI y, si falla, volver a abrir la anterior otro tanto).
+const SWITCH_ANSWER: Duration = Duration::from_secs(15);
+
+/// Por qué no se pudo cambiar de dispositivo con la sala abierta ([`AudioControl::replace_mic`],
+/// [`AudioControl::replace_speaker`]). La interfaz lo explica con sus propios textos.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceSwitchError {
+    /// La sesión no tiene ese dispositivo en marcha: se entró sin micrófono (o sin salida) o la
+    /// sesión ya terminó. Lo elegido vale para la próxima.
+    NotRunning,
+    /// El dispositivo nuevo no se pudo abrir; sigue el que había.
+    Open(AudioError),
+    /// La salida nueva funciona de otra manera que la que había (a demanda o con cola).
+    Incompatible,
+    /// El hilo de audio no contestó a tiempo.
+    Timeout,
+}
+
+impl std::fmt::Display for DeviceSwitchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotRunning => f.write_str("la sala no usa ese dispositivo"),
+            Self::Open(err) => write!(f, "no se pudo abrir: {err}"),
+            Self::Incompatible => f.write_str("la salida nueva funciona de otra manera"),
+            Self::Timeout => f.write_str("el audio de la sala no contestó a tiempo"),
+        }
+    }
+}
+
+impl std::error::Error for DeviceSwitchError {}
+
+/// Un dispositivo de la sala que no funciona: la sesión sigue (sin voz o sin oír nada) hasta que
+/// se elija otro ([`SessionEvent::Audio`]). Se avisa una vez por fallo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioIssue {
+    /// El micrófono no se pudo abrir al entrar.
+    MicUnavailable(AudioError),
+    /// El micrófono dejó de funcionar (se desconectó, el sistema lo invalidó…).
+    MicLost(AudioError),
+    /// La salida no se pudo abrir al entrar.
+    SpeakerUnavailable(AudioError),
+    /// La salida dejó de funcionar.
+    SpeakerLost(AudioError),
+}
+
+impl std::fmt::Display for AudioIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MicUnavailable(err) => write!(f, "sin micrófono: {err}"),
+            Self::MicLost(err) => write!(f, "el micrófono se detuvo: {err}"),
+            Self::SpeakerUnavailable(err) => write!(f, "sin salida de audio: {err}"),
+            Self::SpeakerLost(err) => write!(f, "la salida de audio se detuvo: {err}"),
+        }
+    }
+}
+
+/// Avisa de un dispositivo que no funciona.
+fn report(core: &Core, issue: AudioIssue) {
+    core.emit(SessionEvent::Audio(issue));
+}
 
 /// Cómo se decide cuándo se habla.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -197,12 +269,39 @@ struct ControlInner {
     /// Volumen de la voz propia que se envía (lo alto que la oyen los demás), aparte del
     /// silencio del micrófono.
     mic_gain: GameGain,
-    /// Micrófono nuevo elegido en marcha, que adopta el hilo `voice-cap`.
-    new_mic: Pending<Box<dyn AudioSource>>,
-    /// Salida nueva elegida en marcha, que adopta la reproducción.
-    new_speaker: Pending<Box<dyn AudioSink>>,
-    /// Formato de la salida en uso (para abrir otra igual), cuando suena algo.
+    /// Micrófono nuevo elegido en marcha, **ya abierto**, que adopta el hilo `voice-cap`: le
+    /// devuelve el anterior por el canal, para soltarlo fuera del tiempo real.
+    new_mic: Pending<MicSwap>,
+    /// Salida nueva elegida en marcha, que adopta la reproducción: contesta por el canal si abrió.
+    new_speaker: Pending<SpeakerSwap>,
+    /// Formato de la salida en uso (para abrir otra igual) mientras corre la reproducción.
     speaker_format: Mutex<Option<AudioFormat>>,
+    /// Corre el hilo `voice-cap` (aunque su micrófono no funcione).
+    mic_running: AtomicBool,
+    /// Un cambio de dispositivo a la vez.
+    switching: Mutex<()>,
+}
+
+/// Un micrófono ya abierto camino de `voice-cap` y por dónde devolver el anterior.
+type MicSwap = (Box<dyn AudioSource>, Sender<Box<dyn AudioSource>>);
+
+/// Una salida camino de la reproducción y por dónde contestar si abrió.
+type SpeakerSwap = (Box<dyn AudioSink>, Sender<Result<(), DeviceSwitchError>>);
+
+/// Marca que un hilo de audio corre mientras vive (y que no, al terminar por donde sea).
+struct RunningFlag<'a>(&'a AtomicBool);
+
+impl<'a> RunningFlag<'a> {
+    fn new(flag: &'a AtomicBool) -> Self {
+        flag.store(true, Ordering::Release);
+        Self(flag)
+    }
+}
+
+impl Drop for RunningFlag<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Un dispositivo pedido en marcha que adopta el hilo que lo usa: el aviso es un atómico, para
@@ -349,22 +448,88 @@ impl AudioControl {
         f32::from_bits(self.inner.mic_gain.0.load(Ordering::Relaxed))
     }
 
-    /// Cambia de micrófono en marcha, sin reconectar: el hilo de la voz abre `mic` antes de su
-    /// siguiente trama y suelta el anterior (si `mic` no abre, sigue con el anterior y avisa).
-    /// Sin voz en la sesión (se entró sin micrófono) no hace nada.
-    pub fn replace_mic(&self, mic: Box<dyn AudioSource>) {
-        self.inner.new_mic.put(mic);
+    /// Cambia de micrófono en marcha, sin reconectar. Bloquea (hasta unos segundos): abre `mic`
+    /// en el hilo que llama, nunca en el de la voz, que es de tiempo real y sigue con el anterior
+    /// mientras tanto; el hilo de la voz lo adopta antes de su siguiente trama (también si el
+    /// anterior dejó de funcionar) y el anterior se suelta aquí. Si `mic` no abre, sigue el
+    /// anterior y devuelve el error. Sin voz en la sesión (se entró sin micrófono, o terminó):
+    /// [`DeviceSwitchError::NotRunning`].
+    pub fn replace_mic(&self, mut mic: Box<dyn AudioSource>) -> Result<(), DeviceSwitchError> {
+        let _one = lock(&self.inner.switching);
+        let running = || self.inner.mic_running.load(Ordering::Acquire);
+        if !running() {
+            return Err(DeviceSwitchError::NotRunning);
+        }
+        mic.start(&AudioConfig::voice())
+            .map_err(DeviceSwitchError::Open)?;
+        let (back_tx, back_rx) = crossbeam_channel::bounded(1);
+        self.inner.new_mic.put((mic, back_tx));
+        let deadline = Instant::now() + SWITCH_PICKUP;
+        loop {
+            match back_rx.recv_timeout(SWITCH_POLL) {
+                Ok(mut old) => {
+                    old.stop();
+                    return Ok(());
+                }
+                Err(RecvTimeoutError::Disconnected) => return Err(DeviceSwitchError::NotRunning),
+                Err(RecvTimeoutError::Timeout) => {
+                    let gone = !running();
+                    if (gone || Instant::now() >= deadline)
+                        && let Some((mut mic, _)) = self.inner.new_mic.take()
+                    {
+                        // Nadie lo recogió: se suelta aquí.
+                        mic.stop();
+                        return Err(if gone {
+                            DeviceSwitchError::NotRunning
+                        } else {
+                            DeviceSwitchError::Timeout
+                        });
+                    }
+                    // Si ya lo recogió, el anterior está al llegar.
+                }
+            }
+        }
     }
 
-    /// Cambia de salida en marcha, sin reconectar: la reproducción suelta la anterior y abre
-    /// `speaker` (si no abre, vuelve a la anterior y avisa). `speaker` tiene que aceptar
-    /// [`AudioControl::speaker_format`].
-    pub fn replace_speaker(&self, speaker: Box<dyn AudioSink>) {
-        self.inner.new_speaker.put(speaker);
+    /// Cambia de salida en marcha, sin reconectar. Bloquea hasta que la reproducción suelta la
+    /// anterior y abre `speaker` (también si la anterior dejó de funcionar), y devuelve si abrió;
+    /// si no, vuelve a la anterior. `speaker` tiene que aceptar [`AudioControl::speaker_format`].
+    /// Sin reproducción en la sesión: [`DeviceSwitchError::NotRunning`].
+    pub fn replace_speaker(&self, speaker: Box<dyn AudioSink>) -> Result<(), DeviceSwitchError> {
+        let _one = lock(&self.inner.switching);
+        let running = || self.speaker_format().is_some();
+        if !running() {
+            return Err(DeviceSwitchError::NotRunning);
+        }
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.inner.new_speaker.put((speaker, reply_tx));
+        let started = Instant::now();
+        loop {
+            match reply_rx.recv_timeout(SWITCH_POLL) {
+                Ok(result) => return result,
+                Err(RecvTimeoutError::Disconnected) => return Err(DeviceSwitchError::NotRunning),
+                Err(RecvTimeoutError::Timeout) => {
+                    let gone = !running();
+                    if (gone || started.elapsed() >= SWITCH_PICKUP)
+                        && self.inner.new_speaker.take().is_some()
+                    {
+                        // Nadie la recogió (se suelta aquí, sin haberse abierto).
+                        return Err(if gone {
+                            DeviceSwitchError::NotRunning
+                        } else {
+                            DeviceSwitchError::Timeout
+                        });
+                    }
+                    if started.elapsed() >= SWITCH_ANSWER {
+                        return Err(DeviceSwitchError::Timeout);
+                    }
+                }
+            }
+        }
     }
 
     /// Formato de la salida en uso, para abrir otra igual ([`AudioControl::replace_speaker`]);
-    /// `None` si no suena nada en esta sesión.
+    /// `None` si no hay reproducción en esta sesión (aunque su salida no funcione, la hay).
     pub fn speaker_format(&self) -> Option<AudioFormat> {
         *lock(&self.inner.speaker_format)
     }
@@ -768,7 +933,21 @@ pub(crate) fn game_capture_loop(
     source.stop();
 }
 
+/// Si se envía la trama de voz (y se cuenta como «hablando»): `voice` es lo que dice el VAD. Con
+/// el volumen propio a cero no se oiría nada, así que cuenta como silenciado: no se envía ni se
+/// dice a los demás que se habla.
+fn sends_voice(control: &AudioControl, voice: bool) -> bool {
+    let wants = if control.push_to_talk() {
+        control.inner.talk_pressed.load(Ordering::Acquire)
+    } else {
+        voice
+    };
+    wants && !control.mic_muted() && control.voice_allowed() && control.mic_gain() > 0.0
+}
+
 /// Hilo `voice-cap`: micrófono → procesado → VAD o pulsar para hablar → Opus → SFrame → destinos.
+/// Si el micrófono no abre o deja de funcionar, avisa una vez ([`AudioIssue`]) y espera a que se
+/// elija otro ([`AudioControl::replace_mic`]); solo termina con la sesión.
 pub(crate) fn voice_capture_loop(
     core: &Core,
     mut input: VoiceInput,
@@ -777,20 +956,27 @@ pub(crate) fn voice_capture_loop(
     control: &AudioControl,
     out: &dyn AudioOut,
 ) {
-    realtime("voice-cap");
     let shared = &core.shared;
-    if let Err(err) = input.mic.start(&AudioConfig::voice()) {
-        core.warn(format!("sin micrófono: {err}"));
-        control.set_voice_enabled(false);
-        return;
-    }
     let mut sealer = match Sealer::new(core, Profile::Voice, Track::Voice, input.bitrate) {
         Ok(sealer) => sealer,
         Err(err) => {
             core.warn(format!("sin voz: {err}"));
+            control.set_voice_enabled(false);
             return;
         }
     };
+    // Desde aquí acepta micrófonos nuevos, aunque el primero no abra o deje de funcionar.
+    let _running = RunningFlag::new(&control.inner.mic_running);
+    // Se abre antes de pasar a tiempo real: abrir un dispositivo tarda (segundos, si falla).
+    let mut live = match input.mic.start(&AudioConfig::voice()) {
+        Ok(()) => true,
+        Err(err) => {
+            report(core, AudioIssue::MicUnavailable(err));
+            control.set_voice_enabled(false);
+            false
+        }
+    };
+    realtime("voice-cap");
     debug!(micrófono = %input.mic.describe(), procesado = processor.backend(), "voz");
     let frames = frames_of(frame_ms);
     let mut frame = Vec::with_capacity(MAX_FRAME_SAMPLES);
@@ -798,21 +984,36 @@ pub(crate) fn voice_capture_loop(
     let mut talking = false;
     let mut leaf = core.own_leaf.load(Ordering::Acquire);
     while !shared.stopping() {
-        if let Some(mut mic) = control.inner.new_mic.take() {
-            match mic.start(&AudioConfig::voice()) {
-                Ok(()) => {
-                    input.mic.stop();
-                    debug!(micrófono = %mic.describe(), "micrófono cambiado en marcha");
-                    input.mic = mic;
-                }
-                Err(err) => core.warn(format!("no se pudo cambiar de micrófono: {err}")),
+        if let Some((mic, back)) = control.inner.new_mic.take() {
+            // Llega abierto ([`AudioControl::replace_mic`]); el anterior se suelta allí.
+            debug!(micrófono = %mic.describe(), "micrófono cambiado en marcha");
+            let old = std::mem::replace(&mut input.mic, mic);
+            let _ = back.try_send(old);
+            if !live {
+                live = true;
+                control.set_voice_enabled(true);
             }
+        }
+        if !live {
+            // Sin micrófono que funcione: se espera a que se elija otro.
+            std::thread::sleep(DEAD_DEVICE_POLL);
+            continue;
         }
         let captured_at = match read_packet(input.mic.as_mut(), frames, &mut frame, &mut pcm) {
             Ok(at) => at,
             Err(err) => {
-                core.warn(format!("el micrófono se detuvo: {err}"));
-                break;
+                // Se avisa una vez y se sigue esperando otro micrófono, sin salir del bucle.
+                report(core, AudioIssue::MicLost(err));
+                input.mic.stop();
+                live = false;
+                control.set_voice_enabled(false);
+                if talking || control.speaking() {
+                    talking = false;
+                    if control.set_speaking(false) {
+                        out.speaking(false);
+                    }
+                }
+                continue;
             }
         };
         let mut timeline = AudioTimeline::default();
@@ -834,12 +1035,7 @@ pub(crate) fn voice_capture_loop(
             }
         }
         timeline.mark(AudioStage::Processed, Instant::now());
-        let wants = if control.push_to_talk() {
-            control.inner.talk_pressed.load(Ordering::Acquire)
-        } else {
-            voice
-        };
-        let now_talking = wants && !control.mic_muted() && control.voice_allowed();
+        let now_talking = sends_voice(control, voice);
         if control.set_speaking(now_talking) {
             out.speaking(now_talking);
         }
@@ -1248,6 +1444,21 @@ impl Playout {
         true
     }
 
+    /// Sin salida que funcione: tira lo que llegó (sin decodificarlo), para que al volver a sonar
+    /// no quede una cola vieja. `false` si el canal de paquetes se cerró.
+    fn discard(&mut self) -> bool {
+        loop {
+            match self.packets.try_recv() {
+                Ok(_) => {}
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => {
+                    self.closed.store(true, Ordering::Release);
+                    return false;
+                }
+            }
+        }
+    }
+
     /// Instante local de una marca de captura (reloj del anfitrión). La conversión de la sesión
     /// (`to_local`) pasa por el cerrojo del reloj del enlace: se llama una vez cada
     /// [`SYNC_TICKS`] tramas para renovar el ancla y las demás marcas se sitúan respecto a ella
@@ -1457,7 +1668,9 @@ const _: () = assert!(PUBLISH_TICKS.is_multiple_of(SYNC_TICKS));
 /// Hilo `audio-play`. Con un sumidero a demanda ([`AudioSink::start_pull`]) el dispositivo pide
 /// cada trama justo cuando la necesita y este hilo solo vigila y hace de hilo de contadores; si
 /// no, la decide este hilo en cuanto el sumidero tiene sitio, una trama antes de que suene, y los
-/// contadores van en un hilo aparte (`audio-stats`).
+/// contadores van en un hilo aparte (`audio-stats`). Si la salida no abre o deja de funcionar,
+/// avisa una vez ([`AudioIssue`]), tira lo que llega y espera a que se elija otra
+/// ([`AudioControl::replace_speaker`]); solo termina con la sesión.
 pub(crate) fn play_loop(
     core: &Arc<Core>,
     player: Player,
@@ -1517,35 +1730,49 @@ pub(crate) fn play_loop(
     *lock(&speaker_control.inner.speaker_format) = None;
 }
 
-/// Adopta la salida nueva pedida en marcha ([`AudioControl::replace_speaker`]): `restart`
-/// suelta la actual y abre la nueva (devuelve si abrió); si no abre, se vuelve a abrir la
-/// anterior y se avisa.
+/// Adopta la salida nueva pedida en marcha ([`AudioControl::replace_speaker`]) y le contesta si
+/// abrió: suelta la actual (si funcionaba) y `restart` abre la nueva. Si no abre, se vuelve a
+/// abrir la anterior (si funcionaba; si tampoco abre, se avisa). `live` dice si la salida en uso
+/// funciona.
 fn swap_speaker(
     core: &Core,
     control: &AudioControl,
     sink: &mut Box<dyn AudioSink>,
-    mut restart: impl FnMut(&mut dyn AudioSink) -> Result<(), coroom_audio::AudioError>,
+    live: &mut bool,
+    mut restart: impl FnMut(&mut dyn AudioSink) -> Result<(), AudioError>,
 ) {
-    let Some(mut next) = control.inner.new_speaker.take() else {
+    let Some((mut next, reply)) = control.inner.new_speaker.take() else {
         return;
     };
     if next.supports_pull() != sink.supports_pull() {
-        core.warn("no se pudo cambiar de salida: la nueva funciona de otra manera".to_owned());
+        let _ = reply.try_send(Err(DeviceSwitchError::Incompatible));
         return;
     }
-    sink.stop();
+    if *live {
+        sink.stop();
+    }
     match restart(next.as_mut()) {
         Ok(()) => {
             debug!(salida = %next.describe(), "salida cambiada en marcha");
             *sink = next;
+            *live = true;
+            let _ = reply.try_send(Ok(()));
         }
         Err(err) => {
-            core.warn(format!("no se pudo cambiar de salida: {err}"));
-            if let Err(err) = restart(sink.as_mut()) {
-                core.warn(format!("sin salida de audio: {err}"));
+            let _ = reply.try_send(Err(DeviceSwitchError::Open(err)));
+            if *live && let Err(err) = restart(sink.as_mut()) {
+                report(core, AudioIssue::SpeakerLost(err));
+                *live = false;
             }
         }
     }
+}
+
+/// La salida dejó de funcionar: se avisa una vez, se suelta y se espera otra.
+fn lose_speaker(core: &Core, sink: &mut dyn AudioSink, live: &mut bool, err: AudioError) {
+    report(core, AudioIssue::SpeakerLost(err));
+    sink.stop();
+    *live = false;
 }
 
 /// A demanda: el dispositivo llama a la reproducción desde su hilo; este, el de contadores.
@@ -1572,18 +1799,24 @@ fn play_pull(
             }
         })
     };
-    if let Err(err) = sink.start_pull(config, render()) {
-        core.warn(format!("sin salida de audio: {err}"));
-        return;
-    }
+    let mut live = match sink.start_pull(config, render()) {
+        Ok(()) => true,
+        Err(err) => {
+            report(core, AudioIssue::SpeakerUnavailable(err));
+            false
+        }
+    };
     debug!(salida = %sink.describe(), "reproducción de audio a demanda");
     while !core.shared.stopping() && !closed.load(Ordering::Acquire) {
-        swap_speaker(core, &housekeeper.control, sink, |next| {
+        swap_speaker(core, &housekeeper.control, sink, &mut live, |next| {
             next.start_pull(config, render())
         });
-        if let Err(err) = sink.check() {
-            core.warn(format!("la salida de audio se detuvo: {err}"));
-            break;
+        if live && let Err(err) = sink.check() {
+            lose_speaker(core, sink.as_mut(), &mut live, err);
+        }
+        if !live {
+            // Sin salida que funcione, lo que llega se tira: al volver suena lo de ahora.
+            lock(&playout).discard();
         }
         housekeeper.device.store(sink.device_counters());
         housekeeper.tick();
@@ -1603,10 +1836,13 @@ fn play_push(
     mut housekeeper: Housekeeper,
     frame_len: usize,
 ) {
-    if let Err(err) = sink.start(config) {
-        core.warn(format!("sin salida de audio: {err}"));
-        return;
-    }
+    let mut live = match sink.start(config) {
+        Ok(()) => true,
+        Err(err) => {
+            report(core, AudioIssue::SpeakerUnavailable(err));
+            false
+        }
+    };
     debug!(salida = %sink.describe(), "reproducción de audio");
     let device = Arc::clone(&housekeeper.device);
     let control = housekeeper.control.clone();
@@ -1633,10 +1869,18 @@ fn play_push(
         realtime("audio-play");
         let mut out = [0i16; MAX_FRAME_SAMPLES];
         while !core.shared.stopping() {
-            swap_speaker(core, &control, sink, |next| next.start(config));
+            swap_speaker(core, &control, sink, &mut live, |next| next.start(config));
+            if !live {
+                // Sin salida que funcione, lo que llega se tira hasta que se elija otra.
+                if !playout.discard() {
+                    break;
+                }
+                std::thread::sleep(DEAD_DEVICE_POLL);
+                continue;
+            }
             if let Err(err) = sink.wait_ready() {
-                core.warn(format!("la salida de audio se detuvo: {err}"));
-                break;
+                lose_speaker(core, sink.as_mut(), &mut live, err);
+                continue;
             }
             let decided = Instant::now();
             if !playout.fill(&mut out[..frame_len], decided) {
@@ -1645,8 +1889,8 @@ fn play_push(
             let played = match sink.write(&out[..frame_len]) {
                 Ok(played) => played,
                 Err(err) => {
-                    core.warn(format!("la salida de audio se detuvo: {err}"));
-                    break;
+                    lose_speaker(core, sink.as_mut(), &mut live, err);
+                    continue;
                 }
             };
             device.store(sink.device_counters());
@@ -1758,6 +2002,7 @@ fn publish(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coroom_audio::synthetic::{CaptureSink, ToneSource};
 
     #[test]
     fn microseconds_extend_around_the_reference() {
@@ -1893,13 +2138,389 @@ mod tests {
         assert_eq!(control.mic_gain(), MAX_VOICE_GAIN, "se acota");
         control.set_mic_gain(f32::NAN);
         assert_eq!(control.mic_gain(), 1.0, "no finita cuenta como normal");
-        // Un micrófono pedido en marcha lo recoge el hilo de la voz una sola vez.
+        // Sin hilo de la voz ni reproducción, cambiar de dispositivo lo dice (y no deja nada
+        // pendiente).
+        assert_eq!(
+            control.replace_mic(Box::new(ToneSource::new(440.0, 1))),
+            Err(DeviceSwitchError::NotRunning)
+        );
         assert!(control.inner.new_mic.take().is_none());
-        control.replace_mic(Box::new(coroom_audio::synthetic::ToneSource::new(440.0, 1)));
-        assert!(control.inner.new_mic.take().is_some());
-        assert!(control.inner.new_mic.take().is_none());
-        // Sin nada sonando no hay formato de salida que imitar.
+        assert_eq!(control.speaker_format(), None, "nada que imitar");
+        assert_eq!(
+            control.replace_speaker(Box::new(CaptureSink::new(2))),
+            Err(DeviceSwitchError::NotRunning)
+        );
+        assert!(control.inner.new_speaker.take().is_none());
+    }
+
+    #[test]
+    fn a_zero_voice_volume_counts_as_muted() {
+        let control = AudioControl::default();
+        control.set_voice_allowed(true);
+        assert!(sends_voice(&control, true));
+        assert!(!sends_voice(&control, false), "el VAD no oye nada");
+        control.set_mic_gain(0.0);
+        assert!(
+            !sends_voice(&control, true),
+            "a cero no se envía ni se habla"
+        );
+        control.set_mic_gain(0.05);
+        assert!(sends_voice(&control, true));
+        control.set_push_to_talk(true);
+        assert!(!sends_voice(&control, true), "sin la tecla pulsada");
+        control.set_talk_pressed(true);
+        assert!(sends_voice(&control, false));
+        control.set_mic_gain(0.0);
+        assert!(!sends_voice(&control, false), "ni con la tecla pulsada");
+        control.set_mic_gain(1.0);
+        control.set_mic_muted(true);
+        assert!(!sends_voice(&control, true));
+        control.set_mic_muted(false);
+        control.set_voice_allowed(false);
+        assert!(!sends_voice(&control, true));
+    }
+
+    /// Micrófono sintético que deja de funcionar (como uno USB que se desconecta): `start` falla
+    /// si se le pide y `read` falla tras `frames` tramas.
+    struct FlakyMic {
+        tone: ToneSource,
+        fail_start: bool,
+        frames: u32,
+        read: Arc<AtomicU32>,
+    }
+
+    impl FlakyMic {
+        fn new(fail_start: bool, frames: u32) -> Self {
+            Self {
+                tone: ToneSource::new(440.0, 1),
+                fail_start,
+                frames,
+                read: Arc::new(AtomicU32::new(0)),
+            }
+        }
+    }
+
+    impl AudioSource for FlakyMic {
+        fn format(&self) -> AudioFormat {
+            self.tone.format()
+        }
+
+        fn start(&mut self, config: &AudioConfig) -> Result<(), AudioError> {
+            if self.fail_start {
+                return Err(AudioError::NoSuchDevice("Micrófono de ejemplo".into()));
+            }
+            self.tone.start(config)
+        }
+
+        fn read(&mut self, out: &mut Vec<i16>) -> Result<coroom_audio::Captured, AudioError> {
+            if self.read.fetch_add(1, Ordering::AcqRel) >= self.frames {
+                return Err(AudioError::DeviceLost);
+            }
+            self.tone.read(out)
+        }
+
+        fn stop(&mut self) {
+            self.tone.stop();
+        }
+    }
+
+    /// Destino de prueba: cuenta los paquetes de voz enviados.
+    #[derive(Default)]
+    struct CountingOut {
+        sent: AtomicU32,
+    }
+
+    impl AudioOut for CountingOut {
+        fn send(&self, _track: Track, _seq: u32, _sealed: &[u8]) -> bool {
+            self.sent.fetch_add(1, Ordering::AcqRel);
+            true
+        }
+
+        fn has_targets(&self, _track: Track) -> bool {
+            true
+        }
+
+        fn host_us(&self, _at: Instant) -> Option<u64> {
+            Some(0)
+        }
+
+        fn speaking(&self, _speaking: bool) {}
+    }
+
+    fn test_core() -> Arc<Core> {
+        Arc::new(Core::new(
+            crate::Role::Host,
+            coroom_transport::crypto::Identity::generate().expect("identidad"),
+            Arc::new(LatencyLedger::default()),
+            false,
+        ))
+    }
+
+    /// Los avisos de audio que la sesión emitió hasta ahora.
+    fn issues(core: &Core) -> Vec<AudioIssue> {
+        core.events_rx
+            .try_iter()
+            .filter_map(|event| match event {
+                SessionEvent::Audio(issue) => Some(issue),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn wait_for(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !condition() {
+            assert!(Instant::now() < deadline, "tiempo agotado: {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Arranca `voice-cap` con `mic`, pulsar para hablar y la tecla pulsada (envía cada trama).
+    fn spawn_voice(
+        core: &Arc<Core>,
+        mic: Box<dyn AudioSource>,
+    ) -> (Arc<CountingOut>, std::thread::JoinHandle<()>) {
+        let control = core.audio.clone();
+        control.set_voice_enabled(true);
+        control.set_voice_allowed(true);
+        control.set_push_to_talk(true);
+        control.set_talk_pressed(true);
+        let out = Arc::new(CountingOut::default());
+        let (thread_core, thread_out) = (Arc::clone(core), Arc::clone(&out));
+        let processor = VoiceProcessor::new(ProcessingOptions::NONE).expect("procesado");
+        let handle = std::thread::spawn(move || {
+            let input = VoiceInput::new(mic);
+            voice_capture_loop(
+                &thread_core,
+                input,
+                processor,
+                10,
+                &thread_core.audio,
+                thread_out.as_ref(),
+            );
+        });
+        (out, handle)
+    }
+
+    #[test]
+    fn a_lost_mic_waits_for_another_one_instead_of_ending_the_voice() {
+        let core = test_core();
+        let control = core.audio.clone();
+        let (out, handle) = spawn_voice(&core, Box::new(FlakyMic::new(false, 20)));
+        // Deja de funcionar: un aviso, sin voz, y el hilo sigue esperando otro.
+        wait_for("el aviso", || !control.voice_enabled());
+        let sent = out.sent.load(Ordering::Acquire);
+        assert!(sent > 0 && sent <= 20, "{sent}");
+        assert_eq!(issues(&core), [AudioIssue::MicLost(AudioError::DeviceLost)]);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            out.sent.load(Ordering::Acquire),
+            sent,
+            "sin micrófono no sale nada"
+        );
+        assert!(issues(&core).is_empty(), "se avisa una sola vez");
+        assert!(control.inner.mic_running.load(Ordering::Acquire));
+        // Un micrófono que no abre no se adopta: lo dice y se sigue esperando.
+        assert_eq!(
+            control.replace_mic(Box::new(FlakyMic::new(true, u32::MAX))),
+            Err(DeviceSwitchError::Open(AudioError::NoSuchDevice(
+                "Micrófono de ejemplo".into()
+            )))
+        );
+        // Otro que funciona: la voz vuelve sin reconectar.
+        assert_eq!(
+            control.replace_mic(Box::new(ToneSource::new(550.0, 1))),
+            Ok(())
+        );
+        assert!(control.voice_enabled());
+        wait_for("la voz de nuevo", || {
+            out.sent.load(Ordering::Acquire) > sent + 5
+        });
+        core.shared.finish(None);
+        handle.join().expect("voice-cap");
+        assert!(!control.inner.mic_running.load(Ordering::Acquire));
+        assert_eq!(
+            control.replace_mic(Box::new(ToneSource::new(550.0, 1))),
+            Err(DeviceSwitchError::NotRunning),
+            "con la sesión terminada"
+        );
+    }
+
+    #[test]
+    fn a_mic_that_never_opened_can_be_replaced_in_the_room() {
+        let core = test_core();
+        let control = core.audio.clone();
+        let (out, handle) = spawn_voice(&core, Box::new(FlakyMic::new(true, u32::MAX)));
+        wait_for("el aviso", || !control.voice_enabled());
+        wait_for("el hilo en marcha", || {
+            control.inner.mic_running.load(Ordering::Acquire)
+        });
+        assert!(matches!(
+            issues(&core).as_slice(),
+            [AudioIssue::MicUnavailable(AudioError::NoSuchDevice(_))]
+        ));
+        assert_eq!(out.sent.load(Ordering::Acquire), 0);
+        assert_eq!(
+            control.replace_mic(Box::new(ToneSource::new(550.0, 1))),
+            Ok(())
+        );
+        wait_for("la voz", || out.sent.load(Ordering::Acquire) > 5);
+        assert!(control.voice_enabled());
+        // A volumen cero, como silenciado: no sale nada más.
+        control.set_mic_gain(0.0);
+        std::thread::sleep(Duration::from_millis(50));
+        let muted = out.sent.load(Ordering::Acquire);
+        assert!(!control.speaking());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            out.sent.load(Ordering::Acquire) <= muted + 1,
+            "como mucho la trama DTX del final"
+        );
+        core.shared.finish(None);
+        handle.join().expect("voice-cap");
+    }
+
+    /// Salida sintética que deja de funcionar cuando se le dice (como una USB que se desconecta),
+    /// o que nunca abre.
+    struct FlakySpeaker {
+        sink: CaptureSink,
+        fail_start: bool,
+        lost: Arc<AtomicBool>,
+    }
+
+    impl AudioSink for FlakySpeaker {
+        fn format(&self) -> AudioFormat {
+            self.sink.format()
+        }
+
+        fn start(&mut self, config: &AudioConfig) -> Result<(), AudioError> {
+            if self.fail_start {
+                return Err(AudioError::NoSuchDevice("Salida de ejemplo".into()));
+            }
+            self.sink.start(config)
+        }
+
+        fn wait_ready(&mut self) -> Result<(), AudioError> {
+            if self.lost.load(Ordering::Acquire) {
+                return Err(AudioError::DeviceLost);
+            }
+            self.sink.wait_ready()
+        }
+
+        fn write(&mut self, samples: &[i16]) -> Result<coroom_audio::Played, AudioError> {
+            self.sink.write(samples)
+        }
+
+        fn supports_pull(&self) -> bool {
+            self.sink.supports_pull()
+        }
+
+        fn start_pull(&mut self, config: &AudioConfig, render: Render) -> Result<(), AudioError> {
+            if self.fail_start {
+                return Err(AudioError::NoSuchDevice("Salida de ejemplo".into()));
+            }
+            self.sink.start_pull(config, render)
+        }
+
+        fn check(&mut self) -> Result<(), AudioError> {
+            if self.lost.load(Ordering::Acquire) {
+                return Err(AudioError::DeviceLost);
+            }
+            self.sink.check()
+        }
+
+        fn stop(&mut self) {
+            self.sink.stop();
+        }
+    }
+
+    /// Una salida que deja de funcionar no termina la reproducción: se avisa y se puede elegir
+    /// otra (que se graba); una que no abre lo dice y no cambia nada. A demanda (`pull`) y con
+    /// la cola del sumidero.
+    fn a_lost_speaker_can_be_replaced(pull: bool, never_opened: bool) {
+        let core = test_core();
+        let control = core.audio.clone();
+        let lost = Arc::new(AtomicBool::new(false));
+        let sink = |fail_start: bool| {
+            let sink = CaptureSink::new(2);
+            FlakySpeaker {
+                sink: if pull { sink } else { sink.pushed() },
+                fail_start,
+                lost: Arc::clone(&lost),
+            }
+        };
+        let first = sink(never_opened);
+        let (packets_tx, packets) = packet_channel();
+        let thread_core = Arc::clone(&core);
+        let player = Player {
+            sink: Box::new(first),
+            control: control.clone(),
+            render: None,
+            av_sync: false,
+        };
+        let handle = std::thread::spawn(move || {
+            play_loop(&thread_core, player, packets, |_| None);
+        });
+        wait_for("la reproducción", || control.speaker_format().is_some());
+        if never_opened {
+            wait_for("el aviso", || {
+                matches!(
+                    core.events_rx.try_recv(),
+                    Ok(SessionEvent::Audio(AudioIssue::SpeakerUnavailable(_)))
+                )
+            });
+        } else {
+            lost.store(true, Ordering::Release);
+            wait_for("el aviso", || {
+                matches!(
+                    core.events_rx.try_recv(),
+                    Ok(SessionEvent::Audio(AudioIssue::SpeakerLost(
+                        AudioError::DeviceLost
+                    )))
+                )
+            });
+        }
+        assert!(control.speaker_format().is_some(), "la reproducción sigue");
+        lost.store(false, Ordering::Release);
+        assert_eq!(
+            control.replace_speaker(Box::new(sink(true))),
+            Err(DeviceSwitchError::Open(AudioError::NoSuchDevice(
+                "Salida de ejemplo".into()
+            )))
+        );
+        let other = sink(false);
+        let tape = other.sink.recording();
+        assert_eq!(control.replace_speaker(Box::new(other)), Ok(()));
+        wait_for("la salida nueva", || {
+            tape.lock().map(|r| r.samples.len()).unwrap_or(0) > 4_800
+        });
+        assert!(issues(&core).is_empty(), "{:?}", issues(&core));
+        // Con el canal de paquetes cerrado (la sesión termina), el hilo acaba y ya no hay salida
+        // que cambiar.
+        drop(packets_tx);
+        core.shared.finish(None);
+        handle.join().expect("audio-play");
         assert_eq!(control.speaker_format(), None);
+        assert_eq!(
+            control.replace_speaker(Box::new(sink(false))),
+            Err(DeviceSwitchError::NotRunning)
+        );
+    }
+
+    #[test]
+    fn a_lost_speaker_can_be_replaced_on_demand() {
+        a_lost_speaker_can_be_replaced(true, false);
+    }
+
+    #[test]
+    fn a_lost_speaker_can_be_replaced_with_the_queue() {
+        a_lost_speaker_can_be_replaced(false, false);
+    }
+
+    #[test]
+    fn a_speaker_that_never_opened_can_be_replaced() {
+        a_lost_speaker_can_be_replaced(true, true);
+        a_lost_speaker_can_be_replaced(false, true);
     }
 
     #[test]

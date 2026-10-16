@@ -877,11 +877,18 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 } else {
                     room.muted.insert(id);
                 }
-                return vec![Effect::SetVoiceMuted {
+                let mut effects = vec![Effect::SetVoiceMuted {
                     host: true,
                     source: id.0,
                     muted: !hear,
                 }];
+                // Se recuerda por su nombre, como el volumen: vale si vuelve a entrar.
+                if let Some(status) = guest(app, id) {
+                    let name = status.name.clone();
+                    app.settings.audio.set_voice_muted(&name, !hear);
+                    effects.extend(app.settings_changed());
+                }
+                return effects;
             }
         }
         Msg::Volume(id, percent) => {
@@ -1393,6 +1400,25 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                 // se toque después manda); quien se fue no deja entrada.
                 room.volumes
                     .retain(|id, _| guests.iter().any(|status| status.guest == *id));
+                room.muted
+                    .retain(|id| guests.iter().any(|status| status.guest == *id));
+                // El silencio recordado por su nombre (se guarda al tocarlo) vale siempre: también
+                // si vuelve a entrar con otro id.
+                for status in &guests {
+                    let muted = app.settings.audio.voice_muted(&status.name);
+                    if muted != room.muted.contains(&status.guest) {
+                        if muted {
+                            room.muted.insert(status.guest);
+                        } else {
+                            room.muted.remove(&status.guest);
+                        }
+                        effects.push(Effect::SetVoiceMuted {
+                            host: true,
+                            source: status.guest.0,
+                            muted,
+                        });
+                    }
+                }
                 for status in &guests {
                     if room.volumes.contains_key(&status.guest) {
                         continue;
@@ -1611,8 +1637,22 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
                     |s| s.name.clone(),
                 );
             room.guests.retain(|status| status.guest != guest);
-            room.muted.remove(&guest);
-            room.volumes.remove(&guest);
+            // Su silencio y su volumen dejan libre su sitio en el audio (lo recordado por su
+            // nombre se vuelve a aplicar si vuelve).
+            if room.muted.remove(&guest) {
+                effects.push(Effect::SetVoiceMuted {
+                    host: true,
+                    source: guest.0,
+                    muted: false,
+                });
+            }
+            if room.volumes.remove(&guest).is_some() {
+                effects.push(Effect::SetVoiceGain {
+                    host: true,
+                    source: guest.0,
+                    gain: voice_gain(DEFAULT_VOICE_VOLUME),
+                });
+            }
             // Si era a quien se ofrecía la sala y aún no contestó, la oferta se acaba (al pasarla,
             // en cambio, sale porque ya va a la suya).
             if !app.host.handing_over
@@ -1652,6 +1692,7 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
             }
         }
         SessionEvent::Warning(message) => app.toast(Tone::Warning, message),
+        SessionEvent::Audio(issue) => app.toast(Tone::Warning, settings::audio_issue_text(&issue)),
         _ => {}
     }
     effects
@@ -4904,6 +4945,72 @@ mod tests {
             app.host.room.as_ref().expect("sala").volume(GuestId(3)),
             MAX_VOICE_VOLUME
         );
+    }
+
+    #[test]
+    fn local_mutes_are_remembered_by_name_when_a_guest_comes_back() {
+        let mut app = app();
+        app.settings.audio.set_voice_muted("Carla", true);
+        // Al abrir la sala, lo recordado se aplica a quien llega.
+        app.update(Message::Host(Msg::Start));
+        app.update(Message::Event(Event::HostStarted(
+            Ok(VideoFeed::detached()),
+        )));
+        app.update(Message::Event(Event::Host(SessionEvent::RoomCreated {
+            code: "K7Q2MZ".into(),
+            fingerprint: "cd".repeat(32),
+        })));
+        let effects = app.update(Message::Event(Event::HostGuests(
+            vec![status(1, "Bea"), status(2, "Carla")],
+            HostVoice::default(),
+        )));
+        assert_eq!(
+            effects,
+            [Effect::SetVoiceMuted {
+                host: true,
+                source: 2,
+                muted: true,
+            }]
+        );
+        // Dejar de oír a Bea se aplica y se recuerda por su nombre.
+        let effects = app.update(Message::Host(Msg::Hear(GuestId(1), false)));
+        assert_eq!(
+            effects,
+            [Effect::SetVoiceMuted {
+                host: true,
+                source: 1,
+                muted: true,
+            }]
+        );
+        assert!(app.settings.audio.voice_muted("Bea"));
+        // Bea se va (su sitio en el audio queda libre) y vuelve con otro id: sigue silenciada.
+        let effects = app.update(Message::Event(Event::Host(SessionEvent::GuestLeft {
+            guest: GuestId(1),
+            kicked: false,
+        })));
+        assert_eq!(
+            effects,
+            [Effect::SetVoiceMuted {
+                host: true,
+                source: 1,
+                muted: false,
+            }]
+        );
+        let effects = app.update(Message::Event(Event::HostGuests(
+            vec![status(2, "Carla"), status(3, "Bea")],
+            HostVoice::default(),
+        )));
+        assert_eq!(
+            effects,
+            [Effect::SetVoiceMuted {
+                host: true,
+                source: 3,
+                muted: true,
+            }]
+        );
+        // Volver a oír a Carla lo olvida.
+        app.update(Message::Host(Msg::Hear(GuestId(2), true)));
+        assert!(!app.settings.audio.voice_muted("Carla"));
     }
 
     #[test]

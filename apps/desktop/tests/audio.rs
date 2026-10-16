@@ -656,9 +656,13 @@ fn f_devices_and_the_voice_volume_change_live() {
         Box::new(|| level(&listener.speaker, HOST_VOICE_HZ) > HEARD),
     );
     // Otro micrófono en marcha: llega el nuevo y deja de llegar el anterior.
-    host.session
-        .audio()
-        .replace_mic(Box::new(ToneSource::new(OTHER_MIC_HZ, 1)));
+    assert_eq!(
+        host.session
+            .audio()
+            .replace_mic(Box::new(ToneSource::new(OTHER_MIC_HZ, 1))),
+        Ok(()),
+        "lo adopta el hilo de la voz"
+    );
     wait(
         "el micrófono nuevo",
         Box::new(|| {
@@ -688,7 +692,7 @@ fn f_devices_and_the_voice_volume_change_live() {
     assert_eq!(format.channels, 2);
     let sink = CaptureSink::new(2);
     let new_tape = sink.recording();
-    audio.replace_speaker(Box::new(sink));
+    assert_eq!(audio.replace_speaker(Box::new(sink)), Ok(()), "abre");
     wait(
         "la salida nueva",
         Box::new(|| level(&new_tape, OTHER_MIC_HZ) > HEARD / 2.0),

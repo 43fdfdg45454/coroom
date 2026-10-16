@@ -10,7 +10,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use coroom_session::audio::AudioError;
 use coroom_session::input::gamepad::PadChoice;
+use coroom_session::remote::audio::DeviceSwitchError;
 use coroom_session::remote::{GuestStatus, QualityLevel, SessionEvent};
 use coroom_session::{GuestId, Permissions, SessionError};
 use coroom_transport::api::ServerProbe;
@@ -253,7 +255,19 @@ pub enum Event {
     /// Anfitrión: los invitados ya saben a qué sala ir (el código), o por qué no.
     HandedOver(Result<String, String>),
     /// Prueba del micrófono: el nivel (0-1, el pico de los últimos 50 ms) o por qué paró.
-    MicLevel(Result<f32, String>),
+    MicLevel(Result<f32, MicTestError>),
+    /// Con la sala abierta, el micrófono (`input`) o la salida elegidos se cambiaron en ella, o
+    /// por qué no ([`Effect::SwitchAudioDevice`]).
+    AudioDeviceSwitched {
+        /// Micrófono (`true`) o salida.
+        input: bool,
+        /// El elegido.
+        device: Option<String>,
+        /// El que había, para volver a él si el elegido no abre.
+        previous: Option<String>,
+        /// Si la sala ya lo usa.
+        result: Result<(), DeviceSwitchError>,
+    },
     /// Anfitrión: la sala está arrancando (con su vista previa) o no pudo.
     HostStarted(Result<Arc<VideoFeed>, String>),
     /// Anfitrión: un evento de la sesión.
@@ -326,6 +340,15 @@ pub struct MicTest {
     pub hear: bool,
     /// Volumen de la voz propia (ganancia lineal), el mismo que se envía en la sala.
     pub gain: f32,
+}
+
+/// Por qué paró la prueba del micrófono.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MicTestError {
+    /// El micrófono no abrió o dejó de funcionar.
+    Mic(AudioError),
+    /// La salida para oírse no abrió o dejó de funcionar.
+    Speaker(AudioError),
 }
 
 /// La voz del anfitrión en su sala, con cada lista de invitados.
@@ -550,6 +573,8 @@ pub enum Effect {
         input: bool,
         /// Nombre del dispositivo.
         device: Option<String>,
+        /// El que había (se vuelve a él si el nuevo no abre).
+        previous: Option<String>,
     },
     /// Volumen del audio del juego en este equipo, como invitado (el anfitrión no lo oye por
     /// coroom): ganancia lineal, 1.0 lo normal y 2.0 el doble
@@ -1401,7 +1426,8 @@ impl App {
             Event::Devices(_)
             | Event::DeviceRevoked(_)
             | Event::AudioDevices(_)
-            | Event::MicLevel(_) => settings_screen::on_event(self, event),
+            | Event::MicLevel(_)
+            | Event::AudioDeviceSwitched { .. } => settings_screen::on_event(self, event),
             Event::HostStarted(_)
             | Event::Host(_)
             | Event::HostGuests(..)

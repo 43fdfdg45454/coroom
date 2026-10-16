@@ -503,6 +503,8 @@ pub enum SessionEvent {
     RelayUnavailable(String),
     /// Algo no fue bien pero la sesión sigue.
     Warning(String),
+    /// Un micrófono o una salida no funciona: la sesión sigue y espera a que se elija otro.
+    Audio(audio::AudioIssue),
     /// Invitado: quién está en la sala (el anfitrión incluido), cada vez que cambia.
     Members(Vec<RoomMember>),
     /// Invitado: el anfitrión comparte algo (`true`) o la sala es solo de voz y chat (`false`),
@@ -714,6 +716,7 @@ impl fmt::Display for SessionEvent {
                 write!(f, "Sin relay: {message}.")
             }
             SessionEvent::Warning(message) => write!(f, "Aviso: {message}"),
+            SessionEvent::Audio(issue) => write!(f, "Aviso: {issue}"),
             SessionEvent::ChatMessage(line) => write!(f, "{line}"),
             SessionEvent::ChatHistory { messages } if messages.is_empty() => {
                 f.write_str("Historial del chat: vacío.")
