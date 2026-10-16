@@ -1479,7 +1479,7 @@ fn bar_facts(state: &State) -> String {
     }
     let summary = state.stats.as_ref().map(|stats| &stats.summary);
     if let Some((_, height)) = state.feed.frame_size() {
-        let fps = summary.map_or(0.0, |summary| summary.fps);
+        let fps = summary.map_or(0.0, |summary| summary.fps_recent);
         facts.push(if fps >= 1.0 {
             format!("{height}p{:.0}", fps)
         } else {
@@ -1487,7 +1487,7 @@ fn bar_facts(state: &State) -> String {
         });
     }
     if let Some(summary) = summary {
-        facts.push(stats::kbps(summary.bitrate_kbps));
+        facts.push(stats::kbps(summary.bitrate_recent_kbps));
     }
     facts.join(" · ")
 }
@@ -2198,8 +2198,8 @@ fn connection_tab<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
             t!("room-fps-bitrate"),
             format!(
                 "{} · {}",
-                stats::number(summary.fps, 0),
-                stats::kbps(summary.bitrate_kbps)
+                stats::number(summary.fps_recent, 0),
+                stats::kbps(summary.bitrate_recent_kbps)
             ),
         ));
     } else {
@@ -2962,6 +2962,8 @@ pub(crate) mod shots {
         let mut summary = ledger.summary();
         summary.fps = 60.0;
         summary.bitrate_kbps = 18_400.0;
+        summary.fps_recent = 60.0;
+        summary.bitrate_recent_kbps = 18_400.0;
         // Lo que se ve en el boceto: 48 ms añadidos (Buena).
         summary.total.p50_us = 48_000;
         summary.link = Some(LinkSummary {

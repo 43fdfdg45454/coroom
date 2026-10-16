@@ -185,6 +185,12 @@ pub struct LatencySummary {
     pub fps: f64,
     /// Bitrate codificado real en la ventana, en kbit/s.
     pub bitrate_kbps: f64,
+    /// Fotogramas presentados en el último [`LatencyLedger::RECENT`] (por segundo): lo que se
+    /// enseña en vivo. La ventana de [`LatencySummary::fps`] llega a [`LatencyLedger::WINDOW`]
+    /// fotogramas (34 s a 120 fps, más de 2 min a 30) y tardaba eso en reflejar un cambio de fps.
+    pub fps_recent: f64,
+    /// Bitrate codificado en el último [`LatencyLedger::RECENT`], en kbit/s.
+    pub bitrate_recent_kbps: f64,
     /// Códec y backends en uso (`AV1 · SVT-AV1 → dav1d`), si se conocen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub video: Option<String>,
@@ -798,6 +804,10 @@ impl LatencyLedger {
     /// Fotogramas que se guardan; los más antiguos salen de la ventana.
     pub const WINDOW: usize = 4096;
 
+    /// Tramo de las medidas en vivo ([`LatencySummary::fps_recent`] y
+    /// [`LatencySummary::bitrate_recent_kbps`]): un segundo, lo que dice «por segundo».
+    pub const RECENT: Duration = Duration::from_secs(1);
+
     /// Crea un registro vacío.
     pub fn new() -> Self {
         Self::default()
@@ -1064,9 +1074,21 @@ impl LatencyLedger {
     /// la ventana y los contadores); ordenar y calcular percentiles se hace fuera, para no
     /// retener a los hilos de captura, decodificación y presentación que marcan etapas.
     pub fn summary(&self) -> LatencySummary {
+        let now = Instant::now();
+        let recent_from = now.checked_sub(Self::RECENT);
+        let is_recent = |at: Instant| recent_from.is_none_or(|from| at > from);
         let snapshot = {
             let inner = self.lock();
             Snapshot {
+                bitrate_recent_kbps: inner
+                    .encoded
+                    .iter()
+                    .filter(|&&(at, _)| is_recent(at))
+                    .map(|&(_, bytes)| bytes)
+                    .sum::<u64>() as f64
+                    * 8.0
+                    / Self::RECENT.as_secs_f64()
+                    / 1000.0,
                 frames: inner.frames.values().copied().collect(),
                 marks_total: inner.marks_total,
                 drops: inner.drops,
@@ -1127,6 +1149,8 @@ impl LatencyLedger {
         presented.sort_unstable();
         // n presentados cubren n - 1 intervalos.
         let fps = rate(presented.len().saturating_sub(1) as u64, &presented);
+        let fps_recent = presented.iter().filter(|&&at| is_recent(at)).count() as f64
+            / Self::RECENT.as_secs_f64();
         let bitrate_kbps = inner.bitrate_kbps;
 
         let drops: Vec<StageDrops> = Stage::ALL
@@ -1160,6 +1184,8 @@ impl LatencyLedger {
             drops,
             fps,
             bitrate_kbps,
+            fps_recent,
+            bitrate_recent_kbps: inner.bitrate_recent_kbps,
             video: inner.video.clone(),
             cpu_copies,
             cpu_copies_per_frame,
@@ -1194,6 +1220,7 @@ struct Snapshot {
     decode_errors: u64,
     video: Option<String>,
     bitrate_kbps: f64,
+    bitrate_recent_kbps: f64,
     input: Vec<u64>,
     input_stages: [Vec<u64>; 3],
     input_counts: (u64, u64),
@@ -1247,6 +1274,42 @@ mod tests {
         assert_eq!(nearest_rank(&[7], 50.0), 7);
         assert_eq!(nearest_rank(&[1, 2, 3, 4], 50.0), 2);
         assert_eq!(nearest_rank(&[], 50.0), 0);
+    }
+
+    /// Al bajar de 120 a 30 fps, la medida en vivo dice 30 ya; la de la ventana (miles de
+    /// fotogramas) sigue mezclando los dos ritmos.
+    #[test]
+    fn recent_fps_and_bitrate_follow_a_change_at_once() {
+        let ledger = LatencyLedger::new();
+        let now = Instant::now();
+        let mut id = 0u64;
+        // 120 fps desde hace 3 s hasta hace 1,05 s, a 10 kB por fotograma.
+        let mut at = now - Duration::from_secs(3);
+        while at < now - Duration::from_millis(1050) {
+            id += 1;
+            ledger.mark(id, Stage::Presented, at);
+            ledger.record_encoded_bytes_at(10_000, at);
+            at += Duration::from_micros(8_333);
+        }
+        // 30 fps en el último segundo, a 5 kB.
+        for i in 0..30u64 {
+            id += 1;
+            let at = now - Duration::from_millis(990) + Duration::from_micros(33_333 * i);
+            ledger.mark(id, Stage::Presented, at);
+            ledger.record_encoded_bytes_at(5_000, at);
+        }
+        let summary = ledger.summary();
+        assert!(
+            (summary.fps_recent - 30.0).abs() < 0.5,
+            "{}",
+            summary.fps_recent
+        );
+        assert!(
+            (summary.bitrate_recent_kbps - 1_200.0).abs() < 1.0,
+            "{}",
+            summary.bitrate_recent_kbps
+        );
+        assert!(summary.fps > 70.0, "la ventana mezcla: {}", summary.fps);
     }
 
     #[test]

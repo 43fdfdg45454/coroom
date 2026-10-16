@@ -181,6 +181,9 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- Los fps y el bitrate que ve el invitado (barra de la sala, «Conexión», diagnóstico) se medían
+  sobre los últimos 4096 fotogramas: al bajar de 120 a 30 fps seguía marcando unos 70 y bajaba
+  durante minutos. Ahora son los del último segundo; el cambio de fps ya se aplicaba al momento.
 - Los micrófonos de Windows salían todos como «Micrófono»: ahora con su nombre (el producto).
 - Cambiar la resolución con la sala abierta dejaba la imagen del invitado corrupta hasta cambiar de
   códec con algunos decodificadores por hardware: el decodificador se vuelve a abrir al cambiar el

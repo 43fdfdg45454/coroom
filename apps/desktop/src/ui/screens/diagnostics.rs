@@ -656,7 +656,7 @@ fn guest_metrics(app: &App) -> Vec<Metric> {
                 (Some(link), Some(summary)) => t!(
                     "diagnostics-bitrate-valor",
                     target = mbps(f64::from(link.target_kbps)),
-                    real = mbps(summary.bitrate_kbps)
+                    real = mbps(summary.bitrate_recent_kbps)
                 ),
                 _ => "—".to_owned(),
             },
@@ -1817,6 +1817,8 @@ pub(crate) mod shots {
         stats.summary = ledger.summary();
         stats.summary.fps = 60.0;
         stats.summary.bitrate_kbps = 18_400.0;
+        stats.summary.fps_recent = 60.0;
+        stats.summary.bitrate_recent_kbps = 18_400.0;
         stats.summary.input = input;
         stats.summary.link = link.map(|link| LinkSummary {
             path: path.to_owned(),
