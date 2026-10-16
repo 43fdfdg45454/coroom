@@ -444,15 +444,29 @@ mod tests {
         let mut sink = CaptureSink::new(1);
         sink.start(&AudioConfig::voice()).expect("arranque");
         let mut lead = Vec::new();
-        for _ in 0..10 {
+        for i in 0..10 {
+            let ready_at = sink
+                .queued_until
+                .map(|until| until - (CaptureSink::BUFFER - FRAME_DURATION));
             sink.wait_ready().expect("sitio");
             let now = Instant::now();
             let played = sink.write(&[1; 480]).expect("escritura").played_at_estimate;
             lead.push(played - now);
+            if i < 2 {
+                continue;
+            }
+            // En régimen: una trama en cola (10 ms) más la latencia del dispositivo (10 ms),
+            // menos lo que el sistema tardó en despertar el hilo después de la hora pedida (en
+            // una máquina cargada, varios ms), que no es cosa del sumidero.
+            let ready_at = ready_at.expect("ya hay cola");
+            assert!(now >= ready_at, "no vuelve antes de tiempo: {lead:?}");
+            let lateness = now - ready_at;
+            let full = FRAME_DURATION + sink.latency;
+            assert!(lead[i] <= full + Duration::from_millis(1), "{lead:?}");
+            assert!(
+                lead[i] + lateness + Duration::from_millis(1) >= full,
+                "{lead:?}, despertó {lateness:?} tarde"
+            );
         }
-        // En régimen: una trama en cola (10 ms) más la latencia del dispositivo (10 ms).
-        let last = lead[9];
-        assert!(last <= Duration::from_millis(21), "{lead:?}");
-        assert!(last >= Duration::from_millis(15), "{lead:?}");
     }
 }
