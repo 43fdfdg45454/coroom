@@ -524,13 +524,19 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Cambiado
 
-- **El codificador gasta lo que pide la imagen**, no el objetivo entero: NVENC (calidad variable
-  con techo) y SVT-AV1 (CRF con techo) fijan una calidad y el objetivo del control de tasa es solo
-  el techo de cada fotograma. Con 20 Mbit/s de techo a 1080p60, un escritorio quieto pasa de
-  ~20 Mbit/s a ~2 Mbit/s y una ráfaga de partículas sigue llegando al techo; los fotogramas más
-  grandes, más pequeños que con tasa constante. VA-API, AMF, QSV y Vulkan Video siguen con tasa
-  constante (con VBR se pasaban del techo). `cargo test --release -p coroom-codec --test
-  rate_modes -- --ignored --nocapture` repite la comparación.
+- **El codificador gasta lo que pide la imagen**, no el objetivo entero, en todos los backends: el
+  objetivo del control de tasa es solo el techo de cada fotograma. NVENC va en VBR con suelo de
+  QP; SVT-AV1, Vulkan Video (AV1 y H.264), AMF y QSV (H.264 y HEVC), en CBR con suelo de QP y sin
+  relleno (`filler_data=0` en AMF, sin conformidad HRD en QSV); QSV AV1, que no admite suelo, en
+  VBR; VA-API en QVBR y Vulkan Video HEVC en VBR, porque hay controladores que en CBR no hacen caso
+  del suelo. Con 20 Mbit/s de techo a 1080p60, un escritorio quieto pasa de ~20 Mbit/s a
+  ~1,4–2 Mbit/s con AV1 por hardware (NVENC y Vulkan Video) y a ~0,8 con VA-API, y una ráfaga de
+  partículas sigue llegando al techo sin pasarlo. Si un controlador se pasa del techo (en un
+  segundo o en más de un 10 % de sus fotogramas), se le baja el objetivo en proporción hasta que
+  caben, y lo recupera en pasos de 1,25× cada 2 s; en VA-API y Vulkan HEVC el recorte va en el
+  mismo fotograma que se pasa (y en QVBR también sube la calidad). Nunca vuelve a tasa
+  constante. `cargo test --release -p coroom-codec --test rate_modes -- --ignored --nocapture`
+  repite la comparación (`RATE_ONLY=VulkanVideo` para uno solo).
 - **El control de tasa se asienta al conectar**: la sonda sale en escalera y, contra un
   limitador, fija el techo de ráfaga desde el primer segundo (aunque el vídeo ya esté saliendo);
   sin pérdida el techo no se mueve (sin diente de sierra), lo suben sondas cortas solo cuando

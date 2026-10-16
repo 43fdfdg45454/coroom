@@ -7,7 +7,7 @@
 //! PSNR de la luma decodificada frente a la original.
 //!
 //! `cargo test --release -p coroom-codec --test rate_modes -- --ignored --nocapture`
-//! (`RATE_CAP_KBPS` cambia el techo; por defecto 20 000).
+//! (`RATE_CAP_KBPS` cambia el techo, por defecto 20 000; `RATE_ONLY=Vaapi` mide solo esos).
 
 #![cfg(feature = "ffmpeg")]
 
@@ -122,7 +122,12 @@ struct Phase {
     measured: u32,
 }
 
-fn run(codec: Codec, backend: Backend, mode: RateMode, cap: u32) -> Result<[Phase; 4], String> {
+fn run(
+    codec: Codec,
+    backend: Backend,
+    mode: RateMode,
+    cap: u32,
+) -> Result<([Phase; 4], String), String> {
     let mut encoder = FfmpegEncoder::new(codec, backend).map_err(|err| err.to_string())?;
     encoder.set_rate_mode(mode);
     encoder
@@ -153,8 +158,9 @@ fn run(codec: Codec, backend: Backend, mode: RateMode, cap: u32) -> Result<[Phas
         if slices.is_empty() {
             continue;
         }
-        // PSNR de uno de cada diez (la decodificación por software a 1080p es lenta).
-        let decoded = decoder.decode(&slices).map_err(|err| err.to_string())?;
+        // PSNR de uno de cada diez (la decodificación por software a 1080p es lenta). Si el
+        // decodificador no puede con el flujo, se mide solo lo que gasta.
+        let decoded = decoder.decode(&slices).ok().flatten();
         if frame_id % 10 == 5
             && let Some(decoded) = decoded
         {
@@ -164,7 +170,11 @@ fn run(codec: Codec, backend: Backend, mode: RateMode, cap: u32) -> Result<[Phas
             phase.measured += 1;
         }
     }
-    Ok(phases)
+    let opened = encoder
+        .rate_control_info()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    Ok((phases, opened))
 }
 
 #[test]
@@ -183,12 +193,24 @@ fn constant_rate_against_capped_quality() {
         (Codec::Hevc, Backend::Nvenc),
         (Codec::H264, Backend::Nvenc),
         (Codec::Av1, Backend::Software),
+        (Codec::Av1, Backend::VulkanVideo),
+        (Codec::Hevc, Backend::VulkanVideo),
+        (Codec::H264, Backend::VulkanVideo),
+        (Codec::Av1, Backend::Vaapi),
         (Codec::Hevc, Backend::Vaapi),
         (Codec::H264, Backend::Vaapi),
+        (Codec::Av1, Backend::Amf),
+        (Codec::Av1, Backend::Qsv),
     ] {
+        // `RATE_ONLY=VulkanVideo` (o `Hevc/Vaapi`) mide solo esos.
+        if std::env::var("RATE_ONLY")
+            .is_ok_and(|only| !format!("{codec:?}/{backend:?}").contains(&only))
+        {
+            continue;
+        }
         for mode in [RateMode::Constant, RateMode::Capped] {
             match run(codec, backend, mode, cap) {
-                Ok(phases) => {
+                Ok((phases, opened)) => {
                     let line: Vec<String> = phases
                         .iter()
                         .zip(PHASES)
@@ -203,7 +225,7 @@ fn constant_rate_against_capped_quality() {
                         .collect();
                     let total: u64 = phases.iter().map(|phase| phase.bytes).sum();
                     println!(
-                        "{codec:?}/{backend:?} {mode:?}: {} | media {:.0} kbit/s",
+                        "{codec:?}/{backend:?} {mode:?}: {} | media {:.0} kbit/s | {opened}",
                         line.join(" | "),
                         total as f64 * 8.0 / 1000.0 / (seconds * 4.0)
                     );

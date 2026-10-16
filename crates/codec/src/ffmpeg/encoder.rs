@@ -95,8 +95,9 @@ pub const SVT_MIN_VBV_MS: u64 = 20;
 /// fuente; el test `low_latency_options_exist` lo vuelve a mirar con `av_opt_find`.
 ///
 /// Así salen en tasa constante ([`RateMode::Constant`]); con techo ([`RateMode::Capped`], lo
-/// normal, [`low_latency_options_with`]), NVENC va en VBR y SVT-AV1 en CBR de tiempo real, los dos
-/// con el mismo techo y búfer y un suelo de QP ([`min_qp`]).
+/// normal, [`low_latency_options_with`]), cada uno gasta lo que pide la imagen con el objetivo de
+/// techo: VBR o CBR con suelo de QP ([`min_qp`]) y sin relleno, según el backend
+/// ([`supports_capped`]).
 ///
 /// Comunes: CBR (`b` = `maxrate`) con un búfer VBV de **un fotograma** ([`vbv_buffer_bits`]: así
 /// ningún fotograma, intra incluido, pesa mucho más que lo que el enlace pasa en un intervalo; con
@@ -136,6 +137,7 @@ pub fn low_latency_options(
 pub fn min_qp(codec: Codec, backend: Backend) -> u32 {
     match (codec, backend) {
         (Codec::Av1, Backend::Software) => CAPPED_MIN_QP_AV1_SVT,
+        (Codec::Av1, Backend::VulkanVideo | Backend::Vaapi) => CAPPED_MIN_QP_AV1_GENERIC,
         (Codec::Av1, _) => CAPPED_MIN_QP_AV1,
         _ => CAPPED_MIN_QP,
     }
@@ -152,17 +154,87 @@ pub const CAPPED_MIN_QP: u32 = 20;
 /// Suelo de `qindex` de AV1 por hardware ([`min_qp`]).
 pub const CAPPED_MIN_QP_AV1: u32 = 80;
 
+/// Suelo de `qindex` de AV1 en Vulkan Video y VA-API ([`min_qp`]), que lo toman del `qmin`
+/// genérico de FFmpeg, que no pasa de 69.
+pub const CAPPED_MIN_QP_AV1_GENERIC: u32 = 60;
+
 /// Suelo de QP de SVT-AV1 ([`min_qp`]).
 pub const CAPPED_MIN_QP_AV1_SVT: u32 = 14;
 
-/// Si `backend` tiene [`RateMode::Capped`] en esta implementación: NVENC (VBR con `b` =
-/// `maxrate` y suelo de QP) y SVT-AV1 (CBR de tiempo real con `min-qp`), que respetan el techo y
-/// el búfer de un fotograma. VA-API no: en CBR rellena hasta el objetivo y en VBR se pasa del
-/// techo en los picos (fotogramas de 780 KB con un techo de 20 Mbit/s). AMF, QSV y Vulkan Video
-/// siguen en tasa constante hasta medirlos en su hardware.
+/// Si `backend` tiene [`RateMode::Capped`]: todos. Cómo (opciones comprobadas en el código de
+/// FFmpeg 8.1):
+///
+/// - **NVENC**: VBR con `b` = `maxrate` (el objetivo) y suelo de QP ([`min_qp`]).
+/// - **SVT-AV1**: CBR de tiempo real con `min-qp`.
+/// - **AMF**: CBR sin relleno (`filler_data=0`) y con suelo de QP (`qmin` en H.264, `min_qp_i` y
+///   `min_qp_p` en HEVC y AV1).
+/// - **Vulkan Video**: CBR con suelo de QP (`qmin`, que pasa a `minQp`/`minQIndex`) en AV1 y H.264
+///   (Vulkan no tiene relleno); en HEVC, VBR con la media a la mitad del techo y el control por
+///   fotograma ([`per_frame_ceiling`]).
+/// - **VA-API**: QVBR ([`CAPPED_QUALITY`]) con el objetivo de techo y `max_frame_size`, y el
+///   control por fotograma, que también sube la calidad ([`qvbr_quality`]).
+/// - **QSV**: en H.264 y HEVC, CBR sin relleno (`strict=-1` quita la conformidad HRD de NAL) y con
+///   suelo de QP (`min_qp_i`, `min_qp_p`); en AV1, que no pasa el suelo al runtime, VBR con la
+///   media a la mitad del techo.
+///
+/// Si un controlador no respeta el techo, [`FfmpegEncoder`] le baja el objetivo hasta que los
+/// fotogramas caben (ver [`CEILING_TOLERANCE`]); nunca vuelve a tasa constante por eso. Solo si no
+/// abre con estas opciones abre sin suelo.
 pub fn supports_capped(backend: Backend) -> bool {
-    matches!(backend, Backend::Nvenc | Backend::Software)
+    let _ = backend;
+    true
 }
+
+/// Si el control del techo de `codec` con `backend` reacciona en cada fotograma (y no solo al
+/// cerrar cada segundo): en los modos en que el controlador puede no respetar `maxrate` (QVBR de
+/// VA-API, VBR de HEVC en Vulkan Video), un fotograma que no es intra y se pasa del presupuesto de
+/// un intervalo baja el objetivo antes del siguiente.
+pub fn per_frame_ceiling(codec: Codec, backend: Backend) -> bool {
+    matches!(
+        (backend, codec),
+        (Backend::Vaapi, _) | (Backend::VulkanVideo, Codec::Hevc)
+    )
+}
+
+/// Calidad de QVBR de VA-API con techo, de 1 (la mejor) a 51, como el suelo de QP de H.264 y HEVC
+/// ([`CAPPED_MIN_QP`]). Sube con el recorte del control por fotograma ([`qvbr_quality`]).
+pub const CAPPED_QUALITY: u32 = 20;
+
+/// Calidad de QVBR con el objetivo recortado a `trim` del pedido: seis puntos más (la mitad de
+/// bits en H.264 y HEVC) por cada vez que se reduce a la mitad, hasta 51. En QVBR el controlador
+/// manda por la calidad, y bajar solo `maxrate` no basta si no la respeta.
+pub fn qvbr_quality(trim: f64) -> u32 {
+    let halvings = (1.0 / trim.clamp(MIN_CEILING_TRIM, 1.0)).log2();
+    (f64::from(CAPPED_QUALITY) + 6.0 * halvings)
+        .round()
+        .min(51.0) as u32
+}
+
+/// Fotogramas que espera el control por fotograma tras un recorte antes de volver a mirar (el
+/// primero tras reabrir sale intra y el controlador tarda uno más en asentarse).
+pub const PER_FRAME_SETTLE: u32 = 2;
+
+/// Veces el presupuesto que puede gastar un codificador con techo ([`RateMode::Capped`]) antes de
+/// contar como que no lo respeta: en un segundo, más que esto por el objetivo; o más de
+/// [`LATE_FRAME_SHARE`] de sus fotogramas (sin contar los intra) por encima de esto por lo que le
+/// toca a un intervalo. Entonces el objetivo que se le pasa baja (como mucho a
+/// [`MIN_CEILING_TRIM`] del pedido) hasta que caben.
+pub const CEILING_TOLERANCE: f64 = 1.1;
+
+/// Fracción de fotogramas de un segundo que pueden pasarse del presupuesto de un intervalo.
+pub const LATE_FRAME_SHARE: f64 = 0.1;
+
+/// Lo más que se baja el objetivo que se le pasa a un codificador que no respeta el techo, por el
+/// pedido.
+pub const MIN_CEILING_TRIM: f64 = 0.25;
+
+/// Segundos seguidos en que los fotogramas caben con holgura antes de devolver parte del objetivo
+/// recortado ([`CEILING_RECOVER_STEP`]).
+pub const CEILING_RECOVER_SECONDS: u32 = 2;
+
+/// Lo que se multiplica el objetivo recortado al devolverlo: del mínimo ([`MIN_CEILING_TRIM`]) al
+/// pedido en seis pasos (12 s).
+pub const CEILING_RECOVER_STEP: f64 = 1.25;
 
 /// [`low_latency_options`] con el modo de tasa `mode` (donde el backend lo tiene,
 /// [`supports_capped`]; si no, tasa constante).
@@ -249,6 +321,22 @@ pub fn low_latency_options_with(
         Backend::Amf => {
             set("usage", "ultralowlatency".into());
             set("rc", "cbr".into());
+            if capped {
+                // CBR sin relleno y con suelo de QP: con la imagen quieta el suelo frena antes del
+                // objetivo y no se rellena hasta él.
+                let (min, max) = (min_qp(codec, backend), max_qp(codec));
+                set("filler_data", "0".into());
+                if codec == Codec::H264 {
+                    // `h264_amf` toma el suelo de las genéricas.
+                    set("qmin", min.to_string());
+                    set("qmax", max.to_string());
+                } else {
+                    set("min_qp_i", min.to_string());
+                    set("min_qp_p", min.to_string());
+                    set("max_qp_i", max.to_string());
+                    set("max_qp_p", max.to_string());
+                }
+            }
             set(
                 "latency",
                 if codec == Codec::Av1 {
@@ -271,6 +359,20 @@ pub fn low_latency_options_with(
             set("async_depth", "1".into());
             set("low_delay_brc", "1".into());
             set("forced_idr", "1".into());
+            if capped {
+                if codec == Codec::Av1 {
+                    // `av1_qsv` no pasa el suelo de QP al runtime (solo H.264 y HEVC leen `qmin`
+                    // y `min_qp_*`): VBR con la media a la mitad del techo.
+                    set("b", (bitrate / 2).to_string());
+                } else {
+                    // CBR sin relleno (sin conformidad HRD de NAL, `strict` < normal) y con
+                    // suelo de QP.
+                    let min = min_qp(codec, backend).to_string();
+                    set("strict", "-1".into());
+                    set("min_qp_i", min.clone());
+                    set("min_qp_p", min);
+                }
+            }
             if codec != Codec::Av1 {
                 set("scenario", "remotegaming".into());
                 set("int_ref_type", "vertical".into());
@@ -278,11 +380,40 @@ pub fn low_latency_options_with(
             }
         }
         Backend::Vaapi => {
-            set("rc_mode", "CBR".into());
+            if capped {
+                // QVBR: calidad fija ([`CAPPED_QUALITY`], que sube con el recorte del control
+                // por fotograma) con el objetivo de techo. En CBR hay controladores que no hacen
+                // caso del suelo de QP (`min_qp`) y rellenan hasta el objetivo; en QVBR algunos no
+                // hacen caso de `maxrate` en los picos, y por eso el control por fotograma
+                // ([`per_frame_ceiling`]).
+                set("rc_mode", "QVBR".into());
+                set("global_quality", CAPPED_QUALITY.to_string());
+                set(
+                    "max_frame_size",
+                    vbv_buffer_bits(config.bitrate_kbps, fps, backend)
+                        .div_ceil(8)
+                        .to_string(),
+                );
+            } else {
+                set("rc_mode", "CBR".into());
+            }
             set("async_depth", "1".into());
         }
         Backend::VulkanVideo => {
             set("rc_mode", "cbr".into());
+            if capped && codec == Codec::Hevc {
+                // Hay controladores que no hacen caso del suelo de QP en HEVC (gastan lo mismo
+                // que en CBR): VBR con la media a la mitad del techo y el control por fotograma.
+                set("rc_mode", "vbr".into());
+                set("b", (bitrate / 2).to_string());
+            } else if capped {
+                // `minQp` (`minQIndex` en AV1) del control de tasa de Vulkan sale de `qmin`; en
+                // AV1, `qmax` se queda en el del codificador (255).
+                set("qmin", min_qp(codec, backend).to_string());
+                if codec != Codec::Av1 {
+                    set("qmax", max_qp(codec).to_string());
+                }
+            }
             set("tune", "ull".into());
             set("usage", "stream".into());
             set("content", "rendered".into());
@@ -346,6 +477,39 @@ pub fn software_format(backend: Backend, format: VideoFormat) -> ffi::AVPixelFor
 /// `MFXVideoENCODE_Reset`. SVT-AV1, AMF, VA-API y Vulkan de FFmpeg 8.1 solo lo leen al abrir.
 pub fn supports_live_bitrate(backend: Backend) -> bool {
     matches!(backend, Backend::Nvenc | Backend::Qsv)
+}
+
+/// Recorte del objetivo tras un segundo medido (`window`, con `budget` bytes por intervalo al
+/// objetivo pedido): `(recorte, segundos seguidos que caben)`. Si gastó más de
+/// [`CEILING_TOLERANCE`] veces lo que le tocaba o se pasaron más de [`LATE_FRAME_SHARE`] de sus
+/// fotogramas, baja en proporción (al menos un 10 %, hasta [`MIN_CEILING_TRIM`]); si cupo con
+/// holgura [`CEILING_RECOVER_SECONDS`] seguidos, sube [`CEILING_RECOVER_STEP`] (hasta 1).
+fn next_trim(trim: f64, fits: u32, window: &CeilingWindow, budget: f64) -> (f64, u32) {
+    let allowed = budget * f64::from(window.frames.max(1));
+    let spent = window.bytes as f64;
+    let late = f64::from(window.late) > LATE_FRAME_SHARE * f64::from(window.frames);
+    if spent > allowed * CEILING_TOLERANCE || late {
+        let over = (spent / allowed).max(1.0 / 0.9);
+        ((trim / over).max(MIN_CEILING_TRIM), 0)
+    } else if window.late == 0 && spent < allowed * 0.9 {
+        if fits + 1 >= CEILING_RECOVER_SECONDS {
+            ((trim * CEILING_RECOVER_STEP).min(1.0), 0)
+        } else {
+            (trim, fits + 1)
+        }
+    } else {
+        (trim, 0)
+    }
+}
+
+/// Lo que lleva medido el segundo en curso de [`FfmpegEncoder::watch_ceiling`].
+#[derive(Debug, Default, Clone, Copy)]
+struct CeilingWindow {
+    bytes: u64,
+    frames: u32,
+    /// Fotogramas (no intra) por encima del presupuesto de un intervalo.
+    late: u32,
+    largest: usize,
 }
 
 /// Cómo se evita el IDR grande en estado estable con cada backend.
@@ -477,6 +641,20 @@ pub struct FfmpegEncoder {
     importer: Option<GpuImporter>,
     /// Modo de tasa ([`FfmpegEncoder::set_rate_mode`]).
     rate_mode: RateMode,
+    /// El controlador no abrió con techo: sigue en tasa constante.
+    capped_refused: bool,
+    /// El segundo en curso ([`FfmpegEncoder::watch_ceiling`]).
+    ceiling_window: CeilingWindow,
+    /// Lo que se le pasa al codificador por el objetivo pedido (baja si no respeta el techo).
+    ceiling_trim: f64,
+    /// Segundos seguidos en que los fotogramas caben con holgura.
+    ceiling_fits: u32,
+    /// Objetivo pedido (sin recortar), en kbit/s.
+    requested_kbps: Option<u32>,
+    /// Objetivo recortado pendiente de aplicar antes del siguiente fotograma.
+    ceiling_pending: Option<u32>,
+    /// Fotogramas que faltan para que el control por fotograma vuelva a mirar.
+    ceiling_settle: u32,
     /// La importación sin copias falló una vez: se usa el modo de respaldo.
     zero_copy_failed: bool,
     /// Por qué no se usa la ruta sin copias, si no se usa.
@@ -501,11 +679,15 @@ impl FfmpegEncoder {
     /// no tiene [`RateMode::Capped`], sigue en tasa constante).
     pub fn set_rate_mode(&mut self, mode: RateMode) {
         self.rate_mode = mode;
+        self.capped_refused = false;
+        self.ceiling_trim = 1.0;
+        self.ceiling_fits = 0;
+        self.ceiling_window = CeilingWindow::default();
     }
 
     /// Si codifica con calidad fija y techo.
     fn capped(&self) -> bool {
-        self.rate_mode == RateMode::Capped && supports_capped(self.backend)
+        self.rate_mode == RateMode::Capped && supports_capped(self.backend) && !self.capped_refused
     }
 
     /// Prepara el codificador de `codec` con `backend` (crea el dispositivo de GPU si hace falta).
@@ -538,6 +720,13 @@ impl FfmpegEncoder {
             last_hw: None,
             importer: None,
             rate_mode: RateMode::default(),
+            capped_refused: false,
+            ceiling_window: CeilingWindow::default(),
+            ceiling_trim: 1.0,
+            ceiling_fits: 0,
+            requested_kbps: None,
+            ceiling_pending: None,
+            ceiling_settle: 0,
             zero_copy_failed: false,
             gpu_note: None,
             copies: 0,
@@ -577,11 +766,35 @@ impl FfmpegEncoder {
         self.open_with(config, None)
     }
 
-    /// Abre el codificador; con `imported`, sobre los *hw frames* de la importación.
+    /// Abre el codificador; con `imported`, sobre los *hw frames* de la importación. Con techo
+    /// ([`RateMode::Capped`]), si el controlador no admite ese modo de tasa, vuelve a abrir en
+    /// tasa constante y no lo intenta más.
     fn open_with(
         &mut self,
         config: &EncoderConfig,
         imported: Option<AVHWFramesContext>,
+    ) -> Result<Session, CodecError> {
+        if self.capped() {
+            match self.open_mode(config, imported.clone(), RateMode::Capped) {
+                Ok(session) => return Ok(session),
+                Err(err) => {
+                    super::log_warning(&format!(
+                        "{} no abre con techo ({err}); sigue en tasa constante",
+                        self.av_codec.name().to_string_lossy()
+                    ));
+                    self.capped_refused = true;
+                }
+            }
+        }
+        self.open_mode(config, imported, RateMode::Constant)
+    }
+
+    /// Abre el codificador con el modo de tasa `mode`.
+    fn open_mode(
+        &mut self,
+        config: &EncoderConfig,
+        imported: Option<AVHWFramesContext>,
+        mode: RateMode,
     ) -> Result<Session, CodecError> {
         let fail = |what: &str, err: &RsmpegError| backend_error(what, err);
         let mut ctx = AVCodecContext::new(&self.av_codec);
@@ -632,7 +845,13 @@ impl FfmpegEncoder {
             (None, _, None) => ctx.set_pix_fmt(sw_format),
         }
 
-        let options = low_latency_options_with(self.codec, self.backend, config, self.rate_mode);
+        let mut options = low_latency_options_with(self.codec, self.backend, config, mode);
+        if mode == RateMode::Capped && self.backend == Backend::Vaapi {
+            let quality = qvbr_quality(self.ceiling_trim).to_string();
+            if let Some(entry) = options.iter_mut().find(|(key, _)| *key == "global_quality") {
+                entry.1 = quality;
+            }
+        }
         self.unused_options = super::open_codec(&mut ctx, &options).map_err(|err| {
             CodecError::Unsupported(format!(
                 "{} no abre {}×{} a {} fps: {}",
@@ -644,7 +863,9 @@ impl FfmpegEncoder {
             ))
         })?;
         let rate_control = read_rate_control(&ctx, &options, &self.unused_options);
-        if rate_control.bit_rate <= 0 {
+        // QSV con techo va en ICQ, sin bitrate.
+        if rate_control.bit_rate <= 0 && !(mode == RateMode::Capped && self.backend == Backend::Qsv)
+        {
             super::log_warning(&format!(
                 "{} abrió sin bitrate ({rate_control}); opciones no reconocidas: {:?}",
                 self.av_codec.name().to_string_lossy(),
@@ -1186,50 +1407,26 @@ impl Encoder for FfmpegEncoder {
         self.session = Some(session);
         self.config = Some(*config);
         self.reopened = 0;
+        self.requested_kbps = Some(config.bitrate_kbps);
+        self.ceiling_trim = 1.0;
+        self.ceiling_fits = 0;
+        self.ceiling_window = CeilingWindow::default();
+        self.ceiling_pending = None;
+        self.ceiling_settle = 0;
         Ok(())
     }
 
     /// Cambia el bitrate en caliente donde el backend lo admite ([`supports_live_bitrate`]);
     /// donde no, reabre el codificador y el siguiente fotograma sale intra.
     fn set_bitrate(&mut self, bitrate_kbps: u32) -> Result<(), CodecError> {
-        let Some(mut config) = self.config else {
-            return Err(CodecError::Unsupported(
-                "el codificador no está configurado".into(),
-            ));
-        };
         if bitrate_kbps == 0 {
             return Err(CodecError::Unsupported(
                 "el bitrate debe ser mayor que cero".into(),
             ));
         }
-        if config.bitrate_kbps == bitrate_kbps {
-            return Ok(());
-        }
-        config.bitrate_kbps = bitrate_kbps;
-        let capped = self.capped();
-        if supports_live_bitrate(self.backend)
-            && let Some(session) = self.session.as_mut()
-        {
-            let bitrate = i64::from(bitrate_kbps) * 1000;
-            let vbv = i32::try_from(vbv_buffer_bits(bitrate_kbps, config.fps, self.backend))
-                .unwrap_or(i32::MAX);
-            // Con calidad fija (`b = 0`) el objetivo es solo el techo.
-            if !capped {
-                session.ctx.set_bit_rate(bitrate);
-            }
-            // SAFETY: `as_mut_ptr` apunta al `AVCodecContext` abierto que posee `session.ctx`;
-            // `rc_max_rate` y `rc_buffer_size` son enteros que el codificador lee al
-            // reconfigurarse en el siguiente `avcodec_send_frame`, y nadie más usa el contexto
-            // ahora (`&mut self`). El VBV sigue al bitrate: un fotograma al objetivo nuevo.
-            unsafe {
-                let ctx = session.ctx.as_mut_ptr();
-                (*ctx).rc_max_rate = bitrate;
-                (*ctx).rc_buffer_size = vbv;
-            }
-            self.config = Some(config);
-            return Ok(());
-        }
-        self.reopen(config)
+        self.requested_kbps = Some(bitrate_kbps);
+        let trimmed = ((f64::from(bitrate_kbps) * self.ceiling_trim).round() as u32).max(1);
+        self.apply_bitrate(trimmed)
     }
 
     fn live_bitrate(&self) -> bool {
@@ -1265,10 +1462,16 @@ impl Encoder for FfmpegEncoder {
     }
 
     fn encode(&mut self, frame: &RawFrame) -> Result<Vec<EncodedSlice>, CodecError> {
-        match self.submit(frame)? {
-            Some(submitted) => self.finish_frame(submitted),
-            None => Ok(Vec::new()),
+        self.apply_ceiling_trim()?;
+        let slices = match self.submit(frame)? {
+            Some(submitted) => self.finish_frame(submitted)?,
+            None => Vec::new(),
+        };
+        if !slices.is_empty() {
+            let keyframe = slices.iter().any(|slice| slice.keyframe);
+            self.watch_ceiling(slices.iter().map(|slice| slice.data.len()).sum(), keyframe);
         }
+        Ok(slices)
     }
 
     fn encode_into(
@@ -1276,13 +1479,18 @@ impl Encoder for FfmpegEncoder {
         frame: &RawFrame,
         out: &mut Vec<u8>,
     ) -> Result<Option<EncodedFrame>, CodecError> {
-        match self.submit(frame)? {
-            Some(submitted) => self.finish_frame_into(submitted, out),
+        self.apply_ceiling_trim()?;
+        let encoded = match self.submit(frame)? {
+            Some(submitted) => self.finish_frame_into(submitted, out)?,
             None => {
                 out.clear();
-                Ok(None)
+                None
             }
+        };
+        if let Some(encoded) = &encoded {
+            self.watch_ceiling(out.len(), encoded.keyframe);
         }
+        Ok(encoded)
     }
 
     fn gpu_input(&self) -> GpuInput {
@@ -1597,6 +1805,125 @@ impl FfmpegEncoder {
     }
 
     /// Anota el fotograma en vuelo y recoge lo que haya salido, en slices.
+    /// Pasa `bitrate_kbps` al codificador: en marcha si el backend lo admite
+    /// ([`supports_live_bitrate`]); si no, reabriéndolo.
+    fn apply_bitrate(&mut self, bitrate_kbps: u32) -> Result<(), CodecError> {
+        let Some(mut config) = self.config else {
+            return Err(CodecError::Unsupported(
+                "el codificador no está configurado".into(),
+            ));
+        };
+        if bitrate_kbps == 0 {
+            return Err(CodecError::Unsupported(
+                "el bitrate debe ser mayor que cero".into(),
+            ));
+        }
+        if config.bitrate_kbps == bitrate_kbps {
+            return Ok(());
+        }
+        config.bitrate_kbps = bitrate_kbps;
+        if supports_live_bitrate(self.backend)
+            && let Some(session) = self.session.as_mut()
+        {
+            let bitrate = i64::from(bitrate_kbps) * 1000;
+            let vbv = i32::try_from(vbv_buffer_bits(bitrate_kbps, config.fps, self.backend))
+                .unwrap_or(i32::MAX);
+            session.ctx.set_bit_rate(bitrate);
+            // SAFETY: `as_mut_ptr` apunta al `AVCodecContext` abierto que posee `session.ctx`;
+            // `rc_max_rate` y `rc_buffer_size` son enteros que el codificador lee al
+            // reconfigurarse en el siguiente `avcodec_send_frame`, y nadie más usa el contexto
+            // ahora (`&mut self`). El VBV sigue al bitrate: un fotograma al objetivo nuevo.
+            unsafe {
+                let ctx = session.ctx.as_mut_ptr();
+                (*ctx).rc_max_rate = bitrate;
+                (*ctx).rc_buffer_size = vbv;
+            }
+            self.config = Some(config);
+            return Ok(());
+        }
+        self.reopen(config)
+    }
+
+    /// Con techo, mira que el codificador lo respete (ver [`CEILING_TOLERANCE`]): si en un segundo
+    /// gasta de más o se pasan demasiados fotogramas del presupuesto de un intervalo, le baja el
+    /// objetivo en proporción; si caben con holgura [`CEILING_RECOVER_SECONDS`] seguidos, se lo
+    /// devuelve en pasos ([`CEILING_RECOVER_STEP`]). En [`per_frame_ceiling`], el recorte va en el
+    /// mismo fotograma que se pasa.
+    fn watch_ceiling(&mut self, bytes: usize, keyframe: bool) {
+        let Some(config) = self.config.filter(|_| self.capped()) else {
+            return;
+        };
+        let requested = self.requested_kbps.unwrap_or(config.bitrate_kbps);
+        let fps = config.fps.max(1);
+        // Lo que le toca a un intervalo al objetivo pedido (el techo del enlace).
+        let budget = f64::from(requested) * 1000.0 / 8.0 / f64::from(fps);
+        if per_frame_ceiling(self.codec, self.backend) {
+            self.ceiling_settle = self.ceiling_settle.saturating_sub(1);
+            if !keyframe && self.ceiling_settle == 0 && bytes as f64 > budget * CEILING_TOLERANCE {
+                // En el mismo fotograma: en proporción a lo que se pasó (al menos un 10 %).
+                let over = (bytes as f64 / budget).max(1.0 / 0.9);
+                let trim = (self.ceiling_trim / over).max(MIN_CEILING_TRIM);
+                if trim < self.ceiling_trim {
+                    self.ceiling_trim = trim;
+                    self.ceiling_fits = 0;
+                    self.ceiling_settle = PER_FRAME_SETTLE + 1;
+                    self.ceiling_pending =
+                        Some(((f64::from(requested) * trim).round() as u32).max(1));
+                }
+            }
+        }
+        let window = &mut self.ceiling_window;
+        window.bytes += bytes as u64;
+        window.frames += 1;
+        window.largest = window.largest.max(bytes);
+        if !keyframe && bytes as f64 > budget * CEILING_TOLERANCE {
+            window.late += 1;
+        }
+        if window.frames < fps {
+            return;
+        }
+        let window = std::mem::take(&mut self.ceiling_window);
+        let spent = window.bytes as f64;
+        let before = self.ceiling_trim;
+        let (trim, fits) = next_trim(self.ceiling_trim, self.ceiling_fits, &window, budget);
+        // Con control por fotograma, los recortes ya los hizo él; del segundo queda la vuelta.
+        if trim >= before || !per_frame_ceiling(self.codec, self.backend) {
+            (self.ceiling_trim, self.ceiling_fits) = (trim, fits);
+        }
+        if (self.ceiling_trim - before).abs() > f64::EPSILON {
+            let trimmed = ((f64::from(requested) * self.ceiling_trim).round() as u32).max(1);
+            if self.ceiling_trim < before {
+                super::log_warning(&format!(
+                    "{} se pasa del techo de {requested} kbit/s ({:.0} kbit/s, fotograma mayor {} KB); \
+                     se le pide {trimmed}",
+                    self.av_codec.name().to_string_lossy(),
+                    spent * 8.0 / 1000.0 * f64::from(fps) / f64::from(window.frames),
+                    window.largest / 1000
+                ));
+            }
+            self.ceiling_pending = Some(trimmed);
+        }
+    }
+
+    /// Aplica el objetivo recortado por [`FfmpegEncoder::watch_ceiling`] antes del siguiente
+    /// fotograma.
+    fn apply_ceiling_trim(&mut self) -> Result<(), CodecError> {
+        match self.ceiling_pending.take() {
+            Some(kbps) => self.apply_bitrate(kbps),
+            None => Ok(()),
+        }
+    }
+
+    /// Objetivo pedido (el techo), sin el recorte de [`FfmpegEncoder::watch_ceiling`].
+    pub fn requested_kbps(&self) -> Option<u32> {
+        self.requested_kbps
+    }
+
+    /// Lo que se le pasa al codificador por el objetivo pedido (1 si respeta el techo).
+    pub fn ceiling_trim(&self) -> f64 {
+        self.ceiling_trim
+    }
+
     fn finish_frame(&mut self, submitted: Submitted) -> Result<Vec<EncodedSlice>, CodecError> {
         let (pts, wait) = self.track(submitted);
         self.drain(pts, wait)
@@ -1679,12 +2006,14 @@ mod tests {
                 else {
                     continue;
                 };
-                for (key, _) in low_latency_options(codec, backend, &config(codec)) {
-                    assert!(
-                        option_exists(&av_codec, key),
-                        "{} no tiene la opción `{key}`",
-                        av_codec.name().to_string_lossy()
-                    );
+                for mode in [RateMode::Constant, RateMode::Capped] {
+                    for (key, _) in low_latency_options_with(codec, backend, &config(codec), mode) {
+                        assert!(
+                            option_exists(&av_codec, key),
+                            "{} no tiene la opción `{key}` ({mode:?})",
+                            av_codec.name().to_string_lossy()
+                        );
+                    }
                 }
                 checked.push(av_codec.name().to_string_lossy().into_owned());
             }
@@ -1694,6 +2023,102 @@ mod tests {
             checked.iter().any(|name| name == "libsvtav1"),
             "{checked:?}"
         );
+    }
+
+    /// Por defecto ningún codificador por hardware va en tasa constante pura: en CBR llevan suelo
+    /// de QP (con la imagen quieta frena antes del objetivo) y sin relleno donde FFmpeg 8.1 deja
+    /// quitarlo (AMF, QSV); si no, VBR.
+    #[test]
+    fn no_hardware_encoder_spends_a_constant_rate_by_default() {
+        for codec in Codec::PREFERENCE {
+            for backend in Backend::ALL {
+                if backend == Backend::Software {
+                    continue;
+                }
+                let options =
+                    low_latency_options_with(codec, backend, &config(codec), RateMode::default());
+                let value = |key: &str| {
+                    options
+                        .iter()
+                        .find(|(k, _)| *k == key)
+                        .map(|(_, v)| v.to_ascii_lowercase())
+                };
+                let mode = value("rc").or_else(|| value("rc_mode"));
+                let floor = ["qmin", "min_qp_i", "min_qp_p"]
+                    .iter()
+                    .any(|key| value(key).is_some());
+                let variable = match backend {
+                    // QSV elige VBR cuando `maxrate` pasa de `b`.
+                    Backend::Qsv => value("b") != value("maxrate"),
+                    _ => matches!(mode.as_deref(), Some("vbr" | "qvbr")),
+                };
+                assert!(
+                    variable || floor,
+                    "{codec:?}/{backend:?} en tasa constante sin suelo: {options:?}"
+                );
+                if mode.as_deref() == Some("cbr") || backend == Backend::Qsv && !variable {
+                    let no_filler = match backend {
+                        Backend::Amf => value("filler_data").as_deref() == Some("0"),
+                        Backend::Qsv => value("strict").as_deref() == Some("-1"),
+                        _ => true,
+                    };
+                    assert!(no_filler, "{codec:?}/{backend:?} con relleno: {options:?}");
+                }
+            }
+        }
+    }
+
+    /// La calidad de QVBR sube seis puntos por cada vez que el objetivo se reduce a la mitad.
+    #[test]
+    fn qvbr_quality_follows_the_trim() {
+        assert_eq!(qvbr_quality(1.0), CAPPED_QUALITY);
+        assert_eq!(qvbr_quality(0.5), CAPPED_QUALITY + 6);
+        assert_eq!(qvbr_quality(MIN_CEILING_TRIM), CAPPED_QUALITY + 12);
+        assert_eq!(
+            qvbr_quality(0.01),
+            CAPPED_QUALITY + 12,
+            "no baja de MIN_CEILING_TRIM"
+        );
+        assert!(per_frame_ceiling(Codec::Hevc, Backend::Vaapi));
+        assert!(per_frame_ceiling(Codec::Hevc, Backend::VulkanVideo));
+        assert!(!per_frame_ceiling(Codec::Av1, Backend::VulkanVideo));
+        assert!(!per_frame_ceiling(Codec::Av1, Backend::Nvenc));
+    }
+
+    /// Un codificador que se pasa del techo recibe menos objetivo en proporción, nunca por debajo de
+    /// [`MIN_CEILING_TRIM`] ni vuelta a tasa constante; si después cabe, lo recupera en pasos.
+    #[test]
+    fn an_encoder_over_its_ceiling_gets_a_lower_target_until_it_fits() {
+        let budget = 1000.0;
+        let second = |bytes: u64, late: u32| CeilingWindow {
+            bytes,
+            frames: 60,
+            late,
+            largest: 0,
+        };
+        // Gastó el doble: la mitad de objetivo.
+        let (trim, fits) = next_trim(1.0, 0, &second(120_000, 0), budget);
+        assert!((trim - 0.5).abs() < 1e-9 && fits == 0, "{trim}");
+        // Gasta lo de un segundo pero con muchos fotogramas pasados: baja un 10 %.
+        let (trim, _) = next_trim(1.0, 0, &second(60_000, 10), budget);
+        assert!((trim - 0.9).abs() < 1e-9, "{trim}");
+        // Por mucho que se pase, no baja de MIN_CEILING_TRIM.
+        let mut trim = 1.0;
+        for _ in 0..20 {
+            trim = next_trim(trim, 0, &second(600_000, 60), budget).0;
+        }
+        assert!((trim - MIN_CEILING_TRIM).abs() < 1e-9, "{trim}");
+        // Cabiendo con holgura, sube CEILING_RECOVER_STEP cada CEILING_RECOVER_SECONDS.
+        let (mut trim, mut fits) = (0.5, 0);
+        for _ in 0..CEILING_RECOVER_SECONDS {
+            (trim, fits) = next_trim(trim, fits, &second(30_000, 0), budget);
+        }
+        assert!(
+            (trim - 0.5 * CEILING_RECOVER_STEP).abs() < 1e-9 && fits == 0,
+            "{trim}"
+        );
+        // Justo en el techo no se mueve.
+        assert_eq!(next_trim(0.8, 3, &second(60_000, 2), budget), (0.8, 0));
     }
 
     /// El VBV es de un fotograma al bitrate configurado, en todos los backends.

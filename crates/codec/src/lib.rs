@@ -276,8 +276,8 @@ pub enum RateMode {
     /// Con techo: gasta lo que pide la imagen hasta el objetivo, que hace de techo con el mismo
     /// búfer de un fotograma, y con un suelo de QP (más calidad que esa no se ve). Una pantalla
     /// quieta gasta poco y un pico (partículas, un cambio de escena) sube hasta el techo. Lo
-    /// tienen NVENC y SVT-AV1; el resto sigue en tasa constante
-    /// ([`ffmpeg::encoder::supports_capped`]).
+    /// tienen todos (cómo, en [`ffmpeg::encoder::supports_capped`]); si un controlador se pasa del
+    /// techo, se le baja el objetivo hasta que sus fotogramas caben.
     #[default]
     Capped,
 }
