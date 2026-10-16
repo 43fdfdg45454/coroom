@@ -610,3 +610,61 @@ fn e_relay_carries_game_audio_and_voice() {
     voice_round(&server, true, false);
     drop(server);
 }
+
+/// (f) Con la sala abierta: el anfitrión cambia de micrófono (otro tono) y baja el volumen de su
+/// voz, y el invitado cambia de salida; nadie reconecta y el sonido sigue llegando.
+#[test]
+fn f_devices_and_the_voice_volume_change_live() {
+    const OTHER_MIC_HZ: f64 = 770.0;
+    const HEARD: f64 = 0.1;
+    const ABSENT: f64 = 0.01;
+    let _serial = serial();
+    let server = TestServer::start();
+    let mut host = host(server.config(), false, Some(HOST_VOICE_HZ), false);
+    let code = room_code(&host.session);
+    let mut listener = guest(server.config(), &code, None, None);
+    allow_voice(&mut host.session, 1, true);
+    let level = |tape_: &Tape, freq| tone_level(&tape(tape_), freq, 1.5);
+    wait_until("la voz del anfitrión", Duration::from_secs(10), || {
+        level(&listener.speaker, HOST_VOICE_HZ) > HEARD
+    });
+    // Otro micrófono en marcha.
+    host.session
+        .audio()
+        .replace_mic(Box::new(ToneSource::new(OTHER_MIC_HZ, 1)));
+    std::thread::sleep(Duration::from_secs(3));
+    let full = level(&listener.speaker, OTHER_MIC_HZ);
+    println!(
+        "tras cambiar de micrófono: {OTHER_MIC_HZ} Hz a {full:.3}, {HOST_VOICE_HZ} Hz a {:.3}",
+        level(&listener.speaker, HOST_VOICE_HZ)
+    );
+    assert!(full > HEARD, "llega el micrófono nuevo");
+    assert!(
+        level(&listener.speaker, HOST_VOICE_HZ) < ABSENT,
+        "el anterior ya no"
+    );
+    // La voz a la mitad: llega a la mitad.
+    host.session.audio().set_mic_gain(0.5);
+    std::thread::sleep(Duration::from_secs(3));
+    let half = level(&listener.speaker, OTHER_MIC_HZ);
+    println!("a la mitad: {half:.3} (antes {full:.3})");
+    assert!(
+        (0.35..0.65).contains(&(half / full)),
+        "{half:.3} de {full:.3}"
+    );
+    // El invitado cambia de salida: lo nuevo suena en la nueva.
+    let audio = listener.session.audio();
+    let format = audio.speaker_format().expect("formato de la salida en uso");
+    assert_eq!(format.channels, 2);
+    let sink = CaptureSink::new(2);
+    let new_tape = sink.recording();
+    audio.replace_speaker(Box::new(sink));
+    std::thread::sleep(Duration::from_secs(3));
+    let moved = level(&new_tape, OTHER_MIC_HZ);
+    println!("en la salida nueva: {moved:.3}");
+    assert!(moved > HEARD / 2.0, "suena en la salida nueva");
+    assert_eq!(listener.session.end_reason(), None, "sin reconectar");
+    listener.session.close();
+    host.session.close();
+    drop(server);
+}
