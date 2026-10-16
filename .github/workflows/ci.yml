@@ -143,8 +143,16 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # Si falla, los tests que fallan salen también como anotaciones: se ven en la API pública de
+      # las comprobaciones sin descargar el registro.
       - name: Tests
-        run: cargo test --workspace --locked
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace --locked 2>&1 | tee test-output.txt || {
+            grep -E -A2 "^test .* FAILED|panicked at" test-output.txt | tr -d '\r' | head -40 | sed 's/^/::error::/'
+            exit 1
+          }
 
       # Firma híbrida Ed25519 + ML-DSA-65, tras su `feature` desactivada por defecto.
       - name: Firma híbrida (pq-sign)
