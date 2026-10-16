@@ -4,7 +4,8 @@
 //! Diez segundos a 1080p60 en cuatro tramos de 2,5 s: escritorio quieto, movimiento, ráfaga de
 //! «partículas» (ruido en el 40 % de la imagen, como los efectos de OSU) y quieto otra vez. Por
 //! tramo: lo que gasta (kbit/s), el fotograma más grande (lo que tarda en salir es latencia) y el
-//! PSNR de la luma decodificada frente a la original.
+//! PSNR de la luma decodificada frente a la original, y cuántos intras salieron (el control del
+//! techo reabre el codificador en los backends sin bitrate en marcha) y el mayor.
 //!
 //! `cargo test --release -p coroom-codec --test rate_modes -- --ignored --nocapture`
 //! (`RATE_CAP_KBPS` cambia el techo, por defecto 20 000; `RATE_ONLY=Vaapi` mide solo esos).
@@ -120,6 +121,9 @@ struct Phase {
     largest: usize,
     psnr: f64,
     measured: u32,
+    /// Intras (el del arranque aparte) y el mayor de ellos.
+    intras: u32,
+    largest_intra: usize,
 }
 
 fn run(
@@ -154,6 +158,10 @@ fn run(
         // El primer fotograma (intra de arranque) no cuenta para el más grande.
         if frame_id > 0 {
             phase.largest = phase.largest.max(size);
+            if slices.iter().any(|slice| slice.keyframe) {
+                phase.intras += 1;
+                phase.largest_intra = phase.largest_intra.max(size);
+            }
         }
         if slices.is_empty() {
             continue;
@@ -186,7 +194,8 @@ fn constant_rate_against_capped_quality() {
         .unwrap_or(20_000);
     let seconds = PHASE as f64 / f64::from(FPS);
     println!(
-        "Techo {cap} kbit/s, 1080p{FPS}; por tramo: kbit/s · fotograma mayor (KB) · PSNR luma"
+        "Techo {cap} kbit/s, 1080p{FPS}; por tramo: kbit/s · fotograma mayor (KB) · PSNR luma · \
+         intras y el mayor (KB)"
     );
     for (codec, backend) in [
         (Codec::Av1, Backend::Nvenc),
@@ -216,10 +225,12 @@ fn constant_rate_against_capped_quality() {
                         .zip(PHASES)
                         .map(|(phase, name)| {
                             format!(
-                                "{name} {:>6.0} · {:>4.0} · {:>4.1}",
+                                "{name} {:>6.0} · {:>4.0} · {:>4.1} · {}i {:>3.0}",
                                 phase.bytes as f64 * 8.0 / 1000.0 / seconds,
                                 phase.largest as f64 / 1000.0,
-                                phase.psnr / f64::from(phase.measured.max(1))
+                                phase.psnr / f64::from(phase.measured.max(1)),
+                                phase.intras,
+                                phase.largest_intra as f64 / 1000.0
                             )
                         })
                         .collect();

@@ -533,7 +533,10 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
   ~1,4–2 Mbit/s con AV1 por hardware (NVENC y Vulkan Video) y a ~0,8 con VA-API, y una ráfaga de
   partículas sigue llegando al techo sin pasarlo. Si un controlador se pasa del techo (en un
   segundo o en más de un 10 % de sus fotogramas), se le baja el objetivo en proporción hasta que
-  caben, y lo recupera en pasos de 1,25× cada 2 s; en VA-API y Vulkan HEVC el recorte va en el
+  caben, y lo recupera en pasos de 1,25× cada 2 s donde el bitrate cambia en marcha (NVENC, QSV)
+  o de una vez cuando gasta menos de la mitad del techo donde cambiarlo reabre el codificador y
+  saca un intra (VA-API, Vulkan Video, AMF, SVT-AV1: FFmpeg 8.1 no admite otro control de tasa en
+  marcha en ninguno de ellos); en VA-API y Vulkan HEVC el recorte va en el
   mismo fotograma que se pasa (y en QVBR también sube la calidad). Nunca vuelve a tasa
   constante. `cargo test --release -p coroom-codec --test rate_modes -- --ignored --nocapture`
   repite la comparación (`RATE_ONLY=VulkanVideo` para uno solo).
