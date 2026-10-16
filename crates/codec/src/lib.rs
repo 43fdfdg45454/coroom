@@ -262,6 +262,26 @@ pub fn decoder_label(codec: Codec, backend: DecoderBackend) -> String {
     }
 }
 
+/// Cómo gasta el codificador el bitrate objetivo.
+///
+/// Medido con `tests/rate_modes.rs` (1080p60, techo de 20 Mbit/s, escritorio quieto, movimiento y
+/// una ráfaga de partículas): en tasa constante, NVENC gasta los 20 Mbit/s también con la
+/// pantalla quieta; con techo, 2-3 Mbit/s quieta (PSNR de 45-50 dB, sin diferencia a la vista),
+/// los mismos 20 Mbit/s en la ráfaga y fotogramas máximos iguales o menores (134-224 KB frente a
+/// 208-520 KB). De media, 6-7 Mbit/s en vez de 13-20.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RateMode {
+    /// Tasa constante (CBR): gasta el objetivo siempre, haga falta o no.
+    Constant,
+    /// Con techo: gasta lo que pide la imagen hasta el objetivo, que hace de techo con el mismo
+    /// búfer de un fotograma, y con un suelo de QP (más calidad que esa no se ve). Una pantalla
+    /// quieta gasta poco y un pico (partículas, un cambio de escena) sube hasta el techo. Lo
+    /// tienen NVENC y SVT-AV1; el resto sigue en tasa constante
+    /// ([`ffmpeg::encoder::supports_capped`]).
+    #[default]
+    Capped,
+}
+
 /// Parámetros del codificador.
 ///
 /// `width × height` es el **tope** de resolución (la «resolución máxima» de los ajustes), no un

@@ -40,7 +40,7 @@ use crate::convert::{
 use crate::gpu::GpuImage;
 use crate::{
     Backend, Codec, CodecError, CpuScale, EncodedFrame, EncodedSlice, Encoder, EncoderConfig,
-    GpuInput, PixelFormat, RawFrame,
+    GpuInput, PixelFormat, RateMode, RawFrame,
 };
 
 /// Periodo de GOP «infinito»: solo hay intra al pedirlo (o al empezar). Cabe en los 16 bits de
@@ -94,6 +94,10 @@ pub const SVT_MIN_VBV_MS: u64 = 20;
 /// FFmpeg 8.1 (`ffmpeg -h encoder=…`) y, en los que no hay en la build de desarrollo (AMF), contra su
 /// fuente; el test `low_latency_options_exist` lo vuelve a mirar con `av_opt_find`.
 ///
+/// Así salen en tasa constante ([`RateMode::Constant`]); con techo ([`RateMode::Capped`], lo
+/// normal, [`low_latency_options_with`]), NVENC va en VBR y SVT-AV1 en CBR de tiempo real, los dos
+/// con el mismo techo y búfer y un suelo de QP ([`min_qp`]).
+///
 /// Comunes: CBR (`b` = `maxrate`) con un búfer VBV de **un fotograma** ([`vbv_buffer_bits`]: así
 /// ningún fotograma, intra incluido, pesa mucho más que lo que el enlace pasa en un intervalo; con
 /// tres, un intra tras un cambio de escena salía con tres fotogramas de bits y llenaba la cola del
@@ -123,6 +127,52 @@ pub fn low_latency_options(
     backend: Backend,
     config: &EncoderConfig,
 ) -> Vec<(&'static str, String)> {
+    low_latency_options_with(codec, backend, config, RateMode::Constant)
+}
+
+/// Suelo de QP de [`RateMode::Capped`]: por debajo, la imagen ya no mejora a la vista y el
+/// codificador solo gastaría bits. En la escala de cada códec: H.264 y HEVC de 0 a 51; AV1, el
+/// `qindex` de 0 a 255 en NVENC y de 0 a 63 en SVT-AV1.
+pub fn min_qp(codec: Codec, backend: Backend) -> u32 {
+    match (codec, backend) {
+        (Codec::Av1, Backend::Software) => CAPPED_MIN_QP_AV1_SVT,
+        (Codec::Av1, _) => CAPPED_MIN_QP_AV1,
+        _ => CAPPED_MIN_QP,
+    }
+}
+
+/// Techo de QP de cada códec (el máximo de su escala), que acompaña al suelo de [`min_qp`].
+pub fn max_qp(codec: Codec) -> u32 {
+    if codec == Codec::Av1 { 255 } else { 51 }
+}
+
+/// Suelo de QP de H.264 y HEVC ([`min_qp`]).
+pub const CAPPED_MIN_QP: u32 = 20;
+
+/// Suelo de `qindex` de AV1 por hardware ([`min_qp`]).
+pub const CAPPED_MIN_QP_AV1: u32 = 80;
+
+/// Suelo de QP de SVT-AV1 ([`min_qp`]).
+pub const CAPPED_MIN_QP_AV1_SVT: u32 = 14;
+
+/// Si `backend` tiene [`RateMode::Capped`] en esta implementación: NVENC (VBR con `b` =
+/// `maxrate` y suelo de QP) y SVT-AV1 (CBR de tiempo real con `min-qp`), que respetan el techo y
+/// el búfer de un fotograma. VA-API no: en CBR rellena hasta el objetivo y en VBR se pasa del
+/// techo en los picos (fotogramas de 780 KB con un techo de 20 Mbit/s). AMF, QSV y Vulkan Video
+/// siguen en tasa constante hasta medirlos en su hardware.
+pub fn supports_capped(backend: Backend) -> bool {
+    matches!(backend, Backend::Nvenc | Backend::Software)
+}
+
+/// [`low_latency_options`] con el modo de tasa `mode` (donde el backend lo tiene,
+/// [`supports_capped`]; si no, tasa constante).
+pub fn low_latency_options_with(
+    codec: Codec,
+    backend: Backend,
+    config: &EncoderConfig,
+    mode: RateMode,
+) -> Vec<(&'static str, String)> {
+    let capped = mode == RateMode::Capped && supports_capped(backend);
     let bitrate = u64::from(config.bitrate_kbps) * 1000;
     let fps = config.fps.max(1);
     let mut options: Vec<(&'static str, String)> = vec![
@@ -164,13 +214,30 @@ pub fn low_latency_options(
             );
             set(
                 "svtav1-params",
-                "pred-struct=1:rc=2:rtc=1:lookahead=0:scd=0".into(),
+                if capped {
+                    format!(
+                        "pred-struct=1:rc=2:rtc=1:lookahead=0:scd=0:min-qp={}",
+                        min_qp(codec, backend)
+                    )
+                } else {
+                    "pred-struct=1:rc=2:rtc=1:lookahead=0:scd=0".into()
+                },
             );
         }
         Backend::Nvenc => {
             set("preset", "p1".into());
             set("tune", "ull".into());
-            set("rc", "cbr".into());
+            if capped {
+                // VBR con el objetivo de media y de techo (`b` = `maxrate`) y el VBV de un
+                // fotograma, con un suelo de QP: más calidad que esa no se ve, y sin ella el
+                // codificador gasta menos. FFmpeg solo pasa el suelo a NVENC en VBR y si también
+                // hay techo de QP.
+                set("rc", "vbr".into());
+                set("qmin", min_qp(codec, backend).to_string());
+                set("qmax", max_qp(codec).to_string());
+            } else {
+                set("rc", "cbr".into());
+            }
             set("zerolatency", "1".into());
             set("delay", "0".into());
             set("rc-lookahead", "0".into());
@@ -408,6 +475,8 @@ pub struct FfmpegEncoder {
     last_hw: Option<(AVFrame, u64)>,
     /// Importación de imágenes de GPU.
     importer: Option<GpuImporter>,
+    /// Modo de tasa ([`FfmpegEncoder::set_rate_mode`]).
+    rate_mode: RateMode,
     /// La importación sin copias falló una vez: se usa el modo de respaldo.
     zero_copy_failed: bool,
     /// Por qué no se usa la ruta sin copias, si no se usa.
@@ -428,6 +497,17 @@ impl std::fmt::Debug for FfmpegEncoder {
 }
 
 impl FfmpegEncoder {
+    /// Modo de tasa ([`RateMode`]) desde la próxima vez que se abra el codificador (si el backend
+    /// no tiene [`RateMode::Capped`], sigue en tasa constante).
+    pub fn set_rate_mode(&mut self, mode: RateMode) {
+        self.rate_mode = mode;
+    }
+
+    /// Si codifica con calidad fija y techo.
+    fn capped(&self) -> bool {
+        self.rate_mode == RateMode::Capped && supports_capped(self.backend)
+    }
+
     /// Prepara el codificador de `codec` con `backend` (crea el dispositivo de GPU si hace falta).
     /// Falla con [`CodecError::BackendUnavailable`] si esta build de FFmpeg no lo trae o si no hay
     /// dispositivo; hay que llamar a [`Encoder::configure`] antes de codificar.
@@ -457,6 +537,7 @@ impl FfmpegEncoder {
             orphan_packets: 0,
             last_hw: None,
             importer: None,
+            rate_mode: RateMode::default(),
             zero_copy_failed: false,
             gpu_note: None,
             copies: 0,
@@ -551,7 +632,7 @@ impl FfmpegEncoder {
             (None, _, None) => ctx.set_pix_fmt(sw_format),
         }
 
-        let options = low_latency_options(self.codec, self.backend, config);
+        let options = low_latency_options_with(self.codec, self.backend, config, self.rate_mode);
         self.unused_options = super::open_codec(&mut ctx, &options).map_err(|err| {
             CodecError::Unsupported(format!(
                 "{} no abre {}×{} a {} fps: {}",
@@ -1125,13 +1206,17 @@ impl Encoder for FfmpegEncoder {
             return Ok(());
         }
         config.bitrate_kbps = bitrate_kbps;
+        let capped = self.capped();
         if supports_live_bitrate(self.backend)
             && let Some(session) = self.session.as_mut()
         {
             let bitrate = i64::from(bitrate_kbps) * 1000;
             let vbv = i32::try_from(vbv_buffer_bits(bitrate_kbps, config.fps, self.backend))
                 .unwrap_or(i32::MAX);
-            session.ctx.set_bit_rate(bitrate);
+            // Con calidad fija (`b = 0`) el objetivo es solo el techo.
+            if !capped {
+                session.ctx.set_bit_rate(bitrate);
+            }
             // SAFETY: `as_mut_ptr` apunta al `AVCodecContext` abierto que posee `session.ctx`;
             // `rc_max_rate` y `rc_buffer_size` son enteros que el codificador lee al
             // reconfigurarse en el siguiente `avcodec_send_frame`, y nadie más usa el contexto
