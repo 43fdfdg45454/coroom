@@ -37,13 +37,13 @@ use iced_core::{Alignment, Length, Padding};
 use iced_widget::{Column, Space, button, center, column, container, row, scrollable, stack, text};
 
 use super::chat::{self, Surface};
-use super::diagnostics;
+use super::{diagnostics, settings};
 use crate::ui::app::{
-    App, Dialog, Effect, EndKind, Event, HEADERBAR_HEIGHT, Invitation, Message, Page, Screen,
-    quality_tone,
+    App, AudioDevice, Dialog, Effect, EndKind, Event, HEADERBAR_HEIGHT, Invitation, Message, Page,
+    Screen, quality_tone,
 };
 use crate::ui::settings::{
-    DEFAULT_VOICE_VOLUME, KnownPeer, MAX_VOICE_VOLUME, VoiceMode, voice_gain,
+    DEFAULT_VOICE_VOLUME, DecoderChoice, KnownPeer, MAX_VOICE_VOLUME, VoiceMode, voice_gain,
 };
 use crate::ui::stats;
 use crate::ui::video::{VideoFeed, video_view};
@@ -92,8 +92,10 @@ pub enum Tab {
     Chat,
     /// Conexión y calidad (`Ctrl+Alt+S`).
     Connection,
-    /// Personas y mandos (`Ctrl+Alt+J`).
+    /// Integrantes de la sala.
     Room,
+    /// Ajustes de este equipo en la sala: vídeo, audio, dispositivos y mando (`Ctrl+Alt+J`).
+    Settings,
 }
 
 /// Estimación de calidad.
@@ -512,12 +514,18 @@ pub enum Msg {
     ChoosePad(PadChoice),
     /// Inmersivo.
     ToggleImmersive,
-    /// Micrófono.
+    /// Micrófono (silenciarte para toda la sala).
     ToggleMic,
+    /// Volumen de la voz propia que se envía (porcentaje), mientras se arrastra.
+    MicVolume(u8),
+    /// Al soltar el deslizador de la voz propia: recordarlo en los ajustes.
+    MicVolumeDone,
     /// Audio del juego.
     ToggleGame,
     /// VSync de la ventana (ajuste de este equipo, al momento).
     SetVsync(bool),
+    /// Decodificar por software (se aplica al reconectar).
+    SoftwareDecoder(bool),
     /// Pantalla completa.
     ToggleFullscreen,
     /// Salir (pide confirmación).
@@ -617,7 +625,12 @@ fn set_panel(app: &mut App, tab: Option<Tab>) -> Vec<Effect> {
             state.reveal_bar(now);
         }
     }
-    chat::tab_changed(app, tab)
+    let mut effects = chat::tab_changed(app, tab);
+    // «Ajustes» enseña los micrófonos y salidas: se pide la lista al abrirla.
+    if tab == Some(Tab::Settings) {
+        effects.extend(settings::request_audio(app));
+    }
+    effects
 }
 
 /// Abre `tab` o, si ya está abierta, cierra el panel.
@@ -636,7 +649,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
     match msg {
         Msg::ToggleStats | Msg::TogglePads if state.phase == Phase::Connecting => {}
         Msg::ToggleStats => return toggle_panel(app, Tab::Connection),
-        Msg::TogglePads => return toggle_panel(app, Tab::Room),
+        Msg::TogglePads => return toggle_panel(app, Tab::Settings),
         Msg::TogglePanel(tab) => return toggle_panel(app, tab),
         Msg::ShowTab(tab) => return set_panel(app, Some(tab)),
         Msg::ClosePanel => return set_panel(app, None),
@@ -722,9 +735,25 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
         }
         Msg::ToggleMic => return vec![Effect::ToggleMic],
+        Msg::MicVolume(percent) => {
+            app.settings.audio.mic_volume = percent.min(MAX_VOICE_VOLUME);
+            return vec![Effect::SetMicGain {
+                host: false,
+                gain: voice_gain(app.settings.audio.mic_volume),
+            }];
+        }
+        Msg::MicVolumeDone => return app.settings_changed(),
         Msg::ToggleGame => return vec![Effect::ToggleGameAudio],
         Msg::SetVsync(vsync) => {
             app.settings.video.vsync = vsync;
+            return app.settings_changed();
+        }
+        Msg::SoftwareDecoder(software) => {
+            app.settings.video.decoder = if software {
+                DecoderChoice::Software
+            } else {
+                DecoderChoice::Auto
+            };
             return app.settings_changed();
         }
         Msg::ToggleFullscreen => return vec![Effect::SetFullscreen(!fullscreen)],
@@ -830,13 +859,22 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
         Event::GuestStarted(Ok(feed)) => {
             if let Some(state) = app.guest.as_mut() {
                 state.feed = feed;
-                // La sesión arranca con el juego al volumen normal: se le aplica el recordado.
+                // La sesión arranca con el juego y la voz propia al volumen normal: se les
+                // aplica el recordado.
                 state.game_volume = app.settings.audio.game_volume;
+                let mut effects = Vec::new();
                 if state.game_volume != DEFAULT_VOICE_VOLUME {
-                    return vec![Effect::SetGameGain {
+                    effects.push(Effect::SetGameGain {
                         gain: voice_gain(state.game_volume),
-                    }];
+                    });
                 }
+                if app.settings.audio.mic_volume != DEFAULT_VOICE_VOLUME {
+                    effects.push(Effect::SetMicGain {
+                        host: false,
+                        gain: voice_gain(app.settings.audio.mic_volume),
+                    });
+                }
+                return effects;
             }
         }
         Event::GuestStarted(Err(err)) => {
@@ -1499,6 +1537,48 @@ fn top_bar<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
 
 /// La píldora de latencia: un clic abre el panel en «Conexión»; el tramo «Relay · motivo», el
 /// diagnóstico.
+/// Los demás que hablan ahora, por sus nombres (uno mismo no: ya lo sabe).
+pub fn talking_names(state: &State) -> Vec<&str> {
+    let Some(audio) = state
+        .stats
+        .as_ref()
+        .and_then(|stats| stats.summary.audio.as_ref())
+    else {
+        return Vec::new();
+    };
+    let mut members: Vec<&RoomMember> = state.members.iter().filter(|m| !m.you).collect();
+    members.sort_by_key(|member| member_order(member));
+    members
+        .into_iter()
+        .filter(|member| audio.speaking.contains(&talker_label(member.guest)))
+        .map(|member| member.name.as_str())
+        .collect()
+}
+
+/// Indicador de quién habla: el micrófono y los nombres, en una píldora opaca sobre el vídeo.
+fn talking_view(state: &State) -> Option<Element<'_, Message>> {
+    let names = talking_names(state);
+    if names.is_empty() {
+        return None;
+    }
+    let content = row![
+        icon_with(Icon::Mic, 16.0, SvgClass::Overlay),
+        text(names.join(", "))
+            .size(type_size::SECONDARY)
+            .font(coroom_ui::font::SEMIBOLD)
+            .class(TextClass::Overlay)
+            .wrapping(Wrapping::None),
+    ]
+    .spacing(space::XS)
+    .align_y(Alignment::Center);
+    Some(
+        container(content)
+            .padding(Padding::from([6.0, 12.0]))
+            .class(ContainerClass::OverlayPill)
+            .into(),
+    )
+}
+
 fn pill_view<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     let pill = pill(state, app.now);
     let sep = || {
@@ -1685,28 +1765,41 @@ fn mute_button<'a>(muted: bool, message: Message) -> Element<'a, Message> {
     )
 }
 
-/// Quién está en la sala y a quién se oye: cada uno decide en su equipo, sin que cambie nada para
-/// los demás (el altavoz de cada deslizador silencia a esa persona aquí).
-fn people_section(state: &State) -> Element<'_, Message> {
+/// Orden de «Integrantes»: tú, el anfitrión y los demás por orden de llegada.
+fn member_order(member: &RoomMember) -> u8 {
+    if member.you {
+        0
+    } else if member.guest == 0 {
+        1
+    } else {
+        2
+    }
+}
+
+/// «Integrantes»: quién está en la sala, quién habla y cómo se le oye. En las filas de los demás,
+/// el deslizador es lo alto que se le oye en este equipo y el altavoz deja de oírle aquí (los
+/// demás le siguen oyendo); en la propia, lo alto que te oyen y el altavoz te silencia para todos.
+fn people_section<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     let speaking: Vec<&str> = state
         .stats
         .as_ref()
         .and_then(|stats| stats.summary.audio.as_ref())
         .map(|audio| audio.speaking.iter().map(String::as_str).collect())
         .unwrap_or_default();
+    let mut members: Vec<&RoomMember> = state.members.iter().collect();
+    members.sort_by_key(|member| member_order(member));
     let mut rows: Vec<Element<'_, Message>> = Vec::new();
-    for member in &state.members {
+    for member in members {
         let talks = speaking.contains(&talker_label(member.guest).as_str());
         let role = if member.guest == 0 {
             t!("room-anfitrion")
         } else {
             t!("room-invitado")
         };
-        let detail = if talks {
-            format!("{role} · {}", t!("room-hablando"))
-        } else {
-            role.to_owned()
-        };
+        let mut facts = vec![role.to_owned()];
+        if talks {
+            facts.push(t!("room-hablando").to_owned());
+        }
         rows.push(
             column![
                 text(if member.you {
@@ -1716,19 +1809,21 @@ fn people_section(state: &State) -> Element<'_, Message> {
                 })
                 .size(type_size::BODY)
                 .class(TextClass::Overlay),
-                overlay_text(detail).size(type_size::CAPTION),
+                overlay_text(facts.join(" · ")).size(type_size::CAPTION),
             ]
             .spacing(2)
             .width(Length::Fill)
             .into(),
         );
-        if let Some(volume) = volume_row(state, member) {
-            rows.push(volume);
+        if member.you {
+            rows.push(own_volume_row(app, state));
+        } else {
+            rows.push(volume_row(state, member));
         }
     }
     let mut content = Column::new()
         .spacing(space::S)
-        .push(stat_section(t!("room-personas-en-la-sala"), rows));
+        .push(stat_section(t!("room-integrantes"), rows));
     if state.members.is_empty() {
         content = content.push(overlay_text(t!("room-esperando-la-lista")));
     }
@@ -1740,27 +1835,59 @@ fn people_section(state: &State) -> Element<'_, Message> {
     content.into()
 }
 
-/// Volumen de la voz de `member` en este equipo, bajo su nombre: de 0 a 200 % de 5 en 5
-/// (Ctrl+clic, 100 %), con el botón de dejar de oírle delante. Mientras se arrastra ya suena así;
-/// al soltar se recuerda por su nombre. La propia voz no se oye aquí: sin deslizador.
-fn volume_row<'a>(state: &State, member: &RoomMember) -> Option<Element<'a, Message>> {
-    if member.you {
-        return None;
+/// La voz propia: lo alto que te oyen los demás (de 0 a 200 % de 5 en 5; Ctrl+clic, 100 %), con
+/// el altavoz que te silencia para todos delante. Sin voz (sin micrófono o sin permiso), por qué.
+fn own_volume_row<'a>(app: &App, state: &State) -> Element<'a, Message> {
+    let stats = state.stats.as_ref();
+    let voice = stats.is_some_and(|s| s.voice || s.mic_muted);
+    if !voice {
+        return overlay_text(t!("room-sin-voz"))
+            .size(type_size::CAPTION)
+            .wrapping(Wrapping::WordOrGlyph)
+            .into();
     }
+    let muted = stats.is_some_and(|s| s.mic_muted);
+    let percent = app.settings.audio.mic_volume;
+    ui::slider_with(
+        0..=MAX_VOICE_VOLUME,
+        percent,
+        5,
+        DEFAULT_VOICE_VOLUME,
+        Some(bar_button(
+            if muted { Icon::VolumeOff } else { Icon::Volume },
+            if muted {
+                t!("room-activar-tu-microfono")
+            } else {
+                t!("room-silenciarte")
+            },
+            muted,
+            on(Msg::ToggleMic),
+        )),
+        t!("room-volumen-porcentaje", percent = percent),
+        SliderClass::Overlay.muted(muted),
+        |value| on(Msg::MicVolume(value)),
+        Some(on(Msg::MicVolumeDone)),
+    )
+}
+
+/// Volumen de la voz de `member` en este equipo, bajo su nombre: de 0 a 200 % de 5 en 5
+/// (Ctrl+clic, 100 %), con el botón de dejar de oírle delante (tachado y con la barra apagada si
+/// no se le oye). Mientras se arrastra ya suena así; al soltar se recuerda por su nombre.
+fn volume_row<'a>(state: &State, member: &RoomMember) -> Element<'a, Message> {
     let leaf = member.leaf;
     let percent = state.volume(leaf);
     let muted = state.muted.contains(&leaf);
-    Some(ui::slider_with(
+    ui::slider_with(
         0..=MAX_VOICE_VOLUME,
         percent,
         5,
         DEFAULT_VOICE_VOLUME,
         Some(mute_button(muted, on(Msg::Hear(leaf, muted)))),
         t!("room-volumen-porcentaje", percent = percent),
-        SliderClass::Overlay,
+        SliderClass::Overlay.muted(muted),
         move |value| on(Msg::Volume(leaf, value)),
         Some(on(Msg::VolumeDone(leaf))),
-    ))
+    )
 }
 
 /// Mandos: cuál se envía (automático o uno concreto) entre los conectados.
@@ -1854,16 +1981,12 @@ fn game_volume_section(state: &State) -> Element<'_, Message> {
     )
 }
 
-/// Pestaña «Sala»: volumen del juego, personas (oír o no) y mandos.
+/// Pestaña «Sala»: los integrantes (a quién se oye y cómo).
 fn room_tab<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     scrollable(
-        column![
-            game_volume_section(state),
-            people_section(state),
-            pads_section(app, state)
-        ]
-        .spacing(space::L)
-        .padding(Padding::from([space::S, space::M])),
+        column![people_section(app, state)]
+            .spacing(space::L)
+            .padding(Padding::from([space::S, space::M])),
     )
     .height(Length::Fill)
     .into()
@@ -2064,6 +2187,15 @@ fn connection_tab<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         ],
     ));
 
+    scrollable(sections).height(Length::Fill).into()
+}
+
+/// Pestaña «Ajustes»: lo de este equipo en la sala (vídeo, decodificador, audio con sus
+/// dispositivos y volumen del juego, mando y atajos). Lo que cambia se guarda en los ajustes.
+fn settings_tab<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
+    let mut sections = Column::new()
+        .spacing(space::M)
+        .padding(Padding::from([space::S, space::M]));
     // Tu vídeo: escalado (solo «Ajustar» por ahora) y VSync.
     sections = sections.push(stat_section(
         t!("room-tu-video"),
@@ -2098,6 +2230,31 @@ fn connection_tab<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
                 .size(type_size::CAPTION)
                 .wrapping(Wrapping::WordOrGlyph)
                 .into(),
+            switch_row(
+                t!("room-decodificar-por-software"),
+                app.settings.video.decoder == DecoderChoice::Software,
+                Some(on(Msg::SoftwareDecoder(
+                    app.settings.video.decoder != DecoderChoice::Software,
+                ))),
+            ),
+            row![
+                overlay_text(t!("room-decodificar-nota"))
+                    .size(type_size::CAPTION)
+                    .wrapping(Wrapping::WordOrGlyph)
+                    .width(Length::Fill),
+                button(
+                    text(t!("room-reconectar-ahora"))
+                        .size(type_size::CAPTION)
+                        .font(coroom_ui::font::SEMIBOLD)
+                        .class(TextClass::Custom(dark(app).accent_text.color()))
+                )
+                .padding(Padding::from([2.0, 6.0]))
+                .class(ButtonClass::Overlay { active: false })
+                .on_press(on(Msg::Reconnect)),
+            ]
+            .spacing(space::XS)
+            .align_y(Alignment::Center)
+            .into(),
         ],
     ));
 
@@ -2130,13 +2287,88 @@ fn connection_tab<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         !stats_now.is_some_and(|s| s.game_muted),
         Some(on(Msg::ToggleGame)),
     ));
+    // El micrófono y la salida, que cambian al momento (los mismos de Ajustes → Audio y voz).
+    let devices: Vec<AudioDevice> = app
+        .settings_page
+        .audio_devices
+        .loaded()
+        .cloned()
+        .unwrap_or_default();
+    // Los nombres largos, recortados con «…» para que quepan en el selector del panel.
+    let fit = |choices: Vec<settings::Choice<Option<String>>>| -> Vec<_> {
+        choices
+            .into_iter()
+            .map(|mut choice| {
+                choice.label = ui::ellipsize(&choice.label, DEVICE_LABEL).into_owned();
+                choice
+            })
+            .collect()
+    };
+    let mics = fit(settings::device_choices(
+        &devices,
+        true,
+        &app.settings.audio.microphone,
+    ));
+    let mic = mics
+        .iter()
+        .find(|c| c.value == app.settings.audio.microphone)
+        .cloned();
+    let speakers = fit(settings::device_choices(
+        &devices,
+        false,
+        &app.settings.audio.speaker,
+    ));
+    let speaker = speakers
+        .iter()
+        .find(|c| c.value == app.settings.audio.speaker)
+        .cloned();
+    audio_rows.push(device_row(
+        t!("room-dispositivo-microfono"),
+        ui::select_fixed(
+            mics,
+            mic,
+            |c| Message::Settings(settings::Msg::Microphone(c)),
+            DEVICE_SELECT,
+        ),
+    ));
+    audio_rows.push(device_row(
+        t!("room-dispositivo-salida"),
+        ui::select_fixed(
+            speakers,
+            speaker,
+            |c| Message::Settings(settings::Msg::Speaker(c)),
+            DEVICE_SELECT,
+        ),
+    ));
+    audio_rows.push(
+        overlay_text(t!("room-dispositivos-nota"))
+            .size(type_size::CAPTION)
+            .wrapping(Wrapping::WordOrGlyph)
+            .into(),
+    );
     sections = sections.push(stat_section(t!("room-tu-audio"), audio_rows));
+    sections = sections.push(game_volume_section(state));
+    sections = sections.push(pads_section(app, state));
     sections = sections.push(
         overlay_text(shortcuts_line(&app.settings.input.shortcuts))
             .size(type_size::CAPTION)
             .wrapping(Wrapping::WordOrGlyph),
     );
     scrollable(sections).height(Length::Fill).into()
+}
+
+/// Caracteres que caben en un selector de dispositivo del panel.
+const DEVICE_LABEL: usize = 38;
+
+/// Ancho de los selectores de dispositivo del panel: todo el panel menos sus márgenes.
+const DEVICE_SELECT: f32 = size::STATS_PANEL - 2.0 * space::M;
+
+/// Selector de dispositivo del panel, bajo su nombre (los nombres de los dispositivos son
+/// largos).
+fn device_row<'a>(label: &'a str, select: Element<'a, Message>) -> Element<'a, Message> {
+    column![overlay_text(label), select]
+        .spacing(space::XS)
+        .into()
 }
 
 /// Los atajos del vídeo, con las letras de Ajustes → Entrada.
@@ -2156,39 +2388,45 @@ fn shortcuts_line(shortcuts: &crate::ui::settings::Shortcuts) -> String {
 /// El panel lateral: pestañas Chat · Conexión · Sala, el atajo de la pestaña y cerrar.
 fn side_panel<'a>(app: &'a App, state: &'a State, tab: Tab) -> Element<'a, Message> {
     let keys = &app.settings.input.shortcuts;
-    let tab_button = |label: &'static str, this: Tab| {
-        button(
+    // Cuatro pestañas no dejan sitio al atajo en la cabecera: va en la ayuda de cada una.
+    let shortcut = |this: Tab| match this {
+        Tab::Chat => Some(keys.chat),
+        Tab::Connection => Some(keys.stats),
+        Tab::Room => None,
+        Tab::Settings => Some(keys.pads),
+    };
+    let tab_button = |label: &'static str, this: Tab| -> Element<'a, Message> {
+        let control = button(
             text(label)
                 .size(type_size::SECONDARY)
                 .font(coroom_ui::font::SEMIBOLD)
                 .wrapping(Wrapping::None),
         )
-        .padding(Padding::from([5.0, 12.0]))
+        .padding(Padding::from([5.0, 10.0]))
         .class(ButtonClass::Overlay {
             active: tab == this,
         })
-        .on_press(on(Msg::ShowTab(this)))
+        .on_press(on(Msg::ShowTab(this)));
+        match shortcut(this) {
+            Some(letter) => ui::with_tooltip(control, format!("Ctrl+Alt+{letter}")),
+            None => control.into(),
+        }
     };
     let tabs = container(
         row![
             tab_button(t!("room-tab-chat"), Tab::Chat),
             tab_button(t!("room-tab-conexion"), Tab::Connection),
             tab_button(t!("room-tab-sala"), Tab::Room),
+            tab_button(t!("room-tab-ajustes"), Tab::Settings),
         ]
         .spacing(2),
     )
     .padding(2)
     .class(ContainerClass::OverlaySegmented);
-    let letter = match tab {
-        Tab::Chat => keys.chat,
-        Tab::Connection => keys.stats,
-        Tab::Room => keys.pads,
-    };
     let header = container(
         row![
             tabs,
             ui::fill(),
-            overlay_text(format!("Ctrl+Alt+{letter}")).size(type_size::CAPTION),
             ui::with_tooltip(
                 button(center(icon_with(Icon::Close, 16.0, SvgClass::Overlay)))
                     .width(Length::Fixed(28.0))
@@ -2212,6 +2450,7 @@ fn side_panel<'a>(app: &'a App, state: &'a State, tab: Tab) -> Element<'a, Messa
         Tab::Chat => chat::panel(app, Surface::Overlay),
         Tab::Connection => connection_tab(app, state),
         Tab::Room => room_tab(app, state),
+        Tab::Settings => settings_tab(app, state),
     };
     container(column![header, content].height(Length::Fill))
         .width(Length::Fixed(size::STATS_PANEL))
@@ -2261,6 +2500,28 @@ fn video<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
             .align_y(Vertical::Top)
             .into(),
     );
+    // Quién habla, arriba a la izquierda (debajo de la barra si se ve).
+    if app.settings.room.talking_overlay
+        && let Some(talking) = talking_view(state)
+    {
+        let below_bar = if bar_visible {
+            space::S + size::VIDEO_BAR + space::S
+        } else {
+            space::S
+        };
+        layers.push(
+            container(talking)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(Padding {
+                    top: below_bar,
+                    right: space::S,
+                    bottom: space::S,
+                    left: space::S,
+                })
+                .into(),
+        );
+    }
     if let Some(tab) = state.panel {
         let below_bar = space::S + size::VIDEO_BAR + space::S;
         layers.push(
@@ -2308,12 +2569,12 @@ pub(crate) mod shots {
     use std::time::{Duration, Instant};
 
     use coroom_session::input::gamepad::{ConnectedPad, PadChoice, PadKey, PadKind};
-    use coroom_session::latency::{InputLatency, LatencyLedger, LinkSummary, Stage};
+    use coroom_session::latency::{AudioSummary, InputLatency, LatencyLedger, LinkSummary, Stage};
     use coroom_session::remote::{QualityLevel, RoomMember, SessionEvent};
     use coroom_transport::quic::Path;
 
     use super::{Msg, Phase, Stats, Tab};
-    use crate::ui::app::{App, Event, Message, Page};
+    use crate::ui::app::{App, AudioDevice, Event, Message, Page};
     use crate::ui::screens::chat;
     use crate::ui::shots::{Builder, cursor, cursor_image, game_frame, safety, signed_in};
     use crate::ui::video::VideoFeed;
@@ -2502,7 +2763,55 @@ pub(crate) mod shots {
         app.settings.input.pad = PadChoice::Pad(eightbitdo.key.clone());
         app.update(Message::Guest(Msg::Pads(vec![eightbitdo.clone()], true)));
         app.update(Message::Guest(Msg::Pads(vec![eightbitdo, xbox], true)));
-        app.update(Message::Guest(Msg::TogglePads));
+        speaking(app, &["anfitrión"]);
+        if let Some(stats) = app.guest.as_mut().and_then(|state| state.stats.as_mut()) {
+            stats.voice = true;
+        }
+        app.update(Message::Guest(Msg::MicVolume(120)));
+        app.update(Message::Guest(Msg::ShowTab(Tab::Room)));
+        app.toasts.clear();
+    }
+
+    /// Quién habla según el resumen del audio («anfitrión», «invitado 2»…).
+    fn speaking(app: &mut App, who: &[&str]) {
+        if let Some(stats) = app.guest.as_mut().and_then(|state| state.stats.as_mut()) {
+            let audio = stats.summary.audio.get_or_insert_with(|| AudioSummary {
+                tracks: Vec::new(),
+                av: None,
+                speaking: Vec::new(),
+                status: String::new(),
+            });
+            audio.speaking = who.iter().map(|name| (*name).to_owned()).collect();
+        }
+    }
+
+    /// El indicador de quién habla sobre el vídeo (con la barra escondida).
+    pub(crate) fn guest_talking(app: &mut App) {
+        guest_room(app);
+        speaking(app, &["anfitrión", "invitado 2"]);
+        app.update(Message::Guest(Msg::ClosePanel));
+        still(app);
+    }
+
+    /// La pestaña «Ajustes» del panel: vídeo, decodificador, audio con sus dispositivos, volumen
+    /// del juego y mando.
+    pub(crate) fn guest_settings(app: &mut App) {
+        guest_room(app);
+        app.update(Message::Event(Event::AudioDevices(Ok(vec![
+            AudioDevice {
+                name: "usb-mic".to_owned(),
+                description: "Micrófono USB".to_owned(),
+                input: true,
+                default: true,
+            },
+            AudioDevice {
+                name: "headset".to_owned(),
+                description: "Auriculares".to_owned(),
+                input: false,
+                default: true,
+            },
+        ]))));
+        app.update(Message::Guest(Msg::ShowTab(Tab::Settings)));
         app.toasts.clear();
     }
 
@@ -2615,7 +2924,9 @@ pub(crate) mod shots {
         ("14-conexion", guest_connection),
         ("14-chat", guest_chat),
         ("14-burbujas", guest_bubbles),
+        ("13-video-hablando", guest_talking),
         ("14-sala", guest_room),
+        ("14-ajustes", guest_settings),
         ("15-reconectando", guest_reconnecting),
         ("15-relay-cgnat", guest_relay_cgnat),
     ];
@@ -2842,12 +3153,16 @@ mod tests {
             [Effect::FocusChat(true)]
         );
         assert!(app.chat.open && app.chat.composing);
-        // Otra pestaña: el teclado vuelve al juego.
+        // Otra pestaña: el teclado vuelve al juego. «Ajustes» (`Ctrl+Alt+J`, la del mando)
+        // pide la lista de micrófonos y salidas.
         assert_eq!(
             app.update(Message::Guest(Msg::TogglePads)),
-            [Effect::FocusChat(false)]
+            [Effect::FocusChat(false), Effect::LoadAudioDevices]
         );
-        assert_eq!(app.guest.as_ref().and_then(|g| g.panel), Some(Tab::Room));
+        assert_eq!(
+            app.guest.as_ref().and_then(|g| g.panel),
+            Some(Tab::Settings)
+        );
         assert!(!app.chat.open && !app.chat.composing);
         app.update(Message::Guest(Msg::TogglePads));
         assert_eq!(app.guest.as_ref().and_then(|g| g.panel), None);
@@ -2973,10 +3288,23 @@ mod tests {
             (state.volume(0), state.volume(1), state.volume(2)),
             (100, 100, 60)
         );
-        // El deslizador sale para los demás y no para uno mismo.
-        assert!(volume_row(state, &members[0]).is_some());
-        assert!(volume_row(state, &members[1]).is_none());
-        assert!(volume_row(state, &members[2]).is_some());
+        // «Integrantes» empieza por uno mismo, sigue con el anfitrión y después los demás.
+        let mut order: Vec<&RoomMember> = members.iter().collect();
+        order.sort_by_key(|member| member_order(member));
+        let names: Vec<&str> = order.iter().map(|member| member.name.as_str()).collect();
+        assert_eq!(names, ["Ana", "Bea", "Carla"]);
+        // El deslizador propio es lo alto que te oyen: se aplica en caliente y se recuerda.
+        assert_eq!(
+            app.update(Message::Guest(Msg::MicVolume(150))),
+            [Effect::SetMicGain {
+                host: false,
+                gain: 1.5,
+            }]
+        );
+        assert_eq!(app.settings.audio.mic_volume, 150);
+        app.flush_settings();
+        app.update(Message::Guest(Msg::MicVolumeDone));
+        assert_eq!(app.flush_settings(), Some(Effect::SaveSettings));
         // Arrastrar cambia el volumen en caliente; soltar lo recuerda por el nombre.
         let effects = app.update(Message::Guest(Msg::Volume(0, 150)));
         assert_eq!(

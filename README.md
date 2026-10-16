@@ -339,7 +339,8 @@ Sin `--trust-fingerprint`, el cliente valida el servidor con las raíces de conf
 (el certificado del operador emitido por una autoridad en la que confía el equipo). Si el servidor dice que la sala no tiene relay (cuota agotada o
 relay deshabilitado), los clientes lo avisan y conectan solo en directo. `coroom host --help` y
 `coroom join --help` listan el resto de opciones (`--width`, `--height`, `--fps`,
-`--bitrate-kbps`, `--invite`…).
+`--invite`…); el bitrate no se elige: el control de tasa de cada invitado sube hasta lo que da
+su enlace.
 
 **Códec**: el invitado anuncia lo que decodifica al conectar y el anfitrión elige el mejor códec
 común (primero lo acelerado por hardware; a igualdad, AV1 → HEVC → H.264), lo imprime

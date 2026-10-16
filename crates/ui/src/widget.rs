@@ -362,8 +362,8 @@ pub fn slider<'a, M: Clone + 'a>(
     on_release: Option<M>,
 ) -> Element<'a, M> {
     let icon_class = match class {
-        SliderClass::Accent => SvgClass::Secondary,
-        SliderClass::Overlay => SvgClass::Overlay,
+        SliderClass::Accent | SliderClass::AccentMuted => SvgClass::Secondary,
+        SliderClass::Overlay | SliderClass::OverlayMuted => SvgClass::Overlay,
     };
     let leading = icon.map(|glyph| icon_with(glyph, size::ICON, icon_class));
     slider_with(
@@ -395,8 +395,8 @@ pub fn slider_with<'a, M: Clone + 'a>(
         control = control.on_release(on_release);
     }
     let text_class = match class {
-        SliderClass::Accent => TextClass::Secondary,
-        SliderClass::Overlay => TextClass::OverlaySecondary,
+        SliderClass::Accent | SliderClass::AccentMuted => TextClass::Secondary,
+        SliderClass::Overlay | SliderClass::OverlayMuted => TextClass::OverlaySecondary,
     };
     let mut line = Row::new().spacing(gap::XS).align_y(Alignment::Center);
     if let Some(leading) = leading {
@@ -427,6 +427,25 @@ where
     pick_list(options, selected, on_select)
         .padding(Padding::from([8.0, 12.0]))
         .text_size(type_size::BODY)
+        .font(UI)
+        .into()
+}
+
+/// Menú de acciones de una fila: un botón «`label` ▾» que despliega `actions` (su texto, con
+/// `Display`) y llama a `on_action` con la elegida. No guarda selección: siempre enseña `label`.
+pub fn menu<'a, T, M>(
+    actions: Vec<T>,
+    label: &'a str,
+    on_action: impl Fn(T) -> M + 'a,
+) -> Element<'a, M>
+where
+    T: ToString + PartialEq + Clone + 'a,
+    M: Clone + 'a,
+{
+    pick_list(actions, None::<T>, on_action)
+        .placeholder(label)
+        .padding(Padding::from([6.0, 10.0]))
+        .text_size(type_size::SECONDARY)
         .font(UI)
         .into()
 }
@@ -1064,6 +1083,20 @@ pub fn pref_row<'a, M: 'a>(
     if let Some(subtitle) = subtitle {
         texts = texts.push(secondary(subtitle).wrapping(Wrapping::WordOrGlyph));
     }
+    row![texts.width(Length::Fill), control.into()]
+        .spacing(gap::M)
+        .align_y(Alignment::Center)
+        .padding(Padding::from([10.0, 16.0]))
+        .into()
+}
+
+/// [`pref_row`] con lo que se quiera bajo el título (texto de ayuda y un aviso, por ejemplo).
+pub fn pref_row_with<'a, M: 'a>(
+    title_text: impl text::IntoFragment<'a>,
+    below: impl Into<Element<'a, M>>,
+    control: impl Into<Element<'a, M>>,
+) -> Element<'a, M> {
+    let texts = column![body(title_text), below.into()].spacing(2);
     row![texts.width(Length::Fill), control.into()]
         .spacing(gap::M)
         .align_y(Alignment::Center)

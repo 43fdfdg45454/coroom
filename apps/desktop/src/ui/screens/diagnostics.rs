@@ -251,7 +251,7 @@ pub fn on_event(app: &mut App, event: &Event) {
         Event::GuestStarted(_) | Event::GuestEnded(_) => state.guest = GuestSide::default(),
         Event::HostStarted(_) | Event::HostEnded(_) => state.host = HostSide::default(),
         Event::GuestStats(stats) => state.guest.summary = Some(stats.summary.clone()),
-        Event::HostGuests(statuses) => state.host.statuses = statuses.clone(),
+        Event::HostGuests(statuses, _) => state.host.statuses = statuses.clone(),
         Event::Guest(event) => guest_event(&mut state.guest, event, now),
         Event::Host(event) => host_event(&mut state.host, event, now),
         _ => {}

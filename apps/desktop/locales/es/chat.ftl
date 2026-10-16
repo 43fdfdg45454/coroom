@@ -1,5 +1,6 @@
 # Textos de la pantalla «chat» (identificadores con el prefijo `chat-`; los comunes están en coroom.ftl).
 chat-titulo = Chat de la sala
+chat-copiar-el-mensaje = Copiar el mensaje
 chat-aun-sin-mensajes = Aún no hay mensajes.
 chat-aun-sin-mensajes-detalle = Lo que escribas aquí lo ven todos los de la sala, cifrado de extremo a extremo.
 chat-esperando-las-claves = El chat se abre en cuanto lleguen las claves de la sala.

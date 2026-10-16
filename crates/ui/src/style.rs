@@ -890,6 +890,22 @@ pub enum SliderClass {
     Accent,
     /// Sobre el panel o la barra que flotan sobre el vídeo (siempre oscuros).
     Overlay,
+    /// [`SliderClass::Accent`] de algo silenciado: el raíl se apaga (el valor se conserva).
+    AccentMuted,
+    /// [`SliderClass::Overlay`] de algo silenciado.
+    OverlayMuted,
+}
+
+impl SliderClass {
+    /// La misma clase, apagada si `muted`.
+    pub fn muted(self, muted: bool) -> Self {
+        match (self, muted) {
+            (SliderClass::Accent | SliderClass::AccentMuted, true) => SliderClass::AccentMuted,
+            (SliderClass::Overlay | SliderClass::OverlayMuted, true) => SliderClass::OverlayMuted,
+            (SliderClass::Accent | SliderClass::AccentMuted, false) => SliderClass::Accent,
+            (SliderClass::Overlay | SliderClass::OverlayMuted, false) => SliderClass::Overlay,
+        }
+    }
 }
 
 impl slider::Catalog for Theme {
@@ -907,8 +923,13 @@ impl slider::Catalog for Theme {
         } else {
             p.accent_bg
         };
+        let filled_color = match *class {
+            SliderClass::AccentMuted => p.border.color(),
+            SliderClass::OverlayMuted => p.overlay_text.alpha(0.4),
+            SliderClass::Accent | SliderClass::Overlay => filled.color(),
+        };
         let (empty, handle, handle_border) = match *class {
-            SliderClass::Accent => (
+            SliderClass::Accent | SliderClass::AccentMuted => (
                 Background::Color(p.button_hover.color()),
                 Background::Color(if touched {
                     p.card_hover.color()
@@ -917,7 +938,7 @@ impl slider::Catalog for Theme {
                 }),
                 if touched { filled } else { p.border },
             ),
-            SliderClass::Overlay => (
+            SliderClass::Overlay | SliderClass::OverlayMuted => (
                 Background::Color(p.overlay_text.alpha(0.25)),
                 Background::Color(p.overlay_text.color()),
                 if touched { filled } else { p.overlay_text },
@@ -925,7 +946,7 @@ impl slider::Catalog for Theme {
         };
         slider::Style {
             rail: slider::Rail {
-                backgrounds: (Background::Color(filled.color()), empty),
+                backgrounds: (Background::Color(filled_color), empty),
                 width: 4.0,
                 border: outline(Color::TRANSPARENT, 0.0, radius::PILL),
             },

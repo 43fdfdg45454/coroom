@@ -178,9 +178,10 @@ pub fn start_kbps(max_kbps: u32) -> u32 {
 }
 
 /// Bitrate mínimo del control de tasa para un máximo `max_kbps`: una décima parte, entre 0,1 y
-/// 8 Mbit/s.
+/// 0,5 Mbit/s. El bitrate no tiene tope (siempre [`UNLIMITED_KBPS`]), así que el mínimo no puede
+/// salir del máximo: con 8 Mbit/s de suelo, un enlace de 3 Mbit/s se inundaba sin remedio.
 pub fn min_kbps(max_kbps: u32) -> u32 {
-    (max_kbps / 10).clamp(100, 8_000).min(max_kbps.max(1))
+    (max_kbps / 10).clamp(100, 500).min(max_kbps.max(1))
 }
 
 /// Espera antes del reintento `attempt` (desde 1): 0,5 s, 1 s, 2 s, 4 s y 8 s.
@@ -1999,13 +2000,14 @@ mod tests {
 
     #[test]
     fn rate_limits_keep_the_usual_maxima_and_tame_unlimited() {
-        // Arranque en 8 Mbit/s (o el máximo si es menor) y mínimo en la décima parte.
-        assert_eq!((start_kbps(10_000), min_kbps(10_000)), (8_000, 1_000));
-        assert_eq!((start_kbps(80_000), min_kbps(80_000)), (8_000, 8_000));
+        // Arranque en 8 Mbit/s (o el máximo si es menor) y mínimo en la décima parte, hasta
+        // 0,5 Mbit/s.
+        assert_eq!((start_kbps(10_000), min_kbps(10_000)), (8_000, 500));
+        assert_eq!((start_kbps(80_000), min_kbps(80_000)), (8_000, 500));
         assert_eq!((start_kbps(500), min_kbps(500)), (500, 100));
-        // Sin tope arranca igual y no se queda con un mínimo de 50 kbit/s.
+        // Sin tope arranca igual y puede bajar a lo que dé un enlace lento.
         assert_eq!(start_kbps(UNLIMITED_KBPS), 8_000);
-        assert_eq!(min_kbps(UNLIMITED_KBPS), 8_000);
+        assert_eq!(min_kbps(UNLIMITED_KBPS), 500);
     }
 
     fn config() -> RemoteConfig {

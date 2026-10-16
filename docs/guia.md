@@ -131,10 +131,10 @@ Las letras de `Ctrl+Alt` se cambian en Ajustes → Mandos (no pueden coincidir e
 
 ## Ajustes
 
-- **Vídeo**: resolución, fps (30, 60 o 120), tope del bitrate (el bitrate siempre es **Auto**: sube
-  hasta donde la red aguanta y baja antes de que se congele; el tope solo le pone techo, útil en
-  redes que no avisan de la congestión), códec preferido, 4:4:4 y HDR (solo si
-  el anfitrión, el equipo y todos los invitados lo admiten; si no, Ajustes te dice por qué).
+- **Vídeo**: resolución, fps (30, 60 o 120), códec preferido, 4:4:4 y HDR (solo si
+  el anfitrión, el equipo y todos los invitados lo admiten; si no, Ajustes te dice por qué). El
+  bitrate no se elige: es automático para cada invitado, sube hasta lo que da su conexión y baja
+  antes de que el vídeo se corte (también en redes que tiran lo que sobra sin avisar).
   En **Avanzado**, el codificador del anfitrión y el decodificador del invitado: déjalos en
   Automático salvo que el vídeo se vea gris o corrupto o la aplicación se cierre al compartir. En
   Windows, Automático usa NVENC, AMF o Quick Sync antes que Vulkan Video. Al abrirse, coroom

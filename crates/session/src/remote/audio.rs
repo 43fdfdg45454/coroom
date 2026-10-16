@@ -48,7 +48,7 @@ use coroom_audio::mix::Mixer;
 use coroom_audio::processing::{ProcessingOptions, RenderFeed, VoiceProcessor};
 use coroom_audio::sync::{AvSync, RECOMMEND_PERIOD};
 use coroom_audio::{
-    AudioConfig, AudioSink, AudioSource, DeviceCounters, MAX_FRAME_SAMPLES, Render,
+    AudioConfig, AudioFormat, AudioSink, AudioSource, DeviceCounters, MAX_FRAME_SAMPLES, Render,
 };
 use coroom_transport::PeerConnection;
 use coroom_transport::crypto::sframe::FrameEncryptor;
@@ -194,10 +194,57 @@ struct ControlInner {
     /// Volumen del audio del juego en este equipo, aparte de su silencio
     /// ([`ControlInner::game_muted`], que manda).
     game_gain: GameGain,
+    /// Volumen de la voz propia que se envía (lo alto que la oyen los demás), aparte del
+    /// silencio del micrófono.
+    mic_gain: GameGain,
+    /// Micrófono nuevo elegido en marcha, que adopta el hilo `voice-cap`.
+    new_mic: Pending<Box<dyn AudioSource>>,
+    /// Salida nueva elegida en marcha, que adopta la reproducción.
+    new_speaker: Pending<Box<dyn AudioSink>>,
+    /// Formato de la salida en uso (para abrir otra igual), cuando suena algo.
+    speaker_format: Mutex<Option<AudioFormat>>,
 }
 
-/// Ganancia del juego: los bits del `f32` en un atómico, para que la reproducción la lea sin
-/// cerrojo por cada trama; 1.0 (lo normal) de partida.
+/// Un dispositivo pedido en marcha que adopta el hilo que lo usa: el aviso es un atómico, para
+/// que ese hilo lo mire en cada trama sin tomar el cerrojo.
+struct Pending<T> {
+    ready: AtomicBool,
+    value: Mutex<Option<T>>,
+}
+
+impl<T> Default for Pending<T> {
+    fn default() -> Self {
+        Self {
+            ready: AtomicBool::new(false),
+            value: Mutex::new(None),
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for Pending<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pending")
+            .field("ready", &self.ready.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl<T> Pending<T> {
+    fn put(&self, value: T) {
+        *lock(&self.value) = Some(value);
+        self.ready.store(true, Ordering::Release);
+    }
+
+    fn take(&self) -> Option<T> {
+        if !self.ready.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        lock(&self.value).take()
+    }
+}
+
+/// Ganancia del juego (o del micrófono): los bits del `f32` en un atómico, para que la
+/// reproducción o la captura la lean sin cerrojo por cada trama; 1.0 (lo normal) de partida.
 #[derive(Debug)]
 struct GameGain(AtomicU32);
 
@@ -280,6 +327,46 @@ impl AudioControl {
     /// el hilo del dispositivo por cada trama.
     pub fn game_gain(&self) -> f32 {
         f32::from_bits(self.inner.game_gain.0.load(Ordering::Relaxed))
+    }
+
+    /// Volumen de la voz propia que se envía: ganancia lineal entre 0.0 y [`MAX_VOICE_GAIN`]
+    /// (fuera del rango se acota; no finita cuenta como 1.0). Se aplica tras el procesado, así
+    /// que el control automático de ganancia no la deshace. Aparte del silencio del micrófono.
+    pub fn set_mic_gain(&self, gain: f32) {
+        let gain = if gain.is_finite() {
+            gain.clamp(0.0, MAX_VOICE_GAIN)
+        } else {
+            1.0
+        };
+        self.inner
+            .mic_gain
+            .0
+            .store(gain.to_bits(), Ordering::Release);
+    }
+
+    /// Ganancia lineal de la voz propia (1.0 si no se tocó).
+    pub fn mic_gain(&self) -> f32 {
+        f32::from_bits(self.inner.mic_gain.0.load(Ordering::Relaxed))
+    }
+
+    /// Cambia de micrófono en marcha, sin reconectar: el hilo de la voz abre `mic` antes de su
+    /// siguiente trama y suelta el anterior (si `mic` no abre, sigue con el anterior y avisa).
+    /// Sin voz en la sesión (se entró sin micrófono) no hace nada.
+    pub fn replace_mic(&self, mic: Box<dyn AudioSource>) {
+        self.inner.new_mic.put(mic);
+    }
+
+    /// Cambia de salida en marcha, sin reconectar: la reproducción suelta la anterior y abre
+    /// `speaker` (si no abre, vuelve a la anterior y avisa). `speaker` tiene que aceptar
+    /// [`AudioControl::speaker_format`].
+    pub fn replace_speaker(&self, speaker: Box<dyn AudioSink>) {
+        self.inner.new_speaker.put(speaker);
+    }
+
+    /// Formato de la salida en uso, para abrir otra igual ([`AudioControl::replace_speaker`]);
+    /// `None` si no suena nada en esta sesión.
+    pub fn speaker_format(&self) -> Option<AudioFormat> {
+        *lock(&self.inner.speaker_format)
     }
 
     /// Tecla de pulsar para hablar pulsada o soltada.
@@ -711,6 +798,16 @@ pub(crate) fn voice_capture_loop(
     let mut talking = false;
     let mut leaf = core.own_leaf.load(Ordering::Acquire);
     while !shared.stopping() {
+        if let Some(mut mic) = control.inner.new_mic.take() {
+            match mic.start(&AudioConfig::voice()) {
+                Ok(()) => {
+                    input.mic.stop();
+                    debug!(micrófono = %mic.describe(), "micrófono cambiado en marcha");
+                    input.mic = mic;
+                }
+                Err(err) => core.warn(format!("no se pudo cambiar de micrófono: {err}")),
+            }
+        }
         let captured_at = match read_packet(input.mic.as_mut(), frames, &mut frame, &mut pcm) {
             Ok(at) => at,
             Err(err) => {
@@ -728,6 +825,12 @@ pub(crate) fn voice_capture_loop(
             match processor.process(chunk) {
                 Ok(result) => voice |= result.speaking,
                 Err(err) => debug!(error = %err, "procesado de voz"),
+            }
+        }
+        let gain = control.mic_gain();
+        if gain != 1.0 {
+            for sample in pcm.iter_mut() {
+                *sample = (f32::from(*sample) * gain).clamp(-32768.0, 32767.0) as i16;
             }
         }
         timeline.mark(AudioStage::Processed, Instant::now());
@@ -1373,6 +1476,7 @@ pub(crate) fn play_loop(
         device: None,
         latency: coroom_audio::DEVICE_LATENCY,
     };
+    *lock(&control.inner.speaker_format) = Some(format);
     let closed = Arc::new(AtomicBool::new(false));
     let device = Arc::new(DeviceStats::default());
     let (links, housekeeper_links) = links();
@@ -1404,47 +1508,79 @@ pub(crate) fn play_loop(
         closed: Arc::clone(&closed),
     };
     let frame_len = coroom_audio::SAMPLES_PER_CHANNEL * usize::from(format.channels);
+    let speaker_control = housekeeper.control.clone();
     if sink.supports_pull() {
-        play_pull(core, sink.as_mut(), &config, playout, housekeeper, &closed);
+        play_pull(core, &mut sink, &config, playout, housekeeper, &closed);
     } else {
-        play_push(
-            core,
-            sink.as_mut(),
-            &config,
-            playout,
-            housekeeper,
-            frame_len,
-        );
+        play_push(core, &mut sink, &config, playout, housekeeper, frame_len);
+    }
+    *lock(&speaker_control.inner.speaker_format) = None;
+}
+
+/// Adopta la salida nueva pedida en marcha ([`AudioControl::replace_speaker`]): `restart`
+/// suelta la actual y abre la nueva (devuelve si abrió); si no abre, se vuelve a abrir la
+/// anterior y se avisa.
+fn swap_speaker(
+    core: &Core,
+    control: &AudioControl,
+    sink: &mut Box<dyn AudioSink>,
+    mut restart: impl FnMut(&mut dyn AudioSink) -> Result<(), coroom_audio::AudioError>,
+) {
+    let Some(mut next) = control.inner.new_speaker.take() else {
+        return;
+    };
+    if next.supports_pull() != sink.supports_pull() {
+        core.warn("no se pudo cambiar de salida: la nueva funciona de otra manera".to_owned());
+        return;
+    }
+    sink.stop();
+    match restart(next.as_mut()) {
+        Ok(()) => {
+            debug!(salida = %next.describe(), "salida cambiada en marcha");
+            *sink = next;
+        }
+        Err(err) => {
+            core.warn(format!("no se pudo cambiar de salida: {err}"));
+            if let Err(err) = restart(sink.as_mut()) {
+                core.warn(format!("sin salida de audio: {err}"));
+            }
+        }
     }
 }
 
 /// A demanda: el dispositivo llama a la reproducción desde su hilo; este, el de contadores.
 fn play_pull(
     core: &Core,
-    sink: &mut dyn AudioSink,
+    sink: &mut Box<dyn AudioSink>,
     config: &AudioConfig,
     playout: Playout,
     mut housekeeper: Housekeeper,
     closed: &AtomicBool,
 ) {
-    // Solo el dispositivo lo toma mientras suena (este hilo, al final): el cerrojo no se disputa.
+    // Solo el dispositivo lo toma mientras suena (este hilo, al final): el cerrojo no se disputa
+    // (salvo un instante al cambiar de salida, con la anterior ya parada).
     let playout = Arc::new(Mutex::new(playout));
-    let device = Arc::clone(&playout);
-    let render: Render = Box::new(move |out, played_at| {
-        let mut playout = lock(&device);
-        let decided = Instant::now();
-        if playout.fill(out, decided) {
-            playout.played(out, decided, played_at);
-        } else {
-            out.fill(0);
-        }
-    });
-    if let Err(err) = sink.start_pull(config, render) {
+    let render = || -> Render {
+        let device = Arc::clone(&playout);
+        Box::new(move |out, played_at| {
+            let mut playout = lock(&device);
+            let decided = Instant::now();
+            if playout.fill(out, decided) {
+                playout.played(out, decided, played_at);
+            } else {
+                out.fill(0);
+            }
+        })
+    };
+    if let Err(err) = sink.start_pull(config, render()) {
         core.warn(format!("sin salida de audio: {err}"));
         return;
     }
     debug!(salida = %sink.describe(), "reproducción de audio a demanda");
     while !core.shared.stopping() && !closed.load(Ordering::Acquire) {
+        swap_speaker(core, &housekeeper.control, sink, |next| {
+            next.start_pull(config, render())
+        });
         if let Err(err) = sink.check() {
             core.warn(format!("la salida de audio se detuvo: {err}"));
             break;
@@ -1461,7 +1597,7 @@ fn play_pull(
 /// Con la cola del sumidero: se espera su sitio y después se decide qué suena.
 fn play_push(
     core: &Core,
-    sink: &mut dyn AudioSink,
+    sink: &mut Box<dyn AudioSink>,
     config: &AudioConfig,
     mut playout: Playout,
     mut housekeeper: Housekeeper,
@@ -1473,6 +1609,7 @@ fn play_push(
     }
     debug!(salida = %sink.describe(), "reproducción de audio");
     let device = Arc::clone(&housekeeper.device);
+    let control = housekeeper.control.clone();
     let done_flag = AtomicBool::new(false);
     let done = &done_flag;
     std::thread::scope(|scope| {
@@ -1496,6 +1633,7 @@ fn play_push(
         realtime("audio-play");
         let mut out = [0i16; MAX_FRAME_SAMPLES];
         while !core.shared.stopping() {
+            swap_speaker(core, &control, sink, |next| next.start(config));
             if let Err(err) = sink.wait_ready() {
                 core.warn(format!("la salida de audio se detuvo: {err}"));
                 break;
@@ -1743,6 +1881,25 @@ mod tests {
         control.set_voice_muted(999, true);
         assert!(control.voice_muted(999));
         assert_eq!(control.voice_gain(999), 0.75);
+    }
+
+    #[test]
+    fn the_mic_gain_and_device_swaps_wait_for_their_thread() {
+        let control = AudioControl::default();
+        assert_eq!(control.mic_gain(), 1.0, "de partida, lo normal");
+        control.set_mic_gain(1.5);
+        assert_eq!(control.mic_gain(), 1.5);
+        control.set_mic_gain(9.0);
+        assert_eq!(control.mic_gain(), MAX_VOICE_GAIN, "se acota");
+        control.set_mic_gain(f32::NAN);
+        assert_eq!(control.mic_gain(), 1.0, "no finita cuenta como normal");
+        // Un micrófono pedido en marcha lo recoge el hilo de la voz una sola vez.
+        assert!(control.inner.new_mic.take().is_none());
+        control.replace_mic(Box::new(coroom_audio::synthetic::ToneSource::new(440.0, 1)));
+        assert!(control.inner.new_mic.take().is_some());
+        assert!(control.inner.new_mic.take().is_none());
+        // Sin nada sonando no hay formato de salida que imitar.
+        assert_eq!(control.speaker_format(), None);
     }
 
     #[test]

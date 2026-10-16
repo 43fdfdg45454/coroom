@@ -20,19 +20,25 @@ use coroom_transport::proto::PROTOCOL_VERSION;
 use coroom_transport::proto::api::Devices;
 use coroom_ui::Element;
 use coroom_ui::icon::{Icon, icon_with};
-use coroom_ui::style::{ButtonClass, ContainerClass, SvgClass, TextClass};
+use coroom_ui::style::{
+    ButtonClass, ContainerClass, ProgressClass, SliderClass, SvgClass, TextClass,
+};
 use coroom_ui::tag;
 use coroom_ui::theme::{Accent, Tone};
 use coroom_ui::tokens::{space, text as type_size};
 use coroom_ui::widget::{self as ui, Kind};
 use iced_core::text::Wrapping;
 use iced_core::{Alignment, Length, Padding};
-use iced_widget::{Column, Row, button, column, container, row, text};
+use iced_widget::{Column, Row, button, column, container, progress_bar, row, text};
 
 use crate::portal::{REMEMBERS_SHARE_PERMISSION, RestoreTokens};
-use crate::ui::app::{App, AudioDevice, Dialog, Effect, Event, Load, Message, Page, Screen};
+use crate::ui::app::{
+    App, AudioDevice, Dialog, Effect, Event, Load, Message, MicTest, Page, Screen,
+};
 use crate::ui::screens::diagnostics;
-use crate::ui::settings::{Shortcuts, ThemeChoice, VoiceMode};
+use crate::ui::settings::{
+    DEFAULT_VOICE_VOLUME, MAX_VOICE_VOLUME, Shortcuts, ThemeChoice, VoiceMode, voice_gain,
+};
 use crate::ui::sound;
 
 /// Cada cuánto se vuelve a pedir la lista de micrófonos y salidas con «Audio y voz» abierta.
@@ -131,6 +137,12 @@ pub struct State {
     pub chat_sound_picking: bool,
     /// Error de la última elección del tono (fichero que no vale o selector que falló).
     pub chat_sound_error: Option<String>,
+    /// La prueba del micrófono en marcha: el último nivel (0-1).
+    pub mic_test: Option<f32>,
+    /// Oírse durante la prueba del micrófono.
+    pub mic_test_hear: bool,
+    /// Por qué paró la última prueba del micrófono.
+    pub mic_test_error: Option<String>,
 }
 
 /// Mensajes.
@@ -183,6 +195,16 @@ pub enum Msg {
     ChatNotifications(bool),
     /// Burbuja sobre el vídeo.
     ChatBubbles(bool),
+    /// Empezar o parar la prueba del micrófono.
+    MicTest(bool),
+    /// Oírse (o no) durante la prueba del micrófono.
+    MicTestHear(bool),
+    /// Volumen de la voz propia (porcentaje), mientras se arrastra.
+    MicVolume(u8),
+    /// Al soltar el deslizador de la voz propia.
+    MicVolumeDone,
+    /// Como invitado, quién habla sobre el vídeo.
+    TalkingOverlay(bool),
     /// Como invitado, volver a enviar el último mando que se conecte.
     PadAuto,
     /// Ranura que se ofrece primero al dar mando.
@@ -256,7 +278,7 @@ fn page_effects(app: &mut App, page: SettingsPage) -> Vec<Effect> {
 }
 
 /// Pide la lista de audio (si no está ya pedida); la anterior se sigue viendo mientras.
-fn request_audio(app: &mut App) -> Vec<Effect> {
+pub(crate) fn request_audio(app: &mut App) -> Vec<Effect> {
     let state = &mut app.settings_page;
     if state.audio_refreshing {
         return Vec::new();
@@ -356,8 +378,23 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
             return Vec::new();
         }
-        Msg::Speaker(choice) => settings.audio.speaker = choice.value,
-        Msg::Microphone(choice) => settings.audio.microphone = choice.value,
+        Msg::Speaker(choice) => {
+            settings.audio.speaker = choice.value.clone();
+            let mut effects = switch_device(app, false, choice.value);
+            if app.settings_page.mic_test.is_some() && app.settings_page.mic_test_hear {
+                effects.push(Effect::MicTest(Some(mic_test(app))));
+            }
+            return effects;
+        }
+        Msg::Microphone(choice) => {
+            settings.audio.microphone = choice.value.clone();
+            let mut effects = switch_device(app, true, choice.value);
+            // La prueba sigue con el micrófono nuevo.
+            if app.settings_page.mic_test.is_some() {
+                effects.push(Effect::MicTest(Some(mic_test(app))));
+            }
+            return effects;
+        }
         Msg::HostVoice(on) => settings.audio.host_voice = on,
         Msg::PushToTalk(on) => {
             settings.audio.voice_mode = if on {
@@ -407,6 +444,33 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         }
         Msg::ChatNotifications(on) => settings.room.chat_notifications = on,
         Msg::ChatBubbles(on) => settings.room.chat_bubbles = on,
+        Msg::TalkingOverlay(on) => settings.room.talking_overlay = on,
+        Msg::MicTest(on) => {
+            app.settings_page.mic_test_error = None;
+            app.settings_page.mic_test = on.then_some(0.0);
+            return vec![Effect::MicTest(on.then(|| mic_test(app)))];
+        }
+        Msg::MicTestHear(hear) => {
+            app.settings_page.mic_test_hear = hear;
+            // Se vuelve a abrir con la salida o sin ella.
+            if app.settings_page.mic_test.is_some() {
+                return vec![Effect::MicTest(Some(mic_test(app)))];
+            }
+            return Vec::new();
+        }
+        Msg::MicVolume(percent) => {
+            settings.audio.mic_volume = percent.min(MAX_VOICE_VOLUME);
+            let gain = voice_gain(settings.audio.mic_volume);
+            let mut effects = Vec::new();
+            if app.host.room.is_some() || app.guest.is_some() {
+                effects.push(Effect::SetMicGain {
+                    host: app.host.room.is_some(),
+                    gain,
+                });
+            }
+            return effects;
+        }
+        Msg::MicVolumeDone => {}
         Msg::PadAuto => {
             settings.input.pad = PadChoice::Auto;
             let mut effects = app.settings_changed();
@@ -513,6 +577,29 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
         },
         Event::Doctor(lines) => {
             app.settings_page.doctor = Load::Loaded(lines);
+            Vec::new()
+        }
+        Event::MicLevel(result) => {
+            let state = &mut app.settings_page;
+            if state.mic_test.is_none() {
+                // Llegó tarde, tras pararla.
+                return Vec::new();
+            }
+            match result {
+                Ok(level) => {
+                    state.mic_test = Some(level);
+                    // Fuera de «Audio y voz» la prueba se para sola.
+                    if !audio_visible(app) {
+                        app.settings_page.mic_test = None;
+                        return vec![Effect::MicTest(None)];
+                    }
+                }
+                Err(err) => {
+                    state.mic_test = None;
+                    state.mic_test_error = Some(err);
+                    return vec![Effect::MicTest(None)];
+                }
+            }
             Vec::new()
         }
         Event::AudioDevices(result) => {
@@ -912,14 +999,53 @@ fn peers(app: &App) -> Element<'_, Message> {
 
 // --- Audio y voz ---------------------------------------------------------------------------------
 
+/// La prueba del micrófono con lo elegido ahora en Ajustes.
+fn mic_test(app: &App) -> MicTest {
+    let audio = &app.settings.audio;
+    MicTest {
+        mic: audio.microphone.clone(),
+        speaker: audio.speaker.clone(),
+        hear: app.settings_page.mic_test_hear,
+        gain: voice_gain(audio.mic_volume),
+    }
+}
+
+/// Guarda el micrófono o la salida elegidos y, con una sala abierta (compartiendo o de invitado),
+/// los cambia en ella al momento, sin reconectar.
+fn switch_device(app: &mut App, input: bool, device: Option<String>) -> Vec<Effect> {
+    let mut effects = app.settings_changed();
+    let host = app.host.room.is_some();
+    if host || app.guest.is_some() {
+        effects.push(Effect::SwitchAudioDevice {
+            host,
+            input,
+            device,
+        });
+    }
+    effects
+}
+
 /// Opciones de un selector de audio: «El del sistema», los de la lista y, si el elegido no está
 /// conectado, él también (para que se vea cuál era).
-fn device_choices(
+pub(crate) fn device_choices(
     devices: &[AudioDevice],
     input: bool,
     chosen: &Option<String>,
 ) -> Vec<Choice<Option<String>>> {
-    let mut out = vec![choice(None, t!("settings-el-del-sistema"))];
+    // El del sistema dice cuál es, si la plataforma lo sabe.
+    let system = devices
+        .iter()
+        .find(|device| device.input == input && device.default)
+        .map_or_else(
+            || t!("settings-el-del-sistema").to_owned(),
+            |device| {
+                t!(
+                    "settings-el-del-sistema-con",
+                    name = device.description.as_str()
+                )
+            },
+        );
+    let mut out = vec![choice(None, system)];
     out.extend(
         devices
             .iter()
@@ -975,6 +1101,23 @@ fn audio(app: &App) -> Element<'_, Message> {
             Some(t!("settings-microfono-ayuda").to_owned()),
             ui::select_fixed(mics, mic, |c| on(Msg::Microphone(c)), DEVICE_SELECT_WIDTH),
         ),
+        ui::pref_row(
+            t!("settings-volumen-de-tu-voz"),
+            Some(t!("settings-volumen-de-tu-voz-ayuda").to_owned()),
+            container(ui::slider(
+                0..=MAX_VOICE_VOLUME,
+                audio.mic_volume,
+                5,
+                DEFAULT_VOICE_VOLUME,
+                Some(Icon::Mic),
+                t!("settings-porcentaje", percent = audio.mic_volume),
+                SliderClass::Accent,
+                |value| on(Msg::MicVolume(value)),
+                Some(on(Msg::MicVolumeDone)),
+            ))
+            .width(Length::Fixed(DEVICE_SELECT_WIDTH)),
+        ),
+        mic_test_row(app),
         later_row(
             t!("settings-supresion-de-ruido"),
             Some(t!("settings-supresion-de-ruido-ayuda").to_owned()),
@@ -1058,6 +1201,68 @@ fn audio(app: &App) -> Element<'_, Message> {
     .into()
 }
 
+/// «Probar el micrófono»: el botón, el medidor de nivel mientras dura y «Oírte».
+fn mic_test_row(app: &App) -> Element<'_, Message> {
+    let state = &app.settings_page;
+    let running = state.mic_test.is_some();
+    let button = if running {
+        ui::button_with(
+            Kind::Normal,
+            t!("settings-parar-la-prueba"),
+            Some(Icon::Pause),
+            Some(on(Msg::MicTest(false))),
+        )
+    } else {
+        ui::button_with(
+            Kind::Normal,
+            t!("settings-probar"),
+            Some(Icon::Mic),
+            Some(on(Msg::MicTest(true))),
+        )
+    };
+    let level = state.mic_test.unwrap_or(0.0);
+    let meter = progress_bar(0.0..=1.0, level)
+        .length(Length::Fixed(DEVICE_SELECT_WIDTH - 140.0))
+        .girth(Length::Fixed(8.0))
+        .class(ProgressClass::Tone(if level > 0.9 {
+            Tone::Warning
+        } else {
+            Tone::Success
+        }));
+    let hear = row![
+        ui::switch(
+            state.mic_test_hear,
+            Some(|on_off| on(Msg::MicTestHear(on_off)))
+        ),
+        ui::caption(t!("settings-oirte")),
+    ]
+    .spacing(space::XS)
+    .align_y(Alignment::Center);
+    let mut help = column![
+        ui::secondary(t!("settings-probar-el-microfono-ayuda")).wrapping(Wrapping::WordOrGlyph)
+    ]
+    .spacing(2);
+    if let Some(err) = &state.mic_test_error {
+        help = help.push(
+            ui::caption(t!("settings-la-prueba-paro", err = err.as_str()))
+                .class(TextClass::Tone(Tone::Error))
+                .wrapping(Wrapping::WordOrGlyph),
+        );
+    }
+    ui::pref_row_with(
+        t!("settings-probar-el-microfono"),
+        help,
+        column![
+            row![button, hear]
+                .spacing(space::S)
+                .align_y(Alignment::Center),
+            meter
+        ]
+        .spacing(space::XS)
+        .align_x(Alignment::End),
+    )
+}
+
 /// Ancho de los selectores de audio (los nombres de los dispositivos son largos).
 const DEVICE_SELECT_WIDTH: f32 = 280.0;
 
@@ -1079,6 +1284,18 @@ fn room(app: &App) -> Element<'_, Message> {
     }
     column![
         ui::section(t!("settings-como-anfitrion"), None, as_host),
+        ui::section(
+            t!("settings-como-invitado"),
+            None,
+            vec![ui::pref_row(
+                t!("settings-quien-habla"),
+                Some(t!("settings-quien-habla-ayuda").to_owned()),
+                ui::switch(
+                    room.talking_overlay,
+                    Some(|on_off| on(Msg::TalkingOverlay(on_off))),
+                ),
+            )],
+        ),
         ui::section(
             t!("settings-chat-de-la-sala"),
             Some(t!("settings-chat-de-la-sala-ayuda").to_owned()),
@@ -1698,6 +1915,12 @@ pub(crate) mod shots {
             app.settings.audio.voice_mode = crate::ui::settings::VoiceMode::PushToTalk;
             app.settings.audio.push_to_talk_key = "V".to_owned();
         }),
+        ("17-ajustes-audio-prueba", |app| {
+            settings_page(app, SettingsPage::Audio);
+            app.update(Message::Settings(super::Msg::MicTestHear(true)));
+            app.update(Message::Settings(super::Msg::MicTest(true)));
+            app.update(Message::Event(Event::MicLevel(Ok(0.62))));
+        }),
         ("18-ajustes-sala", |app| {
             settings_page(app, SettingsPage::Room);
             app.settings.room.chat_sound_file =
@@ -1807,6 +2030,12 @@ mod tests {
         assert!(!app.settings.room.chat_notifications);
         change(&mut app, Msg::ChatBubbles(false));
         assert!(!app.settings.room.chat_bubbles);
+        assert!(
+            app.settings.room.talking_overlay,
+            "de partida se ve quién habla"
+        );
+        change(&mut app, Msg::TalkingOverlay(false));
+        assert!(!app.settings.room.talking_overlay);
         change(&mut app, Msg::PreferredSlot(choice(2, "Ranura 2")));
         assert_eq!(app.settings.input.preferred_slot, 2);
         change(&mut app, Msg::Theme(ThemeChoice::Dark));

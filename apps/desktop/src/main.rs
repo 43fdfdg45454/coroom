@@ -329,11 +329,6 @@ struct HostArgs {
           value_parser = clap::value_parser!(u32).range(1..=240))]
     fps: u32,
 
-    /// Bitrate máximo en kbit/s (por defecto 10000); el control de tasa lo baja si hace falta.
-    #[arg(long = "bitrate-kbps", default_value_t = 10_000, hide_default_value = true,
-          value_name = "KBIT/S", value_parser = clap::value_parser!(u32).range(100..=500_000))]
-    bitrate_kbps: u32,
-
     /// Termina tras enviar N fotogramas (por defecto, al pulsar Intro).
     #[arg(long, value_name = "N")]
     frames: Option<u64>,
@@ -628,7 +623,8 @@ impl HostArgs {
                 width: self.width,
                 height: self.height,
                 fps: self.fps,
-                bitrate_kbps: self.bitrate_kbps,
+                // Sin tope: el control de tasa de cada invitado sube hasta lo que da su enlace.
+                bitrate_kbps: coroom_session::remote::UNLIMITED_KBPS,
                 frames: self.frames.filter(|n| *n > 0),
                 yuv444: self.yuv444,
                 hdr: self.hdr,
@@ -1064,13 +1060,12 @@ fn host(args: &HostArgs) -> ExitCode {
         }
     };
     eprintln!(
-        "Anfitrión: fuente {}, {}×{} a {} fps, hasta {} kbit/s; audio: {}{}; identidad en \
+        "Anfitrión: fuente {}, {}×{} a {} fps, bitrate automático; audio: {}{}; identidad en \
          {place}.",
         options.source.label(),
         options.video.width,
         options.video.height,
         options.video.fps,
-        options.video.bitrate_kbps,
         options.audio.game,
         if options.audio.voice { ", con voz" } else { "" }
     );

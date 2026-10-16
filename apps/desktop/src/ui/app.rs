@@ -250,21 +250,23 @@ pub enum Event {
     Doctor(Vec<String>),
     /// Micrófonos y salidas.
     AudioDevices(Result<Vec<AudioDevice>, String>),
+    /// Prueba del micrófono: el nivel (0-1, el pico de los últimos 50 ms) o por qué paró.
+    MicLevel(Result<f32, String>),
     /// Anfitrión: la sala está arrancando (con su vista previa) o no pudo.
     HostStarted(Result<Arc<VideoFeed>, String>),
     /// Anfitrión: un evento de la sesión.
     Host(SessionEvent),
     /// Anfitrión: estado de los invitados.
-    HostGuests(Vec<GuestStatus>),
+    HostGuests(Vec<GuestStatus>, HostVoice),
     /// Anfitrión: la vista previa no está disponible (captura en la GPU).
     PreviewUnavailable,
     /// Anfitrión: la sala se cerró (`Some` con el motivo si fue un error).
     HostEnded(Option<String>),
     /// Anfitrión: se cambió lo que se comparte con la sala abierta, o no se pudo.
     SourceSwitched(Result<(), String>),
-    /// Anfitrión: la sala abierta ya usa el tope del bitrate (kbit/s) o la codificación de los
-    /// ajustes (códec, codificador, resolución máxima y fps; `Ok(None)`), o no se pudo.
-    VideoChanged(Result<Option<u32>, String>),
+    /// Anfitrión: la sala abierta ya usa la codificación de los ajustes (códec, codificador,
+    /// resolución máxima y fps), o no se pudo.
+    VideoChanged(Result<(), String>),
     /// Invitado: la sesión arrancó (con la fuente del vídeo) o no pudo.
     GuestStarted(Result<Arc<VideoFeed>, String>),
     /// Invitado: un evento de la sesión.
@@ -309,6 +311,30 @@ pub struct AudioDevice {
     pub input: bool,
     /// Si es el del sistema.
     pub default: bool,
+}
+
+/// Prueba del micrófono de Ajustes ([`Effect::MicTest`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MicTest {
+    /// Micrófono (`None`: el del sistema).
+    pub mic: Option<String>,
+    /// Salida para oírse (`None`: la del sistema).
+    pub speaker: Option<String>,
+    /// Oírse por la salida mientras se prueba.
+    pub hear: bool,
+    /// Volumen de la voz propia (ganancia lineal), el mismo que se envía en la sala.
+    pub gain: f32,
+}
+
+/// La voz del anfitrión en su sala, con cada lista de invitados.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostVoice {
+    /// Si comparte el micrófono en esta sala.
+    pub enabled: bool,
+    /// Micrófono silenciado.
+    pub mic_muted: bool,
+    /// Quién habla ahora (ids de invitado; 0 = el anfitrión).
+    pub talkers: Vec<u32>,
 }
 
 /// Mensaje de la interfaz.
@@ -439,9 +465,6 @@ pub enum Effect {
     SwitchSource(HostRequest),
     /// Cambiar qué aplicaciones suenan en la sala abierta.
     SetAppAudio(coroom_session::audio::GameCapture),
-    /// Aplicar a la sala abierta el tope del bitrate (kbit/s) de los ajustes: el control de tasa
-    /// lo usa enseguida, sin renegociar nada.
-    SetMaxBitrate(u32),
     /// Anfitrión: si la vista previa de la sala está a la vista (página Compartir, ventana sin ocultar).
     PreviewVisible(bool),
     /// Aplicar a la sala abierta la codificación de los ajustes: códec, codificador, resolución
@@ -485,6 +508,30 @@ pub enum Effect {
         source: u32,
         /// Ganancia.
         gain: f32,
+    },
+    /// Silenciar o no el micrófono propio para toda la sala.
+    SetMicMuted {
+        /// Si es la sala que este equipo comparte.
+        host: bool,
+        /// Silenciado.
+        muted: bool,
+    },
+    /// Volumen de la voz propia que se envía: ganancia lineal, 1.0 lo normal y 2.0 el doble.
+    SetMicGain {
+        /// Si es la sala que este equipo comparte.
+        host: bool,
+        /// Ganancia.
+        gain: f32,
+    },
+    /// Cambiar de micrófono (`input`) o de salida en la sala abierta, sin reconectar
+    /// (`None`: el del sistema).
+    SwitchAudioDevice {
+        /// Si es la sala que este equipo comparte.
+        host: bool,
+        /// Micrófono (`true`) o salida.
+        input: bool,
+        /// Nombre del dispositivo.
+        device: Option<String>,
     },
     /// Volumen del audio del juego en este equipo, como invitado (el anfitrión no lo oye por
     /// coroom): ganancia lineal, 1.0 lo normal y 2.0 el doble
@@ -535,6 +582,8 @@ pub enum Effect {
     RunDoctor,
     /// Dispositivos de audio.
     LoadAudioDevices,
+    /// Empezar (`Some`) o parar la prueba del micrófono de Ajustes.
+    MicTest(Option<MicTest>),
     /// Buscar una versión nueva.
     CheckUpdates,
     /// Abrir un enlace en el navegador.
@@ -1311,12 +1360,13 @@ impl App {
                 diagnostics::on_event(self, &event);
                 settings_screen::on_event(self, event)
             }
-            Event::Devices(_) | Event::DeviceRevoked(_) | Event::AudioDevices(_) => {
-                settings_screen::on_event(self, event)
-            }
+            Event::Devices(_)
+            | Event::DeviceRevoked(_)
+            | Event::AudioDevices(_)
+            | Event::MicLevel(_) => settings_screen::on_event(self, event),
             Event::HostStarted(_)
             | Event::Host(_)
-            | Event::HostGuests(_)
+            | Event::HostGuests(..)
             | Event::PreviewUnavailable
             | Event::HostEnded(_)
             | Event::SourceSwitched(_)

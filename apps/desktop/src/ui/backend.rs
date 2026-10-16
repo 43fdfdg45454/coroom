@@ -27,8 +27,8 @@ use coroom_transport::proto::signal::SignalMessage;
 use coroom_transport::{Endpoint, EndpointOptions, SignalClient};
 
 use super::app::{
-    AccountInfo, App, AudioDevice, Effect, Event, GuestEnd, HostRequest, Invitation, Message,
-    VideoSupport,
+    AccountInfo, App, AudioDevice, Effect, Event, GuestEnd, HostRequest, HostVoice, Invitation,
+    Message, MicTest, VideoSupport,
 };
 use super::compose::Compositor;
 use super::screens::guest::Stats;
@@ -120,6 +120,8 @@ pub struct Backend {
     /// El guardado de ajustes en curso, si lo hay: se espera antes del siguiente (así nunca hay dos
     /// escribiendo el mismo temporal) y al cerrar (para que el último llegue al disco).
     settings_save: Option<thread::JoinHandle<()>>,
+    /// La prueba del micrófono en marcha: se para poniendo el aviso.
+    mic_test: Option<Arc<AtomicBool>>,
 }
 
 /// Lo que este equipo hace con 4:4:4 y HDR (sondea los códecs la primera vez).
@@ -196,6 +198,7 @@ impl Backend {
             hdr_display: None,
             compositor,
             settings_save: None,
+            mic_test: None,
         }
     }
 
@@ -257,6 +260,18 @@ impl Backend {
     /// Mandos del invitado, cuando su sesión ya arrancó.
     pub fn guest_controls(&self) -> Option<GuestControls> {
         lock(&self.guest).as_ref().map(|run| run.controls.clone())
+    }
+
+    /// Mandos del audio de la sala abierta: la que comparte este equipo (`host`) o en la que está
+    /// de invitado.
+    fn room_audio(&self, host: bool) -> Option<AudioControl> {
+        if host {
+            lock(&self.host)
+                .clone()
+                .map(|session| lock(&session).audio())
+        } else {
+            self.guest_controls().map(|controls| controls.audio)
+        }
     }
 
     /// Hace `effect`. `app` da el contexto (cuenta, ajustes).
@@ -355,7 +370,6 @@ impl Backend {
                     (self.notify)(Message::Event(Event::Failed(err.to_string())));
                 }
             }
-            Effect::SetMaxBitrate(kbps) => self.set_video(VideoRequest::MaxBitrate(kbps)),
             Effect::PreviewVisible(visible) => self.set_preview_visible(visible),
             Effect::SetEncoding => self.set_video(VideoRequest::Encoding {
                 codec: codec_preference(app.settings.video.codec),
@@ -385,28 +399,54 @@ impl Backend {
                 source,
                 muted,
             } => {
-                let audio = if host {
-                    lock(&self.host)
-                        .clone()
-                        .map(|session| lock(&session).audio())
-                } else {
-                    self.guest_controls().map(|controls| controls.audio)
-                };
-                if let Some(audio) = audio {
+                if let Some(audio) = self.room_audio(host) {
                     audio.set_voice_muted(source, muted);
                 }
             }
             Effect::SetVoiceGain { host, source, gain } => {
-                let audio = if host {
-                    lock(&self.host)
-                        .clone()
-                        .map(|session| lock(&session).audio())
-                } else {
-                    self.guest_controls().map(|controls| controls.audio)
-                };
-                if let Some(audio) = audio {
+                if let Some(audio) = self.room_audio(host) {
                     audio.set_voice_gain(source, gain);
                 }
+            }
+            Effect::SetMicMuted { host, muted } => {
+                if let Some(audio) = self.room_audio(host) {
+                    audio.set_mic_muted(muted);
+                }
+            }
+            Effect::SetMicGain { host, gain } => {
+                if let Some(audio) = self.room_audio(host) {
+                    audio.set_mic_gain(gain);
+                }
+            }
+            Effect::SwitchAudioDevice {
+                host,
+                input,
+                device,
+            } => {
+                let Some(audio) = self.room_audio(host) else {
+                    return;
+                };
+                self.spawn("dispositivo", move |notify| {
+                    let result = if input {
+                        coroom_session::audio::mic_source(device.as_deref())
+                            .map(|mic| audio.replace_mic(mic))
+                            .map_err(|err| err.to_string())
+                    } else {
+                        match audio.speaker_format() {
+                            Some(format) => {
+                                coroom_session::audio::playback_sink(device.as_deref(), format)
+                                    .map(|sink| audio.replace_speaker(sink))
+                                    .map_err(|err| err.to_string())
+                            }
+                            // Sin salida en marcha no hay nada que cambiar: se usará al entrar.
+                            None => Ok(()),
+                        }
+                    };
+                    if let Err(err) = result {
+                        tracing::warn!(error = %err, input, "no se pudo cambiar de dispositivo");
+                        notify(Message::Event(Event::Failed(err)));
+                    }
+                });
             }
             Effect::SetGameGain { gain } => {
                 if let Some(controls) = self.guest_controls() {
@@ -510,6 +550,18 @@ impl Backend {
                 let lines = crate::doctor::report().unwrap_or_else(|err| vec![err]);
                 notify(Message::Event(Event::Doctor(lines)));
             }),
+            Effect::MicTest(request) => {
+                if let Some(stop) = self.mic_test.take() {
+                    stop.store(true, Ordering::Release);
+                }
+                if let Some(request) = request {
+                    let stop = Arc::new(AtomicBool::new(false));
+                    self.mic_test = Some(Arc::clone(&stop));
+                    self.spawn("prueba-micro", move |notify| {
+                        run_mic_test(&request, &stop, &notify);
+                    });
+                }
+            }
             Effect::LoadAudioDevices => self.spawn("audio", |notify| {
                 use coroom_session::audio::DeviceKind;
                 let result = coroom_session::audio::list_devices()
@@ -671,9 +723,8 @@ impl Backend {
         }
     }
 
-    /// Un cambio de vídeo a la sala abierta: solo el tope del bitrate (enseguida, sin
-    /// renegociar) o el códec, el codificador, la resolución máxima y los fps de los ajustes
-    /// (renegocia con los invitados y reabre el codificador con un intra).
+    /// Un cambio de vídeo a la sala abierta: el códec, el codificador, la resolución máxima y los
+    /// fps de los ajustes (renegocia con los invitados y reabre el codificador con un intra).
     fn set_video(&self, request: VideoRequest) {
         let Some(session) = lock(&self.host).clone() else {
             tracing::warn!("cambio de vídeo sin sala abierta");
@@ -682,15 +733,6 @@ impl Backend {
         let control = lock(&session).host_control();
         self.spawn("video", move |notify| {
             let changed = match request {
-                VideoRequest::MaxBitrate(max_kbps) => control
-                    .and_then(|control| {
-                        control.set_video(coroom_session::remote::VideoChange {
-                            max_kbps: Some(max_kbps),
-                            ..Default::default()
-                        })
-                    })
-                    .map(|()| Some(max_kbps))
-                    .map_err(|err| err.to_string()),
                 VideoRequest::Encoding {
                     codec,
                     encoder,
@@ -708,7 +750,6 @@ impl Backend {
                                     fps: Some(fps),
                                 })
                             })
-                            .map(|()| None)
                             .map_err(|err| err.to_string())
                     })
                 }
@@ -791,7 +832,6 @@ impl Backend {
             width,
             height,
             fps = video.fps,
-            bitrate_kbps = video.max_bitrate_kbps,
             yuv444 = video.chroma_444,
             hdr = video.hdr,
             "abriendo la sala"
@@ -1273,21 +1313,116 @@ fn close_within<T: Send + 'static>(
     result
 }
 
+/// Cada cuánto llega el nivel de la prueba del micrófono a la pantalla.
+const MIC_LEVEL_PERIOD: Duration = Duration::from_millis(50);
+
+/// Nivel de una trama para el medidor: su RMS en una escala de −60 dBFS (0) a 0 dBFS (1), la que
+/// usan los medidores de voz de los escritorios.
+pub fn mic_level(samples: &[i16]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let energy: f64 = samples
+        .iter()
+        .map(|sample| {
+            let value = f64::from(*sample) / 32768.0;
+            value * value
+        })
+        .sum();
+    let rms = (energy / samples.len() as f64).sqrt();
+    if rms <= 0.0 {
+        return 0.0;
+    }
+    let db = 20.0 * rms.log10();
+    ((db + 60.0) / 60.0).clamp(0.0, 1.0) as f32
+}
+
+/// La prueba del micrófono: lee el micrófono con el volumen propio, avisa del nivel cada
+/// [`MIC_LEVEL_PERIOD`] y, si se pide, lo saca por la salida, hasta que se pare o falle.
+fn run_mic_test(request: &MicTest, stop: &AtomicBool, notify: &Notify) {
+    use coroom_session::audio::{AudioConfig, AudioFormat, DEVICE_LATENCY};
+    let fail = |err: String| notify(Message::Event(Event::MicLevel(Err(err))));
+    let mut mic = match coroom_session::audio::mic_source(request.mic.as_deref()) {
+        Ok(mic) => mic,
+        Err(err) => return fail(err.to_string()),
+    };
+    if let Err(err) = mic.start(&AudioConfig::voice()) {
+        return fail(err.to_string());
+    }
+    let mut speaker = None;
+    if request.hear {
+        let config = AudioConfig {
+            format: AudioFormat::VOICE,
+            device: None,
+            latency: DEVICE_LATENCY,
+        };
+        match coroom_session::audio::playback_sink(request.speaker.as_deref(), AudioFormat::VOICE)
+            .and_then(|mut sink| sink.start(&config).map(|()| sink))
+        {
+            Ok(sink) => speaker = Some(sink),
+            Err(err) => {
+                mic.stop();
+                return fail(err.to_string());
+            }
+        }
+    }
+    let gain = request.gain.clamp(0.0, 2.0);
+    let mut frame = Vec::new();
+    let mut peak = 0.0f32;
+    let mut last = Instant::now();
+    while !stop.load(Ordering::Acquire) {
+        if let Err(err) = mic.read(&mut frame) {
+            fail(err.to_string());
+            break;
+        }
+        if gain != 1.0 {
+            for sample in &mut frame {
+                *sample = (f32::from(*sample) * gain).clamp(-32768.0, 32767.0) as i16;
+            }
+        }
+        peak = peak.max(mic_level(&frame));
+        if let Some(sink) = speaker.as_mut()
+            && let Err(err) = sink.write(&frame)
+        {
+            fail(err.to_string());
+            break;
+        }
+        if last.elapsed() >= MIC_LEVEL_PERIOD {
+            notify(Message::Event(Event::MicLevel(Ok(peak))));
+            peak = 0.0;
+            last = Instant::now();
+        }
+    }
+    mic.stop();
+    if let Some(mut sink) = speaker {
+        sink.stop();
+    }
+}
+
 /// Estado de los invitados del anfitrión cada [`HOST_STATUS_PERIOD`] mientras la sala siga.
 fn poll_host_guests(session: std::sync::Weak<Mutex<RemoteSession>>, notify: Notify) {
     let spawned = thread::Builder::new()
         .name("coroom-invitados".into())
         .spawn(move || {
             while let Some(session) = session.upgrade() {
-                let (finished, guests) = {
+                let (finished, guests, audio) = {
                     let session = lock(&session);
-                    (session.is_finished(), session.guests())
+                    (session.is_finished(), session.guests(), session.audio())
                 };
                 drop(session);
                 if finished {
                     return;
                 }
-                notify(Message::Event(Event::HostGuests(guests)));
+                let mut talkers = audio.talkers();
+                if audio.speaking() && !talkers.contains(&0) {
+                    talkers.insert(0, 0);
+                }
+                let voice = HostVoice {
+                    enabled: audio.voice_enabled(),
+                    mic_muted: audio.mic_muted(),
+                    talkers,
+                };
+                notify(Message::Event(Event::HostGuests(guests, voice)));
                 thread::sleep(HOST_STATUS_PERIOD);
             }
         });
@@ -1621,8 +1756,6 @@ fn lobby_once(
 /// Qué cambiar del vídeo de la sala abierta ([`Backend::set_video`]).
 #[derive(Debug, Clone, Copy)]
 enum VideoRequest {
-    /// Tope del bitrate en kbit/s.
-    MaxBitrate(u32),
     /// Lo que reabre el codificador: códec preferido (`None`: el mejor común), codificador,
     /// resolución máxima (ancho × alto) y fps.
     Encoding {
@@ -1657,7 +1790,8 @@ fn host_video(settings: &Settings) -> coroom_session::loopback::LoopbackConfig {
         width,
         height,
         fps: video.fps,
-        bitrate_kbps: video.max_bitrate_kbps,
+        // Sin tope: el control de tasa de cada invitado sube hasta lo que da su enlace.
+        bitrate_kbps: coroom_session::remote::UNLIMITED_KBPS,
         frames: None,
         yuv444: video.chroma_444,
         hdr: video.hdr,

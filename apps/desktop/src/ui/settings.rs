@@ -175,19 +175,16 @@ impl QualityPreset {
             QualityPreset::MinLatency => {
                 video.max_resolution = Resolution::P1080;
                 video.fps = 60;
-                video.max_bitrate_kbps = 10_000;
                 video.chroma_444 = false;
             }
             QualityPreset::Balanced => {
                 video.max_resolution = Resolution::P2160;
                 video.fps = 60;
-                video.max_bitrate_kbps = 20_000;
                 video.chroma_444 = false;
             }
             QualityPreset::MaxQuality => {
                 video.max_resolution = Resolution::P2160;
                 video.fps = 120;
-                video.max_bitrate_kbps = coroom_session::remote::UNLIMITED_KBPS;
                 video.chroma_444 = true;
             }
             QualityPreset::Custom => {}
@@ -204,7 +201,6 @@ impl QualityPreset {
                 preset.apply(&mut probe);
                 probe.max_resolution == video.max_resolution
                     && probe.fps == video.fps
-                    && probe.max_bitrate_kbps == video.max_bitrate_kbps
                     && probe.chroma_444 == video.chroma_444
             })
             .unwrap_or(QualityPreset::Custom)
@@ -229,8 +225,6 @@ pub enum VideoOption {
     Fps,
     /// Códec (y codificador).
     Codec,
-    /// Tope del bitrate Auto.
-    Bitrate,
     /// Croma 4:4:4.
     Chroma444,
     /// HDR10.
@@ -243,8 +237,6 @@ pub enum VideoOption {
 pub struct Video {
     /// Códec preferido.
     pub codec: CodecChoice,
-    /// Bitrate máximo en kbit/s (el control de tasa lo baja si hace falta).
-    pub max_bitrate_kbps: u32,
     /// Fotogramas por segundo (30, 60 o 120).
     pub fps: u32,
     /// Resolución máxima.
@@ -270,7 +262,6 @@ impl Default for Video {
     fn default() -> Self {
         Self {
             codec: CodecChoice::Auto,
-            max_bitrate_kbps: 20_000,
             fps: 60,
             max_resolution: Resolution::P2160,
             chroma_444: false,
@@ -285,15 +276,11 @@ impl Default for Video {
 
 impl Video {
     /// Cuándo surte efecto cada opción: el códec, la resolución máxima y los fps se cambian con
-    /// la sala abierta (se reabre el codificador con un intra) y el tope del bitrate también (sin
-    /// renegociar nada); 4:4:4 y HDR, al abrir la próxima (cambian cómo se pide la captura, en
+    /// la sala abierta (se reabre el codificador con un intra); 4:4:4 y HDR, al abrir la próxima (cambian cómo se pide la captura, en
     /// GPU o en CPU, y eso solo se decide al arrancarla).
     pub fn when(option: VideoOption) -> When {
         match option {
-            VideoOption::Codec
-            | VideoOption::Bitrate
-            | VideoOption::Resolution
-            | VideoOption::Fps => When::Live,
+            VideoOption::Codec | VideoOption::Resolution | VideoOption::Fps => When::Live,
             VideoOption::Chroma444 | VideoOption::Hdr => When::NextRoom,
         }
     }
@@ -313,6 +300,8 @@ pub struct Room {
     pub chat_notifications: bool,
     /// Burbuja de 5 s sobre el vídeo con el panel cerrado.
     pub chat_bubbles: bool,
+    /// Como invitado, quién está hablando arriba a la izquierda del vídeo.
+    pub talking_overlay: bool,
 }
 
 impl Default for Room {
@@ -323,6 +312,7 @@ impl Default for Room {
             chat_sound_file: None,
             chat_notifications: true,
             chat_bubbles: true,
+            talking_overlay: true,
         }
     }
 }
@@ -367,6 +357,9 @@ pub struct Audio {
     /// Volumen del audio del juego como invitado, en porcentaje (0-200; 100 lo normal), aparte
     /// del de cada voz y de silenciarlo. Se aplica al entrar en una sala.
     pub game_volume: u8,
+    /// Volumen de la voz propia que se envía (lo alto que te oyen los demás), en porcentaje
+    /// (0-200; 100 lo normal), se comparta o se esté de invitado.
+    pub mic_volume: u8,
 }
 
 /// Volumen normal de una voz (porcentaje).
@@ -422,6 +415,7 @@ impl Default for Audio {
             host_voice: true,
             voice_volumes: BTreeMap::new(),
             game_volume: DEFAULT_VOICE_VOLUME,
+            mic_volume: DEFAULT_VOICE_VOLUME,
         }
     }
 }
@@ -595,29 +589,12 @@ pub struct Settings {
 /// Valores admitidos de fps.
 pub const FPS_CHOICES: [u32; 3] = [30, 60, 120];
 
-/// Topes del bitrate que se ofrecen (kbit/s). El último es «sin tope»
-/// ([`coroom_session::remote::UNLIMITED_KBPS`]): Auto sube hasta donde la red aguante.
-pub const BITRATE_CHOICES: [u32; 8] = [
-    5_000,
-    10_000,
-    20_000,
-    30_000,
-    50_000,
-    80_000,
-    150_000,
-    coroom_session::remote::UNLIMITED_KBPS,
-];
-
 impl Settings {
     /// Corrige valores fuera de rango (por ejemplo, de una edición a mano).
     pub fn sanitized(mut self) -> Self {
         if !FPS_CHOICES.contains(&self.video.fps) {
             self.video.fps = Video::default().fps;
         }
-        self.video.max_bitrate_kbps = self
-            .video
-            .max_bitrate_kbps
-            .clamp(500, coroom_session::remote::UNLIMITED_KBPS);
         if self.video.preset != QualityPreset::Custom
             && QualityPreset::matching(&self.video) != self.video.preset
         {
@@ -640,6 +617,7 @@ impl Settings {
             .voice_volumes
             .retain(|_, volume| *volume != DEFAULT_VOICE_VOLUME);
         self.audio.game_volume = self.audio.game_volume.min(MAX_VOICE_VOLUME);
+        self.audio.mic_volume = self.audio.mic_volume.min(MAX_VOICE_VOLUME);
         let mut seen = std::collections::BTreeSet::new();
         self.servers
             .retain(|server| seen.insert(server.url.clone()));
@@ -934,15 +912,10 @@ mod tests {
         assert_eq!(QualityPreset::matching(&video), QualityPreset::Balanced);
         QualityPreset::MinLatency.apply(&mut video);
         assert_eq!(video.max_resolution, Resolution::P1080);
-        assert_eq!(video.max_bitrate_kbps, 10_000);
         assert_eq!(video.preset, QualityPreset::MinLatency);
         QualityPreset::MaxQuality.apply(&mut video);
         assert_eq!(video.fps, 120);
         assert!(video.chroma_444);
-        assert_eq!(
-            video.max_bitrate_kbps,
-            coroom_session::remote::UNLIMITED_KBPS
-        );
         video.fps = 30;
         assert_eq!(QualityPreset::matching(&video), QualityPreset::Custom);
         // Un perfil guardado que no cuadra con las opciones se corrige al sanear.
@@ -950,7 +923,6 @@ mod tests {
         settings.video.fps = 30;
         settings.video.preset = QualityPreset::Balanced;
         assert_eq!(settings.sanitized().video.preset, QualityPreset::Custom);
-        assert_eq!(Video::when(VideoOption::Bitrate), When::Live);
         assert_eq!(Video::when(VideoOption::Resolution), When::Live);
         assert_eq!(Video::when(VideoOption::Fps), When::Live);
         assert_eq!(Video::when(VideoOption::Chroma444), When::NextRoom);

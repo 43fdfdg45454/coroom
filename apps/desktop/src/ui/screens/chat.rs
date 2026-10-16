@@ -34,8 +34,8 @@ use iced_core::{Alignment, Color, Font, Length, Padding, mouse};
 use iced_widget::text::Span;
 use iced_widget::text_editor::{self, Binding, KeyPress};
 use iced_widget::{
-    Column, button, center, column, container, mouse_area, rich_text, row, scrollable, span, stack,
-    text,
+    Column, button, center, column, container, hover, mouse_area, rich_text, row, scrollable, span,
+    stack, text,
 };
 
 use crate::ui::app::{App, Effect, Event, Message, Page, Screen};
@@ -529,7 +529,7 @@ pub fn on_event(app: &mut App, event: &Event) -> Vec<Effect> {
         Event::Guest(event) => return session_event(app, event, false),
         Event::Host(event) => return session_event(app, event, true),
         Event::GuestStats(stats) => guest_permissions(app, stats.allowed),
-        Event::HostGuests(guests) => {
+        Event::HostGuests(guests, ..) => {
             for status in guests {
                 let id = status.guest.0;
                 let before = app
@@ -1095,14 +1095,23 @@ fn message_row<'a>(
             .font(coroom_ui::font::MONO)
             .class(look.secondary()),
     );
-    row![
+    let body = row![
         ui::avatar(&app.theme, &seed, 28.0),
         column![who, message_text(look, &line.text, pieces)]
             .spacing(2)
             .width(Length::Fill)
     ]
-    .spacing(space::XS)
-    .into()
+    .spacing(space::XS);
+    // Copiar: con el botón que aparece al pasar por encima o con el botón derecho.
+    let copy = container(ui::icon_button(
+        Icon::Copy,
+        t!("chat-copiar-el-mensaje"),
+        Some(Message::Copy(line.text.clone())),
+    ))
+    .align_right(Length::Fill);
+    mouse_area(hover(body, copy))
+        .on_right_press(Message::Copy(line.text.clone()))
+        .into()
 }
 
 /// Texto plano con los enlaces subrayados y clicables (`pieces`: sus trozos, ya calculados).

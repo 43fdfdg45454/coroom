@@ -27,8 +27,7 @@ use coroom_session::audio::GameCapture;
 use coroom_session::audio::apps::{AppFilter, PlayingApp, normalize};
 use coroom_session::capture::{CaptureTarget, PickedShare, ShareChoice, ShareKind};
 use coroom_session::remote::{
-    CandidateOutcome, GuestStatus, PadTransport, QualityLevel, SessionEvent, UNLIMITED_KBPS,
-    permissions_label, start_kbps,
+    CandidateOutcome, GuestStatus, PadTransport, QualityLevel, SessionEvent, permissions_label,
 };
 use coroom_session::{GuestId, Permissions};
 use coroom_ui::Element;
@@ -41,16 +40,15 @@ use iced_core::text::Wrapping;
 use iced_core::{Alignment, Length, Padding};
 use iced_widget::{Column, Row, button, checkbox, column, container, row, rule};
 
-use super::chat;
+use super::{chat, settings};
 use crate::portal::RestoreTokens;
 use crate::ui::app::{
-    App, Dialog, Effect, Event, HostRequest, JOIN_REQUEST_TTL, Load, Message, Page, Screen,
-    quality_tone,
+    App, AudioDevice, Dialog, Effect, Event, HostRequest, HostVoice, JOIN_REQUEST_TTL, Load,
+    Message, Page, Screen, quality_tone,
 };
 use crate::ui::settings::{
-    BITRATE_CHOICES, CodecChoice, DEFAULT_VOICE_VOLUME, EncoderChoice, FPS_CHOICES, KnownPeer,
-    MAX_VOICE_VOLUME, QualityPreset, RememberedApp, Resolution, Video, VideoOption, When,
-    voice_gain,
+    CodecChoice, DEFAULT_VOICE_VOLUME, EncoderChoice, FPS_CHOICES, KnownPeer, MAX_VOICE_VOLUME,
+    QualityPreset, RememberedApp, Resolution, Video, VideoOption, When, voice_gain,
 };
 use crate::ui::stats;
 use crate::ui::video::{VideoFeed, video_view};
@@ -257,6 +255,8 @@ pub struct Room {
     pub volumes: BTreeMap<GuestId, u8>,
     /// Si los invitados de esta sala entran callados.
     pub guests_muted: bool,
+    /// La voz propia en la sala (micrófono y quién habla), con cada lista de invitados.
+    pub voice: HostVoice,
 }
 
 impl Room {
@@ -266,6 +266,36 @@ impl Room {
             .get(&id)
             .copied()
             .unwrap_or(DEFAULT_VOICE_VOLUME)
+    }
+}
+
+/// Acción del menú de la fila de un invitado (lo que puede hacer y quitarle el anfitrión).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestAction {
+    /// Dar (`true`) o quitar el teclado y el ratón.
+    Keyboard(bool),
+    /// Dar o quitar un mando.
+    Pad(bool),
+    /// Dar o quitar la voz.
+    Voice(bool),
+    /// Ver el número de seguridad.
+    Safety,
+    /// Expulsar (pide confirmación).
+    Kick,
+}
+
+impl std::fmt::Display for GuestAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            GuestAction::Keyboard(true) => t!("host-dar-teclado-y-raton"),
+            GuestAction::Keyboard(false) => t!("host-quitar-teclado-y-raton"),
+            GuestAction::Pad(true) => t!("host-dar-un-mando"),
+            GuestAction::Pad(false) => t!("host-quitar-el-mando"),
+            GuestAction::Voice(true) => t!("host-dar-la-voz"),
+            GuestAction::Voice(false) => t!("host-quitar-la-voz"),
+            GuestAction::Safety => t!("host-numero-de-seguridad"),
+            GuestAction::Kick => t!("host-expulsar"),
+        })
     }
 }
 
@@ -309,8 +339,6 @@ pub struct State {
     pub friends_at: Option<Instant>,
     /// «Avanzado» desplegado.
     pub advanced: bool,
-    /// El último tope del bitrate elegido (para volver a él al marcar «Tope»).
-    pub last_cap_kbps: Option<u32>,
     /// Abriendo.
     pub starting: bool,
     /// Desde cuándo (anima la barra de «Abriendo la sala…»).
@@ -524,10 +552,6 @@ pub enum Msg {
     Codec(Pick<CodecChoice>),
     /// Codificador.
     Encoder(Pick<EncoderChoice>),
-    /// Poner o quitar el tope del bitrate Auto.
-    Capped(bool),
-    /// Tope del bitrate Auto (kbit/s).
-    Cap(Pick<u32>),
     /// Croma 4:4:4.
     Chroma444(bool),
     /// HDR.
@@ -558,6 +582,14 @@ pub enum Msg {
     VolumeDone(GuestId),
     /// Expulsar (pide confirmación).
     Kick(GuestId),
+    /// Una acción del menú de la fila de un invitado.
+    GuestMenu(GuestId, GuestAction),
+    /// Volumen de la voz propia que se envía (porcentaje), mientras se arrastra.
+    MicVolume(u8),
+    /// Al soltar el deslizador de la voz propia: recordarlo en los ajustes.
+    MicVolumeDone,
+    /// Silenciar o no el micrófono propio para toda la sala.
+    SelfMute(bool),
     /// Número de seguridad de un invitado.
     Safety(GuestId),
     /// Invitar a un amigo conectado con la sala abierta.
@@ -615,9 +647,6 @@ fn changed_options(before: &Video, after: &Video) -> Vec<VideoOption> {
     if before.codec != after.codec || before.encoder != after.encoder {
         changed.push(VideoOption::Codec);
     }
-    if before.max_bitrate_kbps != after.max_bitrate_kbps {
-        changed.push(VideoOption::Bitrate);
-    }
     if before.chroma_444 != after.chroma_444 {
         changed.push(VideoOption::Chroma444);
     }
@@ -628,8 +657,8 @@ fn changed_options(before: &Video, after: &Video) -> Vec<VideoOption> {
 }
 
 /// Cambia el vídeo de los ajustes y lo guarda; con la sala abierta, aplica lo que va en vivo
-/// ([`Video::when`]: el tope del bitrate por su cuenta; el códec, la resolución máxima y los fps
-/// juntos, con un solo [`Effect::SetEncoding`] que reabre el codificador) y avisa de lo que espera a
+/// ([`Video::when`]: el códec, la resolución máxima y los fps juntos, con un solo
+/// [`Effect::SetEncoding`] que reabre el codificador) y avisa de lo que espera a
 /// la próxima sala. `custom`: el cambio viene de «Avanzado» y el perfil pasa a «Personalizado».
 fn change_video(app: &mut App, custom: bool, change: impl FnOnce(&mut Video)) -> Vec<Effect> {
     let before = app.settings.video.clone();
@@ -657,11 +686,6 @@ fn change_video(app: &mut App, custom: bool, change: impl FnOnce(&mut Video)) ->
                     );
                     effects.push(Effect::SetEncoding);
                 }
-            }
-            (When::Live, VideoOption::Bitrate) => {
-                let kbps = app.settings.video.max_bitrate_kbps;
-                tracing::info!(kbps, "tope del bitrate para la sala abierta");
-                effects.push(Effect::SetMaxBitrate(kbps));
             }
             (When::Live, other) => {
                 tracing::warn!(?other, "opción en vivo sin forma de aplicarla a la sala");
@@ -738,24 +762,6 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::Encoder(choice) => {
             return change_video(app, true, |video| video.encoder = choice.value);
         }
-        Msg::Capped(capped) => {
-            let current = app.settings.video.max_bitrate_kbps;
-            let kbps = if capped {
-                app.host
-                    .last_cap_kbps
-                    .unwrap_or(Video::default().max_bitrate_kbps)
-            } else {
-                if current < UNLIMITED_KBPS {
-                    app.host.last_cap_kbps = Some(current);
-                }
-                UNLIMITED_KBPS
-            };
-            return change_video(app, true, |video| video.max_bitrate_kbps = kbps);
-        }
-        Msg::Cap(choice) => {
-            app.host.last_cap_kbps = Some(choice.value);
-            return change_video(app, true, |video| video.max_bitrate_kbps = choice.value);
-        }
         Msg::Chroma444(on) => return change_video(app, true, |video| video.chroma_444 = on),
         Msg::Hdr(on) => return change_video(app, true, |video| video.hdr = on),
         Msg::Start => return start(app),
@@ -827,6 +833,35 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 let name = status.name.clone();
                 app.settings.audio.set_voice_volume(&name, room.volume(id));
                 return app.settings_changed();
+            }
+        }
+        Msg::GuestMenu(id, action) => {
+            return update(
+                app,
+                match action {
+                    GuestAction::Keyboard(on) => Msg::Keyboard(id, on),
+                    GuestAction::Pad(on) => Msg::PadOn(id, on),
+                    GuestAction::Voice(on) => Msg::GuestVoice(id, on),
+                    GuestAction::Safety => Msg::Safety(id),
+                    GuestAction::Kick => Msg::Kick(id),
+                },
+            );
+        }
+        Msg::MicVolume(percent) => {
+            app.settings.audio.mic_volume = percent.min(MAX_VOICE_VOLUME);
+            if app.host.room.is_some() {
+                return vec![Effect::SetMicGain {
+                    host: true,
+                    gain: voice_gain(app.settings.audio.mic_volume),
+                }];
+            }
+        }
+        Msg::MicVolumeDone => return app.settings_changed(),
+        Msg::SelfMute(muted) => {
+            if let Some(room) = app.host.room.as_mut() {
+                // Se ve ya; la próxima lista lo confirma.
+                room.voice.mic_muted = muted;
+                return vec![Effect::SetMicMuted { host: true, muted }];
             }
         }
         Msg::Kick(id) => {
@@ -1147,10 +1182,20 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                 muted: BTreeSet::new(),
                 volumes: BTreeMap::new(),
                 guests_muted,
+                voice: HostVoice::default(),
             });
             app.page = Page::Host;
             // La sala lleva su propia señalización: la de espera ya sobra.
             let mut effects = vec![Effect::StopLobby];
+            // Los micrófonos y salidas, para cambiarlos con la sala abierta.
+            effects.extend(settings::request_audio(app));
+            // La voz propia sale al volumen normal: se le aplica el recordado.
+            if app.settings.audio.mic_volume != DEFAULT_VOICE_VOLUME {
+                effects.push(Effect::SetMicGain {
+                    host: true,
+                    gain: voice_gain(app.settings.audio.mic_volume),
+                });
+            }
             effects.extend(app.preview_visibility());
             return effects;
         }
@@ -1160,9 +1205,10 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
             app.host.error = Some(err);
             return vec![Effect::StartLobby];
         }
-        Event::HostGuests(guests) => {
+        Event::HostGuests(guests, voice) => {
             let mut effects = Vec::new();
             if let Some(room) = app.host.room.as_mut() {
+                room.voice = voice;
                 // A quien llega se le aplica el volumen recordado por su nombre (una vez: lo que
                 // se toque después manda); quien se fue no deja entrada.
                 room.volumes
@@ -1220,14 +1266,7 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
         Event::VideoChanged(result) => {
             if app.host.room.is_some() {
                 match result {
-                    Ok(Some(kbps)) => app.toast(
-                        Tone::Info,
-                        t!(
-                            "host-video-de-la-sala-cambiado",
-                            valor = bitrate_phrase(kbps)
-                        ),
-                    ),
-                    Ok(None) => app.toast(
+                    Ok(()) => app.toast(
                         Tone::Info,
                         t!(
                             "host-video-de-la-sala-cambiado",
@@ -1388,26 +1427,6 @@ fn join_names(names: &[String]) -> String {
 
 // --- Textos de vídeo ------------------------------------------------------------------------------
 
-/// El bitrate dentro de una frase: «Auto hasta 20 Mbit/s» o «Auto sin tope». Auto es el único
-/// modo: el control de tasa sube hasta donde la red aguanta y baja antes de que se congele; el
-/// tope solo le pone techo.
-pub fn bitrate_phrase(kbps: u32) -> String {
-    if kbps < UNLIMITED_KBPS {
-        t!("host-auto-hasta", valor = cap_label(kbps))
-    } else {
-        t!("host-auto-sin-tope").to_owned()
-    }
-}
-
-/// Un tope en el selector: «20 Mbit/s» (sin decimales si son Mbit/s enteros).
-pub fn cap_label(kbps: u32) -> String {
-    if kbps >= 1000 && kbps.is_multiple_of(1000) {
-        format!("{} Mbit/s", kbps / 1000)
-    } else {
-        stats::kbps(f64::from(kbps))
-    }
-}
-
 /// Resolución máxima, corta («1080p», «Nativa»: la de la fuente hasta 4K).
 fn resolution_short(resolution: Resolution) -> String {
     match resolution {
@@ -1440,12 +1459,11 @@ fn encoding_phrase(video: &Video) -> String {
     )
 }
 
-/// Lo que fija un perfil: «1080p · 60 fps · Auto hasta 10 Mbit/s».
+/// Lo que fija un perfil: «1080p · 60 fps».
 fn video_spec(video: &Video) -> String {
     let mut parts = vec![
         resolution_short(video.max_resolution),
         t!("host-fps", fps = video.fps),
-        bitrate_phrase(video.max_bitrate_kbps),
     ];
     if video.chroma_444 {
         parts.push("4:4:4".to_owned());
@@ -1504,18 +1522,16 @@ fn option_name(option: VideoOption) -> &'static str {
         VideoOption::Resolution => t!("host-opcion-resolucion"),
         VideoOption::Fps => t!("host-opcion-fps"),
         VideoOption::Codec => t!("host-opcion-codec"),
-        VideoOption::Bitrate => t!("host-opcion-bitrate"),
         VideoOption::Chroma444 => "4:4:4",
         VideoOption::Hdr => "HDR",
     }
 }
 
-/// Cuándo se aplica cada opción, agrupado («En vivo: códec y bitrate · Al abrir la sala: …»),
-/// sacado de [`Video::when`].
+/// Cuándo se aplica cada opción, agrupado («En vivo: códec, resolución y fps · Al abrir la sala:
+/// …»), sacado de [`Video::when`].
 fn when_summary() -> String {
-    const ALL: [VideoOption; 6] = [
+    const ALL: [VideoOption; 5] = [
         VideoOption::Codec,
-        VideoOption::Bitrate,
         VideoOption::Resolution,
         VideoOption::Fps,
         VideoOption::Chroma444,
@@ -1567,15 +1583,6 @@ fn encoder_choices() -> Vec<Pick<EncoderChoice>> {
     );
     encoders.push(pick(EncoderChoice::Software, t!("host-por-software")));
     encoders
-}
-
-/// Topes que se ofrecen con «Tope» marcado (sin el último, que es «sin tope»).
-fn cap_choices() -> Vec<Pick<u32>> {
-    BITRATE_CHOICES
-        .iter()
-        .filter(|kbps| **kbps < UNLIMITED_KBPS)
-        .map(|kbps| pick(*kbps, cap_label(*kbps)))
-        .collect()
 }
 
 /// Códec elegido (`None`: automático).
@@ -1712,28 +1719,6 @@ fn placeholder<'a>(glyph: Icon, label: &'a str) -> Element<'a, Message> {
     .padding(space::XS)
     .center(Length::Fill)
     .into()
-}
-
-/// Botón de solo icono que se enciende con el acento (un permiso dado).
-fn toggle<'a>(glyph: Icon, active: bool, tip: &'a str, message: Message) -> Element<'a, Message> {
-    let (class, tint) = if active {
-        (ButtonClass::Primary, SvgClass::OnAccent)
-    } else {
-        (ButtonClass::Flat, SvgClass::Secondary)
-    };
-    ui::with_tooltip(
-        button(
-            container(icon_with(glyph, size::ICON, tint))
-                .center_x(Length::Fill)
-                .center_y(Length::Fill),
-        )
-        .width(Length::Fixed(size::CONTROL))
-        .height(Length::Fixed(size::CONTROL))
-        .padding(0)
-        .class(class)
-        .on_press(message),
-        tip,
-    )
 }
 
 /// Cómo se nombra lo elegido en el selector del sistema (Wayland solo da el tamaño).
@@ -2225,64 +2210,30 @@ fn advanced(app: &App) -> Element<'_, Message> {
     ui::boxed_list(rows)
 }
 
-/// Bitrate: siempre Auto; con «Tope», hasta dónde puede subir.
+/// Bitrate: automático para cada invitado, hasta lo que da su enlace (sin tope que elegir). Solo
+/// informa de lo que pide ahora el control de tasa del más lento.
 fn bitrate_row(app: &App) -> Element<'_, Message> {
-    let video = &app.settings.video;
-    let capped = video.max_bitrate_kbps < UNLIMITED_KBPS;
-    let mut cap = row![
-        checkbox(capped)
-            .on_toggle(|on_off| on(Msg::Capped(on_off)))
-            .size(18.0),
-        ui::body(t!("host-tope")),
-    ]
-    .spacing(space::XS)
-    .align_y(Alignment::Center);
-    if capped {
-        let caps = cap_choices();
-        let current = caps
-            .iter()
-            .find(|c| c.value == video.max_bitrate_kbps)
-            .cloned()
-            .unwrap_or_else(|| pick(video.max_bitrate_kbps, cap_label(video.max_bitrate_kbps)));
-        cap = cap.push(ui::select(caps, Some(current), |c| on(Msg::Cap(c))));
-    }
-    // Lo que pide ahora el control de tasa del invitado más lento.
     let now = app
         .host
         .room
         .as_ref()
         .and_then(|room| room.guests.iter().filter_map(|g| g.target_kbps).min());
-    let hint = match (capped, now) {
-        (_, Some(kbps)) => t!("host-bitrate-ahora", valor = stats::kbps(f64::from(kbps))),
-        (false, None) => t!(
-            "host-sin-tope-ayuda",
-            valor = cap_label(start_kbps(video.max_bitrate_kbps))
-        ),
-        (true, None) => t!(
-            "host-con-tope-ayuda",
-            valor = cap_label(start_kbps(video.max_bitrate_kbps))
-        ),
+    let hint = match now {
+        Some(kbps) => t!("host-bitrate-ahora", valor = stats::kbps(f64::from(kbps))),
+        None => t!("host-bitrate-sin-sala").to_owned(),
     };
-    cap = cap.push(ui::caption(hint).wrapping(Wrapping::WordOrGlyph));
     let texts = column![
         ui::body(t!("host-bitrate")),
         ui::secondary(t!("host-bitrate-ayuda")).wrapping(Wrapping::WordOrGlyph),
-        container(cap).padding(Padding {
-            top: 6.0,
-            ..Padding::ZERO
-        }),
+        ui::caption(hint).wrapping(Wrapping::WordOrGlyph),
     ]
     .spacing(2)
     .width(Length::Fill);
-    row![
-        texts,
-        tag(Video::when(VideoOption::Bitrate)),
-        ui::strong(t!("host-auto"))
-    ]
-    .spacing(space::S)
-    .align_y(Alignment::Start)
-    .padding(Padding::from([10.0, 16.0]))
-    .into()
+    row![texts, ui::strong(t!("host-auto"))]
+        .spacing(space::S)
+        .align_y(Alignment::Start)
+        .padding(Padding::from([10.0, 16.0]))
+        .into()
 }
 
 /// Fila de la lista de audio: la casilla, el nombre y la nota a la derecha.
@@ -2418,6 +2369,47 @@ fn audio_box(app: &App, with_voice: bool) -> Element<'_, Message> {
     }
     ui::boxed_list(rows)
 }
+
+/// Micrófono y salida de este equipo con la sala abierta: cambian al momento (los mismos de
+/// Ajustes → Audio y voz).
+fn devices_box(app: &App) -> Element<'_, Message> {
+    let audio = &app.settings.audio;
+    let devices: Vec<AudioDevice> = app
+        .settings_page
+        .audio_devices
+        .loaded()
+        .cloned()
+        .unwrap_or_default();
+    let mics = settings::device_choices(&devices, true, &audio.microphone);
+    let mic = mics.iter().find(|c| c.value == audio.microphone).cloned();
+    let speakers = settings::device_choices(&devices, false, &audio.speaker);
+    let speaker = speakers.iter().find(|c| c.value == audio.speaker).cloned();
+    ui::boxed_list(vec![
+        ui::pref_row(
+            t!("host-tu-microfono"),
+            Some(t!("host-cambia-al-momento").to_owned()),
+            ui::select_fixed(
+                mics,
+                mic,
+                |c| Message::Settings(settings::Msg::Microphone(c)),
+                DEVICE_SELECT,
+            ),
+        ),
+        ui::pref_row(
+            t!("host-donde-oyes-la-sala"),
+            Some(t!("host-cambia-al-momento").to_owned()),
+            ui::select_fixed(
+                speakers,
+                speaker,
+                |c| Message::Settings(settings::Msg::Speaker(c)),
+                DEVICE_SELECT,
+            ),
+        ),
+    ])
+}
+
+/// Ancho de los selectores de dispositivo de la sala.
+const DEVICE_SELECT: f32 = 280.0;
 
 /// Amigos marcados que se invitarán (los que siguen conectados).
 fn marked_count(app: &App) -> usize {
@@ -2694,7 +2686,131 @@ fn quality_label(level: QualityLevel) -> &'static str {
     }
 }
 
-/// Fila de un invitado: quién, cómo llega y qué puede hacer.
+/// Lo que va con el nombre en una fila de «Integrantes»: «Anfitrión» y, si habla, «Hablando».
+fn member_tags<'a>(host: bool, talking: bool) -> Vec<Element<'a, Message>> {
+    let mut tags = Vec::new();
+    if host {
+        tags.push(coroom_ui::tag::live(t!("host-anfitrion")));
+    }
+    if talking {
+        tags.push(ui::status_badge(Tone::Success, t!("host-hablando")));
+    }
+    tags
+}
+
+/// Nombre de una fila de «Integrantes», con sus etiquetas detrás.
+fn member_name<'a>(name: String, tags: Vec<Element<'a, Message>>) -> Element<'a, Message> {
+    let mut line = row![ui::strong(name)]
+        .spacing(space::XS)
+        .align_y(Alignment::Center);
+    for tag in tags {
+        line = line.push(tag);
+    }
+    line.into()
+}
+
+/// Deslizador de volumen de una fila, bajo el nombre, con el altavoz delante: tachado y con la
+/// barra apagada si está silenciado (el valor se conserva).
+fn member_volume<'a>(
+    percent: u8,
+    muted: bool,
+    speaker_tip: String,
+    on_speaker: Message,
+    on_change: impl Fn(u8) -> Message + 'a,
+    on_release: Message,
+) -> Element<'a, Message> {
+    let speaker = ui::icon_button(
+        if muted { Icon::VolumeOff } else { Icon::Volume },
+        speaker_tip,
+        Some(on_speaker),
+    );
+    container(ui::slider_with(
+        0..=MAX_VOICE_VOLUME,
+        percent,
+        5,
+        DEFAULT_VOICE_VOLUME,
+        Some(speaker),
+        t!("host-volumen-porcentaje", percent = percent),
+        SliderClass::Accent.muted(muted),
+        on_change,
+        Some(on_release),
+    ))
+    .max_width(360.0)
+    .padding(Padding {
+        left: (size::AVATAR + space::S - size::CONTROL - space::XS).max(0.0),
+        ..Padding::ZERO
+    })
+    .into()
+}
+
+/// Fila propia del anfitrión en «Integrantes»: el deslizador es lo alto que le oyen los demás y
+/// el altavoz le silencia para toda la sala.
+fn own_row<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
+    let name = app
+        .account
+        .as_ref()
+        .map_or_else(|| t!("host-tu").to_owned(), |a| a.display_name.clone());
+    let voice = &room.voice;
+    let talking = voice.talkers.contains(&0);
+    let detail = if !voice.enabled {
+        t!("host-sin-microfono-en-la-sala")
+    } else if voice.mic_muted {
+        t!("host-te-has-silenciado")
+    } else {
+        t!("host-tu-voz-ayuda")
+    };
+    let line = row![
+        ui::avatar(&app.theme, &name, size::AVATAR),
+        column![
+            member_name(
+                t!("host-tu-nombre", name = name.as_str()),
+                member_tags(true, talking)
+            ),
+            ui::secondary(detail).wrapping(Wrapping::WordOrGlyph)
+        ]
+        .spacing(2)
+        .width(Length::Fill),
+    ]
+    .spacing(space::S)
+    .align_y(Alignment::Center);
+    let mut card = column![line].spacing(space::XS);
+    if voice.enabled {
+        let muted = voice.mic_muted;
+        card = card.push(member_volume(
+            app.settings.audio.mic_volume,
+            muted,
+            if muted {
+                t!("host-activar-tu-microfono").to_owned()
+            } else {
+                t!("host-silenciarte").to_owned()
+            },
+            on(Msg::SelfMute(!muted)),
+            |value| on(Msg::MicVolume(value)),
+            on(Msg::MicVolumeDone),
+        ));
+    }
+    container(card)
+        .padding(Padding::from([10.0, 16.0]))
+        .width(Length::Fill)
+        .into()
+}
+
+/// Menú de la fila de un invitado: permisos, número de seguridad y expulsar.
+fn guest_menu<'a>(id: GuestId, permissions: Permissions) -> Element<'a, Message> {
+    let actions = vec![
+        GuestAction::Keyboard(!permissions.keyboard_mouse),
+        GuestAction::Pad(permissions.gamepad_slot.is_none()),
+        GuestAction::Voice(!permissions.voice),
+        GuestAction::Safety,
+        GuestAction::Kick,
+    ];
+    ui::menu(actions, t!("host-mas"), move |action| {
+        on(Msg::GuestMenu(id, action))
+    })
+}
+
+/// Fila de un invitado en «Integrantes»: quién, cómo llega y qué puede hacer (en el menú); el
+/// deslizador es lo alto que se le oye en este equipo y el altavoz deja de oírle aquí.
 fn guest_row<'a>(app: &'a App, room: &'a Room, status: &'a GuestStatus) -> Element<'a, Message> {
     use coroom_transport::Path;
     let id = status.guest;
@@ -2714,10 +2830,11 @@ fn guest_row<'a>(app: &'a App, room: &'a Room, status: &'a GuestStatus) -> Eleme
         facts.push(t!("host-rtt", ms = rtt.round() as u64));
     }
     facts.push(permissions_label(&permissions));
+    let talking = room.voice.talkers.contains(&id.0);
     let mut line = row![
         ui::avatar(&app.theme, &status.name, size::AVATAR),
         column![
-            ui::strong(status.name.as_str()),
+            member_name(status.name.clone(), member_tags(false, talking)),
             ui::secondary(facts.join(" · ")).wrapping(Wrapping::WordOrGlyph)
         ]
         .spacing(2)
@@ -2730,80 +2847,24 @@ fn guest_row<'a>(app: &'a App, room: &'a Room, status: &'a GuestStatus) -> Eleme
         let level = QualityLevel::from_overhead_ms(rtt);
         line = line.push(ui::status_badge(quality_tone(level), quality_label(level)));
     }
+    line = line.push(guest_menu(id, permissions));
     let muted = hears_muted(room, id);
-    let kick = ui::with_tooltip(
-        button(
-            container(icon_with(
-                Icon::UserX,
-                size::ICON,
-                SvgClass::Tone(Tone::Error),
-            ))
-            .center_x(Length::Fill)
-            .center_y(Length::Fill),
-        )
-        .width(Length::Fixed(size::CONTROL))
-        .height(Length::Fixed(size::CONTROL))
-        .padding(0)
-        .class(ButtonClass::DestructiveFlat)
-        .on_press(on(Msg::Kick(id))),
-        t!("host-expulsar"),
-    );
-    line = line
-        .push(
-            row![
-                toggle(
-                    Icon::Pointer,
-                    permissions.keyboard_mouse,
-                    if permissions.keyboard_mouse {
-                        t!("host-quitar-teclado-y-raton")
-                    } else {
-                        t!("host-dar-teclado-y-raton")
-                    },
-                    on(Msg::Keyboard(id, !permissions.keyboard_mouse)),
-                ),
-                toggle(
-                    Icon::Gamepad,
-                    permissions.gamepad_slot.is_some(),
-                    if permissions.gamepad_slot.is_some() {
-                        t!("host-quitar-el-mando")
-                    } else {
-                        t!("host-dar-un-mando")
-                    },
-                    on(Msg::PadOn(id, permissions.gamepad_slot.is_none())),
-                ),
-                toggle(
-                    Icon::Mic,
-                    permissions.voice,
-                    if permissions.voice {
-                        t!("host-quitar-la-voz")
-                    } else {
-                        t!("host-dar-la-voz")
-                    },
-                    on(Msg::GuestVoice(id, !permissions.voice)),
-                ),
-            ]
-            .spacing(space::XXS),
-        )
-        .push(ui::icon_button(
-            if muted {
-                Icon::HeadphonesOff
-            } else {
-                Icon::Headphones
-            },
+    let mut card = column![
+        line,
+        member_volume(
+            room.volume(id),
+            muted,
             if muted {
                 t!("host-volver-a-oir", name = status.name.as_str())
             } else {
                 t!("host-dejar-de-oir", name = status.name.as_str())
             },
-            Some(on(Msg::Hear(id, muted))),
-        ))
-        .push(ui::icon_button(
-            Icon::Fingerprint,
-            t!("host-numero-de-seguridad"),
-            Some(on(Msg::Safety(id))),
-        ))
-        .push(kick);
-    let mut card = column![line, volume_line(room, status)].spacing(space::XS);
+            on(Msg::Hear(id, muted)),
+            move |value| on(Msg::Volume(id, value)),
+            on(Msg::VolumeDone(id)),
+        )
+    ]
+    .spacing(space::XS);
     if permissions.gamepad_slot.is_some() {
         card = card.push(pad_line(app, status));
     }
@@ -2821,30 +2882,6 @@ fn guest_row<'a>(app: &'a App, room: &'a Room, status: &'a GuestStatus) -> Eleme
         .padding(Padding::from([10.0, 16.0]))
         .width(Length::Fill)
         .into()
-}
-
-/// Volumen de la voz de un invitado en este equipo, bajo su nombre: de 0 a 200 % de 5 en 5
-/// (Ctrl+clic, 100 %). Mientras se arrastra ya suena así; al soltar se recuerda por su nombre.
-fn volume_line<'a>(room: &Room, status: &'a GuestStatus) -> Element<'a, Message> {
-    let id = status.guest;
-    let percent = room.volume(id);
-    container(ui::slider(
-        0..=MAX_VOICE_VOLUME,
-        percent,
-        5,
-        DEFAULT_VOICE_VOLUME,
-        Some(Icon::Volume),
-        t!("host-volumen-porcentaje", percent = percent),
-        SliderClass::Accent,
-        move |value| on(Msg::Volume(id, value)),
-        Some(on(Msg::VolumeDone(id))),
-    ))
-    .max_width(320.0)
-    .padding(Padding {
-        left: size::AVATAR + space::S,
-        ..Padding::ZERO
-    })
-    .into()
 }
 
 /// El mando de un invitado: la ranura, si va tal cual o convertido, y el mando que declara
@@ -2918,7 +2955,7 @@ fn guests_section<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
         )
     };
     let head = row![
-        ui::strong(t!("host-invitados", valor = room.guests.len())).size(15.0),
+        ui::strong(t!("host-integrantes", valor = room.guests.len() + 1)).size(15.0),
         ui::fill(),
         pause
     ]
@@ -2928,22 +2965,22 @@ fn guests_section<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
     for request in &app.host.join_requests {
         section = section.push(join_request_card(app, room, request));
     }
-    let body: Element<'a, Message> = if room.guests.is_empty() {
-        ui::card(ui::empty_state(
+    // Primero tú, después los invitados por orden de llegada; sin invitados, cómo traerlos.
+    let mut rows = vec![own_row(app, room)];
+    rows.extend(
+        room.guests
+            .iter()
+            .map(|status| guest_row(app, room, status)),
+    );
+    if room.guests.is_empty() {
+        rows.push(ui::empty_state(
             Icon::Users,
             t!("host-todavia-no-ha-entrado-nadie"),
             t!("host-comparte-el-codigo-de-la-sala"),
             None,
-        ))
-    } else {
-        ui::boxed_list(
-            room.guests
-                .iter()
-                .map(|status| guest_row(app, room, status))
-                .collect(),
-        )
-    };
-    section.push(body).into()
+        ));
+    }
+    section.push(ui::boxed_list(rows)).into()
 }
 
 /// Tarjeta de un amigo que pide entrar, con el borde del acento y su cuenta atrás: «Dejar
@@ -3093,6 +3130,7 @@ fn room_view<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
             None,
         ))
         .push(audio_box(app, false))
+        .push(devices_box(app))
         .push(room_quality(app));
     if let Some(invite) = invite_more(app, room) {
         page = page.push(invite);
@@ -3115,7 +3153,7 @@ pub(crate) mod shots {
     use coroom_transport::quic::Path;
 
     use super::{Msg, ShareMode, ShareOptions, SourceChoice, TargetOption};
-    use crate::ui::app::{App, Dialog, Event, Message, Page};
+    use crate::ui::app::{App, Dialog, Event, HostVoice, Message, Page};
     use crate::ui::settings::QualityPreset;
     use crate::ui::shots::{Builder, game_frame, playing, safety, signed_in};
     use crate::ui::video::VideoFeed;
@@ -3287,41 +3325,49 @@ pub(crate) mod shots {
             codec: coroom_session::codec::Codec::Av1,
             detail: "codifica SVT-AV1".to_owned(),
         })));
-        app.update(Message::Event(Event::HostGuests(vec![
-            guest_status(
-                1,
-                "Bea",
-                Permissions {
-                    keyboard_mouse: true,
-                    gamepad_slot: None,
-                    voice: true,
-                    gamepad_raw: true,
-                },
-                14.2,
-            ),
-            with_pad(
+        app.update(Message::Event(Event::HostGuests(
+            vec![
                 guest_status(
-                    2,
-                    "Carla",
+                    1,
+                    "Bea",
                     Permissions {
-                        keyboard_mouse: false,
-                        gamepad_slot: Some(1),
-                        voice: false,
+                        keyboard_mouse: true,
+                        gamepad_slot: None,
+                        voice: true,
                         gamepad_raw: true,
                     },
-                    61.4,
+                    14.2,
                 ),
-                GuestPad {
-                    name: "8BitDo Ultimate 2 Wireless Controller".to_owned(),
-                    vendor: 0x2dc8,
-                    product: 0x6012,
-                    transport: PadTransport::Hid,
-                    raw: true,
-                    note: None,
-                },
-            ),
-        ])));
+                with_pad(
+                    guest_status(
+                        2,
+                        "Carla",
+                        Permissions {
+                            keyboard_mouse: false,
+                            gamepad_slot: Some(1),
+                            voice: false,
+                            gamepad_raw: true,
+                        },
+                        61.4,
+                    ),
+                    GuestPad {
+                        name: "8BitDo Ultimate 2 Wireless Controller".to_owned(),
+                        vendor: 0x2dc8,
+                        product: 0x6012,
+                        transport: PadTransport::Hid,
+                        raw: true,
+                        note: None,
+                    },
+                ),
+            ],
+            HostVoice {
+                enabled: true,
+                mic_muted: false,
+                talkers: vec![1],
+            },
+        )));
         app.update(Message::Host(Msg::Volume(GuestId(2), 60)));
+        app.update(Message::Host(Msg::Hear(GuestId(2), false)));
         app.toasts.clear();
     }
 
@@ -3425,10 +3471,10 @@ mod tests {
             code: "K7Q2MZ".into(),
             fingerprint: "cd".repeat(32),
         })));
-        app.update(Message::Event(Event::HostGuests(vec![
-            status(1, "Bea"),
-            status(2, "Carla"),
-        ])));
+        app.update(Message::Event(Event::HostGuests(
+            vec![status(1, "Bea"), status(2, "Carla")],
+            HostVoice::default(),
+        )));
     }
 
     fn playing(keys: &[&str]) -> Vec<PlayingApp> {
@@ -4079,13 +4125,10 @@ mod tests {
         assert!(effects.is_empty(), "sin sala, nada en vivo: {effects:?}");
         let video = &app.settings.video;
         assert_eq!(video.preset, QualityPreset::MinLatency);
-        assert_eq!(
-            (video.max_resolution, video.fps, video.max_bitrate_kbps),
-            (Resolution::P1080, 60, 10_000)
-        );
+        assert_eq!((video.max_resolution, video.fps), (Resolution::P1080, 60));
         assert_eq!(app.flush_settings(), Some(Effect::SaveSettings));
         app.update(Message::Host(Msg::Preset(QualityPreset::MaxQuality)));
-        assert_eq!(app.settings.video.max_bitrate_kbps, UNLIMITED_KBPS);
+        assert_eq!(app.settings.video.fps, 120);
         assert!(app.settings.video.chroma_444);
         assert!(app.toasts.is_empty(), "sin sala no hay «próxima sala»");
     }
@@ -4105,7 +4148,6 @@ mod tests {
             Msg::Resolution(pick(Resolution::P1440, "1440p")),
             Msg::Codec(pick(CodecChoice::Hevc, "HEVC")),
             Msg::Encoder(pick(EncoderChoice::Software, "software")),
-            Msg::Capped(false),
             Msg::Chroma444(true),
             Msg::Hdr(true),
         ] {
@@ -4113,12 +4155,6 @@ mod tests {
             assert!(app.update(Message::Host(msg.clone())).is_empty(), "{msg:?}");
             assert_eq!(app.settings.video.preset, QualityPreset::Custom, "{msg:?}");
         }
-        // El tope: quitarlo es «sin tope»; volver a ponerlo recuerda el último.
-        app.update(Message::Host(Msg::Cap(pick(30_000, "30"))));
-        app.update(Message::Host(Msg::Capped(false)));
-        assert_eq!(app.settings.video.max_bitrate_kbps, UNLIMITED_KBPS);
-        app.update(Message::Host(Msg::Capped(true)));
-        assert_eq!(app.settings.video.max_bitrate_kbps, 30_000);
     }
 
     /// Con la sala abierta, lo «En vivo» se aplica ya (la resolución máxima y los fps también,
@@ -4132,10 +4168,6 @@ mod tests {
         assert_eq!(
             app.update(Message::Host(Msg::Codec(pick(CodecChoice::Av1, "AV1")))),
             [Effect::SetEncoding]
-        );
-        assert_eq!(
-            app.update(Message::Host(Msg::Cap(pick(10_000, "10")))),
-            [Effect::SetMaxBitrate(10_000)]
         );
         assert_eq!(
             app.update(Message::Host(Msg::Fps(30))),
@@ -4157,14 +4189,14 @@ mod tests {
                 .iter()
                 .any(|t| t.text == "Guardado para la próxima sala")
         );
-        // Un perfil mezcla las dos cosas: el tope va ya y la resolución y los fps juntos, en un
-        // solo efecto; 4:4:4 espera.
+        // Un perfil mezcla las dos cosas: la resolución y los fps van ya, juntos en un solo
+        // efecto; 4:4:4 espera.
         app.toasts.clear();
         app.update(Message::Host(Msg::Chroma444(false)));
         app.toasts.clear();
         assert_eq!(
             app.update(Message::Host(Msg::Preset(QualityPreset::MaxQuality))),
-            [Effect::SetEncoding, Effect::SetMaxBitrate(UNLIMITED_KBPS)]
+            [Effect::SetEncoding]
         );
         assert_eq!(app.toasts.len(), 1, "{:?}", app.toasts);
         assert_eq!(app.flush_settings(), Some(Effect::SaveSettings));
@@ -4185,7 +4217,7 @@ mod tests {
         ))));
         app.update(Message::Host(Msg::Fps(30)));
         app.toasts.clear();
-        app.update(Message::Event(Event::VideoChanged(Ok(None))));
+        app.update(Message::Event(Event::VideoChanged(Ok(()))));
         assert_eq!(app.toasts.len(), 1);
         assert_eq!(
             app.toasts[0].text,
@@ -4199,11 +4231,9 @@ mod tests {
         let summary = when_summary();
         assert!(summary.starts_with("En vivo: "), "{summary}");
         assert!(summary.contains("Al abrir la sala: "), "{summary}");
-        assert_eq!(bitrate_phrase(20_000), "Auto hasta 20 Mbit/s");
-        assert_eq!(bitrate_phrase(UNLIMITED_KBPS), "Auto sin tope");
         let mut video = Video::default();
         QualityPreset::MinLatency.apply(&mut video);
-        assert_eq!(video_spec(&video), "1080p · 60 fps · Auto hasta 10 Mbit/s");
+        assert_eq!(video_spec(&video), "1080p · 60 fps");
     }
 
     /// Sin haber mirado nunca (se llegó a la página sin `Navigate`), el `Tick` pide la lista; y
@@ -4315,11 +4345,10 @@ mod tests {
         assert_eq!(room.volume(GuestId(2)), 60, "Carla, el recordado al llegar");
         // Quien llega con un volumen recordado suena así desde el principio.
         app.settings.audio.set_voice_volume("Dani", 130);
-        let effects = app.update(Message::Event(Event::HostGuests(vec![
-            status(1, "Bea"),
-            status(2, "Carla"),
-            status(3, "Dani"),
-        ])));
+        let effects = app.update(Message::Event(Event::HostGuests(
+            vec![status(1, "Bea"), status(2, "Carla"), status(3, "Dani")],
+            HostVoice::default(),
+        )));
         assert_eq!(
             effects,
             [Effect::SetVoiceGain {
