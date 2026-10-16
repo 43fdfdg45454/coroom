@@ -950,11 +950,6 @@ fn qa_freezes() {
     }
 }
 
-/// Resolución máxima y fps en caliente (`VideoChange::max_size` y `fps`): desde una fuente de
-/// 2560×1440 a 60 fps, bajar y subir el tope (también por encima de la fuente, impar y con otra
-/// proporción), cambiar los fps de 15 a 240, una ráfaga alternando los dos y valores que no
-/// valen (0×0, 0 fps), que tienen que devolver error sin tumbar nada. Imprime el tamaño y los fps
-/// que ve el invitado tras cada paso.
 /// Un paso de `qa_live_resolution_fps`: nombre, tope, fps y el tamaño que debe ver el invitado.
 type Step = (
     &'static str,
@@ -963,15 +958,46 @@ type Step = (
     Option<(u32, u32)>,
 );
 
+/// Resolución máxima y fps en caliente (`VideoChange::max_size` y `fps`): desde una fuente de
+/// 2560×1440 a 60 fps, bajar y subir el tope (también por encima de la fuente, impar y con otra
+/// proporción), cambiar los fps de 15 a 240, una ráfaga alternando los dos y valores que no
+/// valen (0×0, 0 fps), que tienen que devolver error sin tumbar nada. Imprime el tamaño y los fps
+/// que ve el invitado tras cada paso.
+///
+/// `QA_ENCODER` (`nvenc`, `software`) y `QA_DECODER` (`vulkan`, `nvdec`, `software`) fijan el
+/// codificador del anfitrión y el decodificador del invitado (por defecto, los del sondeo).
 #[test]
 #[ignore = "necesita GPU; QA manual"]
 fn qa_live_resolution_fps() {
     let _serial = serial();
     let server = TestServer::start();
-    let mut host = host(server.config(), 2560, 1440, 60, EncoderSet::probe());
+    let encoder = match std::env::var("QA_ENCODER").as_deref() {
+        Ok("nvenc") => Some(coroom_session::codec::Backend::Nvenc),
+        Ok("software") => Some(coroom_session::codec::Backend::Software),
+        _ => None,
+    };
+    let decoder = match std::env::var("QA_DECODER").as_deref() {
+        Ok("vulkan") => Some(DecoderBackend::Vulkan),
+        Ok("nvdec") => Some(DecoderBackend::Nvdec),
+        Ok("software") => Some(DecoderBackend::Software),
+        _ => None,
+    };
+    let mut host = host(
+        server.config(),
+        2560,
+        1440,
+        60,
+        EncoderSet::probe().only_backend(encoder),
+    );
     let code = room_code(&host).expect("sala");
     let seen = Seen::default();
-    let mut viewer = guest(server.config(), &code, None, DecoderSet::probe(), &seen);
+    let mut viewer = guest(
+        server.config(),
+        &code,
+        None,
+        DecoderSet::probe().only_backend(decoder),
+        &seen,
+    );
     let mut failures: Vec<String> = Vec::new();
     check(
         &mut failures,
