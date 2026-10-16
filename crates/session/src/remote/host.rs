@@ -22,8 +22,8 @@ use coroom_transport::crypto::hpke::{self, PairwiseOffer};
 use coroom_transport::crypto::sframe::MediaKey;
 use coroom_transport::crypto::{RoomGroup, SafetyNumber, sha256_fingerprint};
 use coroom_transport::media::{
-    DEFAULT_SOURCE, MediaSender, MediaSenderConfig, PROBE_SPACING, PROBE_TRAINS, audio_datagram,
-    probe_pace_kbps,
+    DEFAULT_SOURCE, MediaSender, MediaSenderConfig, PROBE_POLL, PROBE_SPACING, audio_datagram,
+    startup_probe_paces,
 };
 use coroom_transport::proto::PROTOCOL_VERSION;
 use coroom_transport::proto::control::{
@@ -1537,15 +1537,18 @@ fn attach_direct(
     ));
 }
 
-/// Sonda del enlace hacia un emisor recién conectado: [`PROBE_TRAINS`] trenes a
-/// [`probe_pace_kbps`] del máximo configurado (varias veces el máximo, hasta el techo del emisor:
-/// la dispersión solo mide cuellos por debajo del ritmo de salida, y el pacing necesita saber
-/// cuánto sobra por encima del máximo), antes de que el invitado pida el vídeo. Con lo que informe
-/// arranca su control de tasa ([`MediaSender::on_probe_result`], acotado al máximo) y se fija el
-/// ritmo del pacing ([`MediaSender::pacing_plan`], que no se acota al máximo).
+/// Sonda del enlace hacia un invitado recién conectado y, mientras siga, las periódicas.
+///
+/// Al conectar, antes de que el invitado pida el vídeo, una escalera de trenes
+/// ([`startup_probe_paces`], hasta varias veces el máximo: la dispersión solo mide cuellos por
+/// debajo del ritmo de salida, y el pacing necesita saber cuánto sobra). Con lo que informe
+/// arranca su control de tasa ([`MediaSender::on_probe_result`]: el objetivo y, si un tren perdió
+/// contra un limitador, el techo de ráfaga) y se fija el ritmo del pacing. Después, cada
+/// [`PROBE_POLL`] se mira si el control de tasa de algún receptor pide una sonda
+/// ([`MediaSender::probe_due`]: subir el techo cuando frena, o confirmar lo medido) y sale.
 async fn probe_link(ctx: Arc<HostCtx>, sender: Arc<MediaSender>) {
-    let pace = probe_pace_kbps(ctx.max_kbps.load(Ordering::Acquire));
-    for train in 0..PROBE_TRAINS {
+    let paces = startup_probe_paces(ctx.max_kbps.load(Ordering::Acquire));
+    for (train, pace) in paces.into_iter().enumerate() {
         if train > 0 {
             tokio::time::sleep(PROBE_SPACING).await;
         }
@@ -1553,6 +1556,26 @@ async fn probe_link(ctx: Arc<HostCtx>, sender: Arc<MediaSender>) {
             debug!(error = %err, "no se pudo enviar la sonda del enlace");
             return;
         }
+    }
+    let closed = sender.connection().clone();
+    let periodic = async {
+        loop {
+            tokio::time::sleep(PROBE_POLL).await;
+            if ctx.core.ended() {
+                return;
+            }
+            if let Some(pace) = sender.probe_due() {
+                debug!(kbps = pace, "sonda periódica del enlace");
+                if let Err(err) = sender.send_probe(pace).await {
+                    debug!(error = %err, "sonda periódica sin enviar");
+                    return;
+                }
+            }
+        }
+    };
+    tokio::select! {
+        () = periodic => {}
+        _ = closed.closed() => {}
     }
 }
 

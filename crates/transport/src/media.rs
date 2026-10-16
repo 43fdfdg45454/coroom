@@ -98,9 +98,22 @@ pub const PING_INTERVAL: Duration = Duration::from_secs(1);
 /// enlace y sale en 6 ms a [`PROBE_MAX_PACE_KBPS`], así que deja ~55 ms de cola.
 pub const PROBE_PACKETS: u16 = 64;
 
-/// Trenes que se envían a cada receptor al conectar, separados [`PROBE_SPACING`]; vale el mejor
-/// (el tráfico ajeno solo puede hacer que un tren mida de menos).
-pub const PROBE_TRAINS: u32 = 2;
+/// Trenes que se envían a cada receptor al conectar, separados [`PROBE_SPACING`], en escalera de
+/// ritmos ([`startup_probe_paces`]); vale el mejor (el tráfico ajeno solo puede hacer que un tren
+/// mida de menos).
+pub const PROBE_TRAINS: u32 = 4;
+
+/// Ritmos de la sonda al arrancar: una escalera hasta [`probe_pace_kbps`] (un octavo, un cuarto,
+/// la mitad y el ritmo entero). Los de abajo pasan limpios por casi cualquier enlace y dicen que
+/// hay al menos eso; el primero que pierde datagramas contra un limitador dice cuánto pasa, y el
+/// techo de ráfaga empieza ahí ([`RateController::on_probe`]), antes de que haya vídeo que perder.
+pub fn startup_probe_paces(max_kbps: u32) -> [u32; PROBE_TRAINS as usize] {
+    let top = probe_pace_kbps(max_kbps);
+    [top / 8, top / 4, top / 2, top].map(|pace| pace.max(1))
+}
+
+/// Cada cuánto se mira si algún receptor pide una sonda periódica ([`MediaSender::probe_due`]).
+pub const PROBE_POLL: Duration = Duration::from_millis(250);
 
 /// Separación entre dos trenes de sonda.
 pub const PROBE_SPACING: Duration = Duration::from_millis(100);
@@ -359,8 +372,11 @@ pub fn pacing_duration(
 pub const CAPPED_INTERVALS: f64 = 0.85;
 
 /// Intervalos de un intra repartido al techo de ráfaga: un intra pesa decenas de fotogramas y,
-/// pasado el techo, el limitador lo tira entero (y se vuelve a pedir otro); mejor que tarde.
-pub const CAPPED_KEYFRAME_INTERVALS: f64 = 8.0;
+/// pasado el techo, el limitador lo tira entero (y se vuelve a pedir otro); mejor que tarde, pero
+/// nunca más de lo que espera el receptor: un intervalo menos que su plazo máximo (4 intervalos;
+/// con 8 intervalos se daba por vencido a los 4, se perdía entero y
+/// se pedía otro, y el vídeo quedaba congelado).
+pub const CAPPED_KEYFRAME_INTERVALS: f64 = MAX_DEADLINE_INTERVALS - 1.0;
 
 /// Lo que una espera del pacing puede adelantarse sin dormir aunque el retraso medido sea menor:
 /// los temporizadores de `tokio` van en pasos de 1 ms, así que una espera más corta que esto se
@@ -977,24 +993,31 @@ impl MediaSender {
         };
         let limiting = state
             .sources
-            .iter_mut()
-            .min_by_key(|source| source.rate.target_kbps());
-        let Some(limiting) = limiting else {
+            .iter()
+            .min_by_key(|source| source.rate.target_kbps())
+            .map(|source| {
+                (
+                    source.probe.and_then(|probe| probe.kbps()),
+                    source.rate.estimate_kbps(),
+                )
+            });
+        let Some((probe, estimate)) = limiting else {
             let (pace, headroom) = pacing_pace(target, None, 0.0, self.config.pacing.gain);
             return (pace, headroom, false);
         };
-        let probe = limiting.probe.and_then(|probe| probe.kbps());
-        let (pace, headroom) = pacing_pace(
-            target,
-            probe,
-            limiting.rate.estimate_kbps(),
-            self.config.pacing.gain,
-        );
+        let (pace, headroom) = pacing_pace(target, probe, estimate, self.config.pacing.gain);
         // Sin techo, un fotograma medio sale en `share` del intervalo: a `target / share` si eso
-        // pasa del ritmo.
+        // pasa del ritmo. Lo saben todos los receptores (en el relay, cada uno tiene su techo), y
+        // el techo que manda es el más bajo.
         let natural = (f64::from(target) / self.config.pacing.share).max(f64::from(pace));
-        limiting.rate.note_pace(natural.round() as u32);
-        match limiting.rate.burst_cap_kbps() {
+        let mut cap: Option<u32> = None;
+        for source in &mut state.sources {
+            source.rate.note_pace(natural.round() as u32);
+            if let Some(source_cap) = source.rate.burst_cap_kbps() {
+                cap = Some(cap.map_or(source_cap, |cap| cap.min(source_cap)));
+            }
+        }
+        match cap {
             Some(cap) => (cap, false, true),
             _ => (pace, headroom, false),
         }
@@ -1003,6 +1026,19 @@ impl MediaSender {
     /// El ritmo de [`MediaSender::pacing_plan`].
     pub fn pacing_kbps(&self) -> u32 {
         self.pacing_plan().0
+    }
+
+    /// Si toca una sonda periódica para algún receptor ([`RateController::probe_due`]): el ritmo
+    /// del tren. Sin techo se mide el enlace a [`probe_pace_kbps`] del máximo configurado.
+    pub fn probe_due(&self) -> Option<u32> {
+        let refresh = probe_pace_kbps(self.rate_config().max_kbps);
+        let mut state = self.state.lock().ok()?;
+        let now = Instant::now();
+        state
+            .sources
+            .iter_mut()
+            .filter_map(|source| source.rate.probe_due(now, refresh))
+            .max()
     }
 
     /// Envía un tren de sonda ([`PROBE_PACKETS`] datagramas de relleno de la pista
@@ -1098,6 +1134,15 @@ impl MediaSender {
                 entry.rate.restart(start);
             }
         }
+        // El control de tasa decide con el tren: techo al arrancar si perdió, subida del techo o
+        // medida del enlace para dejar crecer el objetivo.
+        entry.rate.on_probe(
+            Instant::now(),
+            pace.unwrap_or(kbps),
+            Some(kbps),
+            outcome.lost(),
+            outcome.sent,
+        );
         let target = state
             .limiting()
             .map_or(self.rate_config().start_kbps, |s| s.rate.target_kbps());
