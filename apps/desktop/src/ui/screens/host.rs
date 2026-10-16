@@ -2354,7 +2354,6 @@ fn advanced(app: &App) -> Element<'_, Message> {
         VideoOption::Codec,
         ui::select(encoders, encoder, |c| on(Msg::Encoder(c))),
     ));
-    rows.push(bitrate_row(app));
     rows.push(option_row(
         t!("host-croma"),
         Some(chroma_hint(app)),
@@ -2386,32 +2385,6 @@ fn advanced(app: &App) -> Element<'_, Message> {
         ));
     }
     ui::boxed_list(rows)
-}
-
-/// Bitrate: automático para cada invitado, hasta lo que da su enlace (sin tope que elegir). Solo
-/// informa de lo que pide ahora el control de tasa del más lento.
-fn bitrate_row(app: &App) -> Element<'_, Message> {
-    let now = app
-        .host
-        .room
-        .as_ref()
-        .and_then(|room| room.guests.iter().filter_map(|g| g.target_kbps).min());
-    let hint = match now {
-        Some(kbps) => t!("host-bitrate-ahora", valor = stats::kbps(f64::from(kbps))),
-        None => t!("host-bitrate-sin-sala").to_owned(),
-    };
-    let texts = column![
-        ui::body(t!("host-bitrate")),
-        ui::secondary(t!("host-bitrate-ayuda")).wrapping(Wrapping::WordOrGlyph),
-        ui::caption(hint).wrapping(Wrapping::WordOrGlyph),
-    ]
-    .spacing(2)
-    .width(Length::Fill);
-    row![texts, ui::strong(t!("host-auto"))]
-        .spacing(space::S)
-        .align_y(Alignment::Start)
-        .padding(Padding::from([10.0, 16.0]))
-        .into()
 }
 
 /// Fila de la lista de audio: la casilla, el nombre y la nota a la derecha.

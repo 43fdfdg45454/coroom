@@ -62,7 +62,6 @@ host-perfil-personalizado-ayuda = Lo que elegiste en Avanzado.
 host-nativa = Nativa
 host-nativa-hasta-4k = Nativa (hasta 4K)
 host-fps = { $fps } fps
-host-auto = Auto
 host-en-vivo = En vivo
 host-al-abrir-la-sala = Al abrir la sala
 host-cuando-grupo = { $when }: { $valor }
@@ -76,7 +75,7 @@ host-no-se-pudo-cambiar-el-video = No se pudo cambiar el vídeo de la sala: { $e
 ## Avanzado
 
 host-avanzado = Avanzado
-host-avanzado-plegado = Resolución, fps, códec, croma 4:4:4 y HDR (el bitrate es automático)
+host-avanzado-plegado = Resolución, fps, códec, croma 4:4:4 y HDR
 host-avanzado-desplegado = Cambiar algo aquí convierte el modo en «Personalizado»
 host-avanzado-sin-cambios = { $perfil }, sin cambios
 host-resolucion-maxima = Resolución máxima
@@ -89,10 +88,6 @@ host-automatico = Automático
 host-codificador = Codificador
 host-codificador-ayuda = Automático prueba primero el del fabricante de tu tarjeta gráfica. Si eliges uno que este equipo no tiene, la sala no se abre y te lo dice.
 host-por-software = Por software
-host-bitrate = Bitrate
-host-bitrate-ayuda = Se ajusta solo para cada invitado: sube hasta lo que da su conexión y baja antes de que el vídeo se corte.
-host-bitrate-sin-sala = Con la sala abierta, aquí se ve lo que pide ahora el invitado más lento.
-host-bitrate-ahora = Ahora: { $valor }.
 host-croma = Croma 4:4:4
 host-croma-lead = Texto nítido en escritorios y juegos de estrategia.
 host-croma-comprobando = { $lead } Comprobando qué códecs lo admiten en este equipo…
