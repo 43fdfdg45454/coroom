@@ -11,6 +11,7 @@
 //! - [`style`]: [`Theme`] y los catálogos de estilo de los *widgets* de `iced` con clases propias.
 //! - [`font`]: fuente del escritorio o Inter embebida; monoespaciada para códigos y huellas.
 //! - [`icon`]: iconos de Lucide (ISC) monocromos.
+//! - [`selectable`]: texto que se selecciona con el ratón y se copia (los mensajes del chat).
 //! - [`widget`]: componentes (botones, campos, listas, insignias, avisos, toasts, diálogos,
 //!   progreso, selectores, atajos, barra lateral, cabecera, tarjetas, estados).
 //!
@@ -19,6 +20,7 @@
 pub mod editor;
 pub mod font;
 pub mod icon;
+pub mod selectable;
 pub mod style;
 pub mod tag;
 pub mod theme;

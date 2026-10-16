@@ -109,6 +109,50 @@ impl ShotRenderer {
         (width, height, pixels)
     }
 
+    /// Pasa `events` a `element` (un solo *widget* o un trozo de pantalla, en `size` lógico y
+    /// con `theme`), cada uno con el puntero en su punto, y lo dibuja al final: los mensajes que
+    /// publicó y la captura (ancho, alto y RGBA). Para probar interacciones con el ratón y el
+    /// teclado sin ventana.
+    pub fn interact<M>(
+        &mut self,
+        element: coroom_ui::Element<'_, M>,
+        size: (u32, u32),
+        theme: &coroom_ui::Theme,
+        events: &[(UiEvent, iced_core::Point)],
+    ) -> (Vec<M>, (u32, u32, Vec<u8>)) {
+        let logical = Size::new(size.0 as f32, size.1 as f32);
+        let mut interface = UserInterface::build(
+            element,
+            logical,
+            user_interface::Cache::new(),
+            &mut self.renderer,
+        );
+        let mut messages = Vec::new();
+        let mut clipboard = iced_core::clipboard::Null;
+        let mut cursor = mouse::Cursor::Unavailable;
+        for (event, point) in events {
+            cursor = mouse::Cursor::Available(*point);
+            let _ = interface.update(
+                std::slice::from_ref(event),
+                cursor,
+                &mut self.renderer,
+                &mut clipboard,
+                &mut messages,
+            );
+        }
+        interface.draw(
+            &mut self.renderer,
+            theme,
+            &renderer::Style {
+                text_color: theme.text_color(),
+            },
+            cursor,
+        );
+        let viewport = Viewport::with_physical_size(Size::new(size.0, size.1), 1.0);
+        let pixels = self.renderer.screenshot(&viewport, theme.background());
+        (messages, (size.0, size.1, pixels))
+    }
+
     /// Orden de foco de `app` (accesibilidad): los campos enfocables en el orden en que
     /// los recorre `Tab` (el de la interfaz, como hace la ventana con `focus_next`), con su
     /// identificador (`None` si no tiene), y el índice enfocado tras cada una de `presses`

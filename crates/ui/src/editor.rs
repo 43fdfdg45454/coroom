@@ -51,11 +51,6 @@ pub enum EditorClass {
     Normal,
     /// Sobre el vídeo (dentro de un panel `Overlay`).
     Overlay,
-    /// Texto que se lee y se selecciona (un mensaje del chat): sin fondo ni borde, del color
-    /// del texto de la superficie.
-    Reading,
-    /// [`EditorClass::Reading`] sobre el vídeo.
-    ReadingOverlay,
 }
 
 impl text_editor::Catalog for Theme {
@@ -100,20 +95,6 @@ impl text_editor::Catalog for Theme {
                 },
                 selection: p.accent_bg.alpha(0.35),
             },
-            EditorClass::Reading | EditorClass::ReadingOverlay => {
-                let overlay = *class == EditorClass::ReadingOverlay;
-                text_editor::Style {
-                    background: Background::Color(Color::TRANSPARENT),
-                    border: outline(Color::TRANSPARENT, 0.0),
-                    placeholder: Color::TRANSPARENT,
-                    value: if overlay {
-                        p.overlay_text.color()
-                    } else {
-                        p.text.color()
-                    },
-                    selection: p.accent_bg.alpha(if overlay { 0.45 } else { 0.35 }),
-                }
-            }
             EditorClass::Overlay => text_editor::Style {
                 background: Background::Color(p.overlay_text.alpha(if disabled {
                     0.04

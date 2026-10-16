@@ -28,9 +28,11 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 - **Probar el micrófono** en Ajustes → Audio y voz: el nivel y, con «Oírte», tu voz por la salida.
 - La pestaña **Ajustes** del panel del invitado: VSync, decodificar por software (apagado de
   partida; cambia al momento, sin reconectar), micrófono y salida, volumen del juego y el mando; «Conexión» queda solo con datos.
-- El texto del chat **se selecciona** con el ratón y se copia con `Ctrl+C` (los enlaces siguen
-  abriéndose con un clic); el mensaje entero, con el botón que aparece al pasar por encima o con el
-  botón derecho.
+- El texto del chat **se selecciona** con el ratón como en cualquier chat: arrastrar (también a
+  través de varias líneas), doble clic para la palabra, triple para la línea y Mayús+clic para
+  ampliar; se copia con `Ctrl+C` o el botón derecho. Los enlaces siguen subrayados y se abren con
+  un clic sin arrastrar. El mensaje entero, con el botón que aparece al pasar por encima o con el
+  botón derecho sin nada seleccionado.
 - **«Predeterminado del sistema (…)»** en los selectores de audio, con el dispositivo que es.
 
 - Volumen del audio del juego en el invitado, aparte del de cada participante (0-200 %, recordado):
