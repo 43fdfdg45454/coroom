@@ -620,32 +620,60 @@ fn f_devices_and_the_voice_volume_change_live() {
     const OTHER_MIC_HZ: f64 = 770.0;
     const HEARD: f64 = 0.1;
     const ABSENT: f64 = 0.01;
-    let limit = Duration::from_secs(20);
+    let limit = Duration::from_secs(30);
+    // Solo la cola de la grabación, y sin prisa: copiarla entera cada 20 ms con el cerrojo del
+    // sumidero tomado dejaba sin sitio a la reproducción en un runner lento.
+    let tail = |tape_: &Tape| {
+        let recording = tape_.lock().unwrap_or_else(|p| p.into_inner());
+        let keep = 48_000 * usize::from(recording.channels.max(1));
+        let from = recording.samples.len().saturating_sub(keep);
+        Recording {
+            channels: recording.channels,
+            samples: recording.samples[from..].to_vec(),
+            writes: Vec::new(),
+            underruns: recording.underruns,
+        }
+    };
+    let wait = |what: &str, mut condition: Box<dyn FnMut() -> bool + '_>| {
+        let deadline = Instant::now() + limit;
+        while !condition() {
+            assert!(
+                Instant::now() < deadline,
+                "tiempo agotado esperando: {what}"
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    };
     let _serial = serial();
     let server = TestServer::start();
     let mut host = host(server.config(), false, Some(HOST_VOICE_HZ), false);
     let code = room_code(&host.session);
     let mut listener = guest(server.config(), &code, None, None);
     allow_voice(&mut host.session, 1, true);
-    let level = |tape_: &Tape, freq| tone_level(&tape(tape_), freq, 1.0);
-    wait_until("la voz del anfitrión", limit, || {
-        level(&listener.speaker, HOST_VOICE_HZ) > HEARD
-    });
+    let level = |tape_: &Tape, freq| tone_level(&tail(tape_), freq, 1.0);
+    wait(
+        "la voz del anfitrión",
+        Box::new(|| level(&listener.speaker, HOST_VOICE_HZ) > HEARD),
+    );
     // Otro micrófono en marcha: llega el nuevo y deja de llegar el anterior.
     host.session
         .audio()
         .replace_mic(Box::new(ToneSource::new(OTHER_MIC_HZ, 1)));
-    wait_until("el micrófono nuevo", limit, || {
-        level(&listener.speaker, OTHER_MIC_HZ) > HEARD
-            && level(&listener.speaker, HOST_VOICE_HZ) < ABSENT
-    });
+    wait(
+        "el micrófono nuevo",
+        Box::new(|| {
+            level(&listener.speaker, OTHER_MIC_HZ) > HEARD
+                && level(&listener.speaker, HOST_VOICE_HZ) < ABSENT
+        }),
+    );
     let full = level(&listener.speaker, OTHER_MIC_HZ);
     println!("tras cambiar de micrófono: {OTHER_MIC_HZ} Hz a {full:.3}");
     // La voz a la mitad: llega a la mitad.
     host.session.audio().set_mic_gain(0.5);
-    wait_until("que baje la voz", limit, || {
-        level(&listener.speaker, OTHER_MIC_HZ) / full < 0.65
-    });
+    wait(
+        "que baje la voz",
+        Box::new(|| level(&listener.speaker, OTHER_MIC_HZ) / full < 0.65),
+    );
     // Lo que queda en la ventana de antes del cambio sale en un segundo.
     std::thread::sleep(Duration::from_millis(1500));
     let half = level(&listener.speaker, OTHER_MIC_HZ);
@@ -661,9 +689,10 @@ fn f_devices_and_the_voice_volume_change_live() {
     let sink = CaptureSink::new(2);
     let new_tape = sink.recording();
     audio.replace_speaker(Box::new(sink));
-    wait_until("la salida nueva", limit, || {
-        level(&new_tape, OTHER_MIC_HZ) > HEARD / 2.0
-    });
+    wait(
+        "la salida nueva",
+        Box::new(|| level(&new_tape, OTHER_MIC_HZ) > HEARD / 2.0),
+    );
     println!("en la salida nueva: {:.3}", level(&new_tape, OTHER_MIC_HZ));
     assert_eq!(listener.session.end_reason(), None, "sin reconectar");
     listener.session.close();
