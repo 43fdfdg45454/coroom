@@ -838,7 +838,8 @@ pub(crate) struct DecodeControl {
     opener: DecoderOpener,
     /// Solo decodificadores por software (Ajustes del invitado, en marcha).
     software_only: AtomicBool,
-    /// Hay que volver a abrir el decodificador (cambió [`DecodeControl::software_only`]).
+    /// Hay que volver a abrir el decodificador (cambió [`DecodeControl::software_only`] o el
+    /// anfitrión empezó otro flujo, [`DecodeControl::restart`]).
     reopen: AtomicBool,
 }
 
@@ -874,6 +875,15 @@ impl DecodeControl {
             self.reopen.store(true, Ordering::Release);
             self.renegotiate.store(true, Ordering::Release);
         }
+    }
+
+    /// El anfitrión volvió a abrir su codificador (otro `CodecSelected` del mismo códec, tras
+    /// cambiar los fps, el tamaño o el backend): el flujo empieza de nuevo con otra cabecera de
+    /// secuencia y el decodificador también se abre de nuevo. Algunos de hardware no aceptan una
+    /// cabecera nueva del mismo tamaño en marcha: no dan error ni imagen, y el vídeo se queda
+    /// congelado aunque lleguen intras.
+    pub(crate) fn restart(&self) {
+        self.reopen.store(true, Ordering::Release);
     }
 
     /// Olvida las peticiones de volver a abrir y de renegociar (al arrancar).
@@ -1743,7 +1753,7 @@ pub(crate) fn decode_loop(
     while let Some(frame) = recv_or_stop(&rx, shared) {
         let now = Instant::now();
         if control.is_some_and(DecodeControl::take_reopen) {
-            debug!("decodificador por software o no: se vuelve a abrir");
+            debug!("se vuelve a abrir el decodificador");
             decoder = None;
             opened_format = None;
             unavailable = None;
@@ -2367,6 +2377,18 @@ mod tests {
         assert!(!control.take_reopen(), "sin cambio no se reabre");
         control.set_software_only(false);
         assert!(control.take_reopen());
+        assert_eq!(control.usable().available().len(), 3);
+    }
+
+    /// Un flujo nuevo del anfitrión con el mismo códec vuelve a abrir el decodificador, sin
+    /// renegociar ni apartar el que había.
+    #[test]
+    fn a_new_stream_from_the_host_reopens_the_decoder() {
+        let control = DecodeControl::new(av1_set());
+        control.restart();
+        assert!(control.take_reopen());
+        assert!(!control.take_reopen(), "una vez");
+        assert!(!control.take_renegotiation());
         assert_eq!(control.usable().available().len(), 3);
     }
 

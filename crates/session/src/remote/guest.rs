@@ -1153,7 +1153,10 @@ async fn control_loop(
                 );
                 let selected = codec_from_wire(selected);
                 let format = format_from_wire(chroma, color);
-                if codec != Some((selected, format)) {
+                if codec == Some((selected, format)) {
+                    // Mismo códec, otro flujo: el anfitrión reabrió su codificador.
+                    decode.restart();
+                } else {
                     codec = Some((selected, format));
                     decode.request(selected, format);
                     let backend = decode
