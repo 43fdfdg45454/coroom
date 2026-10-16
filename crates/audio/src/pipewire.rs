@@ -688,6 +688,26 @@ struct Node {
 
 /// Nodos de audio del grafo (con un recorrido completo del registro).
 fn enumerate() -> Result<Vec<Node>, AudioError> {
+    Ok(enumerate_with_defaults()?.0)
+}
+
+/// Salida y micrófono del sistema (`node.name`), de los metadatos `default` de PipeWire.
+#[derive(Debug, Clone, Default)]
+struct Defaults {
+    sink: Option<String>,
+    source: Option<String>,
+}
+
+/// `node.name` de un valor de los metadatos `default` (`{"name":"alsa_output.usb-…"}`).
+fn default_name(value: &str) -> Option<String> {
+    let (_, rest) = value.split_once("\"name\"")?;
+    let (_, rest) = rest.split_once('"')?;
+    let (name, _) = rest.split_once('"')?;
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// [`enumerate`] y la salida y el micrófono del sistema.
+fn enumerate_with_defaults() -> Result<(Vec<Node>, Defaults), AudioError> {
     pw::init();
     let main_loop = pw::main_loop::MainLoopRc::new(None).map_err(no_daemon)?;
     let context = pw::context::ContextRc::new(&main_loop, None).map_err(no_daemon)?;
@@ -695,9 +715,44 @@ fn enumerate() -> Result<Vec<Node>, AudioError> {
     let registry = core.get_registry_rc().map_err(backend)?;
     let nodes = Rc::new(RefCell::new(Vec::new()));
     let found = Rc::clone(&nodes);
+    let defaults = Rc::new(RefCell::new(Defaults::default()));
+    // Los metadatos `default` enlazados y su oyente: viven hasta el final del recorrido.
+    let bound: Rc<RefCell<Vec<(pw::metadata::Metadata, pw::metadata::MetadataListener)>>> =
+        Rc::new(RefCell::new(Vec::new()));
+    let binder = registry.clone();
+    let keep = Rc::clone(&bound);
+    let seen = Rc::clone(&defaults);
     let _registry = registry
         .add_listener_local()
         .global(move |global| {
+            if global.type_ == pw::types::ObjectType::Metadata {
+                let named_default = global
+                    .props
+                    .and_then(|props| props.get("metadata.name"))
+                    .is_some_and(|name| name == "default");
+                if !named_default {
+                    return;
+                }
+                let Ok(metadata) = binder.bind::<pw::metadata::Metadata, _>(global) else {
+                    return;
+                };
+                let seen = Rc::clone(&seen);
+                let listener = metadata
+                    .add_listener_local()
+                    .property(move |_, key, _, value| {
+                        let name = value.and_then(default_name);
+                        let mut defaults = seen.borrow_mut();
+                        match key {
+                            Some("default.audio.sink") => defaults.sink = name,
+                            Some("default.audio.source") => defaults.source = name,
+                            _ => {}
+                        }
+                        0
+                    })
+                    .register();
+                keep.borrow_mut().push((metadata, listener));
+                return;
+            }
             if global.type_ != pw::types::ObjectType::Node {
                 return;
             }
@@ -720,12 +775,24 @@ fn enumerate() -> Result<Vec<Node>, AudioError> {
             });
         })
         .register();
+    // Dos vueltas: la primera trae los objetos (y enlaza los metadatos); la segunda, las
+    // propiedades de los metadatos enlazados.
     let pending = core.sync(0).map_err(backend)?;
     let done_loop = main_loop.clone();
+    let second = Rc::new(RefCell::new(None));
+    let syncer = core.clone();
     let _core = core
         .add_listener_local()
         .done(move |id, seq| {
-            if id == pw::core::PW_ID_CORE && seq == pending {
+            if id != pw::core::PW_ID_CORE {
+                return;
+            }
+            if seq == pending {
+                match syncer.sync(0) {
+                    Ok(next) => *second.borrow_mut() = Some(next),
+                    Err(_) => done_loop.quit(),
+                }
+            } else if *second.borrow() == Some(seq) {
                 done_loop.quit();
             }
         })
@@ -735,7 +802,9 @@ fn enumerate() -> Result<Vec<Node>, AudioError> {
     let _ = timer.update_timer(Some(CONNECT_TIMEOUT), None);
     main_loop.run();
     let out = nodes.borrow().clone();
-    Ok(out)
+    let defaults = defaults.borrow().clone();
+    bound.borrow_mut().clear();
+    Ok((out, defaults))
 }
 
 /// `target.object` del nodo de reproducción de la aplicación `name`.
@@ -862,7 +931,8 @@ impl crate::apps::AppBackend for AppStreams {
 
 /// Dispositivos y aplicaciones con audio.
 pub fn list_devices() -> Result<Vec<DeviceInfo>, AudioError> {
-    Ok(enumerate()?
+    let (nodes, defaults) = enumerate_with_defaults()?;
+    Ok(nodes
         .into_iter()
         .filter_map(|node| {
             let kind = match node.class.as_str() {
@@ -876,6 +946,11 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>, AudioError> {
             } else {
                 node.name.clone()
             };
+            let default = match kind {
+                DeviceKind::Sink => defaults.sink.as_deref() == Some(node.name.as_str()),
+                DeviceKind::Source => defaults.source.as_deref() == Some(node.name.as_str()),
+                DeviceKind::Application => false,
+            };
             Some(DeviceInfo {
                 name,
                 description: if node.description.is_empty() {
@@ -884,7 +959,7 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>, AudioError> {
                     node.description
                 },
                 kind,
-                default: false,
+                default,
             })
         })
         .collect())
@@ -895,6 +970,20 @@ mod tests {
     use super::*;
 
     fn assert_send<T: Send>() {}
+
+    #[test]
+    fn default_metadata_values_give_the_node_name() {
+        assert_eq!(
+            default_name(r#"{"name":"alsa_input.usb-ejemplo-00.analog-stereo"}"#).as_deref(),
+            Some("alsa_input.usb-ejemplo-00.analog-stereo")
+        );
+        assert_eq!(
+            default_name(r#"{ "name": "ejemplo" }"#).as_deref(),
+            Some("ejemplo")
+        );
+        assert_eq!(default_name("{}"), None);
+        assert_eq!(default_name(r#"{"name":""}"#), None);
+    }
 
     #[test]
     fn the_alsa_wrapper_shows_the_executable_instead() {

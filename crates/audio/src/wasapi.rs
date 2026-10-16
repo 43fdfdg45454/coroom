@@ -940,10 +940,17 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>, AudioError> {
             let Ok(device) = device else {
                 continue;
             };
+            // El nombre amigable lleva el producto («Micrófono (Auriculares USB)»); la
+            // descripción del dispositivo es solo la clase («Micrófono»), igual en todos.
             let name = device.get_friendlyname().unwrap_or_default();
             let id = device.get_id().ok();
+            let description = if name.is_empty() {
+                device.get_description().unwrap_or_default()
+            } else {
+                name.clone()
+            };
             out.push(DeviceInfo {
-                description: device.get_description().unwrap_or_else(|_| name.clone()),
+                description,
                 name,
                 kind,
                 default: id.is_some() && id == default_id,
