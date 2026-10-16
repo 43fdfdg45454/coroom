@@ -2,8 +2,12 @@
 //!
 //! En vez de una preferencia fija por fabricante, con varios backends disponibles para un códec
 //! se abre cada uno, se codifican unos fotogramas sintéticos y se mide por fotograma la latencia
-//! de entrega a paquete ([`calibrate`]); gana el de menor p95 (a igual p95, menor p50:
-//! [`pick`]). El resultado se guarda ([`CalibrationCache`], JSON) con la clave de la GPU y su
+//! de entrega a paquete ([`calibrate`]). Después, con una imagen difícil y un intra pedido, se
+//! mide el fotograma más grande frente a lo que el enlace pasa en un intervalo
+//! ([`CalibrationResult::peak_ratio`]): gana el de menor p95 entre los que **respetan el techo**
+//! ([`CalibrationResult::fits`]; a igual p95, menor p50: [`pick`]). Un codificador que no lo
+//! respeta obliga al control del techo a recortarle el objetivo, y donde eso reabre el
+//! codificador (VA-API, Vulkan, AMF, SVT-AV1) sale un intra grande cada vez. El resultado se guarda ([`CalibrationCache`], JSON) con la clave de la GPU y su
 //! driver, el códec, la clase de resolución y el formato de píxel ([`CalibrationKey`]), y se
 //! vuelve a medir solo si cambia la clave o el backend guardado ya no abre.
 //!
@@ -36,6 +40,15 @@ pub const ENCODE_BUDGET: Duration = Duration::from_millis(400);
 /// Muestras mínimas para que una medida valga.
 pub const MIN_SAMPLES: usize = 8;
 
+/// Fotogramas de la imagen difícil ([`hard_frame`]) tras la latencia; antes del tercero se pide un
+/// intra, y los dos últimos dejan salir lo que un codificador con retraso tenga pendiente.
+pub const PEAK_FRAMES: u64 = 6;
+
+/// Veces lo que el enlace pasa en un intervalo que puede pesar el mayor fotograma para contar como
+/// que respeta el techo: la misma tolerancia con que el control del techo de los codificadores de
+/// FFmpeg decide que uno se pasa (`ffmpeg::encoder::CEILING_TOLERANCE`).
+pub const PEAK_TOLERANCE: f64 = 1.1;
+
 /// Lo que se midió de un candidato.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalibrationResult {
@@ -51,8 +64,23 @@ pub struct CalibrationResult {
     pub kbit_s: u32,
     /// Fotogramas medidos.
     pub samples: u32,
+    /// El mayor fotograma de la imagen difícil (intra incluido) entre lo que el enlace pasa en un
+    /// intervalo al bitrate de la configuración, en milésimas (1000 = justo un intervalo).
+    pub peak_ratio_milli: u32,
     /// Por qué no cuenta, si no abrió o no entregó.
     pub note: Option<String>,
+}
+
+impl CalibrationResult {
+    /// El mayor fotograma frente a un intervalo ([`CalibrationResult::peak_ratio_milli`]).
+    pub fn peak_ratio(&self) -> f64 {
+        f64::from(self.peak_ratio_milli) / 1000.0
+    }
+
+    /// Si respeta el techo por fotograma ([`PEAK_TOLERANCE`]).
+    pub fn fits(&self) -> bool {
+        self.peak_ratio() <= PEAK_TOLERANCE
+    }
 }
 
 impl fmt::Display for CalibrationResult {
@@ -60,12 +88,19 @@ impl fmt::Display for CalibrationResult {
         if self.opened {
             write!(
                 f,
-                "{}: p50 {:.1} ms, p95 {:.1} ms, {} kbit/s ({} fotogramas)",
+                "{}: p50 {:.1} ms, p95 {:.1} ms, {} kbit/s ({} fotogramas), mayor fotograma {:.1}× \
+                 el intervalo{}",
                 self.backend,
                 self.p50.as_secs_f64() * 1000.0,
                 self.p95.as_secs_f64() * 1000.0,
                 self.kbit_s,
-                self.samples
+                self.samples,
+                self.peak_ratio(),
+                if self.fits() {
+                    ""
+                } else {
+                    " (no respeta el techo)"
+                }
             )
         } else {
             write!(
@@ -95,6 +130,34 @@ pub fn synthetic_frame(width: u32, height: u32, frame_id: u64) -> RawFrame {
                 (((x + y) / 2 + shift) % 256) as u8,
                 255,
             ];
+        }
+    }
+    RawFrame::cpu(frame_id, (width, height), PixelFormat::Bgra, stride, data)
+}
+
+/// Fotograma BGRA difícil: bloques de 16×16 de color al azar (fija por `frame_id`), lo que
+/// cambia de golpe y llena la imagen de bordes. Un codificador que respeta el techo lo comprime
+/// subiendo el QP; uno que lo ignora gasta lo que su suelo de calidad pide.
+pub fn hard_frame(width: u32, height: u32, frame_id: u64) -> RawFrame {
+    const BLOCK: usize = 16;
+    let (w, h) = (width as usize, height as usize);
+    let stride = width * 4;
+    let mut data = vec![0u8; w * h * 4];
+    let blocks_x = w.div_ceil(BLOCK);
+    // xorshift64 con semilla del fotograma: determinista, sin dependencias.
+    let mut state = frame_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let shades: Vec<[u8; 4]> = (0..blocks_x * h.div_ceil(BLOCK))
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let [b, g, r, ..] = state.to_le_bytes();
+            [b, g, r, 255]
+        })
+        .collect();
+    for (y, row) in data.chunks_exact_mut(w * 4).enumerate() {
+        for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *px = shades[(y / BLOCK) * blocks_x + x / BLOCK];
         }
     }
     RawFrame::cpu(frame_id, (width, height), PixelFormat::Bgra, stride, data)
@@ -134,6 +197,7 @@ pub fn measure(
         p95: Duration::ZERO,
         kbit_s: 0,
         samples: 0,
+        peak_ratio_milli: 0,
         note: Some(note),
     };
     let mut encoder = match open_within(OPEN_LIMIT, open) {
@@ -171,6 +235,24 @@ pub fn measure(
             latencies.len()
         ));
     }
+    // El techo por fotograma: imagen difícil y un intra pedido sobre ella.
+    let interval_bytes =
+        (f64::from(config.bitrate_kbps) * 1000.0 / 8.0 / f64::from(config.fps.max(1))).max(1.0);
+    let mut peak = 0usize;
+    for step in 0..PEAK_FRAMES {
+        if step == 2 {
+            encoder.request_keyframe();
+        }
+        let frame = hard_frame(config.width, config.height, u64::from(FRAMES) + step);
+        match encoder.encode_into(&frame, &mut out) {
+            Ok(Some(_)) => peak = peak.max(out.len()),
+            Ok(None) => {}
+            Err(err) => return dropped(format!("falló al codificar la imagen difícil: {err}")),
+        }
+    }
+    let peak_ratio_milli = (peak as f64 / interval_bytes * 1000.0)
+        .round()
+        .min(f64::from(u32::MAX)) as u32;
     latencies.sort_unstable();
     let p50 = percentile(&latencies, 50);
     let p95 = percentile(&latencies, 95);
@@ -183,6 +265,7 @@ pub fn measure(
         p95,
         kbit_s,
         samples: latencies.len() as u32,
+        peak_ratio_milli,
         note: None,
     }
 }
@@ -222,12 +305,18 @@ fn percentile(sorted: &[Duration], pct: usize) -> Duration {
     sorted[index]
 }
 
-/// El candidato que gana: el de menor p95 entre los que abrieron (a igual p95, menor p50).
+/// El candidato que gana: entre los que abrieron, primero los que respetan el techo
+/// ([`CalibrationResult::fits`]) y, entre ellos, el de menor p95 (a igual p95, menor p50).
 pub fn pick(results: &[CalibrationResult]) -> Option<&CalibrationResult> {
     results
         .iter()
         .filter(|result| result.opened)
-        .min_by_key(|result| (result.p95, result.p50))
+        .min_by_key(|result| rank(result))
+}
+
+/// Orden de [`pick`]: respetar el techo antes que la latencia.
+pub fn rank(result: &CalibrationResult) -> (bool, Duration, Duration) {
+    (!result.fits(), result.p95, result.p50)
 }
 
 /// Clase de resolución de la caché: lo que cambia el coste de codificar sin que cada tamaño de
@@ -285,6 +374,10 @@ pub struct CachedChoice {
     pub p95_us: u64,
     /// Bitrate real medido en kbit/s.
     pub kbit_s: u32,
+    /// [`CalibrationResult::peak_ratio_milli`]; las calibraciones guardadas antes de medirlo no lo
+    /// tienen y se vuelven a medir.
+    #[serde(default)]
+    pub peak_ratio_milli: Option<u32>,
     /// Segundos desde la época Unix.
     pub timestamp: u64,
 }
@@ -328,9 +421,11 @@ impl CalibrationCache {
         }
     }
 
-    /// Lo guardado para `key`.
+    /// Lo guardado para `key`, si midió el techo por fotograma (lo de antes se vuelve a medir).
     pub fn lookup(&self, key: &CalibrationKey) -> Option<&CachedChoice> {
-        self.entries.iter().find(|entry| entry.key == *key)
+        self.entries
+            .iter()
+            .find(|entry| entry.key == *key && entry.peak_ratio_milli.is_some())
     }
 
     /// Guarda (o sustituye) la elección de su clave y escribe el fichero si hay ruta.
@@ -367,6 +462,7 @@ pub fn choice_from(key: CalibrationKey, result: &CalibrationResult) -> CachedCho
         p50_us: u64::try_from(result.p50.as_micros()).unwrap_or(u64::MAX),
         p95_us: u64::try_from(result.p95.as_micros()).unwrap_or(u64::MAX),
         kbit_s: result.kbit_s,
+        peak_ratio_milli: Some(result.peak_ratio_milli),
         timestamp: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()),
@@ -460,6 +556,7 @@ mod tests {
             p95: Duration::from_millis(p95_ms),
             kbit_s: 9_000,
             samples: 25,
+            peak_ratio_milli: 900,
             note: None,
         }
     }
@@ -499,6 +596,50 @@ mod tests {
         assert!(fast.to_string().contains("p95 4.0 ms"));
     }
 
+    /// Un codificador que se pasa del techo por fotograma pierde frente a uno que lo respeta,
+    /// aunque sea más rápido; si ninguno lo respeta, manda la latencia.
+    #[test]
+    fn respecting_the_ceiling_comes_before_latency() {
+        let fast_over = CalibrationResult {
+            peak_ratio_milli: 6_000,
+            ..result(Backend::Vaapi, 1, 2)
+        };
+        let slow_fits = CalibrationResult {
+            peak_ratio_milli: 1_050,
+            ..result(Backend::VulkanVideo, 2, 4)
+        };
+        assert!(!fast_over.fits() && slow_fits.fits());
+        assert_eq!(
+            pick(&[fast_over.clone(), slow_fits]).map(|r| r.backend),
+            Some(Backend::VulkanVideo)
+        );
+        let slow_over = CalibrationResult {
+            peak_ratio_milli: 2_000,
+            ..result(Backend::Software, 5, 9)
+        };
+        assert_eq!(
+            pick(&[slow_over, fast_over.clone()]).map(|r| r.backend),
+            Some(Backend::Vaapi)
+        );
+        assert!(fast_over.to_string().contains("no respeta el techo"));
+    }
+
+    /// La calibración y el control del techo de los codificadores miden con la misma vara.
+    #[cfg(feature = "ffmpeg")]
+    #[test]
+    fn the_peak_tolerance_is_the_ceiling_tolerance() {
+        assert_eq!(PEAK_TOLERANCE, crate::ffmpeg::encoder::CEILING_TOLERANCE);
+    }
+
+    /// La imagen difícil es determinista por fotograma y cambia de uno a otro.
+    #[test]
+    fn hard_frames_are_deterministic_and_change() {
+        let a = hard_frame(96, 64, 7);
+        assert_eq!(a.data, hard_frame(96, 64, 7).data);
+        assert_ne!(a.data, hard_frame(96, 64, 8).data);
+        assert_eq!(a.data.len(), 96 * 64 * 4);
+    }
+
     #[test]
     fn percentiles_and_resolution_classes() {
         let ms: Vec<Duration> = (1..=20).map(Duration::from_millis).collect();
@@ -530,6 +671,7 @@ mod tests {
             .unwrap();
         let reloaded = CalibrationCache::load(Some(&path));
         let hit = reloaded.lookup(&key).expect("acierto");
+        assert_eq!(hit.peak_ratio_milli, Some(900));
         assert_eq!(hit.backend(), Some(Backend::Nvenc));
         assert_eq!(hit.p95(), Duration::from_millis(4));
         // Otra GPU, otra resolución u otro formato: fallo de caché.
@@ -567,6 +709,16 @@ mod tests {
         );
         cache.forget(&key);
         assert!(cache.lookup(&key).is_none());
+        // Lo guardado antes de medir el techo por fotograma no cuenta: se vuelve a medir.
+        let mut old = choice_from(key.clone(), &result(Backend::Nvenc, 3, 4));
+        old.peak_ratio_milli = None;
+        let json = serde_json::to_string(&[old])
+            .unwrap()
+            .replace(",\"peak_ratio_milli\":null", "");
+        std::fs::write(&path, json).unwrap();
+        let old_cache = CalibrationCache::load(Some(&path));
+        assert_eq!(old_cache.entries().len(), 1, "se lee");
+        assert!(old_cache.lookup(&key).is_none(), "pero no vale");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -619,6 +771,9 @@ mod tests {
         assert!(measured.p95 >= measured.p50);
         // 2000 bytes × 8 × 60 fps = 960 kbit/s.
         assert_eq!(measured.kbit_s, 960);
+        // 2000 bytes frente a 10 Mbit/s / 60 fps = 20 833 bytes por intervalo.
+        assert_eq!(measured.peak_ratio_milli, 96);
+        assert!(measured.fits());
         let failed = measure(Backend::Nvenc, &config, || Err("sin GPU".to_owned()));
         assert!(!failed.opened);
         assert!(failed.note.as_deref().unwrap_or("").contains("sin GPU"));

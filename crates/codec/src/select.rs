@@ -303,7 +303,8 @@ impl EncoderSet {
         }
         let mut ranked: Vec<&CalibrationResult> =
             results.iter().filter(|result| result.opened).collect();
-        ranked.sort_by_key(|result| (result.p95, result.p50));
+        // Primero los que respetan el techo por fotograma, luego la latencia ([`calibrate::rank`]).
+        ranked.sort_by_key(|result| calibrate::rank(result));
         let mut last = None;
         for result in ranked {
             match open_one(result.backend) {
@@ -374,7 +375,13 @@ impl EncoderSet {
                 (rank, choice)
             })
             .collect();
-        ranked.sort_by_key(|(rank, choice)| (*rank, choice.p95_us));
+        // Dentro de cada grupo, primero lo que se midió que respeta el techo por fotograma.
+        ranked.sort_by_key(|(rank, choice)| {
+            let fits = choice
+                .peak_ratio_milli
+                .is_some_and(|milli| f64::from(milli) / 1000.0 <= calibrate::PEAK_TOLERANCE);
+            (*rank, !fits, choice.p95_us)
+        });
         let mut tried = Vec::new();
         for (rank, choice) in ranked {
             let Some(backend) = choice.backend() else {

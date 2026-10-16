@@ -64,7 +64,11 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
   hay más de un backend para el códec, se codifican 30 fotogramas con cada uno y se elige el de
   menor p95 de latencia; el resultado se guarda en `calibration.json` por GPU, driver, códec,
   resolución y formato, y solo se repite si cambian. En una GPU NVIDIA de escritorio NVENC tarda
-  2,1 ms y Vulkan Video 3,0 ms (H.264 y AV1) y «auto» elegía el segundo.
+  2,1 ms y Vulkan Video 3,0 ms (H.264 y AV1) y «auto» elegía el segundo. La calibración también
+  codifica 6 fotogramas difíciles (bloques de color al azar, con un intra forzado) y mide el
+  mayor contra lo que cabe en un intervalo del techo: los backends que pasan de 1,1× (VA-API con
+  QVBR llega a ~6× con partículas) quedan detrás de los que lo respetan, aunque tarden menos. Las
+  calibraciones guardadas sin esa medida se repiten una vez.
 - **Vigilante de medios** en el invitado: 3 s sin datagramas ni `Pong` con el códec ya acordado
   y se pasa a reconectar, sin esperar al idle de QUIC (que baja de 15 a 8 s; keep-alive a 2,5 s).
 - `coroom doctor` dice la versión de libva que hay y si sirve, y alinea la tabla de códecs.
