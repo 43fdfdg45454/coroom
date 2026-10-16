@@ -267,6 +267,9 @@ pub struct Room {
     pub guests_muted: bool,
     /// La voz propia en la sala (micrófono y quién habla), con cada lista de invitados.
     pub voice: HostVoice,
+    /// El silencio propio que se acaba de pedir, hasta que una lista lo confirme: la lista que
+    /// llega justo después del clic puede haberse tomado antes y no debe deshacerlo en pantalla.
+    pub mute_pending: Option<bool>,
 }
 
 impl Room {
@@ -372,10 +375,27 @@ pub struct State {
     pub join_requests: Vec<JoinRequest>,
     /// Pasando la sala: a quién se le ofreció (esperando su respuesta).
     pub handoff: Option<(GuestId, String)>,
+    /// Pasando la sala: aceptó y se manda a todos a la suya (ya no se puede retirar).
+    pub handing_over: bool,
     /// Pasando la sala: el código de la sala nueva, para entrar en ella al cerrar esta.
     pub moving_to: Option<String>,
-    /// Como invitado, se aceptó la sala que pasa el anfitrión: al tener código, se le contesta.
-    pub handoff_accepted: bool,
+    /// Como invitado, la sala que pasa el anfitrión: en qué punto va.
+    pub takeover: Takeover,
+}
+
+/// Como invitado, la sala que el anfitrión pasa a este equipo ([`accept_handoff`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Takeover {
+    /// Nada.
+    #[default]
+    None,
+    /// Aceptada: abriendo la sala propia; con su código se le contesta.
+    Opening,
+    /// Contestado con el código: se sigue en la del anfitrión hasta que confirme
+    /// (`MoveToRoom` con este código) o la cierre, para que la respuesta no se pierda al salir.
+    Replied(String),
+    /// El anfitrión retiró la oferta mientras se abría la sala propia: se cierra al abrirse.
+    Withdrawn,
 }
 
 /// Fuente y monitor o ventana de una transmisión.
@@ -613,6 +633,8 @@ pub enum Msg {
     GuestMenu(GuestId, GuestAction),
     /// Pasarle la sala a un invitado (pide confirmación).
     Handoff(GuestId),
+    /// Retirar la oferta de pasar la sala mientras no contesta.
+    CancelHandoff,
     /// Volumen de la voz propia que se envía (porcentaje), mientras se arrastra.
     MicVolume(u8),
     /// Al soltar el deslizador de la voz propia: recordarlo en los ajustes.
@@ -917,9 +939,22 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::MicVolumeDone => return app.settings_changed(),
         Msg::SelfMute(muted) => {
             if let Some(room) = app.host.room.as_mut() {
-                // Se ve ya; la próxima lista lo confirma.
+                // Se ve ya; manda hasta que una lista lo confirme.
                 room.voice.mic_muted = muted;
+                room.mute_pending = Some(muted);
                 return vec![Effect::SetMicMuted { host: true, muted }];
+            }
+        }
+        Msg::CancelHandoff => {
+            if app.host.handing_over {
+                return Vec::new();
+            }
+            if let Some((guest, name)) = app.host.handoff.take() {
+                app.toast(
+                    Tone::Info,
+                    t!("host-ya-no-le-pasas-la-sala", name = name.as_str()),
+                );
+                return vec![Effect::CancelHandoff(guest)];
             }
         }
         Msg::Kick(id) => {
@@ -978,11 +1013,9 @@ pub fn offer_handoff(app: &mut App, guest: GuestId, name: String) -> Vec<Effect>
     if app.host.room.is_none() || app.host.handoff.is_some() {
         return Vec::new();
     }
-    app.toast(
-        Tone::Info,
-        t!("host-esperando-a-que-acepte", name = name.as_str()),
-    );
+    // Mientras no conteste, la sala lo dice con un aviso que deja retirar la oferta.
     app.host.handoff = Some((guest, name));
+    app.host.handing_over = false;
     vec![Effect::OfferHandoff(guest)]
 }
 
@@ -996,7 +1029,7 @@ pub fn accept_handoff(app: &mut App) -> Vec<Effect> {
     host.mode = ShareMode::Nothing;
     host.target = None;
     host.picked = None;
-    host.handoff_accepted = true;
+    host.takeover = Takeover::Opening;
     start(app)
 }
 
@@ -1272,11 +1305,45 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                 muted: BTreeSet::new(),
                 volumes: BTreeMap::new(),
                 guests_muted,
-                voice: HostVoice::default(),
+                // Hasta la primera lista: la voz pedida al abrir, sin «sin micrófono» de paso.
+                voice: HostVoice {
+                    enabled: app.settings.audio.host_voice,
+                    ..HostVoice::default()
+                },
+                mute_pending: None,
             });
             app.page = Page::Host;
             // La sala lleva su propia señalización: la de espera ya sobra.
             let mut effects = vec![Effect::StopLobby];
+            match app.host.takeover {
+                Takeover::Withdrawn => {
+                    // El anfitrión retiró la oferta mientras se abría: se cierra y se sigue en
+                    // la suya.
+                    app.host.takeover = Takeover::None;
+                    app.host.stopping = true;
+                    effects.push(Effect::StopHost);
+                    return effects;
+                }
+                Takeover::Opening => {
+                    // Quien se calló en la sala de antes sigue callado en la suya.
+                    let muted = app
+                        .guest
+                        .as_ref()
+                        .and_then(|guest| guest.stats.as_ref())
+                        .is_some_and(|stats| stats.mic_muted);
+                    if muted {
+                        if let Some(room) = app.host.room.as_mut() {
+                            room.voice.mic_muted = true;
+                            room.mute_pending = Some(true);
+                        }
+                        effects.push(Effect::SetMicMuted {
+                            host: true,
+                            muted: true,
+                        });
+                    }
+                }
+                Takeover::None | Takeover::Replied(_) => {}
+            }
             // Los micrófonos y salidas, para cambiarlos con la sala abierta.
             effects.extend(settings::request_audio(app));
             // La voz propia sale al volumen normal: se le aplica el recordado.
@@ -1292,7 +1359,12 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
         Event::HostStarted(Err(err)) => {
             app.host.starting = false;
             app.host.shared = None;
-            if std::mem::take(&mut app.host.handoff_accepted) {
+            let takeover = std::mem::take(&mut app.host.takeover);
+            if takeover == Takeover::Withdrawn {
+                // Ya no hacía falta: se sigue en la sala del anfitrión.
+                return Vec::new();
+            }
+            if takeover == Takeover::Opening {
                 // No se pudo abrir la sala que se aceptó: se le dice que no al anfitrión y se
                 // sigue de invitado en la suya.
                 app.toast(
@@ -1304,9 +1376,18 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
             app.host.error = Some(err);
             return vec![Effect::StartLobby];
         }
-        Event::HostGuests(guests, voice) => {
+        Event::HostGuests(guests, mut voice) => {
             let mut effects = Vec::new();
             if let Some(room) = app.host.room.as_mut() {
+                // La lista pudo tomarse antes del último clic en el altavoz propio: hasta que
+                // traiga lo pedido, manda lo pedido.
+                if let Some(muted) = room.mute_pending {
+                    if voice.mic_muted == muted {
+                        room.mute_pending = None;
+                    } else {
+                        voice.mic_muted = muted;
+                    }
+                }
                 room.voice = voice;
                 // A quien llega se le aplica el volumen recordado por su nombre (una vez: lo que
                 // se toque después manda); quien se fue no deja entrada.
@@ -1353,6 +1434,7 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                 app.toast(Tone::Info, t!("host-has-dejado-de-compartir"));
             }
             app.host.handoff = None;
+            app.host.handing_over = false;
             if let Some(code) = app.host.moving_to.take() {
                 // La sala pasó a otro: se entra en la suya como invitado.
                 return super::guest::start(app, code);
@@ -1368,6 +1450,8 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
         }
         Event::HandedOver(result) => match result {
             Ok(code) if app.host.room.is_some() => {
+                // El silencio propio de esta sala sigue en la nueva.
+                app.carried_mute = app.host.room.as_ref().map(|room| room.voice.mic_muted);
                 app.host.moving_to = Some(code);
                 app.host.stopping = true;
                 return vec![Effect::StopHost];
@@ -1375,6 +1459,7 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
             Ok(_) => {}
             Err(err) => {
                 app.host.handoff = None;
+                app.host.handing_over = false;
                 app.toast(
                     Tone::Warning,
                     t!("host-no-se-pudo-pasar-la-sala", error = err),
@@ -1446,23 +1531,30 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
                 room.fingerprint = fingerprint;
             }
             effects.extend(invite_marked(app));
-            if app.host.handoff_accepted {
-                // La sala que pasó el anfitrión ya tiene código: se le contesta y se sale de la
-                // suya (los demás vienen solos).
-                app.host.handoff_accepted = false;
+            if app.host.takeover == Takeover::Opening {
+                // La sala que pasó el anfitrión ya tiene código: se le contesta y se sigue en la
+                // suya hasta que lo confirme (si se saliese ya, la respuesta podría no salir).
+                app.host.takeover = Takeover::Replied(code.clone());
                 effects.push(Effect::ReplyHandoff(Some(code)));
-                effects.extend(super::guest::leave(app));
             }
         }
         SessionEvent::HandoffReply { guest, code } => {
-            let Some((offered, name)) = app.host.handoff.clone() else {
+            let pending = app
+                .host
+                .handoff
+                .clone()
+                .filter(|(offered, _)| *offered == guest && !app.host.handing_over);
+            let Some((_, name)) = pending else {
+                // Una respuesta que ya no se espera (se retiró la oferta, o no es de quien la
+                // tiene): si abrió su sala, que la cierre.
+                if code.is_some() && !app.host.handing_over {
+                    effects.push(Effect::CancelHandoff(guest));
+                }
                 return effects;
             };
-            if offered != guest {
-                return effects;
-            }
             match code {
                 Some(code) => {
+                    app.host.handing_over = true;
                     app.toast(
                         Tone::Info,
                         t!("host-pasando-la-sala-a", name = name.as_str()),
@@ -1470,7 +1562,6 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
                     effects.push(Effect::HandOver {
                         code,
                         host_name: name,
-                        except: guest,
                     });
                 }
                 None => {
@@ -1522,6 +1613,17 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
             room.guests.retain(|status| status.guest != guest);
             room.muted.remove(&guest);
             room.volumes.remove(&guest);
+            // Si era a quien se ofrecía la sala y aún no contestó, la oferta se acaba (al pasarla,
+            // en cambio, sale porque ya va a la suya).
+            if !app.host.handing_over
+                && app
+                    .host
+                    .handoff
+                    .as_ref()
+                    .is_some_and(|(offered, _)| *offered == guest)
+            {
+                app.host.handoff = None;
+            }
             app.toast(
                 Tone::Neutral,
                 if kicked {
@@ -3318,6 +3420,22 @@ fn room_view<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
             None,
         ));
     }
+    if let Some((_, name)) = &app.host.handoff {
+        // Pasar la sala, a la vista mientras dura: retirable hasta que conteste.
+        page = page.push(if app.host.handing_over {
+            ui::banner(
+                Tone::Neutral,
+                t!("host-pasando-la-sala-a", name = name.as_str()),
+                None,
+            )
+        } else {
+            ui::banner(
+                Tone::Neutral,
+                t!("host-esperando-a-que-acepte", name = name.as_str()),
+                Some((t!("host-retirar-la-oferta"), on(Msg::CancelHandoff))),
+            )
+        });
+    }
     page = page
         .push(room_source_card(app, room))
         .push(guests_section(app, room))
@@ -3706,13 +3824,13 @@ mod tests {
             app.update(Message::ConfirmDialog),
             [Effect::OfferHandoff(GuestId(1))]
         );
-        // Otro invitado no puede contestar por Bea.
-        assert!(
+        // Otro invitado no puede contestar por Bea: si abrió una sala, se le dice que la cierre.
+        assert_eq!(
             app.update(Message::Event(Event::Host(SessionEvent::HandoffReply {
                 guest: GuestId(2),
                 code: Some("ABCDEF".into()),
-            })))
-            .is_empty()
+            }))),
+            [Effect::CancelHandoff(GuestId(2))]
         );
         assert_eq!(
             app.update(Message::Event(Event::Host(SessionEvent::HandoffReply {
@@ -3722,9 +3840,15 @@ mod tests {
             [Effect::HandOver {
                 code: "ABCDEF".into(),
                 host_name: "Bea".into(),
-                except: GuestId(1),
             }]
         );
+        // Pasándola ya no se puede retirar, y que Bea salga (va a la suya) no la deshace.
+        assert!(app.update(Message::Host(Msg::CancelHandoff)).is_empty());
+        app.update(Message::Event(Event::Host(SessionEvent::GuestLeft {
+            guest: GuestId(1),
+            kicked: false,
+        })));
+        assert!(app.host.handoff.is_some() && app.host.handing_over);
         assert_eq!(
             app.update(Message::Event(Event::HandedOver(Ok("ABCDEF".into())))),
             [Effect::StopHost]
@@ -3733,6 +3857,105 @@ mod tests {
         assert_eq!(effects, [Effect::StopLobby, Effect::Join("ABCDEF".into())]);
         assert_eq!(app.screen, Screen::Guest);
         assert!(app.host.room.is_none());
+        assert!(app.host.handoff.is_none() && !app.host.handing_over);
+    }
+
+    /// La oferta pendiente se ve en la sala y se puede retirar; una respuesta que llega después
+    /// recibe la retirada (y no pasa la sala). Si quien la tenía sale, se acaba sola.
+    #[test]
+    fn a_pending_handoff_can_be_withdrawn_or_ends_when_the_guest_leaves() {
+        let mut app = app();
+        open_room(&mut app);
+        app.update(Message::Host(Msg::Handoff(GuestId(1))));
+        app.update(Message::ConfirmDialog);
+        assert_eq!(app.host.handoff, Some((GuestId(1), "Bea".to_owned())));
+        assert_eq!(
+            app.update(Message::Host(Msg::CancelHandoff)),
+            [Effect::CancelHandoff(GuestId(1))]
+        );
+        assert!(app.host.handoff.is_none());
+        assert_eq!(
+            app.update(Message::Event(Event::Host(SessionEvent::HandoffReply {
+                guest: GuestId(1),
+                code: Some("ABCDEF".into()),
+            }))),
+            [Effect::CancelHandoff(GuestId(1))]
+        );
+        // Un «no» tardío no necesita respuesta.
+        assert!(
+            app.update(Message::Event(Event::Host(SessionEvent::HandoffReply {
+                guest: GuestId(1),
+                code: None,
+            })))
+            .is_empty()
+        );
+        // Otra oferta: quien la tenía se va sin contestar y se puede ofrecer a otro.
+        app.update(Message::Host(Msg::Handoff(GuestId(2))));
+        app.update(Message::ConfirmDialog);
+        app.update(Message::Event(Event::Host(SessionEvent::GuestLeft {
+            guest: GuestId(2),
+            kicked: false,
+        })));
+        assert!(app.host.handoff.is_none());
+        app.update(Message::Host(Msg::Handoff(GuestId(1))));
+        assert!(matches!(&app.dialog, Some(Dialog::OfferHandoff { name, .. }) if name == "Bea"));
+    }
+
+    /// El silencio propio del anfitrión pasa a la sala nueva al entrar en ella como invitado.
+    #[test]
+    fn the_hosts_own_mute_follows_it_to_the_new_room() {
+        let mut app = app();
+        app.account = Some(crate::ui::app::tests::account());
+        open_room(&mut app);
+        app.update(Message::Host(Msg::SelfMute(true)));
+        app.update(Message::Host(Msg::Handoff(GuestId(1))));
+        app.update(Message::ConfirmDialog);
+        app.update(Message::Event(Event::Host(SessionEvent::HandoffReply {
+            guest: GuestId(1),
+            code: Some("ABCDEF".into()),
+        })));
+        app.update(Message::Event(Event::HandedOver(Ok("ABCDEF".into()))));
+        app.update(Message::Event(Event::HostEnded(None)));
+        let effects = app.update(Message::Event(Event::GuestStarted(Ok(
+            VideoFeed::detached(),
+        ))));
+        assert!(
+            effects.contains(&Effect::SetMicMuted {
+                host: false,
+                muted: true
+            }),
+            "{effects:?}"
+        );
+    }
+
+    /// Callarse se ve al momento y no parpadea con una lista tomada antes del clic; hasta la
+    /// primera lista, la voz propia sale como se pidió al abrir (no «sin micrófono»).
+    #[test]
+    fn the_own_mute_does_not_flicker_and_the_voice_shows_from_the_start() {
+        let mut app = app();
+        app.settings.audio.host_voice = true;
+        app.update(Message::Host(Msg::Start));
+        app.update(Message::Event(Event::HostStarted(
+            Ok(VideoFeed::detached()),
+        )));
+        let voice = |app: &App| app.host.room.as_ref().expect("sala").voice.clone();
+        assert!(voice(&app).enabled, "con la voz pedida, desde el principio");
+        assert!(!voice(&app).mic_muted);
+        app.update(Message::Host(Msg::SelfMute(true)));
+        assert!(voice(&app).mic_muted);
+        let listed = |muted: bool| HostVoice {
+            enabled: true,
+            mic_muted: muted,
+            talkers: Vec::new(),
+        };
+        // Una lista de antes del clic no lo deshace.
+        app.update(Message::Event(Event::HostGuests(Vec::new(), listed(false))));
+        assert!(voice(&app).mic_muted);
+        // La que ya lo trae lo confirma; desde ahí, mandan las listas.
+        app.update(Message::Event(Event::HostGuests(Vec::new(), listed(true))));
+        assert!(voice(&app).mic_muted);
+        app.update(Message::Event(Event::HostGuests(Vec::new(), listed(false))));
+        assert!(!voice(&app).mic_muted);
     }
 
     /// Si el invitado no acepta, se queda todo como estaba.

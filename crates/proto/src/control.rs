@@ -37,7 +37,9 @@
 //! puede abrirse solo con voz y chat, y quien comparte puede dejar de hacerlo sin cerrarla. Y el
 //! anfitrión puede pasar a otro: se lo ofrece ([`ControlMessage::HandoffOffer`]), el invitado
 //! abre su sala y contesta con el código ([`ControlMessage::HandoffReply`]) y el anfitrión manda
-//! a los demás a ella ([`ControlMessage::MoveToRoom`]).
+//! a todos a ella ([`ControlMessage::MoveToRoom`]; al nuevo también, como confirmación de que puede
+//! salir de esta). Hasta mandarlos, el anfitrión puede retirar la oferta
+//! ([`ControlMessage::HandoffCancel`]).
 
 use serde::{Deserialize, Serialize};
 
@@ -518,13 +520,17 @@ pub enum ControlMessage {
         /// Código de la sala nueva ([`crate::signal::is_valid_room_code`]).
         code: Option<String>,
     },
-    /// Anfitrión → invitados: el anfitrión pasa a otro; entrad en su sala.
+    /// Anfitrión → invitados: el anfitrión pasa a otro; entrad en su sala. Al anfitrión nuevo
+    /// también: es la confirmación de que su respuesta llegó y ya puede salir de esta.
     MoveToRoom {
         /// Código de la sala nueva.
         code: String,
         /// Nombre visible del anfitrión nuevo (como mucho [`MEMBER_NAME_MAX`] bytes).
         host_name: String,
     },
+    /// Anfitrión → invitado: retira la oferta de [`ControlMessage::HandoffOffer`] (la canceló, o
+    /// llegó una respuesta que ya no esperaba); si el invitado abrió su sala, la cierra.
+    HandoffCancel,
 }
 
 impl ControlMessage {
@@ -888,6 +894,7 @@ mod tests {
             any::<bool>().prop_map(|allowed| ControlMessage::VoicePermission { allowed }),
             any::<bool>().prop_map(|active| ControlMessage::Sharing { active }),
             Just(ControlMessage::HandoffOffer),
+            Just(ControlMessage::HandoffCancel),
             prop::option::of("[A-Z2-9]{6}").prop_map(|code| ControlMessage::HandoffReply { code }),
             ("[A-Z2-9]{6}", ".{0,40}")
                 .prop_map(|(code, host_name)| ControlMessage::MoveToRoom { code, host_name }),

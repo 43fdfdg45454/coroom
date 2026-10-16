@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -573,6 +573,13 @@ fn start_audio(
     Ok(info)
 }
 
+/// Si la pista `track` sale ahora: el audio del juego solo mientras se comparte algo (la
+/// captura sigue abierta para volver al momento, pero con «Dejar de compartir» o en una sala solo
+/// de voz no se envía nada de lo que suena en el equipo); la voz, siempre.
+fn track_flows(track: Track, sharing: bool) -> bool {
+    track != Track::Audio || sharing
+}
+
 /// Destinos del audio del anfitrión: los enlaces directos y el relay.
 struct HostAudioOut {
     core: Arc<Core>,
@@ -633,13 +640,16 @@ impl AudioOut for HostAudioOut {
         let Some(datagram) = audio_datagram(track, seq, epoch, sealed) else {
             return false;
         };
+        if !track_flows(track, self.core.shared.sharing()) {
+            return false;
+        }
         // La voz de la sala la oyen todos los invitados; el permiso de voz es para hablar.
         let links = lock(&self.links);
         send_to(&links, &datagram, |_| true, None)
     }
 
-    fn has_targets(&self, _track: Track) -> bool {
-        lock(&self.links).connected() > 0
+    fn has_targets(&self, track: Track) -> bool {
+        track_flows(track, self.core.shared.sharing()) && lock(&self.links).connected() > 0
     }
 
     fn host_us(&self, at: Instant) -> Option<u64> {
@@ -883,8 +893,11 @@ struct HostCtx {
     input: Arc<HostInput>,
     /// Pistas de audio que se envían.
     audio_info: AudioInfo,
-    /// Lo último que se anunció con `Sharing` (si se comparte algo).
-    announced_sharing: AtomicBool,
+    /// Lo último que se anunció con `Sharing` (si se comparte algo). El cerrojo ordena el anuncio
+    /// a todos y el de quien conecta: ninguno sale con un valor más viejo que otro ya enviado.
+    announced_sharing: std::sync::Mutex<bool>,
+    /// La sala se pasa a otro: el `MoveToRoom` que reciben también los que conecten desde ahora.
+    moving: std::sync::Mutex<Option<ControlMessage>>,
 }
 
 /// `name` en como mucho [`MEMBER_NAME_MAX`] bytes, sin cortar un carácter.
@@ -940,15 +953,31 @@ impl HostCtx {
     /// Si la fuente cambió entre compartir algo y no compartir nada desde el último anuncio,
     /// avisa a todos los invitados conectados (`Sharing`).
     fn announce_sharing(&self) {
+        let mut announced = lock(&self.announced_sharing);
+        self.announce_sharing_locked(&mut announced);
+    }
+
+    /// [`HostCtx::announce_sharing`] con el cerrojo ya tomado; devuelve lo que se comparte.
+    fn announce_sharing_locked(&self, announced: &mut bool) -> bool {
         let active = self.core.shared.sharing();
-        if self.announced_sharing.swap(active, Ordering::AcqRel) == active {
-            return;
+        if *announced != active {
+            *announced = active;
+            debug!(active, "se comparte algo o ya no");
+            let message = ControlMessage::Sharing { active };
+            for (_, control) in lock(&self.links).guest_controls() {
+                let _ = control.send(&message);
+            }
         }
-        debug!(active, "se comparte algo o ya no");
-        let message = ControlMessage::Sharing { active };
-        for (_, control) in lock(&self.links).guest_controls() {
-            let _ = control.send(&message);
-        }
+        active
+    }
+
+    /// `Sharing` al invitado que acaba de conectar, en orden con los anuncios a todos: si cambió
+    /// desde el último, se anuncia a todos antes (él ya está en los enlaces) y después a él, así
+    /// que lo último que recibe es lo de ahora.
+    fn send_sharing(&self, control: &ControlSender) {
+        let mut announced = lock(&self.announced_sharing);
+        let active = self.announce_sharing_locked(&mut announced);
+        let _ = control.send(&ControlMessage::Sharing { active });
     }
 
     /// Anuncia el tamaño del flujo a todos los invitados conectados.
@@ -1121,9 +1150,7 @@ impl HostCtx {
         }
         let (width, height) = self.stream_size();
         let _ = control.send(&ControlMessage::HostFrameSize { width, height });
-        let _ = control.send(&ControlMessage::Sharing {
-            active: self.core.shared.sharing(),
-        });
+        self.send_sharing(control);
         // Audio: formato de cada pista y permiso de voz.
         for (track, format, config) in [
             (
@@ -1163,6 +1190,10 @@ impl HostCtx {
         }
         // Chat: lo último que se escribió, recifrado con la época actual (la suya).
         self.send_chat_history(guest, control);
+        // Si la sala ya se está pasando a otro, a la nueva también él.
+        if let Some(moving) = lock(&self.moving).clone() {
+            let _ = control.send(&moving);
+        }
         self.core.emit(SessionEvent::GuestConnected {
             guest,
             path,
@@ -2175,6 +2206,8 @@ struct Room {
     members: BTreeMap<GuestId, Member>,
     /// Invitados con la apertura simultánea en marcha y el canal de sus candidatos tardíos.
     connecting: BTreeMap<GuestId, mpsc::UnboundedSender<Vec<std::net::SocketAddr>>>,
+    /// Pasando la sala ([`Command::MoveToRoom`]): a quién avisar cuando ya no quede nadie.
+    moved: Option<crossbeam_channel::Sender<()>>,
 }
 
 fn network(what: &str) -> impl Fn(coroom_transport::TransportError) -> SessionError + '_ {
@@ -2592,6 +2625,27 @@ impl Room {
         }
     }
 
+    /// La sala pasa a otra: el aviso a todos los conectados y, desde ya, a cada uno que conecte
+    /// ([`HostCtx::after_attach`]); `done` se avisa cuando no quede nadie ([`Room::check_moved`]).
+    fn move_all(&mut self, message: ControlMessage, done: crossbeam_channel::Sender<()>) {
+        *lock(&self.ctx.moving) = Some(message.clone());
+        for (_, control) in lock(&self.ctx.links).guest_controls() {
+            let _ = control.send(&message);
+        }
+        self.moved = Some(done);
+        self.check_moved();
+    }
+
+    /// Pasando la sala: si ya no queda ningún invitado (todos salieron al recibir el aviso), se
+    /// dice a quien espera para cerrarla.
+    fn check_moved(&mut self) {
+        if self.members.is_empty()
+            && let Some(done) = self.moved.take()
+        {
+            let _ = done.try_send(());
+        }
+    }
+
     async fn shutdown(&self) {
         for control in lock(&self.ctx.links).controls() {
             let _ = control.send(&ControlMessage::Bye);
@@ -2761,7 +2815,8 @@ async fn run_host(
         current: tokio::sync::Mutex::new(None),
         input,
         audio_info,
-        announced_sharing: AtomicBool::new(true),
+        announced_sharing: std::sync::Mutex::new(true),
+        moving: std::sync::Mutex::new(None),
     });
     // Cuando el flujo cambia de tamaño (otra captura, o el tope que la reduce), los invitados se
     // enteran por `HostFrameSize`, además de por el propio flujo.
@@ -2780,6 +2835,7 @@ async fn run_host(
         candidates,
         members: BTreeMap::new(),
         connecting: BTreeMap::new(),
+        moved: None,
     };
     core.emit(SessionEvent::RoomCreated {
         code,
@@ -2834,13 +2890,11 @@ async fn run_host(
                 Some(Command::OfferHandoff(guest)) => {
                     ctx.send_to_guest(guest, &ControlMessage::HandoffOffer);
                 }
-                Some(Command::MoveToRoom { code, host_name, except }) => {
-                    let message = ControlMessage::MoveToRoom { code, host_name };
-                    for (guest, control) in lock(&ctx.links).guest_controls() {
-                        if guest != except {
-                            let _ = control.send(&message);
-                        }
-                    }
+                Some(Command::CancelHandoff(guest)) => {
+                    ctx.send_to_guest(guest, &ControlMessage::HandoffCancel);
+                }
+                Some(Command::MoveToRoom { code, host_name, done }) => {
+                    room.move_all(ControlMessage::MoveToRoom { code, host_name }, done);
                 }
                 Some(Command::Reconnect) => {}
                 Some(Command::Invite(user)) => {
@@ -2864,6 +2918,7 @@ async fn run_host(
                 ctx.announce_sharing();
             }
         }
+        room.check_moved();
     };
     room.shutdown().await;
     signal.close();
@@ -2941,6 +2996,15 @@ mod tests {
             gate.on_request(41, RTT, INTERVAL, at(2_000)),
             KeyframeDecision::Now
         );
+    }
+
+    /// Sin nada compartido no sale el audio del juego (lo que suena en el equipo), y la voz sí.
+    #[test]
+    fn game_audio_only_flows_while_sharing() {
+        assert!(track_flows(Track::Audio, true));
+        assert!(!track_flows(Track::Audio, false));
+        assert!(track_flows(Track::Voice, true));
+        assert!(track_flows(Track::Voice, false));
     }
 
     /// Un intra pedido que nunca sale (el codificador aún no estaba) no bloquea las peticiones.

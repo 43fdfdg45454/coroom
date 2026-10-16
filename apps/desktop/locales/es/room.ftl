@@ -109,6 +109,7 @@ room-nadie-esta-compartiendo = Nadie está compartiendo
 room-nadie-esta-compartiendo-detalle = { $host } tiene la sala abierta para hablar y escribir. Cuando comparta su pantalla o una ventana, aparecerá aquí.
 room-el-anfitrion = El anfitrión
 room-la-sala-pasa-a = La sala pasa a { $name }: entrando en la suya…
+room-el-anfitrion-retiro-la-sala = El anfitrión ya no te pasa la sala: sigues en la suya.
 room-el-anfitrion-comparte = El anfitrión empezó a compartir.
 room-el-anfitrion-dejo-de-compartir = El anfitrión dejó de compartir: la sala sigue con voz y chat.
 room-decodificar-por-software = Decodificar por software

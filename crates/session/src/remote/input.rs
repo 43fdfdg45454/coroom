@@ -7,7 +7,8 @@
 //! invitado (solo declaraciones de mandos). Las dos abren el sellado (que autentica al invitado:
 //! sin su clave no abre) y pasan lo que llega al hilo `inject`, el único que toca el [`InputSink`].
 //! Ese hilo lleva el estado autoritativo de permisos y pausa, así que todo pasa en orden: lo no
-//! permitido se descarta y se cuenta, la pausa descarta todo y suelta lo pulsado (`release_all`),
+//! permitido se descarta y se cuenta, la pausa descarta todo y suelta lo pulsado (`release_all`)
+//! (y lo mismo mientras el anfitrión no comparte nada: «Dejar de compartir» o una sala solo de voz),
 //! al quitar o cambiar la ranura se destruye o crea el mando, y al expulsar o perder a un invitado
 //! se suelta lo suyo y se libera su ranura.
 //!
@@ -498,7 +499,13 @@ struct Worker {
     core: Arc<Core>,
     sink: Box<dyn InputSink>,
     guests: BTreeMap<GuestId, GuestState>,
+    /// No se inyecta nada: la pausa del anfitrión ([`Job::Paused`]) o no se comparte nada.
     paused: bool,
+    /// La pausa que pidió el anfitrión.
+    user_paused: bool,
+    /// Si se comparte algo (lo último visto de `Shared::sharing`): sin nada compartido, la entrada
+    /// de los invitados no llega al equipo (ni teclado ni ratón ni mandos), como en pausa.
+    sharing: bool,
     warned: Vec<String>,
     totals: (u64, u64),
     /// Última publicación periódica y última recogida de salidas de mandos.
@@ -516,6 +523,8 @@ impl Worker {
             sink,
             guests: BTreeMap::new(),
             paused: false,
+            user_paused: false,
+            sharing: true,
             warned: Vec::new(),
             totals: (0, 0),
             last_publish: now,
@@ -584,6 +593,7 @@ impl Worker {
     /// tal cual (cada [`OUTPUTS_PERIOD`]) y la publicación de estadísticas (cada
     /// [`PUBLISH_PERIOD`]).
     fn housekeeping(&mut self, now: Instant) {
+        self.follow_sharing();
         self.expire_stale(now);
         if self.any_raw() && now.saturating_duration_since(self.last_outputs) >= OUTPUTS_PERIOD {
             self.last_outputs = now;
@@ -630,6 +640,8 @@ impl Worker {
     }
 
     fn handle(&mut self, job: Job) {
+        // Antes de cada trabajo: un paquete que llega ya sin nada compartido no se inyecta.
+        self.follow_sharing();
         match job {
             Job::Packet {
                 guest,
@@ -649,25 +661,45 @@ impl Worker {
             Job::Permissions { guest, permissions } => self.permissions(guest, permissions),
             Job::Eis(eis) => self.sink.replace_eis(eis),
             Job::Paused(paused) => {
-                let was = self.paused;
-                self.paused = paused;
-                let guests: Vec<GuestId> = self.guests.keys().copied().collect();
-                if paused && !was {
-                    for guest in &guests {
-                        if let Err(err) = self.sink.release_all(*guest) {
-                            self.warn(&err);
-                        }
-                    }
-                }
-                // Un mando tal cual no tiene un informe «en reposo» que inyectar: en pausa se
-                // quita (el sistema suelta lo que tuviera pulsado) y vuelve al reanudar.
-                if paused != was {
-                    for guest in guests {
-                        self.apply_pad_mode(guest);
-                    }
-                }
+                self.user_paused = paused;
+                self.update_paused();
             }
             Job::GuestGone(guest) => self.gone(guest),
+        }
+    }
+
+    /// Sigue a la fuente: al dejar de compartir se deja de inyectar (y se suelta todo) y al
+    /// volver a compartir se reanuda.
+    fn follow_sharing(&mut self) {
+        let sharing = self.core.shared.sharing();
+        if sharing != self.sharing {
+            self.sharing = sharing;
+            debug!(sharing, "entrada de los invitados según lo que se comparte");
+            self.update_paused();
+        }
+    }
+
+    /// Aplica la pausa que resulta de la del anfitrión y de lo que se comparte: al entrar se
+    /// suelta lo pulsado de todos; al entrar o salir, los mandos tal cual se quitan o vuelven.
+    fn update_paused(&mut self) {
+        let paused = self.user_paused || !self.sharing;
+        let was = self.paused;
+        if paused == was {
+            return;
+        }
+        self.paused = paused;
+        let guests: Vec<GuestId> = self.guests.keys().copied().collect();
+        if paused {
+            for guest in &guests {
+                if let Err(err) = self.sink.release_all(*guest) {
+                    self.warn(&err);
+                }
+            }
+        }
+        // Un mando tal cual no tiene un informe «en reposo» que inyectar: en pausa se quita (el
+        // sistema suelta lo que tuviera pulsado) y vuelve al reanudar.
+        for guest in guests {
+            self.apply_pad_mode(guest);
         }
     }
 
@@ -1482,6 +1514,53 @@ mod tests {
         let state = &worker.guests[&guest];
         assert_eq!(state.applied, 6);
         assert_eq!(state.dropped, 1);
+    }
+
+    /// Sin nada compartido («Dejar de compartir» o una sala solo de voz) no se inyecta nada de
+    /// ningún invitado (en Windows `SendInput` y los mandos no dependen de la captura): lo pulsado
+    /// se suelta al dejar de compartir y, al volver, se sigue sin reconstruir lo de entretanto.
+    #[test]
+    fn nothing_is_injected_while_nothing_is_shared() {
+        let sink = RecordingSink::new();
+        let mut worker = worker(&sink);
+        let guest = GuestId(1);
+        worker.handle(Job::Permissions {
+            guest,
+            permissions: Permissions {
+                keyboard_mouse: true,
+                ..Permissions::VIEW_ONLY
+            },
+        });
+        let s0 = packet(
+            &mut worker,
+            guest,
+            0,
+            &InputState::default(),
+            vec![key(30, true)],
+        );
+        assert_eq!(sink.events_of(guest), vec![key(30, true)]);
+        // Deja de compartir con la A pulsada: se suelta.
+        worker.core.shared.set_sharing(false);
+        worker.housekeeping(Instant::now());
+        assert!(worker.paused);
+        assert_eq!(sink.log().last(), Some(&Recorded::ReleaseAll { guest }));
+        // Lo que llega ahora no se inyecta (y la pausa del anfitrión no lo reanuda).
+        let s1 = packet(&mut worker, guest, 1, &s0, vec![key(48, true)]);
+        worker.handle(Job::Paused(false));
+        let s2 = packet(&mut worker, guest, 2, &s1, vec![key(48, false)]);
+        assert_eq!(sink.events_of(guest), vec![key(30, true)]);
+        assert_eq!(worker.guests[&guest].dropped, 2);
+        // Vuelve a compartir: el siguiente paquete se aplica tal cual.
+        worker.core.shared.set_sharing(true);
+        packet(&mut worker, guest, 3, &s2, vec![key(57, true)]);
+        assert!(!worker.paused);
+        assert_eq!(sink.events_of(guest), vec![key(30, true), key(57, true)]);
+        // Con la pausa del anfitrión puesta, volver a compartir no la quita.
+        worker.handle(Job::Paused(true));
+        worker.core.shared.set_sharing(false);
+        worker.core.shared.set_sharing(true);
+        worker.housekeeping(Instant::now());
+        assert!(worker.paused);
     }
 
     /// Un invitado del que no llega nada en [`STALE_AFTER`] con algo pulsado: se suelta lo suyo y

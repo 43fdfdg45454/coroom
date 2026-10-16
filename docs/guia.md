@@ -67,8 +67,8 @@ En **Transmisión**, debajo del código, cambias sin cerrar la sala (los invitad
   aceptarlo). Los invitados ven la última imagen un momento hasta que llega la nueva; si la nueva
   no se puede capturar, sigue la de antes y te lo dice.
 - **Dejar de compartir**: la sala sigue abierta con voz y chat; tus invitados ven «Nadie está
-  compartiendo» y no reciben ni la última imagen. **Compartir pantalla o ventana** vuelve a
-  compartir.
+  compartiendo» y no reciben ni la última imagen ni el audio de tu equipo, y su teclado, ratón y
+  mandos dejan de llegarte. **Compartir pantalla o ventana** vuelve a compartir.
 - **Audio**: marca o desmarca aplicaciones; se aplica al momento, sin cortar.
 - **Tu micrófono** y **dónde oyes la sala**: cambian al momento, sin cortar a nadie.
 - **Códec preferido**, **resolución** y **fps**: cambiar de códec vuelve a negociar con los
@@ -78,7 +78,9 @@ En **Transmisión**, debajo del código, cambias sin cerrar la sala (los invitad
 ### Pasar la sala a otro
 
 En el menú **Más** de un invitado, **Pasarle la sala**: si acepta, abre una sala nueva (solo voz;
-desde ella comparte lo suyo) y todos, tú incluido, entráis en ella solos, sin escribir el código.
+desde ella comparte lo suyo) y todos, tú incluido, entráis en ella solos, sin escribir el código
+(quien tenía el micrófono silenciado sigue así). Mientras no contesta, la sala lo dice y puedes
+**Retirar la oferta**.
 
 ## Unirte a una sala
 

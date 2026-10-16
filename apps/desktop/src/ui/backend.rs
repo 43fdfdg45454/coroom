@@ -427,21 +427,32 @@ impl Backend {
                     tracing::warn!(error = %err, "no se pudo contestar a la sala");
                 }
             }
-            Effect::HandOver {
-                code,
-                host_name,
-                except,
-            } => {
+            Effect::CancelHandoff(guest) => {
+                if let Some(session) = lock(&self.host).clone()
+                    && let Err(err) = lock(&session).cancel_handoff(guest)
+                {
+                    tracing::warn!(error = %err, "no se pudo retirar la oferta de la sala");
+                }
+            }
+            Effect::HandOver { code, host_name } => {
                 let Some(session) = lock(&self.host).clone() else {
                     return;
                 };
                 self.spawn("pasar-sala", move |notify| {
-                    let result = lock(&session)
-                        .move_to_room(&code, &host_name, except)
-                        .map(|()| code)
+                    let moving = lock(&session).move_to_room(&code, &host_name);
+                    let result = moving
+                        .map(|waiter| {
+                            // Cada invitado sale al recibir el aviso: cuando no queda nadie, lo
+                            // tienen todos y la sala se puede cerrar sin cortárselo a nadie.
+                            if !waiter.wait(HANDOVER_WAIT) {
+                                tracing::warn!(
+                                    segundos = HANDOVER_WAIT.as_secs(),
+                                    "alguien sigue en la sala tras el aviso; se cierra igual"
+                                );
+                            }
+                            code
+                        })
                         .map_err(|err| err.to_string());
-                    // Tiempo para que el aviso salga antes de cerrar la sala.
-                    thread::sleep(HANDOVER_GRACE);
                     notify(Message::Event(Event::HandedOver(result)));
                 });
             }
@@ -841,7 +852,18 @@ impl Backend {
     fn start_host(&mut self, options: AccountOptions, request: HostRequest, settings: &Settings) {
         let video = &settings.video;
         let (width, height) = video.max_resolution.size();
-        let host = HostOptions {
+        // Sin nada compartido aún (solo voz, o la sala que pasa otro anfitrión), la ventana no
+        // pide audio del juego; se abre igual el que tocaría al compartir (sin enviarse hasta
+        // entonces), y se elige en el hilo de la sala porque mira qué suena.
+        let idle_audio = (request.audio == coroom_session::audio::GameCapture::None).then(|| {
+            settings
+                .audio
+                .excluded_apps
+                .iter()
+                .map(|app| coroom_session::audio::apps::normalize(&app.key))
+                .collect::<Vec<_>>()
+        });
+        let mut host = HostOptions {
             net: net_options(&options, settings),
             source: host_source(request.source),
             share: request.share,
@@ -880,6 +902,9 @@ impl Backend {
         let preview = VideoFeed::new(None, Arc::clone(&self.wake), None);
         let on_panic: fn(String) -> Event = |reason| Event::HostEnded(Some(reason));
         self.spawn_or("sala", on_panic, move |notify| {
+            if let Some(excluded) = idle_audio {
+                host.audio.game = crate::remote::idle_room_game_capture(excluded);
+            }
             let on_token = restore_token_sink(host.share.kind, Arc::clone(&notify));
             let prepared =
                 load_identity(crate::ui::settings::explicit_data_dir().as_deref(), false)
@@ -1350,9 +1375,10 @@ fn close_within<T: Send + 'static>(
     result
 }
 
-/// Tras mandar a los invitados a la sala nueva, lo que se espera antes de cerrar esta: el aviso va
-/// por el stream de control, delante del cierre, pero sin esperar a que salga se perdería.
-const HANDOVER_GRACE: Duration = Duration::from_millis(600);
+/// Tras mandar a los invitados a la sala nueva, lo que se espera como mucho a que salgan todos
+/// (cada uno sale al recibir el aviso) antes de cerrar esta: solo cuenta para quien no contesta,
+/// con el enlace muerto; con todos fuera se cierra al momento.
+const HANDOVER_WAIT: Duration = Duration::from_secs(10);
 
 /// Cada cuánto llega el nivel de la prueba del micrófono a la pantalla.
 const MIC_LEVEL_PERIOD: Duration = Duration::from_millis(50);

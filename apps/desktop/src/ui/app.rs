@@ -529,17 +529,17 @@ pub enum Effect {
     SetSoftwareDecoder(bool),
     /// Anfitrión: ofrecer a un invitado pasarle la sala.
     OfferHandoff(GuestId),
+    /// Anfitrión: retirar esa oferta (o decir que no a una respuesta que ya no se espera).
+    CancelHandoff(GuestId),
     /// Invitado: contestar a la oferta de la sala (el código de la que ya abrió, o `None`).
     ReplyHandoff(Option<String>),
-    /// Anfitrión: mandar a los demás a la sala `code` del anfitrión nuevo (`except`) y, después,
+    /// Anfitrión: mandar a todos a la sala `code` del anfitrión nuevo, esperar a que salgan y
     /// avisar con [`Event::HandedOver`].
     HandOver {
         /// Código de la sala nueva.
         code: String,
         /// Nombre del anfitrión nuevo.
         host_name: String,
-        /// El anfitrión nuevo.
-        except: GuestId,
     },
     /// Cambiar de micrófono (`input`) o de salida en la sala abierta, sin reconectar
     /// (`None`: el del sistema).
@@ -803,6 +803,9 @@ pub struct App {
     pub update: UpdateState,
     /// 4:4:4 y HDR en este equipo (`None` hasta que se sondea).
     pub video_support: Option<VideoSupport>,
+    /// Al pasar la sala, el silencio propio de la sala que se deja, para la siguiente: cada sesión
+    /// empieza con el micrófono abierto y quien estaba callado debe seguir callado.
+    pub carried_mute: Option<bool>,
 }
 
 impl App {
@@ -842,6 +845,7 @@ impl App {
             version: env!("CARGO_PKG_VERSION"),
             update: UpdateState::default(),
             video_support: None,
+            carried_mute: None,
         };
         app.refresh_theme();
         app
@@ -1035,10 +1039,12 @@ impl App {
                 }
                 Vec::new()
             }
-            Message::CloseDialog => {
-                self.dialog = None;
-                Vec::new()
-            }
+            Message::CloseDialog => match self.dialog.take() {
+                // Cerrar la oferta de la sala (Esc, clic fuera) es no aceptarla: el anfitrión no
+                // se queda esperando.
+                Some(Dialog::HandoffOffered { .. }) => vec![Effect::ReplyHandoff(None)],
+                _ => Vec::new(),
+            },
             Message::ConfirmDialog => self.confirm_dialog(),
             Message::DismissToast(id) => {
                 self.toasts.retain(|toast| toast.id != id);

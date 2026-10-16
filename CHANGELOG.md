@@ -184,6 +184,27 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 - Los fps y el bitrate que ve el invitado (barra de la sala, «Conexión», diagnóstico) se medían
   sobre los últimos 4096 fotogramas: al bajar de 120 a 30 fps seguía marcando unos 70 y bajaba
   durante minutos. Ahora son los del último segundo; el cambio de fps ya se aplicaba al momento.
+- **«Dejar de compartir» ya no deja salir el audio del equipo**: sin nada compartido no se envía
+  el audio del juego (ni en Linux ni en Windows); al volver a compartir vuelve con las
+  aplicaciones elegidas. Y una sala «Solo voz» (o la que se abre al recibir la de otro) ya no se
+  queda sin audio del juego al empezar a compartir.
+- **Sin nada compartido, la entrada de los invitados no llega al equipo**: ni teclado ni ratón
+  ni mandos (en Windows y con los mandos virtuales seguían funcionando); lo pulsado se suelta al
+  dejar de compartir y todo vuelve al compartir de nuevo.
+- Al pasar la sala, **quien tenía el micrófono silenciado sigue silenciado** en la sala nueva
+  (el anfitrión de antes, el nuevo y los que se pasan).
+- **Pasar la sala ya no se queda colgado**: cerrar la oferta con Esc o fuera del diálogo es no
+  aceptarla, la oferta se acaba si el invitado sale y, mientras no contesta, la sala muestra
+  «Esperando a que … acepte la sala…» con «Retirar la oferta» (si ya abría su sala, se le
+  cierra).
+- Al pasar la sala, el nuevo anfitrión ya no sale de la de antes hasta que esta confirma que
+  recibió su código, y quien entra mientras se pasa también va a la nueva; la sala de antes se
+  cierra cuando ya no queda nadie, en vez de tras una espera fija.
+- Un invitado que entraba justo cuando el anfitrión dejaba de compartir (o empezaba) podía
+  quedarse con lo contrario hasta el siguiente cambio.
+- El altavoz propio del anfitrión ya no parpadea al silenciarse, y su fila ya no dice «sin
+  micrófono» al abrir la sala.
+
 - Los micrófonos de Windows salían todos como «Micrófono»: ahora con su nombre (el producto).
 - Cambiar la resolución con la sala abierta dejaba la imagen del invitado corrupta hasta cambiar de
   códec con algunos decodificadores por hardware: el decodificador se vuelve a abrir al cambiar el

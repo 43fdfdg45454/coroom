@@ -37,6 +37,7 @@ use iced_core::{Alignment, Length, Padding};
 use iced_widget::{Column, Space, button, center, column, container, row, scrollable, stack, text};
 
 use super::chat::{self, Surface};
+use super::host::Takeover;
 use super::{diagnostics, settings};
 use crate::ui::app::{
     App, AudioDevice, Dialog, Effect, EndKind, Event, HEADERBAR_HEIGHT, Invitation, Message, Page,
@@ -904,10 +905,18 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                         gain: voice_gain(app.settings.audio.mic_volume),
                     });
                 }
+                // Y con el micrófono abierto: quien llega de otra sala callado sigue callado.
+                if app.carried_mute.take() == Some(true) {
+                    effects.push(Effect::SetMicMuted {
+                        host: false,
+                        muted: true,
+                    });
+                }
                 return effects;
             }
         }
         Event::GuestStarted(Err(err)) => {
+            app.carried_mute = None;
             app.dialog = Some(Dialog::SessionEnded {
                 title: t!("room-no-se-pudo-entrar-en-la").to_owned(),
                 text: err,
@@ -945,6 +954,14 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
             let Some(state) = app.guest.as_ref() else {
                 return Vec::new();
             };
+            match std::mem::take(&mut app.host.takeover) {
+                // Ya se contestó con la sala propia: que esta termine es lo esperado.
+                Takeover::Replied(_) => return close(app),
+                // La retirada sigue en pie hasta que la sala propia abra (y se cierre).
+                Takeover::Withdrawn => app.host.takeover = Takeover::Withdrawn,
+                // Sin sala de la que venir, la que se abre queda como una más.
+                Takeover::Opening | Takeover::None => {}
+            }
             if let Some(code) = state.moving_to.clone() {
                 // La sala pasó a otro anfitrión: de esta a la suya, sin pasar por Inicio.
                 if let Some(old) = app.guest.take() {
@@ -1056,8 +1073,46 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
                 .unwrap_or_else(|| t!("room-el-anfitrion").to_owned());
             app.dialog = Some(Dialog::HandoffOffered { host });
         }
+        SessionEvent::HandoffCancelled => {
+            // El anfitrión retiró la oferta: fuera el diálogo y, si ya se abría la sala propia,
+            // se cierra; se sigue de invitado en la suya.
+            let mut effects = Vec::new();
+            let mut changed = matches!(app.dialog, Some(Dialog::HandoffOffered { .. }));
+            if changed {
+                app.dialog = None;
+            }
+            let host = &mut app.host;
+            match std::mem::take(&mut host.takeover) {
+                Takeover::None => {}
+                // Aún abriéndose: se cierra en cuanto abra.
+                Takeover::Opening if host.room.is_none() => {
+                    host.takeover = Takeover::Withdrawn;
+                    changed = true;
+                }
+                Takeover::Withdrawn => host.takeover = Takeover::Withdrawn,
+                Takeover::Opening | Takeover::Replied(_) => {
+                    changed = true;
+                    if !host.stopping {
+                        host.stopping = true;
+                        effects.push(Effect::StopHost);
+                    }
+                }
+            }
+            if changed {
+                app.toast(Tone::Info, t!("room-el-anfitrion-retiro-la-sala"));
+            }
+            return effects;
+        }
         SessionEvent::MoveToRoom { code, host_name } => {
+            if app.host.takeover == Takeover::Replied(code.clone()) {
+                // Es la sala propia: el anfitrión confirma que recibió el código; ya se puede
+                // salir de la suya (los demás vienen solos).
+                app.host.takeover = Takeover::None;
+                return leave(app);
+            }
             if state.moving_to.is_none() && !state.leaving {
+                // El silencio propio de esta sala sigue en la nueva.
+                app.carried_mute = state.stats.as_ref().map(|stats| stats.mic_muted);
                 state.moving_to = Some(code);
                 app.toast(
                     Tone::Info,
@@ -3234,7 +3289,7 @@ mod tests {
     }
 
     /// El anfitrión pasa la sala a este invitado: acepta, abre la suya solo con voz y, con el
-    /// código, contesta y sale de la del anfitrión hacia Compartir.
+    /// código, contesta; sale de la del anfitrión hacia Compartir cuando este lo confirma.
     #[test]
     fn accepting_the_room_opens_a_voice_room_and_answers_with_its_code() {
         let mut app = watching();
@@ -3266,10 +3321,144 @@ mod tests {
             effects.contains(&Effect::ReplyHandoff(Some("NEWRM2".into()))),
             "{effects:?}"
         );
+        // Sin salir aún: si se cortase ahora, la respuesta podría no llegar.
+        assert!(!effects.contains(&Effect::Leave), "{effects:?}");
+        // El anfitrión manda a todos a la sala nueva, a este también: es la confirmación.
+        let effects = app.update(Message::Event(Event::Guest(SessionEvent::MoveToRoom {
+            code: "NEWRM2".into(),
+            host_name: "Ana".into(),
+        })));
         assert!(effects.contains(&Effect::Leave), "{effects:?}");
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Join(_))));
         let effects = app.update(Message::Event(Event::GuestEnded(None)));
         assert!(!effects.contains(&Effect::StartLobby), "{effects:?}");
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Join(_))));
         assert_eq!((app.screen, app.page), (Screen::Main, Page::Host));
+        assert!(app.dialog.is_none());
+    }
+
+    /// Ya contestado, si la sala del anfitrión se cierra antes de confirmar (se fue sin más),
+    /// no hay diálogo de «ha cerrado la sala»: se queda en la propia.
+    #[test]
+    fn after_answering_the_old_room_closing_is_expected() {
+        let mut app = watching();
+        app.account = Some(crate::ui::app::tests::account());
+        app.update(Message::Event(Event::Guest(SessionEvent::HandoffOffered)));
+        app.update(Message::ConfirmDialog);
+        app.update(Message::Event(Event::HostStarted(
+            Ok(VideoFeed::detached()),
+        )));
+        app.update(Message::Event(Event::Host(SessionEvent::RoomCreated {
+            code: "NEWRM2".into(),
+            fingerprint: "ab".repeat(32),
+        })));
+        app.update(Message::Event(Event::GuestEnded(None)));
+        assert!(app.dialog.is_none(), "{:?}", app.dialog);
+        assert_eq!((app.screen, app.page), (Screen::Main, Page::Host));
+        assert!(app.host.room.is_some());
+    }
+
+    /// Cerrar la oferta sin elegir (Esc, clic fuera) es no aceptarla: el anfitrión lo sabe.
+    #[test]
+    fn closing_the_offer_declines_it() {
+        let mut app = watching();
+        app.update(Message::Event(Event::Guest(SessionEvent::HandoffOffered)));
+        assert_eq!(
+            app.update(Message::CloseDialog),
+            [Effect::ReplyHandoff(None)]
+        );
+        assert!(app.dialog.is_none());
+        // Cerrar otro diálogo no contesta nada.
+        app.update(Message::Guest(Msg::Leave));
+        assert!(app.update(Message::CloseDialog).is_empty());
+    }
+
+    /// El anfitrión retira la oferta: el diálogo se va; si ya se abría la sala propia, se cierra
+    /// (al momento si está abierta, al abrirse si aún no) y se sigue de invitado.
+    #[test]
+    fn a_withdrawn_offer_closes_the_dialog_and_the_new_room() {
+        let mut app = watching();
+        app.account = Some(crate::ui::app::tests::account());
+        app.update(Message::Event(Event::Guest(SessionEvent::HandoffOffered)));
+        let effects = app.update(Message::Event(Event::Guest(SessionEvent::HandoffCancelled)));
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(app.dialog.is_none());
+        assert!(app.toasts.iter().any(|t| t.text.contains("ya no te pasa")));
+
+        // Aceptada y abriéndose: se cierra en cuanto abra.
+        app.update(Message::Event(Event::Guest(SessionEvent::HandoffOffered)));
+        app.update(Message::ConfirmDialog);
+        assert!(
+            app.update(Message::Event(Event::Guest(SessionEvent::HandoffCancelled)))
+                .is_empty()
+        );
+        let effects = app.update(Message::Event(Event::HostStarted(
+            Ok(VideoFeed::detached()),
+        )));
+        assert!(effects.contains(&Effect::StopHost), "{effects:?}");
+        assert!(
+            !app.update(Message::Event(Event::Host(SessionEvent::RoomCreated {
+                code: "NEWRM2".into(),
+                fingerprint: "ab".repeat(32),
+            })))
+            .iter()
+            .any(|e| matches!(e, Effect::ReplyHandoff(_)))
+        );
+        app.update(Message::Event(Event::HostEnded(None)));
+        assert!(app.guest.is_some(), "sigue de invitado");
+
+        // Ya contestado: se cierra la sala propia y no se sale de la del anfitrión.
+        app.update(Message::Event(Event::Guest(SessionEvent::HandoffOffered)));
+        app.update(Message::ConfirmDialog);
+        app.update(Message::Event(Event::HostStarted(
+            Ok(VideoFeed::detached()),
+        )));
+        app.update(Message::Event(Event::Host(SessionEvent::RoomCreated {
+            code: "NEWRM3".into(),
+            fingerprint: "ab".repeat(32),
+        })));
+        let effects = app.update(Message::Event(Event::Guest(SessionEvent::HandoffCancelled)));
+        assert_eq!(effects, [Effect::StopHost]);
+        assert!(app.guest.as_ref().is_some_and(|guest| !guest.leaving));
+    }
+
+    /// Quien estaba callado sigue callado en la sala nueva (cada sesión empieza con el micrófono
+    /// abierto).
+    #[test]
+    fn a_muted_guest_stays_muted_in_the_new_room() {
+        let mut app = watching();
+        let mut stats = shots::sample_stats();
+        stats.mic_muted = true;
+        app.update(Message::Event(Event::GuestStats(Box::new(stats))));
+        app.update(Message::Event(Event::Guest(SessionEvent::MoveToRoom {
+            code: "NEWRM2".into(),
+            host_name: "Carla".into(),
+        })));
+        app.update(Message::Event(Event::GuestEnded(None)));
+        let effects = app.update(Message::Event(Event::GuestStarted(Ok(
+            VideoFeed::detached(),
+        ))));
+        assert!(
+            effects.contains(&Effect::SetMicMuted {
+                host: false,
+                muted: true
+            }),
+            "{effects:?}"
+        );
+        // Solo una vez: entrar después en otra sala empieza como siempre.
+        app.update(Message::Guest(Msg::Leave));
+        app.update(Message::ConfirmDialog);
+        app.update(Message::Event(Event::GuestEnded(None)));
+        start(&mut app, "OTRA22".into());
+        let effects = app.update(Message::Event(Event::GuestStarted(Ok(
+            VideoFeed::detached(),
+        ))));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::SetMicMuted { .. })),
+            "{effects:?}"
+        );
     }
 
     /// No aceptar contesta que no y cierra el diálogo.

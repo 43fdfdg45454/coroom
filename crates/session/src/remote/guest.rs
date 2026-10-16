@@ -854,6 +854,7 @@ async fn run_guest(
                         | Command::Chat(_)
                         | Command::ChatClear
                         | Command::OfferHandoff(_)
+                        | Command::CancelHandoff(_)
                         | Command::MoveToRoom { .. },
                     ) => {}
                 },
@@ -1267,6 +1268,7 @@ async fn control_loop(
                 core.audio.set_voice_allowed(allowed);
             }
             Some(ControlMessage::HandoffOffer) => core.emit(SessionEvent::HandoffOffered),
+            Some(ControlMessage::HandoffCancel) => core.emit(SessionEvent::HandoffCancelled),
             Some(ControlMessage::MoveToRoom { code, host_name })
                 if coroom_transport::proto::signal::is_valid_room_code(&code) =>
             {

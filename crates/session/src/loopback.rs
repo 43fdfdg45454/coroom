@@ -478,6 +478,12 @@ impl Shared {
         !self.nothing_shared.load(Ordering::Acquire)
     }
 
+    /// Para los tests: como si la fuente en uso compartiese algo o no.
+    #[cfg(test)]
+    pub(crate) fn set_sharing(&self, sharing: bool) {
+        self.nothing_shared.store(!sharing, Ordering::Release);
+    }
+
     /// Anota si la fuente que entra comparte algo.
     pub(crate) fn note_source(&self, capturer: &dyn Capturer) {
         self.nothing_shared

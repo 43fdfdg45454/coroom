@@ -30,7 +30,8 @@
 //! - (n) cortes de red de 600 ms cada 3 s con 1 % de pérdida y 10 Mbit/s: el vídeo vuelve como
 //!   mucho 500 ms después de cada corte;
 //! - (p) con la sala abierta, el anfitrión baja la resolución máxima y los fps (y luego los
-//!   sube) y el invitado sigue presentando, con el tamaño y la cadencia nuevos.
+//!   sube) y el invitado sigue presentando, con el tamaño y la cadencia nuevos;
+//! - (s) el audio del juego solo sale mientras se comparte algo.
 //!
 //! Los tests (a)–(e) usan OpenH264 en los dos extremos, para que sus cotas de
 //! tiempo sigan siendo comparables.
@@ -1497,8 +1498,22 @@ fn q_a_room_without_sharing_and_stopping_sharing() {
     drop(server);
 }
 
+/// El siguiente `MoveToRoom` de una sesión: `(código, anfitrión)`.
+fn wait_move(events: &crossbeam_channel::Receiver<SessionEvent>, who: &str) -> (String, String) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if let Ok(SessionEvent::MoveToRoom { code, host_name }) =
+            events.recv_timeout(Duration::from_millis(100))
+        {
+            return (code, host_name);
+        }
+    }
+    panic!("{who} no recibió el cambio de sala");
+}
+
 /// (r) Pasar el anfitrión: A ofrece la sala a B, B abre la suya (solo voz) y contesta con el
-/// código, A manda a C allí y entra él también; en la sala de B están A y C.
+/// código, A manda a todos allí (a B también, como confirmación, y a D, que entra en la de A
+/// mientras tanto) y espera a que salgan; luego entra él también; en la sala de B están A y C.
 #[test]
 fn r_the_host_hands_the_room_over() {
     use coroom_session::capture::idle::IdleCapturer;
@@ -1552,20 +1567,28 @@ fn r_the_host_hands_the_room_over() {
         }
     };
     assert_eq!(reply, (b_id, Some(new_code.clone())));
-    a.move_to_room(&new_code, "Bea", b_id).expect("mover");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let moved = loop {
-        assert!(Instant::now() < deadline, "C no recibió el cambio de sala");
-        if let Ok(SessionEvent::MoveToRoom { code, host_name }) =
-            c_events.recv_timeout(Duration::from_millis(100))
-        {
-            break (code, host_name);
-        }
-    };
-    assert_eq!(moved, (new_code.clone(), "Bea".to_owned()));
-    // Todos se pasan: C y A entran en la sala de B; la de A se cierra.
+    let waiter = a.move_to_room(&new_code, "Bea").expect("mover");
+    let moved = (new_code.clone(), "Bea".to_owned());
+    assert_eq!(wait_move(&c_events, "C"), moved);
+    // B también: es la confirmación de que su respuesta llegó y ya puede salir.
+    assert_eq!(wait_move(&b_events, "B"), moved);
+    // Quien entra mientras se pasa la sala recibe el aviso en cuanto conecta.
+    let mut d = guest(server.config(), &code, None);
+    let d_events = d.events();
+    assert_eq!(wait_move(&d_events, "D"), moved);
+    // Mientras quede alguien dentro, A no cierra.
+    assert!(
+        !waiter.wait(Duration::from_millis(300)),
+        "aún hay invitados"
+    );
+    // Todos se pasan: C y A entran en la sala de B; la de A se cierra cuando ya no queda nadie.
     c.close();
     b.close();
+    d.close();
+    assert!(
+        waiter.wait(Duration::from_secs(15)),
+        "los invitados salieron de la sala de A"
+    );
     a.close();
     let mut c2 = guest(server.config(), &new_code, None);
     let mut a2 = guest(server.config(), &new_code, None);
@@ -1580,5 +1603,70 @@ fn r_the_host_hands_the_room_over() {
     c2.close();
     a2.close();
     new_host.close();
+    drop(server);
+}
+
+/// Audio del juego enviado por el anfitrión hasta ahora.
+fn game_audio_sent(host: &RemoteSession) -> u64 {
+    host.summary()
+        .audio
+        .and_then(|audio| {
+            audio
+                .track(coroom_session::latency::AudioTrack::Game)
+                .map(|game| game.counters.sent)
+        })
+        .unwrap_or(0)
+}
+
+/// (s) El audio del juego sigue a lo que se comparte: una sala solo de voz abre la captura del
+/// juego pero no envía nada de ella; al compartir sale, y al dejar de compartir deja de salir.
+#[test]
+fn s_game_audio_only_flows_while_sharing() {
+    use coroom_session::audio::synthetic::ToneSource;
+    use coroom_session::capture::idle::IdleCapturer;
+    use coroom_session::remote::HostAudio;
+    let _serial = serial();
+    let server = TestServer::start();
+    let account = server.config();
+    let mut host = RemoteSession::host(
+        account.identity,
+        account.config,
+        Box::new(IdleCapturer::new()),
+        EncoderSet::openh264(),
+        video(None),
+        Arc::new(LatencyLedger::new()),
+    )
+    .with_host_audio(HostAudio {
+        game: Some(Box::new(ToneSource::new(440.0, 2))),
+        game_bitrate: 0,
+        frame_ms: 10,
+        voice: None,
+        speaker: None,
+    });
+    host.start().expect("arranque del anfitrión");
+    let code = room_code(&host);
+    let mut first = guest(server.config(), &code, None);
+    let events = first.events();
+    assert!(!wait_sharing(&events), "la sala se abrió sin compartir");
+    wait_until("el invitado conectado", Duration::from_secs(15), || {
+        host.guests().iter().any(|g| g.path.is_some())
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(game_audio_sent(&host), 0, "sin compartir no sale el juego");
+    host.switch_capture(Box::new(SyntheticCapturer::new(640, 360, FPS)), None)
+        .expect("compartir");
+    assert!(wait_sharing(&events), "ahora comparte");
+    wait_until("el audio del juego", Duration::from_secs(10), || {
+        game_audio_sent(&host) > 50
+    });
+    host.switch_capture(Box::new(IdleCapturer::new()), None)
+        .expect("dejar de compartir");
+    // El invitado se entera después de que la sesión deje de enviarlo.
+    assert!(!wait_sharing(&events), "ya no comparte");
+    let stopped = game_audio_sent(&host);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(game_audio_sent(&host), stopped, "ni una trama más");
+    first.close();
+    host.close();
     drop(server);
 }

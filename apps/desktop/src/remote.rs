@@ -854,6 +854,22 @@ pub fn parse_game_capture(values: &[String]) -> Result<GameCapture, String> {
     }
 }
 
+/// Audio del juego de una sala que se abre sin compartir nada (solo voz, o la que se abre al
+/// aceptar la de otro anfitrión): la captura se abre ya, aunque la sesión no envía nada de ella
+/// hasta que se comparta algo, para que «Compartir pantalla o ventana» traiga el audio al momento
+/// (con el filtro de aplicaciones de lo elegido). Todas las aplicaciones menos `excluded` si este
+/// equipo separa el audio por aplicación (PipeWire, o WASAPI con loopback por proceso); si no, lo
+/// que suena en la salida del sistema (loopback de WASAPI o monitor de PipeWire).
+pub fn idle_room_game_capture(excluded: Vec<String>) -> GameCapture {
+    match coroom_session::audio::playing_apps() {
+        Ok(_) => GameCapture::Apps(AppFilter::AllExcept(excluded)),
+        Err(err) => {
+            tracing::debug!(error = %err, "sin audio por aplicación: el de todo el sistema");
+            GameCapture::System
+        }
+    }
+}
+
 /// Audio de la plataforma o sintético (sin ventana) para el anfitrión.
 pub fn host_audio(options: &HostAudioOptions, headless: bool) -> HostAudio {
     let frame_ms = options.frame_ms;

@@ -510,6 +510,9 @@ pub enum SessionEvent {
     Sharing(bool),
     /// Invitado: el anfitrión le ofrece pasarle el anfitrión ([`RemoteSession::reply_handoff`]).
     HandoffOffered,
+    /// Invitado: el anfitrión retiró la oferta de pasarle el anfitrión (si ya abrió su sala,
+    /// sobra).
+    HandoffCancelled,
     /// Anfitrión: la respuesta de `guest` a la oferta de pasarle el anfitrión: el código de su
     /// sala nueva, o `None` si no acepta.
     HandoffReply {
@@ -602,6 +605,9 @@ impl fmt::Display for SessionEvent {
                 write!(f, "En la sala: {}.", names.join(", "))
             }
             SessionEvent::HandoffOffered => f.write_str("El anfitrión te ofrece pasarte la sala."),
+            SessionEvent::HandoffCancelled => {
+                f.write_str("El anfitrión ya no te ofrece pasarte la sala.")
+            }
             SessionEvent::HandoffReply {
                 guest,
                 code: Some(code),
@@ -912,12 +918,14 @@ pub(crate) enum Command {
     ChatClear,
     /// Anfitrión: ofrecer a un invitado pasarle el anfitrión (`HandoffOffer`).
     OfferHandoff(GuestId),
-    /// Anfitrión: mandar a los demás invitados (todos menos `except`) a la sala `code`
-    /// (`MoveToRoom`).
+    /// Anfitrión: retirar esa oferta (`HandoffCancel`).
+    CancelHandoff(GuestId),
+    /// Anfitrión: mandar a todos los invitados (también a los que entren después) a la sala
+    /// `code` (`MoveToRoom`); `done` avisa cuando ya no queda nadie en esta.
     MoveToRoom {
         code: String,
         host_name: String,
-        except: GuestId,
+        done: channel::Sender<()>,
     },
     Close,
 }
@@ -1293,6 +1301,22 @@ enum Parts {
 pub(crate) struct Started {
     pub(crate) main: tokio::task::JoinHandle<()>,
     pub(crate) threads: Vec<(&'static str, JoinHandle<()>)>,
+}
+
+/// Espera de [`RemoteSession::move_to_room`]: hasta que todos los invitados salieron de la sala
+/// (cada uno sale al recibir `MoveToRoom`, así que entonces ya lo tienen todos).
+#[derive(Debug)]
+pub struct MoveWaiter(channel::Receiver<()>);
+
+impl MoveWaiter {
+    /// Espera como mucho `limit` (para quien no conteste: un enlace muerto). Devuelve `true` si
+    /// ya no queda nadie o la sala terminó, y `false` si venció el plazo con alguien dentro.
+    pub fn wait(&self, limit: Duration) -> bool {
+        match self.0.recv_timeout(limit) {
+            Ok(()) | Err(channel::RecvTimeoutError::Disconnected) => true,
+            Err(channel::RecvTimeoutError::Timeout) => false,
+        }
+    }
 }
 
 /// Mando del anfitrión para cambiar lo que se transmite con la sala abierta
@@ -1758,20 +1782,28 @@ impl RemoteSession {
             .ok_or(SessionError::Network("la sesión no está en marcha".into()))
     }
 
-    /// Anfitrión: manda a todos los invitados menos `except` (el anfitrión nuevo) a la sala
-    /// `code` de `host_name`. Después, la sala se cierra (lo hace quien llama).
-    pub fn move_to_room(
-        &self,
-        code: &str,
-        host_name: &str,
-        except: GuestId,
-    ) -> Result<(), SessionError> {
+    /// Anfitrión: retira la oferta de [`RemoteSession::offer_handoff`] (`HandoffCancel`): si
+    /// `guest` ya abrió su sala, la cierra y sigue aquí.
+    pub fn cancel_handoff(&self, guest: GuestId) -> Result<(), SessionError> {
+        self.require_host()?;
+        self.commands
+            .as_ref()
+            .and_then(|commands| commands.send(Command::CancelHandoff(guest)).ok())
+            .ok_or(SessionError::Network("la sesión no está en marcha".into()))
+    }
+
+    /// Anfitrión: manda a todos los invitados a la sala `code` de `host_name` (al anfitrión
+    /// nuevo también: es su confirmación) y a los que entren desde ahora en cuanto conecten. La
+    /// sala se cierra después (lo hace quien llama) cuando [`MoveWaiter::wait`] diga que ya no
+    /// queda nadie: cada invitado sale al recibir el aviso, y así ninguno se queda sin él.
+    pub fn move_to_room(&self, code: &str, host_name: &str) -> Result<MoveWaiter, SessionError> {
         self.require_host()?;
         if !coroom_transport::proto::signal::is_valid_room_code(code) {
             return Err(SessionError::Network(format!(
                 "código de sala no válido: {code}"
             )));
         }
+        let (done, waiter) = channel::bounded(1);
         self.commands
             .as_ref()
             .and_then(|commands| {
@@ -1779,15 +1811,19 @@ impl RemoteSession {
                     .send(Command::MoveToRoom {
                         code: code.to_owned(),
                         host_name: host::truncate_name(host_name),
-                        except,
+                        done,
                     })
                     .ok()
             })
-            .ok_or(SessionError::Network("la sesión no está en marcha".into()))
+            .ok_or(SessionError::Network("la sesión no está en marcha".into()))?;
+        Ok(MoveWaiter(waiter))
     }
 
     /// Invitado: contesta a [`SessionEvent::HandoffOffered`] con el código de la sala que ya
-    /// abrió (o `None` si no acepta).
+    /// abrió (o `None` si no acepta). La respuesta se encola esperando sitio, sin perderse si la
+    /// cola de control va llena; con un código, quien llama no sale de esta sala hasta que el
+    /// anfitrión conteste (`MoveToRoom` con ese código, o el cierre de la sala), para no cortar
+    /// la conexión antes de que salga.
     pub fn reply_handoff(&self, code: Option<String>) -> Result<(), SessionError> {
         if self.core.role != Role::Guest {
             return Err(SessionError::Network("solo un invitado contesta".into()));
@@ -1796,9 +1832,18 @@ impl RemoteSession {
             .control
             .clone()
             .ok_or_else(|| SessionError::Network("sin conexión con el anfitrión".into()))?;
-        control
-            .send(&coroom_transport::proto::control::ControlMessage::HandoffReply { code })
-            .map_err(|err| SessionError::Network(format!("no se pudo contestar: {err}")))
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| SessionError::Network("la sesión no está en marcha".into()))?;
+        let core = Arc::clone(&self.core);
+        runtime.spawn(async move {
+            let message = coroom_transport::proto::control::ControlMessage::HandoffReply { code };
+            if let Err(err) = control.send_wait(&message).await {
+                core.warn(format!("no se pudo contestar al anfitrión: {err}"));
+            }
+        });
+        Ok(())
     }
 
     /// Anfitrión: vacía el chat para todos (historial incluido; [`SessionEvent::ChatCleared`]
