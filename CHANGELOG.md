@@ -26,9 +26,11 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 - **Volumen de tu voz** (lo que se envía), recordado, y **micrófono y salida que cambian con la
   sala abierta**, sin reconectar: desde la sala, el panel del invitado o Ajustes.
 - **Probar el micrófono** en Ajustes → Audio y voz: el nivel y, con «Oírte», tu voz por la salida.
-- La pestaña **Ajustes** del panel del invitado: VSync, decodificar por software (se aplica al
-  reconectar), micrófono y salida, volumen del juego y el mando; «Conexión» queda solo con datos.
-- El texto del chat se copia: botón al pasar por encima de un mensaje o botón derecho.
+- La pestaña **Ajustes** del panel del invitado: VSync, decodificar por software (apagado de
+  partida; cambia al momento, sin reconectar), micrófono y salida, volumen del juego y el mando; «Conexión» queda solo con datos.
+- El texto del chat **se selecciona** con el ratón y se copia con `Ctrl+C` (los enlaces siguen
+  abriéndose con un clic); el mensaje entero, con el botón que aparece al pasar por encima o con el
+  botón derecho.
 - **«Predeterminado del sistema (…)»** en los selectores de audio, con el dispositivo que es.
 
 - Volumen del audio del juego en el invitado, aparte del de cada participante (0-200 %, recordado):

@@ -187,6 +187,9 @@ pub struct State {
     last_sound: Option<Instant>,
     /// Desfase con UTC y cuándo se leyó.
     utc_offset: Option<(i64, Instant)>,
+    /// El texto de cada mensaje (por su clave), en un campo de solo lectura: se selecciona con
+    /// el ratón y se copia con `Ctrl+C`.
+    bodies: std::collections::HashMap<u64, text_editor::Content<Renderer>>,
 }
 
 impl Default for State {
@@ -213,6 +216,7 @@ impl Default for State {
             guests: BTreeMap::new(),
             last_sound: None,
             utc_offset: None,
+            bodies: std::collections::HashMap::new(),
         }
     }
 }
@@ -245,6 +249,8 @@ pub enum Msg {
     CancelClear,
     /// Pintar también los mensajes anteriores a los últimos [`ENTRIES_SHOWN`].
     ShowOlder,
+    /// Seleccionar en el texto de un mensaje (por su clave), o abrir el enlace pulsado.
+    Select(u64, text_editor::Action),
 }
 
 impl State {
@@ -297,11 +303,63 @@ impl State {
     fn push(&mut self, mut entry: Entry) {
         entry.set_seq(self.next_seq);
         self.next_seq += 1;
+        if let Entry::Message { seq, line, .. } = &entry {
+            self.bodies
+                .insert(*seq, text_editor::Content::with_text(&line.text));
+        }
         self.entries.push(entry);
         if self.entries.len() > ENTRIES_MAX {
             let extra = self.entries.len() - ENTRIES_MAX;
             self.entries.drain(..extra);
+            self.prune_bodies();
         }
+    }
+
+    /// Olvida el texto de los mensajes que ya no están.
+    fn prune_bodies(&mut self) {
+        let entries = &self.entries;
+        self.bodies.retain(|seq, _| {
+            entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Message { seq: s, .. } if s == seq))
+        });
+    }
+
+    /// Selecciona en el texto de un mensaje (las ediciones no se aplican: es de solo lectura).
+    /// Un clic sobre un enlace lo abre.
+    fn select(&mut self, seq: u64, action: text_editor::Action) -> Option<String> {
+        if action.is_edit() {
+            return None;
+        }
+        let click = matches!(action, text_editor::Action::Click(_));
+        let content = self.bodies.get_mut(&seq)?;
+        content.perform(action);
+        if !click {
+            return None;
+        }
+        let cursor = content.cursor();
+        if cursor.selection.is_some() {
+            return None;
+        }
+        let Some(Entry::Message { line, pieces, .. }) = self
+            .entries
+            .iter()
+            .find(|entry| matches!(entry, Entry::Message { seq: s, .. } if *s == seq))
+        else {
+            return None;
+        };
+        // La posición (línea y byte en la línea) en bytes del texto entero.
+        let offset: usize = line
+            .text
+            .split('\n')
+            .take(cursor.position.line)
+            .map(|before| before.len() + 1)
+            .sum::<usize>()
+            + cursor.position.column;
+        pieces
+            .iter()
+            .find(|piece| piece.range.start <= offset && offset < piece.range.end)
+            .and_then(|piece| piece.link.clone())
     }
 
     /// Añade un aviso del sistema con la hora de ahora.
@@ -487,6 +545,10 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             app.chat.show_all = true;
             Vec::new()
         }
+        Msg::Select(seq, action) => match app.chat.select(seq, action) {
+            Some(url) => vec![Effect::OpenUrl(url)],
+            None => Vec::new(),
+        },
     }
 }
 
@@ -630,6 +692,7 @@ fn session_event(app: &mut App, event: &SessionEvent, host: bool) -> Vec<Effect>
             // Sustituye los mensajes; los avisos locales se quedan, en su sitio por la hora.
             chat.entries
                 .retain(|entry| matches!(entry, Entry::System { .. }));
+            chat.prune_bodies();
             for line in messages {
                 chat.message(now, line.clone());
             }
@@ -646,6 +709,7 @@ fn session_event(app: &mut App, event: &SessionEvent, host: bool) -> Vec<Effect>
         }
         SessionEvent::ChatCleared => {
             chat.entries.clear();
+            chat.bodies.clear();
             chat.bubbles.clear();
             chat.unread = 0;
             let text = if host {
@@ -1034,11 +1098,11 @@ fn messages<'a>(app: &'a App, look: Look) -> Element<'a, Message> {
             entry.seq(),
             keyed_item(match entry {
                 Entry::Message {
+                    seq,
                     line,
                     pieces,
                     clock,
-                    ..
-                } => message_row(app, look, line, pieces, clock, you),
+                } => message_row(app, look, *seq, line, pieces, clock, you),
                 Entry::System { spans, clock, .. } => system_row(look, spans, clock),
             }),
         );
@@ -1060,9 +1124,11 @@ fn keyed_item<'a>(row: impl Into<Element<'a, Message>>) -> Element<'a, Message> 
     Column::with_children([row.into()]).into()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn message_row<'a>(
     app: &'a App,
     look: Look,
+    seq: u64,
     line: &'a ChatLine,
     pieces: &'a [Piece],
     clock: &'a str,
@@ -1097,7 +1163,7 @@ fn message_row<'a>(
     );
     let body = row![
         ui::avatar(&app.theme, &seed, 28.0),
-        column![who, message_text(look, &line.text, pieces)]
+        column![who, message_body(app, look, seq, &line.text, pieces)]
             .spacing(2)
             .width(Length::Fill)
     ]
@@ -1112,6 +1178,100 @@ fn message_row<'a>(
     mouse_area(hover(body, copy))
         .on_right_press(Message::Copy(line.text.clone()))
         .into()
+}
+
+/// El texto de un mensaje: un campo de solo lectura, que se selecciona con el ratón y se copia
+/// con `Ctrl+C`, con los enlaces en el color del acento (un clic los abre). Sin su campo (no
+/// debería pasar), el texto con los enlaces subrayados.
+fn message_body<'a>(
+    app: &'a App,
+    look: Look,
+    seq: u64,
+    content: &'a str,
+    pieces: &'a [Piece],
+) -> Element<'a, Message> {
+    let Some(body) = app.chat.bodies.get(&seq) else {
+        return message_text(look, content, pieces);
+    };
+    iced_widget::text_editor(body)
+        .id(format!("chat-message-{seq}"))
+        .on_action(move |action| Message::Chat(Msg::Select(seq, action)))
+        .key_binding(reading_binding)
+        .highlight_with::<LinkHighlighter>(LinkColor(look.accent), |color, _| {
+            iced_core::text::highlighter::Format {
+                color: Some(*color),
+                font: None,
+            }
+        })
+        .size(type_size::BODY)
+        .padding(0)
+        .height(Length::Shrink)
+        .wrapping(Wrapping::WordOrGlyph)
+        .class(match look.surface {
+            Surface::Overlay => EditorClass::ReadingOverlay,
+            Surface::Window => EditorClass::Reading,
+        })
+        .into()
+}
+
+/// Teclas de un mensaje: solo copiar y seleccionar todo; el resto sigue su camino (al juego o
+/// al campo), porque no se puede escribir en él.
+fn reading_binding(press: KeyPress) -> Option<Binding<Message>> {
+    use iced_core::keyboard::Key;
+    if !matches!(press.status, text_editor::Status::Focused { .. }) {
+        return None;
+    }
+    match press.key.as_ref() {
+        Key::Character("c") if press.modifiers.command() => Some(Binding::Copy),
+        Key::Character("a") if press.modifiers.command() => Some(Binding::SelectAll),
+        _ => None,
+    }
+}
+
+/// Color de los enlaces en un mensaje.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LinkColor(Color);
+
+/// Marca los enlaces de cada línea de un mensaje ([`segments`]).
+struct LinkHighlighter {
+    color: Color,
+    line: usize,
+}
+
+impl iced_core::text::Highlighter for LinkHighlighter {
+    type Settings = LinkColor;
+    type Highlight = Color;
+    type Iterator<'a> = std::vec::IntoIter<(std::ops::Range<usize>, Color)>;
+
+    fn new(settings: &Self::Settings) -> Self {
+        Self {
+            color: settings.0,
+            line: 0,
+        }
+    }
+
+    fn update(&mut self, settings: &Self::Settings) {
+        self.color = settings.0;
+    }
+
+    fn change_line(&mut self, line: usize) {
+        self.line = line;
+    }
+
+    fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
+        self.line += 1;
+        let color = self.color;
+        pieces(line)
+            .into_iter()
+            .filter(|piece| piece.link.is_some())
+            .map(|piece| (piece.range, color))
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    fn current_line(&self) -> usize {
+        self.line
+    }
 }
 
 /// Texto plano con los enlaces subrayados y clicables (`pieces`: sus trozos, ya calculados).
@@ -1696,6 +1856,31 @@ mod tests {
             app.update(Message::Chat(Msg::Toggle)),
             [Effect::SetImmersive(false), Effect::FocusChat(true)]
         );
+    }
+
+    /// El texto de un mensaje se selecciona y se copia, pero no se escribe en él; al irse el
+    /// mensaje (vaciar el chat) se olvida su campo.
+    #[test]
+    fn message_text_is_selectable_and_read_only() {
+        let mut chat = State::default();
+        chat.message(
+            Instant::now(),
+            line(1, "Bea", "hola, mira coroom.example.com", false),
+        );
+        let seq = chat.entries[0].seq();
+        assert_eq!(chat.select(seq, text_editor::Action::SelectAll), None);
+        assert_eq!(
+            chat.bodies[&seq].selection().as_deref(),
+            Some("hola, mira coroom.example.com")
+        );
+        chat.select(
+            seq,
+            text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        );
+        assert_eq!(chat.bodies[&seq].text(), "hola, mira coroom.example.com");
+        chat.entries.clear();
+        chat.prune_bodies();
+        assert!(chat.bodies.is_empty());
     }
 
     #[test]

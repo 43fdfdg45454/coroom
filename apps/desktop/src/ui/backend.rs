@@ -408,6 +408,11 @@ impl Backend {
                     audio.set_voice_gain(source, gain);
                 }
             }
+            Effect::SetSoftwareDecoder(on) => {
+                if let Some(run) = lock(&self.guest).as_ref() {
+                    lock(&run.session).set_software_decoder(on);
+                }
+            }
             Effect::OfferHandoff(guest) => {
                 if let Some(session) = lock(&self.host).clone()
                     && let Err(err) = lock(&session).offer_handoff(guest)

@@ -830,6 +830,10 @@ pub(crate) struct DecodeControl {
     /// El invitado tiene que volver a anunciar sus capacidades ([`DecodeControl::usable`]).
     renegotiate: AtomicBool,
     opener: DecoderOpener,
+    /// Solo decodificadores por software (Ajustes del invitado, en marcha).
+    software_only: AtomicBool,
+    /// Hay que volver a abrir el decodificador (cambió [`DecodeControl::software_only`]).
+    reopen: AtomicBool,
 }
 
 impl fmt::Debug for DecodeControl {
@@ -852,7 +856,29 @@ impl DecodeControl {
             excluded: Mutex::new(Vec::new()),
             renegotiate: AtomicBool::new(false),
             opener: Box::new(|set, codec, format| set.open_format(codec, format)),
+            software_only: AtomicBool::new(false),
+            reopen: AtomicBool::new(false),
         }
+    }
+
+    /// Decodificar solo por software (o volver a todos), en marcha: el hilo `decode` vuelve a
+    /// abrir el decodificador y se renegocia el códec con lo que quede.
+    pub(crate) fn set_software_only(&self, on: bool) {
+        if self.software_only.swap(on, Ordering::AcqRel) != on {
+            self.reopen.store(true, Ordering::Release);
+            self.renegotiate.store(true, Ordering::Release);
+        }
+    }
+
+    /// Olvida las peticiones de volver a abrir y de renegociar (al arrancar).
+    pub(crate) fn take_pending(&self) {
+        self.reopen.store(false, Ordering::Release);
+        self.renegotiate.store(false, Ordering::Release);
+    }
+
+    /// Consume la petición de volver a abrir el decodificador.
+    fn take_reopen(&self) -> bool {
+        self.reopen.swap(false, Ordering::AcqRel)
     }
 
     /// Con lo que acepta el invitado: 4:4:4 y HDR10.
@@ -886,7 +912,19 @@ impl DecodeControl {
 
     /// Los decodificadores que quedan (sin los que fallaron): lo que se abre y lo que se anuncia.
     pub(crate) fn usable(&self) -> DecoderSet {
-        self.set.without(&self.excluded())
+        let usable = self.set.without(&self.excluded());
+        if !self.software_only.load(Ordering::Acquire) {
+            return usable;
+        }
+        // Solo software; si ninguno lo es, mejor con todos que sin vídeo.
+        let software = usable
+            .clone()
+            .only_backend(Some(coroom_codec::DecoderBackend::Software));
+        if software.is_empty() {
+            usable
+        } else {
+            software
+        }
     }
 
     fn open(&self, codec: Codec, format: VideoFormat) -> Result<Box<dyn Decoder>, CodecError> {
@@ -1698,6 +1736,12 @@ pub(crate) fn decode_loop(
     let mut decoded_size: Option<(u32, u32)> = None;
     while let Some(frame) = recv_or_stop(&rx, shared) {
         let now = Instant::now();
+        if control.is_some_and(DecodeControl::take_reopen) {
+            debug!("decodificador por software o no: se vuelve a abrir");
+            decoder = None;
+            opened_format = None;
+            unavailable = None;
+        }
         if control.is_some() {
             if last_id.is_some_and(|last| frame.frame_id != last.wrapping_add(1)) {
                 need_keyframe = true;
@@ -2290,6 +2334,34 @@ mod tests {
             (Codec::Av1, DecoderBackend::Software),
             (Codec::H264, DecoderBackend::Software),
         ])
+    }
+
+    /// «Por software» en marcha: solo quedan los de software, se pide volver a abrir y
+    /// renegociar; al quitarlo vuelven todos.
+    #[test]
+    fn the_software_decoder_switches_live() {
+        let control = DecodeControl::new(av1_set());
+        assert!(
+            control
+                .usable()
+                .available()
+                .contains(&(Codec::Av1, DecoderBackend::Vaapi))
+        );
+        control.set_software_only(true);
+        assert!(control.take_reopen());
+        assert!(control.take_renegotiation());
+        assert!(
+            control
+                .usable()
+                .available()
+                .iter()
+                .all(|(_, backend)| *backend == DecoderBackend::Software)
+        );
+        control.set_software_only(true);
+        assert!(!control.take_reopen(), "sin cambio no se reabre");
+        control.set_software_only(false);
+        assert!(control.take_reopen());
+        assert_eq!(control.usable().available().len(), 3);
     }
 
     /// Un decodificador que nunca saca imagen se deja por el siguiente del orden.

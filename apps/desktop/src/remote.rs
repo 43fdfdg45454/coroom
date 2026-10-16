@@ -1318,8 +1318,11 @@ pub fn start_guest(
     let mut config = remote_config(&options.net)?;
     config.accept_yuv444 = options.yuv444;
     config.accept_hdr = options.hdr;
+    // «Por software» se aplica en la sesión (se puede quitar en marcha); otro backend concreto
+    // (`--decoder`), aquí.
+    let software = options.decoder == Some(coroom_session::codec::DecoderBackend::Software);
     let decoders = DecoderSet::probe()
-        .only_backend(options.decoder)
+        .only_backend(options.decoder.filter(|_| !software))
         .with_output(output);
     if decoders.is_empty() {
         tracing::warn!(decoder = ?options.decoder, "sin decodificador");
@@ -1347,6 +1350,7 @@ pub fn start_guest(
     if let Some(audio) = guest_audio(&options.audio, options.net.headless) {
         session = session.with_guest_audio(audio);
     }
+    session.set_software_decoder(software);
     session
         .start()
         .map_err(|err| format!("no se pudo entrar en la sala: {err}"))?;

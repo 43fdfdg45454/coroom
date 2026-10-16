@@ -968,6 +968,10 @@ pub(crate) struct Core {
     pub(crate) host_input: Mutex<Option<Arc<input::HostInput>>>,
     /// Invitado: su entrada.
     pub(crate) guest_input: GuestInput,
+    /// Invitado: control del hilo `decode` (para decodificar por software en marcha).
+    pub(crate) decode: Mutex<Option<Arc<crate::loopback::DecodeControl>>>,
+    /// Invitado: decodificar solo por software desde el principio.
+    pub(crate) software_decoder: AtomicBool,
     /// Origen del reloj del anfitrión (el de todos sus `MediaSender`).
     pub(crate) clock_origin: Instant,
     /// Mandos y estado del audio.
@@ -1026,6 +1030,8 @@ impl Core {
             input_keys: Mutex::new(BTreeMap::new()),
             host_input: Mutex::new(None),
             guest_input: GuestInput::default(),
+            decode: Mutex::new(None),
+            software_decoder: AtomicBool::new(false),
             clock_origin: Instant::now(),
             audio: AudioControl::default(),
             audio_tx: Mutex::new(None),
@@ -1504,6 +1510,15 @@ impl RemoteSession {
             *audio = Some(guest_audio);
         }
         self
+    }
+
+    /// Invitado: decodificar solo por software (o volver a todos los decodificadores), antes de
+    /// arrancar o en marcha: el decodificador se vuelve a abrir enseguida, sin reconectar.
+    pub fn set_software_decoder(&self, on: bool) {
+        self.core.software_decoder.store(on, Ordering::Release);
+        if let Some(decode) = lock(&self.core.decode).as_ref() {
+            decode.set_software_only(on);
+        }
     }
 
     /// Mandos y estado del audio (silenciar, pulsar para hablar, quién habla).

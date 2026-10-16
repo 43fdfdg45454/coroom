@@ -541,7 +541,7 @@ pub enum Msg {
     ToggleGame,
     /// VSync de la ventana (ajuste de este equipo, al momento).
     SetVsync(bool),
-    /// Decodificar por software (se aplica al reconectar).
+    /// Decodificar por software (al momento).
     SoftwareDecoder(bool),
     /// Pantalla completa.
     ToggleFullscreen,
@@ -778,7 +778,9 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             } else {
                 DecoderChoice::Auto
             };
-            return app.settings_changed();
+            let mut effects = app.settings_changed();
+            effects.push(Effect::SetSoftwareDecoder(software));
+            return effects;
         }
         Msg::ToggleFullscreen => return vec![Effect::SetFullscreen(!fullscreen)],
         Msg::Leave => {
@@ -2332,24 +2334,10 @@ fn settings_tab<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
                     app.settings.video.decoder != DecoderChoice::Software,
                 ))),
             ),
-            row![
-                overlay_text(t!("room-decodificar-nota"))
-                    .size(type_size::CAPTION)
-                    .wrapping(Wrapping::WordOrGlyph)
-                    .width(Length::Fill),
-                button(
-                    text(t!("room-reconectar-ahora"))
-                        .size(type_size::CAPTION)
-                        .font(coroom_ui::font::SEMIBOLD)
-                        .class(TextClass::Custom(dark(app).accent_text.color()))
-                )
-                .padding(Padding::from([2.0, 6.0]))
-                .class(ButtonClass::Overlay { active: false })
-                .on_press(on(Msg::Reconnect)),
-            ]
-            .spacing(space::XS)
-            .align_y(Alignment::Center)
-            .into(),
+            overlay_text(t!("room-decodificar-nota"))
+                .size(type_size::CAPTION)
+                .wrapping(Wrapping::WordOrGlyph)
+                .into(),
         ],
     ));
 

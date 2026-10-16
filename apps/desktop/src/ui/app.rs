@@ -525,6 +525,8 @@ pub enum Effect {
         /// Ganancia.
         gain: f32,
     },
+    /// Invitado: decodificar solo por software (o no), en marcha.
+    SetSoftwareDecoder(bool),
     /// Anfitrión: ofrecer a un invitado pasarle la sala.
     OfferHandoff(GuestId),
     /// Invitado: contestar a la oferta de la sala (el código de la que ya abrió, o `None`).

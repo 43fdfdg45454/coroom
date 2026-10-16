@@ -91,6 +91,12 @@ pub(crate) fn start(
     }
     let decode =
         Arc::new(DecodeControl::new(decoders).accepting(config.accept_yuv444, config.accept_hdr));
+    if core.software_decoder.load(Ordering::Acquire) {
+        decode.set_software_only(true);
+        // Al arrancar no hay nada que volver a abrir ni que renegociar.
+        decode.take_pending();
+    }
+    *lock(&core.decode) = Some(Arc::clone(&decode));
     let (rcv_tx, rcv_rx) = bounded::<Compressed>(DECODE_QUEUE_CAPACITY);
     let (dec_tx, dec_rx) = bounded(CHANNEL_CAPACITY);
     let spawn_error = |err: crate::loopback::PipelineError| SessionError::Media(err.to_string());
