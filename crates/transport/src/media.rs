@@ -353,8 +353,10 @@ pub fn pacing_duration(
     spread.min(cap)
 }
 
-/// Intervalos que puede ocupar un fotograma repartido al techo de ráfaga ([`pacing_duration`]).
-pub const CAPPED_INTERVALS: f64 = 1.0;
+/// Intervalos que puede ocupar un fotograma repartido al techo de ráfaga ([`pacing_duration`]):
+/// nunca el intervalo entero, para que termine antes de que llegue el siguiente aunque una espera
+/// se retrase (si no, el retraso se acumula fotograma a fotograma).
+pub const CAPPED_INTERVALS: f64 = 0.85;
 
 /// Intervalos de un intra repartido al techo de ráfaga: un intra pesa decenas de fotogramas y,
 /// pasado el techo, el limitador lo tira entero (y se vuelve a pedir otro); mejor que tarde.

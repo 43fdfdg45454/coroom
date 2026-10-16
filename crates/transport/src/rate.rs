@@ -185,9 +185,10 @@ pub const BURST_HOLD: Duration = Duration::from_secs(1);
 /// Lo que sube el techo de ráfaga por paso sin pérdida.
 pub const BURST_GROW: f64 = 0.05;
 
-/// Parte del techo de ráfaga a la que se acota el objetivo: un fotograma medio cabe en el 80 % del
-/// intervalo y queda margen para la reparación y el audio.
-pub const BURST_TARGET_SHARE: f64 = 0.8;
+/// Parte del techo de ráfaga a la que se acota el objetivo: un fotograma medio sale al techo en el
+/// 70 % del intervalo, y queda margen para la reparación, el audio y lo que se retrase un
+/// temporizador (sin él, cada fotograma empezaría un poco más tarde que el anterior).
+pub const BURST_TARGET_SHARE: f64 = 0.7;
 
 /// Límites del bitrate objetivo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
