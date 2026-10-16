@@ -1138,3 +1138,106 @@ fn qa_live_resolution_fps() {
         failures.join("\n")
     );
 }
+
+/// Enlace con limitador (como la subida de muchos operadores): `QA_RATE_MBPS` (28 por defecto)
+/// que tira lo que sobra sin hacer cola, y una fuente con ruido que pide más de lo que cabe, a
+/// `QA_FPS` (60). Sin tope de bitrate, como en la aplicación. Imprime cada segundo los fps que
+/// presenta el invitado, los fotogramas que pierde y el objetivo del anfitrión, y al final cuánto
+/// tardó en asentarse (último segundo con pérdidas) y las pérdidas desde el segundo 5.
+#[test]
+#[ignore = "necesita GPU; QA manual"]
+fn qa_policed_link() {
+    let _serial = serial();
+    let mbps: u64 = std::env::var("QA_RATE_MBPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(28);
+    let fps: u32 = std::env::var("QA_FPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let seconds: u64 = std::env::var("QA_SECONDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40);
+    let server = TestServer::start();
+    let port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .and_then(|socket| socket.local_addr())
+        .expect("puerto libre")
+        .port();
+    let host_addr: std::net::SocketAddr = (std::net::Ipv4Addr::LOCALHOST, port).into();
+    let proxy = server
+        .runtime
+        .block_on(UdpLossy::start(
+            host_addr,
+            LossyConfig {
+                loss: 0.0,
+                delay: Duration::from_millis(5),
+                jitter: Duration::from_millis(1),
+                rate_bps: Some(mbps * 1_000_000),
+                queue_limit: Duration::from_millis(4),
+                seed: 5,
+                outages: None,
+            },
+        ))
+        .expect("proxy");
+    let mut host_config = server.config();
+    host_config.bind = Some(host_addr);
+    host_config.advertise_candidates = Some(vec![proxy.addr()]);
+    let mut host = RemoteSession::host(
+        host_config.identity,
+        host_config.config,
+        Box::new(common::NoisyCapturer::new(SyntheticCapturer::new(
+            1920, 1080, fps,
+        ))),
+        EncoderSet::probe(),
+        config(1920, 1080, fps, 500_000),
+        Arc::new(LatencyLedger::new()),
+    );
+    host.start().expect("anfitrión");
+    let code = room_code(&host).expect("sala");
+    let mut guest_config = server.config();
+    guest_config.advertise_candidates = Some(Vec::new());
+    let seen = Seen::default();
+    let mut viewer = guest(guest_config, &code, None, DecoderSet::probe(), &seen);
+    advance(&host, &viewer, &seen, 1, None, Duration::from_secs(30)).expect("primer fotograma");
+    let started = Instant::now();
+    let mut last_frames = seen.frames();
+    let mut last_drops = viewer.summary().drops_total;
+    let mut lossy_seconds = Vec::new();
+    let mut total_lost_after_5 = 0u64;
+    println!("QA enlace {mbps} Mbit/s con limitador, 1080p{fps} con ruido");
+    println!("QA  s   fps  perdidos  objetivo kbps  enlace kbps");
+    for second in 1..=seconds {
+        std::thread::sleep(
+            (started + Duration::from_secs(second)).saturating_duration_since(Instant::now()),
+        );
+        let frames = seen.frames();
+        let drops = viewer.summary().drops_total;
+        let status = host.guests();
+        let target = status.first().and_then(|s| s.target_kbps).unwrap_or(0);
+        let link = status.first().and_then(|s| s.link_kbps).unwrap_or(0);
+        let lost = drops.saturating_sub(last_drops);
+        println!(
+            "QA {second:3} {:5} {lost:9} {target:14} {link:12}",
+            frames - last_frames
+        );
+        if lost > 0 {
+            lossy_seconds.push(second);
+            if second > 5 {
+                total_lost_after_5 += lost;
+            }
+        }
+        last_frames = frames;
+        last_drops = drops;
+    }
+    let settled = lossy_seconds.last().map_or(0, |s| s + 1);
+    println!(
+        "QA asentado en el segundo {settled} · segundos con pérdidas: {} · perdidos desde el segundo 5: {total_lost_after_5} · {}",
+        lossy_seconds.len(),
+        line(&viewer.summary())
+    );
+    viewer.close();
+    host.close();
+    drop(proxy);
+}

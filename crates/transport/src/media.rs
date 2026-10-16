@@ -323,17 +323,27 @@ pub fn pacing_pace(
 /// medido del enlace, ver [`MediaSender::pacing_plan`]), como mucho [`PacingConfig::share`] de
 /// `interval`; un intra, [`PacingConfig::keyframe_intervals`] intervalos o, con `headroom` (el
 /// enlace midió [`KEYFRAME_HEADROOM`] veces ese ritmo), [`PacingConfig::keyframe_intervals_measured`].
+///
+/// Con `capped` (el ritmo es el techo de ráfaga del control de tasa: el enlace perdió al pasarlo),
+/// el reparto puede ocupar hasta [`CAPPED_INTERVALS`] intervalos (un intra,
+/// [`CAPPED_KEYFRAME_INTERVALS`]): comprimirlo en el 30 % del intervalo lo haría salir a unas tres
+/// veces el techo y el limitador del enlace volvería a tirarlo.
 pub fn pacing_duration(
     bytes: usize,
     pace_kbps: u32,
     interval: Duration,
     keyframe: bool,
     headroom: bool,
+    capped: bool,
     pacing: &PacingConfig,
 ) -> Duration {
     let rate_bps = f64::from(pace_kbps.max(1)) * 1000.0;
     let spread = Duration::from_secs_f64(bytes as f64 * 8.0 / rate_bps);
-    let cap = if keyframe && headroom {
+    let cap = if capped && keyframe {
+        interval.mul_f64(CAPPED_KEYFRAME_INTERVALS)
+    } else if capped {
+        interval.mul_f64(CAPPED_INTERVALS)
+    } else if keyframe && headroom {
         interval.mul_f64(pacing.keyframe_intervals_measured)
     } else if keyframe {
         interval.mul_f64(pacing.keyframe_intervals)
@@ -342,6 +352,13 @@ pub fn pacing_duration(
     };
     spread.min(cap)
 }
+
+/// Intervalos que puede ocupar un fotograma repartido al techo de ráfaga ([`pacing_duration`]).
+pub const CAPPED_INTERVALS: f64 = 1.0;
+
+/// Intervalos de un intra repartido al techo de ráfaga: un intra pesa decenas de fotogramas y,
+/// pasado el techo, el limitador lo tira entero (y se vuelve a pedir otro); mejor que tarde.
+pub const CAPPED_KEYFRAME_INTERVALS: f64 = 8.0;
 
 /// Lo que una espera del pacing puede adelantarse sin dormir aunque el retraso medido sea menor:
 /// los temporizadores de `tokio` van en pasos de 1 ms, así que una espera más corta que esto se
@@ -943,14 +960,42 @@ impl MediaSender {
     /// [`PacingConfig::keyframe_intervals`]. El objetivo ya lleva el máximo de
     /// [`MediaSender::set_max_kbps`]: bajarlo en marcha baja el ritmo mínimo del pacing al momento.
     pub fn pacing_plan(&self) -> (u32, bool) {
+        let (pace, headroom, _) = self.pacing_plan_capped();
+        (pace, headroom)
+    }
+
+    /// [`MediaSender::pacing_plan`] y si el ritmo es el techo de ráfaga del control de tasa
+    /// ([`RateController::burst_cap_kbps`]): entonces nunca se pasa de él ni hay holgura para los
+    /// intras. Informa al control de tasa del ritmo natural ([`RateController::note_pace`]).
+    fn pacing_plan_capped(&self) -> (u32, bool, bool) {
         let target = self.target_kbps();
-        let measured = self.state.lock().ok().and_then(|state| {
-            let limiting = state.limiting()?;
-            let probe = limiting.probe.and_then(|probe| probe.kbps());
-            Some((probe, limiting.rate.estimate_kbps()))
-        });
-        let (probe, estimate) = measured.unwrap_or((None, 0.0));
-        pacing_pace(target, probe, estimate, self.config.pacing.gain)
+        let Ok(mut state) = self.state.lock() else {
+            let (pace, headroom) = pacing_pace(target, None, 0.0, self.config.pacing.gain);
+            return (pace, headroom, false);
+        };
+        let limiting = state
+            .sources
+            .iter_mut()
+            .min_by_key(|source| source.rate.target_kbps());
+        let Some(limiting) = limiting else {
+            let (pace, headroom) = pacing_pace(target, None, 0.0, self.config.pacing.gain);
+            return (pace, headroom, false);
+        };
+        let probe = limiting.probe.and_then(|probe| probe.kbps());
+        let (pace, headroom) = pacing_pace(
+            target,
+            probe,
+            limiting.rate.estimate_kbps(),
+            self.config.pacing.gain,
+        );
+        // Sin techo, un fotograma medio sale en `share` del intervalo: a `target / share` si eso
+        // pasa del ritmo.
+        let natural = (f64::from(target) / self.config.pacing.share).max(f64::from(pace));
+        limiting.rate.note_pace(natural.round() as u32);
+        match limiting.rate.burst_cap_kbps() {
+            Some(cap) => (cap, false, true),
+            _ => (pace, headroom, false),
+        }
     }
 
     /// El ritmo de [`MediaSender::pacing_plan`].
@@ -1239,13 +1284,14 @@ impl MediaSender {
             repairs: repairs.len(),
             bytes,
         };
-        let (pace_kbps, headroom) = self.pacing_plan();
+        let (pace_kbps, headroom, capped) = self.pacing_plan_capped();
         let pacing = pacing_duration(
             report.bytes,
             pace_kbps,
             self.frame_interval(),
             keyframe,
             headroom,
+            capped,
             &self.config.pacing,
         );
         let all: Vec<Bytes> = sources.into_iter().chain(repairs).collect();
@@ -1296,13 +1342,14 @@ impl MediaSender {
             && let Ok(runtime) = runtime
         {
             let bytes = packets.iter().map(Bytes::len).sum();
-            let (pace_kbps, headroom) = self.pacing_plan();
+            let (pace_kbps, headroom, capped) = self.pacing_plan_capped();
             let pacing = pacing_duration(
                 bytes,
                 pace_kbps,
                 self.frame_interval(),
                 true,
                 headroom,
+                capped,
                 &self.config.pacing,
             );
             let conn = self.conn.clone();
@@ -2815,21 +2862,21 @@ mod tests {
     fn pacing_follows_the_measured_rate_and_the_share_of_the_interval() {
         let pacing = PacingConfig::default();
         // 40 KB a 70 Mbit/s: 4,6 ms, por debajo del 30 % de 16,7 ms.
-        let spread = pacing_duration(40_000, 70_000, INTERVAL, false, false, &pacing);
+        let spread = pacing_duration(40_000, 70_000, INTERVAL, false, false, false, &pacing);
         assert!((spread.as_micros() as i64 - 4_571).abs() < 20, "{spread:?}");
         // 40 KB a 10 Mbit/s: 32 ms, acotado al 30 % del intervalo.
         assert_eq!(
-            pacing_duration(40_000, 10_000, INTERVAL, false, false, &pacing),
+            pacing_duration(40_000, 10_000, INTERVAL, false, false, false, &pacing),
             INTERVAL.mul_f64(FRAME_PACING_SHARE)
         );
         // Un intra de 300 KB a 70 Mbit/s: 34 ms. Sin holgura medida, dos intervalos (lo que
         // tolera el receptor); con ella, uno.
         assert_eq!(
-            pacing_duration(300_000, 70_000, INTERVAL, true, false, &pacing),
+            pacing_duration(300_000, 70_000, INTERVAL, true, false, false, &pacing),
             INTERVAL * 2
         );
         assert_eq!(
-            pacing_duration(300_000, 70_000, INTERVAL, true, true, &pacing),
+            pacing_duration(300_000, 70_000, INTERVAL, true, true, false, &pacing),
             INTERVAL
         );
         // La parte es configurable (A/B con `coroom host`).
@@ -2839,11 +2886,11 @@ mod tests {
             ..pacing
         };
         assert_eq!(
-            pacing_duration(40_000, 10_000, INTERVAL, false, false, &wide),
+            pacing_duration(40_000, 10_000, INTERVAL, false, false, false, &wide),
             INTERVAL.mul_f64(0.8)
         );
         assert_eq!(
-            pacing_duration(300_000, 70_000, INTERVAL, true, false, &wide),
+            pacing_duration(300_000, 70_000, INTERVAL, true, false, false, &wide),
             INTERVAL.mul_f64(1.5)
         );
         // El receptor tolera hasta KEYFRAME_PACING_INTERVALS: el emisor nunca configura más.
@@ -2895,26 +2942,26 @@ mod tests {
         // al 30 % del intervalo (5 ms, lo medido); a 70 Mbit/s, 2,4 ms, por debajo del recorte.
         let interval_60 = INTERVAL;
         assert_eq!(
-            pacing_duration(21_000, 12_500, interval_60, false, false, &pacing),
+            pacing_duration(21_000, 12_500, interval_60, false, false, false, &pacing),
             interval_60.mul_f64(FRAME_PACING_SHARE)
         );
-        let spread = pacing_duration(21_000, 70_000, interval_60, false, false, &pacing);
+        let spread = pacing_duration(21_000, 70_000, interval_60, false, false, false, &pacing);
         assert!((spread.as_micros() as i64 - 2_400).abs() < 20, "{spread:?}");
         assert!(spread < interval_60.mul_f64(FRAME_PACING_SHARE));
         // 720p30 a 10 Mbit/s: ~42 KB por fotograma en un intervalo de 33 ms. A 12,5 Mbit/s,
         // 27 ms recortados al 30 % (10 ms, lo medido con el paquete 1.6.15); a 70 Mbit/s, 4,8 ms.
         let interval_30 = Duration::from_micros(33_333);
-        let clipped = pacing_duration(42_000, 12_500, interval_30, false, false, &pacing);
+        let clipped = pacing_duration(42_000, 12_500, interval_30, false, false, false, &pacing);
         assert_eq!(clipped, interval_30.mul_f64(FRAME_PACING_SHARE));
         assert!(
             (clipped.as_micros() as i64 - 10_000).abs() < 20,
             "{clipped:?}"
         );
-        let spread = pacing_duration(42_000, 70_000, interval_30, false, false, &pacing);
+        let spread = pacing_duration(42_000, 70_000, interval_30, false, false, false, &pacing);
         assert!((spread.as_micros() as i64 - 4_800).abs() < 20, "{spread:?}");
         // Un intra con holgura: si cabe en un intervalo al ritmo medido sale a ese ritmo (nunca
         // por encima del techo); si no cabe, en un intervalo, como antes.
-        let spread = pacing_duration(120_000, 70_000, interval_60, true, true, &pacing);
+        let spread = pacing_duration(120_000, 70_000, interval_60, true, true, false, &pacing);
         assert!(
             (spread.as_micros() as i64 - 13_714).abs() < 20,
             "{spread:?}"
@@ -2926,6 +2973,7 @@ mod tests {
                 interval_60,
                 true,
                 true,
+                false,
                 &pacing
             ),
             interval_60
@@ -3570,25 +3618,25 @@ mod tests {
         let interval = Duration::from_micros(8_333);
         let pacing = PacingConfig::default();
         // 2 KB a 20 Mbit/s: 0,8 ms.
-        let normal = pacing_duration(2_000, 20_000, interval, false, false, &pacing);
+        let normal = pacing_duration(2_000, 20_000, interval, false, false, false, &pacing);
         assert!((normal.as_secs_f64() - 0.0008).abs() < 1e-6, "{normal:?}");
         // 100 KB serían 40 ms: se recorta a la parte del intervalo.
         assert_eq!(
-            pacing_duration(100_000, 20_000, interval, false, false, &pacing),
+            pacing_duration(100_000, 20_000, interval, false, false, false, &pacing),
             interval.mul_f64(FRAME_PACING_SHARE)
         );
         // Un intra de 400 KB: dos intervalos (16,7 ms) en vez de los 4 ms de antes.
         assert_eq!(
-            pacing_duration(400_000, 20_000, interval, true, false, &pacing),
+            pacing_duration(400_000, 20_000, interval, true, false, false, &pacing),
             interval * 2
         );
         // Lo pequeño apenas espera; un ritmo de 0 no divide por cero.
         assert!(
-            pacing_duration(1_200, 80_000, interval, false, false, &pacing)
+            pacing_duration(1_200, 80_000, interval, false, false, false, &pacing)
                 < Duration::from_micros(150)
         );
         assert_eq!(
-            pacing_duration(1_200, 0, interval, false, false, &pacing),
+            pacing_duration(1_200, 0, interval, false, false, false, &pacing),
             interval.mul_f64(FRAME_PACING_SHARE)
         );
     }

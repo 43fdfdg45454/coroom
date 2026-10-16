@@ -36,6 +36,27 @@
 //! seguidos, cada ~40 min) y recortan sin esperar a la ventana: una cola grande, la de un intra que
 //! no cabe, se detecta en 100 ms y no en 500.
 //!
+//! **Techo de ráfaga** ([`RateController::burst_cap_kbps`]): un enlace con limitador (la subida de
+//! muchos operadores, algunos routers) tira lo que llega por encima de su capacidad sin hacer cola,
+//! así que el retardo no avisa y la pérdida que causa (2-10 %) quedaba en la franja que se tomaba
+//! por aleatoria: el objetivo no bajaba y se perdían fotogramas sin parar (se pedían intras, que
+//! volvían a desbordar). Y lo que desborda no es la media sino el ritmo al que sale cada fotograma
+//! (el pacing lo comprime hasta en el 30 % del intervalo: unas 3 veces la media). Con pérdida por
+//! encima de la mitad de [`LOSS_GROW`] y el objetivo en uso, el techo baja a lo que pasó del ritmo
+//! al que salían los fotogramas ([`RateController::note_pace`]), con un 5 % de margen y al menos a
+//! [`BURST_CUT`], cada [`BURST_HOLD`] mientras siga (la pérdida GCC espera a esa comprobación); el
+//! objetivo, a [`BURST_TARGET_SHARE`] del techo (que quepa en un intervalo); y el pacing reparte
+//! a ese techo aunque tarde más del 30 % del intervalo. Sin pérdida durante [`BURST_HOLD`] × 2 el
+//! techo sube un [`BURST_GROW`] cada [`BURST_HOLD`] y, cuando supera el ritmo natural con holgura,
+//! desaparece. Cada recorte se comprueba con lo que predice: si la pérdida `p` viene de desbordar
+//! el enlace, bajar el ritmo a una proporción `r` la deja en `1 − (1 − p) / r` (casi siempre en
+//! nada); si la pérdida de después del recorte queda más de un punto por encima de esa predicción
+//! [`BURST_CHECKS`] veces sin bajar ni subir de forma significativa (una sola puede ser un intra;
+//! si sube, son los intras que la pérdida hace pedir), no depende del ritmo (la de un wifi malo,
+//! que cubren la FEC y el `Nack`): el recorte se deshace y esa pérdida se anota como propia del
+//! enlace, que ya no recorta mientras no la pase con margen (el de una binomial: con pocos
+//! objetos por segundo, la medida es ruidosa) y se olvida despacio si el enlace mejora.
+//!
 //! La salida [`RateController::target_kbps`] lleva histéresis: si la variación es < 10 % no cambia
 //! más de una vez por segundo, para no reconfigurar el codificador a cada informe.
 //!
@@ -154,6 +175,20 @@ const MAX_LOSS_REPORTS: usize = 256;
 const OUTPUT_PERIOD: Duration = Duration::from_secs(1);
 const OUTPUT_STEP: f64 = 0.10;
 
+/// Cuánto baja el techo de ráfaga con cada recorte por pérdida (del ritmo al que salían).
+pub const BURST_CUT: f64 = 0.85;
+
+/// Tiempo mínimo entre recortes del techo de ráfaga (lo que tarda en verse el efecto en la ventana
+/// de pérdida) y paso de su subida.
+pub const BURST_HOLD: Duration = Duration::from_secs(1);
+
+/// Lo que sube el techo de ráfaga por paso sin pérdida.
+pub const BURST_GROW: f64 = 0.05;
+
+/// Parte del techo de ráfaga a la que se acota el objetivo: un fotograma medio cabe en el 80 % del
+/// intervalo y queda margen para la reparación y el audio.
+pub const BURST_TARGET_SHARE: f64 = 0.8;
+
 /// Límites del bitrate objetivo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RateConfig {
@@ -195,6 +230,36 @@ pub struct RateInput<'a> {
     pub sent_bytes: u64,
 }
 
+/// Un recorte del techo de ráfaga pendiente de comprobar ([`RateController`]).
+#[derive(Debug, Clone, Copy)]
+struct BurstCut {
+    /// Pérdida antes del recorte y objetos con que se midió.
+    loss: f64,
+    objects: u64,
+    /// Proporción del ritmo que deja el recorte (techo nuevo / ritmo de antes).
+    ratio: f64,
+    /// Objetos perdidos y enviados desde el recorte: lo que lo comprueba.
+    lost_since: f64,
+    sent_since: u64,
+}
+
+/// Lo que había antes de que los recortes del techo empezaran a fallar ([`RateController`]): a lo
+/// que se vuelve si la pérdida resulta propia del enlace.
+#[derive(Debug, Clone, Copy)]
+struct BurstSnapshot {
+    /// Objetos perdidos y enviados desde que empezó: la pérdida media de la serie.
+    lost: f64,
+    sent: u64,
+    cap: Option<f64>,
+    estimate: f64,
+    loss_estimate: f64,
+}
+
+/// Puntuación de comprobaciones de recorte fallidas (+1 cada fallo, −½ cada acierto) a la que la
+/// pérdida se da por propia del enlace: un fallo suelto puede ser un intra o la cola que aún se
+/// vacía, y una pérdida aleatoria pequeña a veces mide menos de un punto durante un segundo.
+pub const BURST_CHECKS: f64 = 2.0;
+
 /// Control de tasa tipo SCReAM del emisor.
 #[derive(Debug, Clone)]
 pub struct RateController {
@@ -222,6 +287,24 @@ pub struct RateController {
     last_loss_grow: Option<Instant>,
     /// Hasta cuándo no se crece tras un recorte ([`HOLD_AFTER_CUT`]).
     hold_until: Option<Instant>,
+    /// Techo de ráfaga en kbit/s (ver el módulo), si lo hay.
+    burst_cap: Option<f64>,
+    /// Ritmo natural del pacing (sin el techo) que informó el emisor, en kbit/s.
+    natural_pace: f64,
+    /// Último recorte del techo de ráfaga.
+    burst_cut_at: Option<Instant>,
+    /// Último paso de subida del techo.
+    burst_grow_at: Option<Instant>,
+    /// El último recorte del techo, para comprobarlo: la pérdida de antes y lo que había antes
+    /// (techo y estimaciones), por si hay que deshacerlo.
+    last_cut: Option<BurstCut>,
+    /// Puntuación de fallos ([`BURST_CHECKS`]) y lo que había cuando empezó a subir.
+    burst_failures: f64,
+    burst_snapshot: Option<BurstSnapshot>,
+    /// Objetos que cubre la pérdida de la ventana ([`RateController::loss`]).
+    loss_objects: u64,
+    /// Pérdida propia del enlace (aleatoria, no depende del ritmo), que no recorta.
+    inherent_loss: f64,
 }
 
 impl RateController {
@@ -252,6 +335,164 @@ impl RateController {
             last_loss_cut: None,
             last_loss_grow: None,
             hold_until: None,
+            burst_cap: None,
+            natural_pace: 0.0,
+            burst_cut_at: None,
+            burst_grow_at: None,
+            last_cut: None,
+            burst_failures: 0.0,
+            burst_snapshot: None,
+            loss_objects: 0,
+            inherent_loss: 0.0,
+        }
+    }
+
+    /// El emisor informa del ritmo natural de su pacing (sin el techo de ráfaga), en kbit/s: es la
+    /// referencia del primer recorte del techo.
+    pub fn note_pace(&mut self, kbps: u32) {
+        self.natural_pace = f64::from(kbps);
+    }
+
+    /// Techo de ráfaga en kbit/s, si el enlace ha mostrado pérdida por desbordarlo (ver el módulo).
+    pub fn burst_cap_kbps(&self) -> Option<u32> {
+        self.burst_cap.map(|cap| cap.round().max(1.0) as u32)
+    }
+
+    /// Pérdida propia del enlace que se ha dado por aleatoria (0..1).
+    pub fn inherent_loss(&self) -> f64 {
+        self.inherent_loss
+    }
+
+    /// Techo de ráfaga: recorta mientras haya pérdida que depende del ritmo, deshace el recorte que
+    /// no la baja y lo sube sin ella.
+    fn update_burst(&mut self, now: Instant, utilized: bool) {
+        let since = |at: Option<Instant>| at.map(|at| now.saturating_duration_since(at));
+        if since(self.burst_cut_at).is_some_and(|elapsed| elapsed < BURST_HOLD) {
+            return;
+        }
+        // Tras un recorte cuenta solo la pérdida de después: la de la ventana aún arrastra la de
+        // antes.
+        let (loss, objects) = match &self.last_cut {
+            Some(cut) if cut.sent_since > 0 => {
+                (cut.lost_since / cut.sent_since as f64, cut.sent_since)
+            }
+            _ => (self.loss, self.loss_objects),
+        };
+        // Lo que pasa de la pérdida propia del enlace, menos el ruido de medirla con `objects`
+        // objetos (dos desviaciones típicas de una binomial): con pocos objetos por segundo, una
+        // pérdida aleatoria del 2 % mide un 4 % muchos segundos.
+        let noise =
+            2.0 * (self.inherent_loss * (1.0 - self.inherent_loss) / objects.max(1) as f64).sqrt();
+        let excess = loss - self.inherent_loss - noise;
+        // Basta la mitad de [`LOSS_GROW`]: entre el 1 y el 2 % GCC aún sube el objetivo, y un
+        // limitador que tira un 1-2 % de los paquetes tira varios fotogramas por segundo.
+        let cut_at = LOSS_GROW / 2.0;
+        if excess > cut_at && utilized {
+            if let Some(cut) = self.last_cut.take() {
+                // Cumple si la pérdida se fue (lo que predice desbordar el enlace, casi siempre
+                // nada, más un punto) o si bajó de forma significativa (más de dos desviaciones
+                // típicas de la diferencia de dos proporciones: un recorte que aún no basta).
+                let predicted = (1.0 - (1.0 - cut.loss) / cut.ratio).max(0.0);
+                let pooled = (cut.loss + loss) / 2.0;
+                let spread = 2.0
+                    * (pooled
+                        * (1.0 - pooled)
+                        * (1.0 / cut.objects.max(1) as f64 + 1.0 / objects.max(1) as f64))
+                        .sqrt();
+                let dropped = cut.loss - loss > spread;
+                // Si subió no es aleatoria (esa no cambia): son los intras que la propia pérdida
+                // hace pedir, o el contenido que pesa más. Ni cumple ni falla: se recorta otra vez.
+                let rose = loss - cut.loss > spread;
+                if excess > predicted + LOSS_GROW / 2.0 && !dropped && !rose {
+                    self.burst_failures += 1.0;
+                    if self.burst_failures >= BURST_CHECKS {
+                        // La de toda la serie: la de un segundo es ruidosa.
+                        let mean = self
+                            .burst_snapshot
+                            .map_or(loss, |snapshot| snapshot.lost / snapshot.sent.max(1) as f64);
+                        self.inherent_loss = self.inherent_loss.max(mean.max(loss).min(LOSS_CUT));
+                        if let Some(snapshot) = self.burst_snapshot.take() {
+                            self.burst_cap = snapshot.cap;
+                            self.estimate = self.estimate.max(snapshot.estimate);
+                            self.loss_estimate = self.loss_estimate.max(snapshot.loss_estimate);
+                        }
+                        self.burst_failures = 0.0;
+                        self.burst_cut_at = Some(now);
+                        return;
+                    }
+                } else {
+                    self.note_burst_success();
+                }
+            }
+            if self.burst_snapshot.is_none() {
+                self.burst_snapshot = Some(BurstSnapshot {
+                    lost: 0.0,
+                    sent: 0,
+                    cap: self.burst_cap,
+                    estimate: self.estimate,
+                    loss_estimate: self.loss_estimate,
+                });
+            }
+            let natural = if self.natural_pace > 0.0 {
+                self.natural_pace
+            } else {
+                self.estimate.min(self.loss_estimate) / BURST_TARGET_SHARE
+            };
+            let base = self.burst_cap.map_or(natural, |cap| cap.min(natural));
+            // Lo que pasó del ritmo de antes es lo que cabe: el recorte va hasta ahí (con un 5 %
+            // de margen), y al menos un [`BURST_CUT`].
+            let ratio = BURST_CUT.min((1.0 - loss) * 0.95);
+            let floor = f64::from(self.config.min_kbps) / BURST_TARGET_SHARE;
+            let cap = (base * ratio).max(floor);
+            self.last_cut = Some(BurstCut {
+                loss,
+                objects,
+                ratio: (cap / base).min(1.0),
+                lost_since: 0.0,
+                sent_since: 0,
+            });
+            self.burst_cap = Some(cap);
+            self.loss_estimate = self.loss_estimate.min(cap * BURST_TARGET_SHARE);
+            self.estimate = self.estimate.min(cap * BURST_TARGET_SHARE);
+            self.burst_cut_at = Some(now);
+            self.burst_grow_at = Some(now);
+            return;
+        }
+        if excess > LOSS_GROW / 2.0 {
+            return;
+        }
+        // La pérdida se fue: el último recorte cumplió. La propia del enlace se olvida despacio
+        // (media vida de unos 17 s) si ahora pierde menos de la mitad (un wifi que mejora).
+        if self.last_cut.take().is_some() {
+            self.note_burst_success();
+        }
+        if loss < self.inherent_loss / 2.0 {
+            self.inherent_loss = self.inherent_loss * 0.998 + loss * 0.002;
+        }
+        let Some(cap) = self.burst_cap else {
+            return;
+        };
+        // Sin pérdida: tras dos esperas, sube un paso por espera; muy por encima del ritmo natural,
+        // ya no hace falta.
+        if since(self.burst_cut_at).is_some_and(|elapsed| elapsed < BURST_HOLD * 2)
+            || since(self.burst_grow_at).is_some_and(|elapsed| elapsed < BURST_HOLD)
+        {
+            return;
+        }
+        let grown = cap * (1.0 + BURST_GROW);
+        self.burst_grow_at = Some(now);
+        self.burst_cap = if self.natural_pace > 0.0 && grown >= self.natural_pace * 1.5 {
+            None
+        } else {
+            Some(grown)
+        };
+    }
+
+    /// Un recorte que bajó la pérdida: resta medio fallo y, sin fallos, olvida la instantánea.
+    fn note_burst_success(&mut self) {
+        self.burst_failures = (self.burst_failures - 0.5).max(0.0);
+        if self.burst_failures == 0.0 {
+            self.burst_snapshot = None;
         }
     }
 
@@ -367,10 +608,15 @@ impl RateController {
         let utilized = |target: f64| rates.is_none_or(|(sent, _)| sent >= UTILIZATION * target);
         // Lo más alto a lo que se puede subir `from`: [`DELIVERED_HEADROOM`] veces lo recibido, sin
         // bajar por ello de donde está.
+        let burst_limit = self
+            .burst_cap
+            .map_or(f64::INFINITY, |cap| cap * BURST_TARGET_SHARE);
         let grow_cap = |from: f64| {
-            delivered.map_or(f64::INFINITY, |delivered| {
-                (delivered * DELIVERED_HEADROOM).max(from)
-            })
+            delivered
+                .map_or(f64::INFINITY, |delivered| {
+                    (delivered * DELIVERED_HEADROOM).max(from)
+                })
+                .min(burst_limit.max(from))
         };
         let held = self.hold_until.is_some_and(|until| now < until);
 
@@ -407,9 +653,17 @@ impl RateController {
             }
             self.last_adjust = Some(now);
         }
+        // El techo de ráfaga va antes: mientras comprueba un recorte suyo, la pérdida de antes del
+        // recorte no vuelve a recortar.
+        let in_use = utilized(self.estimate.min(self.loss_estimate));
+        self.update_burst(now, in_use);
+        let burst_pending = self.last_cut.is_some()
+            && self
+                .burst_cut_at
+                .is_some_and(|at| now.saturating_duration_since(at) < BURST_HOLD);
         // Pérdida (GCC): por encima del 10 %, recorte desde el objetivo actual; por debajo del
         // 2 %, crece; entre medias se mantiene (y manda la estimación por retardo).
-        if self.loss > LOSS_CUT {
+        if self.loss > LOSS_CUT && !burst_pending {
             if due(self.last_loss_cut, LOSS_PERIOD) {
                 let current = self.estimate.min(self.loss_estimate);
                 self.loss_estimate = current * (1.0 - 0.5 * self.loss);
@@ -434,6 +688,14 @@ impl RateController {
         if sent > 0 {
             let lost = fraction.clamp(0.0, 1.0) * sent as f64;
             self.loss_window.push_back((now, lost, sent));
+            if let Some(cut) = &mut self.last_cut {
+                cut.lost_since += lost;
+                cut.sent_since += sent;
+            }
+            if let Some(snapshot) = &mut self.burst_snapshot {
+                snapshot.lost += lost;
+                snapshot.sent += sent;
+            }
         }
         // Un informe cada 50 ms son 20 en la ventana; la cota es solo contra un par que inunde.
         while self.loss_window.len() > MAX_LOSS_REPORTS {
@@ -453,6 +715,7 @@ impl RateController {
         if sent > 0 {
             self.loss = lost / sent as f64;
         }
+        self.loss_objects = sent;
     }
 
     fn update_throughput(&mut self, now: Instant, received: u64, sent: u64) {
@@ -950,6 +1213,56 @@ mod tests {
         let rates = run(&mut controller, start, 0..40, |_| 15, 0.20);
         assert!(*rates.last().expect("muestras") < 7_000, "{rates:?}");
         assert!(rates.iter().all(|&rate| rate >= 500));
+    }
+
+    /// Un enlace con policía (sin cola, 10 Mbit/s) y un emisor que manda cada fotograma en un 30 %
+    /// del intervalo (ráfagas a 3,3× la media): el techo de ráfaga baja hasta que las ráfagas caben,
+    /// la pérdida desaparece en un segundo y el bitrate se queda cerca de lo que cabe.
+    #[test]
+    fn policed_link_converges_with_the_burst_cap() {
+        let start = Instant::now();
+        let mut controller = RateController::new(RateConfig {
+            min_kbps: 500,
+            max_kbps: 50_000,
+            start_kbps: 6_000,
+        });
+        let link = 10_000.0;
+        let mut target = 6_000;
+        let mut lost_after_5s = 0.0;
+        for tick in 0..400u32 {
+            let natural = f64::from(target) / 0.3;
+            controller.note_pace(natural as u32);
+            let pace = controller
+                .burst_cap_kbps()
+                .map_or(natural, |cap| natural.min(f64::from(cap)));
+            let loss = (1.0 - link / pace).max(0.0);
+            // Lo enviado en 50 ms sigue al objetivo; lo recibido, lo que deja la pérdida.
+            let sent = target * 50 / 8;
+            target = controller.update(
+                start + TICK * tick,
+                RateInput {
+                    owd_us: &[20_000],
+                    loss_fraction: loss,
+                    sent_objects: 10,
+                    ecn_ce: 0,
+                    received_bytes: (f64::from(sent) * (1.0 - loss)) as u64,
+                    sent_bytes: u64::from(sent),
+                },
+            );
+            if tick >= 100 {
+                lost_after_5s += loss;
+            }
+        }
+        // Tras 5 s solo pierde al tantear (el techo sube un 5 % y vuelve a recortar): menos del
+        // 1 % de media.
+        let mean = lost_after_5s / 300.0;
+        assert!(mean < 0.01, "pérdida media tras 5 s: {mean:.4}");
+        assert!(controller.burst_cap_kbps().is_some());
+        assert!(
+            (5_000..=10_000).contains(&target),
+            "bitrate final {target} con un enlace de 10 Mbit/s"
+        );
+        assert!(controller.inherent_loss() < 0.01);
     }
 
     /// Matriz de red: con la pérdida aleatoria y el jitter de los perfiles `media`
