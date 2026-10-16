@@ -431,9 +431,19 @@ mod tests {
         // cola de los 90 encolados antes, unos 70 ms.
         let elapsed = start.elapsed();
         assert!(elapsed >= Duration::from_millis(65), "{elapsed:?}");
-        assert!(played.windows(2).all(|w| w[1] - w[0] == FRAME_DURATION));
+        // Cada trama suena al menos una trama después de la anterior; si el hilo se atrasó tanto
+        // que la cola se vació (subdesbordamiento), la siguiente empieza más tarde, nunca antes.
+        assert!(
+            played.windows(2).all(|w| w[1] - w[0] >= FRAME_DURATION),
+            "{played:?}"
+        );
         assert!(played[0] >= start + Duration::from_millis(10));
         let recording = lock(&recording).clone();
+        coroom_testkit::timing_assert!(
+            played.windows(2).all(|w| w[1] - w[0] == FRAME_DURATION),
+            "las tramas no quedaron seguidas ({} subdesbordamientos): {played:?}",
+            recording.underruns
+        );
         assert_eq!(recording.samples.len(), 4_800);
         assert_eq!(recording.longest_silence(-40.0, true), 1);
         assert_eq!(recording.frame_levels().len(), 10);
