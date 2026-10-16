@@ -173,6 +173,7 @@ host-sin-microfono-en-la-sala = No compartes el micrófono en esta sala (Ajustes
 host-te-has-silenciado = Te has silenciado: nadie te oye.
 host-tu-voz-ayuda = El deslizador es lo alto que te oyen los demás.
 host-activar-tu-microfono = Activar tu micrófono
+host-silenciar-tu-microfono = Silenciar tu micrófono
 host-silenciarte = Silenciarte para toda la sala
 host-mas = Más
 host-modo-solo-voz = Solo voz

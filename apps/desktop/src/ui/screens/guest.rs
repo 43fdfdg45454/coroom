@@ -2042,7 +2042,7 @@ fn people_section<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
 }
 
 /// La voz propia: lo alto que te oyen los demás (de 0 a 200 % de 5 en 5; Ctrl+clic, 100 %), con
-/// el altavoz que te silencia para todos delante. Sin voz (sin micrófono o sin permiso), por qué.
+/// el micrófono que te silencia para todos delante. Sin voz (sin micrófono o sin permiso), por qué.
 fn own_volume_row<'a>(app: &App, state: &State) -> Element<'a, Message> {
     let stats = state.stats.as_ref();
     let voice = stats.is_some_and(|s| s.voice || s.mic_muted);
@@ -2060,7 +2060,7 @@ fn own_volume_row<'a>(app: &App, state: &State) -> Element<'a, Message> {
         5,
         DEFAULT_VOICE_VOLUME,
         Some(bar_button(
-            if muted { Icon::VolumeOff } else { Icon::Volume },
+            if muted { Icon::MicOff } else { Icon::Mic },
             if muted {
                 t!("room-activar-tu-microfono")
             } else {

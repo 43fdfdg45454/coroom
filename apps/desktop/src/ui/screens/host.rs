@@ -3077,13 +3077,14 @@ fn member_name<'a>(name: String, tags: Vec<Element<'a, Message>>) -> Element<'a,
 fn member_volume<'a>(
     percent: u8,
     muted: bool,
+    (icon, muted_icon): (Icon, Icon),
     speaker_tip: String,
     on_speaker: Message,
     on_change: impl Fn(u8) -> Message + 'a,
     on_release: Message,
 ) -> Element<'a, Message> {
     let speaker = ui::icon_button(
-        if muted { Icon::VolumeOff } else { Icon::Volume },
+        if muted { muted_icon } else { icon },
         speaker_tip,
         Some(on_speaker),
     );
@@ -3107,7 +3108,7 @@ fn member_volume<'a>(
 }
 
 /// Fila propia del anfitrión en «Integrantes»: el deslizador es lo alto que le oyen los demás y
-/// el altavoz le silencia para toda la sala.
+/// el micrófono de delante le silencia para toda la sala.
 fn own_row<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
     let name = app
         .account
@@ -3122,7 +3123,7 @@ fn own_row<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
     } else {
         t!("host-tu-voz-ayuda")
     };
-    let line = row![
+    let mut line = row![
         ui::avatar(&app.theme, &name, size::AVATAR),
         column![
             member_name(
@@ -3136,12 +3137,28 @@ fn own_row<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
     ]
     .spacing(space::S)
     .align_y(Alignment::Center);
+    // Silenciarse a la vista, donde los invitados tienen «Más»: el botón del deslizador hace lo
+    // mismo, pero solo con el icono se confundía con el volumen.
+    if voice.enabled {
+        let muted = voice.mic_muted;
+        line = line.push(ui::button_with(
+            Kind::Normal,
+            if muted {
+                t!("host-activar-tu-microfono")
+            } else {
+                t!("host-silenciar-tu-microfono")
+            },
+            Some(if muted { Icon::MicOff } else { Icon::Mic }),
+            Some(on(Msg::SelfMute(!muted))),
+        ));
+    }
     let mut card = column![line].spacing(space::XS);
     if voice.enabled {
         let muted = voice.mic_muted;
         card = card.push(member_volume(
             app.settings.audio.mic_volume,
             muted,
+            (Icon::Mic, Icon::MicOff),
             if muted {
                 t!("host-activar-tu-microfono").to_owned()
             } else {
@@ -3218,6 +3235,7 @@ fn guest_row<'a>(app: &'a App, room: &'a Room, status: &'a GuestStatus) -> Eleme
         member_volume(
             room.volume(id),
             muted,
+            (Icon::Volume, Icon::VolumeOff),
             if muted {
                 t!("host-volver-a-oir", name = status.name.as_str())
             } else {

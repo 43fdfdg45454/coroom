@@ -181,6 +181,10 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **Silenciar tu micrófono como anfitrión, a la vista**: tu fila en «Integrantes» tiene ahora el
+  botón «Silenciar tu micrófono» / «Activar tu micrófono», y el botón del deslizador de tu voz (en
+  la sala y como invitado) es un micrófono: antes era un altavoz y parecía el volumen.
+
 - Los fps y el bitrate que ve el invitado (barra de la sala, «Conexión», diagnóstico) se medían
   sobre los últimos 4096 fotogramas: al bajar de 120 a 30 fps seguía marcando unos 70 y bajaba
   durante minutos. Ahora son los del último segundo; el cambio de fps ya se aplicaba al momento.
