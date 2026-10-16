@@ -1325,8 +1325,7 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
             match app.host.takeover {
                 Takeover::Withdrawn => {
                     // El anfitrión retiró la oferta mientras se abría: se cierra y se sigue en
-                    // la suya.
-                    app.host.takeover = Takeover::None;
+                    // la suya (`Withdrawn` se queda hasta `HostEnded`, que cierra sin avisos).
                     app.host.stopping = true;
                     effects.push(Effect::StopHost);
                     return effects;
@@ -1444,6 +1443,25 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
         }
         Event::HostEnded(reason) => {
             let was_open = app.host.room.take().is_some();
+            // La sala que se abría para recibir la de otro y que este retiró: ya se avisó al
+            // retirarla, y se sigue de invitado en la suya (sin sala de espera).
+            if std::mem::take(&mut app.host.takeover) == Takeover::Withdrawn {
+                let host = &mut app.host;
+                host.join_requests.clear();
+                host.shared = None;
+                host.switching = None;
+                host.starting = false;
+                host.stopping = false;
+                host.changing_source = false;
+                if app.page == Page::Host {
+                    app.page = Page::Home;
+                }
+                return if app.guest.is_none() && app.account.is_some() {
+                    vec![Effect::StartLobby]
+                } else {
+                    Vec::new()
+                };
+            }
             let host = &mut app.host;
             host.join_requests.clear();
             host.shared = None;
@@ -3802,6 +3820,13 @@ pub(crate) mod shots {
         }),
         ("09-sala-cambiar-fuente", host_room_switch),
         ("09-sala-peticion-de-entrada", host_room_join_request),
+        ("09-sala-pasando", |app| {
+            host_room(app);
+            let first = app.host.room.as_ref().and_then(|room| room.guests.first());
+            if let Some((guest, name)) = first.map(|status| (status.guest, status.name.clone())) {
+                super::offer_handoff(app, guest, name);
+            }
+        }),
         ("10-dejar-de-compartir", host_stop_dialog),
     ];
 }

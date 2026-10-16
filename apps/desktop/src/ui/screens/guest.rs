@@ -1106,6 +1106,8 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
                 Takeover::Withdrawn => host.takeover = Takeover::Withdrawn,
                 Takeover::Opening | Takeover::Replied(_) => {
                     changed = true;
+                    // Se cierra sin el aviso de «Has dejado de compartir» (`HostEnded`).
+                    host.takeover = Takeover::Withdrawn;
                     if !host.stopping {
                         host.stopping = true;
                         effects.push(Effect::StopHost);
@@ -3473,6 +3475,13 @@ mod tests {
         let effects = app.update(Message::Event(Event::Guest(SessionEvent::HandoffCancelled)));
         assert_eq!(effects, [Effect::StopHost]);
         assert!(app.guest.as_ref().is_some_and(|guest| !guest.leaving));
+        // Al cerrarse, ni «Has dejado de compartir» ni sala de espera: se sigue de invitado.
+        app.toasts.clear();
+        let effects = app.update(Message::Event(Event::HostEnded(None)));
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(app.toasts.is_empty(), "{:?}", app.toasts);
+        assert_eq!(app.host.takeover, Takeover::None);
+        assert!(app.guest.is_some());
     }
 
     /// Quien estaba callado sigue callado en la sala nueva (cada sesión empieza con el micrófono
