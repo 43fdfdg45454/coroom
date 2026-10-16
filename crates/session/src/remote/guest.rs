@@ -846,7 +846,9 @@ async fn run_guest(
                         | Command::GamepadOutput { .. }
                         | Command::Video(_)
                         | Command::Chat(_)
-                        | Command::ChatClear,
+                        | Command::ChatClear
+                        | Command::OfferHandoff(_)
+                        | Command::MoveToRoom { .. },
                     ) => {}
                 },
                 Some(end) = disconnected.recv() => match end {
@@ -1257,6 +1259,16 @@ async fn control_loop(
             ),
             Some(ControlMessage::VoicePermission { allowed }) => {
                 core.audio.set_voice_allowed(allowed);
+            }
+            Some(ControlMessage::HandoffOffer) => core.emit(SessionEvent::HandoffOffered),
+            Some(ControlMessage::MoveToRoom { code, host_name })
+                if coroom_transport::proto::signal::is_valid_room_code(&code) =>
+            {
+                core.emit(SessionEvent::MoveToRoom { code, host_name });
+            }
+            Some(ControlMessage::Sharing { active }) => {
+                debug!(active, "el anfitrión comparte algo o ya no");
+                core.emit(SessionEvent::Sharing(active));
             }
             Some(ControlMessage::VoiceState { guest, speaking }) => {
                 core.audio.set_talker(guest, speaking);

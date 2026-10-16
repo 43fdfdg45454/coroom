@@ -250,6 +250,8 @@ pub enum Event {
     Doctor(Vec<String>),
     /// Micrófonos y salidas.
     AudioDevices(Result<Vec<AudioDevice>, String>),
+    /// Anfitrión: los invitados ya saben a qué sala ir (el código), o por qué no.
+    HandedOver(Result<String, String>),
     /// Prueba del micrófono: el nivel (0-1, el pico de los últimos 50 ms) o por qué paró.
     MicLevel(Result<f32, String>),
     /// Anfitrión: la sala está arrancando (con su vista previa) o no pudo.
@@ -523,6 +525,20 @@ pub enum Effect {
         /// Ganancia.
         gain: f32,
     },
+    /// Anfitrión: ofrecer a un invitado pasarle la sala.
+    OfferHandoff(GuestId),
+    /// Invitado: contestar a la oferta de la sala (el código de la que ya abrió, o `None`).
+    ReplyHandoff(Option<String>),
+    /// Anfitrión: mandar a los demás a la sala `code` del anfitrión nuevo (`except`) y, después,
+    /// avisar con [`Event::HandedOver`].
+    HandOver {
+        /// Código de la sala nueva.
+        code: String,
+        /// Nombre del anfitrión nuevo.
+        host_name: String,
+        /// El anfitrión nuevo.
+        except: GuestId,
+    },
     /// Cambiar de micrófono (`input`) o de salida en la sala abierta, sin reconectar
     /// (`None`: el del sistema).
     SwitchAudioDevice {
@@ -647,6 +663,18 @@ pub enum Dialog {
         title: String,
         /// Explicación.
         text: String,
+    },
+    /// Anfitrión: pasar la sala a un invitado.
+    OfferHandoff {
+        /// Invitado.
+        guest: GuestId,
+        /// Nombre.
+        name: String,
+    },
+    /// Invitado: el anfitrión le pasa la sala.
+    HandoffOffered {
+        /// Nombre del anfitrión.
+        host: String,
     },
     /// Número de seguridad de un par.
     SafetyNumber {
@@ -1230,6 +1258,8 @@ impl App {
                 effects
             }
             Dialog::RevokeDevice { device, .. } => vec![Effect::RevokeDevice(device)],
+            Dialog::OfferHandoff { guest, name } => host::offer_handoff(self, guest, name),
+            Dialog::HandoffOffered { .. } => host::accept_handoff(self),
             Dialog::SessionEnded { .. } => guest::close(self),
             Dialog::SafetyNumber { .. } => Vec::new(),
         }
@@ -1369,6 +1399,7 @@ impl App {
             | Event::HostGuests(..)
             | Event::PreviewUnavailable
             | Event::HostEnded(_)
+            | Event::HandedOver(_)
             | Event::SourceSwitched(_)
             | Event::VideoChanged(_) => {
                 // El chat y el diagnóstico miran los eventos de la sesión antes que la pantalla
@@ -1708,6 +1739,24 @@ impl App {
                 t!("app-ese-dispositivo-queda-desvinculado-de-tu").to_owned(),
                 vec![fill(), cancel(), confirm(t!("app-cerrar-sesion"), true)],
             ),
+            Dialog::OfferHandoff { name, .. } => (
+                t!("app-pasar-la-sala-a-name", name = name),
+                t!("app-pasar-la-sala-texto", name = name),
+                vec![fill(), cancel(), confirm(t!("app-pasar-la-sala"), false)],
+            ),
+            Dialog::HandoffOffered { host } => (
+                t!("app-name-te-pasa-la-sala", name = host),
+                t!("app-te-pasa-la-sala-texto").to_owned(),
+                vec![
+                    fill(),
+                    ui::normal(
+                        t!("app-ahora-no"),
+                        Some(Message::Guest(guest::Msg::DeclineHandoff)),
+                    )
+                    .into(),
+                    confirm(t!("app-abrir-mi-sala"), false),
+                ],
+            ),
             Dialog::SessionEnded { title, text } => (
                 title.clone(),
                 text.clone(),
@@ -1770,6 +1819,23 @@ pub fn quality_tone(level: QualityLevel) -> Tone {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Una cuenta de ejemplo con sesión iniciada.
+    pub(crate) fn account() -> AccountInfo {
+        AccountInfo {
+            server: ServerEntry {
+                url: "https://coroom.example.com".to_owned(),
+                fingerprint: None,
+                tcp_port: None,
+                username: None,
+            },
+            username: "ana".into(),
+            display_name: "Ana".into(),
+            user_id: 1,
+            device: "pc".into(),
+            fingerprint: String::new(),
+        }
+    }
 
     pub(crate) fn app() -> App {
         App::new(

@@ -32,6 +32,8 @@ pub enum Source {
     Synthetic,
     /// Pantalla real: portal `ScreenCast` en Linux, monitor principal en Windows.
     Screen,
+    /// Nada: una sala solo de voz y chat (solo para `coroom host`; la prueba necesita vídeo).
+    Nothing,
 }
 
 impl Source {
@@ -40,6 +42,7 @@ impl Source {
         match self {
             Source::Synthetic => "sintética",
             Source::Screen => "pantalla",
+            Source::Nothing => "nada (solo voz y chat)",
         }
     }
 }
@@ -361,6 +364,7 @@ pub fn make_capturer(options: &ProbeOptions) -> Result<Box<dyn Capturer>, String
             crate::portal::restore_token_sink(capture::ShareKind::Screen),
         )
         .map_err(|err| format!("no se puede capturar la pantalla: {err}")),
+        Source::Nothing => Ok(Box::new(capture::idle::IdleCapturer::new())),
     }
 }
 

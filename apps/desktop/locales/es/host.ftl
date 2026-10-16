@@ -76,7 +76,7 @@ host-no-se-pudo-cambiar-el-video = No se pudo cambiar el vídeo de la sala: { $e
 ## Avanzado
 
 host-avanzado = Avanzado
-host-avanzado-plegado = Resolución, fps, códec, tope de bitrate, croma 4:4:4 y HDR
+host-avanzado-plegado = Resolución, fps, códec, croma 4:4:4 y HDR (el bitrate es automático)
 host-avanzado-desplegado = Cambiar algo aquí convierte el modo en «Personalizado»
 host-avanzado-sin-cambios = { $perfil }, sin cambios
 host-resolucion-maxima = Resolución máxima
@@ -180,6 +180,21 @@ host-tu-voz-ayuda = El deslizador es lo alto que te oyen los demás.
 host-activar-tu-microfono = Activar tu micrófono
 host-silenciarte = Silenciarte para toda la sala
 host-mas = Más
+host-modo-solo-voz = Solo voz
+host-solo-voz-ayuda = La sala se abre sin compartir nada: voz y chat. Desde la sala puedes compartir la pantalla o una ventana cuando quieras.
+host-solo-voz-detalle = Nadie verá tu pantalla: los invitados verán «Nadie está compartiendo».
+host-no-compartes-nada = No compartes nada
+host-no-compartes-nada-detalle = La sala es de voz y chat. Tus invitados ven «Nadie está compartiendo».
+host-compartir-pantalla-o-ventana = Compartir pantalla o ventana
+host-solo-voz-y-chat = Solo voz y chat
+host-dejar-de-compartir = Dejar de compartir
+host-pasarle-la-sala = Pasarle la sala
+host-esperando-a-que-acepte = Esperando a que { $name } acepte la sala…
+host-pasando-la-sala-a = Pasando la sala a { $name }: todos entráis en la suya.
+host-name-no-acepto-la-sala = { $name } no aceptó la sala.
+host-no-se-pudo-pasar-la-sala = No se pudo pasar la sala: { $error }
+host-solo-tu-voz = Solo tu voz: sin nada compartido no hay audio del juego.
+host-ya-no-compartes-nada = Ya no compartes nada: la sala sigue con voz y chat.
 host-tu-microfono = Tu micrófono
 host-donde-oyes-la-sala = Dónde oyes la sala
 host-cambia-al-momento = Cambia al momento, sin cortar a nadie.
@@ -229,5 +244,5 @@ host-name-ha-salido-de-la-sala = { $name } ha salido de la sala
 host-name-ha-sido-expulsado-las-claves = { $name } ha sido expulsado; las claves de la sala se han rotado
 host-el-invitado = El invitado { $valor }
 host-la-sala-se-cerro-reason = La sala se cerró: { $reason }
-host-has-dejado-de-compartir = Has dejado de compartir
+host-has-dejado-de-compartir = Has cerrado la sala
 

@@ -99,6 +99,7 @@ diagnostics-sonda-hacia-invitado = tú → invitado, antes del vídeo
 diagnostics-sonda-perdidos = { $lost } de { $sent } datagramas perdidos
 diagnostics-bitrate = Bitrate objetivo / real
 diagnostics-bitrate-objetivo = Bitrate objetivo
+diagnostics-bitrate-lo-limita-el-enlace = Sin tope: lo limita solo el enlace (sube mientras llegue todo y baja si se pierde)
 diagnostics-bitrate-valor = { $target } / { $real } Mbit/s
 diagnostics-entrada = Entrada (ratón → juego)
 diagnostics-entrada-detalle = p50 / p95, captura → inyectado

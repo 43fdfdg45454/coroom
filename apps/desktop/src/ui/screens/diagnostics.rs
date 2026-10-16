@@ -651,7 +651,7 @@ fn guest_metrics(app: &App) -> Vec<Metric> {
         probe_metric(side.route.probe, None, t!("diagnostics-sonda-hacia-ti")),
         Metric {
             label: t!("diagnostics-bitrate"),
-            detail: None,
+            detail: Some(t!("diagnostics-bitrate-lo-limita-el-enlace").to_owned()),
             value: match (link, summary) {
                 (Some(link), Some(summary)) => t!(
                     "diagnostics-bitrate-valor",
@@ -701,7 +701,7 @@ fn host_guest_metrics(status: &GuestStatus, route: Option<&Route>) -> Vec<Metric
         ),
         Metric {
             label: t!("diagnostics-bitrate-objetivo"),
-            detail: None,
+            detail: Some(t!("diagnostics-bitrate-lo-limita-el-enlace").to_owned()),
             value: status
                 .target_kbps
                 .map_or_else(|| "—".to_owned(), |kbps| stats::kbps(f64::from(kbps))),

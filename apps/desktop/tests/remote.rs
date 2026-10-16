@@ -1422,3 +1422,163 @@ fn o_guests_learn_who_is_in_the_room() {
     host.close();
     drop(server);
 }
+
+/// Espera el siguiente `Sharing` del anfitrión.
+fn wait_sharing(events: &crossbeam_channel::Receiver<SessionEvent>) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if let Ok(SessionEvent::Sharing(active)) = events.recv_timeout(Duration::from_millis(100)) {
+            return active;
+        }
+    }
+    panic!("no llegó si el anfitrión comparte algo");
+}
+
+/// (q) Una sala solo de voz y chat: el invitado entra sin vídeo y sabe que nadie comparte; el
+/// anfitrión empieza a compartir con la sala abierta y el vídeo llega; deja de compartir y no se
+/// vuelve a enviar nada, ni siquiera el último fotograma cuando un invitado nuevo pide un intra.
+#[test]
+fn q_a_room_without_sharing_and_stopping_sharing() {
+    use coroom_session::capture::idle::IdleCapturer;
+    let _serial = serial();
+    let server = TestServer::start();
+    let account = server.config();
+    let mut host = RemoteSession::host(
+        account.identity,
+        account.config,
+        Box::new(IdleCapturer::new()),
+        EncoderSet::openh264(),
+        video(None),
+        Arc::new(LatencyLedger::new()),
+    );
+    host.start().expect("arranque del anfitrión");
+    let code = room_code(&host);
+    let mut first = guest(server.config(), &code, None);
+    let events = first.events();
+    assert!(!wait_sharing(&events), "la sala se abrió sin compartir");
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(first.summary().frames_presented, 0, "sin vídeo");
+    assert_eq!(host.video_counters().encoded, 0, "nada que codificar");
+    // Empieza a compartir con la sala abierta.
+    host.switch_capture(Box::new(SyntheticCapturer::new(640, 360, FPS)), None)
+        .expect("compartir");
+    assert!(wait_sharing(&events), "ahora comparte");
+    wait_until("el vídeo", Duration::from_secs(10), || {
+        first.summary().frames_presented >= FPS.into()
+    });
+    // Deja de compartir: no llega nada más.
+    host.switch_capture(Box::new(IdleCapturer::new()), None)
+        .expect("dejar de compartir");
+    assert!(!wait_sharing(&events), "ya no comparte");
+    std::thread::sleep(Duration::from_millis(500));
+    let encoded = host.video_counters().encoded;
+    // Quien entra ahora pide un intra: no debe recibir la pantalla de antes.
+    let mut late = guest(server.config(), &code, None);
+    let late_events = late.events();
+    assert!(
+        !wait_sharing(&late_events),
+        "el que llega sabe que nadie comparte"
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    println!(
+        "anfitrión: {:?}; el que llegó tarde presentó {}",
+        host.video_counters(),
+        late.summary().frames_presented
+    );
+    assert_eq!(late.summary().frames_presented, 0, "ni el último fotograma");
+    assert_eq!(
+        host.video_counters().encoded,
+        encoded,
+        "ni se codifica nada"
+    );
+    late.close();
+    first.close();
+    host.close();
+    drop(server);
+}
+
+/// (r) Pasar el anfitrión: A ofrece la sala a B, B abre la suya (solo voz) y contesta con el
+/// código, A manda a C allí y entra él también; en la sala de B están A y C.
+#[test]
+fn r_the_host_hands_the_room_over() {
+    use coroom_session::capture::idle::IdleCapturer;
+    let _serial = serial();
+    let server = TestServer::start();
+    let mut a = host(server.config());
+    let a_events = a.events();
+    let code = room_code(&a);
+    let mut b = guest(server.config(), &code, None);
+    let b_events = b.events();
+    let mut c = guest(server.config(), &code, None);
+    let c_events = c.events();
+    wait_until("los dos invitados", Duration::from_secs(15), || {
+        a.guests().iter().filter(|g| g.path.is_some()).count() == 2
+    });
+    let b_id = a
+        .guests()
+        .iter()
+        .find(|status| status.fingerprint == b.fingerprint())
+        .map(|status| status.guest)
+        .expect("B");
+    a.offer_handoff(b_id).expect("ofrecer");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "B no recibió la oferta");
+        if let Ok(SessionEvent::HandoffOffered) = b_events.recv_timeout(Duration::from_millis(100))
+        {
+            break;
+        }
+    }
+    // B acepta: abre su sala (solo voz) y contesta con el código.
+    let b_account = server.config();
+    let mut new_host = RemoteSession::host(
+        b_account.identity,
+        b_account.config,
+        Box::new(IdleCapturer::new()),
+        EncoderSet::openh264(),
+        video(None),
+        Arc::new(LatencyLedger::new()),
+    );
+    new_host.start().expect("sala de B");
+    let new_code = room_code(&new_host);
+    b.reply_handoff(Some(new_code.clone())).expect("contestar");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let reply = loop {
+        assert!(Instant::now() < deadline, "A no recibió la respuesta");
+        if let Ok(SessionEvent::HandoffReply { guest, code }) =
+            a_events.recv_timeout(Duration::from_millis(100))
+        {
+            break (guest, code);
+        }
+    };
+    assert_eq!(reply, (b_id, Some(new_code.clone())));
+    a.move_to_room(&new_code, "Bea", b_id).expect("mover");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let moved = loop {
+        assert!(Instant::now() < deadline, "C no recibió el cambio de sala");
+        if let Ok(SessionEvent::MoveToRoom { code, host_name }) =
+            c_events.recv_timeout(Duration::from_millis(100))
+        {
+            break (code, host_name);
+        }
+    };
+    assert_eq!(moved, (new_code.clone(), "Bea".to_owned()));
+    // Todos se pasan: C y A entran en la sala de B; la de A se cierra.
+    c.close();
+    b.close();
+    a.close();
+    let mut c2 = guest(server.config(), &new_code, None);
+    let mut a2 = guest(server.config(), &new_code, None);
+    wait_until("A y C en la sala de B", Duration::from_secs(15), || {
+        new_host
+            .guests()
+            .iter()
+            .filter(|g| g.path.is_some())
+            .count()
+            == 2
+    });
+    c2.close();
+    a2.close();
+    new_host.close();
+    drop(server);
+}

@@ -1051,7 +1051,9 @@ pub fn share_source(
     match source {
         Source::Screen => coroom_session::capture::share_capturer(share, on_token)
             .map_err(|err| format!("no se puede capturar la pantalla: {err}")),
-        Source::Synthetic => Ok((make_capturer(&ProbeOptions::h264(source, video))?, None)),
+        Source::Synthetic | Source::Nothing => {
+            Ok((make_capturer(&ProbeOptions::h264(source, video))?, None))
+        }
     }
 }
 

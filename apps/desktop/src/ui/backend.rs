@@ -408,6 +408,38 @@ impl Backend {
                     audio.set_voice_gain(source, gain);
                 }
             }
+            Effect::OfferHandoff(guest) => {
+                if let Some(session) = lock(&self.host).clone()
+                    && let Err(err) = lock(&session).offer_handoff(guest)
+                {
+                    (self.notify)(Message::Event(Event::HandedOver(Err(err.to_string()))));
+                }
+            }
+            Effect::ReplyHandoff(code) => {
+                if let Some(run) = lock(&self.guest).as_ref()
+                    && let Err(err) = lock(&run.session).reply_handoff(code)
+                {
+                    tracing::warn!(error = %err, "no se pudo contestar a la sala");
+                }
+            }
+            Effect::HandOver {
+                code,
+                host_name,
+                except,
+            } => {
+                let Some(session) = lock(&self.host).clone() else {
+                    return;
+                };
+                self.spawn("pasar-sala", move |notify| {
+                    let result = lock(&session)
+                        .move_to_room(&code, &host_name, except)
+                        .map(|()| code)
+                        .map_err(|err| err.to_string());
+                    // Tiempo para que el aviso salga antes de cerrar la sala.
+                    thread::sleep(HANDOVER_GRACE);
+                    notify(Message::Event(Event::HandedOver(result)));
+                });
+            }
             Effect::SetMicMuted { host, muted } => {
                 if let Some(audio) = self.room_audio(host) {
                     audio.set_mic_muted(muted);
@@ -1313,6 +1345,10 @@ fn close_within<T: Send + 'static>(
     result
 }
 
+/// Tras mandar a los invitados a la sala nueva, lo que se espera antes de cerrar esta: el aviso va
+/// por el stream de control, delante del cierre, pero sin esperar a que salga se perdería.
+const HANDOVER_GRACE: Duration = Duration::from_millis(600);
+
 /// Cada cuánto llega el nivel de la prueba del micrófono a la pantalla.
 const MIC_LEVEL_PERIOD: Duration = Duration::from_millis(50);
 
@@ -1518,7 +1554,7 @@ fn net_options(options: &AccountOptions, settings: &Settings) -> NetOptions {
 /// Monitores o ventanas y aplicaciones que suenan, para el paso 1 del anfitrión.
 fn share_options(source: SourceChoice) -> ShareOptions {
     let (targets, targets_error) = match source {
-        SourceChoice::Synthetic => (Vec::new(), None),
+        SourceChoice::Synthetic | SourceChoice::Nothing => (Vec::new(), None),
         SourceChoice::Screen | SourceChoice::App => {
             match coroom_session::capture::share_targets(source.kind()) {
                 Ok(targets) => (targets, None),
@@ -1779,6 +1815,7 @@ fn host_source(source: SourceChoice) -> Source {
     match source {
         SourceChoice::Screen | SourceChoice::App => Source::Screen,
         SourceChoice::Synthetic => Source::Synthetic,
+        SourceChoice::Nothing => Source::Nothing,
     }
 }
 

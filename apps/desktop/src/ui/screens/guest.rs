@@ -188,6 +188,11 @@ pub struct State {
     /// Cuándo cambió por última vez el nivel de la latencia (a pantalla completa, la píldora se
     /// enseña un momento).
     pub level_changed_at: Option<Instant>,
+    /// Si el anfitrión comparte algo (`None`: aún no lo ha dicho; un anfitrión anterior a la
+    /// versión 14 del protocolo nunca lo dice y siempre comparte).
+    pub host_sharing: Option<bool>,
+    /// La sala pasó a otro anfitrión: al terminar esta sesión, se entra en la de este código.
+    pub moving_to: Option<String>,
 }
 
 /// Ventana en la que se cuentan los errores de decodificación.
@@ -264,7 +269,14 @@ impl State {
             decode_window: None,
             corrupt_notice_at: None,
             level_changed_at: None,
+            host_sharing: None,
+            moving_to: None,
         }
+    }
+
+    /// Si el anfitrión dijo que no comparte nada (la sala es solo de voz y chat).
+    pub fn nothing_shared(&self) -> bool {
+        self.host_sharing == Some(false)
     }
 
     /// Si hay algo animándose a cada refresco: solo la entrada de la barra. Los pasos de la
@@ -340,6 +352,11 @@ impl State {
     /// Pasa el tiempo.
     pub fn tick(&mut self, now: Instant) {
         self.now = now;
+        // Sin nada compartido no llegará vídeo: se entra en cuanto el anfitrión lo dice.
+        if self.phase == Phase::Connecting && self.nothing_shared() {
+            self.phase = Phase::Video;
+            self.reveal_bar(now);
+        }
         if self.phase == Phase::Connecting
             && self.feed.has_frame()
             && self
@@ -530,6 +547,8 @@ pub enum Msg {
     ToggleFullscreen,
     /// Salir (pide confirmación).
     Leave,
+    /// No aceptar la sala que pasa el anfitrión.
+    DeclineHandoff,
     /// Cancelar mientras conecta.
     Cancel,
     /// Reintentar la conexión ya.
@@ -606,7 +625,12 @@ pub fn close(app: &mut App) -> Vec<Effect> {
         effects.push(Effect::Quit);
         return effects;
     }
-    if app.account.is_some() {
+    if app.host.room.is_some() {
+        // Se salió para quedarse con la sala propia (pasó el anfitrión): a Compartir, sin la sala
+        // de espera (la sala lleva su señalización).
+        app.screen = Screen::Main;
+        app.page = Page::Host;
+    } else if app.account.is_some() {
         app.screen = Screen::Main;
         app.page = Page::Home;
         effects.push(Effect::StartLobby);
@@ -764,6 +788,10 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             app.dialog = Some(Dialog::Leave);
         }
         Msg::Cancel => return leave(app),
+        Msg::DeclineHandoff => {
+            app.dialog = None;
+            return vec![Effect::ReplyHandoff(None)];
+        }
         Msg::Reconnect => return vec![Effect::Reconnect],
         Msg::Safety => {
             if let (Some(name), Some(number)) = (&state.host_name, &state.safety_number) {
@@ -915,6 +943,13 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
             let Some(state) = app.guest.as_ref() else {
                 return Vec::new();
             };
+            if let Some(code) = state.moving_to.clone() {
+                // La sala pasó a otro anfitrión: de esta a la suya, sin pasar por Inicio.
+                if let Some(old) = app.guest.take() {
+                    old.feed.close();
+                }
+                return start(app, code);
+            }
             match reason {
                 None if state.leaving || state.probe => return close(app),
                 None => {
@@ -1012,6 +1047,39 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
             );
         }
         SessionEvent::Warning(message) => app.toast(Tone::Warning, message),
+        SessionEvent::HandoffOffered => {
+            let host = state
+                .host_name
+                .clone()
+                .unwrap_or_else(|| t!("room-el-anfitrion").to_owned());
+            app.dialog = Some(Dialog::HandoffOffered { host });
+        }
+        SessionEvent::MoveToRoom { code, host_name } => {
+            if state.moving_to.is_none() && !state.leaving {
+                state.moving_to = Some(code);
+                app.toast(
+                    Tone::Info,
+                    t!("room-la-sala-pasa-a", name = host_name.as_str()),
+                );
+                return leave(app);
+            }
+        }
+        SessionEvent::Sharing(active) => {
+            let changed = state.host_sharing.is_some_and(|before| before != active);
+            state.host_sharing = Some(active);
+            let now = app.now;
+            state.tick(now);
+            if changed {
+                app.toast(
+                    Tone::Info,
+                    if active {
+                        t!("room-el-anfitrion-comparte")
+                    } else {
+                        t!("room-el-anfitrion-dejo-de-compartir")
+                    },
+                );
+            }
+        }
         SessionEvent::Members(members) => {
             // Quien ya no está deja de contar como silenciado ni conserva su volumen (su hoja
             // puede volver a usarse).
@@ -1537,6 +1605,33 @@ fn top_bar<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
 
 /// La píldora de latencia: un clic abre el panel en «Conexión»; el tramo «Relay · motivo», el
 /// diagnóstico.
+/// Lo que se ve en lugar del vídeo cuando el anfitrión no comparte nada.
+fn nothing_shared_view(state: &State) -> Element<'_, Message> {
+    let host = state
+        .host_name
+        .as_deref()
+        .map_or_else(|| t!("room-el-anfitrion").to_owned(), str::to_owned);
+    center(
+        column![
+            icon_with(Icon::Monitor, 48.0, SvgClass::Overlay),
+            text(t!("room-nadie-esta-compartiendo"))
+                .size(type_size::TITLE)
+                .font(coroom_ui::font::SEMIBOLD)
+                .class(TextClass::Overlay),
+            overlay_text(t!(
+                "room-nadie-esta-compartiendo-detalle",
+                host = host.as_str()
+            ))
+            .wrapping(Wrapping::WordOrGlyph)
+            .align_x(Horizontal::Center),
+        ]
+        .spacing(space::S)
+        .align_x(Alignment::Center)
+        .max_width(420.0),
+    )
+    .into()
+}
+
 /// Los demás que hablan ahora, por sus nombres (uno mismo no: ya lo sabe).
 pub fn talking_names(state: &State) -> Vec<&str> {
     let Some(audio) = state
@@ -2462,14 +2557,22 @@ fn side_panel<'a>(app: &'a App, state: &'a State, tab: Tab) -> Element<'a, Messa
 fn video<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     // Con compositor el vídeo va debajo de la interfaz: la base queda transparente; sin él (las
     // capturas) el fondo negro de las bandas lo pone el contenedor.
-    let base = container(video_view(&state.feed))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .class(if state.feed.is_composited() {
-            ContainerClass::Transparent
-        } else {
-            ContainerClass::Video
-        });
+    let base = if state.nothing_shared() {
+        // Ni el último fotograma: el anfitrión dejó de compartir.
+        container(nothing_shared_view(state))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .class(ContainerClass::Video)
+    } else {
+        container(video_view(&state.feed))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .class(if state.feed.is_composited() {
+                ContainerClass::Transparent
+            } else {
+                ContainerClass::Video
+            })
+    };
     let mut layers: Vec<Element<'a, Message>> = vec![base.into()];
     let now = app.now;
     let bar_visible = state.bar_visible(now);
@@ -2925,6 +3028,11 @@ pub(crate) mod shots {
         ("14-chat", guest_chat),
         ("14-burbujas", guest_bubbles),
         ("13-video-hablando", guest_talking),
+        ("13-nadie-comparte", |app| {
+            joined(app, true, false);
+            app.update(Message::Event(Event::Guest(SessionEvent::Sharing(false))));
+            app.update(Message::Tick);
+        }),
         ("14-sala", guest_room),
         ("14-ajustes", guest_settings),
         ("15-reconectando", guest_reconnecting),
@@ -3133,6 +3241,72 @@ mod tests {
             state.pill_visible(app.now, true),
             "y vuelve al mover el ratón"
         );
+    }
+
+    /// El anfitrión pasa la sala a este invitado: acepta, abre la suya solo con voz y, con el
+    /// código, contesta y sale de la del anfitrión hacia Compartir.
+    #[test]
+    fn accepting_the_room_opens_a_voice_room_and_answers_with_its_code() {
+        let mut app = watching();
+        app.account = Some(crate::ui::app::tests::account());
+        app.update(Message::Event(Event::Guest(SessionEvent::Joined {
+            host_name: "Bea".to_owned(),
+            host_fingerprint: "b7".repeat(32),
+            safety_number: crate::ui::shots::safety(),
+        })));
+        app.update(Message::Event(Event::Guest(SessionEvent::HandoffOffered)));
+        assert!(matches!(&app.dialog, Some(Dialog::HandoffOffered { host }) if host == "Bea"));
+        let effects = app.update(Message::ConfirmDialog);
+        let [Effect::StartHost(request)] = effects.as_slice() else {
+            panic!("{effects:?}");
+        };
+        assert_eq!(
+            request.source,
+            crate::ui::screens::host::SourceChoice::Nothing
+        );
+        assert_eq!(request.audio, coroom_session::audio::GameCapture::None);
+        app.update(Message::Event(Event::HostStarted(
+            Ok(VideoFeed::detached()),
+        )));
+        let effects = app.update(Message::Event(Event::Host(SessionEvent::RoomCreated {
+            code: "NEWRM2".into(),
+            fingerprint: "ab".repeat(32),
+        })));
+        assert!(
+            effects.contains(&Effect::ReplyHandoff(Some("NEWRM2".into()))),
+            "{effects:?}"
+        );
+        assert!(effects.contains(&Effect::Leave), "{effects:?}");
+        let effects = app.update(Message::Event(Event::GuestEnded(None)));
+        assert!(!effects.contains(&Effect::StartLobby), "{effects:?}");
+        assert_eq!((app.screen, app.page), (Screen::Main, Page::Host));
+    }
+
+    /// No aceptar contesta que no y cierra el diálogo.
+    #[test]
+    fn declining_the_room_answers_no() {
+        let mut app = watching();
+        app.update(Message::Event(Event::Guest(SessionEvent::HandoffOffered)));
+        assert_eq!(
+            app.update(Message::Guest(Msg::DeclineHandoff)),
+            [Effect::ReplyHandoff(None)]
+        );
+        assert!(app.dialog.is_none());
+    }
+
+    /// La sala pasa a otro: se sale de esta y se entra en la suya sin pasar por Inicio.
+    #[test]
+    fn moving_to_the_new_host_joins_its_room() {
+        let mut app = watching();
+        let effects = app.update(Message::Event(Event::Guest(SessionEvent::MoveToRoom {
+            code: "NEWRM2".into(),
+            host_name: "Carla".into(),
+        })));
+        assert!(effects.contains(&Effect::Leave), "{effects:?}");
+        let effects = app.update(Message::Event(Event::GuestEnded(None)));
+        assert_eq!(effects, [Effect::StopLobby, Effect::Join("NEWRM2".into())]);
+        assert_eq!(app.guest.as_ref().map(|g| g.code.as_str()), Some("NEWRM2"));
+        assert_eq!(app.screen, Screen::Guest);
     }
 
     #[test]

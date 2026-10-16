@@ -9,6 +9,28 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Añadido
 
+- **Salas solo de voz y «Dejar de compartir»** (protocolo 14; hay que actualizar también el
+  servidor): en Compartir, «Solo voz» abre la sala sin compartir nada; dentro, «Compartir pantalla
+  o ventana» empieza y «Dejar de compartir» para sin cerrarla. Los invitados ven «Nadie está
+  compartiendo» y no reciben ni la última imagen (tampoco quien entra después y pide un intra).
+  `coroom host --source none` abre una así.
+- **Pasar la sala a otro** (protocolo 14): «Pasarle la sala» en el menú de un invitado; si acepta,
+  abre una sala solo de voz, contesta con su código y todos (el anfitrión de antes también)
+  entran en ella sin escribirlo.
+- **Integrantes**: una sola lista en la sala, igual para anfitrión e invitado (primero tú, después
+  el anfitrión y los demás), con quién habla. En las filas ajenas el deslizador es lo alto que se
+  oye a esa persona aquí y su altavoz la silencia solo aquí (tachado y con la barra apagada); en
+  la propia, lo alto que te oyen y el altavoz te silencia para todos. Los permisos, el número de
+  seguridad, pasar la sala y expulsar van en el menú «Más» de cada invitado.
+- **Quién habla**, arriba a la izquierda del vídeo del invitado (Ajustes → Sala, activado).
+- **Volumen de tu voz** (lo que se envía), recordado, y **micrófono y salida que cambian con la
+  sala abierta**, sin reconectar: desde la sala, el panel del invitado o Ajustes.
+- **Probar el micrófono** en Ajustes → Audio y voz: el nivel y, con «Oírte», tu voz por la salida.
+- La pestaña **Ajustes** del panel del invitado: VSync, decodificar por software (se aplica al
+  reconectar), micrófono y salida, volumen del juego y el mando; «Conexión» queda solo con datos.
+- El texto del chat se copia: botón al pasar por encima de un mensaje o botón derecho.
+- **«Predeterminado del sistema (…)»** en los selectores de audio, con el dispositivo que es.
+
 - Volumen del audio del juego en el invitado, aparte del de cada participante (0-200 %, recordado):
   deslizador «Volumen del juego» encima de «Personas en la sala», con el botón de silenciarlo
   delante.
@@ -154,6 +176,16 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
   pantalla muestra lo elegido y al empezar se repite sin volver a preguntar.
 
 ### Corregido
+
+- Los micrófonos de Windows salían todos como «Micrófono»: ahora con su nombre (el producto).
+- Cambiar la resolución con la sala abierta dejaba la imagen del invitado corrupta hasta cambiar de
+  códec con algunos decodificadores por hardware: el decodificador se vuelve a abrir al cambiar el
+  tamaño del vídeo.
+- **Tirones en enlaces con limitador** (tiran lo que sobra sin hacer cola) y al empezar cada
+  sesión: el control de tasa tomaba esa pérdida por aleatoria y no bajaba, y el pacing mandaba
+  cada fotograma a unas tres veces la media. Ahora lleva un techo de ráfaga con AIMD que se
+  comprueba con lo que predice y el pacing no lo pasa. Con 28 Mbit/s y limitador, de 95
+  fotogramas perdidos tras los primeros 5 s a unos 10 (60 y 120 fps), con más bitrate.
 
 - **La sala ya no se cierra cuando el codificador elegido no lee las imágenes de la captura.**
   Al abrir la sala, la captura entregaba lo que importa el primer codificador de GPU de la lista
@@ -443,6 +475,12 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 - La aplicación escribe sus logs en stderr (`RUST_LOG` elige el nivel; por defecto, avisos).
 
 ### Cambiado
+
+- **El bitrate ya no tiene tope** en ninguna parte (ni en Compartir ni en `coroom host`, que pierde
+  `--bitrate-kbps`): lo negocia el control de tasa de cada invitado con su enlace, y Diagnóstico
+  dice que el límite es el enlace. Su mínimo baja a 0,5 Mbit/s para no inundar un enlace lento.
+- El diálogo de cerrar la sala dice «¿Cerrar la sala?» (antes «¿Dejar de compartir?», que ahora es
+  otra cosa).
 
 - En «Personas en la sala» del invitado, el icono de altavoz delante del deslizador de cada
   persona es el botón de dejar de oírla o volver a oírla («Silenciar» / «Activar sonido»); el

@@ -303,7 +303,7 @@ struct HostArgs {
     #[command(flatten)]
     net: NetArgs,
 
-    /// Fuente de vídeo: `screen` (por defecto) o `synthetic`.
+    /// Fuente de vídeo: `screen` (por defecto), `synthetic` o `none` (sala solo de voz y chat).
     #[arg(
         long,
         value_enum,
@@ -312,7 +312,7 @@ struct HostArgs {
         hide_possible_values = true,
         value_name = "FUENTE"
     )]
-    source: SourceArg,
+    source: HostSourceArg,
 
     /// Ancho en píxeles (por defecto 1920).
     #[arg(long, default_value_t = 1920, hide_default_value = true, value_name = "PÍXELES",
@@ -615,8 +615,9 @@ impl HostArgs {
         Ok(HostOptions {
             net: self.net.options(self.headless),
             source: match self.source {
-                SourceArg::Synthetic => Source::Synthetic,
-                SourceArg::Screen => Source::Screen,
+                HostSourceArg::Synthetic => Source::Synthetic,
+                HostSourceArg::Screen => Source::Screen,
+                HostSourceArg::None => Source::Nothing,
             },
             share: coroom_session::capture::ShareChoice::default(),
             video: LoopbackConfig {
@@ -690,6 +691,17 @@ enum SourceArg {
     Synthetic,
     /// Pantalla real (portal en Linux, monitor principal en Windows).
     Screen,
+}
+
+/// Fuente de vídeo de `coroom host`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum HostSourceArg {
+    /// Patrón sintético en movimiento.
+    Synthetic,
+    /// Pantalla real (portal en Linux, monitor principal en Windows).
+    Screen,
+    /// Nada: la sala es solo de voz y chat.
+    None,
 }
 
 #[derive(Debug, Args)]

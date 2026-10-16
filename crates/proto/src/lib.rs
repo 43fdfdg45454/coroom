@@ -41,8 +41,9 @@ pub mod video;
 /// época MLS: el relay los reenvía sin poder leerlos); la 13, el *keepalive* de la entrada: el
 /// invitado repite su estado cada [`input::KEEPALIVE_PRESSED`] mientras tiene algo pulsado (y cada
 /// [`input::KEEPALIVE_IDLE`] si no) y el anfitrión suelta lo de quien lleva [`input::STALE_AFTER`]
-/// sin mandar nada.
-pub const PROTOCOL_VERSION: u16 = 13;
+/// sin mandar nada; la 14, las salas sin compartir (`Sharing`): solo voz y chat, o tras «Dejar de
+/// compartir».
+pub const PROTOCOL_VERSION: u16 = 14;
 
 /// Identificadores ALPN (RFC 7301) que el socket QUIC usa para demultiplexar conexiones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

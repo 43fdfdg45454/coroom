@@ -32,6 +32,12 @@
 //! (`coroom_crypto::chat`): el relay, que reenvía el stream de control, solo ve la época, la hoja
 //! que sella, el contador y el tamaño. El texto en claro es un [`ChatEntry`] (o una lista, en el
 //! historial) codificado con `postcard`.
+//!
+//! Desde la versión 14 el anfitrión dice si comparte algo ([`ControlMessage::Sharing`]): una sala
+//! puede abrirse solo con voz y chat, y quien comparte puede dejar de hacerlo sin cerrarla. Y el
+//! anfitrión puede pasar a otro: se lo ofrece ([`ControlMessage::HandoffOffer`]), el invitado
+//! abre su sala y contesta con el código ([`ControlMessage::HandoffReply`]) y el anfitrión manda
+//! a los demás a ella ([`ControlMessage::MoveToRoom`]).
 
 use serde::{Deserialize, Serialize};
 
@@ -496,6 +502,29 @@ pub enum ControlMessage {
     /// Anfitrión → invitados: el chat se ha vaciado para todos (texto en claro vacío; va sellado
     /// para que nadie más que el anfitrión pueda pedirlo).
     ChatClear(SealedChat),
+    /// Anfitrión → invitado: si comparte algo (pantalla, ventana o juego) o la sala es solo de voz
+    /// y chat (`false`: la sala se abrió sin compartir o el anfitrión dejó de compartir). Al
+    /// conectar y cada vez que cambia.
+    Sharing {
+        /// Si comparte.
+        active: bool,
+    },
+    /// Anfitrión → invitado: le ofrece pasarle el anfitrión (abrir él una sala nueva a la que
+    /// se pasan todos).
+    HandoffOffer,
+    /// Invitado → anfitrión: la respuesta a [`ControlMessage::HandoffOffer`]: el código de la
+    /// sala nueva que ya abrió, o `None` si no acepta.
+    HandoffReply {
+        /// Código de la sala nueva ([`crate::signal::is_valid_room_code`]).
+        code: Option<String>,
+    },
+    /// Anfitrión → invitados: el anfitrión pasa a otro; entrad en su sala.
+    MoveToRoom {
+        /// Código de la sala nueva.
+        code: String,
+        /// Nombre visible del anfitrión nuevo (como mucho [`MEMBER_NAME_MAX`] bytes).
+        host_name: String,
+    },
 }
 
 impl ControlMessage {
@@ -857,6 +886,11 @@ mod tests {
                 }
             ),
             any::<bool>().prop_map(|allowed| ControlMessage::VoicePermission { allowed }),
+            any::<bool>().prop_map(|active| ControlMessage::Sharing { active }),
+            Just(ControlMessage::HandoffOffer),
+            prop::option::of("[A-Z2-9]{6}").prop_map(|code| ControlMessage::HandoffReply { code }),
+            ("[A-Z2-9]{6}", ".{0,40}")
+                .prop_map(|(code, host_name)| ControlMessage::MoveToRoom { code, host_name }),
             (any::<u32>(), any::<bool>())
                 .prop_map(|(guest, speaking)| ControlMessage::VoiceState { guest, speaking }),
             (1u8..=8, any::<bool>())

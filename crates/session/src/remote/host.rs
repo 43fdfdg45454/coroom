@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -883,6 +883,8 @@ struct HostCtx {
     input: Arc<HostInput>,
     /// Pistas de audio que se envían.
     audio_info: AudioInfo,
+    /// Lo último que se anunció con `Sharing` (si se comparte algo).
+    announced_sharing: AtomicBool,
 }
 
 /// `name` en como mucho [`MEMBER_NAME_MAX`] bytes, sin cortar un carácter.
@@ -932,6 +934,20 @@ impl HostCtx {
         match self.core.shared.captured_size() {
             Some(captured) => video.stream_size(captured),
             None => (video.width, video.height),
+        }
+    }
+
+    /// Si la fuente cambió entre compartir algo y no compartir nada desde el último anuncio,
+    /// avisa a todos los invitados conectados (`Sharing`).
+    fn announce_sharing(&self) {
+        let active = self.core.shared.sharing();
+        if self.announced_sharing.swap(active, Ordering::AcqRel) == active {
+            return;
+        }
+        debug!(active, "se comparte algo o ya no");
+        let message = ControlMessage::Sharing { active };
+        for (_, control) in lock(&self.links).guest_controls() {
+            let _ = control.send(&message);
         }
     }
 
@@ -1105,6 +1121,9 @@ impl HostCtx {
         }
         let (width, height) = self.stream_size();
         let _ = control.send(&ControlMessage::HostFrameSize { width, height });
+        let _ = control.send(&ControlMessage::Sharing {
+            active: self.core.shared.sharing(),
+        });
         // Audio: formato de cada pista y permiso de voz.
         for (track, format, config) in [
             (
@@ -1751,6 +1770,12 @@ async fn control_reader(
                 }
             }
             Some(ControlMessage::Chat(sealed)) => ctx.chat_from_guest(guest, &sealed),
+            Some(ControlMessage::HandoffReply { code }) => {
+                // Un código que no es de sala cuenta como «no».
+                let code =
+                    code.filter(|code| coroom_transport::proto::signal::is_valid_room_code(code));
+                ctx.core.emit(SessionEvent::HandoffReply { guest, code });
+            }
             Some(ControlMessage::Bye) => break,
             _ => {}
         }
@@ -2736,6 +2761,7 @@ async fn run_host(
         current: tokio::sync::Mutex::new(None),
         input,
         audio_info,
+        announced_sharing: AtomicBool::new(true),
     });
     // Cuando el flujo cambia de tamaño (otra captura, o el tope que la reduce), los invitados se
     // enteran por `HostFrameSize`, además de por el propio flujo.
@@ -2805,6 +2831,17 @@ async fn run_host(
                 Some(Command::Video(change)) => ctx.change_video(change),
                 Some(Command::Chat(text)) => ctx.chat_from_host(text),
                 Some(Command::ChatClear) => ctx.chat_clear(),
+                Some(Command::OfferHandoff(guest)) => {
+                    ctx.send_to_guest(guest, &ControlMessage::HandoffOffer);
+                }
+                Some(Command::MoveToRoom { code, host_name, except }) => {
+                    let message = ControlMessage::MoveToRoom { code, host_name };
+                    for (guest, control) in lock(&ctx.links).guest_controls() {
+                        if guest != except {
+                            let _ = control.send(&message);
+                        }
+                    }
+                }
                 Some(Command::Reconnect) => {}
                 Some(Command::Invite(user)) => {
                     let invite = SignalMessage::Invite { to_user: user, code: room.code.clone() };
@@ -2824,6 +2861,7 @@ async fn run_host(
                 if core.shared.stopping() {
                     break Ok(());
                 }
+                ctx.announce_sharing();
             }
         }
     };

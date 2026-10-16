@@ -30,6 +30,8 @@ sesión de uno que ya no uses.
    - **Pantalla**: un monitor entero.
    - **Ventana**: una sola ventana. Si se ve en negro porque el juego usa pantalla completa
      exclusiva, se transmite su monitor.
+   - **Solo voz**: la sala se abre sin compartir nada, para hablar y escribir; tus invitados ven
+     «Nadie está compartiendo». Desde la sala compartes la pantalla o una ventana cuando quieras.
    - La **fuente de prueba**, para comprobar la conexión sin enseñar nada tuyo.
 
    En los dos modos, en **Audio que se envía** salen todas las aplicaciones que suenan, marcadas:
@@ -64,10 +66,19 @@ En **Transmisión**, debajo del código, cambias sin cerrar la sala (los invitad
   esto** (en Linux, **Cambiar…** abre el selector del sistema y lo elegido se comparte al
   aceptarlo). Los invitados ven la última imagen un momento hasta que llega la nueva; si la nueva
   no se puede capturar, sigue la de antes y te lo dice.
+- **Dejar de compartir**: la sala sigue abierta con voz y chat; tus invitados ven «Nadie está
+  compartiendo» y no reciben ni la última imagen. **Compartir pantalla o ventana** vuelve a
+  compartir.
 - **Audio**: marca o desmarca aplicaciones; se aplica al momento, sin cortar.
-- **Códec preferido** y **bitrate máximo**: el bitrate se aplica enseguida; cambiar de códec vuelve
-  a negociar con los invitados y corta el vídeo un instante. El codificador de «Avanzado»
-  también se aplica a la sala abierta; la resolución, los fps, 4:4:4 y HDR, a la siguiente.
+- **Tu micrófono** y **dónde oyes la sala**: cambian al momento, sin cortar a nadie.
+- **Códec preferido**, **resolución** y **fps**: cambiar de códec vuelve a negociar con los
+  invitados y corta el vídeo un instante. El codificador de «Avanzado» también se aplica a la sala
+  abierta; 4:4:4 y HDR, a la siguiente. El bitrate no se elige: lo ajusta solo cada invitado.
+
+### Pasar la sala a otro
+
+En el menú **Más** de un invitado, **Pasarle la sala**: si acepta, abre una sala nueva (solo voz;
+desde ella comparte lo suyo) y todos, tú incluido, entráis en ella solos, sin escribir el código.
 
 ## Unirte a una sala
 
@@ -95,9 +106,18 @@ El anfitrión da y quita, a cada invitado y en cualquier momento:
   invitados entran callados**; entonces se lo da el anfitrión. Oír al anfitrión y a los demás no
   necesita permiso: todo invitado oye la voz de la sala desde que entra.
 
-Aparte de los permisos, cada uno elige a quién oye en su equipo: el invitado, en **Personas en la
-sala** (icono de personas en la barra), y el anfitrión, en la tarjeta de cada invitado, con el icono
-de auriculares (tachados: silenciado). No cambia nada para los demás.
+Los permisos de cada invitado (y su número de seguridad, pasarle la sala o expulsarle) están en el
+menú **Más** de su fila en **Integrantes**.
+
+Aparte de los permisos, cada uno elige a quién oye en su equipo, en **Integrantes** (el anfitrión,
+en Compartir; el invitado, en la pestaña **Sala** del panel): el deslizador de cada persona es lo
+alto que se la oye aquí, y su altavoz la silencia solo aquí (tachado y con la barra apagada). No
+cambia nada para los demás. En tu propia fila, la primera, el deslizador es lo alto que te oyen y el
+altavoz te silencia para toda la sala.
+
+Como invitado, arriba a la izquierda del vídeo ves **quién está hablando** (se quita en Ajustes →
+Sala). La pestaña **Ajustes** del panel reúne lo de tu equipo: VSync, decodificar por software,
+micrófono y salida (cambian al momento), volumen del juego y el mando que envías.
 
 Además puede **pausar la entrada de todos** (se suelta todo lo pulsado) y **expulsar** a un
 invitado: sale al momento y las claves de la sala cambian, así que ya no puede ver nada aunque
@@ -144,7 +164,9 @@ Las letras de `Ctrl+Alt` se cambian en Ajustes → Mandos (no pueden coincidir e
   Automático, y `coroom doctor` y el registro dicen cuáles y por qué; cuando actualices un driver
   que lo arregle, se vuelven a usar solos. Si el invitado recibe muchos fotogramas dañados, la
   aplicación lo avisa.
-- **Audio**: dispositivos, voz por actividad o pulsar para hablar.
+- **Audio**: dispositivos (el **predeterminado del sistema** dice cuál es; con una sala abierta,
+  cambian al momento), **volumen de tu voz** (lo alto que te oyen), **Probar el micrófono** (el
+  nivel y, con **Oírte**, tu voz por la salida) y voz por actividad o pulsar para hablar.
 - **Entrada**: atajos y mandos.
 - **Red**: **Abrir el puerto en el router** (activado: coroom pide al router por UPnP, NAT-PMP o
   PCP que deje entrar la conexión directa y anuncia la dirección WAN del router; sirve también

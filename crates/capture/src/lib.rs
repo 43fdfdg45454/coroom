@@ -29,6 +29,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub mod idle;
 pub mod pool;
 pub mod synthetic;
 
@@ -788,6 +789,13 @@ pub trait Capturer: Send {
             hdr: false,
             ..options
         }
+    }
+
+    /// Si esta fuente no comparte nada ([`idle::IdleCapturer`]: una sala solo de voz o después de
+    /// «Dejar de compartir»): la sesión lo anuncia a los invitados y no repite el último
+    /// fotograma.
+    fn shares_nothing(&self) -> bool {
+        false
     }
 }
 

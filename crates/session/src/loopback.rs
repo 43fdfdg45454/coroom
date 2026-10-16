@@ -401,6 +401,9 @@ pub(crate) struct Shared {
     captured_size: Mutex<Option<(u32, u32)>>,
     /// A quién avisar del cursor entre fotogramas (lo pone el hilo `present` con su sumidero).
     cursor_sink: CursorSinkSlot,
+    /// La fuente en uso no comparte nada ([`Capturer::shares_nothing`]): sala solo de voz o tras
+    /// «Dejar de compartir». El codificador olvida el último fotograma y no lo repite.
+    nothing_shared: AtomicBool,
 }
 
 /// Hueco para el [`CursorSink`] del sumidero de presentación.
@@ -468,6 +471,17 @@ impl fmt::Debug for CapturerSlot {
 impl Shared {
     pub(crate) fn stopping(&self) -> bool {
         self.stop.load(Ordering::Acquire)
+    }
+
+    /// Si la fuente en uso comparte algo (lo anuncia el anfitrión con `Sharing`).
+    pub(crate) fn sharing(&self) -> bool {
+        !self.nothing_shared.load(Ordering::Acquire)
+    }
+
+    /// Anota si la fuente que entra comparte algo.
+    pub(crate) fn note_source(&self, capturer: &dyn Capturer) {
+        self.nothing_shared
+            .store(capturer.shares_nothing(), Ordering::Release);
     }
 
     /// Deja opciones nuevas para la captura en marcha (gana la última).
@@ -1108,6 +1122,7 @@ pub(crate) fn capture_loop(
     shared: &Shared,
     ledger: &LatencyLedger,
 ) -> Result<(), PipelineError> {
+    shared.note_source(capturer.as_ref());
     let result = (|| {
         while !shared.stopping() {
             if let Some(mut next) = shared.next_capturer.take() {
@@ -1122,8 +1137,9 @@ pub(crate) fn capture_loop(
                     next.set_gpu_frames(frames);
                 }
                 capturer = next;
+                shared.note_source(capturer.as_ref());
                 shared.request_keyframe();
-                debug!("captura sustituida");
+                debug!(comparte = shared.sharing(), "captura sustituida");
             }
             if let Some(options) = shared.take_capture_options() {
                 // fps o tamaño máximo cambiados con la sala abierta.
@@ -1375,6 +1391,14 @@ pub(crate) fn encode_loop(
                 recycle(back);
             }
         }
+        if !shared.sharing() {
+            // Se dejó de compartir: lo último que se vio no se guarda ni se repite (un intra
+            // pedido por quien entra después no debe enseñar la pantalla de antes).
+            if let Some(old) = last.take() {
+                recycle(old);
+            }
+            last_id = None;
+        }
         let input = match rx.recv_timeout(POLL) {
             Ok(mut frame) => {
                 // Como `recv_latest`: el más reciente, y los demás cuentan como descartes.
@@ -1386,7 +1410,8 @@ pub(crate) fn encode_loop(
                 EncodeInput::Captured(frame)
             }
             Err(RecvTimeoutError::Timeout) => {
-                if shared.keyframe_requested.load(Ordering::Acquire)
+                if shared.sharing()
+                    && shared.keyframe_requested.load(Ordering::Acquire)
                     && last_at.elapsed() >= IDLE_KEYFRAME
                 {
                     // Un intento cada `IDLE_KEYFRAME` como mucho.

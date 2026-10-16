@@ -505,6 +505,26 @@ pub enum SessionEvent {
     Warning(String),
     /// Invitado: quién está en la sala (el anfitrión incluido), cada vez que cambia.
     Members(Vec<RoomMember>),
+    /// Invitado: el anfitrión comparte algo (`true`) o la sala es solo de voz y chat (`false`),
+    /// al conectar y cada vez que cambia.
+    Sharing(bool),
+    /// Invitado: el anfitrión le ofrece pasarle el anfitrión ([`RemoteSession::reply_handoff`]).
+    HandoffOffered,
+    /// Anfitrión: la respuesta de `guest` a la oferta de pasarle el anfitrión: el código de su
+    /// sala nueva, o `None` si no acepta.
+    HandoffReply {
+        /// Invitado.
+        guest: GuestId,
+        /// Código de la sala nueva (válido).
+        code: Option<String>,
+    },
+    /// Invitado: el anfitrión pasó a otro: entrar en la sala `code` de `host_name`.
+    MoveToRoom {
+        /// Código de la sala nueva (válido).
+        code: String,
+        /// Nombre del anfitrión nuevo.
+        host_name: String,
+    },
     /// Un mensaje del chat, en el orden que fija el anfitrión (los propios llegan así también:
     /// el anfitrión los devuelve con `own`).
     ChatMessage(ChatLine),
@@ -580,6 +600,21 @@ impl fmt::Display for SessionEvent {
             SessionEvent::Members(members) => {
                 let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
                 write!(f, "En la sala: {}.", names.join(", "))
+            }
+            SessionEvent::HandoffOffered => f.write_str("El anfitrión te ofrece pasarte la sala."),
+            SessionEvent::HandoffReply {
+                guest,
+                code: Some(code),
+            } => write!(f, "El invitado {} abrió la sala {code}.", guest.0),
+            SessionEvent::HandoffReply { guest, code: None } => {
+                write!(f, "El invitado {} no acepta la sala.", guest.0)
+            }
+            SessionEvent::MoveToRoom { code, host_name } => {
+                write!(f, "La sala pasa a {host_name}: código {code}.")
+            }
+            SessionEvent::Sharing(true) => f.write_str("El anfitrión comparte su pantalla."),
+            SessionEvent::Sharing(false) => {
+                f.write_str("Nadie está compartiendo: la sala es solo de voz y chat.")
             }
             SessionEvent::QualityEstimate { rtt_ms, level } => write!(
                 f,
@@ -875,6 +910,15 @@ pub(crate) enum Command {
     Chat(String),
     /// Anfitrión: vaciar el chat para todos.
     ChatClear,
+    /// Anfitrión: ofrecer a un invitado pasarle el anfitrión (`HandoffOffer`).
+    OfferHandoff(GuestId),
+    /// Anfitrión: mandar a los demás invitados (todos menos `except`) a la sala `code`
+    /// (`MoveToRoom`).
+    MoveToRoom {
+        code: String,
+        host_name: String,
+        except: GuestId,
+    },
     Close,
 }
 
@@ -1687,6 +1731,59 @@ impl RemoteSession {
                 })
             }
         }
+    }
+
+    /// Anfitrión: ofrece a `guest` pasarle el anfitrión; su respuesta llega como
+    /// [`SessionEvent::HandoffReply`].
+    pub fn offer_handoff(&self, guest: GuestId) -> Result<(), SessionError> {
+        self.require_host()?;
+        self.commands
+            .as_ref()
+            .and_then(|commands| commands.send(Command::OfferHandoff(guest)).ok())
+            .ok_or(SessionError::Network("la sesión no está en marcha".into()))
+    }
+
+    /// Anfitrión: manda a todos los invitados menos `except` (el anfitrión nuevo) a la sala
+    /// `code` de `host_name`. Después, la sala se cierra (lo hace quien llama).
+    pub fn move_to_room(
+        &self,
+        code: &str,
+        host_name: &str,
+        except: GuestId,
+    ) -> Result<(), SessionError> {
+        self.require_host()?;
+        if !coroom_transport::proto::signal::is_valid_room_code(code) {
+            return Err(SessionError::Network(format!(
+                "código de sala no válido: {code}"
+            )));
+        }
+        self.commands
+            .as_ref()
+            .and_then(|commands| {
+                commands
+                    .send(Command::MoveToRoom {
+                        code: code.to_owned(),
+                        host_name: host::truncate_name(host_name),
+                        except,
+                    })
+                    .ok()
+            })
+            .ok_or(SessionError::Network("la sesión no está en marcha".into()))
+    }
+
+    /// Invitado: contesta a [`SessionEvent::HandoffOffered`] con el código de la sala que ya
+    /// abrió (o `None` si no acepta).
+    pub fn reply_handoff(&self, code: Option<String>) -> Result<(), SessionError> {
+        if self.core.role != Role::Guest {
+            return Err(SessionError::Network("solo un invitado contesta".into()));
+        }
+        let control = lock(&self.core.link)
+            .control
+            .clone()
+            .ok_or_else(|| SessionError::Network("sin conexión con el anfitrión".into()))?;
+        control
+            .send(&coroom_transport::proto::control::ControlMessage::HandoffReply { code })
+            .map_err(|err| SessionError::Network(format!("no se pudo contestar: {err}")))
     }
 
     /// Anfitrión: vacía el chat para todos (historial incluido; [`SessionEvent::ChatCleared`]

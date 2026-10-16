@@ -79,14 +79,18 @@ pub enum SourceChoice {
     App,
     /// Patrón sintético.
     Synthetic,
+    /// Nada: la sala es solo de voz y chat.
+    Nothing,
 }
 
 impl SourceChoice {
-    /// Qué se comparte (la fuente de prueba, como la pantalla).
+    /// Qué se comparte (la fuente de prueba y nada, como la pantalla).
     pub fn kind(self) -> ShareKind {
         match self {
             SourceChoice::App => ShareKind::App,
-            SourceChoice::Screen | SourceChoice::Synthetic => ShareKind::Screen,
+            SourceChoice::Screen | SourceChoice::Synthetic | SourceChoice::Nothing => {
+                ShareKind::Screen
+            }
         }
     }
 }
@@ -101,11 +105,13 @@ pub enum ShareMode {
     Window,
     /// La fuente de prueba (un patrón animado).
     Test,
+    /// Nada: la sala es solo de voz y chat (se puede compartir después, desde la sala).
+    Nothing,
 }
 
 impl ShareMode {
     /// Los del segmentado (la fuente de prueba va aparte, como enlace).
-    pub const PICKER: [ShareMode; 2] = [ShareMode::Screen, ShareMode::Window];
+    pub const PICKER: [ShareMode; 3] = [ShareMode::Screen, ShareMode::Window, ShareMode::Nothing];
 
     /// Fuente que se captura.
     pub fn source(self) -> SourceChoice {
@@ -113,6 +119,7 @@ impl ShareMode {
             ShareMode::Screen => SourceChoice::Screen,
             ShareMode::Window => SourceChoice::App,
             ShareMode::Test => SourceChoice::Synthetic,
+            ShareMode::Nothing => SourceChoice::Nothing,
         }
     }
 
@@ -121,6 +128,7 @@ impl ShareMode {
             ShareMode::Screen => t!("host-modo-pantalla"),
             ShareMode::Window => t!("host-modo-ventana"),
             ShareMode::Test => t!("host-la-fuente-de-prueba"),
+            ShareMode::Nothing => t!("host-modo-solo-voz"),
         }
     }
 
@@ -129,6 +137,7 @@ impl ShareMode {
             ShareMode::Screen => t!("host-pantalla-ayuda"),
             ShareMode::Window => t!("host-ventana-ayuda"),
             ShareMode::Test => t!("host-fuente-de-prueba-ayuda"),
+            ShareMode::Nothing => t!("host-solo-voz-ayuda"),
         }
     }
 
@@ -137,6 +146,7 @@ impl ShareMode {
             ShareMode::Screen => Icon::Monitor,
             ShareMode::Window => Icon::AppWindow,
             ShareMode::Test => Icon::Activity,
+            ShareMode::Nothing => Icon::Mic,
         }
     }
 }
@@ -280,6 +290,8 @@ pub enum GuestAction {
     Voice(bool),
     /// Ver el número de seguridad.
     Safety,
+    /// Pasarle la sala (pide confirmación).
+    Handoff,
     /// Expulsar (pide confirmación).
     Kick,
 }
@@ -294,6 +306,7 @@ impl std::fmt::Display for GuestAction {
             GuestAction::Voice(true) => t!("host-dar-la-voz"),
             GuestAction::Voice(false) => t!("host-quitar-la-voz"),
             GuestAction::Safety => t!("host-numero-de-seguridad"),
+            GuestAction::Handoff => t!("host-pasarle-la-sala"),
             GuestAction::Kick => t!("host-expulsar"),
         })
     }
@@ -357,6 +370,12 @@ pub struct State {
     pub switching: Option<Sharing>,
     /// Amigos que piden entrar en la sala abierta, en el orden en que lo pidieron.
     pub join_requests: Vec<JoinRequest>,
+    /// Pasando la sala: a quién se le ofreció (esperando su respuesta).
+    pub handoff: Option<(GuestId, String)>,
+    /// Pasando la sala: el código de la sala nueva, para entrar en ella al cerrar esta.
+    pub moving_to: Option<String>,
+    /// Como invitado, se aceptó la sala que pasa el anfitrión: al tener código, se le contesta.
+    pub handoff_accepted: bool,
 }
 
 /// Fuente y monitor o ventana de una transmisión.
@@ -509,6 +528,10 @@ impl State {
 
     /// Audio del juego que se pide al abrir la sala: todas las aplicaciones salvo las quitadas.
     pub fn game_capture(&self, excluded: &[RememberedApp]) -> GameCapture {
+        if self.mode == ShareMode::Nothing {
+            // Sin nada compartido no hay juego que oír: solo las voces.
+            return GameCapture::None;
+        }
         if self.playing().is_none() {
             // Sin audio por aplicación en este equipo: todo lo que suena.
             return GameCapture::System;
@@ -558,6 +581,10 @@ pub enum Msg {
     Hdr(bool),
     /// Abrir la sala.
     Start,
+    /// Con la sala abierta: dejar de compartir (la sala sigue con voz y chat).
+    StopSharing,
+    /// Con la sala abierta y sin compartir nada: elegir qué compartir.
+    StartSharing,
     /// Copiar el código.
     CopyCode,
     /// Cerrar la sala (pide confirmación).
@@ -584,6 +611,8 @@ pub enum Msg {
     Kick(GuestId),
     /// Una acción del menú de la fila de un invitado.
     GuestMenu(GuestId, GuestAction),
+    /// Pasarle la sala a un invitado (pide confirmación).
+    Handoff(GuestId),
     /// Volumen de la voz propia que se envía (porcentaje), mientras se arrastra.
     MicVolume(u8),
     /// Al soltar el deslizador de la voz propia: recordarlo en los ajustes.
@@ -765,6 +794,24 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::Chroma444(on) => return change_video(app, true, |video| video.chroma_444 = on),
         Msg::Hdr(on) => return change_video(app, true, |video| video.hdr = on),
         Msg::Start => return start(app),
+        Msg::StopSharing => {
+            let host = &mut app.host;
+            if host.room.is_none() || host.switching.is_some() {
+                return Vec::new();
+            }
+            host.mode = ShareMode::Nothing;
+            host.target = None;
+            host.picked = None;
+            host.changing_source = false;
+            return apply_source(app);
+        }
+        Msg::StartSharing => {
+            if app.host.room.is_none() {
+                return Vec::new();
+            }
+            app.host.changing_source = true;
+            return set_mode(app, ShareMode::Screen);
+        }
         Msg::CopyCode => {
             if let Some(code) = app.host.room.as_ref().and_then(|room| room.code.clone()) {
                 return app.update(Message::Copy(code));
@@ -843,9 +890,20 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                     GuestAction::Pad(on) => Msg::PadOn(id, on),
                     GuestAction::Voice(on) => Msg::GuestVoice(id, on),
                     GuestAction::Safety => Msg::Safety(id),
+                    GuestAction::Handoff => Msg::Handoff(id),
                     GuestAction::Kick => Msg::Kick(id),
                 },
             );
+        }
+        Msg::Handoff(id) => {
+            if app.host.handoff.is_none()
+                && let Some(status) = guest(app, id)
+            {
+                app.dialog = Some(Dialog::OfferHandoff {
+                    guest: id,
+                    name: status.name.clone(),
+                });
+            }
         }
         Msg::MicVolume(percent) => {
             app.settings.audio.mic_volume = percent.min(MAX_VOICE_VOLUME);
@@ -912,6 +970,34 @@ fn set_mode(app: &mut App, mode: ShareMode) -> Vec<Effect> {
         return refresh(app);
     }
     Vec::new()
+}
+
+/// Anfitrión: confirmado pasar la sala a `guest`: se le ofrece y se espera su respuesta
+/// ([`SessionEvent::HandoffReply`]).
+pub fn offer_handoff(app: &mut App, guest: GuestId, name: String) -> Vec<Effect> {
+    if app.host.room.is_none() || app.host.handoff.is_some() {
+        return Vec::new();
+    }
+    app.toast(
+        Tone::Info,
+        t!("host-esperando-a-que-acepte", name = name.as_str()),
+    );
+    app.host.handoff = Some((guest, name));
+    vec![Effect::OfferHandoff(guest)]
+}
+
+/// Invitado: aceptada la sala que pasa el anfitrión: se abre una sala solo de voz y chat (desde
+/// ella se puede compartir) y, cuando tenga código, se le contesta ([`SessionEvent::RoomCreated`]).
+pub fn accept_handoff(app: &mut App) -> Vec<Effect> {
+    if app.host.is_open() || app.guest.is_none() {
+        return vec![Effect::ReplyHandoff(None)];
+    }
+    let host = &mut app.host;
+    host.mode = ShareMode::Nothing;
+    host.target = None;
+    host.picked = None;
+    host.handoff_accepted = true;
+    start(app)
 }
 
 /// Abre la sala con lo elegido.
@@ -986,8 +1072,12 @@ pub fn refresh(app: &mut App) -> Vec<Effect> {
     if app.host.starting {
         return Vec::new();
     }
-    app.host.refreshing = true;
-    let mut effects = vec![Effect::LoadShareOptions(app.host.source())];
+    let mut effects = Vec::new();
+    // Sin nada que compartir no hay monitores, ventanas ni aplicaciones que mirar.
+    if app.host.mode != ShareMode::Nothing {
+        app.host.refreshing = true;
+        effects.push(Effect::LoadShareOptions(app.host.source()));
+    }
     if matches!(app.friends, Load::Idle) && app.account.is_some() {
         app.friends = Load::Loading;
         effects.push(Effect::LoadFriends);
@@ -1202,6 +1292,15 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
         Event::HostStarted(Err(err)) => {
             app.host.starting = false;
             app.host.shared = None;
+            if std::mem::take(&mut app.host.handoff_accepted) {
+                // No se pudo abrir la sala que se aceptó: se le dice que no al anfitrión y se
+                // sigue de invitado en la suya.
+                app.toast(
+                    Tone::Warning,
+                    t!("host-no-se-pudo-abrir-la-sala", error = err.as_str()),
+                );
+                return vec![Effect::ReplyHandoff(None)];
+            }
             app.host.error = Some(err);
             return vec![Effect::StartLobby];
         }
@@ -1253,6 +1352,11 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
             } else if was_open {
                 app.toast(Tone::Info, t!("host-has-dejado-de-compartir"));
             }
+            app.host.handoff = None;
+            if let Some(code) = app.host.moving_to.take() {
+                // La sala pasó a otro: se entra en la suya como invitado.
+                return super::guest::start(app, code);
+            }
             if app.page == Page::Host && !was_open {
                 app.page = Page::Home;
             }
@@ -1262,6 +1366,22 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                 Vec::new()
             };
         }
+        Event::HandedOver(result) => match result {
+            Ok(code) if app.host.room.is_some() => {
+                app.host.moving_to = Some(code);
+                app.host.stopping = true;
+                return vec![Effect::StopHost];
+            }
+            Ok(_) => {}
+            Err(err) => {
+                app.host.handoff = None;
+                app.toast(
+                    Tone::Warning,
+                    t!("host-no-se-pudo-pasar-la-sala", error = err),
+                );
+            }
+        },
+
         Event::Host(event) => return session_event(app, event),
         Event::VideoChanged(result) => {
             if app.host.room.is_some() {
@@ -1287,7 +1407,17 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
             }
             match result {
                 Ok(()) => {
-                    app.toast(Tone::Info, t!("host-ahora-compartes-otra-cosa"));
+                    let stopped = requested
+                        .as_ref()
+                        .is_some_and(|sharing| sharing.mode == ShareMode::Nothing);
+                    app.toast(
+                        Tone::Info,
+                        if stopped {
+                            t!("host-ya-no-compartes-nada")
+                        } else {
+                            t!("host-ahora-compartes-otra-cosa")
+                        },
+                    );
                     if requested.is_some() {
                         app.host.shared = requested;
                     }
@@ -1312,10 +1442,45 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
     match event {
         SessionEvent::RoomCreated { code, fingerprint } => {
             if let Some(room) = app.host.room.as_mut() {
-                room.code = Some(code);
+                room.code = Some(code.clone());
                 room.fingerprint = fingerprint;
             }
             effects.extend(invite_marked(app));
+            if app.host.handoff_accepted {
+                // La sala que pasó el anfitrión ya tiene código: se le contesta y se sale de la
+                // suya (los demás vienen solos).
+                app.host.handoff_accepted = false;
+                effects.push(Effect::ReplyHandoff(Some(code)));
+                effects.extend(super::guest::leave(app));
+            }
+        }
+        SessionEvent::HandoffReply { guest, code } => {
+            let Some((offered, name)) = app.host.handoff.clone() else {
+                return effects;
+            };
+            if offered != guest {
+                return effects;
+            }
+            match code {
+                Some(code) => {
+                    app.toast(
+                        Tone::Info,
+                        t!("host-pasando-la-sala-a", name = name.as_str()),
+                    );
+                    effects.push(Effect::HandOver {
+                        code,
+                        host_name: name,
+                        except: guest,
+                    });
+                }
+                None => {
+                    app.host.handoff = None;
+                    app.toast(
+                        Tone::Info,
+                        t!("host-name-no-acepto-la-sala", name = name.as_str()),
+                    );
+                }
+            }
         }
         SessionEvent::GuestJoined {
             user,
@@ -1745,6 +1910,7 @@ fn sharing_label(sharing: &Sharing) -> String {
         });
     match (sharing.mode, target) {
         (ShareMode::Test, _) => t!("host-la-fuente-de-prueba").to_owned(),
+        (ShareMode::Nothing, _) => t!("host-solo-voz-y-chat").to_owned(),
         (_, Some(target)) => target,
         (ShareMode::Screen, None) => t!("host-modo-pantalla").to_owned(),
         (_, None) => t!("host-modo-ventana").to_owned(),
@@ -1756,6 +1922,11 @@ fn sharing_label(sharing: &Sharing) -> String {
 fn target_control(state: &State) -> Element<'_, Message> {
     let window = state.source() == SourceChoice::App;
     let options = state.current_options();
+    if state.mode == ShareMode::Nothing {
+        return ui::body(t!("host-solo-voz-detalle"))
+            .wrapping(Wrapping::WordOrGlyph)
+            .into();
+    }
     if state.mode == ShareMode::Test {
         return column![
             ui::body(t!("host-fuente-de-prueba-ayuda")).wrapping(Wrapping::WordOrGlyph),
@@ -1859,7 +2030,14 @@ fn source_card(app: &App, real: bool) -> Element<'_, Message> {
     .align_y(Alignment::Center);
     // La vista previa en vivo no existe antes de abrir la sala: la captura arranca con ella.
     let preview = thumb(
-        placeholder(state.mode.icon(), t!("host-vista-previa-al-abrir")),
+        placeholder(
+            state.mode.icon(),
+            if state.mode == ShareMode::Nothing {
+                t!("host-solo-voz-y-chat")
+            } else {
+                t!("host-vista-previa-al-abrir")
+            },
+        ),
         THUMB_WIDTH,
     );
     let mut side = column![target_control(state)].spacing(space::XS);
@@ -2271,6 +2449,9 @@ fn audio_row<'a>(row_data: AudioRow) -> Element<'a, Message> {
 /// Resumen de lo que suena en la sala: «Juego y Firefox», o por qué va todo.
 fn audio_summary(app: &App) -> String {
     let state = &app.host;
+    if state.mode == ShareMode::Nothing {
+        return t!("host-solo-tu-voz").to_owned();
+    }
     let Some(options) = state.current_options() else {
         return t!("host-buscando").to_owned();
     };
@@ -2573,6 +2754,42 @@ fn room_header<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
 /// La fuente con la sala abierta: vista previa, qué es y con qué se codifica, y «Cambiar fuente».
 fn room_source_card<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
     let state = &app.host;
+    let nothing = state.switching.is_none()
+        && state
+            .shared
+            .as_ref()
+            .is_some_and(|shared| shared.mode == ShareMode::Nothing);
+    if nothing {
+        let info = column![
+            ui::strong(t!("host-no-compartes-nada")),
+            ui::secondary(t!("host-no-compartes-nada-detalle")).wrapping(Wrapping::WordOrGlyph),
+        ]
+        .spacing(2)
+        .width(Length::Fill);
+        let share = ui::button_with(
+            Kind::Primary,
+            t!("host-compartir-pantalla-o-ventana"),
+            Some(Icon::ShareScreen),
+            (!state.changing_source).then(|| on(Msg::StartSharing)),
+        );
+        let mut card = column![
+            row![
+                thumb(
+                    placeholder(Icon::Mic, t!("host-solo-voz-y-chat")),
+                    PREVIEW_WIDTH
+                ),
+                info,
+                share
+            ]
+            .spacing(space::M)
+            .align_y(Alignment::Center)
+        ]
+        .spacing(space::S);
+        if state.changing_source {
+            card = card.push(rule::horizontal(1)).push(source_picker(app));
+        }
+        return ui::card(card);
+    }
     let preview: Element<'a, Message> = if room.preview_unavailable {
         placeholder(Icon::Monitor, t!("host-sin-vista-previa"))
     } else {
@@ -2606,10 +2823,22 @@ fn room_source_card<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
         Some(Icon::ArrowUpDown),
         (!state.changing_source && state.switching.is_none()).then(|| on(Msg::ChangeSource(true))),
     );
+    let stop = ui::button_with(
+        Kind::Normal,
+        t!("host-dejar-de-compartir"),
+        Some(Icon::Pause),
+        (!state.changing_source && state.switching.is_none()).then(|| on(Msg::StopSharing)),
+    );
     let mut card = column![
-        row![thumb(preview, PREVIEW_WIDTH), info, change]
-            .spacing(space::M)
-            .align_y(Alignment::Center)
+        row![
+            thumb(preview, PREVIEW_WIDTH),
+            info,
+            column![change, stop]
+                .spacing(space::XS)
+                .align_x(Alignment::End)
+        ]
+        .spacing(space::M)
+        .align_y(Alignment::Center)
     ]
     .spacing(space::S);
     if state.changing_source {
@@ -2802,6 +3031,7 @@ fn guest_menu<'a>(id: GuestId, permissions: Permissions) -> Element<'a, Message>
         GuestAction::Pad(permissions.gamepad_slot.is_none()),
         GuestAction::Voice(!permissions.voice),
         GuestAction::Safety,
+        GuestAction::Handoff,
         GuestAction::Kick,
     ];
     ui::menu(actions, t!("host-mas"), move |action| {
@@ -3427,7 +3657,17 @@ pub(crate) mod shots {
         ("08-compartir-ventana", host_setup_window),
         ("08-compartir-avanzado", host_setup_advanced),
         ("08-compartir-wayland", host_setup_wayland),
+        ("08-compartir-solo-voz", |app| {
+            host_setup(app);
+            app.update(Message::Host(Msg::Mode(super::ShareMode::Nothing)));
+        }),
         ("09-sala-abierta", host_room),
+        ("09-sala-sin-compartir", |app| {
+            host_room(app);
+            app.update(Message::Host(Msg::StopSharing));
+            app.update(Message::Event(Event::SourceSwitched(Ok(()))));
+            app.toasts.clear();
+        }),
         ("09-sala-cambiar-fuente", host_room_switch),
         ("09-sala-peticion-de-entrada", host_room_join_request),
         ("10-dejar-de-compartir", host_stop_dialog),
@@ -3475,6 +3715,74 @@ mod tests {
             vec![status(1, "Bea"), status(2, "Carla")],
             HostVoice::default(),
         )));
+    }
+
+    /// Pasar la sala: se confirma, se ofrece, Bea contesta con su código, se manda a los demás y,
+    /// al cerrar esta, se entra en la suya.
+    #[test]
+    fn the_host_hands_the_room_over_and_joins_the_new_one() {
+        let mut app = app();
+        app.account = Some(crate::ui::app::tests::account());
+        open_room(&mut app);
+        app.update(Message::Host(Msg::GuestMenu(
+            GuestId(1),
+            GuestAction::Handoff,
+        )));
+        assert!(matches!(&app.dialog, Some(Dialog::OfferHandoff { name, .. }) if name == "Bea"));
+        assert_eq!(
+            app.update(Message::ConfirmDialog),
+            [Effect::OfferHandoff(GuestId(1))]
+        );
+        // Otro invitado no puede contestar por Bea.
+        assert!(
+            app.update(Message::Event(Event::Host(SessionEvent::HandoffReply {
+                guest: GuestId(2),
+                code: Some("ABCDEF".into()),
+            })))
+            .is_empty()
+        );
+        assert_eq!(
+            app.update(Message::Event(Event::Host(SessionEvent::HandoffReply {
+                guest: GuestId(1),
+                code: Some("ABCDEF".into()),
+            }))),
+            [Effect::HandOver {
+                code: "ABCDEF".into(),
+                host_name: "Bea".into(),
+                except: GuestId(1),
+            }]
+        );
+        assert_eq!(
+            app.update(Message::Event(Event::HandedOver(Ok("ABCDEF".into())))),
+            [Effect::StopHost]
+        );
+        let effects = app.update(Message::Event(Event::HostEnded(None)));
+        assert_eq!(effects, [Effect::StopLobby, Effect::Join("ABCDEF".into())]);
+        assert_eq!(app.screen, Screen::Guest);
+        assert!(app.host.room.is_none());
+    }
+
+    /// Si el invitado no acepta, se queda todo como estaba.
+    #[test]
+    fn a_declined_handoff_changes_nothing() {
+        let mut app = app();
+        open_room(&mut app);
+        app.update(Message::Host(Msg::Handoff(GuestId(2))));
+        app.update(Message::ConfirmDialog);
+        assert!(
+            app.update(Message::Event(Event::Host(SessionEvent::HandoffReply {
+                guest: GuestId(2),
+                code: None,
+            })))
+            .is_empty()
+        );
+        assert!(app.host.handoff.is_none());
+        assert!(app.host.room.is_some());
+        assert!(
+            app.toasts
+                .iter()
+                .any(|t| t.text == "Carla no aceptó la sala.")
+        );
     }
 
     fn playing(keys: &[&str]) -> Vec<PlayingApp> {
