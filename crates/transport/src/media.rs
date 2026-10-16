@@ -98,6 +98,11 @@ pub const PING_INTERVAL: Duration = Duration::from_secs(1);
 /// enlace y sale en 6 ms a [`PROBE_MAX_PACE_KBPS`], así que deja ~55 ms de cola.
 pub const PROBE_PACKETS: u16 = 64;
 
+/// Datagramas de un tren de sonda periódica del techo ([`MediaSender::probe_due`]): va encima del
+/// vídeo, y por encima de un limitador cada datagrama que se pierde puede llevarse uno del vídeo;
+/// para decir si el enlace pasa un ritmo sin pérdida bastan menos que para medirlo.
+pub const CHECK_PROBE_PACKETS: u16 = 16;
+
 /// Trenes que se envían a cada receptor al conectar, separados [`PROBE_SPACING`], en escalera de
 /// ritmos ([`startup_probe_paces`]); vale el mejor (el tráfico ajeno solo puede hacer que un tren
 /// mida de menos).
@@ -1028,16 +1033,15 @@ impl MediaSender {
         self.pacing_plan().0
     }
 
-    /// Si toca una sonda periódica para algún receptor ([`RateController::probe_due`]): el ritmo
-    /// del tren. Sin techo se mide el enlace a [`probe_pace_kbps`] del máximo configurado.
+    /// Si toca una sonda periódica del techo para algún receptor ([`RateController::probe_due`]):
+    /// el ritmo del tren.
     pub fn probe_due(&self) -> Option<u32> {
-        let refresh = probe_pace_kbps(self.rate_config().max_kbps);
         let mut state = self.state.lock().ok()?;
         let now = Instant::now();
         state
             .sources
             .iter_mut()
-            .filter_map(|source| source.rate.probe_due(now, refresh))
+            .filter_map(|source| source.rate.probe_due(now))
             .max()
     }
 
@@ -1047,6 +1051,16 @@ impl MediaSender {
     /// [`MediaSender::handle_control`]. No cuenta como medios: ni en el historial de `Nack` ni en
     /// lo enviado para el control de tasa.
     pub async fn send_probe(&self, pace_kbps: u32) -> Result<u32, TransportError> {
+        self.send_probe_train(pace_kbps, PROBE_PACKETS).await
+    }
+
+    /// Como [`MediaSender::send_probe`], con `count` datagramas (al menos dos).
+    pub async fn send_probe_train(
+        &self,
+        pace_kbps: u32,
+        count: u16,
+    ) -> Result<u32, TransportError> {
+        let count = count.max(2);
         let train = self.next_train.fetch_add(1, Ordering::Relaxed);
         let max_packet = self.conn.max_packet();
         if max_packet < ObjectHeader::LEN + 64 {
@@ -1055,9 +1069,9 @@ impl MediaSender {
             )));
         }
         let payload = vec![0u8; max_packet - ObjectHeader::LEN];
-        let packets: Vec<Bytes> = (0..PROBE_PACKETS)
+        let packets: Vec<Bytes> = (0..count)
             .map(|index| {
-                let flags = if index + 1 == PROBE_PACKETS {
+                let flags = if index + 1 == count {
                     ObjectHeader::LAST_OBJECT
                 } else {
                     0
@@ -1068,7 +1082,7 @@ impl MediaSender {
                         flags,
                         group: train,
                         object: index,
-                        object_count: PROBE_PACKETS,
+                        object_count: count,
                         payload_len: payload.len() as u16,
                         epoch_hint: 0,
                     },

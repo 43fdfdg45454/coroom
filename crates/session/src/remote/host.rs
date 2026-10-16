@@ -22,8 +22,8 @@ use coroom_transport::crypto::hpke::{self, PairwiseOffer};
 use coroom_transport::crypto::sframe::MediaKey;
 use coroom_transport::crypto::{RoomGroup, SafetyNumber, sha256_fingerprint};
 use coroom_transport::media::{
-    DEFAULT_SOURCE, MediaSender, MediaSenderConfig, PROBE_POLL, PROBE_SPACING, audio_datagram,
-    startup_probe_paces,
+    CHECK_PROBE_PACKETS, DEFAULT_SOURCE, MediaSender, MediaSenderConfig, PROBE_POLL, PROBE_SPACING,
+    audio_datagram, startup_probe_paces,
 };
 use coroom_transport::proto::PROTOCOL_VERSION;
 use coroom_transport::proto::control::{
@@ -1545,7 +1545,8 @@ fn attach_direct(
 /// arranca su control de tasa ([`MediaSender::on_probe_result`]: el objetivo y, si un tren perdió
 /// contra un limitador, el techo de ráfaga) y se fija el ritmo del pacing. Después, cada
 /// [`PROBE_POLL`] se mira si el control de tasa de algún receptor pide una sonda
-/// ([`MediaSender::probe_due`]: subir el techo cuando frena, o confirmar lo medido) y sale.
+/// ([`MediaSender::probe_due`]: subir el techo cuando frena) y sale, corta
+/// ([`CHECK_PROBE_PACKETS`]).
 async fn probe_link(ctx: Arc<HostCtx>, sender: Arc<MediaSender>) {
     let paces = startup_probe_paces(ctx.max_kbps.load(Ordering::Acquire));
     for (train, pace) in paces.into_iter().enumerate() {
@@ -1566,7 +1567,7 @@ async fn probe_link(ctx: Arc<HostCtx>, sender: Arc<MediaSender>) {
             }
             if let Some(pace) = sender.probe_due() {
                 debug!(kbps = pace, "sonda periódica del enlace");
-                if let Err(err) = sender.send_probe(pace).await {
+                if let Err(err) = sender.send_probe_train(pace, CHECK_PROBE_PACKETS).await {
                     debug!(error = %err, "sonda periódica sin enviar");
                     return;
                 }

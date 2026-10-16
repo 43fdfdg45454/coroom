@@ -1670,3 +1670,97 @@ fn s_game_audio_only_flows_while_sharing() {
     host.close();
     drop(server);
 }
+
+/// (s) Un enlace con limitador (2 Mbit/s, cola de 15 ms, sin pérdida aleatoria) y una imagen con
+/// ruido que pide más: en 5 s el control de tasa se asienta (la sonda al arrancar y el techo de
+/// ráfaga) y desde ahí no se pierde ningún fotograma ni el objetivo baja a escalones (sin diente
+/// de sierra). Falla si tarda más.
+#[test]
+fn s_a_policed_link_settles_within_five_seconds() {
+    let _serial = serial();
+    common::load_factor();
+    let server = TestServer::start();
+    let port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .and_then(|socket| socket.local_addr())
+        .expect("puerto libre")
+        .port();
+    let host_addr: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, port).into();
+    let proxy = server
+        .runtime
+        .block_on(UdpLossy::start(
+            host_addr,
+            LossyConfig {
+                loss: 0.0,
+                delay: Duration::from_millis(5),
+                jitter: Duration::from_millis(1),
+                rate_bps: Some(2_000_000),
+                // 3,75 KB de ráfaga (tres datagramas): un limitador estricto, pero que deja pasar
+                // un fotograma repartido por el pacing.
+                queue_limit: Duration::from_millis(15),
+                seed: 7,
+                outages: None,
+            },
+        ))
+        .expect("proxy");
+    let mut host_config = server.config();
+    host_config.bind = Some(host_addr);
+    host_config.advertise_candidates = Some(vec![proxy.addr()]);
+    let mut host = RemoteSession::host(
+        host_config.identity,
+        host_config.config,
+        Box::new(NoisyCapturer::new(SyntheticCapturer::new(640, 360, FPS))),
+        EncoderSet::openh264(),
+        LoopbackConfig {
+            bitrate_kbps: 20_000,
+            ..video(None)
+        },
+        Arc::new(LatencyLedger::new()),
+    );
+    host.start().expect("arranque del anfitrión");
+    let code = room_code(&host);
+    let mut guest_config = server.config();
+    guest_config.advertise_candidates = Some(Vec::new());
+    let mut viewer = guest(guest_config, &code, None);
+    wait_until("el primer fotograma", Duration::from_secs(20), || {
+        viewer.summary().frames_presented > 0
+    });
+    let started = Instant::now();
+    let mut last_drops = viewer.summary().drops_total;
+    let mut seconds = Vec::new();
+    for second in 1..=12u64 {
+        std::thread::sleep(
+            (started + Duration::from_secs(second)).saturating_duration_since(Instant::now()),
+        );
+        let drops = viewer.summary().drops_total;
+        let target = host
+            .guests()
+            .first()
+            .and_then(|status| status.target_kbps)
+            .unwrap_or(0);
+        seconds.push((second, drops - last_drops, target));
+        last_drops = drops;
+    }
+    println!("segundo, fotogramas perdidos, objetivo: {seconds:?}");
+    println!("limitador: {} descartados", proxy.stats().queue_drops());
+    let after: Vec<_> = seconds.iter().filter(|(second, ..)| *second > 5).collect();
+    assert!(
+        after.iter().all(|(_, lost, _)| *lost == 0),
+        "se pierde pasados 5 s: {seconds:?}"
+    );
+    assert!(
+        after
+            .windows(2)
+            .all(|pair| f64::from(pair[1].2) >= 0.85 * f64::from(pair[0].2)),
+        "el objetivo baja a escalones pasados 5 s: {seconds:?}"
+    );
+    assert!(
+        after
+            .iter()
+            .all(|(_, _, target)| (500..=2_000).contains(target)),
+        "objetivo fuera de lo que cabe: {seconds:?}"
+    );
+    viewer.close();
+    host.close();
+    drop(proxy);
+    drop(server);
+}

@@ -520,6 +520,20 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Cambiado
 
+- **El codificador gasta lo que pide la imagen**, no el objetivo entero: NVENC (calidad variable
+  con techo) y SVT-AV1 (CRF con techo) fijan una calidad y el objetivo del control de tasa es solo
+  el techo de cada fotograma. Con 20 Mbit/s de techo a 1080p60, un escritorio quieto pasa de
+  ~20 Mbit/s a ~2 Mbit/s y una ráfaga de partículas sigue llegando al techo; los fotogramas más
+  grandes, más pequeños que con tasa constante. VA-API, AMF, QSV y Vulkan Video siguen con tasa
+  constante (con VBR se pasaban del techo). `cargo test --release -p coroom-codec --test
+  rate_modes -- --ignored --nocapture` repite la comparación.
+- **El control de tasa se asienta al conectar**: la sonda sale en escalera y, contra un
+  limitador, fija el techo de ráfaga desde el primer segundo (aunque el vídeo ya esté saliendo);
+  sin pérdida el techo no se mueve (sin diente de sierra), lo suben sondas cortas solo cuando
+  frena, y una subida que pierde vuelve al techo de antes. La pérdida aleatoria baja (wifi) ya no
+  hunde el bitrate, una pérdida que sube tras un recorte no cuenta como acierto, un intra con techo
+  cabe en lo que espera el receptor, y con varios invitados el ritmo se reparte a todos. Lo vigila
+  `s_a_policed_link_settles_within_five_seconds`.
 - **El bitrate ya no tiene tope** en ninguna parte (ni en Compartir ni en `coroom host`, que pierde
   `--bitrate-kbps`): lo negocia el control de tasa de cada invitado con su enlace, y Diagnóstico
   dice que el límite es el enlace. Su mínimo baja a 0,5 Mbit/s para no inundar un enlace lento.

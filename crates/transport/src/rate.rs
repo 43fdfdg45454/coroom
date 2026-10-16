@@ -65,9 +65,10 @@
 //!   las sondas se espacian (se doblan hasta [`PROBE_MAX_INTERVAL`]); si el tren ya pasa del ritmo
 //!   natural del pacing, el enlace aguanta las ráfagas y el techo se quita.
 //!
-//! **Lo que midió la sonda** (al arrancar y cada [`PROBE_REFRESH`] sin techo) también deja crecer
-//! el objetivo hasta [`PROBE_START_SHARE`] de ello aunque el codificador no lo esté usando: si solo
-//! gasta lo que pide la imagen, el objetivo (su tope) tiene que estar ya arriba para los picos.
+//! **Lo que midió la sonda** (al arrancar, y las del techo) también deja crecer el objetivo hasta
+//! [`PROBE_START_SHARE`] de ello aunque el codificador no lo esté usando: si solo gasta lo que pide
+//! la imagen, el objetivo (su tope) tiene que estar ya arriba para los picos. Una cola, ECN o un
+//! recorte por pérdida lo acotan al objetivo de ese momento.
 //!
 //! La salida [`RateController::target_kbps`] lleva histéresis: si la variación es < 10 % no cambia
 //! más de una vez por segundo, para no reconfigurar el codificador a cada informe.
@@ -204,11 +205,6 @@ pub const PROBE_INTERVAL: Duration = Duration::from_secs(4);
 
 /// Espera máxima entre sondas periódicas del techo.
 pub const PROBE_MAX_INTERVAL: Duration = Duration::from_secs(64);
-
-/// Cada cuánto se vuelve a medir el enlace sin techo: lo que midió la sonda deja crecer el
-/// objetivo sin que el codificador lo esté usando (ver [`RateController::probed_kbps`]), así que
-/// no puede ser una medida vieja.
-pub const PROBE_REFRESH: Duration = Duration::from_secs(10);
 
 /// Sondas de tren del techo que fallan seguidas antes de probar la subida con el propio vídeo: un
 /// tren va encima del vídeo que ya sale, y contra un limitador de cubo pequeño la suma no pasa
@@ -439,81 +435,84 @@ impl RateController {
         self.inherent_loss
     }
 
-    /// Lo que midió la sonda del enlace hace menos de [`PROBE_REFRESH`] (el ritmo que pasó limpio,
-    /// o lo que entregó si perdió), en kbit/s.
-    pub fn probed_kbps(&self, now: Instant) -> Option<f64> {
-        self.probed
-            .filter(|(_, at)| now.saturating_duration_since(*at) < PROBE_REFRESH)
-            .map(|(kbps, _)| kbps)
+    /// Lo que midió la sonda del enlace (el ritmo que pasó limpio, o lo que entregó si perdió,
+    /// más el vídeo que salía a la vez), en kbit/s, mientras ninguna señal de congestión lo
+    /// desmienta: una cola, ECN o un recorte por pérdida la olvidan.
+    pub fn probed_kbps(&self) -> Option<f64> {
+        self.probed.map(|(kbps, _)| kbps)
     }
 
-    /// Si toca una sonda: con techo, cada [`RateController::probe_interval`] y si el objetivo
-    /// llega al techo (hace falta más), a [`PROBE_STEP`] veces el techo (o al ritmo natural, para
-    /// ver si sobra, si no frena); sin techo, cada [`PROBE_REFRESH`] a lo último que midió (como
-    /// mucho `refresh_pace`): lo que mide la sonda deja crecer el objetivo aunque el codificador no
-    /// lo use. Devuelve el ritmo del tren y lo anota como pendiente.
-    pub fn probe_due(&mut self, now: Instant, refresh_pace: u32) -> Option<u32> {
+    /// Si toca una sonda del techo: cada [`RateController::probe_interval`], a [`PROBE_STEP`]
+    /// veces el techo si el objetivo llega a él (hace falta más) o al ritmo natural del pacing si
+    /// no (para ver si sobra). Sin techo, nunca. Devuelve el ritmo del tren y lo anota como
+    /// pendiente.
+    pub fn probe_due(&mut self, now: Instant) -> Option<u32> {
         let since = |at: Option<Instant>| at.map(|at| now.saturating_duration_since(at));
         if self.probe_pending.is_some()
             || since(self.probe_at).is_some_and(|elapsed| elapsed < self.probe_interval)
         {
             return None;
         }
-        let pace = match self.burst_cap {
-            Some(cap) => {
-                // Sin un recorte pendiente ni pérdida. Si el techo frena (el objetivo está en
-                // él), un paso por encima; si no frena (el objetivo está por debajo por otra
-                // cosa), al ritmo natural del pacing: si el enlace lo pasa, el techo sobra.
-                let quiet = self.last_cut.is_none()
-                    && self.raised.is_none()
-                    && self.loss <= self.inherent_loss + LOSS_GROW / 2.0
-                    && since(self.burst_cut_at).is_none_or(|elapsed| elapsed >= BURST_HOLD * 2);
-                if !quiet {
-                    return None;
-                }
-                let limited =
-                    self.estimate.min(self.loss_estimate) >= 0.9 * cap * BURST_TARGET_SHARE;
-                let step = cap * PROBE_STEP;
-                let raise = cap * (1.0 + (PROBE_STEP - 1.0) / 2.0);
-                if limited && self.train_fails >= TRAIN_FAILS {
-                    // Los trenes no pasan encima del vídeo; si entre el tren y el vídeo pasaba de
-                    // sobra para el techo nuevo, la subida se prueba con el vídeo, recordando el
-                    // techo de antes. Si no, el techo es el del enlace y se espera más.
-                    self.train_fails = 0;
-                    self.probe_at = Some(now);
-                    if self
-                        .train_room
-                        .is_some_and(|room| room >= raise * RAISE_ROOM)
-                    {
-                        self.raised = Some((cap, now));
-                        self.burst_cap = Some(raise);
-                    } else {
-                        self.probe_interval = (self.probe_interval * 2).min(PROBE_MAX_INTERVAL);
-                    }
-                    return None;
-                }
-                let pace = if limited {
-                    step
-                } else {
-                    step.max(self.natural_pace)
-                };
-                pace.round() as u32
+        // Sin techo no hace falta: lo medido al arrancar vale hasta que la congestión lo desmienta,
+        // y un tren en un enlace lento ocupa cientos de milisegundos que el vídeo pasaría
+        // esperando.
+        let cap = self.burst_cap?;
+        let pace = {
+            // Sin un recorte pendiente ni pérdida. Si el techo frena (el objetivo está en
+            // él), un paso por encima; si no frena (el objetivo está por debajo por otra
+            // cosa), al ritmo natural del pacing: si el enlace lo pasa, el techo sobra.
+            let quiet = self.last_cut.is_none()
+                && self.raised.is_none()
+                && self.loss <= self.inherent_loss + LOSS_GROW / 2.0
+                && since(self.burst_cut_at).is_none_or(|elapsed| elapsed >= BURST_HOLD * 2);
+            if !quiet {
+                return None;
             }
-            None => {
-                if since(self.probe_at).is_some_and(|elapsed| elapsed < PROBE_REFRESH) {
-                    return None;
+            let limited = self.estimate.min(self.loss_estimate) >= 0.9 * cap * BURST_TARGET_SHARE;
+            let step = cap * PROBE_STEP;
+            let raise = cap * (1.0 + (PROBE_STEP - 1.0) / 2.0);
+            if limited && self.train_fails >= TRAIN_FAILS {
+                // Los trenes no pasan encima del vídeo; si entre el tren y el vídeo pasaba de
+                // sobra para el techo nuevo, la subida se prueba con el vídeo, recordando el
+                // techo de antes. Si no, el techo es el del enlace y se espera más.
+                self.train_fails = 0;
+                self.probe_at = Some(now);
+                if self
+                    .train_room
+                    .is_some_and(|room| room >= raise * RAISE_ROOM)
+                {
+                    self.raised = Some((cap, now));
+                    self.burst_cap = Some(raise);
+                } else {
+                    self.probe_interval = (self.probe_interval * 2).min(PROBE_MAX_INTERVAL);
                 }
-                // Al ritmo que ya midió (no más): en un enlace que no cambia, el tren no hace
-                // cola ni retrasa el vídeo; solo confirma que lo medido sigue ahí.
-                self.probed.map_or(refresh_pace, |(kbps, _)| {
-                    (kbps.round() as u32).min(refresh_pace)
-                })
+                return None;
+            }
+            if limited {
+                step.round() as u32
+            } else if self.natural_pace > cap {
+                // El objetivo no llega al techo, pero el techo frena el pacing (los
+                // fotogramas salen más repartidos, más tarde): si el enlace pasa el ritmo
+                // natural, el techo sobra.
+                step.max(self.natural_pace).round() as u32
+            } else {
+                // No frena nada: un tren por encima de un limitador se llevaría datagramas
+                // del vídeo para nada.
+                return None;
             }
         };
         self.probe_pending = Some(pace.max(1));
         self.probe_at = Some(now);
         self.train_at = Some(now);
         self.probe_pending
+    }
+
+    /// La congestión con el objetivo en `at` kbit/s desmiente que el enlace pase más: lo medido
+    /// por la sonda se acota ahí, y el objetivo ya no crece por ello hasta otra sonda limpia.
+    fn distrust_probe(&mut self, at: f64) {
+        if let Some((kbps, when)) = self.probed {
+            self.probed = Some((kbps.min(at), when));
+        }
     }
 
     /// Espera actual entre sondas del techo.
@@ -541,15 +540,16 @@ impl RateController {
             // Los de la escalera al arrancar cuentan como la última sonda.
             self.probe_at = Some(now);
         }
-        // El tren va encima del vídeo que ya sale: el enlace pasa lo de los dos.
+        // El tren va encima del vídeo que ya sale: si pasa limpio, el enlace pasa lo de los dos.
+        // Si pierde, el tren llenó el enlace y lo que entregó ya es casi todo lo que pasa (el
+        // vídeo apenas entra entre sus datagramas): sumarle el vídeo lo contaría dos veces.
         let media = self.sent_kbps().unwrap_or(0.0);
-        let streaming = media > 0.1 * delivered.unwrap_or(0.0);
         self.train_room = delivered.map(|kbps| kbps + media);
         if clean {
             let link = pace_f + media;
-            self.probed = Some((link.max(self.probed_kbps(now).unwrap_or(0.0)), now));
+            self.probed = Some((link.max(self.probed_kbps().unwrap_or(0.0)), now));
         } else if let Some(kbps) = delivered {
-            self.probed = Some((kbps.min(pace_f) + media, now));
+            self.probed = Some((kbps.min(pace_f), now));
         }
         match (self.burst_cap, clean) {
             (Some(cap), true) if periodic => {
@@ -570,17 +570,20 @@ impl RateController {
                 self.probe_interval = (self.probe_interval * 2).min(PROBE_MAX_INTERVAL);
                 self.train_fails += 1;
             }
-            (None, false) if !streaming => {
-                // Una sonda que pierde datagramas sin cola (un limitador), antes del vídeo, dice
-                // cuánto pasa: el techo arranca ahí y el objetivo, por debajo. Con vídeo, el
-                // tren solo mide lo que este le deja.
+            (cap, false) if !periodic && (cap.is_none() || self.burst_cut_at.is_none()) => {
+                // Una sonda de la escalera al arrancar que pierde datagramas (un limitador) dice
+                // cuánto pasa: el techo arranca ahí (el mejor de la escalera) y el objetivo, por
+                // debajo. Si el techo ya lo movió la pérdida del vídeo, manda ese.
                 if let Some(kbps) = delivered.filter(|_| lost > 1) {
                     let floor = f64::from(self.config.min_kbps) / BURST_TARGET_SHARE;
-                    let cap = (kbps * 0.95).max(floor);
+                    let cap = (kbps * 0.95).max(floor).max(cap.unwrap_or(0.0));
                     self.burst_cap = Some(cap);
                     self.estimate = self.estimate.min(cap * BURST_TARGET_SHARE);
                     self.loss_estimate = self.loss_estimate.min(cap * BURST_TARGET_SHARE);
                     self.probe_at = Some(now);
+                    // El techo es una medida recién hecha: volver a probar enseguida solo
+                    // costaría datagramas del vídeo.
+                    self.probe_interval = PROBE_INTERVAL * 4;
                 }
             }
             _ => {}
@@ -846,11 +849,11 @@ impl RateController {
         let burst_limit = self
             .burst_cap
             .map_or(f64::INFINITY, |cap| cap * BURST_TARGET_SHARE);
-        // Lo que midió la sonda del enlace (hace poco) también deja crecer: un codificador que
+        // Lo que midió la sonda del enlace también deja crecer: un codificador que
         // solo gasta lo que pide la imagen no llena el enlace, y el objetivo tiene que poder
         // estar por encima para los picos.
         let probed = self
-            .probed_kbps(now)
+            .probed_kbps()
             .map_or(0.0, |kbps| kbps * PROBE_START_SHARE);
         let grow_cap = |from: f64| {
             delivered
@@ -878,12 +881,14 @@ impl RateController {
                 {
                     next = next.min(delivered * DELIVERED_CUT);
                 }
+                self.distrust_probe(self.estimate);
                 self.estimate = next;
                 self.last_adjust = Some(now);
                 self.hold_until = Some(now + HOLD_AFTER_CUT);
             }
         } else if input.ecn_ce > 0 {
             if due(self.last_adjust, ADJUST_PERIOD) {
+                self.distrust_probe(self.estimate);
                 self.estimate *= 0.90;
                 self.last_adjust = Some(now);
                 self.hold_until = Some(now + HOLD_AFTER_CUT);
@@ -907,6 +912,7 @@ impl RateController {
         if self.loss > LOSS_CUT && !burst_pending {
             if due(self.last_loss_cut, LOSS_PERIOD) {
                 let current = self.estimate.min(self.loss_estimate);
+                self.distrust_probe(current);
                 self.loss_estimate = current * (1.0 - 0.5 * self.loss);
                 self.last_loss_cut = Some(now);
             }
@@ -1475,7 +1481,7 @@ mod tests {
             controller.note_pace(natural as u32);
             // Una sonda que pasa del enlace se lleva también un 5 % del vídeo de ese informe.
             let mut collateral = 0.0;
-            if let Some(pace) = controller.probe_due(now, 100_000) {
+            if let Some(pace) = controller.probe_due(now) {
                 // El tren va encima del vídeo que ya sale: le queda lo que el vídeo deja.
                 let pace_f = f64::from(pace);
                 let left = (link - f64::from(*target)).max(1.0);
