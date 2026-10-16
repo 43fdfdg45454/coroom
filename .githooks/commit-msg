@@ -7,3 +7,10 @@ if grep -nE '\b(RTX|GTX|RX) ?[0-9]{3,}|\bArc [AB][0-9]{3}|\bRyzen [0-9] [0-9]{3,
   grep -nE '\b(RTX|GTX|RX) ?[0-9]{3,}|\bArc [AB][0-9]{3}|\bRyzen [0-9] [0-9]{3,}|\bCore i[0-9][ -][0-9]{3,}' "$1" >&2
   exit 1
 fi
+# Los commits no llevan identificadores de IA (CLAUDE.md, «Convenciones»): ni coautoría ni enlaces
+# de sesión ni firmas de herramientas.
+if grep -niE '^(Co-Authored-By|Claude-Session):|Generated with \[?Claude|noreply@anthropic\.com' "$1" >/dev/null; then
+  echo "commit-msg: el mensaje lleva un identificador de IA (regla de commits del CLAUDE.md):" >&2
+  grep -niE '^(Co-Authored-By|Claude-Session):|Generated with \[?Claude|noreply@anthropic\.com' "$1" >&2
+  exit 1
+fi
