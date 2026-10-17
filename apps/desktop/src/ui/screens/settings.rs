@@ -40,8 +40,8 @@ use crate::ui::app::{
 };
 use crate::ui::screens::diagnostics;
 use crate::ui::settings::{
-    DEFAULT_NOTIFICATION_VOLUME, DEFAULT_VOICE_VOLUME, MAX_VOICE_VOLUME, Shortcuts, SoundChoice,
-    SoundEvent, ThemeChoice, VoiceMode, voice_gain,
+    DEFAULT_NOTIFICATION_VOLUME, DEFAULT_VOICE_VOLUME, MAX_VOICE_VOLUME, MotionChoice, Shortcuts,
+    SoundChoice, SoundEvent, ThemeChoice, VoiceMode, voice_gain,
 };
 use crate::ui::tones::Builtin;
 
@@ -234,6 +234,8 @@ pub enum Msg {
     Theme(ThemeChoice),
     /// Acento (`"system"` o una clave).
     Accent(String),
+    /// Animaciones.
+    Motion(MotionChoice),
     /// Comprobar ya si hay una versión nueva.
     CheckUpdates,
     /// Buscar versiones nuevas cada cierto tiempo.
@@ -521,6 +523,8 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             settings.appearance.accent = key;
             app.refresh_theme();
         }
+        // Se aplica al momento: [`App::motion`] lo lee de los ajustes.
+        Msg::Motion(choice) => settings.appearance.motion = choice,
         Msg::CheckUpdates => return app.check_updates(true),
         Msg::UpdateChecks(on) => {
             settings.updates.check = on;
@@ -2025,6 +2029,38 @@ fn appearance(app: &App) -> Element<'_, Message> {
     } else {
         t!("settings-fuente-instalada", family = app.fonts.family)
     };
+    let motion = ui::segmented(vec![
+        (
+            t!("settings-como-el-sistema").to_owned(),
+            on(Msg::Motion(MotionChoice::System)),
+            current.motion == MotionChoice::System,
+        ),
+        (
+            t!("settings-reducidas").to_owned(),
+            on(Msg::Motion(MotionChoice::Reduced)),
+            current.motion == MotionChoice::Reduced,
+        ),
+        (
+            t!("settings-completas").to_owned(),
+            on(Msg::Motion(MotionChoice::Full)),
+            current.motion == MotionChoice::Full,
+        ),
+    ]);
+    let system_motion = app.system.motion();
+    let motion_hint = match current.motion {
+        MotionChoice::System => t!(
+            "settings-sigue-al-sistema",
+            valor = if system_motion.is_off() {
+                t!("settings-ahora-sin-animaciones")
+            } else if system_motion.is_reduced() {
+                t!("settings-ahora-reducidas")
+            } else {
+                t!("settings-ahora-completas")
+            }
+        ),
+        MotionChoice::Reduced => t!("settings-solo-fundidos-cortos").to_owned(),
+        MotionChoice::Full => t!("settings-siempre-completas").to_owned(),
+    };
     column![ui::section(
         t!("settings-apariencia"),
         None,
@@ -2045,6 +2081,7 @@ fn appearance(app: &App) -> Element<'_, Message> {
                 Some(font_hint),
                 icon_with(Icon::Lock, 16.0, SvgClass::Secondary)
             ),
+            ui::pref_row(t!("settings-animaciones"), Some(motion_hint), motion),
         ]
     )]
     .into()
@@ -2439,6 +2476,12 @@ mod tests {
         );
         change(&mut app, Msg::Accent("purple".into()));
         assert_eq!(app.theme.palette.accent, Accent::Purple);
+        assert!(!app.motion().is_reduced());
+        change(&mut app, Msg::Motion(MotionChoice::Reduced));
+        assert!(
+            app.motion().is_reduced(),
+            "las animaciones cambian al momento"
+        );
         change(&mut app, Msg::UpdateInterval(choice(168, "Semana")));
         assert_eq!(app.settings.updates.interval_hours, 168);
         change(&mut app, Msg::UpdateChecks(false));

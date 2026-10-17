@@ -118,6 +118,8 @@ diagnostics-video-total = Vídeo total
 diagnostics-anadido = Añadido de extremo a extremo
 diagnostics-etapas-resumen = Vídeo total { $video } · entrada (ratón → juego) { $input } · añadido de extremo a extremo ≈ { $added }
 diagnostics-etapas-anfitrion = Las etapas del vídeo se miden en el equipo de cada invitado: pídele que copie su informe desde su diagnóstico.
+diagnostics-dibujado-de-la-interfaz = Dibujado de la interfaz en este equipo: { $value } ({ $percentile } de { $draws } dibujos)
+diagnostics-dibujado-de-la-interfaz-vacio = Dibujado de la interfaz en este equipo: todavía sin medir.
 
 ## Servidor y este equipo
 

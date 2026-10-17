@@ -295,6 +295,8 @@ pub(crate) fn base(mode: Mode, fonts: Fonts) -> App {
         mode: Some(mode),
         accent: None,
         font: Some("Inter 11".to_owned()),
+        reduced_motion: None,
+        animation_factor: None,
         source: "portal Settings",
     };
     let now = Instant::now();

@@ -1,16 +1,24 @@
-//! Apariencia del sistema: claro u oscuro, color de acento y fuente del escritorio.
+//! Apariencia del sistema: claro u oscuro, color de acento, fuente del escritorio y movimiento.
 //!
-//! - **Linux**: el portal `org.freedesktop.portal.Settings` (`ashpd`): `color-scheme` y
-//!   `accent-color` de `org.freedesktop.appearance`, y la fuente de `org.gnome.desktop.interface`
-//!   (`font-name`) o de KDE (`org.kde.kdeglobals.General`, `font`); con suscripción a los cambios
-//!   ([`watch`]). Sin portal (sesiones mínimas), el tema que diga `winit`.
+//! - **Linux**: el portal `org.freedesktop.portal.Settings` (`ashpd`): `color-scheme`,
+//!   `accent-color` y `reduced-motion` de `org.freedesktop.appearance`, y la fuente de
+//!   `org.gnome.desktop.interface` (`font-name`) o de KDE (`org.kde.kdeglobals.General`, `font`);
+//!   con suscripción a los cambios ([`watch`]). El movimiento reducido también cuenta si GNOME
+//!   tiene las animaciones quitadas (`enable-animations` de `org.gnome.desktop.interface`), y el
+//!   factor de duración es el `AnimationDurationFactor` de KDE (`org.kde.kdeglobals.KDE` por el
+//!   portal o, en KDE, la sección `[KDE]` de `kdeglobals`). Sin portal (sesiones mínimas), el tema
+//!   que diga `winit`.
 //! - **Windows**: el registro (`winreg`): `AppsUseLightTheme` de
 //!   `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize` y `AccentColorMenu` de
-//!   `HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Accent`; los cambios llegan con el
-//!   `ThemeChanged` de la ventana, que hace releerlo.
+//!   `HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Accent`, y «Mostrar animaciones»
+//!   con `SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION)`; se relee con el `ThemeChanged` de
+//!   la ventana y al volverle el foco ([`reread_on_focus`]): ese ajuste se cambia fuera de la app.
+//!
+//! Lo que el sistema no dice cuenta como movimiento completo con las duraciones de siempre.
 //!
 //! El `cfg(target_os)` solo vive aquí dentro (`CLAUDE.md`, convenciones).
 
+use coroom_ui::motion::Motion;
 use coroom_ui::theme::{Accent, Mode};
 
 /// Lo que dice el sistema.
@@ -22,8 +30,22 @@ pub struct SystemAppearance {
     pub accent: Option<Accent>,
     /// Fuente de la interfaz del escritorio (`"Cantarell 11"`).
     pub font: Option<String>,
+    /// Si pide movimiento reducido (`None`: no lo dice).
+    pub reduced_motion: Option<bool>,
+    /// Factor de duración de las animaciones (KDE; `None`: no lo dice).
+    pub animation_factor: Option<f32>,
     /// De dónde salió (para Ajustes → Apariencia).
     pub source: &'static str,
+}
+
+impl SystemAppearance {
+    /// Movimiento que pide el sistema (lo que no dice, completo y con factor 1).
+    pub fn motion(&self) -> Motion {
+        Motion::new(
+            self.reduced_motion.unwrap_or(false),
+            self.animation_factor.unwrap_or(1.0),
+        )
+    }
 }
 
 /// Lee la apariencia del sistema (bloquea un momento: una consulta por D-Bus o al registro).
@@ -59,6 +81,12 @@ pub fn watch(on_change: Box<dyn Fn(SystemAppearance) + Send>) -> bool {
     }
 }
 
+/// Si la apariencia hay que releerla al volver el foco a la ventana: donde [`watch`] no avisa de
+/// los cambios (Windows informa «Mostrar animaciones» con un mensaje que la ventana no recibe).
+pub fn reread_on_focus() -> bool {
+    !cfg!(target_os = "linux")
+}
+
 /// Identificador de la aplicación para el escritorio: el del Flatpak y el nombre del `.desktop`
 /// (`packaging/flatpak/`). Sigue la convención de Flathub para proyectos de GitHub,
 /// `io.github.<usuario>.<repositorio>`, con un `_` delante del usuario porque ningún componente de
@@ -88,7 +116,7 @@ pub fn window_attributes(
 mod portal {
     use std::time::Duration;
 
-    use ashpd::desktop::settings::{ColorScheme, Settings};
+    use ashpd::desktop::settings::{ColorScheme, ReducedMotion, Settings};
     use coroom_ui::theme::{Accent, Mode};
     use futures_util::StreamExt;
 
@@ -98,6 +126,11 @@ mod portal {
     const TIMEOUT: Duration = Duration::from_secs(2);
 
     const APPEARANCE: &str = "org.freedesktop.appearance";
+    const GNOME_INTERFACE: &str = "org.gnome.desktop.interface";
+    const KDE_GLOBALS: &str = "org.kde.kdeglobals.KDE";
+    const KDE_FACTOR: &str = "AnimationDurationFactor";
+    /// Claves de fuera de `org.freedesktop.appearance` que cambian lo que se lee.
+    const WATCHED_KEYS: [&str; 4] = ["font-name", "font", "enable-animations", KDE_FACTOR];
 
     fn runtime() -> Option<tokio::runtime::Runtime> {
         tokio::runtime::Builder::new_current_thread()
@@ -123,10 +156,7 @@ mod portal {
                     .all(|channel| (0.0..=1.0).contains(channel))
             })
             .map(|color| Accent::from_unit(color.red(), color.green(), color.blue()));
-        let font = match settings
-            .read::<String>("org.gnome.desktop.interface", "font-name")
-            .await
-        {
+        let font = match settings.read::<String>(GNOME_INTERFACE, "font-name").await {
             Ok(font) => Some(font),
             Err(_) => settings
                 .read::<String>("org.kde.kdeglobals.General", "font")
@@ -137,8 +167,62 @@ mod portal {
             mode,
             accent,
             font,
+            reduced_motion: reduced_motion(settings).await,
+            animation_factor: animation_factor(settings).await,
             source: "portal Settings",
         }
+    }
+
+    /// `reduced-motion` del portal, o GNOME con las animaciones quitadas (cualquiera de los dos
+    /// basta; `None` si ninguno lo dice).
+    async fn reduced_motion(settings: &Settings) -> Option<bool> {
+        let standard = settings
+            .reduced_motion()
+            .await
+            .ok()
+            .map(|motion| motion == ReducedMotion::ReducedMotion);
+        let gnome = settings
+            .read::<bool>(GNOME_INTERFACE, "enable-animations")
+            .await
+            .ok()
+            .map(|enabled| !enabled);
+        match (standard, gnome) {
+            (None, None) => None,
+            (standard, gnome) => Some(standard.unwrap_or(false) || gnome.unwrap_or(false)),
+        }
+    }
+
+    /// `AnimationDurationFactor` de KDE: por el portal (como texto, que es como lo da el de KDE,
+    /// o como número) o, en una sesión de KDE sin él, del fichero `kdeglobals`.
+    async fn animation_factor(settings: &Settings) -> Option<f32> {
+        let portal = match settings.read::<String>(KDE_GLOBALS, KDE_FACTOR).await {
+            Ok(text) => text.trim().parse::<f32>().ok(),
+            Err(_) => settings
+                .read::<f64>(KDE_GLOBALS, KDE_FACTOR)
+                .await
+                .ok()
+                .map(|factor| factor as f32),
+        };
+        portal.or_else(kdeglobals_factor)
+    }
+
+    /// El factor de `$XDG_CONFIG_HOME/kdeglobals` (o `~/.config/kdeglobals`), solo en KDE.
+    fn kdeglobals_factor() -> Option<f32> {
+        let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+        if !desktop
+            .split(':')
+            .any(|name| name.eq_ignore_ascii_case("KDE"))
+        {
+            return None;
+        }
+        let config = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|dir| !dir.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".config"))
+            })?;
+        let text = std::fs::read_to_string(config.join("kdeglobals")).ok()?;
+        super::factor_from_kdeglobals(&text)
     }
 
     pub(super) fn read() -> SystemAppearance {
@@ -177,8 +261,7 @@ mod portal {
                     };
                     while let Some(change) = changes.next().await {
                         let relevant = change.namespace() == APPEARANCE
-                            || change.key() == "font-name"
-                            || change.key() == "font";
+                            || WATCHED_KEYS.contains(&change.key());
                         if relevant {
                             on_change(current(&settings).await);
                         }
@@ -217,7 +300,80 @@ mod registry {
             mode,
             accent,
             font: Some("Segoe UI Variable Text".to_owned()),
+            reduced_motion: client_area_animation().map(|enabled| !enabled),
+            animation_factor: None,
             source: t!("system-registro-de-windows"),
         }
+    }
+
+    /// «Mostrar animaciones en Windows» (Accesibilidad → Efectos visuales).
+    #[allow(unsafe_code)]
+    fn client_area_animation() -> Option<bool> {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+        };
+        use windows::core::BOOL;
+
+        let mut enabled = BOOL::default();
+        // SAFETY: con `SPI_GETCLIENTAREAANIMATION`, `uiparam` es 0 y `pvparam` apunta a un `BOOL`
+        // en el que escribe; `enabled` vive en este marco hasta después de la llamada.
+        let read = unsafe {
+            SystemParametersInfoW(
+                SPI_GETCLIENTAREAANIMATION,
+                0,
+                Some((&raw mut enabled).cast()),
+                SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            )
+        };
+        read.ok().map(|()| enabled.as_bool())
+    }
+}
+
+/// `AnimationDurationFactor` de la sección `[KDE]` de un `kdeglobals` (formato INI de KConfig).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn factor_from_kdeglobals(text: &str) -> Option<f32> {
+    let mut in_kde = false;
+    for line in text.lines().map(str::trim) {
+        if let Some(group) = line.strip_prefix('[') {
+            in_kde = group.strip_suffix(']') == Some("KDE");
+        } else if in_kde
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim() == "AnimationDurationFactor"
+        {
+            return value.trim().parse().ok();
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_values_mean_full_motion() {
+        assert_eq!(SystemAppearance::default().motion(), Motion::FULL);
+        let reduced = SystemAppearance {
+            reduced_motion: Some(true),
+            animation_factor: Some(0.5),
+            ..SystemAppearance::default()
+        };
+        assert!(reduced.motion().is_reduced());
+        assert_eq!(reduced.motion().factor(), 0.5);
+    }
+
+    #[test]
+    fn the_kde_factor_comes_from_its_section() {
+        let text = "[General]\nAnimationDurationFactor=3\n\n[KDE]\nLookAndFeelPackage=x\nAnimationDurationFactor=0.5\n";
+        assert_eq!(factor_from_kdeglobals(text), Some(0.5));
+        assert_eq!(
+            factor_from_kdeglobals("[KDE]\nAnimationDurationFactor = 0\n"),
+            Some(0.0)
+        );
+        assert_eq!(
+            factor_from_kdeglobals("[General]\nAnimationDurationFactor=2\n"),
+            None
+        );
+        assert_eq!(factor_from_kdeglobals(""), None);
     }
 }

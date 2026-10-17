@@ -68,7 +68,8 @@ use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
 use super::app::{App, Effect, Message, Screen, Shortcut};
 use super::backend::{Backend, GuestControls, Notify};
-use super::compose::Compositor;
+use super::compose::{Compositor, Present};
+use super::pacing::{self, FrameClock, NextFrame};
 use super::screens::chat;
 use super::screens::guest::{self, Phase};
 use super::screens::settings as settings_screen;
@@ -152,6 +153,13 @@ struct Ready {
     /// Mientras se mira o se comparte una transmisión, el escritorio no se bloquea
     /// ([`App::wants_idle_inhibit`]).
     idle_inhibit: Option<crate::inhibit::IdleInhibitor>,
+    /// Quién marca el ritmo de los cuadros de animación ([`pacing`]).
+    clock: FrameClock,
+    /// Cuándo empezó el último dibujo.
+    last_frame: Instant,
+    /// Si la interfaz quedó esperando al vídeo ([`Present::WithVideo`]) y el vídeo no llegó para
+    /// entonces, se dibuja sola.
+    video_fallback: Option<Instant>,
 }
 
 /// Lo que devolvió una pasada de la interfaz ([`Ready::pass`]).
@@ -400,6 +408,7 @@ impl Runner {
             }
         }
         let clipboard = Clipboard::connect(Arc::clone(&window));
+        let clock = frame_clock(&window);
         Ok(Ready {
             window,
             compositor,
@@ -424,6 +433,9 @@ impl Runner {
             quit: false,
             pending: Vec::new(),
             idle_inhibit: None,
+            clock,
+            last_frame: Instant::now(),
+            video_fallback: None,
         })
     }
 }
@@ -906,8 +918,17 @@ impl Ready {
                     input.capture.set_window_size(size.width, size.height);
                 }
             }
-            WindowEvent::ScaleFactorChanged { .. } => self.resized = true,
-            WindowEvent::Focused(focused) => self.dispatch(Message::WindowFocused(*focused)),
+            WindowEvent::ScaleFactorChanged { .. } => {
+                self.resized = true;
+                self.reread_monitor();
+            }
+            WindowEvent::Moved(_) => self.reread_monitor(),
+            WindowEvent::Focused(focused) => {
+                self.dispatch(Message::WindowFocused(*focused));
+                if *focused && system::reread_on_focus() {
+                    self.reread_appearance(self.window.theme());
+                }
+            }
             WindowEvent::Occluded(hidden) => self.dispatch(Message::WindowOccluded(*hidden)),
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
@@ -935,16 +956,7 @@ impl Ready {
                 }
             }
             WindowEvent::CursorLeft { .. } => self.cursor = mouse::Cursor::Unavailable,
-            WindowEvent::ThemeChanged(theme) => {
-                let mut appearance = system::read();
-                if appearance.mode.is_none() {
-                    appearance.mode = Some(match theme {
-                        winit::window::Theme::Dark => coroom_ui::theme::Mode::Dark,
-                        winit::window::Theme::Light => coroom_ui::theme::Mode::Light,
-                    });
-                }
-                self.dispatch(Message::System(appearance));
-            }
+            WindowEvent::ThemeChanged(theme) => self.reread_appearance(Some(*theme)),
             _ => {}
         }
 
@@ -1137,12 +1149,13 @@ impl Ready {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        self.last_frame = now;
         self.apply_hdr();
         self.apply_vsync();
         if self.resized {
             self.reconfigure();
         }
-        let now = Instant::now();
         self.app.now = now;
         let effects = self.app.update(Message::Tick);
         self.run_effects(effects);
@@ -1173,13 +1186,32 @@ impl Ready {
             self.apply_state(pass.state.take());
         }
         // La interfaz va a su textura (transparente donde no dibuja nada: el vídeo se ve
-        // debajo) y el compositor la pone sobre el fondo y el vídeo y entrega.
+        // debajo) y el compositor la pone sobre el fondo y el vídeo y entrega; con el vídeo
+        // delante y llegando, la entrega el próximo fotograma ([`Present::WithVideo`]).
+        let video = if self.app.video_in_front() {
+            self.compositor.video_interval(now)
+        } else {
+            None
+        };
+        let present = if video.is_some() {
+            Present::WithVideo
+        } else {
+            Present::Now
+        };
         let format = self.render_format;
         let renderer = &mut self.renderer;
         let viewport = &self.viewport;
-        self.compositor.draw_ui(self.app.backdrop(), |target| {
-            let _ = renderer.present(Some(Color::TRANSPARENT), format, target, viewport);
-        });
+        let window = &self.window;
+        self.compositor.draw_ui(
+            self.app.backdrop(),
+            present,
+            |target| {
+                let _ = renderer.present(Some(Color::TRANSPARENT), format, target, viewport);
+            },
+            // En Wayland, el siguiente `RedrawRequested` espera la señal de cuadro del compositor.
+            || window.pre_present_notify(),
+        );
+        self.app.ui_draws.record(now.elapsed());
         if !pass.messages.is_empty() {
             for message in pass.messages {
                 self.dispatch(message);
@@ -1187,8 +1219,67 @@ impl Ready {
             self.window.request_redraw();
         }
         self.set_composing(pass.typing);
-        if self.app.animating() {
-            self.window.request_redraw();
+        self.schedule_frame(now, video);
+    }
+
+    /// Pide el siguiente cuadro de animación al ritmo del compositor ([`pacing`]), si algo se
+    /// mueve. Con el teclado y el ratón tomados o en modo inmersivo no se anima nada: se leen en
+    /// este mismo hilo; con la ventana oculta, tampoco. Un dibujo que quedó esperando al vídeo
+    /// (`video`) sale solo si el vídeo se detiene.
+    fn schedule_frame(&mut self, now: Instant, video: Option<Duration>) {
+        let animating = self.app.animating() && !self.input_taken() && !self.app.window_hidden;
+        if !animating && video.is_none() {
+            return;
+        }
+        let next = pacing::next_frame(
+            self.clock,
+            now,
+            self.last_frame,
+            video,
+            pacing::desktop_vblank,
+        );
+        match next {
+            NextFrame::Request => self.window.request_redraw(),
+            NextFrame::At(at) => self.redraw_at(at),
+            NextFrame::WithVideo { fallback } => {
+                if animating {
+                    self.compositor.want_ui_frame();
+                }
+                self.video_fallback = Some(fallback);
+            }
+            NextFrame::Never => {}
+        }
+    }
+
+    fn redraw_at(&mut self, at: Instant) {
+        self.redraw_at = Some(self.redraw_at.map_or(at, |old| old.min(at)));
+    }
+
+    /// Si el invitado tiene el teclado y el ratón tomados o está en modo inmersivo.
+    fn input_taken(&self) -> bool {
+        self.input
+            .as_ref()
+            .is_some_and(|input| input.capture.grabbed())
+            || self.app.guest.as_ref().is_some_and(|guest| guest.immersive)
+    }
+
+    /// Vuelve a leer la apariencia del sistema; `theme` es el modo que da la ventana si el sistema
+    /// no lo informa.
+    fn reread_appearance(&mut self, theme: Option<winit::window::Theme>) {
+        let mut appearance = system::read();
+        if appearance.mode.is_none() {
+            appearance.mode = theme.map(|theme| match theme {
+                winit::window::Theme::Dark => coroom_ui::theme::Mode::Dark,
+                winit::window::Theme::Light => coroom_ui::theme::Mode::Light,
+            });
+        }
+        self.dispatch(Message::System(appearance));
+    }
+
+    /// El monitor de la ventana pudo cambiar: con [`FrameClock::Monitor`], su período de nuevo.
+    fn reread_monitor(&mut self) {
+        if let FrameClock::Monitor(_) = self.clock {
+            self.clock = FrameClock::Monitor(monitor_period(&self.window));
         }
     }
 
@@ -1217,9 +1308,7 @@ impl Ready {
         }
         match redraw_request {
             window::RedrawRequest::NextFrame => self.window.request_redraw(),
-            window::RedrawRequest::At(at) => {
-                self.redraw_at = Some(self.redraw_at.map_or(at, |old| old.min(at)));
-            }
+            window::RedrawRequest::At(at) => self.redraw_at(at),
             window::RedrawRequest::Wait => {}
         }
         self.input_method(input_method);
@@ -1265,6 +1354,7 @@ impl Ready {
             }
         };
         consider(self.redraw_at);
+        consider(self.video_fallback);
         if self.input.is_some() {
             consider(Some(self.next_sync));
         }
@@ -1273,20 +1363,40 @@ impl Ready {
 }
 
 impl ApplicationHandler<UserEvent> for Runner {
-    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         let Some(ready) = self.ready.as_mut() else {
             return;
         };
         if let StartCause::ResumeTimeReached { .. } = cause {
             let now = Instant::now();
+            // Si lo único que tocaba era el respaldo del vídeo y el vídeo ya entregó la interfaz,
+            // no hay nada que dibujar.
+            let mut redraw = ready.app.next_tick().is_some_and(|at| at <= now);
             if ready.redraw_at.is_some_and(|at| at <= now) {
                 ready.redraw_at = None;
+                redraw = true;
+            }
+            if ready.video_fallback.is_some_and(|at| at <= now) {
+                ready.video_fallback = None;
+                redraw |= ready.compositor.ui_pending();
             }
             if ready.input.is_some() && now >= ready.next_sync {
                 ready.next_sync = now + INPUT_SYNC;
                 ready.sync_input();
+                redraw = true;
             }
-            ready.window.request_redraw();
+            // Los plazos de la aplicación corren aunque la ventana no dibuje (oculta, el
+            // compositor no manda su señal de cuadro): el `Tick` va aquí, no solo al dibujar.
+            ready.app.now = now;
+            let effects = ready.app.update(Message::Tick);
+            ready.run_effects(effects);
+            if ready.should_exit() {
+                event_loop.exit();
+                return;
+            }
+            if redraw {
+                ready.window.request_redraw();
+            }
         }
     }
 
@@ -1379,6 +1489,31 @@ impl ApplicationHandler<UserEvent> for Runner {
             self.result = ready.backend.shutdown();
         }
     }
+}
+
+/// Quién marca el ritmo de las animaciones en esta ventana ([`pacing`]).
+fn frame_clock(window: &Window) -> FrameClock {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let wayland = window
+        .window_handle()
+        .is_ok_and(|handle| matches!(handle.as_raw(), RawWindowHandle::Wayland(_)));
+    if wayland {
+        FrameClock::Compositor
+    } else if cfg!(target_os = "windows") {
+        FrameClock::Desktop
+    } else {
+        FrameClock::Monitor(monitor_period(window))
+    }
+}
+
+/// Período del monitor en el que está la ventana, si lo informa.
+fn monitor_period(window: &Window) -> Option<Duration> {
+    FrameClock::period(
+        window
+            .current_monitor()
+            .and_then(|monitor| monitor.refresh_rate_millihertz()),
+    )
 }
 
 #[cfg(test)]

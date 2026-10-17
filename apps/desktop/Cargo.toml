@@ -50,14 +50,20 @@ futures-util.workspace = true
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg.workspace = true
 # `Win32_Media_Audio`: `PlaySound` para el tono del chat; `Win32_UI_Shell` y `Win32_System_Com`:
-# el diálogo de abrir fichero para elegirlo.
+# el diálogo de abrir fichero para elegirlo; `Win32_Graphics_Dwm` y `Win32_System_Performance`: el
+# vblank del compositor de escritorio, que marca el ritmo de las animaciones;
+# `Win32_UI_WindowsAndMessaging`: «Mostrar animaciones» (`SystemParametersInfoW`), el movimiento
+# reducido.
 windows = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_Media_Audio",
     "Win32_System_Com",
+    "Win32_System_Performance",
     "Win32_System_Power",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dev-dependencies]

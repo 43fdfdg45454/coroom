@@ -21,9 +21,17 @@
 //! hilo de `present` llega a esperar al de la ventana, y nunca a que la interfaz se reconstruya.
 //! Dentro del dibujo de la interfaz nadie vuelve a llamar al compositor ([`VideoFeed::set_area`]
 //! solo anota el área).
+//!
+//! Con el vídeo llegando, la interfaz no agrega cuadros: [`Present::WithVideo`] deja su textura
+//! lista sin componer y el próximo fotograma la entrega junto con él; si la ventana quiere otro
+//! cuadro de animación ([`Compositor::want_ui_frame`]), ese fotograma la despierta
+//! ([`Compositor::present_video`]). [`Compositor::video_interval`] dice si el vídeo sigue
+//! llegando, medido con su propio ritmo.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::time::{Duration, Instant};
 
 use coroom_render::hdr::{HDR_FORMAT, HdrOutput};
 use coroom_render::layer::VideoLayer;
@@ -66,6 +74,22 @@ struct Inner {
     low_latency_mode: wgpu::PresentMode,
     /// Sincronización vertical pedida (`Fifo`, que toda superficie admite).
     vsync: bool,
+    /// La interfaz se dibujó con [`Present::WithVideo`] y todavía no salió en ningún fotograma.
+    ui_pending: bool,
+    /// Cuándo se compuso el último fotograma de vídeo y el intervalo medio entre fotogramas
+    /// (media exponencial), para saber si el vídeo sigue llegando.
+    last_video: Option<Instant>,
+    video_interval: Option<Duration>,
+}
+
+/// Cómo sale a la pantalla un dibujo de la interfaz ([`Compositor::draw_ui`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Present {
+    /// Se compone y se entrega ya.
+    Now,
+    /// Queda lista y la entrega el próximo fotograma de vídeo: con el vídeo llegando, la interfaz
+    /// no agrega cuadros propios.
+    WithVideo,
 }
 
 /// El compositor de la ventana (ver el módulo). Se comparte entre la ventana y las fuentes de
@@ -76,6 +100,8 @@ pub struct Compositor {
     inner: Mutex<Inner>,
     /// Orden de las entregas a la cola (ver el módulo). Se toma después de `inner`, nunca antes.
     submit: Mutex<()>,
+    /// La ventana quiere otro cuadro de animación con el próximo fotograma de vídeo.
+    ui_frame_wanted: AtomicBool,
 }
 
 impl std::fmt::Debug for Compositor {
@@ -123,8 +149,12 @@ impl Compositor {
                 presented: 0,
                 low_latency_mode: setup.config.present_mode,
                 vsync: false,
+                ui_pending: false,
+                last_video: None,
+                video_interval: None,
             }),
             submit: Mutex::new(()),
+            ui_frame_wanted: AtomicBool::new(false),
         })
     }
 
@@ -218,9 +248,17 @@ impl Compositor {
     /// Dibuja la interfaz: `draw` recibe la vista de la textura trasera de la interfaz (limpiarla
     /// a transparente y dibujar encima) **sin el candado del compositor** (el hilo de `present`
     /// sigue componiendo la delantera mientras tanto) y, después, las texturas se intercambian y
-    /// se compone con el vídeo y se entrega. `background` es el fondo bajo la interfaz y el vídeo.
-    /// `draw` no debe llamar al compositor.
-    pub fn draw_ui(&self, background: Color, draw: impl FnOnce(&wgpu::TextureView)) {
+    /// se compone con el vídeo y se entrega (o, con [`Present::WithVideo`], la entrega el próximo
+    /// fotograma). `background` es el fondo bajo la interfaz y el vídeo. `draw` no debe llamar al
+    /// compositor; `before_present` se llama justo antes de entregar la imagen con la interfaz
+    /// (la ventana avisa así al sistema de ventanas, que marca el ritmo del siguiente cuadro).
+    pub fn draw_ui(
+        &self,
+        background: Color,
+        present: Present,
+        draw: impl FnOnce(&wgpu::TextureView),
+        before_present: impl FnOnce(),
+    ) {
         let (view, size) = {
             let mut inner = self.lock();
             let size = (inner.config.width, inner.config.height);
@@ -250,13 +288,52 @@ impl Compositor {
                 ui.drawn = true;
             }
         }
-        self.composite(&mut inner);
+        match present {
+            Present::Now => self.composite(&mut inner, Some(before_present)),
+            Present::WithVideo => inner.ui_pending = true,
+        }
     }
 
-    /// Llegó un fotograma a alguna fuente: compone y entrega sin esperar a la interfaz.
-    pub fn present_video(&self) {
+    /// Llegó un fotograma a alguna fuente (`frame`; si no, cambió solo el cursor): compone y
+    /// entrega sin esperar a la interfaz. Devuelve si la ventana pidió un cuadro de animación con
+    /// él ([`Compositor::want_ui_frame`]).
+    pub fn present_video(&self, frame: bool) -> bool {
         let mut inner = self.lock();
-        self.composite(&mut inner);
+        if frame {
+            let now = Instant::now();
+            if let Some(last) = inner.last_video {
+                let gap = now.saturating_duration_since(last);
+                inner.video_interval = Some(match inner.video_interval {
+                    // El vídeo se había detenido: el hueco no es su ritmo.
+                    Some(mean) if gap > mean * 2 => mean,
+                    Some(mean) => (mean * 7 + gap) / 8,
+                    None => gap,
+                });
+            }
+            inner.last_video = Some(now);
+        }
+        self.composite(&mut inner, None::<fn()>);
+        self.ui_frame_wanted.swap(false, Ordering::AcqRel)
+    }
+
+    /// El intervalo medio del vídeo si sigue llegando en `now`: algún fotograma en el doble de
+    /// ese intervalo. `None` sin vídeo o si se detuvo.
+    pub fn video_interval(&self, now: Instant) -> Option<Duration> {
+        let inner = self.lock();
+        let interval = inner.video_interval?;
+        let last = inner.last_video?;
+        (now.saturating_duration_since(last) <= interval * 2).then_some(interval)
+    }
+
+    /// Que el próximo fotograma de vídeo despierte a la ventana para el siguiente cuadro de
+    /// animación (ver [`Compositor::present_video`]).
+    pub fn want_ui_frame(&self) {
+        self.ui_frame_wanted.store(true, Ordering::Release);
+    }
+
+    /// Si la interfaz quedó dibujada con [`Present::WithVideo`] y todavía no salió.
+    pub fn ui_pending(&self) -> bool {
+        self.lock().ui_pending
     }
 
     fn make_ui_texture(&self, inner: &Inner, size: (u32, u32)) -> UiTexture {
@@ -288,7 +365,7 @@ impl Compositor {
     /// Fondo, capas de vídeo e interfaz a la superficie (y el aviso a las fuentes de que su
     /// fotograma ya salió). Si la superficie no da imagen (ventana oculta), no se avisa a las
     /// fuentes: su fotograma no se mostró y el pipeline lo cuenta como descarte.
-    fn composite(&self, inner: &mut Inner) {
+    fn composite(&self, inner: &mut Inner, before_present: Option<impl FnOnce()>) {
         if inner.outdated {
             inner.surface.configure(&self.device, &inner.config);
             inner.outdated = false;
@@ -378,8 +455,12 @@ impl Compositor {
             output.composite(&mut encoder, &surface_view);
         }
         self.queue.submit([encoder.finish()]);
+        if let Some(before_present) = before_present {
+            before_present();
+        }
         self.queue.present(frame);
         inner.presented += 1;
+        inner.ui_pending = false;
         for feed in &feeds {
             feed.commit_shown();
         }

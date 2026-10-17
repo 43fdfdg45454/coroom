@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use coroom_session::input::gamepad::PadChoice;
+use coroom_ui::motion::Motion;
 use serde::{Deserialize, Serialize};
 
 use super::tones::Builtin;
@@ -30,6 +31,33 @@ pub enum ThemeChoice {
     Dark,
 }
 
+/// Animaciones pedidas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MotionChoice {
+    /// Las que pida el sistema (movimiento reducido y factor de duración).
+    #[default]
+    System,
+    /// Reducidas: fundidos cortos, sin desplazamientos, escalas ni escalonados.
+    Reduced,
+    /// Completas, aunque el sistema pida menos.
+    Full,
+}
+
+impl MotionChoice {
+    /// El movimiento efectivo con lo que pide el sistema. El factor de duración del sistema se
+    /// respeta en los tres casos, salvo con «Completas» si el sistema las quita del todo (factor
+    /// 0): entonces van con sus duraciones.
+    pub fn apply(self, system: Motion) -> Motion {
+        match self {
+            Self::System => system,
+            Self::Reduced => system.with_reduced(true),
+            Self::Full if system.is_off() => Motion::FULL,
+            Self::Full => system.with_reduced(false),
+        }
+    }
+}
+
 /// Apariencia.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -38,6 +66,8 @@ pub struct Appearance {
     pub theme: ThemeChoice,
     /// Acento: `"system"` o una clave de [`coroom_ui::theme::Accent::key`].
     pub accent: String,
+    /// Animaciones: las del sistema, reducidas o completas.
+    pub motion: MotionChoice,
 }
 
 impl Default for Appearance {
@@ -45,6 +75,7 @@ impl Default for Appearance {
         Self {
             theme: ThemeChoice::System,
             accent: "system".to_owned(),
+            motion: MotionChoice::System,
         }
     }
 }
@@ -1088,6 +1119,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.appearance.theme = ThemeChoice::Dark;
         settings.appearance.accent = "teal".into();
+        settings.appearance.motion = MotionChoice::Reduced;
         settings.video.fps = 120;
         settings.video.codec = CodecChoice::Av1;
         settings.video.max_resolution = Resolution::P1440;
@@ -1127,6 +1159,7 @@ mod tests {
         settings.save(&path).expect("guardar");
         let text = std::fs::read_to_string(&path).expect("leer");
         assert!(text.contains("theme = \"dark\""), "{text}");
+        assert!(text.contains("motion = \"reduced\""), "{text}");
         assert!(
             text.contains("file = \"/home/ana/sonidos/tono.ogg\""),
             "{text}"
@@ -1144,6 +1177,48 @@ mod tests {
         let (loaded, warning) = Settings::load(&path);
         assert_eq!(warning, None);
         assert_eq!(loaded, settings);
+    }
+
+    /// Los ajustes de antes de las animaciones cargan con «Como el sistema».
+    #[test]
+    fn the_motion_choice_defaults_to_the_system() {
+        let dir = tempfile::tempdir().expect("directorio");
+        let path = path_in(dir.path());
+        std::fs::write(&path, "[appearance]\ntheme = \"dark\"\naccent = \"teal\"\n")
+            .expect("escribir");
+        let (loaded, warning) = Settings::load(&path);
+        assert_eq!(warning, None);
+        assert_eq!(loaded.appearance.theme, ThemeChoice::Dark);
+        assert_eq!(loaded.appearance.motion, MotionChoice::System);
+        for choice in [
+            MotionChoice::Full,
+            MotionChoice::Reduced,
+            MotionChoice::System,
+        ] {
+            let mut settings = loaded.clone();
+            settings.appearance.motion = choice;
+            settings.save(&path).expect("guardar");
+            assert_eq!(Settings::load(&path).0.appearance.motion, choice);
+        }
+    }
+
+    #[test]
+    fn the_motion_choice_combines_with_the_system() {
+        let kde_slow = Motion::new(false, 2.0);
+        let reduced = Motion::REDUCED;
+        assert_eq!(MotionChoice::System.apply(Motion::FULL), Motion::FULL);
+        assert_eq!(MotionChoice::System.apply(reduced), reduced);
+        assert_eq!(MotionChoice::System.apply(Motion::OFF), Motion::OFF);
+        // Reducidas: aunque el sistema no lo pida, y con su factor.
+        assert_eq!(
+            MotionChoice::Reduced.apply(kde_slow),
+            Motion::new(true, 2.0)
+        );
+        assert!(MotionChoice::Reduced.apply(Motion::FULL).is_reduced());
+        // Completas: aunque el sistema pida reducidas; con factor 0, las de siempre.
+        assert_eq!(MotionChoice::Full.apply(reduced), Motion::FULL);
+        assert_eq!(MotionChoice::Full.apply(kde_slow), kde_slow);
+        assert_eq!(MotionChoice::Full.apply(Motion::OFF), Motion::FULL);
     }
 
     /// El temporal del guardado va junto a los ajustes, lleva el pid y no sobrevive al guardado.

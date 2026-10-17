@@ -238,6 +238,15 @@ settings-fuente = Fuente
 settings-fuente-del-escritorio = { $family }, la de tu escritorio. coroom usa siempre la del sistema: cámbiala en los ajustes del escritorio.
 settings-fuente-incluida = { $family }, incluida con coroom: no se encontró la de tu escritorio.
 settings-fuente-instalada = { $family }, instalada en el sistema: el escritorio no dice cuál usa.
+settings-animaciones = Animaciones
+settings-como-el-sistema = Como el sistema
+settings-reducidas = Reducidas
+settings-completas = Completas
+settings-ahora-completas = ahora completas
+settings-ahora-reducidas = ahora reducidas
+settings-ahora-sin-animaciones = ahora sin animaciones
+settings-solo-fundidos-cortos = Solo fundidos cortos, sin desplazamientos ni escalas
+settings-siempre-completas = Siempre completas, aunque el sistema pida menos
 
 ## Acerca de
 settings-version-y-protocolo = Versión { $version } · protocolo { $protocol }

@@ -171,8 +171,10 @@ impl VideoFeed {
     /// Compone y entrega ya lo que haya (el fotograma de siempre con el cursor nuevo), si la
     /// fuente está en la ventana.
     pub(super) fn present_now(&self) {
-        if let Some(compositor) = self.compositor() {
-            compositor.present_video();
+        if let Some(compositor) = self.compositor()
+            && compositor.present_video(false)
+        {
+            (self.wake)();
         }
     }
 
@@ -211,8 +213,9 @@ impl VideoFeed {
         };
         match self.compositor() {
             Some(compositor) => {
-                compositor.present_video();
-                if layout_changed {
+                // Despierta a la ventana si cambió algo que le importa o si espera este fotograma
+                // para su siguiente cuadro de animación.
+                if compositor.present_video(true) || layout_changed {
                     (self.wake)();
                 }
             }

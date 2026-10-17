@@ -6,12 +6,14 @@
 //! sistema. Módulos:
 //!
 //! - [`avatar`]: avatares con imagen (o iniciales) y el indicador de quién habla.
-//! - [`tokens`]: espaciado (4-32), radios (8, 12, 16), escala tipográfica, tamaños y duraciones.
+//! - [`tokens`]: espaciado (4-32), radios (8, 12, 16), escala tipográfica, tamaños y movimiento.
 //! - [`theme`]: [`theme::Palette`] (los únicos colores fijos del código) con contraste AA
 //!   garantizado para cualquier acento, y utilidades de contraste WCAG.
 //! - [`style`]: [`Theme`] y los catálogos de estilo de los *widgets* de `iced` con clases propias.
 //! - [`font`]: fuente del escritorio o Inter embebida; monoespaciada para códigos y huellas.
 //! - [`icon`]: iconos de Lucide (ISC) monocromos.
+//! - [`motion`]: animaciones en función del tiempo con la preferencia de movimiento (reducido,
+//!   factor de duración), sobre las de `iced`; resortes.
 //! - [`release`]: desplegables que eligen al soltar el botón, no al pulsarlo.
 //! - [`selectable`]: texto que se selecciona con el ratón y se copia (los mensajes del chat).
 //! - [`widget`]: componentes (botones, campos, listas, insignias, avisos, toasts, diálogos,
@@ -23,6 +25,7 @@ pub mod avatar;
 pub mod editor;
 pub mod font;
 pub mod icon;
+pub mod motion;
 pub mod release;
 pub mod selectable;
 pub mod style;

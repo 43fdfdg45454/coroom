@@ -753,6 +753,24 @@ fn groups(summary: &LatencySummary, percentile: Percentile) -> Option<[u64; 5]> 
     Some(out)
 }
 
+/// La etapa «dibujado de la interfaz»: lo que tarda la ventana en reconstruir, dibujar y entregar
+/// la interfaz, con el percentil elegido; se mide en este equipo, con o sin vídeo.
+fn ui_draws<'a>(app: &App) -> Element<'a, Message> {
+    let text = match app.ui_draws.p50_p95() {
+        Some((p50, p95)) => t!(
+            "diagnostics-dibujado-de-la-interfaz",
+            percentile = app.diagnostics.percentile.label(),
+            value = ms_us(match app.diagnostics.percentile {
+                Percentile::P50 => p50,
+                Percentile::P95 => p95,
+            }),
+            draws = app.ui_draws.len()
+        ),
+        None => t!("diagnostics-dibujado-de-la-interfaz-vacio").to_owned(),
+    };
+    ui::caption(text).wrapping(Wrapping::WordOrGlyph).into()
+}
+
 fn ms_us(us: u64) -> String {
     stats::ms(us as f64 / 1000.0)
 }
@@ -1396,7 +1414,10 @@ fn stages_card<'a>(app: &App, summary: Option<&LatencySummary>) -> Element<'a, M
     let Some((summary, values)) = values else {
         return column![
             header,
-            ui::card(ui::secondary(t!("diagnostics-etapas-vacio")))
+            ui::card(
+                column![ui::secondary(t!("diagnostics-etapas-vacio")), ui_draws(app)]
+                    .spacing(gap::XS)
+            )
         ]
         .spacing(gap::XS)
         .into();
@@ -1436,7 +1457,7 @@ fn stages_card<'a>(app: &App, summary: Option<&LatencySummary>) -> Element<'a, M
     .wrapping(Wrapping::WordOrGlyph);
     column![
         header,
-        container(column![bar, labels, hint].spacing(gap::XS))
+        container(column![bar, labels, hint, ui_draws(app)].spacing(gap::XS))
             .padding(Padding::from([12.0, 14.0]))
             .width(Length::Fill)
             .class(ContainerClass::Card),

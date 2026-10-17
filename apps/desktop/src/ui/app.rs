@@ -868,6 +868,8 @@ pub struct App {
     pub window_hidden: bool,
     /// Ahora (lo mueve [`Message::Tick`]).
     pub now: Instant,
+    /// Lo que tardaron los últimos dibujos de la interfaz (la ventana los anota).
+    pub ui_draws: super::pacing::DrawTimes,
     /// Prueba local (`coroom probe` con ventana): solo el vídeo.
     pub probe: bool,
     /// Versión de la aplicación.
@@ -916,6 +918,7 @@ impl App {
             fullscreen: false,
             window_hidden: false,
             now,
+            ui_draws: super::pacing::DrawTimes::default(),
             probe: false,
             version: env!("CARGO_PKG_VERSION"),
             update: UpdateState::default(),
@@ -943,6 +946,13 @@ impl App {
         } else {
             Accent::from_key(key).unwrap_or_default()
         }
+    }
+
+    /// Movimiento efectivo: lo que pide el sistema con lo elegido en Apariencia → Animaciones. Se
+    /// calcula al pedirlo, así que un cambio en el sistema ([`Message::System`]) o en los ajustes
+    /// vale desde el cuadro siguiente.
+    pub fn motion(&self) -> coroom_ui::motion::Motion {
+        self.settings.appearance.motion.apply(self.system.motion())
     }
 
     /// Recalcula el tema con los ajustes y el sistema.
@@ -1014,9 +1024,7 @@ impl App {
 
     /// Cuándo hace falta el próximo [`Message::Tick`].
     pub fn next_tick(&self) -> Option<Instant> {
-        if self.animating() {
-            return Some(self.now + Duration::from_millis(16));
-        }
+        // Los cuadros de las animaciones no van aquí: los marca el compositor (`ui::pacing`).
         let mut next: Option<Instant> = None;
         let mut consider = |at: Instant| {
             next = Some(next.map_or(at, |next| next.min(at)));
@@ -2049,8 +2057,12 @@ pub(crate) mod tests {
             mode: Some(Mode::Dark),
             accent: Some(Accent::Teal),
             font: None,
+            reduced_motion: Some(true),
+            animation_factor: Some(0.5),
             source: "prueba",
         }));
+        assert!(app.motion().is_reduced(), "el movimiento también");
+        assert_eq!(app.motion().factor(), 0.5);
         assert_eq!(app.theme.mode(), Mode::Dark);
         assert_eq!(app.theme.palette.accent, Accent::Teal);
         app.settings.appearance.theme = ThemeChoice::Light;
@@ -2188,6 +2200,25 @@ pub(crate) mod tests {
             Some(12.4),
             "se recuerda el último RTT"
         );
+    }
+
+    /// En reposo no se pide ningún cuadro: mientras algo se mueve los marca el compositor
+    /// (`ui::pacing`) y el próximo plazo de la aplicación nunca es un cuadro supuesto.
+    #[test]
+    fn nothing_redraws_at_rest() {
+        let mut app = app();
+        assert!(!app.animating());
+        assert_eq!(app.next_tick(), None);
+        let shown_at = app.now;
+        app.toast(Tone::Info, "hola");
+        assert!(app.animating(), "el toast entra animado");
+        assert_eq!(
+            app.next_tick(),
+            Some(shown_at + coroom_ui::tokens::motion::TOAST),
+            "animando, el próximo plazo sigue siendo el de la aplicación"
+        );
+        app.now += Duration::from_millis(300);
+        assert!(!app.animating(), "ya entró: nada se mueve");
     }
 
     #[test]
