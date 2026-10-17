@@ -183,27 +183,78 @@ pub(crate) fn from_wire(text: &str) -> Option<Capabilities> {
         .capabilities()
 }
 
-/// Las capacidades guardadas en `path` si su huella es `fingerprint`.
-fn load_cached(path: &Path, fingerprint: &str) -> Option<Capabilities> {
-    let bytes = std::fs::read(path).ok()?;
-    let cached: CachedProbe = serde_json::from_slice(&bytes).ok()?;
-    if cached.fingerprint != fingerprint {
-        return None;
-    }
-    cached.capabilities()
+/// Sondeos que guarda la caché, uno por huella, del último al más antiguo: dos ejecutables de
+/// coroom en el mismo equipo (el instalado y uno compilado, o dos versiones) no se borran el
+/// sondeo el uno al otro.
+const CACHED_PROBES: usize = 4;
+
+/// Los sondeos guardados en `path` (vacío si no hay o no se entiende).
+fn read_cache(path: &Path) -> Vec<CachedProbe> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
 }
 
-/// Guarda `caps` con su huella en `path` (escribe un temporal y lo renombra: un arranque a la vez
-/// nunca lee un fichero a medias).
+/// Las capacidades guardadas en `path` con la huella `fingerprint`.
+fn load_cached(path: &Path, fingerprint: &str) -> Option<Capabilities> {
+    read_cache(path)
+        .iter()
+        .find(|cached| cached.fingerprint == fingerprint)?
+        .capabilities()
+}
+
+/// Guarda `caps` con su huella en `path`, delante de los demás sondeos (escribe un temporal y lo
+/// renombra: un arranque a la vez nunca lee un fichero a medias).
 fn store_cached(path: &Path, fingerprint: String, caps: &Capabilities) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let json = serde_json::to_vec_pretty(&CachedProbe::new(fingerprint, caps))
-        .map_err(std::io::Error::other)?;
+    let mut probes = read_cache(path);
+    probes.retain(|cached| cached.fingerprint != fingerprint);
+    probes.insert(0, CachedProbe::new(fingerprint, caps));
+    probes.truncate(CACHED_PROBES);
+    let json = serde_json::to_vec_pretty(&probes).map_err(std::io::Error::other)?;
     let temporary = path.with_extension("json.tmp");
     std::fs::write(&temporary, json)?;
     std::fs::rename(&temporary, path)
+}
+
+/// Lo guardado en `path` para `fingerprint` (`true`: salió de la caché) o, si no hay, lo que diga
+/// `probe` (`(capacidades, terminó)`), que se guarda si terminó. Con el cerrojo de
+/// `codecs.json.lock`: dos procesos que arrancan a la vez con la caché vieja (el anfitrión y el
+/// invitado tras una actualización) no sondean los dos, que es el doble de largo porque el driver
+/// no abre dispositivos en paralelo; el segundo espera al primero y usa lo que guardó.
+fn cached_or_probe(
+    path: &Path,
+    fingerprint: &str,
+    probe: impl FnOnce() -> (Capabilities, bool),
+) -> (Capabilities, bool) {
+    if let Some(caps) = load_cached(path, fingerprint) {
+        return (caps, true);
+    }
+    let lock = path.parent().and_then(|parent| {
+        std::fs::create_dir_all(parent).ok()?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_extension("json.lock"))
+            .ok()?;
+        file.lock().ok()?;
+        Some(file)
+    });
+    // Quien tenía el cerrojo pudo dejarlo guardado mientras se esperaba.
+    if let Some(caps) = load_cached(path, fingerprint) {
+        return (caps, true);
+    }
+    let (caps, complete) = probe();
+    // Un sondeo que no terminó no se guarda: el próximo arranque lo repite.
+    if complete {
+        let _ = store_cached(path, fingerprint.to_owned(), &caps);
+    }
+    drop(lock);
+    (caps, false)
 }
 
 /// Huella de la máquina para la caché (`None`: sin caché en esta plataforma o sin FFmpeg).
@@ -242,19 +293,13 @@ impl Capabilities {
                 let cache = CACHE_FILE
                     .get()
                     .and_then(|path| Some((path, fingerprint()?)));
-                if let Some((path, fingerprint)) = &cache
-                    && let Some(caps) = load_cached(path, fingerprint)
-                {
-                    let _ = FROM_CACHE.set(true);
-                    return caps;
-                }
-                let (caps, complete) = Self::run_probe();
-                let _ = FROM_CACHE.set(false);
-                // Un sondeo que no terminó no se guarda: el próximo arranque lo repite.
-                if let Some((path, fingerprint)) = cache.filter(|_| complete) {
-                    // Sin caché solo se vuelve a sondear en el próximo arranque.
-                    let _ = store_cached(path, fingerprint, &caps);
-                }
+                let (caps, from_cache) = match &cache {
+                    Some((path, fingerprint)) => {
+                        cached_or_probe(path, fingerprint, Self::run_probe)
+                    }
+                    None => (Self::run_probe().0, false),
+                };
+                let _ = FROM_CACHE.set(from_cache);
                 caps
             })
             .clone()
@@ -574,5 +619,64 @@ mod tests {
                 .to_string()
                 .contains("Solo software")
         );
+    }
+
+    fn probed(name: &str) -> Capabilities {
+        let mut caps = Capabilities::openh264_only();
+        caps.ffmpeg_version = Some(name.to_owned());
+        caps
+    }
+
+    /// Dos ejecutables (dos huellas) usan la misma caché sin borrarse el sondeo; se guardan los
+    /// [`CACHED_PROBES`] últimos.
+    #[test]
+    fn the_cache_keeps_one_probe_per_fingerprint() {
+        let dir = tempfile::tempdir().expect("directorio");
+        let path = dir.path().join("codecs.json");
+        let never = || -> (Capabilities, bool) { panic!("debía salir de la caché") };
+        assert!(!cached_or_probe(&path, "a", || (probed("a"), true)).1);
+        assert!(!cached_or_probe(&path, "b", || (probed("b"), true)).1);
+        let (caps, from_cache) = cached_or_probe(&path, "a", never);
+        assert!(from_cache);
+        assert_eq!(caps.ffmpeg_version.as_deref(), Some("a"));
+        assert_eq!(
+            cached_or_probe(&path, "b", never)
+                .0
+                .ffmpeg_version
+                .as_deref(),
+            Some("b")
+        );
+        // Uno que no terminó no se guarda.
+        assert!(!cached_or_probe(&path, "c", || (probed("c"), false)).1);
+        assert!(load_cached(&path, "c").is_none());
+        for name in ["c", "d", "e", "f"] {
+            cached_or_probe(&path, name, || (probed(name), true));
+        }
+        assert_eq!(read_cache(&path).len(), CACHED_PROBES);
+        assert!(load_cached(&path, "f").is_some());
+        assert!(load_cached(&path, "a").is_none(), "el más antiguo sale");
+    }
+
+    /// Dos procesos que arrancan a la vez sin caché: sondea uno y el otro usa su resultado.
+    #[test]
+    fn concurrent_starts_probe_only_once() {
+        let dir = tempfile::tempdir().expect("directorio");
+        let path = dir.path().join("codecs.json");
+        let probes = std::sync::atomic::AtomicU32::new(0);
+        let (first, second) = std::thread::scope(|scope| {
+            let start = || {
+                cached_or_probe(&path, "a", || {
+                    probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    (probed("a"), true)
+                })
+            };
+            let first = scope.spawn(start);
+            let second = scope.spawn(start);
+            (first.join().expect("hilo"), second.join().expect("hilo"))
+        });
+        assert_eq!(probes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(first.0.ffmpeg_version, second.0.ffmpeg_version);
+        assert!(first.1 != second.1, "uno sondeó y el otro leyó la caché");
     }
 }

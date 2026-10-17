@@ -1262,6 +1262,7 @@ dependencies = [
  "rsmpeg",
  "serde",
  "serde_json",
+ "tempfile",
  "windows",
  "yuv",
 ]
