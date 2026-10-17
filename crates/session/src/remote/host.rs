@@ -2874,6 +2874,7 @@ async fn run_host(
     }
 
     let mut tick = tokio::time::interval(Duration::from_millis(200));
+    let mut stall = CaptureStall::default();
     let result = loop {
         tokio::select! {
             report = super::mapping_report(&mut mapping_rx) => {
@@ -2940,6 +2941,15 @@ async fn run_host(
                     break Ok(());
                 }
                 ctx.announce_sharing();
+                let captured = core.shared.counters.captured.load(Ordering::Relaxed);
+                if stall.check(captured, core.shared.sharing(), Instant::now()) {
+                    core.warn(format!(
+                        "La captura no da imágenes nuevas hace {} s. Si los invitados ven la imagen \
+                         congelada mientras la pantalla cambia, puede ser un juego en pantalla \
+                         completa exclusiva: ponlo en ventana sin bordes o comparte otra fuente.",
+                        CAPTURE_STALL.as_secs()
+                    ));
+                }
             }
         }
         room.check_moved();
@@ -2947,6 +2957,39 @@ async fn run_host(
     room.shutdown().await;
     signal.close();
     result
+}
+
+/// Tiempo sin fotogramas nuevos de la captura, compartiendo algo, tras el que se avisa al
+/// anfitrión ([`CaptureStall`]).
+pub(crate) const CAPTURE_STALL: Duration = Duration::from_secs(10);
+
+/// Vigila que la captura siga dando fotogramas: una captura de ventana que pasó al monitor con un
+/// juego en pantalla completa exclusiva se quedó sin imagen y los invitados vieron un fotograma
+/// fijo sin que el anfitrión lo supiera. Avisa una vez por parón.
+#[derive(Debug, Default)]
+struct CaptureStall {
+    /// Fotogramas capturados la última vez y desde cuándo no cambian.
+    last: Option<(u64, Instant)>,
+    warned: bool,
+}
+
+impl CaptureStall {
+    /// Con `captured` fotogramas capturados hasta `now`: si toca avisar.
+    fn check(&mut self, captured: u64, sharing: bool, now: Instant) -> bool {
+        match self.last {
+            Some((count, since)) if count == captured && sharing => {
+                if !self.warned && now.saturating_duration_since(since) >= CAPTURE_STALL {
+                    self.warned = true;
+                    return true;
+                }
+            }
+            _ => {
+                self.last = Some((captured, now));
+                self.warned = false;
+            }
+        }
+        false
+    }
 }
 
 /// Error de la conexión de señalización, con el texto del servidor si lo rechazó.
@@ -3023,6 +3066,29 @@ mod tests {
     }
 
     /// Sin nada compartido no sale el audio del juego (lo que suena en el equipo), y la voz sí.
+    #[test]
+    fn a_stalled_capture_warns_once_per_stall() {
+        let start = Instant::now();
+        let mut stall = CaptureStall::default();
+        assert!(!stall.check(5, true, start));
+        assert!(!stall.check(5, true, start + Duration::from_secs(9)));
+        assert!(
+            stall.check(5, true, start + CAPTURE_STALL),
+            "a los 10 s, avisa"
+        );
+        assert!(
+            !stall.check(5, true, start + Duration::from_secs(30)),
+            "una vez"
+        );
+        // Vuelven los fotogramas y se para otra vez: avisa de nuevo.
+        assert!(!stall.check(6, true, start + Duration::from_secs(31)));
+        assert!(stall.check(6, true, start + Duration::from_secs(41)));
+        // Sin compartir nada (sala solo de voz) no hay fotogramas y no es un parón.
+        let mut idle = CaptureStall::default();
+        assert!(!idle.check(0, false, start));
+        assert!(!idle.check(0, false, start + Duration::from_secs(60)));
+    }
+
     #[test]
     fn game_audio_only_flows_while_sharing() {
         assert!(track_flows(Track::Audio, true));

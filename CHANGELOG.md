@@ -185,6 +185,18 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **Cambiar de fuente ya no se queda colgado**: si la fuente nueva no arranca en 10 s (en Windows,
+  la captura se colgó con un juego en pantalla completa exclusiva), el cambio falla con un aviso en
+  vez de dejar a los invitados con la imagen congelada mientras el anfitrión cree que comparte otra
+  cosa. La del portal de Linux, que puede esperar a que elijas, no tiene plazo.
+- **Aviso cuando la captura no da imagen**: si compartiendo algo pasan 10 s sin fotogramas nuevos,
+  el anfitrión ve un aviso (un juego en pantalla completa exclusiva no se deja capturar en
+  Windows: en ventana sin bordes sí).
+- **Al pasar la sala, nadie se queda fuera por un corte al conectar**: entrar en una sala reintenta
+  la conexión con el servidor tres veces (0,5, 1 y 2 s) si se corta al conectar; un rechazo o un
+  servidor que no responde no se reintentan. Al anfitrión que pasaba la sala, el servidor le cortó
+  la conexión justo al entrar en la nueva y tuvo que pedir entrar a mano.
+
 - **Silenciar tu micrófono como anfitrión, a la vista**: tu fila en «Integrantes» tiene ahora el
   botón «Silenciar tu micrófono» / «Activar tu micrófono», y el botón del deslizador de tu voz (en
   la sala y como invitado) es un micrófono: antes era un altavoz y parecía el volumen.

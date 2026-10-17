@@ -675,6 +675,45 @@ impl Room {
     }
 }
 
+/// Esperas entre intentos de conectar con el servidor al entrar: un corte justo al conectar (al
+/// pasar la sala, el anfitrión de antes cierra la suya y entra en la nueva casi a la vez, y una
+/// vez el servidor cortó esa conexión) no deja a nadie fuera. Un rechazo del servidor no se
+/// reintenta.
+const SIGNAL_RETRIES: [Duration; 3] = [
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+];
+
+/// Conecta con el servidor de señalización, reintentando los fallos de red que no son un plazo
+/// agotado ([`SIGNAL_RETRIES`]).
+async fn connect_signal(
+    config: &RemoteConfig,
+    endpoint: &Endpoint,
+) -> Result<SignalClient, SessionError> {
+    let mut retries = SIGNAL_RETRIES.iter();
+    loop {
+        // Si no responde en todo el plazo no es un corte puntual: no se reintenta.
+        let attempt = tokio::time::timeout(
+            REPLY_TIMEOUT,
+            SignalClient::connect(&config.server_url, &config.token, endpoint, &config.trust),
+        )
+        .await
+        .map_err(|_| SessionError::Network("el servidor no responde".to_owned()))?
+        .map_err(signal_error);
+        match attempt {
+            Err(SessionError::Network(err)) => match retries.next() {
+                Some(wait) => {
+                    debug!(error = %err, "señalización: se reintenta");
+                    tokio::time::sleep(*wait).await;
+                }
+                None => return Err(SessionError::Network(err)),
+            },
+            other => return other,
+        }
+    }
+}
+
 async fn run_guest(
     core: Arc<Core>,
     config: RemoteConfig,
@@ -688,13 +727,7 @@ async fn run_guest(
         .map_err(network("no se pudo abrir el socket UDP"))?;
     let mapping_task = super::start_port_mapping(&config, &endpoint);
     let mut mapping_rx = super::watch_port_mapping(&core, mapping_task);
-    let mut signal = tokio::time::timeout(
-        REPLY_TIMEOUT,
-        SignalClient::connect(&config.server_url, &config.token, &endpoint, &config.trust),
-    )
-    .await
-    .map_err(|_| SessionError::Network("el servidor no responde".to_owned()))?
-    .map_err(signal_error)?;
+    let mut signal = connect_signal(&config, &endpoint).await?;
     let server = ServerUrl::parse(&config.server_url).map_err(network("URL del servidor"))?;
     let (key_package, bundle) = KeyPackageBundle::generate(&identity)
         .map_err(|err| SessionError::Crypto(err.to_string()))?;

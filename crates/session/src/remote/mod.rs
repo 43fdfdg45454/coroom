@@ -1336,6 +1336,50 @@ impl fmt::Debug for HostControl {
     }
 }
 
+/// Plazo para que arranque una fuente nueva que no espera al usuario
+/// ([`Capturer::start_may_wait_for_user`]).
+pub const SOURCE_START_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Arranca `capturer` en `target` en un hilo aparte y espera como mucho
+/// [`SOURCE_START_DEADLINE`]: una captura que se cuelga al arrancar (WGC con un juego en pantalla
+/// completa exclusiva lo hizo) devuelve un error en vez de dejar colgado el cambio de fuente. El
+/// hilo se queda con ella y la suelta si algún día termina.
+fn start_with_deadline(
+    mut capturer: Box<dyn Capturer>,
+    target: coroom_capture::CaptureTarget,
+) -> Result<Box<dyn Capturer>, coroom_capture::CaptureError> {
+    if capturer.start_may_wait_for_user() {
+        capturer.start(&target)?;
+        return Ok(capturer);
+    }
+    let (done, started) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("captura-arranque".into())
+        .spawn(move || {
+            let result = capturer.start(&target);
+            // Si ya nadie espera (pasó el plazo), la captura que arrancó tarde se suelta aquí.
+            if let Err(std::sync::mpsc::SendError((_, mut late))) = done.send((result, capturer)) {
+                late.stop();
+            }
+        })
+        .map_err(|err| coroom_capture::CaptureError::Backend(format!("hilo de arranque: {err}")))?;
+    match started.recv_timeout(SOURCE_START_DEADLINE) {
+        Ok((Ok(()), capturer)) => Ok(capturer),
+        Ok((Err(err), _)) => Err(err),
+        Err(_) => {
+            tracing::warn!(
+                "la fuente nueva no arrancó en {} s",
+                SOURCE_START_DEADLINE.as_secs()
+            );
+            Err(coroom_capture::CaptureError::Backend(format!(
+                "la fuente nueva no arranca en {} s; prueba con otra (un juego en pantalla \
+                 completa exclusiva no se deja capturar: ponlo en ventana sin bordes)",
+                SOURCE_START_DEADLINE.as_secs()
+            )))
+        }
+    }
+}
+
 impl HostControl {
     /// Anfitrión: cambia lo que se comparte con la sala abierta. Arranca `capturer` (en Linux
     /// puede abrir el diálogo del portal, así que bloquea: llámala fuera del hilo de la ventana)
@@ -1368,7 +1412,7 @@ impl HostControl {
             .ok_or_else(|| SessionError::Media("captura: no hay nada que capturar".into()))?;
         capturer.set_gpu_frames(gpu);
         capturer.set_options(options);
-        capturer.start(&target).map_err(capture)?;
+        let mut capturer = start_with_deadline(capturer, target).map_err(capture)?;
         if self.core.ended() {
             capturer.stop();
             return Err(SessionError::Network("la sesión terminó".into()));

@@ -187,6 +187,10 @@ impl Capturer for Chosen {
     fn set_options(&mut self, options: CaptureOptions) -> CaptureOptions {
         self.inner.set_options(options)
     }
+
+    fn start_may_wait_for_user(&self) -> bool {
+        self.inner.start_may_wait_for_user()
+    }
 }
 
 /// Envuelve `inner` para que capture `target` si se eligió uno.
@@ -789,6 +793,13 @@ pub trait Capturer: Send {
             hdr: false,
             ..options
         }
+    }
+
+    /// Si [`Capturer::start`] puede quedarse esperando al usuario (el diálogo del portal de
+    /// PipeWire): entonces quien la arranca no le pone plazo. Las demás arrancan en un momento, y
+    /// si tardan es que algo se colgó.
+    fn start_may_wait_for_user(&self) -> bool {
+        false
     }
 
     /// Si esta fuente no comparte nada ([`idle::IdleCapturer`]: una sala solo de voz o después de

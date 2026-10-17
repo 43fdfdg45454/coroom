@@ -1078,6 +1078,9 @@ impl WgcCapturer {
         window: Option<u64>,
         watch: bool,
     ) -> Result<(), CaptureError> {
+        // Cada paso deja huella: un arranque colgado (pasó con un juego en pantalla completa
+        // exclusiva) dice en el registro dónde se quedó.
+        tracing::info!(?source, "WGC: arranca la captura");
         let (device, context) = shared_device()?;
         let d3d_device = winrt_device(&device)?;
         let size = item
@@ -1165,6 +1168,7 @@ impl WgcCapturer {
             let _ = pool.Close();
             return Err(backend("StartCapture", err));
         }
+        tracing::info!(?source, "WGC: captura en marcha");
         let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
         *ACTIVE.lock().unwrap_or_else(PoisonError::into_inner) = Some((generation, source));
         self.running = Some(Running {
@@ -1291,6 +1295,7 @@ impl Capturer for WgcCapturer {
 
     fn stop(&mut self) {
         if let Some(running) = self.running.take() {
+            tracing::info!("WGC: se detiene la captura");
             let _ = running.pool.RemoveFrameArrived(running.token);
             let _ = running.item.RemoveClosed(running.closed_token);
             let _ = running.session.Close();

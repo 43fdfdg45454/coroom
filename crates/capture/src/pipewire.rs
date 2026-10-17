@@ -2013,6 +2013,11 @@ impl PipeWireCapturer {
 }
 
 impl Capturer for PipeWireCapturer {
+    /// El portal puede sacar su diálogo al arrancar.
+    fn start_may_wait_for_user(&self) -> bool {
+        true
+    }
+
     fn targets(&self) -> Result<Vec<CaptureTarget>, CaptureError> {
         Ok(vec![CaptureTarget::Monitor {
             id: 0,
