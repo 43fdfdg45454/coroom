@@ -13,7 +13,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
@@ -86,6 +86,8 @@ pub struct ApiClient {
     /// Cabeceras de más en cada petición ([`ApiClient::with_header`]).
     headers: Vec<(header::HeaderName, HeaderValue)>,
     h3: Mutex<Option<H3Conn>>,
+    /// Conexiones HTTP/3 abiertas ([`ApiClient::h3_connections`]).
+    h3_opened: AtomicU32,
     tcp_only: AtomicBool,
 }
 
@@ -144,6 +146,7 @@ impl ApiClient {
             token: None,
             headers: Vec::new(),
             h3: Mutex::new(None),
+            h3_opened: AtomicU32::new(0),
             tcp_only: AtomicBool::new(false),
         })
     }
@@ -192,6 +195,12 @@ impl ApiClient {
         self.token.as_deref()
     }
 
+    /// Cuántas conexiones HTTP/3 ha abierto este cliente: una mientras siga viva, por muchas
+    /// peticiones que haga.
+    pub fn h3_connections(&self) -> u32 {
+        self.h3_opened.load(Ordering::Relaxed)
+    }
+
     async fn resolve(&self, port: u16) -> Result<Vec<SocketAddr>, TransportError> {
         let addrs: Vec<SocketAddr> = tokio::net::lookup_host((self.url.host.as_str(), port))
             .await?
@@ -214,7 +223,7 @@ impl ApiClient {
         let addrs = self.resolve(self.url.port).await?;
         let host = self.url.host.as_str();
         // Todas las direcciones a la vez, escalonadas: una que no contesta no retiene a la otra.
-        let (endpoint, connection) = first_to_connect(addrs, |addr| {
+        let (endpoint, connection) = first_to_connect(host, addrs, |addr| {
             let crypto = Arc::clone(&crypto);
             Box::pin(async move {
                 let local: SocketAddr = if addr.is_ipv6() {
@@ -299,6 +308,7 @@ impl ApiClient {
             .is_some_and(|conn| conn.connection.close_reason().is_none());
         if !reuse {
             *guard = Some(self.connect_h3().await?);
+            self.h3_opened.fetch_add(1, Ordering::Relaxed);
         }
         let Some(conn) = guard.as_ref() else {
             return Err(TransportError::Closed);
@@ -361,20 +371,11 @@ impl ApiClient {
         let name = ServerName::try_from(self.url.host.clone()).map_err(|_| {
             TransportError::InvalidUrl(format!("{}: nombre no válido", self.url.host))
         })?;
-        let mut last = None;
-        let mut stream = None;
-        for addr in self.resolve(self.tcp_port).await? {
-            match tokio::net::TcpStream::connect(addr).await {
-                Ok(tcp) => {
-                    stream = Some(tcp);
-                    break;
-                }
-                Err(err) => last = Some(err),
-            }
-        }
-        let Some(tcp) = stream else {
-            return Err(last.map_or(TransportError::Unreachable, TransportError::Io));
-        };
+        let addrs = self.resolve(self.tcp_port).await?;
+        let tcp = first_to_connect(&self.url.host, addrs, |addr| {
+            Box::pin(async move { Ok(tokio::net::TcpStream::connect(addr).await?) })
+        })
+        .await?;
         let tls = connector.connect(name, tcp).await?;
         let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
         let io = TokioIo::new(tls);

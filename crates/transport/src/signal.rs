@@ -155,7 +155,7 @@ impl SignalClient {
         }
         // Todas las direcciones a la vez, escalonadas: una que no contesta no retiene a la otra.
         let host = url.host.as_str();
-        let (connection, server_addr) = first_to_connect(addrs, |addr| {
+        let (connection, server_addr) = first_to_connect(host, addrs, |addr| {
             Box::pin(async move {
                 let (connection, _) = endpoint.connect_server(addr, host, trust, Alpn::H3).await?;
                 Ok((connection, addr))

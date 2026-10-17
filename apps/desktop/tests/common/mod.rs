@@ -184,6 +184,26 @@ impl TestServer {
         }
     }
 
+    /// La sesión de la aplicación (`coroom_desktop::account`) de `account`, como la deja `coroom login`.
+    pub fn session(&self, account: &Account) -> coroom_desktop::account::Session {
+        let ServerTrust::Fingerprint(fingerprint) = &self.trust else {
+            unreachable!("el servidor de pruebas se fija por su huella");
+        };
+        coroom_desktop::account::Session {
+            credentials: coroom_desktop::account::Credentials {
+                server: self.url.clone(),
+                username: account.username.clone(),
+                display_name: account.username.clone(),
+                user_id: account.user,
+                token: account.config.token.clone(),
+                expires_at: i64::MAX,
+                trust_fingerprint: Some(fingerprint.clone()),
+                tcp_port: Some(self.tcp_port),
+            },
+            trust: self.trust.clone(),
+        }
+    }
+
     /// Hace amigos a `a` y `b`.
     pub fn befriend(&self, a: &Account, b: &Account) {
         let api_a = self.api().with_token(a.config.token.clone());

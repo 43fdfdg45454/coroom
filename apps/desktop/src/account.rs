@@ -9,11 +9,15 @@
 //! - **Login**: pide usuario y contraseña por consola sin eco (o `--user` y `--password-stdin`),
 //!   presenta la clave pública de la identidad del equipo y firma el desafío del servidor
 //!   ([`ApiClient::login`]); con `--invitation CÓDIGO`, antes crea la cuenta con el código.
-//! - Las llamadas a la API se hacen en un runtime de `tokio` propio y corto; el llavero se lee
-//!   y escribe fuera de él (en Linux es bloqueante).
+//! - Las llamadas a la API se hacen en un runtime de `tokio` del proceso y con un cliente por
+//!   sesión ([`Session::api`]) que reutiliza su conexión HTTP/3 de una petición a la siguiente:
+//!   abrir Amigos o Cuenta no paga otra vez el handshake. El llavero se lee y escribe fuera del
+//!   runtime (en Linux es bloqueante).
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -199,11 +203,57 @@ pub fn device_name() -> String {
     name.unwrap_or_else(|| "equipo".to_owned())
 }
 
-fn runtime() -> Result<tokio::runtime::Runtime, String> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| format!("no se pudo arrancar la red: {err}"))
+/// Runtime de las llamadas a la API, el mismo durante todo el proceso: la conexión HTTP/3 de un
+/// cliente vive en el runtime donde se abrió, y así sigue abierta entre peticiones.
+fn runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+    static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("coroom-api")
+                .enable_all()
+                .build()
+                .map_err(|err| format!("no se pudo arrancar la red: {err}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
+/// Lo que distingue un cliente de la API de otro: servidor, token, huella fijada y puerto TCP.
+type ClientKey = (String, String, Option<String>, Option<u16>);
+
+/// El cliente de la API de cada servidor, con su conexión abierta ([`Session::api`]).
+static CLIENTS: LazyLock<Mutex<HashMap<ClientKey, Arc<ApiClient>>>> = LazyLock::new(Mutex::default);
+
+fn client_key(credentials: &Credentials, trust: &ServerTrust) -> ClientKey {
+    let fingerprint = match trust {
+        ServerTrust::Fingerprint(fingerprint) => Some(fingerprint.clone()),
+        _ => None,
+    };
+    (
+        credentials.server.clone(),
+        credentials.token.clone(),
+        fingerprint,
+        credentials.tcp_port,
+    )
+}
+
+/// Guarda `client` como el de `key` (el de su servidor deja de valer).
+fn keep_client(key: ClientKey, client: ApiClient) -> Arc<ApiClient> {
+    let client = Arc::new(client);
+    if let Ok(mut clients) = CLIENTS.lock() {
+        clients.retain(|cached, _| cached.0 != key.0);
+        clients.insert(key, Arc::clone(&client));
+    }
+    client
+}
+
+/// Olvida el cliente de `server` (sesión cerrada: su token ya no vale).
+fn forget_client(server: &str) {
+    if let Ok(mut clients) = CLIENTS.lock() {
+        clients.retain(|cached, _| cached.0 != server);
+    }
 }
 
 fn api_error(err: TransportError) -> String {
@@ -244,15 +294,20 @@ pub struct Session {
 }
 
 impl Session {
-    /// Cliente de la API con el token.
-    pub fn api(&self) -> Result<ApiClient, String> {
+    /// Cliente de la API con el token, el mismo para todas las peticiones de esta sesión (con su
+    /// conexión ya abierta); se usa con el runtime de [`runtime`].
+    pub fn api(&self) -> Result<Arc<ApiClient>, String> {
+        let key = client_key(&self.credentials, &self.trust);
+        if let Some(client) = CLIENTS.lock().ok().and_then(|c| c.get(&key).cloned()) {
+            return Ok(client);
+        }
         let mut client = ApiClient::new(&self.credentials.server, self.trust.clone())
             .map_err(|err| err.to_string())?
             .with_token(&self.credentials.token);
         if let Some(port) = self.credentials.tcp_port {
             client = client.with_tcp_port(port);
         }
-        Ok(client)
+        Ok(keep_client(key, client))
     }
 }
 
@@ -387,6 +442,7 @@ pub fn logout(options: &AccountOptions) -> Result<String, String> {
         }
         Err(_) => false,
     };
+    forget_client(&server);
     store.delete(&server)?;
     Ok(if revoked {
         format!("Sesión cerrada en {server}.")
@@ -583,9 +639,9 @@ pub fn sign_in(
     let server = store.server(account.server.as_deref())?;
     let trust = trust_for(account.trust_fingerprint.as_deref())?;
     let (identity, place) = load_identity(account.data_dir.as_deref(), account.headless)?;
-    // Un solo runtime para todas las llamadas: el cliente reutiliza su conexión HTTP/3.
+    // El cliente reutiliza su conexión HTTP/3 en todas las llamadas, y luego en las de la sesión.
     let runtime = runtime()?;
-    let mut api = ApiClient::new(&server, trust).map_err(|err| err.to_string())?;
+    let mut api = ApiClient::new(&server, trust.clone()).map_err(|err| err.to_string())?;
     if let Some(port) = account.tcp_port {
         api = api.with_tcp_port(port);
     }
@@ -612,6 +668,10 @@ pub fn sign_in(
             .transpose()?,
         tcp_port: account.tcp_port,
     };
+    keep_client(
+        client_key(&credentials, &trust),
+        api.with_token(&credentials.token),
+    );
     let saved = store.save(&credentials)?;
     Ok(SignedIn {
         credentials,

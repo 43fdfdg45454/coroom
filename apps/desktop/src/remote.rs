@@ -1200,16 +1200,8 @@ pub fn wait_for_invitation(
     first: bool,
 ) -> Result<String, String> {
     let session = net.session()?;
-    let names: std::collections::HashMap<u64, String> = session
-        .api()
+    let names: std::collections::HashMap<u64, String> = crate::account::list_friends(&session)
         .ok()
-        .and_then(|api| {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .ok()?;
-            runtime.block_on(api.friends()).ok()
-        })
         .map(|list| {
             list.friends
                 .into_iter()
