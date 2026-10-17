@@ -214,10 +214,41 @@ fn store_cached(path: &Path, fingerprint: String, caps: &Capabilities) -> std::i
     probes.retain(|cached| cached.fingerprint != fingerprint);
     probes.insert(0, CachedProbe::new(fingerprint, caps));
     probes.truncate(CACHED_PROBES);
-    let json = serde_json::to_vec_pretty(&probes).map_err(std::io::Error::other)?;
+    write_cache(path, &probes)
+}
+
+fn write_cache(path: &Path, probes: &[CachedProbe]) -> std::io::Result<()> {
+    let json = serde_json::to_vec_pretty(probes).map_err(std::io::Error::other)?;
     let temporary = path.with_extension("json.tmp");
     std::fs::write(&temporary, json)?;
     std::fs::rename(&temporary, path)
+}
+
+/// El cerrojo de la caché (`codecs.json.lock`), mientras viva el fichero devuelto (`None` si no se
+/// pudo tomar: se sigue sin él).
+fn lock_cache(path: &Path) -> Option<std::fs::File> {
+    let parent = path.parent()?;
+    std::fs::create_dir_all(parent).ok()?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_extension("json.lock"))
+        .ok()?;
+    file.lock().ok()?;
+    Some(file)
+}
+
+/// Quita de `path` el sondeo de `fingerprint` (los de otros ejecutables se quedan).
+fn forget_cached(path: &Path, fingerprint: &str) -> std::io::Result<()> {
+    let _lock = lock_cache(path);
+    let mut probes = read_cache(path);
+    let before = probes.len();
+    probes.retain(|cached| cached.fingerprint != fingerprint);
+    if probes.len() == before {
+        return Ok(());
+    }
+    write_cache(path, &probes)
 }
 
 /// Lo guardado en `path` para `fingerprint` (`true`: salió de la caché) o, si no hay, lo que diga
@@ -233,17 +264,7 @@ fn cached_or_probe(
     if let Some(caps) = load_cached(path, fingerprint) {
         return (caps, true);
     }
-    let lock = path.parent().and_then(|parent| {
-        std::fs::create_dir_all(parent).ok()?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path.with_extension("json.lock"))
-            .ok()?;
-        file.lock().ok()?;
-        Some(file)
-    });
+    let lock = lock_cache(path);
     // Quien tenía el cerrojo pudo dejarlo guardado mientras se esperaba.
     if let Some(caps) = load_cached(path, fingerprint) {
         return (caps, true);
@@ -312,11 +333,14 @@ impl Capabilities {
         let _ = CACHE_FILE.set(path);
     }
 
-    /// Borra la caché del sondeo: el siguiente arranque vuelve a sondear. Se llama cuando algo que
-    /// el sondeo dio por bueno no abre, y desde `coroom doctor` (que siempre sondea de verdad).
+    /// Borra de la caché el sondeo de este ejecutable (los de otros se quedan): el siguiente
+    /// arranque vuelve a sondear. Se llama cuando algo que el sondeo dio por bueno no abre, y desde
+    /// `coroom doctor` (que siempre sondea de verdad).
     pub fn forget_cache() {
-        if let Some(path) = CACHE_FILE.get() {
-            let _ = std::fs::remove_file(path);
+        if let Some(path) = CACHE_FILE.get()
+            && let Some(fingerprint) = fingerprint()
+        {
+            let _ = forget_cached(path, &fingerprint);
         }
     }
 
@@ -655,6 +679,11 @@ mod tests {
         assert_eq!(read_cache(&path).len(), CACHED_PROBES);
         assert!(load_cached(&path, "f").is_some());
         assert!(load_cached(&path, "a").is_none(), "el más antiguo sale");
+        // Olvidar el de un ejecutable (`coroom doctor`) deja los de los demás.
+        forget_cached(&path, "f").expect("olvidar");
+        assert!(load_cached(&path, "f").is_none());
+        assert_eq!(read_cache(&path).len(), CACHED_PROBES - 1);
+        assert!(load_cached(&path, "e").is_some());
     }
 
     /// Dos procesos que arrancan a la vez sin caché: sondea uno y el otro usa su resultado.

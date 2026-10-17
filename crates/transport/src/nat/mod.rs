@@ -12,6 +12,7 @@
 
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -185,6 +186,40 @@ impl fmt::Display for MappingReport {
     }
 }
 
+/// Lo que dice el router sin abrir nada ([`Mapper::inspect`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouterInspection {
+    /// La puerta de enlace, o por qué no se encontró.
+    pub gateway: Result<Ipv4Addr, String>,
+    /// Los protocolos que respondieron, con la dirección externa que dio cada uno.
+    pub answers: Vec<(MappingProtocol, Ipv4Addr)>,
+}
+
+impl fmt::Display for RouterInspection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let gateway = match &self.gateway {
+            Ok(gateway) => gateway,
+            Err(error) => return write!(f, "sin puerta de enlace IPv4: {error}"),
+        };
+        if self.answers.is_empty() {
+            return write!(
+                f,
+                "el router {gateway} no respondió a UPnP ni a NAT-PMP (apagados o sin ellos)"
+            );
+        }
+        let answers = self
+            .answers
+            .iter()
+            .map(|(protocol, external)| format!("{protocol} (dirección externa {external})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            f,
+            "el router {gateway} responde a {answers}; no se abrió ningún puerto: la sala lo abre al abrirse"
+        )
+    }
+}
+
 /// Por qué falló un protocolo (uso interno de los clientes).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Failure {
@@ -290,6 +325,40 @@ impl Mapper {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// Pregunta al router su dirección externa por NAT-PMP y por UPnP a la vez, **sin abrir ningún
+    /// puerto**: lo que usa `coroom doctor`, que no debe dejar reglas en el router.
+    pub async fn inspect(&self) -> RouterInspection {
+        let deadline = Instant::now() + self.timeout;
+        let gateway = match self.gateway {
+            Some(gateway) => gateway,
+            None => match blocking(gateway::default_gateway).await {
+                Ok(ip) => SocketAddrV4::new(ip, GATEWAY_PORT),
+                Err(error) => {
+                    return RouterInspection {
+                        gateway: Err(error),
+                        answers: Vec::new(),
+                    };
+                }
+            },
+        };
+        let gateway_ip = *gateway.ip();
+        let local = blocking(move || gateway::local_ip_towards(gateway_ip)).await;
+        let ssdp = self.ssdp;
+        let upnp = async move { upnp::external(ssdp, local.ok()?, deadline).await.ok() };
+        let (pmp, upnp) = tokio::join!(pmp::external(gateway, deadline), upnp);
+        let answers = [
+            (MappingProtocol::NatPmp, pmp),
+            (MappingProtocol::Upnp, upnp),
+        ]
+        .into_iter()
+        .filter_map(|(protocol, external)| Some((protocol, external?)))
+        .collect();
+        RouterInspection {
+            gateway: Ok(gateway_ip),
+            answers,
+        }
     }
 
     /// Pide abrir el puerto UDP `internal_port` de este equipo. Siempre devuelve algo: si no se
@@ -451,10 +520,51 @@ impl Drop for PortMapping {
             renew.abort();
         }
         if let Some(lease) = self.lease.take() {
-            // Fuera del runtime (la sesión puede estar cerrándose): un hilo corto y bloqueante.
-            std::thread::spawn(move || lease.delete_blocking());
+            // Fuera del runtime (la sesión puede estar cerrándose): un hilo corto y bloqueante, que
+            // el proceso espera al salir ([`wait_for_deletions`]).
+            let deleting = Deleting::start();
+            let _ = std::thread::Builder::new()
+                .name("coroom-nat-borrado".into())
+                .spawn(move || {
+                    lease.delete_blocking();
+                    drop(deleting);
+                });
         }
     }
+}
+
+/// Borrados de asignaciones en curso: cuántos y el aviso de que terminó uno.
+static DELETING: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+/// Un borrado en curso mientras viva.
+struct Deleting;
+
+impl Deleting {
+    fn start() -> Self {
+        *DELETING.0.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+        Deleting
+    }
+}
+
+impl Drop for Deleting {
+    fn drop(&mut self) {
+        let mut pending = DELETING.0.lock().unwrap_or_else(PoisonError::into_inner);
+        *pending = pending.saturating_sub(1);
+        DELETING.1.notify_all();
+    }
+}
+
+/// Espera hasta `timeout` a que terminen los borrados de las asignaciones que se soltaron (cada
+/// [`PortMapping`] borra la suya en un hilo aparte). Se llama antes de que termine el proceso:
+/// si no, el puerto se queda abierto en el router, y en los que solo admiten asignaciones
+/// permanentes, para siempre. `false` si alguno no terminó a tiempo.
+pub fn wait_for_deletions(timeout: Duration) -> bool {
+    let pending = DELETING.0.lock().unwrap_or_else(PoisonError::into_inner);
+    let (pending, _) = DELETING
+        .1
+        .wait_timeout_while(pending, timeout, |pending| *pending > 0)
+        .unwrap_or_else(PoisonError::into_inner);
+    *pending == 0
 }
 
 async fn renew_loop(lease: Lease, lifetime: Duration, mut granted: Duration) {

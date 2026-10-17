@@ -853,10 +853,15 @@ fn main() -> ExitCode {
     coroom_session::codec::Capabilities::use_cache_file(
         coroom_desktop::remote::default_data_dir().join("codecs.json"),
     );
+    // La dirección del servidor que contesta (IPv4 o IPv6), para no volver a probar primero la que
+    // no contesta en cada arranque.
+    coroom_transport::remember_addresses_in(
+        coroom_desktop::remote::default_data_dir().join("addresses"),
+    );
     if matches!(cli.command, Some(Command::Doctor)) {
         coroom_session::codec::Capabilities::forget_cache();
     }
-    match cli.command {
+    let code = match cli.command {
         Some(Command::Doctor) => doctor(),
         Some(Command::Probe(args)) => probe(&args),
         Some(Command::Host(args)) => host(&args),
@@ -896,7 +901,13 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+    };
+    // Los puertos que la sala abrió en el router se borran en hilos aparte: sin esperarlos, el
+    // proceso termina antes y el puerto se queda abierto.
+    if !coroom_transport::nat::wait_for_deletions(std::time::Duration::from_secs(3)) {
+        tracing::warn!("no se pudo confirmar el cierre del puerto abierto en el router");
     }
+    code
 }
 
 /// Muestra la ayuda o la versión que pidió el usuario, o el error de argumentos en español.

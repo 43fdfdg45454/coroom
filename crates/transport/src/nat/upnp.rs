@@ -439,18 +439,13 @@ fn random_high_port() -> u16 {
 }
 
 /// Busca la puerta de enlace por SSDP y le pide la asignación de `internal` hasta `deadline`.
-pub(super) async fn map(
+/// Busca el router por SSDP desde `local` y lee su descripción: el servicio de control.
+async fn find_control(
     ssdp: SocketAddrV4,
-    internal: SocketAddrV4,
-    lifetime: Duration,
+    local: Ipv4Addr,
     deadline: Instant,
-) -> Result<(Mapping, Lease), Failure> {
-    let location = discover(ssdp, *internal.ip(), deadline).await?;
-    let refused = |error: String, external: Option<Ipv4Addr>| Failure::Refused {
-        protocol: MappingProtocol::Upnp,
-        error,
-        external,
-    };
+) -> Result<Control, Failure> {
+    let location = discover(ssdp, local, deadline).await?;
     let location = Url::parse(&location).map_err(|err| refused(err, None))?;
     let description = exchange(
         &location,
@@ -462,7 +457,36 @@ pub(super) async fn map(
     let control =
         control_from_description(&description.body, &location).map_err(|err| refused(err, None))?;
     debug!(%control.url, service = %control.service, "servicio UPnP del router");
+    Ok(control)
+}
 
+fn refused(error: String, external: Option<Ipv4Addr>) -> Failure {
+    Failure::Refused {
+        protocol: MappingProtocol::Upnp,
+        error,
+        external,
+    }
+}
+
+/// La dirección externa del router (`GetExternalIPAddress`), sin abrir nada.
+pub(super) async fn external(
+    ssdp: SocketAddrV4,
+    local: Ipv4Addr,
+    deadline: Instant,
+) -> Result<Ipv4Addr, Failure> {
+    let control = find_control(ssdp, local, deadline).await?;
+    external_ip(&control, deadline)
+        .await
+        .map_err(|err| refused(format!("dirección externa: {err}"), None))
+}
+
+pub(super) async fn map(
+    ssdp: SocketAddrV4,
+    internal: SocketAddrV4,
+    lifetime: Duration,
+    deadline: Instant,
+) -> Result<(Mapping, Lease), Failure> {
+    let control = find_control(ssdp, *internal.ip(), deadline).await?;
     let external_ip = external_ip(&control, deadline).await;
     let external_ip = match external_ip {
         Ok(ip) => ip,

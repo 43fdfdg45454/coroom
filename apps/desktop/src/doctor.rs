@@ -146,8 +146,8 @@ pub fn report() -> Result<Vec<String>, String> {
 
 /// Qué parte de la ruta sin copias hay en este equipo: captura, codificadores de GPU y
 /// presentación.
-/// Pide al router que abra un puerto UDP de prueba y lo cierra: dice si hay UPnP, NAT-PMP o PCP y
-/// qué dirección externa da (la WAN del router; si empieza por 100.64-100.127, hay CGNAT).
+/// Pregunta al router, sin abrir ningún puerto, si responde a UPnP o NAT-PMP y qué dirección
+/// externa da (la WAN del router; si empieza por 100.64-100.127, hay CGNAT).
 fn router_report() -> Vec<String> {
     let gateway = match default_route() {
         Ok(route) => format!(
@@ -166,16 +166,8 @@ fn router_report() -> Vec<String> {
         Ok(runtime) => runtime,
         Err(err) => return vec![gateway, format!("prueba no hecha: {err}")],
     };
-    let port = std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|socket| socket.local_addr())
-        .map_or(0, |addr| addr.port());
-    let report = runtime.block_on(async {
-        let mapping = Mapper::new().map(port).await;
-        mapping.report().clone()
-    });
-    // El borrado de la asignación de prueba va en un hilo aparte: se le da un momento.
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    vec![gateway, report.to_string()]
+    let inspection = runtime.block_on(Mapper::new().inspect());
+    vec![gateway, inspection.to_string()]
 }
 
 fn zero_copy_report(caps: &Capabilities) -> Vec<String> {

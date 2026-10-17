@@ -179,6 +179,52 @@ async fn b_a_nat_pmp_only_gateway_answers_the_fallback() {
     })
     .await;
     assert_eq!(&deletion[6..8], &[0, 0], "puerto externo 0 al borrar");
+    // El proceso puede esperar a que termine antes de salir.
+    let finished =
+        tokio::task::spawn_blocking(|| coroom_transport::nat::wait_for_deletions(TIMEOUT))
+            .await
+            .expect("espera");
+    assert!(finished, "el borrado terminó");
+}
+
+/// `coroom doctor` pregunta sin abrir nada: NAT-PMP y UPnP dan su dirección externa y ninguno
+/// recibe una petición de asignación.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e_inspecting_the_router_opens_no_port() {
+    let (gateway, mut requests) = udp_server(natpmp_reply).await;
+    let (ssdp, mut actions) = upnp_server().await;
+    let inspection = Mapper::new()
+        .with_gateway(gateway)
+        .with_ssdp(ssdp)
+        .with_timeout(Duration::from_secs(2))
+        .inspect()
+        .await;
+    assert_eq!(
+        *inspection.gateway.as_ref().expect("puerta de enlace"),
+        *gateway.ip()
+    );
+    let mut answers = inspection.answers.clone();
+    answers.sort_by_key(|(protocol, _)| protocol.to_string());
+    assert_eq!(
+        answers,
+        vec![
+            (MappingProtocol::NatPmp, EXTERNAL),
+            (MappingProtocol::Upnp, EXTERNAL)
+        ]
+    );
+    assert!(
+        inspection.to_string().contains("no se abrió ningún puerto"),
+        "{inspection}"
+    );
+    while let Ok(request) = requests.try_recv() {
+        assert_eq!(
+            request, NATPMP_EXTERNAL_REQUEST,
+            "solo se pregunta la dirección"
+        );
+    }
+    let (action, _) = next_action(&mut actions).await;
+    assert_eq!(action, "GetExternalIPAddress");
+    assert!(actions.try_recv().is_err(), "ninguna acción más por UPnP");
 }
 
 /// Router UPnP falso: SSDP en UDP y la descripción y el control SOAP en HTTP. Anota cada acción

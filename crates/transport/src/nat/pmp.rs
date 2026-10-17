@@ -206,6 +206,36 @@ enum Mode {
     NatPmp,
 }
 
+/// Pide a `gateway` su dirección externa por NAT-PMP hasta `deadline`, sin abrir nada (`None` si
+/// no contesta).
+pub(super) async fn external(gateway: SocketAddrV4, deadline: Instant) -> Option<Ipv4Addr> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await.ok()?;
+    socket.connect(gateway).await.ok()?;
+    let mut wait = FIRST_RETRY;
+    let mut buf = [0u8; 64];
+    loop {
+        socket.send(&NATPMP_EXTERNAL_REQUEST).await.ok()?;
+        let until = deadline.min(Instant::now() + wait);
+        loop {
+            match tokio::time::timeout_at(until, socket.recv(&mut buf)).await {
+                Ok(Ok(n)) => {
+                    if let Ok(NatPmpResponse::External { result: 0, ip }) = parse_natpmp(&buf[..n])
+                    {
+                        return Some(ip);
+                    }
+                }
+                // ICMP de puerto inalcanzable: no hay servidor NAT-PMP.
+                Ok(Err(_)) => return None,
+                Err(_) => break,
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        wait *= 2;
+    }
+}
+
 /// Pide la asignación de `internal` a la puerta de enlace `gateway` hasta `deadline`.
 pub(super) async fn map(
     gateway: SocketAddrV4,
