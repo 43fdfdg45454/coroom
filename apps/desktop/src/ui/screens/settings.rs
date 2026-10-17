@@ -49,7 +49,7 @@ use crate::ui::tones::Builtin;
 pub const AUDIO_REFRESH: Duration = Duration::from_secs(3);
 
 /// Páginas de Ajustes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SettingsPage {
     /// Cuenta, servidor, dispositivos de la cuenta y red.
     #[default]
@@ -798,7 +798,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     row![
         nav,
         iced_widget::rule::vertical(1),
-        container(ui::page(content)).width(Length::Fill)
+        container(ui::page(("settings", state.page), content)).width(Length::Fill)
     ]
     .height(Length::Fill)
     .into()

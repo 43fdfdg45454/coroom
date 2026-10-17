@@ -113,7 +113,7 @@ fn gallery(theme: &Theme) -> Vec<Element<'static, Msg>> {
         vec![ui::normal("Cancelar", Some(Msg::Press)).into()],
     );
     all.push(ui::modal(
-        ui::page(ui::body("página")),
+        ui::page("galería", ui::body("página")),
         Some(dialog),
         Msg::Press,
     ));

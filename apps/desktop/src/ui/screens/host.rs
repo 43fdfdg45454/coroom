@@ -2818,7 +2818,7 @@ fn setup(app: &App) -> Element<'_, Message> {
         .into()
     };
     page = page.push(row![ui::fill(), actions].align_y(Alignment::Center));
-    ui::page(page)
+    ui::page("share", page)
 }
 
 /// `K7Q2MZ` → `K7Q 2MZ` (más fácil de dictar).
@@ -3553,7 +3553,7 @@ fn room_view<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
         page = page.push(invite);
     }
     Row::new()
-        .push(container(ui::page(page)).width(Length::Fill))
+        .push(container(ui::page("room", page)).width(Length::Fill))
         .push(chat_panel(app))
         .height(Length::Fill)
         .into()

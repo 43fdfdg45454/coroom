@@ -15,6 +15,8 @@
 //! - [`motion`]: animaciones en función del tiempo con la preferencia de movimiento (reducido,
 //!   factor de duración), sobre las de `iced`; resortes.
 //! - [`release`]: desplegables que eligen al soltar el botón, no al pulsarlo.
+//! - [`scroll`]: el scroll de las páginas, con ancla (lo de arriba no empuja lo que se mira) y una
+//!   posición por página.
 //! - [`selectable`]: texto que se selecciona con el ratón y se copia (los mensajes del chat).
 //! - [`widget`]: componentes (botones, campos, listas, insignias, avisos, toasts, diálogos,
 //!   progreso, selectores, atajos, barra lateral, cabecera, tarjetas, estados).
@@ -27,6 +29,7 @@ pub mod font;
 pub mod icon;
 pub mod motion;
 pub mod release;
+pub mod scroll;
 pub mod selectable;
 pub mod style;
 pub mod tag;

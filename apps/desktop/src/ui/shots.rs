@@ -69,6 +69,11 @@ impl ShotRenderer {
         })
     }
 
+    /// El motor de `iced`, para pruebas que construyen la interfaz a mano cuadro a cuadro.
+    pub fn renderer(&mut self) -> &mut Renderer {
+        &mut self.renderer
+    }
+
     /// Dibuja `app` a `scale` (1.0, o 2.0 para HiDPI); devuelve el ancho, el alto y los píxeles
     /// RGBA.
     pub fn render(&mut self, app: &App, scale: f32) -> (u32, u32, Vec<u8>) {

@@ -964,14 +964,26 @@ pub fn page_header<'a, M: 'a>(
     .into()
 }
 
-/// Página con desplazamiento: contenido centrado hasta el ancho máximo.
-pub fn page<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Element<'a, M> {
-    scrollable(
-        container(container(content).max_width(size::CONTENT))
-            .padding(Padding::from([gap::L, gap::XL]))
-            .center_x(Length::Fill),
+/// Página con desplazamiento: contenido centrado hasta el ancho máximo. `key` dice qué página es
+/// (cada una recuerda su posición) y lo de arriba no empuja lo que se está mirando
+/// ([`crate::scroll`]).
+pub fn page<'a, M: 'a>(
+    key: impl std::hash::Hash,
+    content: impl Into<Element<'a, M>>,
+) -> Element<'a, M> {
+    use std::hash::{DefaultHasher, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    crate::scroll::Anchored::new(
+        hasher.finish(),
+        scrollable(
+            container(container(content).max_width(size::CONTENT))
+                .padding(Padding::from([gap::L, gap::XL]))
+                .center_x(Length::Fill),
+        )
+        .height(Length::Fill),
     )
-    .height(Length::Fill)
     .into()
 }
 

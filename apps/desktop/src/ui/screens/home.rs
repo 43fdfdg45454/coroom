@@ -360,7 +360,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
     }
     page = page.push(ui::gap(space::XXS));
     page = page.push(friends_section(app));
-    ui::page(page)
+    ui::page("home", page)
 }
 
 fn notices(app: &App) -> Vec<Element<'_, Message>> {
