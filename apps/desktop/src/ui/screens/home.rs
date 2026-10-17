@@ -142,7 +142,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             Vec::new()
         }
         Msg::Join => {
-            if server_down(app) || app.host.is_open() {
+            if server_down(app) || app.host.is_open() || app.guest.is_some() {
                 return Vec::new();
             }
             let code = app.home.code.clone();
@@ -158,7 +158,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             guest::start(app, code)
         }
         Msg::Accept(code) => {
-            if server_down(app) || app.host.is_open() {
+            if server_down(app) || app.host.is_open() || app.guest.is_some() {
                 return Vec::new();
             }
             app.invitations.retain(|invitation| invitation.code != code);
@@ -541,6 +541,17 @@ fn hosting_reason<'a>() -> Element<'a, Message> {
     .into()
 }
 
+/// El motivo de los botones desactivados dentro de la sala de otro (se ve desde el riel).
+fn visiting_reason<'a>() -> Element<'a, Message> {
+    row![
+        icon_with(Icon::Info, 14.0, SvgClass::Tone(Tone::Info)),
+        ui::caption(t!("room-ya-estas-en-una-sala")).wrapping(Wrapping::WordOrGlyph)
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center)
+    .into()
+}
+
 /// El motivo de un botón desactivado por el servidor caído.
 fn offline_reason<'a>() -> Element<'a, Message> {
     row![
@@ -573,7 +584,8 @@ fn big_card<'a>(
 /// Tarjeta de compartir (`real`: ver [`ui::equal_height_row`]).
 fn share_card(app: &App, real: bool) -> Element<'_, Message> {
     let open = app.host.is_open();
-    let blocked = server_down(app) && !open;
+    let visiting = app.guest.is_some() && !open;
+    let blocked = (server_down(app) && !open) || visiting;
     let mut content = column![
         big_card_header(
             Icon::ShareScreen,
@@ -591,7 +603,9 @@ fn share_card(app: &App, real: bool) -> Element<'_, Message> {
             (real && !blocked).then(|| on(Msg::Share))
         )
     ];
-    if blocked {
+    if visiting {
+        content = content.push(visiting_reason());
+    } else if blocked {
         content = content.push(offline_reason());
     }
     big_card(content, real)
@@ -624,7 +638,8 @@ fn code_input(app: &App, real: bool, enabled: bool) -> Element<'_, Message> {
 /// ni mensajes).
 fn join_card(app: &App, real: bool) -> Element<'_, Message> {
     let hosting = app.host.is_open();
-    let blocked = server_down(app) || hosting;
+    let visiting = app.guest.is_some();
+    let blocked = server_down(app) || hosting || visiting;
     let mut content = column![
         big_card_header(Icon::LogIn, t!("home-join-title"), t!("home-join-text")),
         row![
@@ -654,6 +669,8 @@ fn join_card(app: &App, real: bool) -> Element<'_, Message> {
     }
     if hosting {
         content = content.push(hosting_reason());
+    } else if visiting {
+        content = content.push(visiting_reason());
     } else if blocked {
         content = content.push(offline_reason());
     }
@@ -784,7 +801,7 @@ fn invitation_card<'a>(
         .min(INVITATION_TTL);
     let remaining = INVITATION_TTL.saturating_sub(ago);
     let left = remaining.as_secs().max(u64::from(!leaving));
-    let hosting = app.host.is_open();
+    let hosting = app.host.is_open() || app.guest.is_some();
     let blocked = server_down(app) || hosting || leaving;
     let fraction = remaining.as_secs_f32() / INVITATION_TTL.as_secs_f32();
     container(

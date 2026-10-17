@@ -31,6 +31,7 @@ use iced_core::{
 use iced_widget::button as iced_button;
 
 use crate::motion::{Instant, Motion, Token};
+use crate::sound::Cue;
 use crate::style::Blend;
 use crate::{Element, Renderer, Theme};
 
@@ -40,6 +41,7 @@ pub struct Animated<'a, M> {
     enabled: bool,
     press_scale: bool,
     lift: bool,
+    cue: Option<Cue>,
 }
 
 impl<'a, M> Animated<'a, M> {
@@ -50,6 +52,7 @@ impl<'a, M> Animated<'a, M> {
             enabled,
             press_scale: false,
             lift: false,
+            cue: Some(Cue::Press),
         }
     }
 
@@ -62,6 +65,12 @@ impl<'a, M> Animated<'a, M> {
     /// Que suba 1 px al pasar el ratón ([`crate::style::ButtonClass::lifts`]).
     pub fn lift(mut self, lift: bool) -> Self {
         self.lift = lift;
+        self
+    }
+
+    /// El sonido al pulsarlo (`None`: lo pone otro, como las pestañas al cambiar).
+    pub fn cue(mut self, cue: Option<Cue>) -> Self {
+        self.cue = cue;
         self
     }
 }
@@ -205,6 +214,9 @@ impl<M> iced_core::Widget<M, Theme, Renderer> for Animated<'_, M> {
                 if over =>
             {
                 state.held = true;
+                if let Some(cue) = self.cue.filter(|_| self.enabled) {
+                    crate::sound::cue(cue);
+                }
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
             | Event::Touch(touch::Event::FingerLifted { .. } | touch::Event::FingerLost { .. }) => {
@@ -225,6 +237,17 @@ impl<M> iced_core::Widget<M, Theme, Renderer> for Animated<'_, M> {
         state.set(status);
         if state.status != before {
             shell.request_redraw();
+            if status == iced_button::Status::Hovered
+                && before == iced_button::Status::Active
+                && let Some(position) = cursor.position()
+            {
+                let x = if viewport.width > 0.0 {
+                    ((position.x - viewport.x) / viewport.width).clamp(0.0, 1.0)
+                } else {
+                    0.5
+                };
+                crate::sound::cue(Cue::Hover { x });
+            }
         }
     }
 
@@ -506,6 +529,7 @@ pub struct AnimatedButton<'a, M> {
     enabled: bool,
     press_scale: bool,
     lift: bool,
+    cue: Option<Cue>,
 }
 
 impl<'a, M: Clone + 'a> AnimatedButton<'a, M> {
@@ -516,6 +540,7 @@ impl<'a, M: Clone + 'a> AnimatedButton<'a, M> {
             enabled: false,
             press_scale: false,
             lift: crate::style::ButtonClass::default().lifts(),
+            cue: crate::style::ButtonClass::default().cue(),
         }
     }
 
@@ -553,12 +578,19 @@ impl<'a, M: Clone + 'a> AnimatedButton<'a, M> {
     pub fn class(mut self, class: crate::style::ButtonClass) -> Self {
         self.button = self.button.class(class);
         self.lift = class.lifts();
+        self.cue = class.cue();
         self
     }
 
     /// Que se encoja al pulsarlo (solo para botones de icono: el texto no se escala).
     pub fn press_scale(mut self, press_scale: bool) -> Self {
         self.press_scale = press_scale;
+        self
+    }
+
+    /// El sonido al pulsarlo (por defecto, el de su clase: [`crate::style::ButtonClass::cue`]).
+    pub fn cue(mut self, cue: Option<Cue>) -> Self {
+        self.cue = cue;
         self
     }
 }
@@ -568,6 +600,7 @@ impl<'a, M: Clone + 'a> From<AnimatedButton<'a, M>> for Element<'a, M> {
         Animated::new(button.button, button.enabled)
             .press_scale(button.press_scale)
             .lift(button.lift)
+            .cue(button.cue)
             .into()
     }
 }
@@ -863,6 +896,7 @@ impl<M> iced_core::Widget<M, Theme, Renderer> for Switch<'_, M> {
                 if let Some(on_toggle) = &self.on_toggle {
                     shell.publish(on_toggle(!self.value));
                     shell.capture_event();
+                    crate::sound::cue(Cue::Toggle(!self.value));
                 }
             }
             _ => {}
@@ -1094,7 +1128,10 @@ impl<M> iced_core::Widget<M, Theme, Renderer> for Segments<'_, M> {
                 .set_settle(state.motion.get().spring_settle(Token::Panel));
             match (state.selected, self.selected) {
                 // De uno a otro: se desliza.
-                (Some(_), Some(to)) => state.spring.go(to as f32, now),
+                (Some(_), Some(to)) => {
+                    state.spring.go(to as f32, now);
+                    crate::sound::cue(Cue::Navigate);
+                }
                 // Sin elegido antes: aparece en su sitio.
                 (None, Some(to)) => {
                     state.spring = state.motion.get().spring(Token::Panel, to as f32);
@@ -1761,6 +1798,7 @@ impl<M> iced_core::Widget<M, Theme, Renderer> for Shake<'_, M> {
             if self.error.is_some() {
                 state.since = Some(state.now.unwrap_or_else(Instant::now));
                 shell.request_redraw();
+                crate::sound::cue(Cue::Error);
             }
             state.error = self.error;
         }

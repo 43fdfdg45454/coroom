@@ -49,11 +49,12 @@ use crate::ui::app::{
     App, AudioDevice, Dialog, Effect, Event, Load, Message, MicTest, MicTestError, Page, Screen,
     VideoSupport,
 };
-use crate::ui::screens::{diagnostics, host};
+use crate::ui::screens::{diagnostics, guest, host};
 use crate::ui::settings::{
-    CodecChoice, DEFAULT_NOTIFICATION_VOLUME, DEFAULT_VOICE_VOLUME, DecoderChoice, EncoderChoice,
-    FPS_CHOICES, MAX_VOICE_VOLUME, MotionChoice, QualityPreset, Resolution, Shortcuts, SoundChoice,
-    SoundEvent, ThemeChoice, Video, VideoOption, VoiceMode, When, voice_gain,
+    CodecChoice, DEFAULT_INTERFACE_VOLUME, DEFAULT_NOTIFICATION_VOLUME, DEFAULT_VOICE_VOLUME,
+    DecoderChoice, FPS_CHOICES, MAX_VOICE_VOLUME, MotionChoice, QualityPreset, Resolution,
+    Shortcuts, SoundChoice, SoundEvent, ThemeChoice, Video, VideoOption, VoiceMode, When,
+    voice_gain,
 };
 use crate::ui::tones::Builtin;
 
@@ -224,6 +225,12 @@ pub enum Msg {
     NotificationVolume(u8),
     /// Al soltar el deslizador del volumen de los avisos (suena uno para oírlo).
     NotificationVolumeDone,
+    /// Volumen de los sonidos de la interfaz (porcentaje), mientras se arrastra.
+    InterfaceVolume(u8),
+    /// Al soltar el deslizador del volumen de la interfaz (suena «Confirmar» para oírlo).
+    InterfaceVolumeDone,
+    /// Oír un sonido de la interfaz.
+    PreviewCue(coroom_ui::sound::Cue),
     /// Olvidar el permiso de pantalla del portal: el diálogo del sistema volverá a salir.
     ForgetSharePermission,
     /// Notificación del escritorio con la ventana sin foco.
@@ -505,6 +512,19 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             return effects;
         }
         Msg::InterfaceSounds(on) => settings.notifications.interface_sounds = on,
+        Msg::InterfaceVolume(percent) => {
+            settings.notifications.interface_volume = percent.min(100);
+            return Vec::new();
+        }
+        Msg::InterfaceVolumeDone => {
+            let effects = app.settings_changed();
+            preview_cue(app, coroom_ui::sound::Cue::Confirm);
+            return effects;
+        }
+        Msg::PreviewCue(cue) => {
+            preview_cue(app, cue);
+            return Vec::new();
+        }
         Msg::MicTest(on) => {
             app.settings_page.mic_test_error = None;
             app.settings_page.mic_test = on.then_some(0.0);
@@ -906,7 +926,7 @@ impl Applies {
     }
 
     /// Cuándo surte efecto una opción de vídeo ([`Video::when`]).
-    fn of_video(option: VideoOption) -> Applies {
+    pub fn of_video(option: VideoOption) -> Applies {
         match Video::when(option) {
             When::Live => Applies::Now,
             When::NextRoom => Applies::NextRoom,
@@ -916,7 +936,7 @@ impl Applies {
 
 /// La columna de «cuándo aplica» de una fila con su etiqueta: del ancho de la más ancha, así las
 /// etiquetas de las filas con el mismo control quedan una debajo de otra.
-fn when_column<'a>(applies: Applies) -> Element<'a, Message> {
+pub fn when_column<'a>(applies: Applies) -> Element<'a, Message> {
     let labels = Applies::ALL.map(|applies| (applies.when(), applies.label()));
     tag::column(&labels, Some((applies.when(), applies.label())))
 }
@@ -1652,163 +1672,12 @@ const DEVICE_SELECT_WIDTH: f32 = 280.0;
 
 // --- Vídeo ---------------------------------------------------------------------------------------
 
-fn preset_name(preset: QualityPreset) -> &'static str {
-    match preset {
-        QualityPreset::MinLatency => t!("host-perfil-min-latencia"),
-        QualityPreset::Balanced => t!("host-perfil-equilibrado"),
-        QualityPreset::MaxQuality => t!("host-perfil-max-calidad"),
-        QualityPreset::Custom => t!("host-perfil-personalizado"),
-    }
-}
-
-fn preset_short(preset: QualityPreset) -> &'static str {
-    match preset {
-        QualityPreset::MinLatency => t!("host-perfil-min-latencia-corto"),
-        QualityPreset::Balanced => t!("host-perfil-equilibrado"),
-        QualityPreset::MaxQuality => t!("host-perfil-max-calidad-corto"),
-        QualityPreset::Custom => t!("host-perfil-personalizado"),
-    }
-}
-
-fn preset_help(preset: QualityPreset) -> &'static str {
-    match preset {
-        QualityPreset::MinLatency => t!("host-perfil-min-latencia-ayuda"),
-        QualityPreset::Balanced => t!("host-perfil-equilibrado-ayuda"),
-        QualityPreset::MaxQuality => t!("host-perfil-max-calidad-ayuda"),
-        QualityPreset::Custom => t!("host-perfil-personalizado-ayuda"),
-    }
-}
-
-/// Resolución máxima en el desplegable.
-fn resolution_label(resolution: Resolution) -> String {
-    match resolution {
-        Resolution::P2160 => t!("host-nativa-hasta-4k").to_owned(),
-        other => {
-            let (width, height) = other.size();
-            format!("{height}p ({width} × {height})")
-        }
-    }
-}
-
-fn pick<T>(value: T, label: impl Into<String>) -> host::Pick<T> {
-    host::Pick {
-        value,
-        label: label.into(),
-    }
-}
-
-fn codec_choices() -> Vec<host::Pick<CodecChoice>> {
-    vec![
-        pick(CodecChoice::Auto, t!("host-automatico")),
-        pick(CodecChoice::Av1, "AV1"),
-        pick(CodecChoice::Hevc, "HEVC"),
-        pick(CodecChoice::H264, "H.264"),
-    ]
-}
-
-/// Codificadores de esta plataforma.
-fn encoder_choices() -> Vec<host::Pick<EncoderChoice>> {
-    let mut encoders = vec![pick(EncoderChoice::Auto, t!("host-automatico"))];
-    encoders.extend(
-        [
-            (EncoderChoice::Nvenc, "NVENC (NVIDIA)"),
-            (EncoderChoice::Amf, "AMF (AMD)"),
-            (EncoderChoice::Qsv, "Quick Sync (Intel)"),
-            (EncoderChoice::Vulkan, "Vulkan Video"),
-            (EncoderChoice::Vaapi, "VA-API"),
-        ]
-        .into_iter()
-        .filter(|(c, _)| cfg!(target_os = "linux") || *c != EncoderChoice::Vaapi)
-        .map(|(c, label)| pick(c, label)),
-    );
-    encoders.push(pick(EncoderChoice::Software, t!("host-por-software")));
-    encoders
-}
-
-/// El códec de una elección (`None`: automático).
-fn codec_of(choice: CodecChoice) -> Option<Codec> {
-    match choice {
-        CodecChoice::Auto => None,
-        CodecChoice::Av1 => Some(Codec::Av1),
-        CodecChoice::Hevc => Some(Codec::Hevc),
-        CodecChoice::H264 => Some(Codec::H264),
-    }
-}
-
-/// «AV1», «AV1 y HEVC», «AV1, HEVC y H.264».
-fn join_names(names: &[String]) -> String {
-    match names {
-        [] => String::new(),
-        [one] => one.clone(),
-        [rest @ .., last] => t!("host-y-last", valor = rest.join(", "), last = last),
-    }
-}
-
-/// Explicación de 4:4:4 con lo que hace este equipo y el códec `codec` (los mismos textos que en
-/// Compartir; aquí con el códec como parámetro, para reservar el alto de la más larga).
-fn chroma_hint(support: Option<&VideoSupport>, codec: Option<Codec>) -> String {
-    let lead = t!("host-croma-lead");
-    let Some(support) = support else {
-        return t!("host-croma-comprobando", lead = lead);
-    };
-    if support.yuv444.is_empty() {
-        let decode = if support.decode_yuv444.is_empty() {
-            String::new()
-        } else {
-            let names: Vec<String> = support
-                .decode_yuv444
-                .iter()
-                .map(ToString::to_string)
-                .collect();
-            t!("host-croma-como-invitado", valor = join_names(&names))
-        };
-        return t!("host-croma-no-disponible", lead = lead, decode = decode);
-    }
-    let names: Vec<String> = support
-        .yuv444
-        .iter()
-        .map(|(_, label)| label.clone())
-        .collect();
-    let with = join_names(&names);
-    match codec {
-        Some(codec) if !support.yuv444.iter().any(|(c, _)| *c == codec) => t!(
-            "host-croma-no-con-este-codec",
-            lead = lead,
-            codec = codec,
-            valor = with
-        ),
-        _ => t!("host-croma-disponible-con", lead = lead, valor = with),
-    }
-}
-
-/// Explicación de HDR con lo que hace este equipo y el códec `codec`.
-fn hdr_hint(support: Option<&VideoSupport>, codec: Option<Codec>) -> String {
-    let Some(support) = support else {
-        return t!("host-hdr-comprobando").to_owned();
-    };
-    let share = if support.hdr10.is_empty() {
-        t!("host-hdr-no-disponible").to_owned()
-    } else {
-        let names: Vec<String> = support
-            .hdr10
-            .iter()
-            .map(|(_, label)| label.clone())
-            .collect();
-        let with = join_names(&names);
-        match codec {
-            Some(codec) if !support.hdr10.iter().any(|(c, _)| *c == codec) => {
-                t!("host-hdr-no-con-este-codec", codec = codec, valor = with)
-            }
-            _ => t!("host-hdr-disponible-con", valor = with),
-        }
-    };
-    let display = match support.hdr_display {
-        Some(true) => t!("host-hdr-pantalla-si"),
-        Some(false) => t!("host-hdr-pantalla-no"),
-        None => t!("host-hdr-pantalla-quiza"),
-    };
-    format!("{share} {display}")
-}
+// Los textos de vídeo (perfiles, resoluciones, códecs, codificadores y las explicaciones de 4:4:4
+// y HDR) son los de Compartir: una sola fuente, en `host`.
+use host::{
+    chroma_hint_for as chroma_hint, codec_choices, codec_of, encoder_choices,
+    hdr_hint_for as hdr_hint, pick, preset_help, preset_name, preset_short, resolution_label,
+};
 
 /// La descripción de una opción de vídeo según el códec, del alto de la más larga de las de todos
 /// los códecs (cambiar de códec no mueve la página).
@@ -2293,11 +2162,42 @@ fn notifications<'a>(app: &'a App) -> Element<'a, Message> {
             Some(|on_off| on(Msg::InterfaceSounds(on_off))),
         ),
     );
+    let interface_volume = notifications.interface_volume;
+    let interface_volume_row = setting(
+        t!("settings-volumen-de-la-interfaz"),
+        Some(help(t!("settings-volumen-de-la-interfaz-ayuda"))),
+        None,
+        container(ui::slider(
+            0..=100,
+            interface_volume,
+            5,
+            DEFAULT_INTERFACE_VOLUME,
+            Some(if interface_volume == 0 {
+                Icon::VolumeOff
+            } else {
+                Icon::Volume
+            }),
+            t!("settings-porcentaje", percent = interface_volume),
+            if interface_volume == 0 || !notifications.interface_sounds {
+                SliderClass::AccentMuted
+            } else {
+                SliderClass::Accent
+            },
+            |percent| on(Msg::InterfaceVolume(percent)),
+            Some(on(Msg::InterfaceVolumeDone)),
+        ))
+        .width(Length::Fixed(TONE_SELECT_WIDTH + 110.0)),
+    );
     column![
         ui::section(
             t!("settings-sonido"),
             None,
-            vec![volume_row, interface_sounds]
+            vec![
+                volume_row,
+                interface_sounds,
+                interface_volume_row,
+                cue_previews(),
+            ]
         ),
         ui::section(
             t!("settings-avisos-en-la-sala"),
@@ -2334,8 +2234,7 @@ fn notifications<'a>(app: &'a App) -> Element<'a, Message> {
 
 fn gamepads<'a>(app: &'a App) -> Element<'a, Message> {
     let input = &app.settings.input;
-    let pads_letter = input.shortcuts.pads.to_string();
-    let auto_help = t!("settings-mando-automatico-ayuda", letter = pads_letter);
+    let auto_help = t!("settings-mando-automatico-ayuda").to_owned();
     let auto_control =
         || -> Element<'a, Message> { ui::secondary(t!("settings-el-ultimo-que-conectes")).into() };
     let back_to_auto = || -> Element<'a, Message> {
@@ -2348,11 +2247,7 @@ fn gamepads<'a>(app: &'a App) -> Element<'a, Message> {
     let (pad_help, pad_control, variants) = match &input.pad {
         PadChoice::Auto => (auto_help.clone(), auto_control(), vec![auto_help]),
         PadChoice::Pad(key) => {
-            let chosen = t!(
-                "settings-mando-elegido-ayuda",
-                name = key.name,
-                letter = pads_letter
-            );
+            let chosen = t!("settings-mando-elegido-ayuda", name = key.name);
             (chosen.clone(), back_to_auto(), vec![auto_help, chosen])
         }
     };
@@ -2366,13 +2261,18 @@ fn gamepads<'a>(app: &'a App) -> Element<'a, Message> {
     );
     let max = coroom_session::input::max_gamepads();
     let mut slots = vec![choice(0u8, t!("settings-la-primera-libre"))];
+    let connected_row = connected_pads(app);
     slots.extend((1..=max).map(|slot| choice(slot, t!("settings-ranura", slot = slot))));
     let slot = slots
         .iter()
         .find(|c| c.value == input.preferred_slot)
         .cloned();
     column![
-        ui::section(t!("settings-como-invitado"), None, vec![pad_row]),
+        ui::section(
+            t!("settings-como-invitado"),
+            None,
+            vec![pad_row, connected_row]
+        ),
         ui::section(
             t!("settings-como-anfitrion"),
             None,
@@ -2386,6 +2286,53 @@ fn gamepads<'a>(app: &'a App) -> Element<'a, Message> {
     ]
     .spacing(space::L)
     .into()
+}
+
+/// «Mandos conectados»: dentro de una sala, los mandos de este equipo (los ve la sesión) para
+/// elegir cuál se envía, al momento; fuera de una sala, por qué no hay lista. La ayuda y el
+/// control van en ranuras de su variante mayor: la fila no cambia de alto al entrar o salir.
+fn connected_pads(app: &App) -> Element<'_, Message> {
+    let choice = &app.settings.input.pad;
+    let pads = app.guest.as_ref().and_then(|guest| guest.pads.as_deref());
+    let inside = t!("settings-mandos-conectados-ayuda");
+    let outside = t!("settings-mandos-conectados-fuera");
+    let outside_control =
+        || -> Element<'_, Message> { ui::secondary(t!("settings-sin-sala")).into() };
+    let (current_help, control) = match pads {
+        Some(pads) => {
+            let mut options = vec![self::choice(PadChoice::Auto, t!("room-automatico"))];
+            for pad in pads {
+                options.push(self::choice(
+                    PadChoice::Pad(pad.key.clone()),
+                    pad.key.name.clone(),
+                ));
+            }
+            // El elegido, aunque ahora no esté conectado.
+            if let PadChoice::Pad(key) = choice
+                && !pads.iter().any(|pad| &pad.key == key)
+            {
+                options.push(self::choice(
+                    choice.clone(),
+                    format!("{} · {}", key.name, t!("room-desconectado")),
+                ));
+            }
+            let selected = options.iter().find(|c| &c.value == choice).cloned();
+            let select = ui::select(options, selected, |c: Choice<PadChoice>| {
+                Message::Guest(guest::Msg::ChoosePad(c.value))
+            });
+            (inside, select)
+        }
+        None => (outside, outside_control()),
+    };
+    setting(
+        t!("settings-mandos-conectados"),
+        Some(varying(
+            vec![inside.to_owned(), outside.to_owned()],
+            help(current_help),
+        )),
+        Some(Applies::Now),
+        steady(vec![outside_control()], control),
+    )
 }
 
 // --- Atajos de teclado ---------------------------------------------------------------------------
@@ -3004,9 +2951,9 @@ pub(crate) mod shots {
         ("19-ajustes-mandos", |app| {
             settings_page(app, SettingsPage::Gamepads);
             app.settings.input.pad = PadChoice::Pad(PadKey {
-                vendor: 0x045e,
-                product: 0x0b13,
-                name: "Mando inalámbrico Xbox".to_owned(),
+                vendor: 0x1234,
+                product: 0x5678,
+                name: "Mando de ejemplo".to_owned(),
             });
         }),
         ("19-ajustes-atajos", |app| {
@@ -3023,6 +2970,58 @@ pub(crate) mod shots {
             settings_page(app, SettingsPage::About)
         }),
     ];
+}
+
+/// Hace sonar `cue` con el volumen de la interfaz (aunque estén apagados: es la vista previa).
+fn preview_cue(app: &App, cue: coroom_ui::sound::Cue) {
+    let notifications = &app.settings.notifications;
+    let fraction = f32::from(notifications.interface_volume.min(100)) / 100.0;
+    crate::ui::ui_sound::preview(
+        cue,
+        fraction * fraction,
+        app.settings.audio.speaker.as_deref(),
+    );
+}
+
+/// Los sonidos de la interfaz, cada uno con su botón para oírlo.
+fn cue_previews<'a>() -> Element<'a, Message> {
+    use coroom_ui::sound::Cue;
+    let cues = [
+        (t!("settings-sonido-pasar"), Cue::Hover { x: 0.5 }),
+        (t!("settings-sonido-pulsar"), Cue::Press),
+        (t!("settings-sonido-confirmar"), Cue::Confirm),
+        (t!("settings-sonido-encender"), Cue::Toggle(true)),
+        (t!("settings-sonido-apagar"), Cue::Toggle(false)),
+        (t!("settings-sonido-abrir"), Cue::Open),
+        (t!("settings-sonido-cerrar"), Cue::Close),
+        (t!("settings-sonido-cambiar-de-pantalla"), Cue::Navigate),
+        (t!("settings-sonido-copiado"), Cue::Copied),
+        (t!("settings-sonido-error"), Cue::Error),
+    ];
+    let buttons = cues.into_iter().map(|(label, cue)| {
+        coroom_ui::animate::button(
+            row![
+                icon_with(Icon::Volume, 14.0, SvgClass::Text),
+                text(label).size(type_size::SECONDARY)
+            ]
+            .spacing(space::XS)
+            .align_y(Alignment::Center),
+        )
+        .class(ButtonClass::Flat)
+        .padding(Padding::from([4.0, 10.0]))
+        // Sin el «toc» del botón: se oye solo el sonido elegido.
+        .cue(None)
+        .on_press(Message::Settings(Msg::PreviewCue(cue)))
+        .into()
+    });
+    setting(
+        t!("settings-escuchar-los-sonidos"),
+        Some(help(t!("settings-escuchar-los-sonidos-ayuda"))),
+        None,
+        iced_widget::Row::with_children(buttons)
+            .spacing(space::XS)
+            .wrap(),
+    )
 }
 
 #[cfg(test)]
@@ -3726,7 +3725,7 @@ mod tests {
     }
 
     /// Las descripciones de 4:4:4 y HDR se calculan para cada códec (la fila reserva la más
-    /// larga) y dicen lo mismo que en Compartir.
+    /// larga) con los textos de Compartir, y Compartir las da para el códec elegido.
     #[test]
     fn the_codec_hints_match_share() {
         let support = VideoSupport {

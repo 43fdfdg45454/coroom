@@ -213,7 +213,9 @@ impl<Message> Widget<Message, Theme, Renderer> for ReleaseToPick<'_, Message> {
             viewport,
             translation,
         ) else {
-            state.open = false;
+            if std::mem::take(&mut state.open) {
+                crate::sound::cue(crate::sound::Cue::Close);
+            }
             return None;
         };
         state.open = true;
@@ -222,6 +224,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ReleaseToPick<'_, Message> {
             // cuenta para este.
             state.armed = false;
             state.opened_at = Some(state.now.unwrap_or_else(Instant::now));
+            crate::sound::cue(crate::sound::Cue::Open);
         }
         Some(overlay::Element::new(Box::new(Release { inner, state })))
     }

@@ -56,6 +56,7 @@ icons! {
     Headphones => "headphones",
     HeadphonesOff => "headphone-off",
     Hourglass => "hourglass",
+    LoaderCircle => "loader-circle",
     Home => "house",
     Info => "info",
     Key => "key-round",

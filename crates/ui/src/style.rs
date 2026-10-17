@@ -247,9 +247,28 @@ pub enum ButtonClass {
         /// Si es la elegida.
         selected: bool,
     },
+    /// [`ButtonClass::Choice`] que se enciende al elegirla: `lit` va de 0 (sin elegir) a 1
+    /// (elegida); el borde se ilumina con el acento y la sombra crece, como si se elevase (la
+    /// tarjeta de calidad elegida).
+    ChoiceLit {
+        /// Cuánto está encendida, de 0 a 1.
+        lit: f32,
+    },
 }
 
 impl ButtonClass {
+    /// El sonido al pulsar un botón de esta clase: confirmar el principal, nada en las pestañas y
+    /// la navegación (suena el cambio de pantalla) y un «toc» en los demás.
+    pub fn cue(self) -> Option<crate::sound::Cue> {
+        match self {
+            ButtonClass::Primary => Some(crate::sound::Cue::Confirm),
+            ButtonClass::Segment { .. } | ButtonClass::SegmentThumb | ButtonClass::Nav { .. } => {
+                None
+            }
+            _ => Some(crate::sound::Cue::Press),
+        }
+    }
+
     /// Si al pasar el ratón sube 1 px con sombra: los botones con relleno. Los planos, los de la
     /// barra sobre el vídeo, las pestañas y las tarjetas cambian solo de fondo.
     pub fn lifts(self) -> bool {
@@ -477,6 +496,22 @@ impl Theme {
                 shadow: self.shadow(2.0, 1.0, 0.12, 0.3),
                 snap: true,
             },
+            ButtonClass::ChoiceLit { lit } => {
+                let lit = lit.clamp(0.0, 1.0);
+                let mut style = mix_button(
+                    self.button_surface(ButtonClass::Choice { selected: false }, status),
+                    self.button_surface(ButtonClass::Choice { selected: true }, status),
+                    lit,
+                );
+                // Elevada: la sombra se alarga y baja con lo encendida.
+                let raised = self.shadow(10.0, 4.0, 0.14, 0.42);
+                style.shadow = Shadow {
+                    color: mix(Color::TRANSPARENT, raised.color, lit),
+                    offset: raised.offset * lit,
+                    blur_radius: raised.blur_radius * lit,
+                };
+                style
+            }
         }
     }
 }
@@ -514,6 +549,11 @@ pub enum ContainerClass {
     Overlay,
     /// Fondo del vídeo.
     Video,
+    /// El fondo del vídeo encima de la imagen, con lo que le queda de su fundido (1: tapa del
+    /// todo, 0: no se ve): la imagen aparece desde el fondo.
+    VideoCover(f32),
+    /// El borde del vídeo marcado con el acento (el teclado y el ratón van a la sala), sin fondo.
+    VideoFocus,
     /// Bloque de texto monoespaciado (huellas, diagnóstico).
     Code,
     /// Bloque de esqueleto de carga.
@@ -552,6 +592,21 @@ pub enum ContainerClass {
     BarSegment {
         /// Si es uno de los alternos.
         alternate: bool,
+    },
+    /// Tarjeta de lo que está saliendo de este equipo (la transmisión «EN VIVO»): el borde pasa
+    /// al rojo con `live` (1 mientras se comparte; baja a 0 con el fundido al dejar de compartir)
+    /// y brilla con `glow` (1 al empezar, 0 en reposo: brilla una sola vez y queda quieta).
+    CardLive {
+        /// Cuánto rojo lleva el borde, de 0 a 1.
+        live: f32,
+        /// El brillo del arranque, de 0 a 1.
+        glow: f32,
+    },
+    /// La etiqueta «EN VIVO» con el tiempo transmitiendo: rojo lleno, con el brillo del arranque
+    /// (`glow`, de 1 a 0).
+    LiveTag {
+        /// El brillo del arranque, de 0 a 1.
+        glow: f32,
     },
 }
 
@@ -644,6 +699,14 @@ impl container::Catalog for Theme {
                 text_color: Some(p.overlay_text.color()),
                 ..none
             },
+            ContainerClass::VideoCover(left) => container::Style {
+                background: fill(p.video_backdrop.alpha(left.clamp(0.0, 1.0))),
+                ..none
+            },
+            ContainerClass::VideoFocus => container::Style {
+                border: outline(p.accent_bg.color(), 2.0, 0.0),
+                ..none
+            },
             ContainerClass::Code => container::Style {
                 background: fill(p.window.color()),
                 text_color: Some(p.text.color()),
@@ -723,6 +786,49 @@ impl container::Catalog for Theme {
                 border: outline(Color::TRANSPARENT, 0.0, 4.0),
                 ..none
             },
+            ContainerClass::CardLive { live, glow } => {
+                let live = live.clamp(0.0, 1.0);
+                let glow = glow.clamp(0.0, 1.0);
+                let resting = self.shadow(3.0, 1.0, 0.06, 0.0);
+                let red = p.error.solid.color();
+                container::Style {
+                    background: fill(p.card.color()),
+                    text_color: Some(p.text.color()),
+                    border: outline(
+                        mix(p.border.color(), red, live),
+                        1.0 + 0.5 * live,
+                        radius::CARD,
+                    ),
+                    shadow: if glow > 0.0 {
+                        Shadow {
+                            color: mix(resting.color, p.error.solid.alpha(0.55), glow),
+                            offset: resting.offset * (1.0 - glow),
+                            blur_radius: resting.blur_radius + 18.0 * glow,
+                        }
+                    } else {
+                        resting
+                    },
+                    snap: true,
+                }
+            }
+            ContainerClass::LiveTag { glow } => {
+                let glow = glow.clamp(0.0, 1.0);
+                container::Style {
+                    background: fill(mix(
+                        p.destructive_bg.color(),
+                        p.destructive_bg_hover.color(),
+                        glow,
+                    )),
+                    text_color: Some(p.on_destructive.color()),
+                    border: outline(Color::TRANSPARENT, 0.0, radius::PILL),
+                    shadow: Shadow {
+                        color: p.error.solid.alpha(0.6 * glow),
+                        offset: Vector::ZERO,
+                        blur_radius: 12.0 * glow,
+                    },
+                    snap: true,
+                }
+            }
         }
     }
 }

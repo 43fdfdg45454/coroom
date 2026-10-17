@@ -483,6 +483,9 @@ impl EventSound {
 /// Volumen de los avisos por defecto (porcentaje).
 pub const DEFAULT_NOTIFICATION_VOLUME: u8 = 80;
 
+/// Volumen de partida de los sonidos de la interfaz: la mitad (−12 dB), por debajo de los avisos.
+pub const DEFAULT_INTERFACE_VOLUME: u8 = 50;
+
 /// Avisos con sonido: el volumen de todos y qué suena en cada uno. Se lee con
 /// [`NotificationsFile`]: un aviso que no se entiende vuelve a su tono sin tirar el resto.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -509,6 +512,8 @@ pub struct Notifications {
     /// Sonidos de la interfaz (al pulsar, abrir paneles, confirmar), aparte de los avisos.
     /// Encendidos de partida.
     pub interface_sounds: bool,
+    /// Volumen de los sonidos de la interfaz, en porcentaje (0-100), aparte del de los avisos.
+    pub interface_volume: u8,
 }
 
 impl Default for Notifications {
@@ -525,6 +530,7 @@ impl Default for Notifications {
             became_host: tone(SoundEvent::BecameHost),
             friend_request: tone(SoundEvent::FriendRequest),
             interface_sounds: true,
+            interface_volume: DEFAULT_INTERFACE_VOLUME,
         }
     }
 }
@@ -546,6 +552,7 @@ struct NotificationsFile {
     became_host: EventSoundFile,
     friend_request: EventSoundFile,
     interface_sounds: Option<toml::Value>,
+    interface_volume: Option<toml::Value>,
 }
 
 /// [`EventSound`] tal como viene en `settings.toml` (ver [`NotificationsFile`]).
@@ -590,6 +597,12 @@ impl From<NotificationsFile> for Notifications {
                 .interface_sounds
                 .and_then(|on| on.as_bool())
                 .unwrap_or(true),
+            interface_volume: file
+                .interface_volume
+                .and_then(|volume| volume.as_integer())
+                .map_or(DEFAULT_INTERFACE_VOLUME, |volume| {
+                    volume.clamp(0, 100) as u8
+                }),
         }
     }
 }
@@ -627,6 +640,16 @@ impl Notifications {
     /// del deslizador que una recta (80 % ≈ −4 dB, 50 % ≈ −12 dB).
     pub fn gain(&self) -> f32 {
         let fraction = f32::from(self.volume.min(100)) / 100.0;
+        fraction * fraction
+    }
+
+    /// Ganancia lineal de los sonidos de la interfaz (como [`Notifications::gain`]); cero si están
+    /// apagados.
+    pub fn interface_gain(&self) -> f32 {
+        if !self.interface_sounds {
+            return 0.0;
+        }
+        let fraction = f32::from(self.interface_volume.min(100)) / 100.0;
         fraction * fraction
     }
 }

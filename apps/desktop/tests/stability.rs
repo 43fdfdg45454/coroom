@@ -291,7 +291,7 @@ fn speaking(app: &mut App, who: &[&str]) {
 /// quita.
 type Toggle = (&'static str, fn(&mut App), fn(&mut App));
 
-const TOGGLES: [Toggle; 5] = [
+const TOGGLES: [Toggle; 7] = [
     (
         "quién habla",
         |app| {
@@ -348,6 +348,26 @@ const TOGGLES: [Toggle; 5] = [
         },
     ),
     (
+        // El aviso de abajo y el borde del vídeo en el acento.
+        "teclado y ratón tomados",
+        |app| {
+            app.update(Message::Guest(guest::Msg::ForwardingChanged(true)));
+        },
+        |app| {
+            app.update(Message::Guest(guest::Msg::ForwardingChanged(false)));
+        },
+    ),
+    (
+        "menú del sonido",
+        |app| {
+            app.update(Message::Guest(guest::Msg::ToggleSoundMenu));
+            assert!(state(app).sound_menu, "el menú se abre");
+        },
+        |app| {
+            app.update(Message::Guest(guest::Msg::ToggleSoundMenu));
+        },
+    ),
+    (
         "nada compartido",
         |app| {
             app.update(Message::Event(Event::Guest(SessionEvent::Sharing(false))));
@@ -368,7 +388,8 @@ fn the_guest_panel_keeps_its_scroll_and_focus_as_layers_come_and_go() {
     let mut focused = 0;
     for scene in scenes() {
         let name = scene.name.clone();
-        if !["14-sala-oscuro", "14-conexion-oscuro", "14-chat-oscuro"].contains(&name.as_str()) {
+        if !["14-personas-oscuro", "14-conexion-oscuro", "14-chat-oscuro"].contains(&name.as_str())
+        {
             continue;
         }
         let mut app = scene.app;

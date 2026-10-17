@@ -186,6 +186,7 @@ struct Runner {
 /// Abre la ventana y la ejecuta hasta que se cierre. Con [`Launch::Probe`] y [`Launch::Join`]
 /// devuelve el resumen de latencia final.
 pub fn run(launch: Launch) -> Result<Option<LatencySummary>, String> {
+    super::ui_sound::install();
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .map_err(|err| {
@@ -464,12 +465,21 @@ impl Ready {
     fn pass(&mut self, events: &[UiEvent], draw: bool) -> Pass {
         let mut messages = Vec::new();
         let mut theme = self.app.theme;
-        // Con el teclado y el ratón tomados no se anima nada (se leen en este hilo).
-        theme.motion = if self.input_taken() {
+        // Con el teclado y el ratón tomados no se anima nada (se leen en este hilo) ni suena la
+        // interfaz, que tampoco suena con el vídeo a pantalla completa.
+        let input_taken = self.input_taken();
+        theme.motion = if input_taken {
             coroom_ui::motion::Motion::OFF
         } else {
             self.app.motion()
         };
+        super::ui_sound::set_muted(
+            input_taken || (self.app.fullscreen && self.app.video_in_front()),
+        );
+        super::ui_sound::configure(
+            self.app.settings.notifications.interface_gain(),
+            self.app.settings.audio.speaker.as_deref(),
+        );
         let mut interface = UserInterface::build(
             self.app.view(),
             self.viewport.logical_size(),
@@ -613,7 +623,10 @@ impl Ready {
     fn run_effects(&mut self, effects: Vec<Effect>) {
         for effect in effects {
             match effect {
-                Effect::Copy(text) => self.clipboard.write(Kind::Standard, text),
+                Effect::Copy(text) => {
+                    self.clipboard.write(Kind::Standard, text);
+                    coroom_ui::sound::cue(coroom_ui::sound::Cue::Copied);
+                }
                 Effect::SetFullscreen(on) => {
                     self.window
                         .set_fullscreen(on.then_some(Fullscreen::Borderless(None)));
@@ -648,15 +661,71 @@ impl Ready {
     }
 
     /// Tras cada cambio de la aplicación: si el vídeo dejó de estar delante (un diálogo como la
-    /// oferta de traspaso, otra pantalla), el teclado y el ratón pasan a la interfaz y se sueltan
-    /// en el anfitrión las teclas, el cursor y la tecla de pulsar para hablar.
+    /// oferta de traspaso, otra página del riel), el teclado y el ratón pasan a la interfaz y se
+    /// sueltan en el anfitrión las teclas, el cursor y la tecla de pulsar para hablar. Desde otra
+    /// página tampoco se envía el mando (el anfitrión lo ve desconectarse y volver). La captura
+    /// mide el vídeo sin el riel.
     fn sync_in_front(&mut self) {
         let in_front = self.video_in_front();
+        let video = self.video_size();
         let Some(input) = self.input.as_mut() else {
             return;
         };
+        input.capture.set_window_size(video.0, video.1);
+        if let Some(gamepads) = &input.gamepads {
+            let allowed = input.capture.allowed().gamepad_slot;
+            gamepads.set_slot(guest::sent_pad_slot(&self.app, allowed));
+        }
         let actions = input.capture.set_in_front(in_front);
         self.apply(actions);
+    }
+
+    /// Dónde empieza el vídeo por la izquierda, en píxeles físicos (a la derecha del riel).
+    fn video_left(&self) -> f64 {
+        f64::from(guest::video_left(&self.app)) * self.window.scale_factor()
+    }
+
+    /// Tamaño físico del vídeo en la ventana: toda menos el riel.
+    fn video_size(&self) -> (u32, u32) {
+        let size = self.window.inner_size();
+        let left = self.video_left().round() as u32;
+        (size.width.saturating_sub(left), size.height)
+    }
+
+    /// El evento como lo ve el vídeo: la posición del cursor, desde su esquina (a la derecha del
+    /// riel).
+    fn on_video<'e>(&self, event: &'e WindowEvent) -> std::borrow::Cow<'e, WindowEvent> {
+        match event {
+            WindowEvent::CursorMoved {
+                device_id,
+                position,
+            } if guest::video_left(&self.app) > 0.0 => {
+                std::borrow::Cow::Owned(WindowEvent::CursorMoved {
+                    device_id: *device_id,
+                    position: winit::dpi::PhysicalPosition::new(
+                        position.x - self.video_left(),
+                        position.y,
+                    ),
+                })
+            }
+            other => std::borrow::Cow::Borrowed(other),
+        }
+    }
+
+    /// Si `code` con los modificadores de ahora es un destino del riel (`Ctrl+1/2/3`, `Ctrl+,`).
+    fn rail_shortcut(&self, code: KeyCode) -> bool {
+        self.modifiers.control_key()
+            && !self.modifiers.alt_key()
+            && matches!(
+                code,
+                KeyCode::Digit1 | KeyCode::Digit2 | KeyCode::Digit3 | KeyCode::Comma
+            )
+    }
+
+    /// Si el cursor está sobre el riel (lo de ahí es de la interfaz, no del vídeo).
+    fn over_rail(&self) -> bool {
+        let left = guest::video_left(&self.app);
+        left > 0.0 && self.cursor.position().is_some_and(|point| point.x < left)
     }
 
     fn attach_input(&mut self) {
@@ -705,7 +774,7 @@ impl Ready {
                     self.dispatch(Message::Guest(guest::Msg::ToggleStats));
                 }
                 Action::TogglePads => {
-                    self.dispatch(Message::Guest(guest::Msg::TogglePads));
+                    self.dispatch(Message::Guest(guest::Msg::TogglePeople));
                 }
                 Action::ToggleChat => {
                     self.dispatch(Message::Chat(super::screens::chat::Msg::Toggle));
@@ -803,7 +872,7 @@ impl Ready {
         }
         if allowed != input.capture.allowed() {
             if let Some(gamepads) = &input.gamepads {
-                gamepads.set_slot(allowed.gamepad_slot);
+                gamepads.set_slot(guest::sent_pad_slot(&self.app, allowed.gamepad_slot));
             }
             let actions = input.capture.set_allowed(allowed);
             self.apply(actions);
@@ -849,7 +918,7 @@ impl Ready {
         if code == keys.overlay {
             self.dispatch(Message::Guest(guest::Msg::ToggleStats));
         } else if code == keys.pads {
-            self.dispatch(Message::Guest(guest::Msg::TogglePads));
+            self.dispatch(Message::Guest(guest::Msg::TogglePeople));
         } else if code == keys.quit {
             let effects = guest::leave(&mut self.app);
             self.run_effects(effects);
@@ -929,8 +998,11 @@ impl Ready {
             }
             WindowEvent::Resized(size) => {
                 self.resized = true;
+                let left = self.video_left().round() as u32;
                 if let Some(input) = self.input.as_mut() {
-                    input.capture.set_window_size(size.width, size.height);
+                    input
+                        .capture
+                        .set_window_size(size.width.saturating_sub(left), size.height);
                 }
             }
             WindowEvent::ScaleFactorChanged { .. } => {
@@ -1023,6 +1095,15 @@ impl Ready {
                         if pressed && !key.repeat {
                             self.shortcut(KeyCode::Escape);
                         }
+                    } else if !forwarding && code.is_some_and(|code| self.rail_shortcut(code)) {
+                        // Sin reenviar, los destinos del riel (`Ctrl+1/2/3`, `Ctrl+,`) son de la
+                        // aplicación, como en las demás páginas.
+                        if pressed
+                            && !key.repeat
+                            && let Some(code) = code
+                        {
+                            self.shortcut(code);
+                        }
                     } else {
                         capture_now = true;
                     }
@@ -1050,7 +1131,7 @@ impl Ready {
                 if in_front && grabbed {
                     to_interface = false;
                     capture_now = true;
-                } else if in_front {
+                } else if in_front && !self.over_rail() {
                     capture_if_ignored = true;
                 }
             }
@@ -1059,8 +1140,10 @@ impl Ready {
             }
             _ => {}
         }
+        // La captura ve el vídeo, que empieza a la derecha del riel.
+        let video_event = self.on_video(&event);
         if capture_now && let Some(input) = self.input.as_mut() {
-            let actions = input.capture.on_window_event(&event);
+            let actions = input.capture.on_window_event(&video_event);
             self.apply(actions);
         }
         if !to_interface {
@@ -1079,7 +1162,7 @@ impl Ready {
             // interfaz la ve en el próximo dibujo, si es que le importa.
             WindowEvent::CursorMoved { .. } if capture_if_ignored => {
                 if let Some(input) = self.input.as_mut() {
-                    let actions = input.capture.on_window_event(&event);
+                    let actions = input.capture.on_window_event(&video_event);
                     self.apply(actions);
                 }
                 self.queue(converted);
@@ -1093,7 +1176,7 @@ impl Ready {
             {
                 let captured = self.process_now(converted);
                 if !captured && let Some(input) = self.input.as_mut() {
-                    let actions = input.capture.on_window_event(&event);
+                    let actions = input.capture.on_window_event(&video_event);
                     self.apply(actions);
                 }
             }

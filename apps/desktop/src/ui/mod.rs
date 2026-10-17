@@ -38,6 +38,7 @@ pub mod sound;
 pub mod stats;
 pub mod system;
 pub mod tones;
+pub mod ui_sound;
 pub mod video;
 
 pub use runner::{Launch, run};

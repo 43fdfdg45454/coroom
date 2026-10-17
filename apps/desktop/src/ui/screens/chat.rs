@@ -42,7 +42,7 @@ use iced_widget::{
 use crate::ui::app::{App, Effect, Event, Message, Page, Screen};
 use crate::ui::avatars;
 use crate::ui::notify;
-use crate::ui::screens::guest::Tab;
+use crate::ui::screens::guest::{self, Tab};
 use crate::ui::settings::SoundEvent;
 
 /// Identificador del campo de escritura (para darle el foco y saber si lo tiene).
@@ -365,20 +365,26 @@ pub fn active(app: &App) -> bool {
     app.guest.is_some() || app.host.is_open()
 }
 
-/// Si los mensajes están a la vista: el invitado con el panel en «Chat»; el anfitrión, además,
-/// con la sala en pantalla (el panel del chat va fijo a su derecha).
+/// Si los mensajes están a la vista: el invitado con el panel en «Chat» y la sala delante (desde
+/// otra página del riel, no); el anfitrión, además, con la sala en pantalla (el panel del chat va
+/// fijo a su derecha).
 pub fn visible(app: &App) -> bool {
     if app.guest.is_some() {
-        return app.chat.open;
+        return app.chat.open && app.screen == Screen::Guest;
     }
     app.chat.open || (app.host.is_open() && app.screen == Screen::Main && app.page == Page::Host)
 }
 
-/// Abre el panel en «Chat» y pone el cursor en el campo (si ya se puede escribir).
+/// Abre el panel en «Chat» y pone el cursor en el campo (si ya se puede escribir). Como invitado
+/// desde otra página, primero vuelve a la sala.
 fn open(app: &mut App) -> Vec<Effect> {
     let mut effects = Vec::new();
+    if app.away_from_room() {
+        effects.extend(app.update(Message::Navigate(Page::Host)));
+    }
+    let now = app.now;
     if let Some(guest) = app.guest.as_mut() {
-        guest.panel = Some(Tab::Chat);
+        guest::place_panel(guest, Some(Tab::Chat), now, true);
         if guest.immersive {
             // El ratón vuelve para poder escribir y pulsar (la ventana confirma el cambio).
             effects.push(Effect::SetImmersive(false));
@@ -398,10 +404,11 @@ fn open(app: &mut App) -> Vec<Effect> {
 
 /// Cierra el panel (el teclado vuelve al juego).
 fn close(app: &mut App) -> Vec<Effect> {
+    let now = app.now;
     if let Some(guest) = app.guest.as_mut()
         && guest.panel == Some(Tab::Chat)
     {
-        guest.panel = None;
+        guest::place_panel(guest, None, now, true);
     }
     app.chat.open = false;
     app.chat.confirm_clear = false;

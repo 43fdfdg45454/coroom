@@ -177,6 +177,107 @@ impl Builtin {
     }
 }
 
+/// Los sonidos de la interfaz ([`coroom_ui::sound::Cue`]): de la misma familia que los avisos
+/// pero muy cortos y bajos, para acompañar la mano sin cansar. Mono, [`RATE`], ya con su nivel
+/// (por debajo de los avisos; el más bajo, el de pasar el ratón); el volumen de la interfaz se
+/// aplica después.
+pub fn cue_samples(cue: coroom_ui::sound::Cue) -> Vec<f32> {
+    use coroom_ui::sound::Cue;
+    let (voices, level_db) = match cue {
+        // Un «tic» de 15 ms, agudo, que sube un poco de izquierda a derecha (si₆ a re♯₇).
+        Cue::Hover { x } => (
+            vec![
+                Voice::new(
+                    0.0,
+                    1975.53 * (1.0 + 0.25 * f64::from(x.clamp(0.0, 1.0))),
+                    0.015,
+                    &PURE,
+                )
+                .attack(0.001)
+                .decay(0.004),
+            ],
+            -24.0,
+        ),
+        // «Toc» seco de 30 ms: un golpe de marimba corto en sol₅.
+        Cue::Press => (
+            vec![
+                Voice::new(0.0, 783.99, 0.03, &MARIMBA)
+                    .attack(0.001)
+                    .decay(0.008)
+                    .glide(0.94, 0.02),
+            ],
+            -14.0,
+        ),
+        // Dos notas que suben una quinta, 80 ms en total.
+        Cue::Confirm => (
+            vec![
+                Voice::new(0.0, 880.00, 0.04, &CHIME)
+                    .attack(0.002)
+                    .decay(0.02),
+                Voice::new(0.04, 1318.51, 0.04, &CHIME)
+                    .attack(0.002)
+                    .decay(0.025),
+            ],
+            -12.0,
+        ),
+        // Una nota de 40 ms que sube (encender) o baja (apagar) una tercera.
+        Cue::Toggle(on) => (
+            vec![
+                Voice::new(0.0, if on { 880.00 } else { 1108.73 }, 0.04, &PURE)
+                    .attack(0.002)
+                    .decay(0.02)
+                    .glide(if on { 1.26 } else { 0.79 }, 0.03),
+            ],
+            -14.0,
+        ),
+        // Barrido corto de 90 ms hacia arriba (abrir) o hacia abajo (cerrar).
+        Cue::Open | Cue::Close => {
+            let open = cue == Cue::Open;
+            (
+                vec![
+                    Voice::new(0.0, if open { 500.0 } else { 900.0 }, 0.09, &PURE)
+                        .attack(0.008)
+                        .decay(0.05)
+                        .glide(if open { 1.8 } else { 0.56 }, 0.08),
+                ],
+                -18.0,
+            )
+        }
+        // Barrido suave de 120 ms, de timbre cálido.
+        Cue::Navigate => (
+            vec![
+                Voice::new(0.0, 587.33, 0.12, &WARM)
+                    .attack(0.015)
+                    .decay(0.06)
+                    .glide(1.12, 0.1),
+            ],
+            -18.0,
+        ),
+        // Una campanita corta (sol₆).
+        Cue::Copied => (
+            vec![Voice::new(0.0, 1567.98, 0.14, &BELL).decay(0.05)],
+            -14.0,
+        ),
+        // Dos notas graves que bajan (mi₄, do₄).
+        Cue::Error => (
+            vec![
+                Voice::new(0.0, 329.63, 0.07, &WARM)
+                    .attack(0.004)
+                    .decay(0.05),
+                Voice::new(0.075, 261.63, 0.09, &WARM)
+                    .attack(0.004)
+                    .decay(0.06),
+            ],
+            -10.0,
+        ),
+    };
+    let gain = 10f32.powf(level_db / 20.0);
+    normalize(render(&voices))
+        .into_iter()
+        .map(|sample| sample * gain)
+        .collect()
+}
+
 /// Un parcial del timbre: múltiplo de la fundamental, amplitud relativa y cuánto dura su caída
 /// respecto a la de la nota (los agudos se apagan antes, como en una campana real).
 #[derive(Debug, Clone, Copy)]

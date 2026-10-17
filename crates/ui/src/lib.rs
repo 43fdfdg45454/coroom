@@ -37,6 +37,7 @@ pub mod release;
 pub mod scroll;
 pub mod selectable;
 pub mod slot;
+pub mod sound;
 pub mod style;
 pub mod tag;
 pub mod theme;

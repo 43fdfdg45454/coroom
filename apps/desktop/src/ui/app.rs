@@ -1087,8 +1087,13 @@ impl App {
             || account::animating(self)
             || friends::animating(self)
             || self.login.probe.is_checking()
-            || self.guest.as_ref().is_some_and(guest::State::animating)
+            || (self.screen == Screen::Guest
+                && self
+                    .guest
+                    .as_ref()
+                    .is_some_and(|guest| guest.animating(self.motion())))
             || self.host.starting
+            || host::animating(self)
     }
 
     /// Cuándo hace falta el próximo [`Message::Tick`].
@@ -1152,6 +1157,9 @@ impl App {
 
     /// Añade un toast.
     pub fn toast(&mut self, tone: Tone, text: impl Into<String>) {
+        if tone == Tone::Error {
+            coroom_ui::sound::cue(coroom_ui::sound::Cue::Error);
+        }
         let id = self.next_toast;
         self.next_toast += 1;
         self.toasts.push(Toast {
@@ -1175,7 +1183,14 @@ impl App {
         let back = matches!(message, Message::Shortcut(Shortcut::Back));
         let effects = self.reduce(message);
         match (had_overlay, self.overlay_open()) {
-            (false, true) => self.overlay_since = Some(self.now),
+            (false, true) => {
+                self.overlay_since = Some(self.now);
+                coroom_ui::sound::cue(coroom_ui::sound::Cue::Open);
+            }
+            (true, false) => {
+                self.overlay_since = None;
+                coroom_ui::sound::cue(coroom_ui::sound::Cue::Close);
+            }
             (_, false) => self.overlay_since = None,
             _ => {}
         }
@@ -1184,7 +1199,9 @@ impl App {
                 at: self.now,
                 from_below: self.page.order() > page.order(),
             });
-            if screen == Screen::Main && !back {
+            // Desde el vídeo de la sala de otro, la página de antes es la sala.
+            let from_room = screen == Screen::Guest && self.guest.is_some();
+            if (screen == Screen::Main || from_room) && !back {
                 self.history.retain(|known| *known != page);
                 self.history.push(page);
                 if self.history.len() > HISTORY {
@@ -1472,11 +1489,20 @@ impl App {
 
     fn navigate(&mut self, page: Page) -> Vec<Effect> {
         self.account_menu = false;
+        let mut effects = Vec::new();
+        // En la sala de otro, «Sala» es su vídeo; ir a otra página no sale de ella.
+        if self.in_room_as_guest() && self.screen != Screen::Login {
+            if page == Page::Host && self.host.room.is_none() {
+                return self.return_to_room();
+            }
+            if self.screen == Screen::Guest {
+                effects.extend(self.leave_room_view());
+            }
+        }
         if self.screen != Screen::Main {
-            return Vec::new();
+            return effects;
         }
         self.page = page;
-        let mut effects = Vec::new();
         match page {
             Page::Home | Page::Friends if !self.friends.is_loading() => {
                 self.friends = match std::mem::take(&mut self.friends) {
@@ -1491,6 +1517,40 @@ impl App {
             _ => {}
         }
         effects.extend(self.preview_visibility());
+        effects
+    }
+
+    /// Vuelve al vídeo de la sala de otro desde otra página: la barra se enseña y, con el panel en
+    /// el chat, lo que llegó mientras tanto se da por leído.
+    fn return_to_room(&mut self) -> Vec<Effect> {
+        let now = self.now;
+        self.screen = Screen::Guest;
+        self.page = Page::Host;
+        if let Some(guest) = self.guest.as_mut() {
+            guest.pointer_moved(now);
+        }
+        if self.chat.open {
+            self.chat.unread = 0;
+            self.chat.bubbles.clear();
+        }
+        self.preview_visibility().into_iter().collect()
+    }
+
+    /// Deja el vídeo de la sala de otro por otra página (sin salir de ella): el ratón vuelve si
+    /// estaba en modo inmersivo, el campo del chat suelta el foco y se cierra el menú del sonido.
+    /// El teclado, el ratón y los mandos dejan de enviarse ([`App::video_in_front`]).
+    fn leave_room_view(&mut self) -> Vec<Effect> {
+        self.screen = Screen::Main;
+        let mut effects = Vec::new();
+        if let Some(guest) = self.guest.as_mut() {
+            guest.sound_menu = false;
+            if guest.immersive {
+                effects.push(Effect::SetImmersive(false));
+            }
+        }
+        if std::mem::take(&mut self.chat.composing) {
+            effects.push(Effect::FocusChat(false));
+        }
         effects
     }
 
@@ -1521,9 +1581,17 @@ impl App {
         effects
     }
 
-    /// Si se está dentro de una sala como invitado (no la prueba local).
+    /// Si se está dentro de una sala como invitado (no la prueba local), con el vídeo delante o
+    /// desde otra página.
     pub fn in_room_as_guest(&self) -> bool {
-        self.screen == Screen::Guest && self.guest.is_some() && !self.probe
+        self.guest.is_some() && !self.probe
+    }
+
+    /// Si se está en la sala de otro pero en otra página del riel (Inicio, Amigos, Ajustes o
+    /// Cuenta): la voz, el sonido y el vídeo siguen; el teclado, el ratón y los mandos no se
+    /// envían ([`App::video_in_front`] es falso).
+    pub fn away_from_room(&self) -> bool {
+        self.in_room_as_guest() && self.screen == Screen::Main
     }
 
     fn shortcut(&mut self, shortcut: Shortcut) -> Vec<Effect> {
@@ -1543,7 +1611,7 @@ impl App {
                 }
             }
             Shortcut::Settings => {
-                if self.screen == Screen::Main {
+                if self.screen == Screen::Main || self.in_room_as_guest() {
                     self.navigate(Page::Settings)
                 } else {
                     Vec::new()
@@ -1551,7 +1619,8 @@ impl App {
             }
             Shortcut::Fullscreen => vec![Effect::SetFullscreen(!self.fullscreen)],
             Shortcut::Go(page) => {
-                if self.screen == Screen::Main && self.dialog.is_none() {
+                if (self.screen == Screen::Main || self.in_room_as_guest()) && self.dialog.is_none()
+                {
                     self.navigate(page)
                 } else {
                     Vec::new()
@@ -1577,6 +1646,13 @@ impl App {
                     && self.friends_page.adding
                 {
                     return friends::update(self, friends::Msg::ToggleAdd);
+                }
+                if let Some(guest) = self.guest.as_mut()
+                    && self.screen == Screen::Guest
+                    && guest.sound_menu
+                {
+                    guest.sound_menu = false;
+                    return Vec::new();
                 }
                 if self.fullscreen {
                     return vec![Effect::SetFullscreen(false)];
@@ -1872,7 +1948,18 @@ impl App {
         let content: Element<'_, Message> = match self.screen {
             Screen::Login => login::view(self),
             Screen::Guest => match &self.guest {
-                Some(state) => guest::view(self, state),
+                // Con la ventana normal, el riel a la izquierda del vídeo (siempre en los mismos
+                // hijos: a pantalla completa quedan vacíos).
+                Some(state) => {
+                    let shown = guest::rail_shown(self);
+                    row![
+                        ui::slot(shown.then(|| self.rail())),
+                        ui::slot(shown.then(|| iced_widget::rule::vertical(1).into())),
+                        guest::view(self, state),
+                    ]
+                    .height(Length::Fill)
+                    .into()
+                }
                 None => login::view(self),
             },
             Screen::Main => self.shell(),
@@ -2112,7 +2199,18 @@ impl App {
         };
         let room = self.host.room.as_ref();
         let mut sala = item(Page::Host, Icon::ShareScreen, t!("app-sala"), "Ctrl+3");
-        if self.host.is_open() {
+        let visiting = self
+            .guest
+            .as_ref()
+            .filter(|_| room.is_none() && !self.probe);
+        if let Some(state) = visiting {
+            // En la sala de otro, «Sala» es su vídeo.
+            sala.tip = t!(
+                "app-destino-atajo",
+                destino = guest::room_title(state),
+                atajo = "Ctrl+3"
+            );
+        } else if self.host.is_open() {
             sala.mark = self.sharing_screen().then(|| self.live_mark());
             let guests = room.map_or(0, |room| room.guests.len());
             sala.count = (guests > 0).then(|| guests.to_string());
@@ -2160,7 +2258,10 @@ impl App {
         } else {
             icon_with(Icon::RadioTower, BRAND_ICON, SvgClass::Accent)
         };
-        let footer = room.map(|room| self.rail_footer(room, wide));
+        let footer = match visiting {
+            Some(state) => Some(guest::rail_footer(self, state, wide)),
+            None => room.map(|room| self.rail_footer(room, wide)),
+        };
         let selected = Page::ALL.iter().position(|page| *page == self.page);
         container(ui::rail(header, top, footer, bottom, selected, wide))
             .id(iced_widget::Id::new(RAIL_ID))
