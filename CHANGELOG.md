@@ -185,6 +185,10 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **El ratón del invitado coincide con el del anfitrión Windows con varios monitores o escalado**:
+  el movimiento absoluto lleva el cursor a su píxel exacto con `SetCursorPos` después de
+  `SendInput` (con dos monitores quedaba desplazado, más hacia las esquinas), y la inyección y la
+  captura van en píxeles físicos (*per-monitor DPI aware v2*) también sin ventana.
 - **Cambiar de fuente ya no se queda colgado**: si la fuente nueva no arranca en 10 s (en Windows,
   la captura se colgó con un juego en pantalla completa exclusiva), el cambio falla con un aviso en
   vez de dejar a los invitados con la imagen congelada mientras el anfitrión cree que comparte otra

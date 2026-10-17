@@ -7,8 +7,11 @@
 //!   los movimientos); absoluto con `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK` sobre la
 //!   zona capturada (el monitor o la ventana que comparte WGC, donde esté ahora; la da la fuente
 //!   de [`set_pointer_area_source`]) o, sin ella, sobre el monitor principal, expresada en
-//!   coordenadas del escritorio virtual; rueda con `MOUSEEVENTF_WHEEL`/`HWHEEL`
-//!   (`WHEEL_DELTA` = 120, como el cable).
+//!   coordenadas del escritorio virtual, y después `SetCursorPos` al píxel exacto: con dos
+//!   monitores, la normalización de `SendInput` dejaba el cursor desplazado, más cuanto más cerca
+//!   de una esquina. El hilo que inyecta va en *per-monitor DPI aware v2*, así la zona capturada,
+//!   el escritorio virtual y `SetCursorPos` están todos en píxeles físicos. Rueda con
+//!   `MOUSEEVENTF_WHEEL`/`HWHEEL` (`WHEEL_DELTA` = 120, como el cable).
 //! - **Mandos** (feature `windows-vhid`): con el driver propio de UMDF2
 //!   ([`super::windows_vhid::VhidGamepads`]), que se abre al asignar la primera ranura: un Xbox
 //!   360 por ranura (el genérico cuando no quedan) y, tal cual
@@ -33,9 +36,15 @@
 
 #![allow(unsafe_code)]
 
+use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{PoisonError, RwLock};
 use std::time::Instant;
 
+use windows::Win32::Foundation::POINT;
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE,
@@ -45,9 +54,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_GETKEYBOARDDELAY, SPI_GETKEYBOARDSPEED,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW, XBUTTON1, XBUTTON2,
+    GetCursorPos, GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_GETKEYBOARDDELAY,
+    SPI_GETKEYBOARDSPEED, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetCursorPos, SystemParametersInfoW,
+    XBUTTON1, XBUTTON2,
 };
 
 #[cfg(feature = "windows-vhid")]
@@ -173,7 +183,33 @@ impl SendInputSink {
 
     /// Un grupo seguido de eventos de teclado y ratón de `guest` en una sola llamada a
     /// `SendInput`. Devuelve cuántos se aplicaron.
+    /// Un grupo de teclado y ratón: se corta después de cada movimiento absoluto, que lleva el
+    /// cursor a su píxel exacto ([`place_cursor`]) antes de lo que venga detrás (un clic).
     fn kbm_batch(
+        &mut self,
+        run: &[InputEvent],
+        guest: GuestId,
+        errors: &mut Vec<InputError>,
+    ) -> usize {
+        let mut applied = 0;
+        let mut start = 0;
+        for (index, event) in run.iter().enumerate() {
+            if let InputEvent::MouseMoveAbsolute { x, y } = *event {
+                let before = errors.len();
+                applied += self.kbm_segment(&run[start..=index], guest, errors);
+                if errors.len() == before {
+                    place_cursor(x, y);
+                }
+                start = index + 1;
+            }
+        }
+        if start < run.len() {
+            applied += self.kbm_segment(&run[start..], guest, errors);
+        }
+        applied
+    }
+
+    fn kbm_segment(
         &mut self,
         run: &[InputEvent],
         guest: GuestId,
@@ -345,32 +381,98 @@ impl SendInputSink {
     /// Posición normalizada de la zona capturada (o del monitor principal) en coordenadas
     /// normalizadas del escritorio virtual (`0..=65535`).
     fn absolute(x: u16, y: u16) -> INPUT {
-        // SAFETY: `GetSystemMetrics` no tiene precondiciones; solo lee métricas del sistema.
-        let metric = |index| unsafe { GetSystemMetrics(index) };
-        let (vx, vy) = (metric(SM_XVIRTUALSCREEN), metric(SM_YVIRTUALSCREEN));
-        let (vw, vh) = (
-            metric(SM_CXVIRTUALSCREEN).max(1),
-            metric(SM_CYVIRTUALSCREEN).max(1),
-        );
-        // Sin zona capturada, el monitor principal (su origen es el del escritorio, (0, 0)).
-        let area = captured_area().unwrap_or_else(|| PointerArea {
-            left: 0,
-            top: 0,
-            width: metric(SM_CXSCREEN).max(1),
-            height: metric(SM_CYSCREEN).max(1),
-        });
-        let to_desk = |value: u16, start: i32, size: i32, origin: i32, virtual_size: i32| {
-            // Píxel de la zona → coordenada normalizada del escritorio virtual.
-            let pixel = f64::from(start) + f64::from(value) / 65535.0 * f64::from(size - 1);
-            ((pixel - f64::from(origin)) * 65535.0 / f64::from((virtual_size - 1).max(1))).round()
+        let (vx, vy, vw, vh) = virtual_desktop();
+        let (px, py) = target_pixel(x, y);
+        let to_desk = |pixel: i32, origin: i32, virtual_size: i32| {
+            (f64::from(pixel - origin) * 65535.0 / f64::from((virtual_size - 1).max(1))).round()
                 as i32
         };
         Self::mouse(
-            to_desk(x, area.left, area.width, vx, vw),
-            to_desk(y, area.top, area.height, vy, vh),
+            to_desk(px, vx, vw),
+            to_desk(py, vy, vh),
             0,
             MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
         )
+    }
+}
+
+/// Pone el hilo en *per-monitor DPI aware v2* (una vez por hilo): `GetSystemMetrics`, el
+/// rectángulo de los monitores y `SetCursorPos` en píxeles físicos, como el fotograma de WGC y
+/// `DWMWA_EXTENDED_FRAME_BOUNDS`. Sin esto, con un escalado distinto de 100 % (o distinto en cada
+/// monitor) unas cosas iban en píxeles lógicos y otras en físicos.
+fn per_monitor_aware() {
+    thread_local! {
+        static AWARE: Cell<bool> = const { Cell::new(false) };
+    }
+    AWARE.with(|aware| {
+        if !aware.get() {
+            // SAFETY: cambia el contexto de DPI de este hilo; el valor es una constante del
+            // sistema.
+            let _ =
+                unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+            aware.set(true);
+        }
+    });
+}
+
+/// Origen y tamaño del escritorio virtual en píxeles físicos.
+fn virtual_desktop() -> (i32, i32, i32, i32) {
+    per_monitor_aware();
+    // SAFETY: `GetSystemMetrics` no tiene precondiciones; solo lee métricas del sistema.
+    let metric = |index| unsafe { GetSystemMetrics(index) };
+    (
+        metric(SM_XVIRTUALSCREEN),
+        metric(SM_YVIRTUALSCREEN),
+        metric(SM_CXVIRTUALSCREEN).max(1),
+        metric(SM_CYVIRTUALSCREEN).max(1),
+    )
+}
+
+/// Píxel del escritorio virtual (físico) que corresponde a `(x, y)` normalizados (`0..=65535`)
+/// de la zona capturada, o del monitor principal si no hay.
+fn target_pixel(x: u16, y: u16) -> (i32, i32) {
+    per_monitor_aware();
+    // SAFETY: como en `virtual_desktop`.
+    let metric = |index| unsafe { GetSystemMetrics(index) };
+    // Sin zona capturada, el monitor principal (su origen es el del escritorio, (0, 0)).
+    let area = captured_area().unwrap_or_else(|| PointerArea {
+        left: 0,
+        top: 0,
+        width: metric(SM_CXSCREEN).max(1),
+        height: metric(SM_CYSCREEN).max(1),
+    });
+    let to_pixel = |value: u16, start: i32, size: i32| {
+        (f64::from(start) + f64::from(value) / 65535.0 * f64::from(size - 1)).round() as i32
+    };
+    (
+        to_pixel(x, area.left, area.width),
+        to_pixel(y, area.top, area.height),
+    )
+}
+
+/// Lleva el cursor del sistema al píxel exacto de `(x, y)` tras el `SendInput` absoluto (que los
+/// juegos con *raw input* necesitan ver). La primera vez que `SendInput` lo dejó en otro sitio,
+/// lo anota en el registro con las medidas del escritorio.
+fn place_cursor(x: u16, y: u16) {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    let (tx, ty) = target_pixel(x, y);
+    let mut landed = POINT::default();
+    // SAFETY: `landed` es un `POINT` local válido para escribir.
+    if unsafe { GetCursorPos(&mut landed) }.is_ok()
+        && ((landed.x - tx).abs() > 1 || (landed.y - ty).abs() > 1)
+        && !REPORTED.swap(true, Ordering::Relaxed)
+    {
+        tracing::info!(
+            target = ?(tx, ty),
+            landed = ?(landed.x, landed.y),
+            desktop = ?virtual_desktop(),
+            area = ?captured_area(),
+            "ratón absoluto: SendInput dejó el cursor en otro píxel; se corrige con SetCursorPos"
+        );
+    }
+    // SAFETY: `SetCursorPos` admite cualquier coordenada (la recorta al escritorio).
+    if let Err(err) = unsafe { SetCursorPos(tx, ty) } {
+        tracing::debug!(error = %err, "SetCursorPos");
     }
 }
 

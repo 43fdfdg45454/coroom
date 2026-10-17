@@ -96,6 +96,9 @@ use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CURSOR_SHOWING, CURSORINFO, EnumWindows, GW_OWNER, GWL_EXSTYLE, GetCursorInfo,
     GetForegroundWindow, GetIconInfo, GetWindow, GetWindowLongW, GetWindowRect,
@@ -1017,7 +1020,16 @@ pub struct WgcCapturer {
 
 impl WgcCapturer {
     /// Crea un capturador sin iniciar.
+    /// Pone el proceso en *per-monitor DPI aware v2* si nadie lo hizo antes (la ventana de winit
+    /// ya lo hace; `coroom host` sin ventana, no): la posición del cursor de `GetCursorInfo` y el
+    /// rectángulo de los monitores tienen que ir en píxeles físicos, como el fotograma. Con un
+    /// escalado distinto de 100 % iban en lógicos y el cursor del invitado se desfasaba, más hacia
+    /// las esquinas.
     pub fn new() -> Self {
+        // SAFETY: sin precondiciones; si el proceso ya tiene contexto de DPI, falla sin cambiar
+        // nada.
+        let _ =
+            unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
         Self::default()
     }
 
