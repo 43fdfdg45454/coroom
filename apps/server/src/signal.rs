@@ -97,6 +97,8 @@ struct Account {
     user: Option<i64>,
     /// Nombre visible.
     name: String,
+    /// Versión de su avatar (`None`: no tiene).
+    avatar: Option<u64>,
     /// Clave del dispositivo autenticado (`None` en modo desarrollo: no se comprueba).
     device_pk: Option<[u8; 32]>,
 }
@@ -246,6 +248,8 @@ pub struct Hub {
     db: Option<Db>,
     quota: Option<Arc<Quota>>,
     inner: Mutex<HubInner>,
+    /// Pone en fila los avisos de avatar ([`Hub::avatar_changed`]).
+    avatar_order: tokio::sync::Mutex<()>,
 }
 
 /// Resultado de una operación: mensajes para quien la pidió o un error.
@@ -290,6 +294,7 @@ impl Hub {
             db: None,
             quota: None,
             inner: Mutex::new(HubInner::default()),
+            avatar_order: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -306,6 +311,7 @@ impl Hub {
             db: Some(db),
             quota: Some(quota),
             inner: Mutex::new(HubInner::default()),
+            avatar_order: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -333,6 +339,18 @@ impl Hub {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Avisa a las sesiones de `to` de que `from` (con su nombre visible) le pide amistad.
+    pub fn friend_requested(&self, to: i64, from: i64, from_name: &str) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let message = SignalMessage::FriendRequested {
+            from_user: u64::try_from(from).unwrap_or(0),
+            from_name: from_name.to_owned(),
+        };
+        Self::deliver_user(&mut inner, to, &message);
     }
 
     /// Si `user` tiene alguna sesión de señalización abierta.
@@ -614,6 +632,57 @@ impl Hub {
         }
     }
 
+    /// `user` cambió de avatar (o lo quitó): lo apuntan sus sesiones y las salas en las que está
+    /// (para los `Joined` y `PeerJoined` siguientes) y se avisa con `Avatar` a sus amigos
+    /// conectados, a sus otras sesiones y a quien comparte sala con él. La versión se lee de la
+    /// base en fila (`avatar_order`): dos cambios seguidos avisan siempre de la última.
+    pub async fn avatar_changed(&self, user: i64) {
+        let Some(db) = &self.db else {
+            return;
+        };
+        let _order = self.avatar_order.lock().await;
+        let avatar = match db.user_by_id(user).await {
+            Ok(Some(row)) => row.avatar,
+            Ok(None) => return,
+            Err(err) => {
+                warn!(user, %err, "no se pudo leer el avatar para avisar");
+                return;
+            }
+        };
+        let friends = self.friend_ids(Some(user)).await;
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        for session in inner.sessions.values_mut() {
+            if session.account.user == Some(user) {
+                session.account.avatar = avatar;
+            }
+        }
+        // A sus amigos, a sus otras sesiones y a quien comparte sala con él (amigo o no).
+        let mut targets: std::collections::BTreeSet<i64> = friends.into_iter().collect();
+        targets.insert(user);
+        for room in inner.rooms.values_mut() {
+            let mut inside = false;
+            for member in std::iter::once(&mut room.host).chain(room.guests.values_mut()) {
+                if member.account.user == Some(user) {
+                    member.account.avatar = avatar;
+                    inside = true;
+                }
+            }
+            if inside {
+                let members = std::iter::once(&room.host).chain(room.guests.values());
+                targets.extend(members.filter_map(|member| member.account.user));
+            }
+        }
+        let message = SignalMessage::Avatar {
+            user: u64::try_from(user).unwrap_or(0),
+            avatar,
+        };
+        for target in targets {
+            Self::deliver_user(&mut inner, target, &message);
+        }
+    }
+
     async fn friend_ids(&self, user: Option<i64>) -> Vec<i64> {
         match (&self.db, user) {
             (Some(db), Some(user)) => db.friend_ids(user).await.unwrap_or_default(),
@@ -827,6 +896,7 @@ impl Hub {
         room.next_peer += 1;
         let user = account.user_id();
         let name = account.name.clone();
+        let avatar = account.avatar;
         room.guests.insert(
             peer_id,
             Member {
@@ -840,6 +910,7 @@ impl Hub {
         let host_user = room.host.account.user_id();
         let host_user_id = room.host.account.user;
         let host_name = room.host.account.name.clone();
+        let host_avatar = room.host.account.avatar;
         let relay = room.relay;
         if let Some(entry) = inner.sessions.get_mut(&session) {
             entry.member = Some((room_id, peer_id));
@@ -853,6 +924,7 @@ impl Hub {
                 key_package,
                 user,
                 name,
+                avatar,
             },
         );
         drop(inner);
@@ -875,6 +947,7 @@ impl Hub {
                 your_peer_id: peer_id,
                 host_user,
                 host_name,
+                host_avatar,
             },
             relay_message,
         ])
@@ -1194,6 +1267,7 @@ impl Hub {
             return Ok(Account {
                 user: None,
                 name: DEV_NAME.to_owned(),
+                avatar: None,
                 device_pk: None,
             });
         }
@@ -1229,6 +1303,7 @@ impl Hub {
                 Ok(Account {
                     user: Some(session.user.id),
                     name: session.user.display_name,
+                    avatar: session.user.avatar,
                     device_pk: Some(device_pk),
                 })
             }
@@ -1382,6 +1457,7 @@ mod tests {
         let dev = Account {
             user: None,
             name: DEV_NAME.to_owned(),
+            avatar: None,
             device_pk: None,
         };
         assert_eq!(dev.user_id(), 0);
@@ -1389,6 +1465,7 @@ mod tests {
         let real = Account {
             user: Some(7),
             name: "Ana".to_owned(),
+            avatar: None,
             device_pk: Some([2; 32]),
         };
         assert_eq!(real.user_id(), 7);
@@ -1402,6 +1479,7 @@ mod tests {
         let account = Account {
             user,
             name: "Ana".to_owned(),
+            avatar: None,
             device_pk: None,
         };
         hub.register(tx, close, account).expect("sesión").0
@@ -1463,6 +1541,7 @@ mod tests {
         let friend = Account {
             user: Some(1),
             name: "Bea".to_owned(),
+            avatar: None,
             device_pk: None,
         };
         hub.register(tx, close, friend).expect("sesión del amigo");
@@ -1476,6 +1555,7 @@ mod tests {
             let account = Account {
                 user: Some(2),
                 name: "Ana".to_owned(),
+                avatar: None,
                 device_pk: None,
             };
             hub.register(tx, close, account).expect("sesión de la sala")

@@ -525,10 +525,13 @@ impl Palette {
             Rgb::new(0xd5, 0x61, 0x99),
             Rgb::new(0x91, 0x41, 0xac),
         ];
-        let hash = seed.bytes().fold(0u32, |acc, byte| {
-            acc.wrapping_mul(31).wrapping_add(u32::from(byte))
+        // FNV-1a y una mezcla final: con `× 31` y el resto entre 8, los bits bajos apenas
+        // cambiaban y muchos nombres cortos salían del mismo color.
+        let hash = seed.bytes().fold(0x811c_9dc5_u32, |acc, byte| {
+            (acc ^ u32::from(byte)).wrapping_mul(0x0100_0193)
         });
-        let base = AVATARS[(hash % AVATARS.len() as u32) as usize];
+        let mixed = u64::from(hash.wrapping_mul(0x9e37_79b1));
+        let base = AVATARS[((mixed * AVATARS.len() as u64) >> 32) as usize];
         let colors = button_background(base);
         (colors.background, colors.text)
     }

@@ -9,6 +9,8 @@
 //!   `COROOM_PUBLIC_HOST || desafío` con la identidad cuya clave pública presentó.
 //! - **Límite de intentos**: [`MAX_FAILURES`] fallos por minuto por cuenta y por IP; después, la
 //!   misma respuesta para todo (también para la contraseña buena) hasta que pase el minuto.
+//! - **Acciones que avisan a otros** (solicitudes de amistad, cambios de avatar): un tope por cuenta y
+//!   por minuto, para que nadie llene la cola de señalización de otro a fuerza de avisos.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
@@ -45,6 +47,12 @@ pub const MAX_FAILURES: usize = 5;
 
 /// Ventana del límite de intentos.
 pub const FAILURE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Solicitudes de amistad por minuto y cuenta.
+pub const MAX_FRIEND_REQUESTS: usize = 10;
+
+/// Cambios de avatar (subir o quitar) por minuto y cuenta.
+pub const MAX_AVATAR_CHANGES: usize = 10;
 
 /// Desafíos pendientes como mucho (protección de memoria).
 const MAX_CHALLENGES: usize = 4096;
@@ -248,6 +256,32 @@ impl Failures {
 pub struct AuthState {
     challenges: Mutex<HashMap<String, PendingChallenge>>,
     failures: Mutex<Failures>,
+    actions: Mutex<Failures>,
+}
+
+/// Acción con tope por cuenta y minuto ([`AuthState::allow`]).
+#[derive(Debug, Clone, Copy)]
+pub enum Action {
+    /// `POST /friends/requests`.
+    FriendRequest,
+    /// `PUT` o `DELETE /me/avatar`.
+    AvatarChange,
+}
+
+impl Action {
+    fn key(self, user: i64) -> String {
+        match self {
+            Self::FriendRequest => format!("amistad:{user}"),
+            Self::AvatarChange => format!("avatar:{user}"),
+        }
+    }
+
+    fn max(self) -> usize {
+        match self {
+            Self::FriendRequest => MAX_FRIEND_REQUESTS,
+            Self::AvatarChange => MAX_AVATAR_CHANGES,
+        }
+    }
 }
 
 fn account_key(username: &str) -> String {
@@ -292,6 +326,22 @@ impl AuthState {
         if let Ok(mut failures) = self.failures.lock() {
             failures.add(ip_key(ip), Instant::now());
         }
+    }
+
+    /// Apunta `action` de `user` y dice si cabe en su tope del último minuto; la que no cabe no
+    /// cuenta.
+    pub fn allow(&self, action: Action, user: i64) -> bool {
+        let Ok(mut actions) = self.actions.lock() else {
+            return false;
+        };
+        let now = Instant::now();
+        actions.prune(now);
+        let key = action.key(user);
+        if actions.count(&key) >= action.max() {
+            return false;
+        }
+        actions.add(key, now);
+        true
     }
 
     /// Guarda un desafío nuevo y devuelve su identificador y sus bytes.
@@ -393,6 +443,17 @@ mod tests {
         assert!(state.limited("ANA", other), "por cuenta");
         assert!(state.limited("bea", ip), "por IP");
         assert!(!state.limited("bea", other));
+    }
+
+    #[test]
+    fn actions_that_notify_others_have_a_cap_per_account() {
+        let state = AuthState::default();
+        for _ in 0..MAX_FRIEND_REQUESTS {
+            assert!(state.allow(Action::FriendRequest, 1));
+        }
+        assert!(!state.allow(Action::FriendRequest, 1), "tope de la cuenta");
+        assert!(state.allow(Action::FriendRequest, 2), "otra cuenta no");
+        assert!(state.allow(Action::AvatarChange, 1), "otra acción no");
     }
 
     #[test]

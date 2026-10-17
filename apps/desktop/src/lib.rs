@@ -7,6 +7,7 @@
 pub mod l10n;
 
 pub mod account;
+pub mod avatar;
 pub mod doctor;
 pub mod localtime;
 pub mod logging;

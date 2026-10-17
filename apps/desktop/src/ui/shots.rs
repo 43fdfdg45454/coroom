@@ -300,7 +300,54 @@ pub(crate) fn base(mode: Mode, fonts: Fonts) -> App {
     let now = Instant::now();
     let mut app = App::new(settings, system, fonts, now);
     app.login = login::State::new(&app.settings);
+    for (name, colors) in SAMPLE_AVATARS {
+        if let Some(version) = sample_avatar(name) {
+            app.avatars.insert(version, sample_avatar_image(colors));
+        }
+    }
     app
+}
+
+/// Quién tiene avatar en las capturas (el resto, sus iniciales) y sus colores, de arriba abajo.
+const SAMPLE_AVATARS: [(&str, [[u8; 3]; 2]); 3] = [
+    ("Ana", [[0x3d, 0x7e, 0xd8], [0x1c, 0x3f, 0x8a]]),
+    ("Bea", [[0xe0, 0x8a, 0x3c], [0xa8, 0x3a, 0x2a]]),
+    ("Dani", [[0x3c, 0xb0, 0x8a], [0x1d, 0x5e, 0x66]]),
+];
+
+/// La versión del avatar de ejemplo de `name`, si tiene.
+pub(crate) fn sample_avatar(name: &str) -> Option<u64> {
+    SAMPLE_AVATARS
+        .iter()
+        .position(|(sample, _)| *sample == name)
+        .map(|index| 0x5a_0000 + index as u64)
+}
+
+/// Avatar de ejemplo dibujado aquí (nada de fotos de nadie): un busto claro sobre un degradado,
+/// con los bordes suavizados.
+fn sample_avatar_image([top, bottom]: [[u8; 3]; 2]) -> coroom_ui::avatar::AvatarImage {
+    let side = coroom_transport::proto::api::AVATAR_SIDE_MAX;
+    let center = side as f32 / 2.0;
+    let image = image::RgbaImage::from_fn(side, side, |x, y| {
+        let (x, y) = (x as f32 + 0.5, y as f32 + 0.5);
+        let t = y / side as f32;
+        let mix = |a: u8, b: u8| f32::from(a) * (1.0 - t) + f32::from(b) * t;
+        let background = [0, 1, 2].map(|i| mix(top[i], bottom[i]));
+        // La cabeza (un círculo) y los hombros (media elipse que sale por abajo).
+        let head = 50.0 - ((x - center).powi(2) + (y - 104.0).powi(2)).sqrt();
+        let shoulders =
+            (1.0 - (((x - center) / 96.0).powi(2) + ((y - 262.0) / 92.0).powi(2)).sqrt()) * 92.0;
+        let cover = head.max(shoulders).clamp(0.0, 1.0);
+        let pixel = background.map(|channel| channel + (240.0 - channel) * cover * 0.85);
+        image::Rgba([pixel[0] as u8, pixel[1] as u8, pixel[2] as u8, 255])
+    });
+    coroom_ui::avatar::AvatarImage::from_rgba_levels(
+        crate::avatar::levels(&image)
+            .into_iter()
+            .map(|level| (level.width(), level.into_raw()))
+            .collect(),
+    )
+    .expect("avatar de ejemplo")
 }
 
 pub(crate) fn safety() -> SafetyNumber {
@@ -314,6 +361,7 @@ pub(crate) fn friend(id: u64, username: &str, display_name: &str, online: bool) 
         display_name: display_name.to_owned(),
         online,
         activity: Default::default(),
+        avatar: sample_avatar(display_name),
     }
 }
 
@@ -326,6 +374,7 @@ pub(crate) fn signed_in(app: &mut App, page: Page) {
         user_id: 1,
         device: "Portátil de Ana".to_owned(),
         fingerprint: "a1".repeat(32),
+        avatar: sample_avatar("Ana"),
     }))));
     app.update(Message::Event(Event::Friends(Ok(Friends {
         friends: vec![

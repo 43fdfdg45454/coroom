@@ -566,6 +566,8 @@ pub struct SignedIn {
     pub place: String,
     /// Dónde se guardaron las credenciales.
     pub saved: String,
+    /// Versión del avatar de la cuenta (`None`: no tiene).
+    pub avatar: Option<u64>,
 }
 
 /// Inicia sesión sin preguntar nada (la interfaz ya pidió los datos): crea antes la cuenta si se
@@ -595,6 +597,7 @@ pub fn sign_in(
     let token = runtime
         .block_on(api.login(username.trim(), password, &identity, device))
         .map_err(api_error)?;
+    let avatar = token.user.avatar;
     let credentials = Credentials {
         server: server.clone(),
         username: token.user.username.clone(),
@@ -616,6 +619,7 @@ pub fn sign_in(
         fingerprint: identity.fingerprint(),
         place,
         saved,
+        avatar,
     })
 }
 
@@ -636,6 +640,7 @@ pub fn resume(options: &AccountOptions) -> Result<(Session, SignedIn), String> {
         fingerprint: identity.fingerprint(),
         place,
         saved: String::new(),
+        avatar: me.user.avatar,
     };
     Ok((session, signed))
 }
@@ -708,6 +713,54 @@ pub fn revoke_device(session: &Session, device: u64) -> Result<String, String> {
 pub fn usage(session: &Session) -> Result<coroom_transport::proto::api::Usage, String> {
     let api = session.api()?;
     runtime()?.block_on(api.usage()).map_err(api_error)
+}
+
+/// Sube el avatar propio (el PNG ya preparado, `crate::avatar::prepare`); devuelve la versión que
+/// le dio el servidor.
+pub fn upload_avatar(session: &Session, png: Vec<u8>) -> Result<Option<u64>, String> {
+    let api = session.api()?;
+    let user = runtime()?
+        .block_on(api.set_avatar(png))
+        .map_err(avatar_change_error)?;
+    Ok(user.avatar)
+}
+
+/// Quita el avatar propio.
+pub fn remove_avatar(session: &Session) -> Result<(), String> {
+    let api = session.api()?;
+    runtime()?
+        .block_on(api.delete_avatar())
+        .map_err(avatar_change_error)?;
+    Ok(())
+}
+
+/// Como [`api_error`], con el tope de cambios de avatar por minuto del servidor
+/// (`too_many_requests`) explicado en la aplicación.
+fn avatar_change_error(err: TransportError) -> String {
+    match err {
+        TransportError::Api { code, .. } if code == "too_many_requests" => {
+            t!("avatar-demasiados-cambios").to_owned()
+        }
+        other => api_error(other),
+    }
+}
+
+/// Descarga el avatar de cada usuario de `users` por la misma conexión y se lo da a `each`
+/// (`Ok(None)`: no tiene).
+pub fn download_avatars(
+    session: &Session,
+    users: &[u64],
+    mut each: impl FnMut(u64, Result<Option<Vec<u8>>, String>),
+) -> Result<(), String> {
+    let api = session.api()?;
+    let runtime = runtime()?;
+    for user in users {
+        each(
+            *user,
+            runtime.block_on(api.avatar(*user)).map_err(api_error),
+        );
+    }
+    Ok(())
 }
 
 /// Comprueba un servidor sin credenciales (ver [`ApiClient::probe`]).
@@ -861,5 +914,28 @@ mod tests {
         assert_eq!(human_bytes(1_500_000), "1.5 MB");
         assert_eq!(human_bytes(2_000_000_000), "2.00 GB");
         assert!(!device_name().is_empty());
+    }
+
+    #[test]
+    fn the_avatar_change_limit_is_explained_in_the_app() {
+        // El 429 del tope de cambios por minuto: el texto del catálogo, no el del servidor.
+        let limited = TransportError::Api {
+            status: 429,
+            code: "too_many_requests".to_owned(),
+            message: "demasiadas peticiones seguidas".to_owned(),
+        };
+        let text = avatar_change_error(limited);
+        assert_eq!(text, t!("avatar-demasiados-cambios"));
+        assert!(text.contains("minuto"), "{text}");
+        // Los demás errores de la API, con el texto del servidor.
+        let invalid = TransportError::Api {
+            status: 400,
+            code: "invalid_avatar".to_owned(),
+            message: "el avatar debe ser una imagen PNG".to_owned(),
+        };
+        assert_eq!(
+            avatar_change_error(invalid),
+            "el avatar debe ser una imagen PNG"
+        );
     }
 }

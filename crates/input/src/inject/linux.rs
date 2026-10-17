@@ -18,7 +18,8 @@
 //! solo `flush`; igual que un teclado o un ratón reales, que agrupan en una trama lo que pasa a la
 //! vez. La posición
 //! absoluta se escala a la región del dispositivo absoluto que corresponde al monitor capturado
-//! ([`PointerArea::Monitor`]; si no hay datos, la primera). Con una ventana, Wayland no dice dónde
+//! ([`PointerArea::Monitor`]: la de su `mapping_id`, o la que empieza en su posición; si no hay
+//! datos, la primera, con un aviso en el registro cuando hay varias). Con una ventana, Wayland no dice dónde
 //! está: la posición absoluta se convierte en movimiento relativo escalado a su tamaño
 //! ([`PointerArea::Window`]). La rueda va por `scroll_discrete` (1/120 de muesca, positivo hacia
 //! abajo en EI).
@@ -170,7 +171,7 @@ impl EiInput {
             .map_or(0, reis::event::Connection::serial);
         let touched = all_or_nothing(
             events,
-            |event| Self::target(&state, self.area, event),
+            |event| Self::target(&state, &self.area, event),
             |device, event| self.queue(device, event),
         )?;
         if touched.is_empty() {
@@ -189,7 +190,7 @@ impl EiInput {
     /// escribir nada. Falla si el compositor no ofrece uno activo con la capacidad que hace falta.
     fn target<'s>(
         state: &'s EiState,
-        area: PointerArea,
+        area: &PointerArea,
         event: &InputEvent,
     ) -> Result<Option<&'s reis::event::Device>, InputError> {
         let capability = match *event {
@@ -252,7 +253,8 @@ impl EiInput {
             }
             InputEvent::MouseMove { dx, dy } => Self::motion(device, dx, dy),
             InputEvent::MouseMoveAbsolute { x, y } => {
-                if let PointerArea::Window { width, height } = self.area {
+                if let PointerArea::Window { width, height } = &self.area {
+                    let (width, height) = (*width, *height);
                     let last = lock(&self.last_absolute).replace((x, y));
                     if let Some((dx, dy)) = window_delta(last, (x, y), (width, height)) {
                         Self::motion(device, dx, dy);
@@ -287,19 +289,22 @@ impl EiInput {
         let Some(pointer) = device.interface::<ei::PointerAbsolute>() else {
             return;
         };
-        let monitor = match self.area {
-            PointerArea::Monitor { x, y } => Some((x, y)),
-            _ => None,
-        };
         let regions = device.regions();
-        let (ox, oy, w, h) = monitor
-            .and_then(|(x, y)| {
-                regions.iter().find(|region| {
-                    i64::from(region.x) == i64::from(x) && i64::from(region.y) == i64::from(y)
-                })
-            })
-            .or_else(|| regions.first())
-            .map(|region| (region.x, region.y, region.width, region.height))
+        let region = monitor_region(regions, &self.area);
+        if region.is_none_or(|(_, exact)| !exact) && regions.len() > 1 {
+            // Con varios monitores, la primera región puede no ser la compartida: el puntero
+            // caería en otra pantalla. Se avisa una vez para que el registro lo cuente.
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    area = ?self.area,
+                    regions = regions.len(),
+                    "EI: ninguna región coincide con el monitor compartido; se usa la primera"
+                );
+            });
+        }
+        let (ox, oy, w, h) = region
+            .map(|(region, _)| (region.x, region.y, region.width, region.height))
             .or_else(|| device.dimensions().map(|(w, h)| (0, 0, w, h)))
             .unwrap_or((0, 0, 1920, 1080));
         let scale = |value: u16, size: u32| {
@@ -309,6 +314,34 @@ impl EiInput {
             (f64::from(ox) + scale(x, w)) as f32,
             (f64::from(oy) + scale(y, h)) as f32,
         );
+    }
+}
+
+/// Región de EI del monitor compartido: la de su `mapping_id` (lo que el portal y el compositor
+/// acuerdan para casar flujo y región), si no la que empieza donde el portal dice que está el
+/// monitor y, sin ninguna de las dos, la primera. El `bool` dice si se encontró la exacta.
+fn monitor_region<'r>(
+    regions: &'r [reis::event::Region],
+    area: &PointerArea,
+) -> Option<(&'r reis::event::Region, bool)> {
+    let PointerArea::Monitor { x, y, mapping_id } = area else {
+        return regions.first().map(|region| (region, false));
+    };
+    if let Some(id) = mapping_id.as_deref()
+        && let Some(region) = regions
+            .iter()
+            .find(|region| region.mapping_id.as_deref() == Some(id))
+    {
+        return Some((region, true));
+    }
+    // Por posición solo es seguro si el portal no dio identificador: con uno que ninguna región
+    // conoce, la posición puede ser la (0, 0) que se pone cuando el portal no la da.
+    let by_position = regions.iter().find(|region| {
+        i64::from(region.x) == i64::from(*x) && i64::from(region.y) == i64::from(*y)
+    });
+    match by_position {
+        Some(region) => Some((region, mapping_id.is_none())),
+        None => regions.first().map(|region| (region, false)),
     }
 }
 
@@ -1182,6 +1215,62 @@ impl InputSink for LinuxSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn region(x: u32, width: u32, mapping_id: Option<&str>) -> reis::event::Region {
+        reis::event::Region {
+            x,
+            y: 0,
+            width,
+            height: 1080,
+            scale: 1.0,
+            mapping_id: mapping_id.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn the_pointer_goes_to_the_shared_monitor_with_two_monitors() {
+        // Dos monitores lado a lado; se comparte el de la derecha.
+        let regions = [
+            region(0, 2560, Some("izquierdo")),
+            region(2560, 1920, Some("derecho")),
+        ];
+        let by_id = PointerArea::Monitor {
+            x: 0,
+            y: 0,
+            mapping_id: Some("derecho".to_owned()),
+        };
+        let (found, exact) = monitor_region(&regions, &by_id).expect("región");
+        assert!(exact);
+        assert_eq!(found.x, 2560, "el mapping_id manda sobre la posición");
+        let by_position = PointerArea::Monitor {
+            x: 2560,
+            y: 0,
+            mapping_id: None,
+        };
+        let (found, exact) = monitor_region(&regions, &by_position).expect("región");
+        assert!(exact);
+        assert_eq!(found.x, 2560);
+        // Sin datos que casen, la primera, y se dice que no es exacta (se avisa en el registro).
+        let unknown = PointerArea::Monitor {
+            x: 5000,
+            y: 0,
+            mapping_id: Some("otro".to_owned()),
+        };
+        let (found, exact) = monitor_region(&regions, &unknown).expect("región");
+        assert!(!exact);
+        assert_eq!(found.x, 0);
+        // Un identificador que ninguna región conoce con la (0, 0) puesta a falta de posición:
+        // casa por posición, pero no se da por exacta.
+        let unmatched = PointerArea::Monitor {
+            x: 0,
+            y: 0,
+            mapping_id: Some("otro".to_owned()),
+        };
+        let (found, exact) = monitor_region(&regions, &unmatched).expect("región");
+        assert!(!exact);
+        assert_eq!(found.x, 0);
+        assert!(monitor_region(&[], &PointerArea::Unknown).is_none());
+    }
 
     #[test]
     fn window_delta_turns_positions_into_motion() {

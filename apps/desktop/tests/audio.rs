@@ -331,7 +331,14 @@ fn check_game_audio(guest: &Guest, summary: &LatencySummary, seconds: u64) {
         "juego: captura → suena p50 {p50:.1} ms, p95 {p95:.1} ms ({} tramas)",
         total.samples
     );
-    assert!(total.samples > 100, "{total:?}");
+    // Que suene es funcional; cuántas tramas se miden en el tiempo de la prueba depende de la
+    // máquina (una CI lenta pierde rachas de tramas).
+    assert!(total.samples > 0, "no sonó ninguna trama: {total:?}");
+    timing_assert!(
+        total.samples > 100,
+        "solo {} tramas medidas: {total:?}",
+        total.samples
+    );
     let load = common::load_factor();
     timing_assert!(
         p50 < 40.0 * load,
@@ -352,7 +359,12 @@ fn check_game_audio(guest: &Guest, summary: &LatencySummary, seconds: u64) {
         "|A−V|: p50 {:.1} ms, p95 {:.1} ms ({} muestras), ajuste {} ms",
         av.p50_ms, av.p95_ms, av.samples, av.adjust_ms
     );
-    assert!(av.samples > 100, "{av:?}");
+    assert!(av.samples > 0, "sin muestras de |A−V|: {av:?}");
+    timing_assert!(
+        av.samples > 100,
+        "solo {} muestras de |A−V|: {av:?}",
+        av.samples
+    );
     // 40 ms en el equipo de referencia, por el factor de carga del entorno. En Windows el
     // planificador de las máquinas virtuales de la CI retrasa la salida hasta una trama de audio
     // (20 ms) más, aunque la codificación vaya a la velocidad de referencia.

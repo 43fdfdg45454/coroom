@@ -153,6 +153,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "server_avatar"
+path = "fuzz_targets/server_avatar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "codec_slices"
 path = "fuzz_targets/codec_slices.rs"
 test = false

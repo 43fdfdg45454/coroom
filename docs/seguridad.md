@@ -187,7 +187,8 @@ suba el protocolo, el desafío pasará a `"coroom device challenge v1\0" ‖ len
 |---|---|
 | Login | 5 fallos por minuto por cuenta y por IP (`too_many_attempts`) |
 | Códigos de sala | 10 códigos que no existen por minuto por cuenta (o por sesión sin cuentas) (**S-3**) |
-| Cuerpo HTTP | 64 KiB (HTTP/3 y TCP); 20 s para llegar entero por TCP (**S-4**) |
+| Cuerpo HTTP | 64 KiB (HTTP/3 y TCP), salvo `PUT /api/v1/me/avatar`: 320 KiB; 20 s para llegar entero por TCP (**S-4**) |
+| Avatares | PNG cuadrado de 16 a 256 píxeles de lado; la cabecera se lee antes de reservar y el decodificador tiene tope de memoria (§2.14) |
 | Cabeceras HTTP/1.1 | 10 s por petición, también entre peticiones (**S-4**); `PING` de HTTP/2 cada 30 s |
 | Conexiones TCP | 1 024 a la vez (**S-4**); handshake TLS en 10 s |
 | QUIC | `idle_timeout` 15 s, `keep_alive` 5 s; streams por conexión de `quinn` |
@@ -305,7 +306,44 @@ en «Convertido» o sin mando.
 las versiones fijadas con `=`. Las revisadas expresamente: `ml-dsa` (opcional), `fluent-bundle`,
 `fluent-syntax` y `unic-langid` (Project Fluent, Apache-2.0 o MIT), `libfuzzer-sys` (solo en
 `fuzz/`), `hidapi` (MIT, solo en Windows y con su backend en Rust, sin C: el mando del invitado en
-crudo).
+crudo), `image` (MIT o Apache-2.0, solo PNG, JPEG y WebP, en Rust: la imagen que se elige como
+avatar en el cliente; el servidor solo usa `png`).
+
+### 2.14 Avatares
+
+Cada usuario puede subir una imagen (`PUT /api/v1/me/avatar`, `DELETE` para quitarla). Es lo único
+que el servidor guarda tal como lo elige un usuario y sirve a otros, así que nunca sirve los bytes
+que llegan:
+
+- **Validación** (`apps/server/src/avatar.rs`): como mucho 320 KiB (la pila HTTP corta antes con
+  413, y solo admite ese tamaño si la petición trae `Authorization: Bearer`; sin token, el límite
+  normal de 64 KiB), firma PNG, ancho y alto leídos de la cabecera y comprobados (cuadrado, de 16 a 256 px)
+  **antes** de reservar los píxeles, y el decodificador con tope de memoria. Del primer fotograma
+  solo se quedan los píxeles, que se vuelven a codificar en un PNG propio sin fragmentos auxiliares
+  (texto, EXIF, perfiles de color, animación). Si algo falla, 400 `invalid_avatar` y nada cambia.
+- **Versión**: los 53 bits altos del SHA-256 del PNG propio (cabe en un número de JSON). Viaja en
+  `User`, `Friend`, `Joined`/`PeerJoined`, en los integrantes de la sala y en el aviso `Avatar` de
+  la señalización (a los amigos, a quien comparte sala con él y a las sesiones propias). Es también
+  el `ETag` de la descarga. El aviso lleva la versión que hay en la base cuando sale, de uno en
+  uno, así que dos subidas seguidas nunca dejan a nadie con la penúltima.
+- **Avisos acotados**: subir la misma imagen otra vez no escribe ni avisa, y cada cuenta puede
+  cambiar el avatar 10 veces por minuto (`429` después); las solicitudes de amistad, 10 por minuto,
+  y solo la primera a cada persona avisa (`FriendRequested`). Así nadie llena la cola de
+  señalización de otro (256 mensajes, que al llenarse cierra su sesión) a fuerza de avisos.
+- **Moderación**: el avatar de una cuenta deshabilitada no se sirve, y el administrador lo quita
+  desde `/admin` («Quitar avatar», `DELETE /api/v1/admin/users/{id}/avatar`), con el mismo aviso.
+- **Quién lo ve**: `GET /api/v1/users/{id}/avatar` vale con **cualquier sesión** del servidor, no
+  solo entre amigos: en una sala hay invitados que no son amigos entre sí y tienen que verse. Es el
+  mismo alcance que el nombre visible. Los id de usuario son correlativos, así que quien tenga cuenta
+  puede bajar todos los avatares de su servidor; sin cuenta, nada (401). Se sirve con
+  `Cache-Control: private, no-cache`, `X-Content-Type-Options: nosniff` y una CSP que no deja
+  ejecutar nada.
+- **En el cliente**: la imagen que se elige se lee con límites (40 MB, 12 000 px de lado, tope de
+  memoria del decodificador, PNG, JPEG o WebP con su orientación EXIF), se recorta al cuadrado
+  central y se reduce a 256 px antes de subirla; la EXIF no sale del equipo. Lo que se descarga se
+  vuelve a decodificar con límites y se comprueba que su SHA-256 da la versión pedida, también lo
+  que se lee de la caché de disco (`avatars/` en el directorio de datos, 400 ficheros como mucho).
+- El objetivo de fuzzing `server_avatar` cubre la validación (§3), y `server_api` la ruta.
 
 ## 3. Fuzzing
 
@@ -334,6 +372,7 @@ señalización no deja salas abiertas al cerrarse la sesión.
 | `crypto_mls` | `process`, `join` y `add_member` con mensajes arbitrarios | 0,75 M | 6 167 |
 | `server_api` | Peticiones HTTP (método, sesión, ruta, cuerpo) al despacho real | 0,47 M | 4 351 |
 | `server_signal` | Sesiones de señalización completas | 0,46 M | 2 632 |
+| `server_avatar` | Ficheros subidos como avatar: límites y PNG propio estable | sin medir aún | — |
 | `codec_slices` | Paquetes H.264, HEVC y AV1 | 16,5 M | 111 |
 | `audio_jitter` | Secuencias de paquetes de audio y reloj | 2,2 M | 160 |
 

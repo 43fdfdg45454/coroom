@@ -16,7 +16,7 @@ use coroom_transport::proto::Alpn;
 use coroom_transport::quic::canonical;
 
 use crate::ServerState;
-use crate::routes::{self, MAX_BODY, dispatch};
+use crate::routes::{self, dispatch};
 use crate::signal::SIGNAL_PATH;
 
 /// Acepta conexiones QUIC hasta que `shutdown` cambia y luego cierra el endpoint.
@@ -221,7 +221,8 @@ async fn handle_request<S>(
 ) where
     S: h3::quic::BidiStream<Bytes>,
 {
-    // Cuerpo, como mucho `MAX_BODY`.
+    // Cuerpo, como mucho lo que admite la ruta.
+    let limit = routes::body_limit(request.method(), request.uri().path(), request.headers());
     let mut body = Vec::new();
     let mut too_large = false;
     loop {
@@ -229,7 +230,7 @@ async fn handle_request<S>(
             Ok(Some(mut chunk)) => {
                 while chunk.has_remaining() {
                     let part = chunk.chunk();
-                    if body.len() + part.len() > MAX_BODY {
+                    if body.len() + part.len() > limit {
                         too_large = true;
                     } else {
                         body.extend_from_slice(part);
@@ -262,6 +263,11 @@ async fn handle_request<S>(
                 .get(header::AUTHORIZATION)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned),
+            if_none_match: parts
+                .headers
+                .get(header::IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned),
             body: Bytes::from(body),
             remote: remote.ip().to_canonical(),
         };
@@ -274,6 +280,9 @@ async fn handle_request<S>(
         .header(header::CONTENT_TYPE, reply.content_type);
     for (name, value) in &reply.headers {
         builder = builder.header(*name, *value);
+    }
+    if let Some(etag) = &reply.etag {
+        builder = builder.header(header::ETAG, etag.as_str());
     }
     let response = match builder.body(()) {
         Ok(response) => response,

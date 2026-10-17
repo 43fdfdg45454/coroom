@@ -8,8 +8,9 @@
 //! [`SignalMessage::Error`].
 //!
 //! Con cuentas, la identidad de `CreateRoom` y `JoinRoom` debe ser la del dispositivo
-//! autenticado; el servidor añade el usuario y su nombre visible a `PeerJoined` y `Joined`, reparte
-//! la presencia de los amigos (`Presence`) y las invitaciones a salas (`Invite` → `Invited`, solo
+//! autenticado; el servidor añade el usuario, su nombre visible y la versión de su avatar a
+//! `PeerJoined` y `Joined`, reparte la presencia de los amigos (`Presence`, y `Avatar` cuando uno
+//! cambia de avatar) y las invitaciones a salas (`Invite` → `Invited`, solo
 //! entre amigos), y avisa con `QuotaExceeded` o `RelayDisabled` cuando la sala no tiene relay.
 //!
 //! El servidor enruta `Mls` y `Candidates` sin interpretarlos y rellena `from_peer` con el par que
@@ -104,6 +105,10 @@ impl Activity {
 }
 
 /// Mensaje de señalización.
+///
+/// postcard codifica la variante por su posición: `Auth` (la primera) y `Error` no se mueven,
+/// para que un cliente y un servidor de versiones distintas se entiendan al menos el
+/// `Error { code: ProtocolVersion }`; las variantes nuevas van al final.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SignalMessage {
     /// Cliente → servidor, primer mensaje: versión, token de sesión (o el de desarrollo,
@@ -149,6 +154,8 @@ pub enum SignalMessage {
         host_user: UserId,
         /// Nombre visible del anfitrión.
         host_name: String,
+        /// Versión del avatar del anfitrión (`crate::api::avatar_version`; `None`: no tiene).
+        host_avatar: Option<u64>,
     },
     /// Servidor → anfitrión: un invitado ha entrado.
     PeerJoined {
@@ -162,6 +169,8 @@ pub enum SignalMessage {
         user: UserId,
         /// Su nombre visible.
         name: String,
+        /// Versión de su avatar (`None`: no tiene).
+        avatar: Option<u64>,
     },
     /// Servidor → miembros: un par ha salido de la sala.
     PeerLeft {
@@ -278,6 +287,22 @@ pub enum SignalMessage {
         /// Texto en español para mostrar.
         message: String,
     },
+    /// Servidor → cliente: un amigo, alguien con quien compartes sala u otra sesión tuya ha
+    /// cambiado de avatar o lo ha quitado (`None`).
+    Avatar {
+        /// El usuario.
+        user: UserId,
+        /// Versión nueva (`crate::api::avatar_version`).
+        avatar: Option<u64>,
+    },
+    /// Servidor → cliente: alguien acaba de pedirte amistad (`POST /friends/requests`); la
+    /// lista de amigos se vuelve a pedir por la API.
+    FriendRequested {
+        /// Quien la pide.
+        from_user: UserId,
+        /// Su nombre visible.
+        from_name: String,
+    },
 }
 
 #[cfg(test)]
@@ -324,31 +349,37 @@ mod tests {
                 any::<[u8; 32]>(),
                 any::<u32>(),
                 any::<u64>(),
-                ".{0,40}"
+                ".{0,40}",
+                prop::option::of(any::<u64>())
             )
-                .prop_map(|(room_id, host_pk, your_peer_id, host_user, host_name)| {
-                    SignalMessage::Joined {
-                        room_id,
-                        host_pk,
-                        your_peer_id,
-                        host_user,
-                        host_name,
+                .prop_map(
+                    |(room_id, host_pk, your_peer_id, host_user, host_name, host_avatar)| {
+                        SignalMessage::Joined {
+                            room_id,
+                            host_pk,
+                            your_peer_id,
+                            host_user,
+                            host_name,
+                            host_avatar,
+                        }
                     }
-                }),
+                ),
             (
                 any::<u32>(),
                 any::<[u8; 32]>(),
                 bytes(),
                 any::<u64>(),
-                ".{0,40}"
+                ".{0,40}",
+                prop::option::of(any::<u64>())
             )
-                .prop_map(|(peer_id, identity_pk, key_package, user, name)| {
+                .prop_map(|(peer_id, identity_pk, key_package, user, name, avatar)| {
                     SignalMessage::PeerJoined {
                         peer_id,
                         identity_pk,
                         key_package,
                         user,
                         name,
+                        avatar,
                     }
                 }),
             (any::<u64>(), "[A-Z2-9]{6}")
@@ -362,6 +393,8 @@ mod tests {
             }),
             (any::<u64>(), any::<bool>())
                 .prop_map(|(user, online)| SignalMessage::Presence { user, online }),
+            (any::<u64>(), prop::option::of(any::<u64>()))
+                .prop_map(|(user, avatar)| SignalMessage::Avatar { user, avatar }),
             (any::<u64>(), prop::sample::select(Activity::ALL.to_vec()))
                 .prop_map(|(user, activity)| SignalMessage::Activity { user, activity }),
             any::<u64>().prop_map(|to_user| SignalMessage::JoinRequest { to_user }),
@@ -374,6 +407,12 @@ mod tests {
             any::<u64>().prop_map(|to_user| SignalMessage::JoinDecline { to_user }),
             (any::<u64>(), ".{0,40}").prop_map(|(from_user, from_name)| {
                 SignalMessage::JoinDeclined {
+                    from_user,
+                    from_name,
+                }
+            }),
+            (any::<u64>(), ".{0,40}").prop_map(|(from_user, from_name)| {
+                SignalMessage::FriendRequested {
                     from_user,
                     from_name,
                 }
@@ -421,6 +460,26 @@ mod tests {
         fn garbage_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..256)) {
             let _ = decode::<SignalMessage>(&bytes);
         }
+    }
+
+    /// `Auth` y `Error` conservan su posición entre versiones del protocolo: un cliente viejo
+    /// tiene que poder leer el `Error { code: ProtocolVersion }` con el que se le rechaza.
+    #[test]
+    fn auth_and_error_keep_their_wire_index() {
+        let error = SignalMessage::Error {
+            code: ErrorCode::ProtocolVersion,
+            message: "x".to_owned(),
+        };
+        assert_eq!(
+            postcard::to_stdvec(&error).expect("codifica"),
+            [22, 1, 1, b'x']
+        );
+        let auth = SignalMessage::Auth {
+            protocol_version: 1,
+            token: String::new(),
+            device_pk: [0; 32],
+        };
+        assert_eq!(postcard::to_stdvec(&auth).expect("codifica")[0], 0);
     }
 
     #[test]

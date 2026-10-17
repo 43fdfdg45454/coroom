@@ -116,8 +116,8 @@ crossbeam-channel = { version = "=0.5.17", default-features = false, features = 
 # `cryoglyph` dependen de `wgpu` 27 en crates.io; las copias de `vendor/` los adaptan a `wgpu` 30
 # (`[patch.crates-io]` al final) hasta que salga `iced` 0.15.
 iced_core = { version = "=0.14.0", default-features = false, features = ["advanced"] }
-iced_widget = { version = "=0.14.0", default-features = false, features = ["wgpu", "svg", "advanced"] }
-iced_wgpu = { version = "=0.14.0", default-features = false, features = ["svg", "web-colors"] }
+iced_widget = { version = "=0.14.0", default-features = false, features = ["wgpu", "svg", "image", "advanced"] }
+iced_wgpu = { version = "=0.14.0", default-features = false, features = ["svg", "image", "web-colors"] }
 iced_winit = { version = "=0.14.0", default-features = false, features = ["x11", "wayland"] }
 iced_runtime = { version = "=0.14.0", default-features = false }
 # Apariencia del sistema: el portal `Settings` en Linux (con `ashpd`, más abajo) y el
@@ -173,8 +173,12 @@ toml = { version = "=1.1.8", default-features = false, features = ["parse", "dis
 # Solo para tests.
 proptest = { version = "=1.12.0", default-features = false, features = ["std"] }
 tempfile = "=3.27.0"
-# Capturas de pantalla de la interfaz, en PNG.
+# PNG: las capturas de pantalla de la interfaz y la validación de los avatares en el servidor
+# (decodifica con límites y vuelve a codificar).
 png = { version = "=0.18.1", default-features = false }
+# Avatares en la aplicación: decodificar lo que elige el usuario (PNG, JPEG o WebP) con límites,
+# recortar, reducir y codificar en PNG. Sin formatos de más: `iced` lo usa para sus imágenes.
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 
 # Los tests en debug codifican y convierten vídeo: optimizar siempre esas crates.
 [profile.dev.package.openh264-sys2]
@@ -208,6 +212,13 @@ opt-level = 3
 # El PNG de las capturas (`COROOM_SHOTS_DIR=dir cargo test -p coroom --test shots`) sin optimizar
 # tardaba 42 de los 51 s del test en comprimir.
 [profile.dev.package.png]
+opt-level = 3
+
+# Los avatares (decodificar, reducir y codificar) en los tests de la aplicación.
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.zune-jpeg]
 opt-level = 3
 
 [profile.dev.package.fdeflate]

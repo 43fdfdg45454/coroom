@@ -1,18 +1,19 @@
 //! Rutas HTTP compartidas por la pila HTTP/3 y la pila TCP.
 //!
-//! Las dos pilas convierten cada petición en un [`Request`] (método, ruta, consulta, cabecera
-//! `Authorization`, cuerpo de como mucho [`MAX_BODY`] y la IP del cliente) y devuelven lo que dé
+//! Las dos pilas convierten cada petición en un [`Request`] (método, ruta, consulta, cabeceras
+//! `Authorization` e `If-None-Match`, cuerpo de como mucho [`body_limit`] y la IP del cliente) y
+//! devuelven lo que dé
 //! [`dispatch`]: `/health` y `/version`, la interfaz de administración `/admin` ([`crate::admin`])
 //! y la API `/api/v1` ([`crate::api`]).
 
 use std::net::IpAddr;
 
 use bytes::Bytes;
-use http::{Method, StatusCode};
+use http::{HeaderMap, Method, StatusCode, header};
 use serde::Serialize;
 
 use coroom_transport::proto::PROTOCOL_VERSION;
-use coroom_transport::proto::api::{API_PREFIX, ApiError};
+use coroom_transport::proto::api::{API_PREFIX, AVATAR_MAX_BYTES, ApiError};
 
 use crate::ServerState;
 
@@ -28,6 +29,28 @@ pub const CONTENT_TYPE_JSON: &str = "application/json";
 /// Cuerpo máximo de una petición.
 pub const MAX_BODY: usize = 64 * 1024;
 
+/// Cuerpo máximo de la petición `method path`: [`MAX_BODY`], salvo la subida del avatar
+/// (`PUT /api/v1/me/avatar` con `Authorization: Bearer`, [`AVATAR_MAX_BYTES`]; sin token se
+/// queda en el límite normal, porque la respuesta será `401` igual). Lo miran las dos pilas antes
+/// de leer el cuerpo.
+pub fn body_limit(method: &Method, path: &str, headers: &HeaderMap) -> usize {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("Bearer "));
+    if bearer
+        && method == Method::PUT
+        && path
+            .strip_prefix(API_PREFIX)
+            .map(|rest| rest.trim_end_matches('/'))
+            == Some("/me/avatar")
+    {
+        AVATAR_MAX_BYTES
+    } else {
+        MAX_BODY
+    }
+}
+
 /// Petición ya leída, igual para HTTP/3 y TCP.
 #[derive(Debug, Clone)]
 pub struct Request {
@@ -39,6 +62,8 @@ pub struct Request {
     pub query: Option<String>,
     /// Cabecera `Authorization`.
     pub authorization: Option<String>,
+    /// Cabecera `If-None-Match` (las respuestas con `ETag`).
+    pub if_none_match: Option<String>,
     /// Cuerpo.
     pub body: Bytes,
     /// IP del cliente.
@@ -53,6 +78,7 @@ impl Request {
             path: path.to_owned(),
             query: None,
             authorization: None,
+            if_none_match: None,
             body: Bytes::new(),
             remote: IpAddr::from([127, 0, 0, 1]),
         }
@@ -76,6 +102,8 @@ pub struct Response {
     pub content_type: &'static str,
     /// Cabeceras extra.
     pub headers: Vec<(&'static str, &'static str)>,
+    /// Cabecera `ETag` (la única que no es fija).
+    pub etag: Option<String>,
     /// Cuerpo.
     pub body: Vec<u8>,
 }
@@ -108,6 +136,7 @@ impl Response {
                 status,
                 content_type: CONTENT_TYPE_JSON,
                 headers: API_HEADERS.to_vec(),
+                etag: None,
                 body: bytes,
             },
             // Los tipos de la API son structs planos con campos serializables: no puede fallar,
@@ -116,6 +145,7 @@ impl Response {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 content_type: CONTENT_TYPE_JSON,
                 headers: API_HEADERS.to_vec(),
+                etag: None,
                 body: b"{}".to_vec(),
             },
         }
@@ -197,6 +227,7 @@ pub(crate) async fn dispatch(state: &ServerState, request: Request) -> Response 
             status: StatusCode::SEE_OTHER,
             content_type: "text/plain; charset=utf-8",
             headers: vec![("location", "/admin/"), HSTS],
+            etag: None,
             body: b"/admin/".to_vec(),
         },
         _ => Response::not_found(),
@@ -230,6 +261,38 @@ mod tests {
         request.query = Some("month=2026-10&x".to_owned());
         assert_eq!(request.query_param("month"), Some("2026-10"));
         assert_eq!(request.query_param("x"), Some(""));
+    }
+
+    #[test]
+    fn only_the_avatar_upload_with_a_token_takes_a_larger_body() {
+        let mut token = HeaderMap::new();
+        token.insert(
+            header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer abc"),
+        );
+        let none = HeaderMap::new();
+        assert_eq!(
+            body_limit(&Method::PUT, "/api/v1/me/avatar", &token),
+            AVATAR_MAX_BYTES
+        );
+        assert_eq!(
+            body_limit(&Method::PUT, "/api/v1/me/avatar/", &token),
+            AVATAR_MAX_BYTES
+        );
+        assert_eq!(
+            body_limit(&Method::PUT, "/api/v1/me/avatar", &none),
+            MAX_BODY,
+            "sin token, el límite normal"
+        );
+        assert_eq!(
+            body_limit(&Method::POST, "/api/v1/me/avatar", &token),
+            MAX_BODY
+        );
+        assert_eq!(body_limit(&Method::PUT, "/api/v1/me", &token), MAX_BODY);
+        assert_eq!(
+            body_limit(&Method::PUT, "/admin/me/avatar", &token),
+            MAX_BODY
+        );
     }
 
     #[test]

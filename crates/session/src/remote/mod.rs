@@ -483,6 +483,13 @@ pub enum SessionEvent {
         /// Su nombre visible.
         from_name: String,
     },
+    /// Alguien te acaba de pedir amistad.
+    FriendRequested {
+        /// Usuario que la pide.
+        from_user: u64,
+        /// Su nombre visible.
+        from_name: String,
+    },
     /// Qué hace un amigo ahora (abre una sala, juega en una, nada). Llega al conectarse y cada
     /// vez que cambia; al desconectarse solo llega `Presence`.
     Activity {
@@ -498,6 +505,13 @@ pub enum SessionEvent {
         user: u64,
         /// Si está conectado.
         online: bool,
+    },
+    /// Un amigo (o esta misma cuenta en otro equipo) cambió de avatar o lo quitó (`None`).
+    Avatar {
+        /// Usuario.
+        user: u64,
+        /// Versión nueva.
+        avatar: Option<u64>,
     },
     /// La sala no tiene relay (cuota agotada o servidor sin relay): solo conexión directa.
     RelayUnavailable(String),
@@ -702,6 +716,9 @@ impl fmt::Display for SessionEvent {
             SessionEvent::JoinDeclined { from_name, .. } => {
                 write!(f, "{from_name} no te deja entrar ahora.")
             }
+            SessionEvent::FriendRequested { from_name, .. } => {
+                write!(f, "{from_name} te pide amistad.")
+            }
             SessionEvent::Activity { user, activity } => {
                 write!(f, "El usuario {user} está {activity:?}.")
             }
@@ -712,6 +729,9 @@ impl fmt::Display for SessionEvent {
                 user,
                 online: false,
             } => write!(f, "El usuario {user} se ha desconectado."),
+            SessionEvent::Avatar { user, .. } => {
+                write!(f, "El usuario {user} ha cambiado de avatar.")
+            }
             SessionEvent::RelayUnavailable(message) => {
                 write!(f, "Sin relay: {message}.")
             }
@@ -766,6 +786,8 @@ pub struct GuestStatus {
     pub user: u64,
     /// Su nombre visible.
     pub name: String,
+    /// Versión de su avatar (`None`: no tiene).
+    pub avatar: Option<u64>,
     /// Clave pública de su identidad (la de su credencial MLS).
     pub public_key: [u8; 32],
     /// Huella de su identidad.
@@ -833,6 +855,10 @@ pub struct RoomMember {
     pub leaf: u32,
     /// Nombre visible.
     pub name: String,
+    /// Su usuario en el servidor (`0` en modo desarrollo): con él se pide su avatar.
+    pub user: u64,
+    /// Versión de su avatar (`None`: no tiene).
+    pub avatar: Option<u64>,
     /// Si es este mismo equipo.
     pub you: bool,
 }
@@ -945,6 +971,9 @@ pub(crate) struct GuestLink {
     pub(crate) safety_number: Option<SafetyNumber>,
     pub(crate) host_fingerprint: String,
     pub(crate) host_name: String,
+    /// Usuario del anfitrión y versión de su avatar (de `Joined`).
+    pub(crate) host_user: u64,
+    pub(crate) host_avatar: Option<u64>,
 }
 
 #[derive(Default)]

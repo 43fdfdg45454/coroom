@@ -35,7 +35,7 @@ pub use chat::{ChatCryptoError, ChatKey, ChatKind, ChatRing};
 pub use credentials::CredentialStore;
 pub use identity::{
     FileStore, Identity, IdentityError, IdentityStore, KeyringStore, PUBLIC_KEY_LENGTH,
-    SIGNATURE_LENGTH, StoreError, sha256_fingerprint, verify_signature,
+    SIGNATURE_LENGTH, StoreError, sha256, sha256_fingerprint, verify_signature,
 };
 pub use input::{InputCipher, InputCryptoError};
 pub use mls::{KeyPackageBundle, Member, MembershipChange, MlsError, Processed, RoomGroup};

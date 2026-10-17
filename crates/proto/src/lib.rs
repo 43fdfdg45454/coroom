@@ -42,8 +42,10 @@ pub mod video;
 /// invitado repite su estado cada [`input::KEEPALIVE_PRESSED`] mientras tiene algo pulsado (y cada
 /// [`input::KEEPALIVE_IDLE`] si no) y el anfitrión suelta lo de quien lleva [`input::STALE_AFTER`]
 /// sin mandar nada; la 14, las salas sin compartir (`Sharing`): solo voz y chat, o tras «Dejar de
-/// compartir».
-pub const PROTOCOL_VERSION: u16 = 14;
+/// compartir»; la 16, los avatares (la versión del avatar en `Joined`, `PeerJoined` y
+/// `control::Member`, con el usuario, y el aviso `Avatar`) y la solicitud de amistad en vivo
+/// (`FriendRequested`), las dos detrás de `Error`, que vuelve a la posición que tenía.
+pub const PROTOCOL_VERSION: u16 = 16;
 
 /// Identificadores ALPN (RFC 7301) que el socket QUIC usa para demultiplexar conexiones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

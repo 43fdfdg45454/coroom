@@ -303,6 +303,24 @@ impl State {
         floor_boundary(&self.content, line.range.start + index)
     }
 
+    /// Si un punto (relativo al *widget*) cae sobre el texto de alguna línea y no sobre el espacio
+    /// libre a su derecha o entre líneas: solo ahí empieza una selección.
+    fn over_text(&self, point: Point) -> bool {
+        // Medio píxel de margen, para que el borde de una letra cuente como letra.
+        const SLACK: f32 = 0.5;
+        let Some(line) = self
+            .lines
+            .iter()
+            .find(|line| point.y >= line.top && point.y < line.top + line.height)
+        else {
+            return false;
+        };
+        let local = Point::new(point.x, point.y - line.top);
+        (0..line.pieces.len())
+            .flat_map(|span| line.paragraph.span_bounds(span))
+            .any(|rect| rect.expand(SLACK).contains(local))
+    }
+
     /// Enlace bajo un punto (relativo al *widget*).
     fn link_at(&self, point: Point) -> Option<usize> {
         let line = self
@@ -607,7 +625,12 @@ impl<Message> Widget<Message, Theme, Renderer> for Selectable<'_, Message> {
                 }
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                let Some(point) = cursor.position_over(bounds) else {
+                // La selección solo empieza sobre el texto (o ampliando una con mayúsculas): un clic
+                // en el hueco a la derecha de una línea corta es como un clic en otro sitio.
+                let Some(point) = cursor.position_over(bounds).filter(|point| {
+                    state.over_text(relative(*point))
+                        || (state.modifiers.shift() && state.selection().is_some())
+                }) else {
                     // Clic en otro sitio: se quita la selección (y no se captura el clic).
                     if state.select(0, 0) {
                         state.reselect();
@@ -706,7 +729,10 @@ impl<Message> Widget<Message, Theme, Renderer> for Selectable<'_, Message> {
             mouse::Interaction::Text
         } else if state.hovered_link.is_some() && self.on_link.is_some() {
             mouse::Interaction::Pointer
-        } else if cursor.is_over(layout.bounds()) {
+        } else if cursor
+            .position_over(layout.bounds())
+            .is_some_and(|point| state.over_text(Point::ORIGIN + (point - layout.position())))
+        {
             mouse::Interaction::Text
         } else {
             mouse::Interaction::None

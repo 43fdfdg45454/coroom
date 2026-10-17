@@ -46,6 +46,7 @@ use crate::ui::app::{
     App, AudioDevice, Dialog, Effect, Event, HostRequest, HostVoice, JOIN_REQUEST_TTL, Load,
     Message, Page, Screen, quality_tone,
 };
+use crate::ui::avatars;
 use crate::ui::settings::{
     CodecChoice, DEFAULT_VOICE_VOLUME, EncoderChoice, FPS_CHOICES, KnownPeer, MAX_VOICE_VOLUME,
     QualityPreset, RememberedApp, Resolution, Video, VideoOption, When, voice_gain,
@@ -2011,12 +2012,14 @@ fn select_fill<'a, T>(
 where
     T: ToString + PartialEq + Clone + 'a,
 {
-    iced_widget::pick_list(options, selected, on_select)
-        .padding(Padding::from([8.0, 12.0]))
-        .text_size(type_size::BODY)
-        .font(coroom_ui::font::UI)
-        .width(Length::Fill)
-        .into()
+    coroom_ui::release::release_to_pick(
+        iced_widget::pick_list(options, selected, on_select)
+            .padding(Padding::from([8.0, 12.0]))
+            .text_size(type_size::BODY)
+            .font(coroom_ui::font::UI)
+            .width(Length::Fill),
+    )
+    .into()
 }
 
 /// Recuadro 16:9 del vídeo con `content` dentro.
@@ -2289,7 +2292,7 @@ fn invite_card(app: &App, real: bool) -> Element<'_, Message> {
                     container(
                         row![
                             mark,
-                            ui::avatar(&app.theme, &friend.display_name, 28.0),
+                            avatars::view(app, &friend.display_name, friend.avatar, 28.0),
                             container(name).width(Length::Fill),
                             badge
                         ]
@@ -3124,7 +3127,13 @@ fn own_row<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
         t!("host-tu-voz-ayuda")
     };
     let mut line = row![
-        ui::avatar(&app.theme, &name, size::AVATAR),
+        avatars::ringed_view(
+            app,
+            &name,
+            app.account.as_ref().and_then(|account| account.avatar),
+            size::AVATAR,
+            talking,
+        ),
         column![
             member_name(
                 t!("host-tu-nombre", name = name.as_str()),
@@ -3213,7 +3222,7 @@ fn guest_row<'a>(app: &'a App, room: &'a Room, status: &'a GuestStatus) -> Eleme
     facts.push(permissions_label(&permissions));
     let talking = room.voice.talkers.contains(&id.0);
     let mut line = row![
-        ui::avatar(&app.theme, &status.name, size::AVATAR),
+        avatars::ringed_view(app, &status.name, status.avatar, size::AVATAR, talking),
         column![
             member_name(status.name.clone(), member_tags(false, talking)),
             ui::secondary(facts.join(" · ")).wrapping(Wrapping::WordOrGlyph)
@@ -3379,7 +3388,12 @@ fn join_request_card<'a>(
     let left = JOIN_REQUEST_TTL.saturating_sub(ago).as_secs().max(1);
     container(
         row![
-            ui::avatar(&app.theme, &request.name, size::AVATAR),
+            avatars::view(
+                app,
+                &request.name,
+                avatars::of_user(app, request.user),
+                size::AVATAR,
+            ),
             column![
                 ui::strong(t!("host-name-pide-entrar", name = request.name))
                     .wrapping(Wrapping::WordOrGlyph),
@@ -3436,7 +3450,12 @@ fn invite_more<'a>(app: &'a App, room: &'a Room) -> Option<Element<'a, Message>>
         .filter(|friend| friend.online && !inside.contains(&friend.id))
         .map(|friend| {
             ui::list_row(
-                Some(ui::avatar(&app.theme, &friend.display_name, 28.0)),
+                Some(avatars::view(
+                    app,
+                    &friend.display_name,
+                    friend.avatar,
+                    28.0,
+                )),
                 friend.display_name.as_str(),
                 None,
                 vec![
@@ -3669,6 +3688,7 @@ pub(crate) mod shots {
         GuestStatus {
             guest: GuestId(id),
             user: u64::from(id) + 1,
+            avatar: crate::ui::shots::sample_avatar(name),
             name: name.to_owned(),
             public_key: [id as u8; 32],
             fingerprint: format!("{:02x}", id + 0xb0).repeat(32),
@@ -3859,6 +3879,7 @@ mod tests {
         GuestStatus {
             guest: GuestId(id),
             user: u64::from(id) + 10,
+            avatar: None,
             name: name.into(),
             public_key: [0; 32],
             fingerprint: "ab".repeat(32),
@@ -4086,6 +4107,7 @@ mod tests {
             display_name: name.to_owned(),
             online,
             activity: Default::default(),
+            avatar: None,
         }
     }
 
@@ -4534,7 +4556,11 @@ mod tests {
             safety_number: coroom_transport::crypto::SafetyNumber::between(&[1; 32], &[3; 32]),
             permissions: Permissions::VIEW_ONLY,
         })));
-        assert!(effects.is_empty(), "{effects:?}");
+        assert_eq!(
+            effects,
+            [Effect::Sound(crate::ui::settings::SoundEvent::MemberJoined)],
+            "solo el aviso de que entra alguien"
+        );
         assert_eq!(
             app.flush_settings(),
             Some(Effect::SaveSettings),
@@ -4993,6 +5019,8 @@ mod tests {
     #[test]
     fn local_mutes_are_remembered_by_name_when_a_guest_comes_back() {
         let mut app = app();
+        // Sin los avisos de quien entra y sale: aquí solo cuentan los efectos de la voz.
+        app.settings.notifications.volume = 0;
         app.settings.audio.set_voice_muted("Carla", true);
         // Al abrir la sala, lo recordado se aplica a quien llega.
         app.update(Message::Host(Msg::Start));

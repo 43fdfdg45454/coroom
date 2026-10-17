@@ -41,6 +41,7 @@ app-inicio = Inicio
 app-la-sala-se-cierra-y-todos = La sala se cierra y todos los invitados salen.
 app-name-no-puede-dejarte-entrar = { $name } no puede dejarte entrar ahora
 app-name-te-deja-entrar = { $name } te deja entrar
+app-name-quiere-ser-tu-amigo = { $name } quiere ser tu amigo
 app-no-se-pudo-comprobar-err = No se pudo comprobar: { $err }
 app-numero-de-seguridad-con-name = Número de seguridad con { $name }
 app-quitar = Quitar
@@ -159,3 +160,24 @@ system-registro-de-windows = registro de Windows
 system-sin-datos-del-sistema = sin datos del sistema
 app-host-sin-conexion = { $host } · sin conexión
 app-host-rtt-ms = { $host } · { $rtt } ms
+
+## Avatares
+
+avatar-titulo = Avatar
+avatar-ayuda = Una imagen cuadrada para que los demás te distingan. Se recorta al centro.
+avatar-guardando = Guardando…
+avatar-elegir = Elegir imagen…
+avatar-cambiar = Cambiar imagen…
+avatar-quitar = Quitar
+avatar-actualizado = Avatar actualizado.
+avatar-quitado = Avatar quitado.
+avatar-elegir-titulo = Elegir un avatar
+avatar-elegir-boton = Elegir
+avatar-filtro-imagenes = Imágenes (PNG, JPEG, WebP)
+avatar-sin-selector = No hay un selector de ficheros en este sistema.
+avatar-no-se-puede-leer = No se puede leer el fichero.
+avatar-demasiado-grande = La imagen es demasiado grande: como mucho, 40 MB y 12 000 píxeles de lado.
+avatar-formato-no-admitido = Ese formato no vale: elige una imagen PNG, JPEG o WebP.
+avatar-danada = La imagen está dañada y no se puede abrir.
+avatar-demasiado-pequena = La imagen es demasiado pequeña: al menos 16 píxeles de lado.
+avatar-demasiados-cambios = Has cambiado el avatar muchas veces seguidas. Espera un minuto y vuelve a probar.

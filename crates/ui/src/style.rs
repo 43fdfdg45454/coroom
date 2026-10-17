@@ -336,6 +336,8 @@ pub enum ContainerClass {
         /// Letra.
         text: Rgb,
     },
+    /// Anillo alrededor de un avatar (quien habla, en el tono de éxito).
+    AvatarRing(Tone),
     /// Punto de estado.
     Dot(Tone),
     /// Etiqueta de tecla de un atajo.
@@ -468,6 +470,10 @@ impl container::Catalog for Theme {
                 background: fill(background.color()),
                 text_color: Some(text.color()),
                 border: outline(Color::TRANSPARENT, 0.0, radius::PILL),
+                ..none
+            },
+            ContainerClass::AvatarRing(tone) => container::Style {
+                border: outline(p.tone(tone).solid.color(), 2.0, radius::PILL),
                 ..none
             },
             ContainerClass::Dot(tone) => container::Style {

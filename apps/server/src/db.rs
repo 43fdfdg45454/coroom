@@ -25,11 +25,14 @@ use crate::clock;
 pub const DATABASE_FILE: &str = "coroom.db";
 
 /// Migraciones embebidas, en orden.
-const MIGRATIONS: &[(i64, &str, &str)] = &[(
-    1,
-    "accounts",
-    include_str!("../migrations/0001_accounts.sql"),
-)];
+const MIGRATIONS: &[(i64, &str, &str)] = &[
+    (
+        1,
+        "accounts",
+        include_str!("../migrations/0001_accounts.sql"),
+    ),
+    (2, "avatars", include_str!("../migrations/0002_avatars.sql")),
+];
 
 /// Error de la base de datos.
 #[derive(Debug)]
@@ -88,6 +91,8 @@ pub struct UserRow {
     pub disabled: bool,
     /// Alta.
     pub created_at: i64,
+    /// Versión del avatar (`None`: no tiene).
+    pub avatar: Option<u64>,
 }
 
 /// Usuario con sus dispositivos, para la administración.
@@ -185,8 +190,10 @@ pub struct FriendRequestRow {
 /// Resultado de pedir amistad.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FriendOutcome {
-    /// Solicitud enviada (o ya estaba enviada).
+    /// Solicitud enviada ahora.
     Requested,
+    /// Ya estaba enviada y sin responder.
+    AlreadyRequested,
     /// El otro ya la había pedido: ahora sois amigos.
     Accepted,
     /// Ya erais amigos.
@@ -200,7 +207,7 @@ pub struct Db {
 }
 
 const USER_COLUMNS: &str = "u.id, u.username, u.display_name, u.password_hash, u.is_admin, \
-                            u.disabled, u.created_at";
+                            u.disabled, u.created_at, u.avatar_version";
 
 fn user_from(row: &SqliteRow) -> Result<UserRow, sqlx::Error> {
     Ok(UserRow {
@@ -211,6 +218,9 @@ fn user_from(row: &SqliteRow) -> Result<UserRow, sqlx::Error> {
         is_admin: row.try_get::<i64, _>("is_admin")? != 0,
         disabled: row.try_get::<i64, _>("disabled")? != 0,
         created_at: row.try_get("created_at")?,
+        avatar: row
+            .try_get::<Option<i64>, _>("avatar_version")?
+            .and_then(|version| u64::try_from(version).ok()),
     })
 }
 
@@ -467,6 +477,67 @@ impl Db {
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    // --- Avatares -------------------------------------------------------------------------------
+
+    /// Guarda el avatar de un usuario (el PNG ya validado) con su versión, sustituyendo el que
+    /// tuviese.
+    pub async fn set_avatar(&self, user: i64, png: &[u8], version: u64) -> DbResult<()> {
+        let version = i64::try_from(version).map_err(|_| DbError::NotFound("versión de avatar"))?;
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query("UPDATE users SET avatar_version = ? WHERE id = ?")
+            .bind(version)
+            .bind(user)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound("usuario"));
+        }
+        sqlx::query(
+            "INSERT INTO avatars (user_id, png, updated_at) VALUES (?, ?, ?) \
+             ON CONFLICT (user_id) DO UPDATE SET png = excluded.png, \
+             updated_at = excluded.updated_at",
+        )
+        .bind(user)
+        .bind(png)
+        .bind(clock::now())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Quita el avatar de un usuario; `false` si no tenía.
+    pub async fn delete_avatar(&self, user: i64) -> DbResult<bool> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE users SET avatar_version = NULL WHERE id = ?")
+            .bind(user)
+            .execute(&mut *tx)
+            .await?;
+        let result = sqlx::query("DELETE FROM avatars WHERE user_id = ?")
+            .bind(user)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// El avatar de un usuario: su versión y el PNG (`None` si no tiene, no existe o está
+    /// deshabilitado).
+    pub async fn avatar(&self, user: i64) -> DbResult<Option<(u64, Vec<u8>)>> {
+        let row = sqlx::query(
+            "SELECT u.avatar_version, a.png FROM users u JOIN avatars a ON a.user_id = u.id \
+             WHERE u.id = ? AND u.avatar_version IS NOT NULL AND u.disabled = 0",
+        )
+        .bind(user)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let version: i64 = row.try_get("avatar_version")?;
+        Ok(Some((as_u64(version), row.try_get("png")?)))
     }
 
     // --- Dispositivos y sesiones ---------------------------------------------------------------
@@ -893,7 +964,7 @@ impl Db {
             tx.commit().await?;
             return Ok(FriendOutcome::Accepted);
         }
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT OR IGNORE INTO friend_requests (from_user, to_user, created_at) \
              VALUES (?, ?, ?)",
         )
@@ -901,9 +972,14 @@ impl Db {
         .bind(to)
         .bind(clock::now())
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
         tx.commit().await?;
-        Ok(FriendOutcome::Requested)
+        Ok(if inserted == 1 {
+            FriendOutcome::Requested
+        } else {
+            FriendOutcome::AlreadyRequested
+        })
     }
 
     /// `user` acepta la solicitud `request`; devuelve quién la había enviado.
@@ -1182,6 +1258,10 @@ mod tests {
         assert_eq!(
             db.request_friend(ana.id, bea.id).await.expect("pide"),
             FriendOutcome::Requested
+        );
+        assert_eq!(
+            db.request_friend(ana.id, bea.id).await.expect("repite"),
+            FriendOutcome::AlreadyRequested
         );
         assert!(!db.are_friends(ana.id, bea.id).await.expect("amigos"));
         let incoming = db.friend_requests(bea.id, true).await.expect("recibidas");

@@ -387,6 +387,27 @@ impl Backend {
             Effect::LoadUsage => {
                 self.with_session(account, "uso", |s| Event::Usage(account::usage(&s)));
             }
+            Effect::FetchAvatars(wanted) => self.spawn("avatares", move |notify| {
+                let session = account.as_ref().and_then(|o| account::session(o).ok());
+                super::avatars::fetch(session, &super::avatars::disk_cache(), wanted, &notify);
+            }),
+            Effect::PickAvatar => self.spawn("avatar", move |notify| {
+                let picked = super::avatars::pick_image();
+                notify(Message::Event(Event::AvatarPicked(picked)));
+            }),
+            Effect::UploadAvatar(path) => self.spawn("avatar", move |notify| {
+                match account.as_ref().map(account::session) {
+                    Some(Ok(session)) => {
+                        let cache = super::avatars::disk_cache();
+                        super::avatars::upload(&session, &cache, &path, &notify);
+                    }
+                    Some(Err(err)) => notify(Message::Event(Event::AvatarChanged(Err(err)))),
+                    None => {}
+                }
+            }),
+            Effect::RemoveAvatar => self.with_session(account, "avatar", |session| {
+                Event::AvatarChanged(account::remove_avatar(&session).map(|()| None))
+            }),
             Effect::StartLobby => {
                 if let Some(options) = account {
                     self.start_lobby(options);
@@ -426,14 +447,16 @@ impl Backend {
             Effect::ChatNotify { title, body } => self.spawn("aviso", move |_| {
                 chat_notification(&title, &body);
             }),
-            Effect::ChatSound => {
-                let tone = app.settings.room.chat_sound_file.clone();
-                self.spawn("sonido", move |_| super::sound::play(tone.as_deref()));
+            Effect::Sound(event) => {
+                if let Some(request) = super::sound::playback(&app.settings, event) {
+                    self.spawn("sonido", move |_| super::sound::play(&request));
+                }
             }
-            Effect::PickChatSound => self.spawn("tono", |notify| {
-                let picked = super::sound::pick_tone();
+            Effect::PickSound(event) => self.spawn("tono", move |notify| {
+                // Elegir y comprobar el fichero (lo lee) aquí, fuera del hilo de la interfaz.
+                let picked = super::sound::pick_checked();
                 notify(Message::Settings(
-                    super::screens::settings::Msg::ChatSoundPicked(picked),
+                    super::screens::settings::Msg::SoundPicked(event, picked),
                 ));
             }),
             // Lo hace la ventana (`runner.rs`): aquí no hay campo que enfocar.
@@ -1288,6 +1311,10 @@ fn lobby_event(event: &SessionEvent) -> Option<Event> {
             user: *user,
             activity: *activity,
         },
+        SessionEvent::Avatar { user, avatar } => Event::Avatar {
+            user: *user,
+            avatar: *avatar,
+        },
         SessionEvent::JoinRequested {
             from_user,
             from_name,
@@ -1299,6 +1326,13 @@ fn lobby_event(event: &SessionEvent) -> Option<Event> {
             from_user,
             from_name,
         } => Event::JoinDeclined {
+            from_user: *from_user,
+            from_name: from_name.clone(),
+        },
+        SessionEvent::FriendRequested {
+            from_user,
+            from_name,
+        } => Event::FriendRequested {
             from_user: *from_user,
             from_name: from_name.clone(),
         },
@@ -1703,6 +1737,7 @@ fn account_info(server: ServerEntry, signed: account::SignedIn) -> AccountInfo {
         user_id: signed.credentials.user_id,
         device: signed.device,
         fingerprint: signed.fingerprint,
+        avatar: signed.avatar,
     }
 }
 
@@ -1843,12 +1878,18 @@ fn lobby_once(
                     Ok(Some(SignalMessage::Activity { user, activity })) => {
                         notify(Message::Event(Event::Activity { user, activity }));
                     }
+                    Ok(Some(SignalMessage::Avatar { user, avatar })) => {
+                        notify(Message::Event(Event::Avatar { user, avatar }));
+                    }
                     // Solo si la sala está abierta en otro dispositivo de la cuenta: se avisa.
                     Ok(Some(SignalMessage::JoinRequested { from_user, from_name })) => {
                         notify(Message::Event(Event::JoinRequested { from_user, from_name }));
                     }
                     Ok(Some(SignalMessage::JoinDeclined { from_user, from_name })) => {
                         notify(Message::Event(Event::JoinDeclined { from_user, from_name }));
+                    }
+                    Ok(Some(SignalMessage::FriendRequested { from_user, from_name })) => {
+                        notify(Message::Event(Event::FriendRequested { from_user, from_name }));
                     }
                     // La sala de espera solo envía peticiones de entrar: un error es su respuesta
                     // (el texto del servidor ya viene en español).

@@ -328,6 +328,27 @@ diff -ruN a/iced_wgpu/src/image/atlas.rs b/iced_wgpu/src/image/atlas.rs
                          &pixels[src_bottom + PIXEL * (w - 1)
                              ..src_bottom + PIXEL * w],
                      );
+diff -ruN a/iced_wgpu/src/image/cache.rs b/iced_wgpu/src/image/cache.rs
+--- a/iced_wgpu/src/image/cache.rs
++++ b/iced_wgpu/src/image/cache.rs
+@@ -38,7 +38,7 @@
+             raster: Raster {
+                 cache: crate::image::raster::Cache::default(),
+                 pending: HashMap::new(),
+-                belt: wgpu::util::StagingBelt::new(2 * 1024 * 1024),
++                belt: wgpu::util::StagingBelt::new(device.clone(), 2 * 1024 * 1024),
+             },
+             #[cfg(feature = "svg")]
+             vector: crate::image::vector::Cache::default(),
+@@ -445,7 +445,7 @@
+                 backend,
+                 texture_layout,
+                 shell: shell.clone(),
+-                belt: wgpu::util::StagingBelt::new(4 * 1024 * 1024),
++                belt: wgpu::util::StagingBelt::new(device.clone(), 4 * 1024 * 1024),
+                 jobs: jobs_receiver,
+                 output: work_sender,
+                 quit: quit_receiver,
 diff -ruN a/iced_wgpu/src/image/mod.rs b/iced_wgpu/src/image/mod.rs
 --- a/iced_wgpu/src/image/mod.rs
 +++ b/iced_wgpu/src/image/mod.rs

@@ -43,6 +43,7 @@ use crate::ui::app::{
     App, AudioDevice, Dialog, Effect, EndKind, Event, HEADERBAR_HEIGHT, Invitation, Message, Page,
     Screen, quality_tone,
 };
+use crate::ui::avatars;
 use crate::ui::settings::{
     DEFAULT_VOICE_VOLUME, DecoderChoice, KnownPeer, MAX_VOICE_VOLUME, VoiceMode, voice_gain,
 };
@@ -158,6 +159,8 @@ pub struct State {
     pub panel: Option<Tab>,
     /// Quién está en la sala (con el anfitrión), según el último `Members`.
     pub members: Vec<RoomMember>,
+    /// Los demás que hablan ahora (su `guest`), en el orden en que empezaron a hablar.
+    pub talk_order: Vec<u32>,
     /// Hojas MLS de las voces que este equipo no quiere oír.
     pub muted: std::collections::BTreeSet<u32>,
     /// Volumen de cada voz en este equipo, por hoja MLS (porcentaje; sin entrada, 100).
@@ -174,6 +177,9 @@ pub struct State {
     pub bar_shown_at: Instant,
     /// Modo inmersivo.
     pub immersive: bool,
+    /// Si la ventana reenvía ahora el teclado y el ratón (desde el clic en la imagen hasta
+    /// soltarlos con el atajo o perder el foco).
+    pub forwarding: bool,
     /// Reconectando.
     pub reconnecting: Option<Reconnecting>,
     /// Saliendo.
@@ -264,6 +270,7 @@ impl State {
             bar_until: now,
             bar_shown_at: now,
             immersive: false,
+            forwarding: false,
             reconnecting: None,
             leaving: false,
             probe: false,
@@ -274,6 +281,7 @@ impl State {
             level_changed_at: None,
             host_sharing: None,
             moving_to: None,
+            talk_order: Vec::new(),
         }
     }
 
@@ -562,6 +570,9 @@ pub enum Msg {
     Continue,
     /// La ventana cambió el modo del ratón (atajo `Ctrl+Alt+G` o foco perdido).
     ImmersiveChanged(bool),
+    /// La ventana empezó o dejó de reenviar el teclado y el ratón (clic en la imagen, atajo de
+    /// soltar, foco perdido o permiso quitado).
+    ForwardingChanged(bool),
 }
 
 /// Entra en la sala `code`.
@@ -766,6 +777,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             }
             return vec![Effect::SetImmersive(state.immersive)];
         }
+        Msg::ForwardingChanged(forwarding) => state.forwarding = forwarding,
         Msg::ImmersiveChanged(immersive) => {
             state.immersive = immersive;
             if !immersive {
@@ -951,6 +963,7 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                 );
                 let level_before = state.level();
                 state.stats = Some(*stats);
+                state.talk_order = talk_order(&state.talk_order, &talking_now(state));
                 if state.level() != level_before && level_before.is_some() {
                     state.level_changed_at = Some(now);
                 }
@@ -1732,8 +1745,57 @@ fn nothing_shared_view(state: &State) -> Element<'_, Message> {
     .into()
 }
 
-/// Los demás que hablan ahora, por sus nombres (uno mismo no: ya lo sabe).
-pub fn talking_names(state: &State) -> Vec<&str> {
+/// El aviso del teclado y el ratón junto a la píldora (y como ella, a pantalla completa solo
+/// con la barra), solo si el anfitrión le dio ese permiso a este invitado: cómo soltarlos
+/// mientras se reenvían o, sueltos, cómo volver a usarlos. Sin nada compartido no hay imagen en
+/// la que hacer clic.
+pub fn input_hint(app: &App, state: &State) -> Option<String> {
+    let allowed = state
+        .stats
+        .as_ref()
+        .is_some_and(|stats| stats.allowed.keyboard_mouse);
+    if !allowed || state.nothing_shared() {
+        return None;
+    }
+    Some(if state.forwarding {
+        t!(
+            "room-soltar-teclado-y-raton",
+            key = app.settings.input.shortcuts.release
+        )
+    } else {
+        t!("room-clic-para-usar-teclado-y-raton").to_owned()
+    })
+}
+
+fn input_hint_view<'a>(app: &App, state: &State) -> Option<Element<'a, Message>> {
+    let hint = input_hint(app, state)?;
+    let glyph = if state.forwarding {
+        Icon::Keyboard
+    } else {
+        Icon::Mouse
+    };
+    let content = row![
+        icon_with(glyph, 16.0, SvgClass::Overlay),
+        text(hint)
+            .size(type_size::SECONDARY)
+            .class(TextClass::Overlay)
+            .wrapping(Wrapping::None),
+    ]
+    .spacing(space::XS)
+    .align_y(Alignment::Center);
+    Some(
+        container(content)
+            .padding(Padding::from([0.0, 12.0]))
+            .height(Length::Fixed(36.0))
+            .center_y(Length::Fixed(36.0))
+            .class(ContainerClass::OverlayPill)
+            .into(),
+    )
+}
+
+/// Los demás que hablan ahora (su `guest`), en el orden de «Integrantes» (uno mismo no: ya lo
+/// sabe).
+fn talking_now(state: &State) -> Vec<u32> {
     let Some(audio) = state
         .stats
         .as_ref()
@@ -1746,32 +1808,60 @@ pub fn talking_names(state: &State) -> Vec<&str> {
     members
         .into_iter()
         .filter(|member| audio.speaking.contains(&talker_label(member.guest)))
+        .map(|member| member.guest)
+        .collect()
+}
+
+/// El orden del indicador de quién habla con `now` hablando: quien ya hablaba conserva su sitio,
+/// quien calla sale y quien empieza va al final (así las filas no saltan mientras se habla).
+pub fn talk_order(before: &[u32], now: &[u32]) -> Vec<u32> {
+    let mut order: Vec<u32> = before
+        .iter()
+        .copied()
+        .filter(|guest| now.contains(guest))
+        .collect();
+    for guest in now {
+        if !order.contains(guest) {
+            order.push(*guest);
+        }
+    }
+    order
+}
+
+/// Los demás que hablan ahora, en el orden en que empezaron (quien empezó después del último
+/// `GuestStats` va al final).
+pub fn talking_members(state: &State) -> Vec<&RoomMember> {
+    talk_order(&state.talk_order, &talking_now(state))
+        .iter()
+        .filter_map(|guest| {
+            state
+                .members
+                .iter()
+                .find(|member| !member.you && member.guest == *guest)
+        })
+        .collect()
+}
+
+/// Los demás que hablan ahora, por sus nombres y en el orden en que empezaron.
+pub fn talking_names(state: &State) -> Vec<&str> {
+    talking_members(state)
+        .into_iter()
         .map(|member| member.name.as_str())
         .collect()
 }
 
-/// Indicador de quién habla: el micrófono y los nombres, en una píldora opaca sobre el vídeo.
-fn talking_view(state: &State) -> Option<Element<'_, Message>> {
-    let names = talking_names(state);
-    if names.is_empty() {
-        return None;
-    }
-    let content = row![
-        icon_with(Icon::Mic, 16.0, SvgClass::Overlay),
-        text(names.join(", "))
-            .size(type_size::SECONDARY)
-            .font(coroom_ui::font::SEMIBOLD)
-            .class(TextClass::Overlay)
-            .wrapping(Wrapping::None),
-    ]
-    .spacing(space::XS)
-    .align_y(Alignment::Center);
-    Some(
-        container(content)
-            .padding(Padding::from([6.0, 12.0]))
-            .class(ContainerClass::OverlayPill)
-            .into(),
-    )
+/// Indicador de quién habla: una fila por persona con su avatar, sobre el vídeo.
+fn talking_view<'a>(app: &'a App, state: &'a State) -> Option<Element<'a, Message>> {
+    let people: Vec<coroom_ui::avatar::Speaker<'_>> = talking_members(state)
+        .into_iter()
+        .map(|member| coroom_ui::avatar::Speaker {
+            name: &member.name,
+            picture: avatars::of(app, member.avatar),
+        })
+        .collect();
+    coroom_ui::avatar::speakers(&app.theme, &people, |more| {
+        t!("room-hablan-mas", n = more).to_owned()
+    })
 }
 
 fn pill_view<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
@@ -1988,6 +2078,9 @@ fn member_order(member: &RoomMember) -> u8 {
     }
 }
 
+/// Lado del avatar en «Integrantes».
+const MEMBER_AVATAR: f32 = 28.0;
+
 /// «Integrantes»: quién está en la sala, quién habla y cómo se le oye. En las filas de los demás,
 /// el deslizador es lo alto que se le oye en este equipo y el altavoz deja de oírle aquí (los
 /// demás le siguen oyendo); en la propia, lo alto que te oyen y el altavoz te silencia para todos.
@@ -2007,18 +2100,29 @@ fn people_section<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
             facts.push(t!("room-hablando").to_owned());
         }
         rows.push(
-            column![
-                text(if member.you {
-                    t!("room-tu-nombre", name = member.name.as_str())
-                } else {
-                    member.name.clone()
-                })
-                .size(type_size::BODY)
-                .class(TextClass::Overlay),
-                overlay_text(facts.join(" · ")).size(type_size::CAPTION),
+            row![
+                avatars::ringed_view(
+                    app,
+                    &member.name,
+                    avatars::of_member(app, member.guest, member.you).or(member.avatar),
+                    MEMBER_AVATAR,
+                    talks,
+                ),
+                column![
+                    text(if member.you {
+                        t!("room-tu-nombre", name = member.name.as_str())
+                    } else {
+                        member.name.clone()
+                    })
+                    .size(type_size::BODY)
+                    .class(TextClass::Overlay),
+                    overlay_text(facts.join(" · ")).size(type_size::CAPTION),
+                ]
+                .spacing(2)
+                .width(Length::Fill),
             ]
-            .spacing(2)
-            .width(Length::Fill)
+            .spacing(space::S)
+            .align_y(Alignment::Center)
             .into(),
         );
         if member.you {
@@ -2568,6 +2672,7 @@ fn shortcuts_line(shortcuts: &crate::ui::settings::Shortcuts) -> String {
     t!(
         "room-atajos-linea",
         immersive = shortcuts.immersive,
+        release = shortcuts.release,
         stats = shortcuts.stats,
         chat = shortcuts.chat,
         mic = shortcuts.mic,
@@ -2702,7 +2807,7 @@ fn video<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     );
     // Quién habla, arriba a la izquierda (debajo de la barra si se ve).
     if app.settings.room.talking_overlay
-        && let Some(talking) = talking_view(state)
+        && let Some(talking) = talking_view(app, state)
     {
         let below_bar = if bar_visible {
             space::S + size::VIDEO_BAR + space::S
@@ -2739,8 +2844,14 @@ fn video<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         );
     }
     if state.pill_visible(now, app.fullscreen) {
+        let mut status = row![pill_view(app, state)]
+            .spacing(space::XS)
+            .align_y(Alignment::Center);
+        if let Some(hint) = input_hint_view(app, state) {
+            status = status.push(hint);
+        }
         layers.push(
-            container(pill_view(app, state))
+            container(status)
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .align_y(Vertical::Bottom)
@@ -2864,6 +2975,13 @@ pub(crate) mod shots {
         video(app);
     }
 
+    /// Reenviando el teclado y el ratón: el aviso dice cómo soltarlos.
+    pub(crate) fn guest_video_forwarding(app: &mut App) {
+        video(app);
+        app.update(Message::Guest(Msg::ForwardingChanged(true)));
+        still(app);
+    }
+
     pub(crate) fn guest_video_still(app: &mut App) {
         video(app);
         still(app);
@@ -2880,8 +2998,21 @@ pub(crate) mod shots {
         app.update(Message::Guest(Msg::ToggleStats));
     }
 
+    /// Quién está en la sala de las escenas del chat (sin pasar por `Members`, que escribiría en
+    /// el chat quién entra): así cada mensaje lleva el avatar de su autor.
+    fn chat_members(app: &mut App) {
+        if let Some(state) = app.guest.as_mut() {
+            state.members = vec![
+                member(0, 0, "Bea", false),
+                member(1, 1, "Ana", true),
+                member(2, 2, "Carla", false),
+            ];
+        }
+    }
+
     pub(crate) fn guest_chat(app: &mut App) {
         video(app);
+        chat_members(app);
         chat::shots::conversation(app);
         app.update(Message::Guest(Msg::TogglePanel(Tab::Chat)));
         app.chat.composing = false;
@@ -2889,6 +3020,7 @@ pub(crate) mod shots {
 
     pub(crate) fn guest_bubbles(app: &mut App) {
         video(app);
+        chat_members(app);
         chat::shots::conversation(app);
         let now = app.now;
         for (guest, name, text) in [
@@ -2932,12 +3064,6 @@ pub(crate) mod shots {
         if let Some(stats) = app.guest.as_mut().and_then(|state| state.stats.as_mut()) {
             stats.allowed.gamepad_slot = Some(2);
         }
-        let member = |guest: u32, leaf: u32, name: &str, you: bool| RoomMember {
-            guest,
-            leaf,
-            name: name.to_owned(),
-            you,
-        };
         app.update(Message::Event(Event::Guest(SessionEvent::Members(vec![
             member(0, 0, "Bea", false),
             member(1, 1, "Ana", true),
@@ -2972,6 +3098,23 @@ pub(crate) mod shots {
         app.toasts.clear();
     }
 
+    /// Integrante de ejemplo (con el usuario y el avatar de la lista de amigos de ejemplo).
+    fn member(guest: u32, leaf: u32, name: &str, you: bool) -> RoomMember {
+        RoomMember {
+            guest,
+            leaf,
+            name: name.to_owned(),
+            you,
+            user: match name {
+                "Ana" => 1,
+                "Bea" => 2,
+                "Carla" => 3,
+                _ => 4,
+            },
+            avatar: crate::ui::shots::sample_avatar(name),
+        }
+    }
+
     /// Quién habla según el resumen del audio («anfitrión», «invitado 2»…).
     fn speaking(app: &mut App, who: &[&str]) {
         if let Some(stats) = app.guest.as_mut().and_then(|state| state.stats.as_mut()) {
@@ -2985,10 +3128,22 @@ pub(crate) mod shots {
         }
     }
 
-    /// El indicador de quién habla sobre el vídeo (con la barra escondida).
+    /// El indicador de quién habla sobre el vídeo (con la barra escondida): tres personas, una
+    /// fila cada una con su avatar (Carla sin imagen: sus iniciales).
     pub(crate) fn guest_talking(app: &mut App) {
         guest_room(app);
-        speaking(app, &["anfitrión", "invitado 2"]);
+        app.update(Message::Event(Event::Guest(SessionEvent::Members(vec![
+            member(0, 0, "Bea", false),
+            member(1, 1, "Ana", true),
+            member(2, 2, "Carla", false),
+            member(3, 3, "Dani", false),
+        ]))));
+        speaking(app, &["invitado 3"]);
+        let stats = app.guest.as_ref().and_then(|state| state.stats.clone());
+        if let Some(stats) = stats {
+            app.update(Message::Event(Event::GuestStats(Box::new(stats))));
+        }
+        speaking(app, &["anfitrión", "invitado 2", "invitado 3"]);
         app.update(Message::Guest(Msg::ClosePanel));
         still(app);
     }
@@ -3123,6 +3278,7 @@ pub(crate) mod shots {
         ("12-estimacion", guest_estimate),
         ("13-video", guest_video),
         ("13-video-quieto", guest_video_still),
+        ("13-video-reenviando", guest_video_forwarding),
         ("13-video-pantalla-completa-quieto", guest_fullscreen_still),
         ("14-conexion", guest_connection),
         ("14-chat", guest_chat),
@@ -3341,6 +3497,42 @@ mod tests {
             state.pill_visible(app.now, true),
             "y vuelve al mover el ratón"
         );
+    }
+
+    /// El aviso del teclado y el ratón: solo con ese permiso, dice cómo soltarlos mientras se
+    /// reenvían y cómo volver a usarlos sueltos; a pantalla completa se va con la píldora.
+    #[test]
+    fn the_input_hint_follows_the_permission_and_the_capture() {
+        let mut app = watching();
+        let hint = |app: &App| input_hint(app, app.guest.as_ref().expect("invitado"));
+        assert_eq!(
+            hint(&app).as_deref(),
+            Some("Haz clic en la imagen para usar el teclado y el ratón"),
+            "con el permiso recién dado, aún no se reenvía"
+        );
+        app.update(Message::Guest(Msg::ForwardingChanged(true)));
+        assert_eq!(
+            hint(&app).as_deref(),
+            Some("Ctrl+Alt+R suelta el teclado y el ratón")
+        );
+        app.settings.input.shortcuts.release = 'T';
+        assert!(hint(&app).is_some_and(|text| text.starts_with("Ctrl+Alt+T ")));
+        // Sin el permiso (solo mirar o solo mando), nada.
+        let mut stats = shots::sample_stats();
+        stats.allowed.keyboard_mouse = false;
+        stats.allowed.gamepad_slot = Some(1);
+        app.update(Message::Event(Event::GuestStats(Box::new(stats))));
+        assert_eq!(hint(&app), None);
+        // A pantalla completa, como la píldora: solo con la barra.
+        let mut app = watching();
+        app.now += motion::BAR_HIDE + Duration::from_millis(1);
+        let state = app.guest.as_ref().expect("invitado");
+        assert!(input_hint(&app, state).is_some());
+        assert!(!state.pill_visible(app.now, true));
+        assert!(state.pill_visible(app.now, false));
+        // Sin nada compartido no hay imagen en la que hacer clic.
+        app.update(Message::Event(Event::Guest(SessionEvent::Sharing(false))));
+        assert_eq!(hint(&app), None);
     }
 
     /// El anfitrión pasa la sala a este invitado: acepta, abre la suya solo con voz y, con el
@@ -3680,6 +3872,8 @@ mod tests {
             leaf,
             name: name.to_owned(),
             you,
+            user: u64::from(guest) + 1,
+            avatar: None,
         };
         let members = vec![
             member(0, 0, "Bea", false),
@@ -3754,12 +3948,16 @@ mod tests {
     #[test]
     fn local_mutes_are_remembered_by_name_across_reconnections() {
         let mut app = app();
+        // Sin los avisos de quien entra y sale: aquí solo cuentan los efectos de la voz.
+        app.settings.notifications.volume = 0;
         shots::video(&mut app);
         let member = |leaf: u32, name: &str, you: bool| RoomMember {
             guest: leaf,
             leaf,
             name: name.to_owned(),
             you,
+            user: u64::from(leaf) + 1,
+            avatar: None,
         };
         app.update(Message::Event(Event::Guest(SessionEvent::Members(vec![
             member(0, "Bea", false),
@@ -3829,12 +4027,16 @@ mod tests {
                 leaf: 0,
                 name: "Bea".to_owned(),
                 you: false,
+                user: 1,
+                avatar: None,
             },
             RoomMember {
                 guest: 1,
                 leaf: 1,
                 name: "Ana".to_owned(),
                 you: true,
+                user: 2,
+                avatar: None,
             },
         ];
         app.update(Message::Event(Event::Guest(SessionEvent::Members(
@@ -3975,5 +4177,108 @@ mod tests {
         assert!(state.pill_visible(now, true));
         assert_eq!(state.next_tick(), Some(now + PILL_FLASH));
         assert!(!state.pill_visible(now + PILL_FLASH, true));
+    }
+
+    #[test]
+    fn whoever_starts_talking_goes_last_and_the_rest_keep_their_place() {
+        assert_eq!(talk_order(&[], &[]), Vec::<u32>::new());
+        assert_eq!(
+            talk_order(&[], &[0, 2]),
+            [0, 2],
+            "a la vez, en el orden de la sala"
+        );
+        assert_eq!(
+            talk_order(&[2], &[0, 2]),
+            [2, 0],
+            "quien ya hablaba sigue delante"
+        );
+        assert_eq!(talk_order(&[2, 0], &[0, 3]), [0, 3], "quien calla sale");
+        assert_eq!(talk_order(&[3, 0], &[0, 2, 3]), [3, 0, 2]);
+    }
+
+    /// Tres hablan, uno a uno: una fila cada uno en el orden en que empezaron, sin uno mismo; con
+    /// más de los que caben, la última fila dice cuántos más.
+    #[test]
+    fn the_talking_indicator_has_a_row_per_person_in_the_order_they_started() {
+        let mut app = app();
+        shots::video(&mut app);
+        let member = |guest: u32, name: &str, you: bool| RoomMember {
+            guest,
+            leaf: guest,
+            name: name.to_owned(),
+            you,
+            user: u64::from(guest) + 10,
+            avatar: None,
+        };
+        app.update(Message::Event(Event::Guest(SessionEvent::Members(vec![
+            member(0, "Bea", false),
+            member(1, "Ana", true),
+            member(2, "Carla", false),
+            member(3, "Dani", false),
+            member(4, "Eli", false),
+            member(5, "Fran", false),
+        ]))));
+        let talk = |app: &mut App, who: &[&str]| {
+            let mut stats = app
+                .guest
+                .as_ref()
+                .and_then(|state| state.stats.clone())
+                .expect("estadísticas");
+            stats.summary.audio = Some(coroom_session::latency::AudioSummary {
+                tracks: Vec::new(),
+                av: None,
+                speaking: who.iter().map(|name| (*name).to_owned()).collect(),
+                status: String::new(),
+            });
+            stats.speaking = true;
+            app.update(Message::Event(Event::GuestStats(Box::new(stats))));
+            talking_names(app.guest.as_ref().expect("invitado"))
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert!(talk(&mut app, &[]).is_empty());
+        assert_eq!(talk(&mut app, &["invitado 3"]), ["Dani"]);
+        assert_eq!(
+            talk(&mut app, &["anfitrión", "invitado 3"]),
+            ["Dani", "Bea"]
+        );
+        // Uno mismo habla (y el anfitrión le cuenta): no sale, ya lo sabe.
+        assert_eq!(
+            talk(
+                &mut app,
+                &["anfitrión", "invitado 1", "invitado 2", "invitado 3"]
+            ),
+            ["Dani", "Bea", "Carla"]
+        );
+        assert_eq!(
+            talk(&mut app, &["anfitrión", "invitado 2"]),
+            ["Bea", "Carla"]
+        );
+        let state = app.guest.as_ref().expect("invitado");
+        assert!(
+            talking_view(&app, state).is_some(),
+            "con gente hablando, se ve"
+        );
+        let five = talk(
+            &mut app,
+            &[
+                "anfitrión",
+                "invitado 2",
+                "invitado 3",
+                "invitado 4",
+                "invitado 5",
+            ],
+        );
+        assert_eq!(five, ["Bea", "Carla", "Dani", "Eli", "Fran"]);
+        assert_eq!(
+            coroom_ui::avatar::speaker_rows(five.len(), coroom_ui::avatar::SPEAKERS_MAX_ROWS),
+            (3, 2),
+            "tres filas y «y 2 más»"
+        );
+        assert_eq!(t!("room-hablan-mas", n = 2), "y 2 más");
+        assert!(talk(&mut app, &[]).is_empty());
+        let state = app.guest.as_ref().expect("invitado");
+        assert!(talking_view(&app, state).is_none(), "nadie habla: no se ve");
     }
 }

@@ -202,6 +202,10 @@ pub struct Member {
     pub leaf: u32,
     /// Nombre visible (como mucho [`MEMBER_NAME_MAX`] bytes).
     pub name: String,
+    /// Usuario del servidor (0 en modo desarrollo): con él se pide su avatar.
+    pub user: u64,
+    /// Versión de su avatar (`crate::api::avatar_version`; `None`: no tiene).
+    pub avatar: Option<u64>,
 }
 
 /// Miembros como mucho en [`ControlMessage::Members`].
@@ -904,14 +908,28 @@ mod tests {
                 .prop_map(|(slot, raw)| ControlMessage::GamepadMode { slot, raw }),
             (1u8..=8, prop::collection::vec(any::<u8>(), 1..64))
                 .prop_map(|(slot, data)| ControlMessage::GamepadOutput { slot, data }),
-            prop::collection::vec((any::<u32>(), any::<u32>(), "[a-zñ ]{0,32}"), 0..8).prop_map(
-                |members| ControlMessage::Members {
-                    members: members
-                        .into_iter()
-                        .map(|(guest, leaf, name)| Member { guest, leaf, name })
-                        .collect(),
-                }
-            ),
+            prop::collection::vec(
+                (
+                    any::<u32>(),
+                    any::<u32>(),
+                    "[a-zñ ]{0,32}",
+                    any::<u64>(),
+                    prop::option::of(any::<u64>())
+                ),
+                0..8
+            )
+            .prop_map(|members| ControlMessage::Members {
+                members: members
+                    .into_iter()
+                    .map(|(guest, leaf, name, user, avatar)| Member {
+                        guest,
+                        leaf,
+                        name,
+                        user,
+                        avatar,
+                    })
+                    .collect(),
+            }),
             (0u8..3, sealed_chat()).prop_map(|(kind, sealed)| match kind {
                 0 => ControlMessage::Chat(sealed),
                 1 => ControlMessage::ChatHistory(sealed),

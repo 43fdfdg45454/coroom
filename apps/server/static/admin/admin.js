@@ -244,6 +244,11 @@ async function loadUsers() {
         "aria-label": `Restablecer la contraseña de ${user.username}`,
         onclick: () => openPassword(user),
       }),
+      user.avatar == null ? null : el("button", {
+        type: "button", class: "small danger", text: "Quitar avatar",
+        "aria-label": `Quitar el avatar de ${user.username}`,
+        onclick: () => removeAvatar(user),
+      }),
       self ? null : el("button", {
         type: "button", class: `small${user.disabled ? "" : " danger"}`, text: user.disabled ? "Habilitar" : "Deshabilitar",
         "aria-label": `${user.disabled ? "Habilitar" : "Deshabilitar"} a ${user.username}`,
@@ -252,13 +257,42 @@ async function loadUsers() {
           patchUser(user, { disabled: !user.disabled });
         },
       }));
+    const picture = user.avatar == null ? null : el("img", { class: "avatar", alt: "", width: 32, height: 32 });
+    if (picture) loadAvatar(picture, user);
     body.append(el("tr", {},
-      el("td", { class: "who" }, el("strong", { text: user.display_name }), el("span", { text: `@${user.username}${self ? " · tú" : ""}` })),
+      el("td", { class: "who" }, el("div", { class: "who-row" }, picture, el("div", {}, el("strong", { text: user.display_name }), el("span", { text: `@${user.username}${self ? " · tú" : ""}` })))),
       el("td", {}, user.is_admin ? el("span", { class: "pill accent", text: "Administrador" }) : "Usuario"),
       el("td", {}, state),
       el("td", { class: "num", text: user.devices }),
       el("td", { text: when(user.last_seen_at) }),
       actions));
+  }
+}
+
+// La imagen pide el token, así que no vale un `src` directo: se descarga y se enseña como blob.
+async function loadAvatar(img, user) {
+  try {
+    const response = await fetch(`${API}/users/${user.id}/avatar`, {
+      headers: { Authorization: `Bearer ${token}` },
+      cache: "no-store",
+    });
+    if (!response.ok) return;
+    const url = URL.createObjectURL(await response.blob());
+    img.addEventListener("load", () => URL.revokeObjectURL(url), { once: true });
+    img.src = url;
+  } catch {
+    // Sin imagen: la fila sigue igual de útil.
+  }
+}
+
+async function removeAvatar(user) {
+  if (!confirm(`¿Quitar el avatar de ${user.username}? Dejará de verse en ese momento; podrá subir otro.`)) return;
+  try {
+    await api("DELETE", `/admin/users/${user.id}/avatar`);
+    notify(`${user.username}: avatar quitado.`);
+    await loadUsers();
+  } catch (err) {
+    notify(err.message, true);
   }
 }
 

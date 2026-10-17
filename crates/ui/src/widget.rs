@@ -14,6 +14,7 @@ use iced_widget::{
 
 use crate::font::{MONO, SEMIBOLD, UI};
 use crate::icon::{Icon, icon, icon_with};
+use crate::release::release_to_pick;
 use crate::style::{
     ButtonClass, ContainerClass, InputClass, ProgressClass, SliderClass, SvgClass, TextClass,
 };
@@ -424,11 +425,13 @@ where
     T: ToString + PartialEq + Clone + 'a,
     M: Clone + 'a,
 {
-    pick_list(options, selected, on_select)
-        .padding(Padding::from([8.0, 12.0]))
-        .text_size(type_size::BODY)
-        .font(UI)
-        .into()
+    release_to_pick(
+        pick_list(options, selected, on_select)
+            .padding(Padding::from([8.0, 12.0]))
+            .text_size(type_size::BODY)
+            .font(UI),
+    )
+    .into()
 }
 
 /// Menú de acciones de una fila: un botón «`label` ▾» que despliega `actions` (su texto, con
@@ -442,12 +445,14 @@ where
     T: ToString + PartialEq + Clone + 'a,
     M: Clone + 'a,
 {
-    pick_list(actions, None::<T>, on_action)
-        .placeholder(label)
-        .padding(Padding::from([6.0, 10.0]))
-        .text_size(type_size::SECONDARY)
-        .font(UI)
-        .into()
+    release_to_pick(
+        pick_list(actions, None::<T>, on_action)
+            .placeholder(label)
+            .padding(Padding::from([6.0, 10.0]))
+            .text_size(type_size::SECONDARY)
+            .font(UI),
+    )
+    .into()
 }
 
 /// Selector desplegable de ancho fijo, para opciones de texto largo (títulos de ventana): sin él,
@@ -463,12 +468,14 @@ where
     T: ToString + PartialEq + Clone + 'a,
     M: Clone + 'a,
 {
-    pick_list(options, selected, on_select)
-        .padding(Padding::from([8.0, 12.0]))
-        .text_size(type_size::BODY)
-        .font(UI)
-        .width(Length::Fixed(width))
-        .into()
+    release_to_pick(
+        pick_list(options, selected, on_select)
+            .padding(Padding::from([8.0, 12.0]))
+            .text_size(type_size::BODY)
+            .font(UI)
+            .width(Length::Fixed(width)),
+    )
+    .into()
 }
 
 /// `text` con como mucho `max` caracteres: si sobra, lo corta y termina en «…».

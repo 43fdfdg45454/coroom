@@ -5,21 +5,25 @@
 //! escritorio y los espaciados y radios los suyos; en Windows, lo mismo con el tema y el acento del
 //! sistema. Módulos:
 //!
+//! - [`avatar`]: avatares con imagen (o iniciales) y el indicador de quién habla.
 //! - [`tokens`]: espaciado (4-32), radios (8, 12, 16), escala tipográfica, tamaños y duraciones.
 //! - [`theme`]: [`theme::Palette`] (los únicos colores fijos del código) con contraste AA
 //!   garantizado para cualquier acento, y utilidades de contraste WCAG.
 //! - [`style`]: [`Theme`] y los catálogos de estilo de los *widgets* de `iced` con clases propias.
 //! - [`font`]: fuente del escritorio o Inter embebida; monoespaciada para códigos y huellas.
 //! - [`icon`]: iconos de Lucide (ISC) monocromos.
+//! - [`release`]: desplegables que eligen al soltar el botón, no al pulsarlo.
 //! - [`selectable`]: texto que se selecciona con el ratón y se copia (los mensajes del chat).
 //! - [`widget`]: componentes (botones, campos, listas, insignias, avisos, toasts, diálogos,
 //!   progreso, selectores, atajos, barra lateral, cabecera, tarjetas, estados).
 //!
 //! No depende de ninguna crate del workspace (`docs/ARQUITECTURA.md` §5): la aplicación le da los datos.
 
+pub mod avatar;
 pub mod editor;
 pub mod font;
 pub mod icon;
+pub mod release;
 pub mod selectable;
 pub mod style;
 pub mod tag;

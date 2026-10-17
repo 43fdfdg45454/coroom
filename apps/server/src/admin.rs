@@ -30,7 +30,7 @@ const STATIC_HEADERS: &[(&str, &str)] = &[
     (
         "content-security-policy",
         "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; \
-         img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+         img-src 'self' data: blob:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
     ),
     ("x-content-type-options", "nosniff"),
     ("referrer-policy", "no-referrer"),
@@ -54,6 +54,7 @@ pub(crate) fn static_file(request: &Request) -> Response {
         status: StatusCode::OK,
         content_type,
         headers: STATIC_HEADERS.to_vec(),
+        etag: None,
         body: body.as_bytes().to_vec(),
     }
 }
@@ -78,6 +79,7 @@ pub(crate) async fn handle(state: &ServerState, request: &Request, segments: &[&
         (&Method::POST, ["users"]) => create_user(state, request).await,
         (&Method::PATCH, ["users", user]) => update_user(state, request, &admin, user).await,
         (&Method::POST, ["users", user, "password"]) => set_password(state, request, user).await,
+        (&Method::DELETE, ["users", user, "avatar"]) => delete_avatar(state, user).await,
         (&Method::GET, ["invitations"]) => invitations(state).await,
         (&Method::POST, ["invitations"]) => create_invitation(state, request, &admin).await,
         (&Method::DELETE, ["invitations", invitation]) => {
@@ -109,6 +111,7 @@ fn admin_user_dto(state: &ServerState, row: crate::db::AdminUserRow) -> AdminUse
         created_at: row.user.created_at,
         devices: as_u64(row.devices),
         last_seen_at: row.last_seen_at,
+        avatar: row.user.avatar,
     }
 }
 
@@ -217,6 +220,16 @@ async fn set_password(state: &ServerState, request: &Request, segment: &str) -> 
         .map_err(db_error)?;
     state.hub.disconnect_user(user_id);
     ok(&serde_json::json!({}))
+}
+
+/// Quita el avatar de otro usuario (moderación): lo dejan de ver todos en ese momento.
+async fn delete_avatar(state: &ServerState, segment: &str) -> Handled {
+    let user_id = id(segment)?;
+    if state.db.delete_avatar(user_id).await.map_err(db_error)? {
+        tracing::info!(user = user_id, "avatar quitado por un administrador");
+        state.hub.avatar_changed(user_id).await;
+    }
+    ok(&admin_user(state, user_id).await?)
 }
 
 fn invitation_dto(row: &InvitationRow, now: i64) -> Invitation {

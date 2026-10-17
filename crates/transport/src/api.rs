@@ -29,9 +29,10 @@ use tracing::debug;
 
 use coroom_crypto::Identity;
 use coroom_proto::api::{
-    API_PREFIX, AddFriend, AddFriendResult, ApiError, CreateInvitation, CreateUser,
-    CreatedInvitation, Devices, Friends, LoginChallenge, LoginComplete, LoginRequest, Me,
-    RedeemRequest, SessionToken, SetupRequest, SetupStatus, Usage, User, challenge_message,
+    API_PREFIX, AVATAR_CONTENT_TYPE, AddFriend, AddFriendResult, ApiError, CreateInvitation,
+    CreateUser, CreatedInvitation, Devices, Friends, LoginChallenge, LoginComplete, LoginRequest,
+    Me, RedeemRequest, SessionToken, SetupRequest, SetupStatus, Usage, User, avatar_path,
+    challenge_message,
 };
 use coroom_proto::{Alpn, hex};
 
@@ -51,6 +52,12 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Tamaño máximo de una respuesta.
 const MAX_RESPONSE: usize = 1024 * 1024;
+
+/// Tipo de contenido de los cuerpos JSON.
+const JSON: &str = "application/json";
+
+/// Cuerpo de una petición con su tipo de contenido.
+type Payload = Option<(Vec<u8>, &'static str)>;
 
 type H3Send = h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>;
 
@@ -271,14 +278,14 @@ impl ApiClient {
         &self,
         method: &Method,
         uri: String,
-        has_body: bool,
+        content_type: Option<&'static str>,
     ) -> Result<http::request::Builder, TransportError> {
         let mut builder = Request::builder().method(method.clone()).uri(uri);
         for (name, value) in &self.headers {
             builder = builder.header(name, value);
         }
-        if has_body {
-            builder = builder.header(header::CONTENT_TYPE, "application/json");
+        if let Some(content_type) = content_type {
+            builder = builder.header(header::CONTENT_TYPE, content_type);
         }
         if let Some(token) = &self.token {
             if matches!(self.trust, ServerTrust::Inspect(_)) {
@@ -297,7 +304,7 @@ impl ApiClient {
         &self,
         method: &Method,
         path: &str,
-        body: &Option<Vec<u8>>,
+        body: &Payload,
     ) -> Result<RawResponse, TransportError> {
         let mut guard = self.h3.lock().await;
         let reuse = guard
@@ -312,14 +319,14 @@ impl ApiClient {
         let mut send = conn.send.clone();
         drop(guard);
         let request = self
-            .request(method, self.uri(path), body.is_some())?
+            .request(method, self.uri(path), body.as_ref().map(|(_, kind)| *kind))?
             .body(())
             .map_err(protocol)?;
         let mut stream = send
             .send_request(request)
             .await
             .map_err(|err| protocol(format!("HTTP/3: {err}")))?;
-        if let Some(body) = body {
+        if let Some((body, _)) = body {
             stream
                 .send_data(Bytes::from(body.clone()))
                 .await
@@ -360,7 +367,7 @@ impl ApiClient {
         &self,
         method: &Method,
         path: &str,
-        body: &Option<Vec<u8>>,
+        body: &Payload,
     ) -> Result<RawResponse, TransportError> {
         let config = self.client_config(&[b"h2", b"http/1.1"])?;
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
@@ -384,7 +391,12 @@ impl ApiClient {
         let tls = connector.connect(name, tcp).await?;
         let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
         let io = TokioIo::new(tls);
-        let payload = Full::new(Bytes::from(body.clone().unwrap_or_default()));
+        let content_type = body.as_ref().map(|(_, kind)| *kind);
+        let payload = Full::new(Bytes::from(
+            body.as_ref()
+                .map(|(bytes, _)| bytes.clone())
+                .unwrap_or_default(),
+        ));
         let response = if h2 {
             let (mut sender, connection) =
                 hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
@@ -392,7 +404,7 @@ impl ApiClient {
                     .map_err(|err| protocol(format!("HTTP/2: {err}")))?;
             tokio::spawn(connection);
             let request = self
-                .request(method, self.uri(path), body.is_some())?
+                .request(method, self.uri(path), content_type)?
                 .body(payload)
                 .map_err(protocol)?;
             sender
@@ -405,7 +417,7 @@ impl ApiClient {
                 .map_err(|err| protocol(format!("HTTP/1.1: {err}")))?;
             tokio::spawn(connection);
             let request = self
-                .request(method, path.to_owned(), body.is_some())?
+                .request(method, path.to_owned(), content_type)?
                 .header(header::HOST, &self.url.authority)
                 .body(payload)
                 .map_err(protocol)?;
@@ -438,8 +450,12 @@ impl ApiClient {
         path: &str,
         body: Option<Vec<u8>>,
     ) -> Result<RawResponse, TransportError> {
-        self.send(method, &format!("{API_PREFIX}{path}"), body)
-            .await
+        self.send(
+            method,
+            &format!("{API_PREFIX}{path}"),
+            body.map(|body| (body, JSON)),
+        )
+        .await
     }
 
     /// Como [`ApiClient::raw`], con la ruta completa (`/version`, `/health`).
@@ -447,7 +463,7 @@ impl ApiClient {
         &self,
         method: Method,
         path: &str,
-        body: Option<Vec<u8>>,
+        body: Payload,
     ) -> Result<RawResponse, TransportError> {
         if !self.tcp_only.load(Ordering::Relaxed) {
             match tokio::time::timeout(H3_REQUEST_TIMEOUT, self.call_h3(&method, path, &body)).await
@@ -477,18 +493,7 @@ impl ApiClient {
             .map(serde_json::to_vec)
             .transpose()
             .map_err(|err| protocol(format!("JSON: {err}")))?;
-        let response = self.raw(method, path, body).await?;
-        if !response.status.is_success() {
-            let error: ApiError = serde_json::from_slice(&response.body).unwrap_or(ApiError {
-                error: "http".to_owned(),
-                message: format!("el servidor respondió {}", response.status),
-            });
-            return Err(TransportError::Api {
-                status: response.status.as_u16(),
-                code: error.error,
-                message: error.message,
-            });
-        }
+        let response = success(self.raw(method, path, body).await?)?;
         let body: &[u8] = if response.body.is_empty() {
             b"null"
         } else {
@@ -702,6 +707,35 @@ impl ApiClient {
         self.json(Method::GET, "/usage", None::<&()>).await
     }
 
+    /// `PUT /me/avatar`: sube el avatar propio (un PNG cuadrado, ya reducido); el servidor lo
+    /// valida y lo vuelve a codificar. Devuelve el usuario con la versión nueva.
+    pub async fn set_avatar(&self, png: Vec<u8>) -> Result<User, TransportError> {
+        let response = self
+            .send(
+                Method::PUT,
+                &format!("{API_PREFIX}/me/avatar"),
+                Some((png, AVATAR_CONTENT_TYPE)),
+            )
+            .await?;
+        serde_json::from_slice(&success(response)?.body)
+            .map_err(|err| protocol(format!("respuesta JSON no válida: {err}")))
+    }
+
+    /// `DELETE /me/avatar`: quita el avatar propio.
+    pub async fn delete_avatar(&self) -> Result<User, TransportError> {
+        self.json(Method::DELETE, "/me/avatar", None::<&()>).await
+    }
+
+    /// `GET /users/{id}/avatar`: el PNG del avatar de un usuario (`None` si no tiene).
+    pub async fn avatar(&self, user_id: u64) -> Result<Option<Vec<u8>>, TransportError> {
+        let response = self.raw(Method::GET, &avatar_path(user_id), None).await?;
+        match success(response) {
+            Ok(response) => Ok(Some(response.body.to_vec())),
+            Err(TransportError::Api { status: 404, .. }) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Administrador: `POST /admin/users`.
     pub async fn create_user(&self, user: &CreateUser) -> Result<User, TransportError> {
         self.json(Method::POST, "/admin/users", Some(user)).await
@@ -730,6 +764,22 @@ impl ApiClient {
         };
         self.json(Method::POST, "/auth/login", Some(&request)).await
     }
+}
+
+/// La respuesta si su estado es de éxito; si no, el error de la API que trae.
+fn success(response: RawResponse) -> Result<RawResponse, TransportError> {
+    if response.status.is_success() {
+        return Ok(response);
+    }
+    let error: ApiError = serde_json::from_slice(&response.body).unwrap_or(ApiError {
+        error: "http".to_owned(),
+        message: format!("el servidor respondió {}", response.status),
+    });
+    Err(TransportError::Api {
+        status: response.status.as_u16(),
+        code: error.error,
+        message: error.message,
+    })
 }
 
 #[cfg(test)]

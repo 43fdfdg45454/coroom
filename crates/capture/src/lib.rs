@@ -534,7 +534,7 @@ pub struct EisSocket {
 }
 
 /// Zona del escritorio que se transmite, en coordenadas lógicas del compositor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SharedArea {
     /// El portal no lo dijo.
     #[default]
@@ -545,6 +545,9 @@ pub enum SharedArea {
         x: i32,
         /// Esquina superior izquierda.
         y: i32,
+        /// Identificador del flujo que el compositor repite en la región de EI de ese monitor
+        /// (`mapping_id`, portales recientes): con varios monitores, el modo seguro de casarlos.
+        mapping_id: Option<String>,
     },
     /// Una ventana (Wayland no dice dónde está).
     Window {

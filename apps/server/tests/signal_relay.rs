@@ -186,6 +186,7 @@ async fn room(
             key_package: b"key-package".to_vec(),
             user: 0,
             name: "desarrollo".to_owned(),
+            avatar: None,
         }
     );
     (code, host_token, guest_token, your_peer_id)

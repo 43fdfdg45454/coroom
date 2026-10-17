@@ -274,6 +274,7 @@ fn shared_area(
     source: Option<SourceType>,
     position: Option<(i32, i32)>,
     size: Option<(i32, i32)>,
+    mapping_id: Option<&str>,
 ) -> SharedArea {
     match (source, position, size) {
         (Some(SourceType::Window), _, Some((width, height))) => SharedArea::Window {
@@ -281,7 +282,18 @@ fn shared_area(
             height: u32::try_from(height).unwrap_or(0),
         },
         (Some(SourceType::Window), _, None) => SharedArea::Unknown,
-        (_, Some((x, y)), _) => SharedArea::Monitor { x, y },
+        (_, Some((x, y)), _) => SharedArea::Monitor {
+            x,
+            y,
+            mapping_id: mapping_id.map(str::to_owned),
+        },
+        // Sin posición pero con `mapping_id`: la región de EI se casa por el identificador (la
+        // posición solo se mira si el identificador no aparece).
+        (_, None, _) if mapping_id.is_some() => SharedArea::Monitor {
+            x: 0,
+            y: 0,
+            mapping_id: mapping_id.map(str::to_owned),
+        },
         _ => SharedArea::Unknown,
     }
 }
@@ -343,7 +355,12 @@ async fn open_screencast(
     Ok(Started {
         node_id: stream.pipe_wire_node_id(),
         restore_token: streams.restore_token().map(str::to_owned),
-        area: shared_area(stream.source_type(), stream.position(), stream.size()),
+        area: shared_area(
+            stream.source_type(),
+            stream.position(),
+            stream.size(),
+            stream.mapping_id(),
+        ),
         size: stream.size(),
     })
 }
@@ -450,17 +467,17 @@ pub fn pick(kind: crate::ShareKind) -> Result<crate::PickedShare, CaptureError> 
             .map_err(PortalFailure::into_error)?;
         let _ = screen.session.close().await;
         Ok(crate::PickedShare {
-            target: picked_target(screen.area, screen.size),
+            target: picked_target(&screen.area, screen.size),
             restore_token: screen.restore_token,
         })
     })
 }
 
 /// Destino que se muestra para lo elegido en el portal (Wayland no da nombres: solo el tamaño).
-fn picked_target(area: SharedArea, size: Option<(i32, i32)>) -> CaptureTarget {
+fn picked_target(area: &SharedArea, size: Option<(i32, i32)>) -> CaptureTarget {
     let size = size.map(|(w, h)| (w.max(0).unsigned_abs(), h.max(0).unsigned_abs()));
     match (area, size) {
-        (SharedArea::Window { width, height }, _) => CaptureTarget::Window {
+        (&SharedArea::Window { width, height }, _) => CaptureTarget::Window {
             id: 0,
             title: format!("{width} × {height}"),
             app: None,
@@ -2216,12 +2233,22 @@ mod tests {
             shared_area(
                 Some(SourceType::Monitor),
                 Some((2560, 0)),
-                Some((1920, 1080))
+                Some((1920, 1080)),
+                Some("monitor-2")
             ),
-            SharedArea::Monitor { x: 2560, y: 0 }
+            SharedArea::Monitor {
+                x: 2560,
+                y: 0,
+                mapping_id: Some("monitor-2".to_owned())
+            }
         );
         assert_eq!(
-            shared_area(Some(SourceType::Window), Some((10, 20)), Some((800, 600))),
+            shared_area(
+                Some(SourceType::Window),
+                Some((10, 20)),
+                Some((800, 600)),
+                None
+            ),
             SharedArea::Window {
                 width: 800,
                 height: 600
@@ -2229,13 +2256,44 @@ mod tests {
             "la posición de una ventana no sirve para colocar el puntero"
         );
         assert_eq!(
-            shared_area(None, Some((-1920, 0)), None),
-            SharedArea::Monitor { x: -1920, y: 0 }
+            shared_area(None, Some((-1920, 0)), None, None),
+            SharedArea::Monitor {
+                x: -1920,
+                y: 0,
+                mapping_id: None
+            }
         );
-        assert_eq!(shared_area(None, None, None), SharedArea::Unknown);
+        assert_eq!(shared_area(None, None, None, None), SharedArea::Unknown);
         assert_eq!(
-            shared_area(Some(SourceType::Window), None, None),
+            shared_area(Some(SourceType::Window), None, None, None),
             SharedArea::Unknown
+        );
+        assert_eq!(
+            shared_area(
+                Some(SourceType::Monitor),
+                None,
+                Some((1920, 1080)),
+                Some("monitor-2")
+            ),
+            SharedArea::Monitor {
+                x: 0,
+                y: 0,
+                mapping_id: Some("monitor-2".to_owned())
+            },
+            "sin posición, el monitor se casa por su mapping_id"
+        );
+        assert_eq!(
+            shared_area(None, None, None, Some("monitor-2")),
+            SharedArea::Monitor {
+                x: 0,
+                y: 0,
+                mapping_id: Some("monitor-2".to_owned())
+            }
+        );
+        assert_eq!(
+            shared_area(Some(SourceType::Window), None, None, Some("ventana-1")),
+            SharedArea::Unknown,
+            "una ventana nunca es un monitor"
         );
     }
 

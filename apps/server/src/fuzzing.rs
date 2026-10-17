@@ -65,6 +65,7 @@ fn request(method: Method, path: &str, auth: Option<&str>, body: &[u8]) -> Reque
         path,
         query,
         authorization: auth.map(|token| format!("Bearer {token}")),
+        if_none_match: None,
         body: Bytes::copy_from_slice(body),
         remote: IpAddr::from(Ipv4Addr::LOCALHOST),
     }

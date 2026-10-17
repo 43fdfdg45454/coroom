@@ -10,15 +10,27 @@
 //!   recentrado si el compositor no admite `Locked`) y lo oculta; el movimiento va como
 //!   [`InputEvent::MouseMove`] con los deltas crudos de `DeviceEvent::MouseMotion`. Si el cursor se
 //!   suelta (foco perdido), un clic en la ventana lo vuelve a capturar (ese clic no se envía).
+//! - **Clic para capturar** (como QEMU): con el permiso de teclado y ratón recién dado no se
+//!   reenvía nada hasta que el invitado hace clic en el vídeo; ese clic no llega al anfitrión.
+//!   `Ctrl+Alt+R` ([`ShortcutKeys::release`]) y perder el foco sueltan el reenvío (el permiso
+//!   sigue; ver [`InputCapture::forwarding`]) y otro clic lo recupera. Al soltarlo se envía
+//!   [`InputEvent::ReleaseAll`]. Los mandos no dependen de esto: no chocan con el escritorio del
+//!   invitado y siguen yendo mientras haya ranura.
 //! - **Teclado** por tecla física ([`crate::keymap`]); las repeticiones automáticas no se envían
 //!   (el sistema del anfitrión repite solo).
 //! - **Rueda** en 1/120 de muesca: `LineDelta` × 120 y `PixelDelta` a [`WHEEL_PIXELS_PER_NOTCH`]
 //!   píxeles por muesca, guardando los restos.
-//! - **Atajos** (no se envían al anfitrión): `Ctrl+Alt+G` alterna inmersivo y escritorio y suelta
-//!   la captura; `Ctrl+Alt+S` muestra u oculta el overlay; `Ctrl+Alt+C` el chat; `Ctrl+Alt+Q` sale;
-//!   `Ctrl+Alt+M` silencia o reactiva el micrófono, `Ctrl+Alt+V` el audio del juego y
-//!   `Ctrl+Alt+J` muestra u oculta el panel de mandos. Sin permiso
-//!   de teclado, `Esc` también sale.
+//! - **Atajos** (no se envían al anfitrión): `Ctrl+Alt+G` alterna inmersivo y escritorio (entrar
+//!   en inmersivo captura el reenvío); `Ctrl+Alt+R` suelta el reenvío; `Ctrl+Alt+S` muestra u
+//!   oculta el overlay; `Ctrl+Alt+C` el chat; `Ctrl+Alt+Q` sale; `Ctrl+Alt+M` silencia o reactiva
+//!   el micrófono, `Ctrl+Alt+V` el audio del juego y `Ctrl+Alt+J` muestra u oculta el panel de
+//!   mandos. Sin permiso de teclado, `Esc` también sale.
+//! - **AltGr no es Alt**: el Alt de un atajo es el izquierdo o el que el sistema da por Alt
+//!   ([`InputCapture::set_modifiers`]). Con una distribución con AltGr (latinoamericana,
+//!   española, alemana…) el Alt derecho es AltGr: en Linux llega como `AltRight` sin modificador
+//!   Alt (es `ISO_Level3_Shift`) y en Windows como `AltRight` con un `ControlLeft` sintético que
+//!   `winit` descarta y sin Ctrl ni Alt en los modificadores. Así `AltGr+Q` (`@`) va al juego y no
+//!   sale de la sala; con una distribución sin AltGr, `Ctrl+Alt derecho` sigue valiendo.
 //! - **Pulsar para hablar** ([`InputCapture::set_push_to_talk`]): la tecla elegida
 //!   (`--ptt TECLA`) no va al anfitrión; pulsarla y soltarla dan [`Action::PushToTalk`].
 //! - **Foco**: al perderlo se envía [`InputEvent::ReleaseAll`] y se suelta el cursor.
@@ -94,6 +106,8 @@ pub struct ShortcutKeys {
     pub game: KeyCode,
     /// Panel de mandos (`J`).
     pub pads: KeyCode,
+    /// Soltar el teclado y el ratón (`R`): deja de reenviar hasta el próximo clic en el vídeo.
+    pub release: KeyCode,
 }
 
 impl Default for ShortcutKeys {
@@ -106,6 +120,7 @@ impl Default for ShortcutKeys {
             mic: KeyCode::KeyM,
             game: KeyCode::KeyV,
             pads: KeyCode::KeyJ,
+            release: KeyCode::KeyR,
         }
     }
 }
@@ -139,17 +154,25 @@ pub struct InputCapture {
     mode: CaptureMode,
     allowed: Allowed,
     grabbed: bool,
+    /// Reenviando teclado y ratón (desde el clic en el vídeo hasta soltarlo).
+    engaged: bool,
     focused: bool,
     ctrl: [bool; 2],
     alt: [bool; 2],
+    /// Alt según el sistema (`ModifiersChanged`), que no cuenta AltGr.
+    system_alt: bool,
     keys: BTreeSet<u16>,
     buttons: BTreeSet<MouseButton>,
     frame: Option<(u32, u32)>,
     window: (u32, u32),
+    /// Última posición del cursor en la ventana (para llevar el del anfitrión al capturar).
+    pointer: Option<(f64, f64)>,
     motion_rest: (f64, f64),
     wheel_rest: (f64, f64),
     push_to_talk: Option<KeyCode>,
     talking: bool,
+    /// Si el vídeo estaba delante la última vez que lo dijo la ventana ([`Self::set_in_front`]).
+    in_front: bool,
     shortcuts: ShortcutKeys,
 }
 
@@ -192,6 +215,12 @@ impl InputCapture {
         self.grabbed
     }
 
+    /// Si se reenvían el teclado y el ratón ahora: hay permiso y el invitado hizo clic en el
+    /// vídeo sin soltarlo después (atajo o foco perdido).
+    pub fn forwarding(&self) -> bool {
+        self.allowed.keyboard_mouse && self.engaged
+    }
+
     /// Permisos actuales.
     pub fn allowed(&self) -> Allowed {
         self.allowed
@@ -216,18 +245,69 @@ impl InputCapture {
         self.window = (width, height);
     }
 
-    /// Nuevos permisos; si se pierde el teclado y ratón, suelta lo pulsado y el cursor.
+    /// Nuevos permisos; si se pierde el teclado y ratón, suelta lo pulsado y el cursor. Recién
+    /// dado, no se reenvía nada hasta el primer clic en el vídeo.
     pub fn set_allowed(&mut self, allowed: Allowed) -> Vec<Action> {
         let mut out = Vec::new();
         if self.allowed.keyboard_mouse && !allowed.keyboard_mouse {
             out.extend(self.release());
-            if self.grabbed {
-                self.grabbed = false;
-                out.push(Action::Grab(false));
-            }
+            out.extend(self.ungrab());
+        }
+        if self.allowed.keyboard_mouse != allowed.keyboard_mouse {
+            self.engaged = false;
         }
         self.allowed = allowed;
         out
+    }
+
+    /// Deja de reenviar el teclado y el ratón (`Ctrl+Alt+R`) sin tocar el permiso: suelta lo
+    /// pulsado en el anfitrión y el cursor capturado. Un clic en el vídeo lo vuelve a capturar.
+    pub fn release_forwarding(&mut self) -> Vec<Action> {
+        if !self.engaged {
+            return Vec::new();
+        }
+        self.engaged = false;
+        let mut out = self.release();
+        out.extend(self.ungrab());
+        out
+    }
+
+    /// Suelta en el anfitrión lo pulsado y el cursor capturado, pero sigue reenviando (el
+    /// teclado pasa un momento a la interfaz, como al escribir en el chat). Si se estaba
+    /// hablando con la tecla de pulsar para hablar, cierra el micrófono: su soltar irá a la
+    /// interfaz y no llegaría aquí.
+    pub fn release_held(&mut self) -> Vec<Action> {
+        let mut out = self.release();
+        out.extend(self.stop_talking());
+        out.extend(self.ungrab());
+        out
+    }
+
+    /// Si el vídeo está delante (nada lo tapa: un diálogo, otra pantalla). Al dejar de estarlo,
+    /// el teclado y el ratón pasan a la interfaz y lo que se suelte ya no llega aquí: suelta lo
+    /// pulsado, el cursor y la tecla de pulsar para hablar ([`Self::release_held`]).
+    pub fn set_in_front(&mut self, in_front: bool) -> Vec<Action> {
+        let covered = self.in_front && !in_front;
+        self.in_front = in_front;
+        if covered {
+            self.release_held()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn stop_talking(&mut self) -> Option<Action> {
+        self.talking.then(|| {
+            self.talking = false;
+            Action::PushToTalk(false)
+        })
+    }
+
+    fn ungrab(&mut self) -> Option<Action> {
+        self.grabbed.then(|| {
+            self.grabbed = false;
+            Action::Grab(false)
+        })
     }
 
     /// Tecla de pulsar para hablar (`None`: activación por voz).
@@ -243,7 +323,9 @@ impl InputCapture {
 
     /// Ctrl y Alt como los ve el sistema (`WindowEvent::ModifiersChanged`): reajusta lo que esta
     /// captura deduce de las teclas (que puede quedarse atrás si una pulsación llegó con la
-    /// ventana sin foco) sin enviar nada al anfitrión.
+    /// ventana sin foco) sin enviar nada al anfitrión. El Alt del sistema no incluye AltGr (ni en
+    /// Linux, donde es otro modificador, ni en Windows, donde `winit` lo filtra): con él vale el
+    /// Alt derecho de una distribución sin AltGr.
     pub fn set_modifiers(&mut self, ctrl: bool, alt: bool) {
         if !ctrl {
             self.ctrl = [false; 2];
@@ -252,9 +334,14 @@ impl InputCapture {
         }
         if !alt {
             self.alt = [false; 2];
-        } else if !self.alt.iter().any(|down| *down) {
-            self.alt[0] = true;
         }
+        self.system_alt = alt;
+    }
+
+    /// Si `Ctrl+Alt` está pulsado para un atajo: algún Ctrl y el Alt izquierdo, o un Alt que el
+    /// sistema da por Alt (nunca AltGr).
+    fn ctrl_alt(&self) -> bool {
+        self.ctrl.iter().any(|down| *down) && (self.alt[0] || self.system_alt)
     }
 
     /// Pasa al modo inmersivo (`true`) o al de escritorio, como `Ctrl+Alt+G` (desde un botón de
@@ -277,7 +364,11 @@ impl InputCapture {
             CaptureMode::Desktop => CaptureMode::Immersive,
             CaptureMode::Immersive => CaptureMode::Desktop,
         };
-        let grab = self.mode == CaptureMode::Immersive && self.allowed.keyboard_mouse;
+        // Pedir el inmersivo es pedir el ratón para el juego: captura el reenvío.
+        if self.mode == CaptureMode::Immersive && self.allowed.keyboard_mouse && self.focused {
+            self.engaged = true;
+        }
+        let grab = self.mode == CaptureMode::Immersive && self.forwarding();
         if grab != self.grabbed {
             self.grabbed = grab;
             out.push(Action::Grab(grab));
@@ -303,11 +394,13 @@ impl InputCapture {
     }
 
     fn shortcut(&mut self, code: KeyCode) -> Option<Vec<Action>> {
-        if !(self.ctrl.iter().any(|d| *d) && self.alt.iter().any(|d| *d)) {
+        if !self.ctrl_alt() {
             return None;
         }
         let keys = self.shortcuts;
-        if code == keys.immersive {
+        if code == keys.release {
+            Some(self.release_forwarding())
+        } else if code == keys.immersive {
             Some(self.toggle_mode())
         } else if code == keys.overlay {
             Some(vec![Action::ToggleOverlay])
@@ -354,7 +447,7 @@ impl InputCapture {
                 return vec![Action::Quit];
             }
         }
-        if !self.allowed.keyboard_mouse || repeat {
+        if !self.forwarding() || repeat {
             return Vec::new();
         }
         let Some(code) = evdev_from_physical(physical) else {
@@ -402,15 +495,11 @@ impl InputCapture {
                 }
                 self.ctrl = [false; 2];
                 self.alt = [false; 2];
+                self.system_alt = false;
+                self.engaged = false;
                 let mut out = self.release();
-                if self.talking {
-                    self.talking = false;
-                    out.push(Action::PushToTalk(false));
-                }
-                if self.grabbed {
-                    self.grabbed = false;
-                    out.push(Action::Grab(false));
-                }
+                out.extend(self.stop_talking());
+                out.extend(self.ungrab());
                 out
             }
             WindowEvent::Resized(size) => {
@@ -423,7 +512,8 @@ impl InputCapture {
                 event.repeat,
             ),
             WindowEvent::CursorMoved { position, .. } => {
-                if !self.allowed.keyboard_mouse || self.mode != CaptureMode::Desktop {
+                self.pointer = Some((position.x, position.y));
+                if !self.forwarding() || self.mode != CaptureMode::Desktop {
                     return Vec::new();
                 }
                 self.absolute(position.x, position.y)
@@ -436,6 +526,10 @@ impl InputCapture {
                     return Vec::new();
                 }
                 let pressed = *state == ElementState::Pressed;
+                if !self.engaged {
+                    // El clic que captura el reenvío no es del juego (ni su soltar).
+                    return if pressed { self.engage() } else { Vec::new() };
+                }
                 if self.mode == CaptureMode::Immersive && !self.grabbed {
                     // Un clic vuelve a capturar el cursor; ese clic no es del juego.
                     if pressed {
@@ -459,7 +553,7 @@ impl InputCapture {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if !self.allowed.keyboard_mouse {
+                if !self.forwarding() {
                     return Vec::new();
                 }
                 let (x, y) = match delta {
@@ -483,6 +577,24 @@ impl InputCapture {
                 }
             }
             _ => Vec::new(),
+        }
+    }
+
+    /// Un clic en el vídeo captura el reenvío: en escritorio, el cursor del anfitrión va adonde
+    /// está el del invitado; en inmersivo, se captura el cursor.
+    fn engage(&mut self) -> Vec<Action> {
+        self.engaged = true;
+        match self.mode {
+            CaptureMode::Desktop => self
+                .pointer
+                .and_then(|(x, y)| self.absolute(x, y))
+                .map(Action::Send)
+                .into_iter()
+                .collect(),
+            CaptureMode::Immersive => {
+                self.grabbed = true;
+                vec![Action::Grab(true)]
+            }
         }
     }
 
@@ -554,7 +666,296 @@ mod tests {
         });
         capture.set_host_frame(1920, 1080);
         capture.set_window_size(1000, 1000);
+        // El clic que captura el reenvío.
+        assert!(sent(&capture.on_window_event(&click(true))).is_empty());
+        assert!(capture.on_window_event(&click(false)).is_empty());
+        assert!(capture.forwarding());
         capture
+    }
+
+    fn press(capture: &mut InputCapture, code: KeyCode, pressed: bool) -> Vec<Action> {
+        capture.key(PhysicalKey::Code(code), pressed, false)
+    }
+
+    fn release_shortcut(capture: &mut InputCapture) -> Vec<Action> {
+        press(capture, KeyCode::ControlLeft, true);
+        press(capture, KeyCode::AltLeft, true);
+        let actions = press(capture, KeyCode::KeyR, true);
+        assert!(
+            press(capture, KeyCode::KeyR, false).is_empty(),
+            "la R no se envía"
+        );
+        press(capture, KeyCode::AltLeft, false);
+        press(capture, KeyCode::ControlLeft, false);
+        actions
+    }
+
+    fn moved(capture: &mut InputCapture, x: f64, y: f64) -> Vec<Action> {
+        capture.on_window_event(&WindowEvent::CursorMoved {
+            device_id: device(),
+            position: PhysicalPosition::new(x, y),
+        })
+    }
+
+    /// `AltGr+Q` es `@` en la distribución latinoamericana: no sale de la sala y llega al juego
+    /// como AltGr y Q (el anfitrión lo escribe con su distribución).
+    #[test]
+    fn altgr_is_not_the_alt_of_the_shortcuts() {
+        let q = |capture: &mut InputCapture| press(capture, KeyCode::KeyQ, true);
+        let quits = |actions: &[Action]| actions.contains(&Action::Quit);
+        let altgr_q = vec![
+            InputEvent::Key {
+                code: 100,
+                pressed: true,
+            },
+            InputEvent::Key {
+                code: 16,
+                pressed: true,
+            },
+        ];
+        // Windows: `winit` descarta el Ctrl izquierdo sintético y el sistema no da Ctrl ni Alt.
+        let mut windows = allowed();
+        windows.set_modifiers(false, false);
+        let mut out = sent(&press(&mut windows, KeyCode::AltRight, true));
+        let actions = q(&mut windows);
+        assert!(!quits(&actions));
+        out.extend(sent(&actions));
+        assert_eq!(out, altgr_q, "al anfitrión, AltGr y Q sin Ctrl");
+        // Si el Ctrl sintético llegara a pasar, tampoco: el Alt es el derecho y el sistema no lo
+        // da por Alt.
+        let mut leaked = allowed();
+        press(&mut leaked, KeyCode::ControlLeft, true);
+        press(&mut leaked, KeyCode::AltRight, true);
+        leaked.set_modifiers(false, false);
+        assert!(!quits(&q(&mut leaked)));
+        // Linux: AltGr es `ISO_Level3_Shift`, no Alt; ni con Ctrl pulsado de verdad.
+        let mut linux = allowed();
+        press(&mut linux, KeyCode::ControlLeft, true);
+        linux.set_modifiers(true, false);
+        press(&mut linux, KeyCode::AltRight, true);
+        assert!(!quits(&q(&mut linux)));
+        // Ctrl y Alt izquierdos: el atajo, que no se envía.
+        let mut left = allowed();
+        press(&mut left, KeyCode::ControlLeft, true);
+        press(&mut left, KeyCode::AltLeft, true);
+        left.set_modifiers(true, true);
+        assert_eq!(
+            q(&mut left),
+            vec![Action::Send(InputEvent::ReleaseAll), Action::Quit]
+        );
+        // Distribución sin AltGr (inglesa de EE. UU.): el Alt derecho es Alt y vale.
+        let mut us = allowed();
+        press(&mut us, KeyCode::ControlRight, true);
+        press(&mut us, KeyCode::AltRight, true);
+        us.set_modifiers(true, true);
+        assert!(quits(&q(&mut us)));
+        // Sin noticias del sistema (antes del primer `ModifiersChanged`), solo el izquierdo.
+        let mut unknown = allowed();
+        press(&mut unknown, KeyCode::ControlLeft, true);
+        press(&mut unknown, KeyCode::AltRight, true);
+        assert!(!quits(&q(&mut unknown)));
+    }
+
+    #[test]
+    fn a_new_permission_forwards_nothing_until_a_click_on_the_video() {
+        let mut capture = InputCapture::new();
+        capture.set_host_frame(1920, 1080);
+        capture.set_window_size(1000, 1000);
+        let granted = capture.set_allowed(Allowed {
+            keyboard_mouse: true,
+            gamepad_slot: None,
+        });
+        assert!(granted.is_empty(), "{granted:?}");
+        assert!(!capture.forwarding());
+        assert!(press(&mut capture, KeyCode::KeyW, true).is_empty());
+        assert!(moved(&mut capture, 500.0, 500.0).is_empty());
+        assert!(
+            capture
+                .on_window_event(&wheel(MouseScrollDelta::LineDelta(0.0, 1.0)))
+                .is_empty()
+        );
+        // El clic captura: el cursor del anfitrión va adonde está el del invitado y el botón no
+        // llega al juego (ni al pulsar ni al soltar).
+        assert_eq!(
+            capture.on_window_event(&click(true)),
+            vec![Action::Send(InputEvent::MouseMoveAbsolute {
+                x: 32768,
+                y: 32768
+            })]
+        );
+        assert!(capture.on_window_event(&click(false)).is_empty());
+        assert!(capture.forwarding());
+        assert_eq!(
+            sent(&press(&mut capture, KeyCode::KeyA, true)),
+            vec![InputEvent::Key {
+                code: 30,
+                pressed: true
+            }]
+        );
+        assert_eq!(
+            sent(&capture.on_window_event(&click(true))),
+            vec![InputEvent::MouseButton {
+                button: MouseButton::Left,
+                pressed: true
+            }]
+        );
+    }
+
+    #[test]
+    fn the_release_shortcut_stops_forwarding_and_keeps_the_permission() {
+        let mut capture = allowed();
+        press(&mut capture, KeyCode::KeyW, true);
+        capture.on_window_event(&click(true));
+        assert_eq!(
+            release_shortcut(&mut capture),
+            vec![Action::Send(InputEvent::ReleaseAll)],
+            "el anfitrión suelta lo pulsado"
+        );
+        assert!(!capture.forwarding());
+        assert!(capture.allowed().keyboard_mouse, "el permiso sigue");
+        assert!(press(&mut capture, KeyCode::KeyW, false).is_empty());
+        assert!(capture.on_window_event(&click(false)).is_empty());
+        assert!(press(&mut capture, KeyCode::KeyD, true).is_empty());
+        assert!(moved(&mut capture, 500.0, 500.0).is_empty());
+        assert!(
+            release_shortcut(&mut capture).is_empty(),
+            "ya estaba suelto"
+        );
+        // Otro clic lo recupera, sin llegar al juego.
+        assert_eq!(
+            sent(&capture.on_window_event(&click(true))),
+            vec![InputEvent::MouseMoveAbsolute { x: 32768, y: 32768 }]
+        );
+        assert!(capture.on_window_event(&click(false)).is_empty());
+        assert!(capture.forwarding());
+        // En inmersivo, soltar también suelta el cursor; el modo se queda.
+        assert!(capture.set_immersive(true).contains(&Action::Grab(true)));
+        assert_eq!(
+            release_shortcut(&mut capture),
+            vec![Action::Send(InputEvent::ReleaseAll), Action::Grab(false)]
+        );
+        assert_eq!(capture.mode(), CaptureMode::Immersive);
+        assert!(capture.on_mouse_motion(4.0, 4.0).is_empty());
+        assert_eq!(
+            capture.on_window_event(&click(true)),
+            vec![Action::Grab(true)]
+        );
+        assert!(capture.on_window_event(&click(false)).is_empty());
+        assert!(!capture.on_mouse_motion(4.0, 4.0).is_empty());
+    }
+
+    #[test]
+    fn revoking_the_permission_while_captured_releases_everything() {
+        let mut capture = allowed();
+        capture.set_immersive(true);
+        press(&mut capture, KeyCode::KeyW, true);
+        let revoked = capture.set_allowed(Allowed::default());
+        assert_eq!(
+            revoked,
+            vec![Action::Send(InputEvent::ReleaseAll), Action::Grab(false)]
+        );
+        assert!(!capture.forwarding());
+        assert!(capture.on_mouse_motion(3.0, 3.0).is_empty());
+        // Si vuelve el permiso, hace falta otro clic.
+        capture.set_allowed(Allowed {
+            keyboard_mouse: true,
+            gamepad_slot: None,
+        });
+        assert!(!capture.forwarding());
+        assert!(press(&mut capture, KeyCode::KeyW, true).is_empty());
+        assert_eq!(
+            capture.on_window_event(&click(true)),
+            vec![Action::Grab(true)]
+        );
+        assert!(capture.forwarding());
+    }
+
+    #[test]
+    fn losing_focus_releases_forwarding_until_the_next_click() {
+        let mut capture = allowed();
+        press(&mut capture, KeyCode::KeyW, true);
+        assert_eq!(
+            capture.on_window_event(&WindowEvent::Focused(false)),
+            vec![Action::Send(InputEvent::ReleaseAll)]
+        );
+        assert!(
+            capture
+                .on_window_event(&WindowEvent::Focused(true))
+                .is_empty()
+        );
+        assert!(!capture.forwarding());
+        assert!(press(&mut capture, KeyCode::KeyW, true).is_empty());
+        assert!(moved(&mut capture, 500.0, 500.0).is_empty());
+        assert!(!sent(&capture.on_window_event(&click(true))).is_empty());
+        assert!(capture.forwarding());
+    }
+
+    #[test]
+    fn releasing_held_keys_keeps_forwarding() {
+        let mut capture = allowed();
+        capture.set_immersive(true);
+        press(&mut capture, KeyCode::KeyW, true);
+        assert_eq!(
+            capture.release_held(),
+            vec![Action::Send(InputEvent::ReleaseAll), Action::Grab(false)]
+        );
+        assert!(
+            capture.forwarding(),
+            "escribir en el chat no suelta el reenvío"
+        );
+        assert!(!sent(&press(&mut capture, KeyCode::KeyW, true)).is_empty());
+    }
+
+    #[test]
+    fn releasing_held_keys_closes_push_to_talk() {
+        let mut capture = allowed();
+        capture.set_push_to_talk(Some(KeyCode::F12));
+        assert_eq!(
+            press(&mut capture, KeyCode::F12, true),
+            vec![Action::PushToTalk(true)]
+        );
+        // El chat toma el teclado con la tecla aún pulsada: su soltar no llegará aquí.
+        let released = capture.release_held();
+        assert!(
+            released.contains(&Action::PushToTalk(false)),
+            "{released:?}"
+        );
+        assert!(
+            !capture.release_held().contains(&Action::PushToTalk(false)),
+            "solo una vez"
+        );
+        assert!(capture.forwarding());
+        assert_eq!(
+            press(&mut capture, KeyCode::F12, true),
+            vec![Action::PushToTalk(true)],
+            "la siguiente pulsación vuelve a abrir el micrófono"
+        );
+    }
+
+    #[test]
+    fn covering_the_video_releases_keys_cursor_and_push_to_talk() {
+        let mut capture = allowed();
+        capture.set_push_to_talk(Some(KeyCode::F12));
+        assert!(capture.set_in_front(true).is_empty(), "nada que soltar");
+        capture.set_immersive(true);
+        press(&mut capture, KeyCode::KeyW, true);
+        press(&mut capture, KeyCode::F12, true);
+        // Se abre un diálogo (la oferta de traspaso) con W y F12 aún pulsadas.
+        let covered = capture.set_in_front(false);
+        assert_eq!(
+            covered,
+            vec![
+                Action::Send(InputEvent::ReleaseAll),
+                Action::PushToTalk(false),
+                Action::Grab(false)
+            ]
+        );
+        assert!(capture.set_in_front(false).is_empty(), "solo al taparse");
+        assert!(
+            capture.set_in_front(true).is_empty(),
+            "volver no suelta nada"
+        );
+        assert!(capture.forwarding(), "el permiso y el reenvío siguen");
     }
 
     #[test]
@@ -669,6 +1070,8 @@ mod tests {
         key(&mut capture, KeyCode::F12, true);
         let lost = capture.on_window_event(&WindowEvent::Focused(false));
         assert!(lost.contains(&Action::PushToTalk(false)), "{lost:?}");
+        capture.on_window_event(&WindowEvent::Focused(true));
+        capture.on_window_event(&click(true));
         // Sin pulsar para hablar, la tecla va al anfitrión como cualquier otra.
         capture.set_push_to_talk(None);
         assert!(!sent(&key(&mut capture, KeyCode::F12, true)).is_empty());
@@ -760,8 +1163,10 @@ mod tests {
     #[test]
     fn an_immersive_click_regrabs_without_reaching_the_game() {
         let mut capture = allowed();
+        // Distribución sin AltGr: el Alt derecho es Alt para el sistema.
         capture.key(PhysicalKey::Code(KeyCode::ControlRight), true, false);
         capture.key(PhysicalKey::Code(KeyCode::AltRight), true, false);
+        capture.set_modifiers(true, true);
         capture.key(PhysicalKey::Code(KeyCode::KeyG), true, false);
         capture.on_window_event(&WindowEvent::Focused(false));
         assert!(!capture.grabbed());

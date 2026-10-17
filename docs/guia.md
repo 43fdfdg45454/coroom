@@ -23,6 +23,11 @@ Esta guía es para quien usa la aplicación. Para montar un servidor, mira la
 Tu sesión dura 30 días en cada equipo. En Ajustes → Cuenta y servidor ves tus equipos y puedes cerrar la
 sesión de uno que ya no uses.
 
+Ahí mismo, en **Avatar**, eliges una imagen tuya (PNG, JPEG o WebP) con el selector de ficheros del
+sistema: se recorta al cuadrado central y se reduce antes de subirla. La ve cualquiera con cuenta
+en tu servidor (tus amigos en su lista, quien comparte sala contigo en la sala y en el chat). Sin
+imagen, se ven tus iniciales.
+
 ## Alojar: compartir tu juego
 
 1. En **Inicio**, pulsa **Compartir mi pantalla**.
@@ -99,7 +104,11 @@ Si se corta la conexión, coroom **reconecta solo** (hasta 5 intentos, de medio 
 
 El anfitrión da y quita, a cada invitado y en cualquier momento:
 
-- **Teclado y ratón**: el invitado escribe y mueve el ratón en el equipo del anfitrión.
+- **Teclado y ratón**: el invitado escribe y mueve el ratón en el equipo del anfitrión. Como en
+  QEMU, no se envía nada hasta que el invitado **hace clic en la imagen** (ese clic no llega al
+  juego); `Ctrl+Alt+R` o cambiar de ventana lo sueltan sin perder el permiso, y otro clic lo
+  recupera. Mientras tenga el permiso, un aviso junto a la píldora de latencia dice cuál de las
+  dos cosas toca (a pantalla completa, solo con la barra). Los mandos no dependen de esto.
 - **Mando**: una **ranura** (1 a 8) para un mando; cada ranura es de un solo invitado. Tu mando
   llega **tal cual** (el juego y Steam lo ven como ese mando, con sus botones) o **convertido a
   Xbox 360**, como decida el anfitrión. Si tienes varios mandos, eliges cuál envías en el panel de
@@ -117,8 +126,9 @@ alto que se la oye aquí, y su altavoz la silencia solo aquí (tachado y con la 
 cambia nada para los demás. En tu propia fila, la primera, el deslizador es lo alto que te oyen y el
 altavoz te silencia para toda la sala.
 
-Como invitado, arriba a la izquierda del vídeo ves **quién está hablando** (se quita en Ajustes →
-Sala). La pestaña **Ajustes** del panel reúne lo de tu equipo: VSync, decodificar por software,
+Como invitado, arriba a la izquierda del vídeo ves **quién está hablando**: una fila por persona
+con su avatar, en el orden en que empezaron a hablar (se quita en Ajustes → Sala). En
+**Integrantes**, el avatar de quien habla lleva un anillo verde, también como anfitrión. La pestaña **Ajustes** del panel reúne lo de tu equipo: VSync, decodificar por software,
 micrófono y salida (cambian al momento), volumen del juego y el mando que envías.
 
 Además puede **pausar la entrada de todos** (se suelta todo lo pulsado) y **expulsar** a un
@@ -142,6 +152,7 @@ puesto en medio, ni siquiera el servidor. coroom lo recuerda en Ajustes → Cuen
 | `Tab` / `Mayús+Tab` | Campo siguiente / anterior (da la vuelta al llegar al final) |
 | `Intro` | Envía el formulario del campo |
 | `Ctrl+Alt+G` | Invitado: modo inmersivo (el ratón se queda en el juego) o escritorio |
+| `Ctrl+Alt+R` | Invitado: soltar el teclado y el ratón (un clic en la imagen los recupera) |
 | `Ctrl+Alt+S` | Invitado: estadísticas de la conexión |
 | `Ctrl+Alt+C` | Chat de la sala (también en la sala de espera) |
 | `Ctrl+Alt+M` | Silenciar o activar el micrófono |
@@ -150,6 +161,8 @@ puesto en medio, ni siquiera el servidor. coroom lo recuerda en Ajustes → Cuen
 | `F12` (pulsar para hablar) | Hablar mientras se mantiene, si lo activas en Ajustes → Audio y voz |
 
 Las letras de `Ctrl+Alt` se cambian en Ajustes → Mandos (no pueden coincidir entre sí).
+El `Alt` de los atajos es el izquierdo (o el derecho en distribuciones sin AltGr): con AltGr,
+como en la latinoamericana, `AltGr+Q` escribe `@` en el juego o en el chat y no sale de la sala.
 
 ## Ajustes
 

@@ -485,12 +485,33 @@ impl Room {
                 });
                 Ok(())
             }
+            SignalMessage::FriendRequested {
+                from_user,
+                from_name,
+            } => {
+                self.core.emit(SessionEvent::FriendRequested {
+                    from_user,
+                    from_name,
+                });
+                Ok(())
+            }
             SignalMessage::Activity { user, activity } => {
                 self.core.emit(SessionEvent::Activity { user, activity });
                 Ok(())
             }
             SignalMessage::Presence { user, online } => {
                 self.core.emit(SessionEvent::Presence { user, online });
+                Ok(())
+            }
+            SignalMessage::Avatar { user, avatar } => {
+                // El del anfitrión, para los `Members` que lleguen después.
+                {
+                    let mut link = lock(&self.core.link);
+                    if link.host_user == user {
+                        link.host_avatar = avatar;
+                    }
+                }
+                self.core.emit(SessionEvent::Avatar { user, avatar });
                 Ok(())
             }
             SignalMessage::Error { code, message } => match code {
@@ -741,7 +762,7 @@ async fn run_guest(
         .map_err(network("señalización"))?;
 
     let mut backlog = VecDeque::new();
-    let (host_pk, host_name) = loop {
+    let (host_pk, host_name, host_user, host_avatar) = loop {
         let message = tokio::time::timeout(REPLY_TIMEOUT, signal.next_event())
             .await
             .map_err(|_| SessionError::Network("el servidor no respondió a tiempo".into()))?
@@ -750,6 +771,8 @@ async fn run_guest(
             Some(SignalMessage::Joined {
                 host_pk,
                 host_name,
+                host_user,
+                host_avatar,
                 your_peer_id,
                 ..
             }) => {
@@ -757,7 +780,7 @@ async fn run_guest(
                 // etiquetar los datagramas de control hacia el anfitrión.
                 lock(&core.chat).add_own_guest(your_peer_id);
                 core.own_peer_id.store(your_peer_id, Ordering::Release);
-                break (host_pk, host_name);
+                break (host_pk, host_name, host_user, host_avatar);
             }
             Some(SignalMessage::Error { message, .. }) => {
                 return Err(SessionError::Rejected(message));
@@ -778,6 +801,8 @@ async fn run_guest(
         link.safety_number = Some(safety_number);
         link.host_fingerprint = host_fingerprint.clone();
         link.host_name = host_name.clone();
+        link.host_user = host_user;
+        link.host_avatar = host_avatar;
     }
     core.joined_once.store(true, Ordering::Release);
     core.emit(SessionEvent::Joined {
@@ -1320,18 +1345,23 @@ async fn control_loop(
             Some(ControlMessage::Members { members }) => {
                 if ControlMessage::members_within_limits(&members) {
                     let own = core.own_leaf.load(Ordering::Acquire);
-                    let host_name = lock(&core.link).host_name.clone();
+                    let (host_name, host_user, host_avatar) = {
+                        let link = lock(&core.link);
+                        (link.host_name.clone(), link.host_user, link.host_avatar)
+                    };
                     let members = members
                         .into_iter()
-                        .map(|member| RoomMember {
-                            name: if member.guest == 0 && member.name.is_empty() {
-                                host_name.clone()
-                            } else {
-                                member.name
-                            },
-                            guest: member.guest,
-                            you: member.leaf == own,
-                            leaf: member.leaf,
+                        .map(|member| {
+                            // El anfitrión va sin nombre ni avatar: los da la señalización.
+                            let host = member.guest == 0 && member.name.is_empty();
+                            RoomMember {
+                                name: if host { host_name.clone() } else { member.name },
+                                user: if host { host_user } else { member.user },
+                                avatar: if host { host_avatar } else { member.avatar },
+                                guest: member.guest,
+                                you: member.leaf == own,
+                                leaf: member.leaf,
+                            }
                         })
                         .collect();
                     core.emit(SessionEvent::Members(members));

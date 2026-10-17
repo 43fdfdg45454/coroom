@@ -106,7 +106,9 @@ pub fn eis_provider(share: coroom_capture::RemoteDesktopShare) -> EisProvider {
 fn pointer_area(area: coroom_capture::SharedArea) -> PointerArea {
     match area {
         coroom_capture::SharedArea::Unknown => PointerArea::Unknown,
-        coroom_capture::SharedArea::Monitor { x, y } => PointerArea::Monitor { x, y },
+        coroom_capture::SharedArea::Monitor { x, y, mapping_id } => {
+            PointerArea::Monitor { x, y, mapping_id }
+        }
         coroom_capture::SharedArea::Window { width, height } => {
             PointerArea::Window { width, height }
         }

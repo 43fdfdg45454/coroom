@@ -17,6 +17,33 @@ pub const MIN_PASSWORD_LEN: usize = 12;
 /// Longitud máxima de una contraseña (Argon2 acepta más, pero no tiene sentido).
 pub const MAX_PASSWORD_LEN: usize = 256;
 
+/// Lado máximo de un avatar, en píxeles (los avatares son cuadrados).
+pub const AVATAR_SIDE_MAX: u32 = 256;
+
+/// Lado mínimo de un avatar, en píxeles.
+pub const AVATAR_SIDE_MIN: u32 = 16;
+
+/// Bytes como mucho del PNG de un avatar (`PUT /me/avatar`): un PNG de
+/// [`AVATAR_SIDE_MAX`]² en RGBA sin comprimir ocupa unos 257 KiB, así que cualquier imagen del
+/// tamaño permitido cabe.
+pub const AVATAR_MAX_BYTES: usize = 320 * 1024;
+
+/// Tipo de contenido de los avatares.
+pub const AVATAR_CONTENT_TYPE: &str = "image/png";
+
+/// Versión de un avatar: los 53 bits altos del SHA-256 del PNG guardado (53 para que quepa
+/// exacta en un número de JSON). Cambia con la imagen y sirve de clave de caché y de `ETag`.
+pub fn avatar_version(sha256: &[u8; 32]) -> u64 {
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&sha256[..8]);
+    u64::from_be_bytes(first) >> 11
+}
+
+/// Ruta (bajo [`API_PREFIX`]) del avatar de un usuario.
+pub fn avatar_path(user: u64) -> String {
+    format!("/users/{user}/avatar")
+}
+
 /// Cuerpo de todas las respuestas de error.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiError {
@@ -60,6 +87,9 @@ pub struct User {
     pub display_name: String,
     /// Si es administrador.
     pub is_admin: bool,
+    /// Versión de su avatar ([`avatar_version`]; `None`: no tiene).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<u64>,
 }
 
 /// `POST /auth/login`.
@@ -186,6 +216,9 @@ pub struct Friend {
     /// Qué hace ahora (solo de los amigos conectados).
     #[serde(default, skip_serializing_if = "is_idle")]
     pub activity: crate::signal::Activity,
+    /// Versión de su avatar ([`avatar_version`]; `None`: no tiene).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<u64>,
 }
 
 fn is_idle(activity: &crate::signal::Activity) -> bool {
@@ -275,6 +308,9 @@ pub struct AdminUser {
     pub last_seen_at: Option<i64>,
     /// Conectado ahora a la señalización.
     pub online: bool,
+    /// Versión de su avatar (`None` sin avatar); el administrador puede quitarlo.
+    #[serde(default)]
+    pub avatar: Option<u64>,
 }
 
 /// `POST /admin/users`.
@@ -451,6 +487,27 @@ mod tests {
         let update: UpdateUser = serde_json::from_str(r#"{"disabled":true}"#).expect("JSON");
         assert_eq!(update.disabled, Some(true));
         assert_eq!(update.is_admin, None);
+    }
+
+    #[test]
+    fn avatar_versions_fit_a_json_number() {
+        assert_eq!(avatar_version(&[0xff; 32]), (1 << 53) - 1);
+        assert_eq!(avatar_version(&[0; 32]), 0);
+        let mut digest = [0u8; 32];
+        digest[6] = 0x08;
+        assert_eq!(avatar_version(&digest), 1);
+        let user: User = serde_json::from_str(
+            r#"{"id":1,"username":"ana","display_name":"Ana","is_admin":false}"#,
+        )
+        .expect("JSON sin avatar");
+        assert_eq!(user.avatar, None);
+        let text = serde_json::to_string(&User {
+            avatar: Some((1 << 53) - 1),
+            ..user
+        })
+        .expect("JSON");
+        assert!(text.contains(r#""avatar":9007199254740991"#), "{text}");
+        assert_eq!(avatar_path(7), "/users/7/avatar");
     }
 
     #[test]

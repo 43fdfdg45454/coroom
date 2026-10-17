@@ -37,6 +37,8 @@ subtle.workspace = true
 tokio-rustls.workspace = true
 rpassword.workspace = true
 sha2.workspace = true
+# Avatares: se decodifican con límites y se vuelven a codificar antes de guardarlos.
+png.workspace = true
 
 [dev-dependencies]
 coroom-transport = { workspace = true, features = ["test-util"] }

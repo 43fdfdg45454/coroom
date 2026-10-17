@@ -9,6 +9,24 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Añadido
 
+- **Avatares** (protocolo 16; hay que actualizar también el servidor): cada uno elige una imagen en
+  Ajustes → Cuenta y servidor (PNG, JPEG o WebP; se recorta al centro y se reduce a 256 px). El
+  servidor la valida y guarda su propio PNG, y avisa del cambio a los amigos y a quien comparte sala.
+  El administrador ve los avatares en `/admin` y puede quitar cualquiera.
+  Se ve en la cabecera, los amigos, las invitaciones, los integrantes, el chat y el indicador de
+  quién habla; sin imagen, las iniciales con un color fijo por nombre.
+- **Quién habla, una línea por persona** con su avatar, en el orden en que empezaron a hablar (hasta
+  4 y «y N más»); en Integrantes, un aro verde en el avatar de quien habla.
+- **Sonidos de aviso** en una página nueva, «Notificaciones»: entra o sale alguien, mensaje del chat,
+  alguien pide entrar (solo el anfitrión), te invitan, te dejan entrar, ahora eres el anfitrión y
+  solicitud de amistad. Nueve tonos propios, elegibles por evento, con «Probar», «Ninguno» o un
+  fichero propio, y un volumen de avisos. Suenan por la salida de «Audio y voz» y nunca llegan a la
+  sala; varios a la vez suenan una sola vez. Las solicitudes de amistad llegan al momento.
+- **El teclado y el ratón se toman con un clic**, como en QEMU: con el permiso, no se envía nada
+  hasta hacer clic en la imagen; Ctrl+Alt+R (configurable en Ajustes → Mandos) los suelta sin
+  perder el permiso, y perder el foco también. Un aviso junto a la latencia dice cómo soltarlos o
+  tomarlos.
+
 - **Salas solo de voz y «Dejar de compartir»** (protocolo 14; hay que actualizar también el
   servidor): en Compartir, «Solo voz» abre la sala sin compartir nada; dentro, «Compartir pantalla
   o ventana» empieza y «Dejar de compartir» para sin cerrarla. Los invitados ven «Nadie está
@@ -200,6 +218,15 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
   la conexión con el servidor tres veces (0,5, 1 y 2 s) si se corta al conectar; un rechazo o un
   servidor que no responde no se reintentan. Al anfitrión que pasaba la sala, el servidor le cortó
   la conexión justo al entrar en la nueva y tuvo que pedir entrar a mano.
+- El texto del chat solo empieza a seleccionarse sobre las letras, no en el hueco a su derecha.
+- Los desplegables (el «Más» de cada integrante, los selectores) eligen al soltar el botón, no al
+  pulsarlo.
+- La cabecera queda centrada, a la misma distancia de la barra de título del sistema que del borde
+  izquierdo.
+- Linux: con varios monitores, el puntero del invitado va al monitor compartido por el identificador
+  que da el portal (`mapping_id`), no solo por su posición.
+- AltGr nunca cuenta como el Alt de los atajos Ctrl+Alt.
+- Linux: el sonido del chat ya no se colaba en el audio del juego que capta el anfitrión.
 
 - **Silenciar tu micrófono como anfitrión, a la vista**: tu fila en «Integrantes» tiene ahora el
   botón «Silenciar tu micrófono» / «Activar tu micrófono», y el botón del deslizador de tu voz (en

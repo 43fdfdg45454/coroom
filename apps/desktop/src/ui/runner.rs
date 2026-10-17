@@ -13,7 +13,9 @@
 //!   oculto, con los deltas crudos de `DeviceEvent::MouseMotion`.
 //! - **Eventos crudos para [`InputCapture`]**: con el vídeo delante, el teclado va al juego si hay
 //!   permiso (salvo `F11`) y el ratón también cuando la interfaz no lo usa (un clic en la barra no
-//!   llega al anfitrión; con el cursor capturado no llega nada a la interfaz). En modo escritorio
+//!   llega al anfitrión; con el cursor capturado no llega nada a la interfaz), desde que el
+//!   invitado hace clic en la imagen (clic para capturar, como QEMU) hasta que lo suelta con
+//!   `Ctrl+Alt+R` o pierde el foco; suelto, `Esc` vuelve a ser de la aplicación. En modo escritorio
 //!   la posición del cursor sale hacia el anfitrión **antes** de pasar por la interfaz.
 //! - **Un dibujo por refresco**: los eventos de la ventana se convierten y se acumulan
 //!   ([`Ready::queue`]); la interfaz los recibe todos de golpe en el siguiente `RedrawRequested`
@@ -114,6 +116,8 @@ struct WindowInput {
     pads: Option<(Vec<ConnectedPad>, bool)>,
     confined: bool,
     mode: CaptureMode,
+    /// Si reenviaba el teclado y el ratón la última vez que lo vio la interfaz.
+    forwarding: bool,
 }
 
 struct Ready {
@@ -220,6 +224,7 @@ fn shortcut_keys(shortcuts: &Shortcuts) -> ShortcutKeys {
         mic: letter_key(shortcuts.mic).unwrap_or(default.mic),
         game: letter_key(shortcuts.game).unwrap_or(default.game),
         pads: letter_key(shortcuts.pads).unwrap_or(default.pads),
+        release: letter_key(shortcuts.release).unwrap_or(default.release),
     }
 }
 
@@ -515,8 +520,7 @@ impl Ready {
         let Some(input) = self.input.as_mut() else {
             return;
         };
-        let mut actions = input.capture.on_window_event(&WindowEvent::Focused(false));
-        actions.extend(input.capture.on_window_event(&WindowEvent::Focused(true)));
+        let actions = input.capture.release_held();
         self.apply(actions);
     }
 
@@ -601,6 +605,19 @@ impl Ready {
                 other => self.backend.execute(other, &self.app),
             }
         }
+        self.sync_in_front();
+    }
+
+    /// Tras cada cambio de la aplicación: si el vídeo dejó de estar delante (un diálogo como la
+    /// oferta de traspaso, otra pantalla), el teclado y el ratón pasan a la interfaz y se sueltan
+    /// en el anfitrión las teclas, el cursor y la tecla de pulsar para hablar.
+    fn sync_in_front(&mut self) {
+        let in_front = self.video_in_front();
+        let Some(input) = self.input.as_mut() else {
+            return;
+        };
+        let actions = input.capture.set_in_front(in_front);
+        self.apply(actions);
     }
 
     fn attach_input(&mut self) {
@@ -623,6 +640,7 @@ impl Ready {
             pads: None,
             confined: false,
             mode: CaptureMode::Desktop,
+            forwarding: false,
         });
     }
 
@@ -682,6 +700,15 @@ impl Ready {
             self.dispatch(Message::Guest(guest::Msg::ImmersiveChanged(
                 mode == CaptureMode::Immersive,
             )));
+        }
+        let forwarding = self.input.as_ref().map(|input| input.capture.forwarding());
+        if let (Some(forwarding), Some(input)) = (forwarding, self.input.as_mut())
+            && forwarding != input.forwarding
+        {
+            input.forwarding = forwarding;
+            self.dispatch(Message::Guest(guest::Msg::ForwardingChanged(forwarding)));
+            // El aviso del teclado y el ratón cambia de texto.
+            self.window.request_redraw();
         }
     }
 
@@ -762,6 +789,9 @@ impl Ready {
     /// Atajos `Ctrl+Alt` de la sala con el teclado en la interfaz (escribiendo en el chat): los
     /// mismos que con el vídeo delante, salvo el inmersivo.
     fn room_shortcut(&mut self, code: KeyCode) -> bool {
+        // Los modificadores del sistema no cuentan AltGr como Ctrl ni Alt (en Linux es otro
+        // modificador; en Windows `winit` filtra el Ctrl sintético y los quita): `AltGr+Q` escribe
+        // `@` en el chat y no sale de la sala.
         if !(self.modifiers.control_key() && self.modifiers.alt_key()) {
             return false;
         }
@@ -784,6 +814,11 @@ impl Ready {
         } else if code == keys.quit {
             let effects = guest::leave(&mut self.app);
             self.run_effects(effects);
+        } else if code == keys.release {
+            if let Some(input) = self.input.as_mut() {
+                let actions = input.capture.release_forwarding();
+                self.apply(actions);
+            }
         } else if let Some(input) = self.input.as_ref()
             && (code == keys.mic || code == keys.game)
         {
@@ -918,10 +953,11 @@ impl Ready {
             .input
             .as_ref()
             .is_some_and(|input| input.capture.grabbed());
-        let keyboard_allowed = self
+        // Sin reenviar (sin permiso, o suelto hasta el próximo clic), `Esc` es de la aplicación.
+        let forwarding = self
             .input
             .as_ref()
-            .is_some_and(|input| input.capture.allowed().keyboard_mouse);
+            .is_some_and(|input| input.capture.forwarding());
         let mut to_interface = true;
         let mut capture_now = false;
         let mut capture_if_ignored = false;
@@ -938,7 +974,7 @@ impl Ready {
                         if pressed && !key.repeat {
                             self.shortcut(KeyCode::F11);
                         }
-                    } else if code == Some(KeyCode::Escape) && !keyboard_allowed {
+                    } else if code == Some(KeyCode::Escape) && !forwarding {
                         if pressed && !key.repeat {
                             self.shortcut(KeyCode::Escape);
                         }
@@ -1345,5 +1381,6 @@ mod tests {
         assert_eq!(keys.immersive, KeyCode::KeyK);
         assert_eq!(keys.overlay, KeyCode::KeyS);
         assert_eq!(keys.chat, KeyCode::KeyC);
+        assert_eq!(keys.release, KeyCode::KeyR);
     }
 }

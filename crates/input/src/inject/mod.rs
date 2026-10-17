@@ -134,17 +134,20 @@ pub struct EisConnection {
 }
 
 /// Zona del escritorio que ve el invitado, en coordenadas lógicas del compositor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PointerArea {
     /// Sin datos: la posición absoluta va a la primera región del dispositivo.
     #[default]
     Unknown,
-    /// Un monitor: la región de EI que empieza en `(x, y)`.
+    /// Un monitor: la región de EI con su `mapping_id` o, si el portal no lo da, la que empieza
+    /// en `(x, y)`.
     Monitor {
         /// Esquina superior izquierda.
         x: i32,
         /// Esquina superior izquierda.
         y: i32,
+        /// Identificador del flujo que repite la región de EI del monitor.
+        mapping_id: Option<String>,
     },
     /// Una ventana: Wayland no dice dónde está, así que la posición absoluta se convierte en
     /// movimiento relativo escalado a su tamaño.

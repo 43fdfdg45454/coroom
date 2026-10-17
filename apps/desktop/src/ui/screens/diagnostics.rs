@@ -1575,7 +1575,7 @@ fn host_body<'a>(app: &'a App) -> Vec<Element<'a, Message>> {
         let empty = Route::default();
         let detail = tried_detail(app, route.unwrap_or(&empty));
         let heading = row![
-            ui::avatar(&app.theme, &status.name, 28.0),
+            crate::ui::avatars::view(app, &status.name, status.avatar, 28.0),
             ui::heading(status.name.as_str()),
             ui::fill(),
             path_badge(status.path, status.rtt_ms),

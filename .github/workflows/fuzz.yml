@@ -47,6 +47,7 @@ jobs:
           - crypto_mls
           - server_api
           - server_signal
+          - server_avatar
           - codec_slices
           - audio_jitter
     steps:

@@ -27,7 +27,8 @@ código publicado en crates.io):
 - `RenderPipelineDescriptor`: `multiview` → `multiview_mask`; `vertex.buffers` con `Option`;
   `RenderPassDescriptor` con `multiview_mask: None`.
 - `SamplerDescriptor`: `mipmap_filter` con `MipmapFilterMode`.
-- `util::StagingBelt::new(device, tamaño)`, y `write_buffer`/`allocate` sin dispositivo.
+- `util::StagingBelt::new(device, tamaño)` (también en la caché de imágenes, que se compila con
+  la función `image` de los avatares), y `write_buffer`/`allocate` sin dispositivo.
 - `get_mapped_range{,_mut}` devuelven `Result`; `BufferViewMut` se escribe por `slice`.
 - `InstanceDescriptor` por valor (`new_without_display_handle`), `enumerate_adapters` asíncrono y
   `Surface::get_current_texture` → `CurrentSurfaceTexture` con `Queue::present` (solo en el

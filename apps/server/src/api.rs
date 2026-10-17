@@ -1,5 +1,6 @@
 //! API `/api/v1`: primer administrador, login con desafío de dispositivo, sesión,
-//! invitaciones, amigos y uso del relay. Las rutas de administración están en [`crate::admin`].
+//! invitaciones, amigos, avatares y uso del relay. Las rutas de administración están en
+//! [`crate::admin`].
 //!
 //! Errores uniformes `{ "error", "message" }` en español; `Authorization: Bearer <token>`. Ningún
 //! registro incluye tokens, contraseñas ni claves.
@@ -10,19 +11,19 @@ use tracing::{info, warn};
 
 use coroom_transport::crypto::{sha256_fingerprint, verify_signature};
 use coroom_transport::proto::api::{
-    AddFriend, AddFriendResult, DayUsage, Device, Devices, Friend, FriendRequest, Friends,
-    LoginChallenge, LoginComplete, LoginRequest, Me, RedeemRequest, SessionToken, SetupRequest,
-    SetupStatus, Usage, User, challenge_message,
+    AVATAR_CONTENT_TYPE, AddFriend, AddFriendResult, DayUsage, Device, Devices, Friend,
+    FriendRequest, Friends, LoginChallenge, LoginComplete, LoginRequest, Me, RedeemRequest,
+    SessionToken, SetupRequest, SetupStatus, Usage, User, challenge_message,
 };
 use coroom_transport::proto::hex;
 use coroom_transport::proto::signal::Activity;
 
 use crate::ServerState;
-use crate::auth::{self, CHALLENGE_TTL, SESSION_TTL, WEB_SESSION_TTL};
+use crate::auth::{self, Action, CHALLENGE_TTL, SESSION_TTL, WEB_SESSION_TTL};
 use crate::clock;
 use crate::config::Registration;
 use crate::db::{DbError, DeviceRow, FriendOutcome, SessionRow, UserRow};
-use crate::routes::{Request, Response, SERVER_VERSION};
+use crate::routes::{HSTS, Request, Response, SERVER_VERSION};
 
 /// Resultado de un manejador: la respuesta buena o la de error.
 pub(crate) type Handled = Result<Response, Response>;
@@ -93,6 +94,7 @@ pub(crate) fn user_dto(user: &UserRow) -> User {
         username: user.username.clone(),
         display_name: user.display_name.clone(),
         is_admin: user.is_admin,
+        avatar: user.avatar,
     }
 }
 
@@ -117,6 +119,7 @@ fn friend_dto(state: &ServerState, user: &UserRow, presence: bool) -> Friend {
         } else {
             Activity::Idle
         },
+        avatar: user.avatar,
     }
 }
 
@@ -222,6 +225,9 @@ pub(crate) async fn handle(state: &ServerState, request: &Request, rest: &str) -
         (&Method::GET, ["me"]) => me(state, request).await,
         (&Method::GET, ["me", "devices"]) => devices(state, request).await,
         (&Method::DELETE, ["me", "devices", id]) => delete_device(state, request, id).await,
+        (&Method::PUT, ["me", "avatar"]) => set_avatar(state, request).await,
+        (&Method::DELETE, ["me", "avatar"]) => delete_avatar(state, request).await,
+        (&Method::GET, ["users", id, "avatar"]) => avatar(state, request, id).await,
         (&Method::POST, ["invitations", "redeem"]) => redeem(state, request).await,
         (&Method::GET, ["friends"]) => friends(state, request).await,
         (&Method::POST, ["friends"] | ["friends", "requests"]) => add_friend(state, request).await,
@@ -278,6 +284,15 @@ fn too_many() -> Response {
         StatusCode::TOO_MANY_REQUESTS,
         "too_many_attempts",
         "demasiados intentos fallidos; espera un minuto y vuelve a probar",
+    )
+}
+
+/// Tope de [`Action`] agotado.
+fn slow_down() -> Response {
+    fail(
+        StatusCode::TOO_MANY_REQUESTS,
+        "too_many_requests",
+        "demasiadas peticiones seguidas; espera un minuto y vuelve a probar",
     )
 }
 
@@ -425,6 +440,118 @@ async fn delete_device(state: &ServerState, request: &Request, segment: &str) ->
     ok(&serde_json::json!({}))
 }
 
+/// Cabeceras de los avatares: como las de la API, pero se pueden guardar en la caché privada del
+/// cliente si revalida con el `ETag` (la ruta no cambia con la versión).
+const AVATAR_HEADERS: &[(&str, &str)] = &[
+    ("cache-control", "private, no-cache"),
+    ("x-content-type-options", "nosniff"),
+    (
+        "content-security-policy",
+        "default-src 'none'; frame-ancestors 'none'",
+    ),
+    ("x-frame-options", "DENY"),
+    ("referrer-policy", "no-referrer"),
+    HSTS,
+];
+
+/// `ETag` de una versión de avatar.
+pub(crate) fn avatar_etag(version: u64) -> String {
+    format!("\"{version:014x}\"")
+}
+
+/// `PUT /me/avatar`: el cuerpo es el PNG; el servidor lo valida, lo vuelve a codificar y lo
+/// guarda. Responde con el usuario y su versión de avatar nueva.
+async fn set_avatar(state: &ServerState, request: &Request) -> Handled {
+    let session = session(state, request).await?;
+    if !state.auth.allow(Action::AvatarChange, session.user.id) {
+        return Err(slow_down());
+    }
+    let body = request.body.clone();
+    let avatar = tokio::task::spawn_blocking(move || crate::avatar::validate(&body))
+        .await
+        .map_err(internal)?
+        .map_err(|err| match err {
+            crate::avatar::AvatarError::TooLarge => {
+                fail(StatusCode::PAYLOAD_TOO_LARGE, "too_large", err.to_string())
+            }
+            other => fail(StatusCode::BAD_REQUEST, "invalid_avatar", other.to_string()),
+        })?;
+    if session.user.avatar == Some(avatar.version) {
+        // La misma imagen: nada que guardar ni que avisar.
+        return ok(&user_dto(&session.user));
+    }
+    state
+        .db
+        .set_avatar(session.user.id, &avatar.png, avatar.version)
+        .await
+        .map_err(db_error)?;
+    info!(
+        user = session.user.id,
+        side = avatar.side,
+        bytes = avatar.png.len(),
+        "avatar nuevo"
+    );
+    state.hub.avatar_changed(session.user.id).await;
+    ok(&User {
+        avatar: Some(avatar.version),
+        ..user_dto(&session.user)
+    })
+}
+
+/// `DELETE /me/avatar`.
+async fn delete_avatar(state: &ServerState, request: &Request) -> Handled {
+    let session = session(state, request).await?;
+    if !state.auth.allow(Action::AvatarChange, session.user.id) {
+        return Err(slow_down());
+    }
+    if state
+        .db
+        .delete_avatar(session.user.id)
+        .await
+        .map_err(db_error)?
+    {
+        info!(user = session.user.id, "avatar quitado");
+        state.hub.avatar_changed(session.user.id).await;
+    }
+    ok(&User {
+        avatar: None,
+        ..user_dto(&session.user)
+    })
+}
+
+/// `GET /users/{id}/avatar`: lo ve cualquier usuario con sesión en este servidor (los nombres ya
+/// los ven sus amigos y quien comparte sala con él, y en una sala se ven personas que no son
+/// amigas entre sí). Con `If-None-Match` igual al `ETag`, `304` sin cuerpo.
+async fn avatar(state: &ServerState, request: &Request, segment: &str) -> Handled {
+    session(state, request).await?;
+    let user = id(segment)?;
+    let Some((version, png)) = state.db.avatar(user).await.map_err(db_error)? else {
+        return Err(fail(
+            StatusCode::NOT_FOUND,
+            "no_avatar",
+            "ese usuario no tiene avatar",
+        ));
+    };
+    let etag = avatar_etag(version);
+    let unchanged = request.if_none_match.as_deref().is_some_and(|value| {
+        value
+            .split(',')
+            .map(|tag| tag.trim().trim_start_matches("W/"))
+            .any(|tag| tag == etag || tag == "*")
+    });
+    Ok(Response {
+        status: if unchanged {
+            StatusCode::NOT_MODIFIED
+        } else {
+            StatusCode::OK
+        },
+        content_type: AVATAR_CONTENT_TYPE,
+        headers: AVATAR_HEADERS.to_vec(),
+        etag: Some(etag),
+        body: if unchanged { Vec::new() } else { png },
+    })
+}
+
 async fn redeem(state: &ServerState, request: &Request) -> Handled {
     if state.config.registration == Registration::Admin {
         return Err(fail(
@@ -504,6 +631,9 @@ async fn friends(state: &ServerState, request: &Request) -> Handled {
 
 async fn add_friend(state: &ServerState, request: &Request) -> Handled {
     let session = session(state, request).await?;
+    if !state.auth.allow(Action::FriendRequest, session.user.id) {
+        return Err(slow_down());
+    }
     let add: AddFriend = body(request)?;
     let other = state
         .db
@@ -525,7 +655,16 @@ async fn add_friend(state: &ServerState, request: &Request) -> Handled {
         .request_friend(session.user.id, other.id)
         .await
         .map_err(db_error)?;
-    let accepted = !matches!(outcome, FriendOutcome::Requested);
+    let accepted = matches!(
+        outcome,
+        FriendOutcome::Accepted | FriendOutcome::AlreadyFriends
+    );
+    if outcome == FriendOutcome::Requested {
+        // Solo la solicitud nueva avisa: repetirla no vuelve a sonar en el otro.
+        state
+            .hub
+            .friend_requested(other.id, session.user.id, &session.user.display_name);
+    }
     created(&AddFriendResult {
         accepted,
         user: friend_dto(state, &other, accepted),

@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use coroom_session::input::gamepad::PadChoice;
 use serde::{Deserialize, Serialize};
 
+use super::tones::Builtin;
+
 /// Nombre del fichero dentro del directorio de datos.
 pub const FILE_NAME: &str = "settings.toml";
 
@@ -292,10 +294,13 @@ impl Video {
 pub struct Room {
     /// Los invitados entran con el micrófono cerrado (el permiso de voz se da después).
     pub guests_muted: bool,
-    /// Sonido al llegar un mensaje del chat.
-    pub chat_sound: bool,
-    /// Fichero del tono (`None`: el de por defecto; ver `ui::sound`). En Windows solo WAV.
-    pub chat_sound_file: Option<PathBuf>,
+    /// Ajustes de antes de [`Notifications`]: si sonaba el chat. Solo se lee, para pasarlo a
+    /// [`Notifications::chat_message`] ([`Settings::sanitized`]); ya no se escribe.
+    #[serde(rename = "chat_sound", skip_serializing)]
+    pub legacy_chat_sound: Option<bool>,
+    /// Como [`Room::legacy_chat_sound`], el fichero del tono del chat.
+    #[serde(rename = "chat_sound_file", skip_serializing)]
+    pub legacy_chat_sound_file: Option<PathBuf>,
     /// Notificación del escritorio con la ventana sin foco.
     pub chat_notifications: bool,
     /// Burbuja de 5 s sobre el vídeo con el panel cerrado.
@@ -308,12 +313,281 @@ impl Default for Room {
     fn default() -> Self {
         Self {
             guests_muted: false,
-            chat_sound: true,
-            chat_sound_file: None,
+            legacy_chat_sound: None,
+            legacy_chat_sound_file: None,
             chat_notifications: true,
             chat_bubbles: true,
             talking_overlay: true,
         }
+    }
+}
+
+/// Cada aviso con sonido.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SoundEvent {
+    /// Entra alguien en la sala (todos los de la sala; uno mismo al entrar, no).
+    MemberJoined,
+    /// Sale alguien de la sala, o el anfitrión la cierra (todos los de la sala).
+    MemberLeft,
+    /// Mensaje nuevo del chat de la sala, con el chat cerrado o la ventana sin foco.
+    ChatMessage,
+    /// Alguien pide entrar en tu sala («Pedir entrar»; solo el anfitrión).
+    JoinRequest,
+    /// Te invitan a una sala, o el anfitrión te ofrece quedarte con la suya.
+    Invitation,
+    /// Te dejan entrar en la sala en la que pediste entrar.
+    Admitted,
+    /// Te pasaron la sala: ahora eres el anfitrión.
+    BecameHost,
+    /// Alguien te pide amistad.
+    FriendRequest,
+}
+
+impl SoundEvent {
+    /// Todos, en el orden de Ajustes.
+    pub const ALL: [SoundEvent; 8] = [
+        SoundEvent::MemberJoined,
+        SoundEvent::MemberLeft,
+        SoundEvent::ChatMessage,
+        SoundEvent::JoinRequest,
+        SoundEvent::Invitation,
+        SoundEvent::Admitted,
+        SoundEvent::BecameHost,
+        SoundEvent::FriendRequest,
+    ];
+
+    /// El tono propio que suena si no se elige otro.
+    pub const fn default_tone(self) -> Builtin {
+        match self {
+            SoundEvent::MemberJoined => Builtin::Rise,
+            SoundEvent::MemberLeft => Builtin::Fall,
+            SoundEvent::ChatMessage => Builtin::Chime,
+            SoundEvent::JoinRequest => Builtin::Knock,
+            SoundEvent::Invitation => Builtin::Bells,
+            SoundEvent::Admitted => Builtin::Arpeggio,
+            SoundEvent::BecameHost => Builtin::Chord,
+            SoundEvent::FriendRequest => Builtin::Bubble,
+        }
+    }
+
+    /// Prioridad al juntar avisos seguidos (`ui::notify`): uno no suena si en el último segundo
+    /// ya sonó otro de su prioridad o más. Lo que pide una respuesta, arriba.
+    pub const fn priority(self) -> u8 {
+        match self {
+            SoundEvent::JoinRequest | SoundEvent::BecameHost => 3,
+            SoundEvent::Invitation | SoundEvent::Admitted => 2,
+            SoundEvent::FriendRequest => 1,
+            SoundEvent::MemberJoined | SoundEvent::MemberLeft | SoundEvent::ChatMessage => 0,
+        }
+    }
+}
+
+/// Qué suena en un aviso: nada, un fichero propio o uno de los tonos de coroom. En
+/// `settings.toml`, `"off"`, `"file"` o la clave del tono (`"rise"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "String", try_from = "String")]
+pub enum SoundChoice {
+    /// Sin sonido.
+    Off,
+    /// El fichero de [`EventSound::file`].
+    File,
+    /// Un tono propio.
+    Tone(Builtin),
+}
+
+impl From<SoundChoice> for String {
+    fn from(choice: SoundChoice) -> String {
+        match choice {
+            SoundChoice::Off => "off".to_owned(),
+            SoundChoice::File => "file".to_owned(),
+            SoundChoice::Tone(tone) => tone.key().to_owned(),
+        }
+    }
+}
+
+impl TryFrom<String> for SoundChoice {
+    type Error = String;
+
+    fn try_from(key: String) -> Result<Self, String> {
+        match key.as_str() {
+            "off" => Ok(SoundChoice::Off),
+            "file" => Ok(SoundChoice::File),
+            other => Builtin::from_key(other)
+                .map(SoundChoice::Tone)
+                .ok_or_else(|| format!("tono desconocido: {other}")),
+        }
+    }
+}
+
+/// El sonido de un aviso. Se lee con [`Notifications`] ([`EventSoundFile`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EventSound {
+    /// Lo que suena.
+    pub tone: SoundChoice,
+    /// El fichero propio (se recuerda aunque se elija otro tono, para volver a él). En Windows
+    /// solo WAV.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<PathBuf>,
+}
+
+impl EventSound {
+    /// Un tono propio, sin fichero.
+    pub const fn tone(tone: Builtin) -> Self {
+        Self {
+            tone: SoundChoice::Tone(tone),
+            file: None,
+        }
+    }
+
+    /// Si suena algo.
+    pub fn is_on(&self) -> bool {
+        match self.tone {
+            SoundChoice::Off => false,
+            SoundChoice::File => self.file.is_some(),
+            SoundChoice::Tone(_) => true,
+        }
+    }
+}
+
+/// Volumen de los avisos por defecto (porcentaje).
+pub const DEFAULT_NOTIFICATION_VOLUME: u8 = 80;
+
+/// Avisos con sonido: el volumen de todos y qué suena en cada uno. Se lee con
+/// [`NotificationsFile`]: un aviso que no se entiende vuelve a su tono sin tirar el resto.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "NotificationsFile")]
+pub struct Notifications {
+    /// Volumen de los avisos, en porcentaje (0-100), aparte del de la sala.
+    pub volume: u8,
+    /// Entra alguien en la sala.
+    pub member_joined: EventSound,
+    /// Sale alguien de la sala.
+    pub member_left: EventSound,
+    /// Mensaje del chat.
+    pub chat_message: EventSound,
+    /// Alguien pide entrar (anfitrión).
+    pub join_request: EventSound,
+    /// Te invitan.
+    pub invitation: EventSound,
+    /// Te dejan entrar.
+    pub admitted: EventSound,
+    /// Ahora eres el anfitrión.
+    pub became_host: EventSound,
+    /// Solicitud de amistad.
+    pub friend_request: EventSound,
+}
+
+impl Default for Notifications {
+    fn default() -> Self {
+        let tone = |event: SoundEvent| EventSound::tone(event.default_tone());
+        Self {
+            volume: DEFAULT_NOTIFICATION_VOLUME,
+            member_joined: tone(SoundEvent::MemberJoined),
+            member_left: tone(SoundEvent::MemberLeft),
+            chat_message: tone(SoundEvent::ChatMessage),
+            join_request: tone(SoundEvent::JoinRequest),
+            invitation: tone(SoundEvent::Invitation),
+            admitted: tone(SoundEvent::Admitted),
+            became_host: tone(SoundEvent::BecameHost),
+            friend_request: tone(SoundEvent::FriendRequest),
+        }
+    }
+}
+
+/// [`Notifications`] tal como viene en `settings.toml`, sin fiarse de nada: un valor que no se
+/// entiende (un tono que no existe, de otra versión o de una edición a mano; un aviso sin `tone`;
+/// un volumen que no es un número) deja el de por defecto de ese aviso, y el resto de los ajustes
+/// se queda como estaba.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct NotificationsFile {
+    volume: Option<toml::Value>,
+    member_joined: EventSoundFile,
+    member_left: EventSoundFile,
+    chat_message: EventSoundFile,
+    join_request: EventSoundFile,
+    invitation: EventSoundFile,
+    admitted: EventSoundFile,
+    became_host: EventSoundFile,
+    friend_request: EventSoundFile,
+}
+
+/// [`EventSound`] tal como viene en `settings.toml` (ver [`NotificationsFile`]).
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct EventSoundFile {
+    tone: Option<toml::Value>,
+    file: Option<toml::Value>,
+}
+
+impl EventSoundFile {
+    /// El sonido de `event`: lo que se entienda, y su tono por defecto si no.
+    fn into_sound(self, event: SoundEvent) -> EventSound {
+        let tone = self
+            .tone
+            .and_then(|tone| SoundChoice::try_from(tone.as_str()?.to_owned()).ok())
+            .unwrap_or(SoundChoice::Tone(event.default_tone()));
+        let file = self.file.and_then(|file| file.as_str().map(PathBuf::from));
+        EventSound { tone, file }
+    }
+}
+
+impl From<NotificationsFile> for Notifications {
+    fn from(file: NotificationsFile) -> Self {
+        let volume = file
+            .volume
+            .and_then(|volume| volume.as_integer())
+            .map_or(DEFAULT_NOTIFICATION_VOLUME, |volume| {
+                volume.clamp(0, 100) as u8
+            });
+        Self {
+            volume,
+            member_joined: file.member_joined.into_sound(SoundEvent::MemberJoined),
+            member_left: file.member_left.into_sound(SoundEvent::MemberLeft),
+            chat_message: file.chat_message.into_sound(SoundEvent::ChatMessage),
+            join_request: file.join_request.into_sound(SoundEvent::JoinRequest),
+            invitation: file.invitation.into_sound(SoundEvent::Invitation),
+            admitted: file.admitted.into_sound(SoundEvent::Admitted),
+            became_host: file.became_host.into_sound(SoundEvent::BecameHost),
+            friend_request: file.friend_request.into_sound(SoundEvent::FriendRequest),
+        }
+    }
+}
+
+impl Notifications {
+    /// El sonido de `event`.
+    pub fn sound(&self, event: SoundEvent) -> &EventSound {
+        match event {
+            SoundEvent::MemberJoined => &self.member_joined,
+            SoundEvent::MemberLeft => &self.member_left,
+            SoundEvent::ChatMessage => &self.chat_message,
+            SoundEvent::JoinRequest => &self.join_request,
+            SoundEvent::Invitation => &self.invitation,
+            SoundEvent::Admitted => &self.admitted,
+            SoundEvent::BecameHost => &self.became_host,
+            SoundEvent::FriendRequest => &self.friend_request,
+        }
+    }
+
+    /// El sonido de `event`, para cambiarlo.
+    pub fn sound_mut(&mut self, event: SoundEvent) -> &mut EventSound {
+        match event {
+            SoundEvent::MemberJoined => &mut self.member_joined,
+            SoundEvent::MemberLeft => &mut self.member_left,
+            SoundEvent::ChatMessage => &mut self.chat_message,
+            SoundEvent::JoinRequest => &mut self.join_request,
+            SoundEvent::Invitation => &mut self.invitation,
+            SoundEvent::Admitted => &mut self.admitted,
+            SoundEvent::BecameHost => &mut self.became_host,
+            SoundEvent::FriendRequest => &mut self.friend_request,
+        }
+    }
+
+    /// Ganancia lineal del volumen: el cuadrado del porcentaje, que se oye más parejo a lo largo
+    /// del deslizador que una recta (80 % ≈ −4 dB, 50 % ≈ −12 dB).
+    pub fn gain(&self) -> f32 {
+        let fraction = f32::from(self.volume.min(100)) / 100.0;
+        fraction * fraction
     }
 }
 
@@ -446,6 +720,8 @@ impl Default for Audio {
 pub struct Shortcuts {
     /// Inmersivo / escritorio.
     pub immersive: char,
+    /// Soltar el teclado y el ratón (hasta el próximo clic en el vídeo).
+    pub release: char,
     /// Panel de conexión (estadísticas).
     pub stats: char,
     /// Chat de la sala.
@@ -464,6 +740,7 @@ impl Default for Shortcuts {
     fn default() -> Self {
         Self {
             immersive: 'G',
+            release: 'R',
             stats: 'S',
             chat: 'C',
             leave: 'Q',
@@ -475,10 +752,11 @@ impl Default for Shortcuts {
 }
 
 impl Shortcuts {
-    /// Las siete letras, en orden.
-    pub fn letters(&self) -> [char; 7] {
+    /// Las ocho letras, en orden.
+    pub fn letters(&self) -> [char; 8] {
         [
             self.immersive,
+            self.release,
             self.stats,
             self.chat,
             self.leave,
@@ -496,6 +774,26 @@ impl Shortcuts {
                 .iter()
                 .enumerate()
                 .all(|(i, a)| letters[i + 1..].iter().all(|b| !a.eq_ignore_ascii_case(b)))
+    }
+
+    /// Ajustes de antes del atajo de soltar el teclado y el ratón: si su letra (la de fábrica)
+    /// ya la usa otro atajo elegido, toma la primera libre en lugar de perder los demás.
+    fn free_release(&mut self) {
+        let taken = |letter: char, shortcuts: &Self| {
+            shortcuts.letters()[..]
+                .iter()
+                .enumerate()
+                .any(|(index, other)| index != 1 && other.eq_ignore_ascii_case(&letter))
+        };
+        if !taken(self.release, self) {
+            return;
+        }
+        if let Some(letter) = std::iter::once(Self::default().release)
+            .chain('A'..='Z')
+            .find(|letter| !taken(*letter, self))
+        {
+            self.release = letter;
+        }
     }
 }
 
@@ -598,6 +896,8 @@ pub struct Settings {
     pub network: Network,
     /// Chat y avisos de la sala.
     pub room: Room,
+    /// Avisos con sonido.
+    pub notifications: Notifications,
     /// Aviso de versión nueva.
     pub updates: Updates,
     /// Servidores conocidos (el primero, el último usado).
@@ -623,6 +923,9 @@ impl Settings {
             self.video.preset = QualityPreset::matching(&self.video);
         }
         if !self.input.shortcuts.is_valid() {
+            self.input.shortcuts.free_release();
+        }
+        if !self.input.shortcuts.is_valid() {
             self.input.shortcuts = Shortcuts::default();
         }
         self.input.preferred_slot = self.input.preferred_slot.min(8);
@@ -637,6 +940,14 @@ impl Settings {
             .voice_volumes
             .retain(|_, volume| *volume != DEFAULT_VOICE_VOLUME);
         self.audio.game_volume = self.audio.game_volume.min(MAX_VOICE_VOLUME);
+        self.migrate_chat_sound();
+        self.notifications.volume = self.notifications.volume.min(100);
+        for event in SoundEvent::ALL {
+            let sound = self.notifications.sound_mut(event);
+            if sound.tone == SoundChoice::File && sound.file.is_none() {
+                sound.tone = SoundChoice::Tone(event.default_tone());
+            }
+        }
         self.audio.mic_volume = self.audio.mic_volume.min(MAX_VOICE_VOLUME);
         let mut seen = std::collections::BTreeSet::new();
         self.servers
@@ -646,6 +957,26 @@ impl Settings {
             self.updates.interval_hours = Updates::default().interval_hours;
         }
         self
+    }
+
+    /// Pasa el sonido del chat de los ajustes de antes (`[room] chat_sound` y
+    /// `chat_sound_file`) a [`Notifications::chat_message`]: apagado sigue apagado, un fichero
+    /// propio sigue sonando y, si no, la campanilla de siempre.
+    fn migrate_chat_sound(&mut self) {
+        let on = self.room.legacy_chat_sound.take();
+        let file = self.room.legacy_chat_sound_file.take();
+        if on.is_none() && file.is_none() {
+            return;
+        }
+        let chat = &mut self.notifications.chat_message;
+        if file.is_some() {
+            chat.file = file;
+        }
+        chat.tone = match on {
+            Some(false) => SoundChoice::Off,
+            _ if chat.file.is_some() => SoundChoice::File,
+            _ => SoundChoice::Tone(SoundEvent::ChatMessage.default_tone()),
+        };
     }
 
     /// Lee los ajustes de `path`; si no existe, los de por defecto. Si está dañado, los de por
@@ -764,7 +1095,13 @@ mod tests {
         settings.audio.push_to_talk_key = "CapsLock".into();
         settings.network.force_relay = true;
         settings.network.local_port = 47_000;
-        settings.room.chat_sound_file = Some(PathBuf::from("/home/ana/sonidos/tono.ogg"));
+        settings.notifications.chat_message = EventSound {
+            tone: SoundChoice::File,
+            file: Some(PathBuf::from("/home/ana/sonidos/tono.ogg")),
+        };
+        settings.notifications.member_left.tone = SoundChoice::Off;
+        settings.notifications.join_request.tone = SoundChoice::Tone(Builtin::Ping);
+        settings.notifications.volume = 55;
         settings.input.shortcuts.immersive = 'K';
         settings.video.chroma_444 = true;
         settings.video.hdr = true;
@@ -791,8 +1128,17 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("leer");
         assert!(text.contains("theme = \"dark\""), "{text}");
         assert!(
-            text.contains("chat_sound_file = \"/home/ana/sonidos/tono.ogg\""),
+            text.contains("file = \"/home/ana/sonidos/tono.ogg\""),
             "{text}"
+        );
+        assert!(
+            text.contains("[notifications.member_left]\ntone = \"off\""),
+            "{text}"
+        );
+        assert!(text.contains("tone = \"ping\""), "{text}");
+        assert!(
+            !text.contains("chat_sound"),
+            "lo de antes no se escribe: {text}"
         );
         assert!(!temporary_path(&path).exists(), "sin temporales");
         let (loaded, warning) = Settings::load(&path);
@@ -989,6 +1335,24 @@ mod tests {
         assert_eq!(settings.sanitized().input.shortcuts, Shortcuts::default());
     }
 
+    /// Unos ajustes de antes del atajo de soltar con su letra (`R`) ya en otro atajo: ese se
+    /// respeta y soltar toma una libre.
+    #[test]
+    fn the_release_shortcut_takes_a_free_letter_in_old_settings() {
+        let old: Settings =
+            toml::from_str("[input.shortcuts]\nchat = \"R\"\nstats = \"K\"\n").expect("leer");
+        let shortcuts = old.sanitized().input.shortcuts;
+        assert_eq!(shortcuts.chat, 'R');
+        assert_eq!(shortcuts.stats, 'K');
+        assert_ne!(shortcuts.release, 'R');
+        assert!(shortcuts.is_valid(), "{shortcuts:?}");
+        assert_eq!(
+            Settings::default().sanitized().input.shortcuts.release,
+            'R',
+            "sin choque, la de fábrica"
+        );
+    }
+
     #[test]
     fn servers_keep_the_last_one_first() {
         let mut settings = Settings::default();
@@ -1005,5 +1369,130 @@ mod tests {
         assert_eq!(urls, ["https://a.example.com", "https://b.example.com"]);
         settings.forget_server("https://a.example.com");
         assert_eq!(settings.servers.len(), 1);
+    }
+
+    /// El sonido del chat de antes pasa a «Notificaciones»: apagado, con fichero propio o, sin
+    /// tocar, la campanilla; y lo de antes ya no se vuelve a escribir.
+    #[test]
+    fn the_old_chat_sound_moves_to_notifications() {
+        let load = |text: &str| -> Settings {
+            toml::from_str::<Settings>(text).expect("leer").sanitized()
+        };
+        let off = load("[room]\nchat_sound = false\nchat_bubbles = false\n");
+        assert_eq!(off.notifications.chat_message.tone, SoundChoice::Off);
+        assert!(!off.room.chat_bubbles, "el resto de la sala se respeta");
+        assert_eq!(
+            off.notifications.member_joined,
+            Notifications::default().member_joined,
+            "los avisos nuevos, con su tono"
+        );
+
+        let custom = load("[room]\nchat_sound = true\nchat_sound_file = \"/home/ana/tono.ogg\"\n");
+        assert_eq!(custom.notifications.chat_message.tone, SoundChoice::File);
+        assert_eq!(
+            custom.notifications.chat_message.file.as_deref(),
+            Some(Path::new("/home/ana/tono.ogg"))
+        );
+        // Apagado con un fichero elegido: sigue apagado, y el fichero se recuerda.
+        let both = load("[room]\nchat_sound = false\nchat_sound_file = \"/home/ana/tono.ogg\"\n");
+        assert_eq!(both.notifications.chat_message.tone, SoundChoice::Off);
+        assert!(both.notifications.chat_message.file.is_some());
+
+        let untouched = load("[room]\nchat_sound = true\n");
+        assert_eq!(
+            untouched.notifications.chat_message,
+            EventSound::tone(Builtin::Chime)
+        );
+        assert_eq!(untouched.notifications.volume, DEFAULT_NOTIFICATION_VOLUME);
+
+        let text = toml::to_string_pretty(&custom).expect("escribir");
+        assert!(!text.contains("chat_sound"), "{text}");
+        let again: Settings = toml::from_str(&text).expect("leer");
+        assert_eq!(again.sanitized(), custom, "la migración se queda");
+    }
+
+    /// Un aviso que no se entiende (un tono que no existe, una tabla sin `tone`, un volumen que
+    /// no es un número) vuelve a lo de por defecto de ese aviso; el resto de los ajustes, también
+    /// de los otros avisos, se queda como estaba y no hay aviso de ajustes dañados.
+    #[test]
+    fn a_bad_notification_value_keeps_the_other_settings() {
+        let dir = tempfile::tempdir().expect("directorio");
+        let path = path_in(dir.path());
+        std::fs::write(
+            &path,
+            "[video]\nfps = 30\n\
+             [notifications]\nvolume = \"alto\"\n\
+             [notifications.invitation]\ntone = \"gong\"\n\
+             [notifications.chat_message]\nfile = \"/home/ana/tono.ogg\"\n\
+             [notifications.member_left]\ntone = 7\n\
+             [notifications.join_request]\ntone = \"ping\"\n\
+             [notifications.member_joined]\ntone = \"off\"\n",
+        )
+        .expect("escribir");
+        let (loaded, warning) = Settings::load(&path);
+        assert_eq!(warning, None);
+        assert_eq!(loaded.video.fps, 30, "lo de fuera de los avisos sigue");
+        let notifications = &loaded.notifications;
+        assert_eq!(notifications.volume, DEFAULT_NOTIFICATION_VOLUME);
+        assert_eq!(
+            notifications.invitation,
+            EventSound::tone(SoundEvent::Invitation.default_tone()),
+            "un tono que no existe"
+        );
+        assert_eq!(
+            notifications.chat_message.tone,
+            SoundChoice::Tone(SoundEvent::ChatMessage.default_tone()),
+            "sin «tone»"
+        );
+        assert_eq!(
+            notifications.chat_message.file.as_deref(),
+            Some(Path::new("/home/ana/tono.ogg")),
+            "el fichero se recuerda"
+        );
+        assert_eq!(
+            notifications.member_left,
+            EventSound::tone(SoundEvent::MemberLeft.default_tone())
+        );
+        assert_eq!(
+            notifications.join_request.tone,
+            SoundChoice::Tone(Builtin::Ping),
+            "los otros avisos siguen como estaban"
+        );
+        assert_eq!(notifications.member_joined.tone, SoundChoice::Off);
+        // Guardar y volver a leer da lo mismo.
+        let text = toml::to_string_pretty(&loaded).expect("escribir");
+        assert_eq!(toml::from_str::<Settings>(&text).expect("leer"), loaded);
+    }
+
+    #[test]
+    fn notification_settings_are_sanitized() {
+        let edited: Settings = toml::from_str(
+            "[notifications]\nvolume = 180\n[notifications.invitation]\ntone = \"file\"\n",
+        )
+        .expect("leer");
+        let sane = edited.sanitized();
+        assert_eq!(sane.notifications.volume, 100, "el volumen no pasa de 100");
+        assert_eq!(
+            sane.notifications.invitation.tone,
+            SoundChoice::Tone(SoundEvent::Invitation.default_tone()),
+            "«fichero» sin fichero vuelve a su tono"
+        );
+        // Cada aviso tiene su tono, y todos distintos.
+        let defaults: BTreeSet<Builtin> = SoundEvent::ALL
+            .iter()
+            .map(|event| event.default_tone())
+            .collect();
+        assert_eq!(defaults.len(), SoundEvent::ALL.len());
+        assert!(
+            SoundEvent::ALL
+                .iter()
+                .all(|event| Notifications::default().sound(*event).is_on())
+        );
+        assert!((Notifications::default().gain() - 0.64).abs() < 1e-6);
+        let quiet = Notifications {
+            volume: 0,
+            ..Notifications::default()
+        };
+        assert_eq!(quiet.gain(), 0.0);
     }
 }

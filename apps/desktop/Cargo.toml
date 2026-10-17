@@ -28,6 +28,8 @@ iced_runtime.workspace = true
 iced_wgpu.workspace = true
 iced_widget.workspace = true
 iced_winit.workspace = true
+# Avatares: decodificar la imagen elegida, recortarla, reducirla y codificarla en PNG.
+image.workspace = true
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true

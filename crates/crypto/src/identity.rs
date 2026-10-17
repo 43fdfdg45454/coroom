@@ -158,6 +158,11 @@ impl fmt::Debug for Identity {
     }
 }
 
+/// SHA-256 de `data` (la versión de los avatares sale de él: `coroom_proto::api::avatar_version`).
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    Sha256::digest(data).into()
+}
+
 /// SHA-256 de `data` en hexadecimal en minúsculas (64 caracteres).
 ///
 /// Es el formato de todas las huellas de coroom: identidades y certificados (sobre su DER).

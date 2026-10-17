@@ -1250,17 +1250,22 @@ impl HostCtx {
     /// Envía a `guest` sus permisos de entrada y de voz actuales.
     /// Un mensaje de control solo para `guest`.
     /// Manda a todos los invitados quién está en la sala (`Members`), para que cada uno silencie
-    /// a quien quiera. El anfitrión va sin nombre: el invitado ya lo tiene de la señalización.
+    /// a quien quiera. El anfitrión va sin nombre ni avatar: el invitado ya los tiene de la
+    /// señalización.
     fn broadcast_members(&self) {
         let members: Vec<WireMember> = std::iter::once(WireMember {
             guest: 0,
             leaf: self.core.own_leaf.load(Ordering::Acquire),
             name: String::new(),
+            user: 0,
+            avatar: None,
         })
         .chain(lock(&self.core.guests).values().map(|status| WireMember {
             guest: status.guest.0,
             leaf: status.leaf,
             name: truncate_name(&status.name),
+            user: status.user,
+            avatar: status.avatar,
         }))
         .take(MEMBERS_MAX)
         .collect();
@@ -2297,9 +2302,15 @@ impl Room {
                 key_package,
                 user,
                 name,
+                avatar,
             } => {
-                self.on_peer_joined(GuestId(peer_id), identity_pk, &key_package, user, name)
-                    .await
+                self.on_peer_joined(
+                    GuestId(peer_id),
+                    identity_pk,
+                    &key_package,
+                    (user, name, avatar),
+                )
+                .await
             }
             SignalMessage::Invited {
                 from_user,
@@ -2333,6 +2344,16 @@ impl Room {
                 });
                 Ok(())
             }
+            SignalMessage::FriendRequested {
+                from_user,
+                from_name,
+            } => {
+                self.ctx.core.emit(SessionEvent::FriendRequested {
+                    from_user,
+                    from_name,
+                });
+                Ok(())
+            }
             SignalMessage::Activity { user, activity } => {
                 self.ctx
                     .core
@@ -2341,6 +2362,21 @@ impl Room {
             }
             SignalMessage::Presence { user, online } => {
                 self.ctx.core.emit(SessionEvent::Presence { user, online });
+                Ok(())
+            }
+            SignalMessage::Avatar { user, avatar } => {
+                // Un invitado cambió el suyo: su estado y los `Members` de todos lo llevan.
+                let mut changed = false;
+                for status in lock(&self.ctx.core.guests).values_mut() {
+                    if status.user == user && status.avatar != avatar {
+                        status.avatar = avatar;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    self.ctx.broadcast_members();
+                }
+                self.ctx.core.emit(SessionEvent::Avatar { user, avatar });
                 Ok(())
             }
             SignalMessage::QuotaExceeded { message } => {
@@ -2402,8 +2438,7 @@ impl Room {
         guest: GuestId,
         identity_pk: PublicKey,
         key_package: &[u8],
-        user: u64,
-        name: String,
+        (user, name, avatar): (u64, String, Option<u64>),
     ) -> Result<(), SessionError> {
         let own = self.ctx.core.identity.public_key();
         if identity_pk == own {
@@ -2499,6 +2534,7 @@ impl Room {
                 guest,
                 user,
                 name: name.clone(),
+                avatar,
                 public_key: identity_pk,
                 fingerprint: fingerprint.clone(),
                 safety_number,

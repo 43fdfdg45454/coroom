@@ -24,10 +24,12 @@ use coroom_ui::{Element, Theme, font::Fonts};
 use iced_core::{Alignment, Length, Padding};
 use iced_widget::{column, container, row};
 
+use super::avatars;
+use super::notify;
 use super::screens::{
     chat, diagnostics, friends, guest, home, host, login, settings as settings_screen,
 };
-use super::settings::{ServerEntry, Settings, ThemeChoice};
+use super::settings::{ServerEntry, Settings, SoundEvent, ThemeChoice};
 use super::system::SystemAppearance;
 use super::video::VideoFeed;
 use crate::update::Update;
@@ -77,6 +79,8 @@ pub struct AccountInfo {
     pub device: String,
     /// Huella de la identidad de este equipo.
     pub fingerprint: String,
+    /// Versión de su avatar (`None`: no tiene).
+    pub avatar: Option<u64>,
 }
 
 impl AccountInfo {
@@ -208,6 +212,31 @@ pub enum Event {
     Usage(Result<Usage, String>),
     /// Un amigo te invita (por la señalización de espera).
     Invited(Invitation),
+    /// Alguien te pidió amistad ahora mismo (la lista de amigos se vuelve a pedir).
+    FriendRequested {
+        /// Quien la pide.
+        from_user: u64,
+        /// Su nombre.
+        from_name: String,
+    },
+    /// Se eligió (o no: `Ok(None)`) la imagen del avatar propio.
+    AvatarPicked(Result<Option<std::path::PathBuf>, String>),
+    /// El avatar propio cambió en el servidor (`Ok(None)`: se quitó), o por qué no.
+    AvatarChanged(Result<Option<u64>, String>),
+    /// Llegó un avatar (de la caché o del servidor), o por qué no.
+    AvatarLoaded {
+        /// Versión.
+        version: u64,
+        /// La imagen.
+        image: Result<coroom_ui::avatar::AvatarImage, avatars::Unavailable>,
+    },
+    /// Alguien (un amigo, o esta cuenta en otro equipo) cambió de avatar.
+    Avatar {
+        /// Usuario.
+        user: u64,
+        /// Versión nueva (`None`: lo quitó).
+        avatar: Option<u64>,
+    },
     /// Un amigo se conectó o desconectó.
     Presence {
         /// Usuario.
@@ -405,6 +434,8 @@ pub enum Message {
     Guest(guest::Msg),
     /// Ajustes.
     Settings(settings_screen::Msg),
+    /// El avatar propio (Ajustes → Cuenta).
+    Avatar(avatars::Msg),
     /// Diagnóstico (encima de cualquier pantalla).
     Diagnostics(diagnostics::Msg),
     /// Chat de la sala (anfitrión o invitado).
@@ -477,6 +508,14 @@ pub enum Effect {
     RevokeDevice(u64),
     /// Cargar el uso del relay.
     LoadUsage,
+    /// Traer estos avatares `(usuario, versión)`: de la caché de disco o del servidor.
+    FetchAvatars(Vec<(u64, u64)>),
+    /// Abrir el selector de ficheros para elegir la imagen del avatar propio.
+    PickAvatar,
+    /// Preparar (recortar, reducir) y subir esta imagen como avatar propio.
+    UploadAvatar(std::path::PathBuf),
+    /// Quitar el avatar propio.
+    RemoveAvatar,
     /// Escuchar invitaciones y presencia mientras no hay sesión.
     StartLobby,
     /// Dejar de escuchar.
@@ -509,11 +548,12 @@ pub enum Effect {
         /// El texto.
         body: String,
     },
-    /// Sonido de mensaje nuevo del chat (el tono elegido en Ajustes o el de por defecto).
-    ChatSound,
-    /// Abrir el selector de ficheros para elegir el tono del chat; vuelve con
-    /// `Message::Settings(Msg::ChatSoundPicked)`.
-    PickChatSound,
+    /// Sonar un aviso con su tono y el volumen de los avisos de Ajustes (también «Probar»). Los
+    /// de los eventos pasan antes por [`notify::sound`], que los junta.
+    Sound(SoundEvent),
+    /// Abrir el selector de ficheros para elegir el tono de un aviso; vuelve con
+    /// `Message::Settings(Msg::SoundPicked)`.
+    PickSound(SoundEvent),
     /// Dejar de oír (o volver a oír) una voz en este equipo: en la sala propia (`host`, por id de
     /// invitado) o en la que se está como invitado (por hoja MLS).
     SetVoiceMuted {
@@ -803,6 +843,10 @@ pub struct App {
     pub diagnostics: diagnostics::State,
     /// Chat de la sala abierta o en la que se está.
     pub chat: chat::State,
+    /// Avisos con sonido (cuáles sonaron hace poco, para juntarlos).
+    pub notify: notify::State,
+    /// Avatares en memoria y los pedidos.
+    pub avatars: avatars::Store,
     /// Estado del servidor para la cabecera.
     pub server_status: ServerStatus,
     /// Toasts.
@@ -857,6 +901,8 @@ impl App {
             settings_page: settings_screen::State::default(),
             diagnostics: diagnostics::State::default(),
             chat: chat::State::default(),
+            notify: notify::State::default(),
+            avatars: avatars::Store::default(),
             server_status: ServerStatus::default(),
             toasts: Vec::new(),
             next_toast: 1,
@@ -1113,6 +1159,7 @@ impl App {
             Message::Host(msg) => host::update(self, msg),
             Message::Guest(msg) => guest::update(self, msg),
             Message::Settings(msg) => settings_screen::update(self, msg),
+            Message::Avatar(msg) => avatars::update(self, msg),
             Message::Diagnostics(msg) => diagnostics::update(self, msg),
             Message::Chat(msg) => chat::update(self, msg),
             Message::WindowFocused(focused) => {
@@ -1122,7 +1169,15 @@ impl App {
                 self.window_hidden = hidden;
                 self.preview_visibility().into_iter().collect()
             }
-            Message::Event(event) => self.event(event),
+            Message::Event(event) => {
+                if avatars::retry_trigger(self, &event) {
+                    self.avatars.retry_unreachable();
+                }
+                let mut effects = self.event(event);
+                // Las versiones de avatar llegan con los eventos: se piden las que falten.
+                effects.extend(avatars::requests(self));
+                effects
+            }
         }
     }
 
@@ -1301,7 +1356,19 @@ impl App {
     fn event(&mut self, event: Event) -> Vec<Effect> {
         // Inicio anota cuándo llegan las invitaciones y cuándo cambió la lista de amigos.
         home::on_event(self, &event);
+        // Los avisos con sonido miran el evento antes que las pantallas (que lo consumen).
+        let sounds = notify::on_event(self, &event);
+        let mut effects = self.dispatch_event(event);
+        effects.extend(sounds);
+        effects
+    }
+
+    fn dispatch_event(&mut self, event: Event) -> Vec<Effect> {
         match event {
+            event @ (Event::AvatarPicked(_)
+            | Event::AvatarChanged(_)
+            | Event::AvatarLoaded { .. }
+            | Event::Avatar { .. }) => avatars::on_event(self, &event).unwrap_or_default(),
             Event::Probed { .. } | Event::SignedIn(_) | Event::NoSavedSession => {
                 login::on_event(self, event)
             }
@@ -1369,6 +1436,29 @@ impl App {
             } => {
                 host::on_join_requested(self, from_user, from_name);
                 Vec::new()
+            }
+            Event::FriendRequested {
+                from_user,
+                from_name,
+            } => {
+                // Repetir una solicitud que ya está en la lista no vuelve a avisar.
+                let known = self.friends.loaded().is_some_and(|friends| {
+                    friends
+                        .incoming
+                        .iter()
+                        .any(|request| request.user.id == from_user)
+                });
+                if !known {
+                    self.toast(
+                        Tone::Info,
+                        t!("app-name-quiere-ser-tu-amigo", name = from_name),
+                    );
+                }
+                // Aunque ya se estuviese pidiendo: esa respuesta podría ser de antes.
+                if !matches!(self.friends, Load::Loaded(_)) {
+                    self.friends = Load::Loading;
+                }
+                vec![Effect::LoadFriends]
             }
             Event::JoinDeclined { from_name, .. } => {
                 // Inicio ya olvidó la petición (`home::on_event`).
@@ -1603,7 +1693,7 @@ impl App {
         let mut left = row![].spacing(8).align_y(Alignment::Center);
         match self.page_title() {
             None => {
-                left = left.push(icon_with(Icon::RadioTower, 22.0, SvgClass::Accent));
+                left = left.push(icon_with(Icon::RadioTower, BRAND_ICON, SvgClass::Accent));
                 left = left.push(ui::heading("coroom"));
             }
             Some(title) => {
@@ -1612,11 +1702,12 @@ impl App {
                     t!("app-inicio"),
                     Some(Message::Navigate(Page::Home)),
                 ));
-                let mut titles = column![ui::heading(title)];
+                // El subtítulo va al lado del título y no debajo: en dos líneas no cabría con aire
+                // en el alto de la cabecera.
+                left = left.push(ui::heading(title));
                 if let Some(subtitle) = self.page_subtitle() {
-                    titles = titles.push(ui::caption(subtitle));
+                    left = left.push(ui::caption(subtitle));
                 }
-                left = left.push(titles);
             }
         }
         let server_tone = match self.server_status.online {
@@ -1644,10 +1735,15 @@ impl App {
         ));
         if let Some(account) = &self.account {
             right = right.push(
-                button(ui::avatar(&self.theme, &account.display_name, 28.0))
-                    .padding(2)
-                    .class(coroom_ui::style::ButtonClass::Flat)
-                    .on_press(Message::ToggleAccountMenu),
+                button(super::avatars::view(
+                    self,
+                    &account.display_name,
+                    account.avatar,
+                    28.0,
+                ))
+                .padding(2)
+                .class(coroom_ui::style::ButtonClass::Flat)
+                .on_press(Message::ToggleAccountMenu),
             );
         }
         container(
@@ -1655,8 +1751,10 @@ impl App {
                 .align_y(Alignment::Center)
                 .width(Length::Fill),
         )
-        .height(Length::Fixed(HEADERBAR_HEIGHT))
-        .padding(Padding::from([0.0, 12.0]))
+        // Centrado en vertical: sin `center_y`, la fila (del alto de un botón) quedaba arriba,
+        // pegada a la barra de título del sistema.
+        .padding(Padding::from([0.0, coroom_ui::tokens::space::S]))
+        .center_y(Length::Fixed(HEADERBAR_HEIGHT))
         .class(ContainerClass::Headerbar)
         .into()
     }
@@ -1671,7 +1769,7 @@ impl App {
             return ui::gap(0.0);
         };
         let who = row![
-            ui::avatar(&self.theme, &account.display_name, 32.0),
+            super::avatars::view(self, &account.display_name, account.avatar, 32.0),
             column![
                 ui::strong(account.display_name.as_str()),
                 ui::caption(account.host())
@@ -1831,8 +1929,13 @@ impl App {
     }
 }
 
-/// Alto de la cabecera en píxeles lógicos.
-pub const HEADERBAR_HEIGHT: f32 = 56.0;
+/// Tamaño de la marca (el icono de la antena) en la cabecera.
+const BRAND_ICON: f32 = 22.0;
+
+/// Alto de la cabecera en píxeles lógicos: la marca, centrada, queda a la misma distancia del
+/// borde de arriba (la barra de título del sistema) y de abajo que del borde izquierdo de la
+/// ventana (`space::S`), como en la barra de cabecera de GNOME.
+pub const HEADERBAR_HEIGHT: f32 = BRAND_ICON + 2.0 * coroom_ui::tokens::space::S;
 
 /// Cuánto se espera tras el último cambio de ajustes para guardarlos.
 pub const SETTINGS_SAVE_DELAY: Duration = Duration::from_millis(600);
@@ -1868,6 +1971,7 @@ pub(crate) mod tests {
             user_id: 1,
             device: "pc".into(),
             fingerprint: String::new(),
+            avatar: None,
         }
     }
 
@@ -2009,6 +2113,7 @@ pub(crate) mod tests {
             user_id: 1,
             device: "pc".into(),
             fingerprint: String::new(),
+            avatar: None,
         });
         assert_eq!(app.server_badge_text(), "coroom.example.com");
         app.update(Message::Event(Event::ServerStatus {

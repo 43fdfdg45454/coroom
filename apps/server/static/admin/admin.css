@@ -269,6 +269,8 @@ tbody tr:hover { background: color-mix(in srgb, var(--surface-2) 60%, transparen
 td.row-actions { text-align: right; white-space: nowrap; }
 td.row-actions button + button { margin-left: 6px; }
 .empty { color: var(--muted); padding: 22px; margin: 0; text-align: center; }
+.who-row { display: flex; align-items: center; gap: 10px; }
+.who .avatar { width: 32px; height: 32px; border-radius: 50%; object-fit: cover; flex: none; background: var(--surface-2); }
 .who strong { display: block; }
 .who span { color: var(--muted); font-size: 0.88rem; }
 

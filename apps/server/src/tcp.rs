@@ -25,7 +25,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::debug;
 
 use crate::ServerState;
-use crate::routes::{self, MAX_BODY, dispatch};
+use crate::routes::{self, dispatch};
 
 /// Espera máxima del handshake TLS.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -35,7 +35,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// envía las cabeceras byte a byte ocupaba la conexión para siempre).
 pub const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Espera máxima del cuerpo de una petición (como mucho `MAX_BODY`, 64 KiB).
+/// Espera máxima del cuerpo de una petición (como mucho `routes::body_limit`: 64 KiB, o el
+/// avatar).
 pub const BODY_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Intervalo de los `PING` de HTTP/2 y espera de su respuesta: una conexión HTTP/2 que no responde
@@ -72,8 +73,8 @@ async fn handle(
     request: Request<Incoming>,
 ) -> Result<Response<Body>, Infallible> {
     let (parts, body) = request.into_parts();
-    let collected =
-        tokio::time::timeout(BODY_TIMEOUT, Limited::new(body, MAX_BODY).collect()).await;
+    let limit = routes::body_limit(&parts.method, parts.uri.path(), &parts.headers);
+    let collected = tokio::time::timeout(BODY_TIMEOUT, Limited::new(body, limit).collect()).await;
     let body = match collected {
         Ok(Ok(collected)) => collected.to_bytes(),
         Err(_) => {
@@ -110,6 +111,11 @@ async fn handle(
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned),
+        if_none_match: parts
+            .headers
+            .get(header::IF_NONE_MATCH)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
         body,
         remote: remote.ip().to_canonical(),
     };
@@ -119,6 +125,12 @@ async fn handle(
     let headers = response.headers_mut();
     for (name, value) in reply.headers {
         headers.insert(name, HeaderValue::from_static(value));
+    }
+    if let Some(etag) = reply
+        .etag
+        .and_then(|etag| HeaderValue::from_str(&etag).ok())
+    {
+        headers.insert(header::ETAG, etag);
     }
     headers.insert(header::ALT_SVC, alt_svc);
     Ok(response)

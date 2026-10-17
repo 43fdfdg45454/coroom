@@ -155,6 +155,61 @@ fn events() -> Vec<InputEvent> {
     ]
 }
 
+/// CRC-32 de los fragmentos PNG (polinomio `0xEDB88320`).
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 0 {
+                crc >> 1
+            } else {
+                (crc >> 1) ^ 0xedb8_8320
+            };
+        }
+    }
+    !crc
+}
+
+/// PNG gris de 8 bits sin comprimir (un bloque «stored» de deflate, hasta 65 535 bytes de datos),
+/// sin dependencias: la cabecera dice `header` (ancho, alto) y los datos son de `data`.
+fn gray_png(header: (u32, u32), data: (u32, u32)) -> Vec<u8> {
+    let mut raw = Vec::new();
+    for y in 0..data.1 {
+        raw.push(0);
+        raw.extend((0..data.0).map(|x| (x * 16 + y * 4) as u8));
+    }
+    let length = u16::try_from(raw.len()).expect("cabe en un bloque");
+    let mut zlib = vec![0x78, 0x01, 0x01];
+    zlib.extend_from_slice(&length.to_le_bytes());
+    zlib.extend_from_slice(&(!length).to_le_bytes());
+    zlib.extend_from_slice(&raw);
+    let (mut a, mut b) = (1u32, 0u32);
+    for &byte in &raw {
+        a = (a + u32::from(byte)) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    zlib.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&header.0.to_be_bytes());
+    ihdr.extend_from_slice(&header.1.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 0, 0, 0, 0]);
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    for (kind, body) in [
+        (b"IHDR", ihdr.as_slice()),
+        (b"IDAT", zlib.as_slice()),
+        (b"IEND", &[][..]),
+    ] {
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        let start = out.len();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(body);
+        let crc = crc32(&out[start..]);
+        out.extend_from_slice(&crc.to_be_bytes());
+    }
+    out
+}
+
 fn frame<T: serde::Serialize>(message: &T) -> Vec<u8> {
     codec::encode(message).expect("codificar")
 }
@@ -537,6 +592,28 @@ fn fuzz_seeds() {
         request.extend_from_slice(body);
         seeds.write("server_api", name, &request);
     }
+    let mut avatar = vec![4, 1];
+    avatar.extend_from_slice(b"me/avatar\0");
+    avatar.extend_from_slice(&gray_png((32, 32), (32, 32)));
+    seeds.write("server_api", "avatar", &avatar);
+
+    // --- server_avatar ------------------------------------------------------------------------------
+    seeds.write("server_avatar", "gris-16", &gray_png((16, 16), (16, 16)));
+    seeds.write("server_avatar", "gris-64", &gray_png((64, 64), (64, 64)));
+    seeds.write(
+        "server_avatar",
+        "rectangular",
+        &gray_png((64, 32), (64, 32)),
+    );
+    // La cabecera dice 60 000 × 60 000 con los datos de 16 × 16: se rechaza sin reservar nada.
+    seeds.write(
+        "server_avatar",
+        "cabecera-enorme",
+        &gray_png((60_000, 60_000), (16, 16)),
+    );
+    let mut truncated = gray_png((64, 64), (64, 64));
+    truncated.truncate(truncated.len() / 2);
+    seeds.write("server_avatar", "truncado", &truncated);
 
     // --- codec_slices -------------------------------------------------------------------------------
     let h264 = [

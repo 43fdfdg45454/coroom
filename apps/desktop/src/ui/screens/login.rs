@@ -1039,6 +1039,7 @@ mod tests {
                 user_id: 2,
                 device: "Portátil".into(),
                 fingerprint: "ab".repeat(32),
+                avatar: None,
             },
         ))));
         assert_eq!(app.screen, Screen::Main);
@@ -1064,6 +1065,7 @@ mod tests {
                 user_id: 2,
                 device: "Portátil".into(),
                 fingerprint: "ab".repeat(32),
+                avatar: None,
             },
         ))));
     }

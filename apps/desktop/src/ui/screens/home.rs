@@ -26,6 +26,7 @@ use iced_widget::{Column, column, container, row, text, text_input};
 use crate::ui::app::{
     App, Effect, Event, Invitation, JOIN_REQUEST_TTL, Load, Message, Page, Screen,
 };
+use crate::ui::avatars;
 use crate::ui::screens::friends::{self, Msg as FriendsMsg};
 use crate::ui::screens::guest;
 
@@ -543,7 +544,12 @@ fn invitation_card<'a>(app: &'a App, invitation: &'a Invitation) -> Element<'a, 
     let blocked = server_down(app);
     container(
         row![
-            ui::avatar(&app.theme, &invitation.from_name, size::AVATAR),
+            avatars::view(
+                app,
+                &invitation.from_name,
+                avatars::of_user(app, invitation.from_user),
+                size::AVATAR,
+            ),
             column![
                 ui::strong(t!("home-invite-title", name = invitation.from_name))
                     .wrapping(Wrapping::WordOrGlyph),
@@ -711,9 +717,10 @@ fn requests<'a>(app: &'a App, friends: &'a Friends) -> Option<Element<'a, Messag
     let busy = app.friends_page.busy;
     let incoming = friends.incoming.iter().map(|request| {
         ui::list_row(
-            Some(ui::avatar(
-                &app.theme,
+            Some(avatars::view(
+                app,
                 &request.user.display_name,
+                request.user.avatar,
                 size::AVATAR,
             )),
             request.user.display_name.as_str(),
@@ -737,9 +744,10 @@ fn requests<'a>(app: &'a App, friends: &'a Friends) -> Option<Element<'a, Messag
     });
     let outgoing = friends.outgoing.iter().map(|request| {
         ui::list_row(
-            Some(ui::avatar(
-                &app.theme,
+            Some(avatars::view(
+                app,
                 &request.user.display_name,
+                request.user.avatar,
                 size::AVATAR,
             )),
             request.user.display_name.as_str(),
@@ -799,7 +807,12 @@ fn friend_row<'a>(app: &'a App, friend: &'a Friend) -> Element<'a, Message> {
         invite_button(Some(on(Msg::Invite(friend.id)))).into()
     };
     ui::list_row(
-        Some(ui::avatar(&app.theme, &friend.display_name, size::AVATAR)),
+        Some(avatars::view(
+            app,
+            &friend.display_name,
+            friend.avatar,
+            size::AVATAR,
+        )),
         friend.display_name.as_str(),
         Some(format!("@{}", friend.username)),
         vec![
@@ -930,6 +943,7 @@ mod tests {
             display_name: name.to_owned(),
             online,
             activity: Default::default(),
+            avatar: None,
         }
     }
 
@@ -1332,6 +1346,7 @@ mod tests {
             user_id: 1,
             device: "equipo".into(),
             fingerprint: "a1".repeat(32),
+            avatar: None,
         });
         assert!(app.update(Message::Friends(FriendsMsg::Add)).is_empty());
         assert!(app.friends_page.add_error.is_some(), "no a uno mismo");

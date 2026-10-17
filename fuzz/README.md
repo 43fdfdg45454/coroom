@@ -43,5 +43,6 @@ ejecuta cada objetivo 120 s con AddressSanitizer cada semana y a mano.
 | `crypto_mls` | `RoomGroup::process`, `join` y `add_member` | Byte de modo (`% 4`) y el mensaje |
 | `server_api` | `routes::dispatch` del servidor con SQLite temporal (arnés `coroom_server::fuzzing`) | Método, sesión (0 ninguna, 1 administrador, 2 falsa), ruta hasta `0x00`, cuerpo |
 | `server_signal` | `Hub::run`: una sesión de señalización entera | Byte (impar: `Auth` de desarrollo delante) y los bytes del stream |
+| `server_avatar` | `avatar::validate` del servidor: límites al decodificar, PNG propio y estable al volver a validarlo | El fichero subido |
 | `codec_slices` | `split_slices` de H.264, HEVC y AV1 | Byte de códec y el paquete |
 | `audio_jitter` | `JitterBuffer` con secuencias arbitrarias | Órdenes: `op % 3 == 0` avanza y saca; si no, mete un paquete (secuencia, captura, banderas, avance y trozo) |

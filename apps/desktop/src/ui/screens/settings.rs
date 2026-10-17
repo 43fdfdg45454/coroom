@@ -1,9 +1,10 @@
 //! Ajustes: lo que no depende de una sala.
 //!
-//! Seis páginas con su navegación lateral: **Cuenta y servidor** (quién eres, el servidor y su
+//! Siete páginas con su navegación lateral: **Cuenta y servidor** (quién eres, el servidor y su
 //! huella, los dispositivos de la cuenta, la red y los números de seguridad), **Audio y voz**
 //! (salida y micrófono con la lista en vivo, la voz como anfitrión y como invitado), **Sala** (cómo
-//! entran los invitados y los avisos del chat), **Mandos** (qué mando envías, la ranura que
+//! entran los invitados y los avisos del chat), **Notificaciones** (el volumen de los avisos con
+//! sonido y el tono de cada uno, con «Probar»), **Mandos** (qué mando envías, la ranura que
 //! ofreces y los atajos `Ctrl+Alt+letra`), **Apariencia** (tema, acento y la fuente del
 //! escritorio) y **Acerca de** (versión, versiones nuevas y licencias). Lo de vídeo y calidad vive
 //! en Compartir y en el panel de la sala; el diagnóstico se abre desde la cabecera y la sala.
@@ -39,9 +40,10 @@ use crate::ui::app::{
 };
 use crate::ui::screens::diagnostics;
 use crate::ui::settings::{
-    DEFAULT_VOICE_VOLUME, MAX_VOICE_VOLUME, Shortcuts, ThemeChoice, VoiceMode, voice_gain,
+    DEFAULT_NOTIFICATION_VOLUME, DEFAULT_VOICE_VOLUME, MAX_VOICE_VOLUME, Shortcuts, SoundChoice,
+    SoundEvent, ThemeChoice, VoiceMode, voice_gain,
 };
-use crate::ui::sound;
+use crate::ui::tones::Builtin;
 
 /// Cada cuánto se vuelve a pedir la lista de micrófonos y salidas con «Audio y voz» abierta.
 pub const AUDIO_REFRESH: Duration = Duration::from_secs(3);
@@ -56,6 +58,8 @@ pub enum SettingsPage {
     Audio,
     /// Cómo entran los invitados y los avisos del chat.
     Room,
+    /// Los avisos con sonido.
+    Notifications,
     /// Mandos y atajos.
     Gamepads,
     /// Tema, acento y fuente.
@@ -66,10 +70,11 @@ pub enum SettingsPage {
 
 impl SettingsPage {
     /// Todas, en el orden de la navegación.
-    pub const ALL: [SettingsPage; 6] = [
+    pub const ALL: [SettingsPage; 7] = [
         SettingsPage::Account,
         SettingsPage::Audio,
         SettingsPage::Room,
+        SettingsPage::Notifications,
         SettingsPage::Gamepads,
         SettingsPage::Appearance,
         SettingsPage::About,
@@ -81,6 +86,7 @@ impl SettingsPage {
             SettingsPage::Account => t!("settings-cuenta-y-servidor"),
             SettingsPage::Audio => t!("settings-audio-y-voz"),
             SettingsPage::Room => t!("settings-sala"),
+            SettingsPage::Notifications => t!("settings-notificaciones"),
             SettingsPage::Gamepads => t!("settings-mandos"),
             SettingsPage::Appearance => t!("settings-apariencia"),
             SettingsPage::About => t!("settings-acerca-de"),
@@ -92,6 +98,7 @@ impl SettingsPage {
             SettingsPage::Account => Icon::UserRound,
             SettingsPage::Audio => Icon::Headphones,
             SettingsPage::Room => Icon::Users,
+            SettingsPage::Notifications => Icon::Bell,
             SettingsPage::Gamepads => Icon::Gamepad,
             SettingsPage::Appearance => Icon::Palette,
             SettingsPage::About => Icon::Info,
@@ -135,10 +142,11 @@ pub struct State {
     pub port: Option<String>,
     /// Error del puerto.
     pub port_error: Option<String>,
-    /// El selector del tono del chat está abierto («Elegir…» no se repite mientras).
-    pub chat_sound_picking: bool,
-    /// Error de la última elección del tono (fichero que no vale o selector que falló).
-    pub chat_sound_error: Option<String>,
+    /// El selector de ficheros está abierto para el tono de este aviso (no se abre otro).
+    pub sound_picking: Option<SoundEvent>,
+    /// Error de la última elección de un tono propio (fichero que no vale o selector que falló),
+    /// en la fila de su aviso.
+    pub sound_error: Option<(SoundEvent, String)>,
     /// La prueba del micrófono en marcha: el último nivel (0-1).
     pub mic_test: Option<f32>,
     /// Oírse durante la prueba del micrófono.
@@ -183,16 +191,17 @@ pub enum Msg {
     NoiseSuppression(bool),
     /// Los invitados entran callados.
     GuestsMuted(bool),
-    /// Sonido al llegar un mensaje.
-    ChatSound(bool),
-    /// Abrir el selector de ficheros para el tono del chat.
-    PickChatSound,
-    /// El selector volvió: un fichero, nada (cancelado) o un error.
-    ChatSoundPicked(Result<Option<PathBuf>, String>),
-    /// Oír el tono actual.
-    TestChatSound,
-    /// Volver al tono de por defecto.
-    ClearChatSound,
+    /// El tono de un aviso, elegido en su selector (suena para oírlo).
+    Tone(SoundEvent, Choice<ToneOption>),
+    /// El selector de ficheros volvió para un aviso: un fichero ya comprobado
+    /// (`sound::pick_checked`, en la tarea del selector), nada (cancelado) o el motivo en palabras.
+    SoundPicked(SoundEvent, Result<Option<PathBuf>, String>),
+    /// Oír el tono de un aviso («Probar»).
+    TestSound(SoundEvent),
+    /// Volumen de los avisos (porcentaje), mientras se arrastra.
+    NotificationVolume(u8),
+    /// Al soltar el deslizador del volumen de los avisos (suena uno para oírlo).
+    NotificationVolumeDone,
     /// Olvidar el permiso de pantalla del portal: el diálogo del sistema volverá a salir.
     ForgetSharePermission,
     /// Notificación del escritorio con la ventana sin foco.
@@ -231,6 +240,19 @@ pub enum Msg {
     UpdateChecks(bool),
     /// Cada cuántas horas.
     UpdateInterval(Choice<u32>),
+}
+
+/// Una opción del selector de tono de un aviso.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToneOption {
+    /// Un tono propio.
+    Tone(Builtin),
+    /// Sin sonido.
+    Off,
+    /// El fichero propio que ya se eligió.
+    File,
+    /// Elegir un fichero (abre el selector).
+    Pick,
 }
 
 /// Opción de un selector con su texto.
@@ -409,37 +431,24 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         }
         Msg::NoiseSuppression(on) => settings.audio.noise_suppression = on,
         Msg::GuestsMuted(on) => settings.room.guests_muted = on,
-        Msg::ChatSound(on) => settings.room.chat_sound = on,
-        Msg::PickChatSound => {
-            if app.settings_page.chat_sound_picking {
-                return Vec::new();
-            }
-            app.settings_page.chat_sound_picking = true;
-            return vec![Effect::PickChatSound];
+        Msg::Tone(event, choice) => return choose_tone(app, event, choice.value),
+        Msg::SoundPicked(event, picked) => return sound_picked(app, event, picked),
+        Msg::TestSound(event) => return vec![Effect::Sound(event)],
+        Msg::NotificationVolume(percent) => {
+            settings.notifications.volume = percent.min(100);
+            return Vec::new();
         }
-        Msg::ChatSoundPicked(picked) => {
-            app.settings_page.chat_sound_picking = false;
-            match picked {
-                Ok(None) => return Vec::new(),
-                Ok(Some(file)) => {
-                    if let Err(error) = sound::check_tone(&file) {
-                        app.settings_page.chat_sound_error = Some(error);
-                        return Vec::new();
-                    }
-                    app.settings_page.chat_sound_error = None;
-                    settings.room.chat_sound_file = Some(file);
-                }
-                Err(error) => {
-                    app.settings_page.chat_sound_error =
-                        Some(t!("settings-tono-no-se-pudo-elegir", error = error));
-                    return Vec::new();
-                }
-            }
-        }
-        Msg::TestChatSound => return vec![Effect::ChatSound],
-        Msg::ClearChatSound => {
-            app.settings_page.chat_sound_error = None;
-            settings.room.chat_sound_file = None;
+        Msg::NotificationVolumeDone => {
+            // Suena el primer aviso que tenga sonido, ya con el volumen nuevo.
+            let mut effects = app.settings_changed();
+            let notifications = &app.settings.notifications;
+            effects.extend(
+                SoundEvent::ALL
+                    .into_iter()
+                    .find(|event| notifications.sound(*event).is_on())
+                    .map(Effect::Sound),
+            );
+            return effects;
         }
         Msg::ForgetSharePermission => {
             // No es un ajuste: va a `portal.json`, y borrarlo ahí es borrar el fichero.
@@ -524,6 +533,66 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
     app.settings_changed()
 }
 
+/// Lo elegido en el selector de tono de `event`: un tono (suena para oírlo), ninguno, el fichero
+/// propio de antes o elegir otro (abre el selector de ficheros).
+fn choose_tone(app: &mut App, event: SoundEvent, option: ToneOption) -> Vec<Effect> {
+    let state = &mut app.settings_page;
+    if state
+        .sound_error
+        .as_ref()
+        .is_some_and(|(at, _)| *at == event)
+    {
+        state.sound_error = None;
+    }
+    let sound = app.settings.notifications.sound_mut(event);
+    sound.tone = match option {
+        ToneOption::Pick => {
+            if state.sound_picking.is_some() {
+                return Vec::new();
+            }
+            state.sound_picking = Some(event);
+            return vec![Effect::PickSound(event)];
+        }
+        ToneOption::File if sound.file.is_none() => return Vec::new(),
+        ToneOption::File => SoundChoice::File,
+        ToneOption::Off => SoundChoice::Off,
+        ToneOption::Tone(tone) => SoundChoice::Tone(tone),
+    };
+    let on = sound.is_on();
+    let mut effects = app.settings_changed();
+    if on {
+        effects.push(Effect::Sound(event));
+    }
+    effects
+}
+
+/// El selector de ficheros volvió para `event`: el fichero (ya comprobado fuera del hilo de la
+/// interfaz, `sound::pick_checked`) pasa a ser su tono y suena; si no valía o el selector falló,
+/// el motivo queda en su fila y el ajuste como estaba.
+fn sound_picked(
+    app: &mut App,
+    event: SoundEvent,
+    picked: Result<Option<PathBuf>, String>,
+) -> Vec<Effect> {
+    let state = &mut app.settings_page;
+    state.sound_picking = None;
+    let file = match picked {
+        Ok(None) => return Vec::new(),
+        Ok(Some(file)) => file,
+        Err(error) => {
+            state.sound_error = Some((event, error));
+            return Vec::new();
+        }
+    };
+    state.sound_error = None;
+    let sound = app.settings.notifications.sound_mut(event);
+    sound.file = Some(file);
+    sound.tone = SoundChoice::File;
+    let mut effects = app.settings_changed();
+    effects.push(Effect::Sound(event));
+    effects
+}
+
 /// La tecla que llegó mientras se cambiaba un atajo o la de pulsar para hablar.
 fn key_captured(app: &mut App, name: String) -> Vec<Effect> {
     let Some(capture) = app.settings_page.capturing.take() else {
@@ -550,11 +619,12 @@ fn key_captured(app: &mut App, name: String) -> Vec<Effect> {
             let letter = letter.to_ascii_uppercase();
             match index {
                 0 => shortcuts.immersive = letter,
-                1 => shortcuts.stats = letter,
-                2 => shortcuts.chat = letter,
-                3 => shortcuts.leave = letter,
-                4 => shortcuts.mic = letter,
-                5 => shortcuts.game = letter,
+                1 => shortcuts.release = letter,
+                2 => shortcuts.stats = letter,
+                3 => shortcuts.chat = letter,
+                4 => shortcuts.leave = letter,
+                5 => shortcuts.mic = letter,
+                6 => shortcuts.game = letter,
                 _ => shortcuts.pads = letter,
             }
             if !shortcuts.is_valid() {
@@ -716,6 +786,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         SettingsPage::Account => account(app),
         SettingsPage::Audio => audio(app),
         SettingsPage::Room => room(app),
+        SettingsPage::Notifications => notifications(app),
         SettingsPage::Gamepads => gamepads(app),
         SettingsPage::Appearance => appearance(app),
         SettingsPage::About => about(app),
@@ -829,38 +900,42 @@ fn account(app: &App) -> Element<'_, Message> {
         (_, Some(rtt)) => t!("settings-servidor-responde-en", rtt = rtt.round() as u64),
         _ => t!("settings-servidor-comprobando").to_owned(),
     };
-    let mut rows = vec![
-        ui::list_row(
-            Some(ui::avatar(&app.theme, &account.display_name, 36.0)),
-            account.display_name.as_str(),
-            Some(t!(
-                "settings-usuario-en-este-equipo",
-                username = account.username,
-                device = account.device
-            )),
-            vec![
-                ui::button_with(
-                    Kind::DestructiveFlat,
-                    t!("settings-cerrar-sesion"),
-                    Some(Icon::LogOut),
-                    Some(Message::SignOut),
-                )
-                .into(),
-            ],
-        ),
-        ui::list_row(
-            Some(icon_with(Icon::Server, 22.0, SvgClass::Secondary)),
-            account.host(),
-            Some(server_status),
-            vec![
-                ui::normal(
-                    t!("settings-cambiar-de-servidor"),
-                    Some(Message::SwitchServer),
-                )
-                .into(),
-            ],
-        ),
-    ];
+    let mut rows = vec![ui::list_row(
+        Some(crate::ui::avatars::view(
+            app,
+            &account.display_name,
+            account.avatar,
+            crate::ui::avatars::SETTINGS_SIDE,
+        )),
+        account.display_name.as_str(),
+        Some(t!(
+            "settings-usuario-en-este-equipo",
+            username = account.username,
+            device = account.device
+        )),
+        vec![
+            ui::button_with(
+                Kind::DestructiveFlat,
+                t!("settings-cerrar-sesion"),
+                Some(Icon::LogOut),
+                Some(Message::SignOut),
+            )
+            .into(),
+        ],
+    )];
+    rows.extend(crate::ui::avatars::settings_row(app));
+    rows.extend([ui::list_row(
+        Some(icon_with(Icon::Server, 22.0, SvgClass::Secondary)),
+        account.host(),
+        Some(server_status),
+        vec![
+            ui::normal(
+                t!("settings-cambiar-de-servidor"),
+                Some(Message::SwitchServer),
+            )
+            .into(),
+        ],
+    )]);
     if let Some(certificate) = &account.server.fingerprint {
         rows.push(copy_row(
             t!("settings-certificado-del-servidor"),
@@ -1469,12 +1544,6 @@ fn room(app: &App) -> Element<'_, Message> {
             Some(t!("settings-chat-de-la-sala-ayuda").to_owned()),
             vec![
                 ui::pref_row(
-                    t!("settings-sonido-al-llegar-un-mensaje"),
-                    Some(t!("settings-sonido-al-llegar-un-mensaje-ayuda").to_owned()),
-                    ui::switch(room.chat_sound, Some(|on_off| on(Msg::ChatSound(on_off)))),
-                ),
-                tone_row(app),
-                ui::pref_row(
                     t!("settings-notificacion-del-escritorio"),
                     Some(t!("settings-notificacion-del-escritorio-ayuda").to_owned()),
                     ui::switch(
@@ -1497,33 +1566,113 @@ fn room(app: &App) -> Element<'_, Message> {
     .into()
 }
 
-/// Fila del tono del chat: cuál suena ahora, «Probar», «Elegir…» y, con uno propio, «Quitar»; el
-/// error de la última elección va bajo el texto.
-fn tone_row(app: &App) -> Element<'_, Message> {
-    let room = &app.settings.room;
-    let state = &app.settings_page;
-    let windows = cfg!(target_os = "windows");
-    let current = match &room.chat_sound_file {
-        Some(file) => file.file_name().map_or_else(
+// --- Notificaciones ------------------------------------------------------------------------------
+
+/// Nombre de un tono propio en los selectores.
+fn tone_label(tone: Builtin) -> &'static str {
+    match tone {
+        Builtin::Chime => t!("settings-tono-campanilla"),
+        Builtin::Rise => t!("settings-tono-llegada"),
+        Builtin::Fall => t!("settings-tono-despedida"),
+        Builtin::Bells => t!("settings-tono-campanas"),
+        Builtin::Knock => t!("settings-tono-toc-toc"),
+        Builtin::Arpeggio => t!("settings-tono-arpegio"),
+        Builtin::Chord => t!("settings-tono-acorde"),
+        Builtin::Bubble => t!("settings-tono-burbuja"),
+        Builtin::Ping => t!("settings-tono-destello"),
+    }
+}
+
+/// Título y explicación (quién lo oye y cuándo) de cada aviso.
+fn sound_texts(event: SoundEvent) -> (&'static str, &'static str) {
+    match event {
+        SoundEvent::MemberJoined => (
+            t!("settings-aviso-entra-alguien"),
+            t!("settings-aviso-entra-alguien-ayuda"),
+        ),
+        SoundEvent::MemberLeft => (
+            t!("settings-aviso-sale-alguien"),
+            t!("settings-aviso-sale-alguien-ayuda"),
+        ),
+        SoundEvent::ChatMessage => (
+            t!("settings-aviso-mensaje"),
+            t!("settings-aviso-mensaje-ayuda"),
+        ),
+        SoundEvent::JoinRequest => (
+            t!("settings-aviso-piden-entrar"),
+            t!("settings-aviso-piden-entrar-ayuda"),
+        ),
+        SoundEvent::Invitation => (
+            t!("settings-aviso-invitacion"),
+            t!("settings-aviso-invitacion-ayuda"),
+        ),
+        SoundEvent::Admitted => (
+            t!("settings-aviso-te-dejan-entrar"),
+            t!("settings-aviso-te-dejan-entrar-ayuda"),
+        ),
+        SoundEvent::BecameHost => (
+            t!("settings-aviso-anfitrion"),
+            t!("settings-aviso-anfitrion-ayuda"),
+        ),
+        SoundEvent::FriendRequest => (
+            t!("settings-aviso-amistad"),
+            t!("settings-aviso-amistad-ayuda"),
+        ),
+    }
+}
+
+/// Las opciones del selector de tono de un aviso: los propios (el suyo primero, «(de serie)»),
+/// «Ninguno», el fichero ya elegido si hay y «Elegir un fichero…».
+fn tone_options(event: SoundEvent, file: Option<&std::path::Path>) -> Vec<Choice<ToneOption>> {
+    let default = event.default_tone();
+    let mut options: Vec<Choice<ToneOption>> = std::iter::once(default)
+        .chain(Builtin::ALL.into_iter().filter(|tone| *tone != default))
+        .map(|tone| {
+            let label = if tone == default {
+                t!("settings-tono-de-serie", name = tone_label(tone))
+            } else {
+                tone_label(tone).to_owned()
+            };
+            choice(ToneOption::Tone(tone), label)
+        })
+        .collect();
+    options.push(choice(ToneOption::Off, t!("settings-tono-ninguno")));
+    if let Some(file) = file {
+        let name = file.file_name().map_or_else(
             || file.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
-        ),
-        None if windows => t!("settings-tono-por-defecto-windows").to_owned(),
-        None => t!("settings-tono-por-defecto-linux").to_owned(),
+        );
+        options.push(choice(
+            ToneOption::File,
+            ui::ellipsize(&name, 26).into_owned(),
+        ));
+    }
+    options.push(choice(ToneOption::Pick, t!("settings-tono-elegir-fichero")));
+    options
+}
+
+/// Ancho de los selectores de tono.
+const TONE_SELECT_WIDTH: f32 = 230.0;
+
+/// Fila de un aviso: qué es y quién lo oye, su tono y «Probar»; el error de la última elección
+/// de un fichero va bajo el texto.
+fn sound_row(app: &App, event: SoundEvent) -> Element<'_, Message> {
+    let sound = app.settings.notifications.sound(event);
+    let state = &app.settings_page;
+    let (title, help) = sound_texts(event);
+    let options = tone_options(event, sound.file.as_deref());
+    let current = match sound.tone {
+        SoundChoice::Tone(tone) => ToneOption::Tone(tone),
+        SoundChoice::Off => ToneOption::Off,
+        SoundChoice::File => ToneOption::File,
     };
-    let help = if windows {
-        t!("settings-tono-ayuda-windows")
-    } else {
-        t!("settings-tono-ayuda-linux")
-    };
-    let mut texts = column![
-        ui::body(t!("settings-tono")),
-        ui::secondary(current).wrapping(Wrapping::WordOrGlyph),
-        ui::caption(help).wrapping(Wrapping::WordOrGlyph),
-    ]
-    .spacing(2);
-    if let Some(error) = &state.chat_sound_error {
-        texts = texts.push(
+    let selected = options
+        .iter()
+        .find(|option| option.value == current)
+        .cloned();
+    let mut below = column![ui::secondary(help).wrapping(Wrapping::WordOrGlyph)].spacing(2);
+    if let Some((_, error)) = state.sound_error.as_ref().filter(|(at, _)| *at == event) {
+        below = below.push(
             row![
                 icon_with(Icon::CircleAlert, 14.0, SvgClass::Tone(Tone::Error)),
                 text(error)
@@ -1535,26 +1684,99 @@ fn tone_row(app: &App) -> Element<'_, Message> {
             .align_y(Alignment::Center),
         );
     }
-    let mut buttons = row![
-        ui::flat(t!("settings-tono-probar"), Some(on(Msg::TestChatSound))),
-        ui::normal(
-            t!("settings-tono-elegir"),
-            (!state.chat_sound_picking).then(|| on(Msg::PickChatSound)),
+    let picking = state.sound_picking.is_some();
+    let select = ui::select_fixed(
+        options,
+        selected,
+        move |option: Choice<ToneOption>| on(Msg::Tone(event, option)),
+        TONE_SELECT_WIDTH,
+    );
+    // Con el selector de ficheros abierto, los tonos esperan (el que vuelva manda).
+    let select: Element<'_, Message> = if picking {
+        container(ui::secondary(t!("settings-tono-eligiendo")))
+            .width(Length::Fixed(TONE_SELECT_WIDTH))
+            .into()
+    } else {
+        select
+    };
+    let test = ui::button_with(
+        Kind::Flat,
+        t!("settings-tono-probar"),
+        Some(Icon::Play),
+        sound.is_on().then(|| on(Msg::TestSound(event))),
+    );
+    ui::pref_row_with(
+        title,
+        below,
+        row![select, test]
+            .spacing(space::XS)
+            .align_y(Alignment::Center),
+    )
+}
+
+fn notifications(app: &App) -> Element<'_, Message> {
+    let notifications = &app.settings.notifications;
+    let volume = notifications.volume;
+    let volume_row = ui::pref_row(
+        t!("settings-volumen-de-los-avisos"),
+        Some(t!("settings-volumen-de-los-avisos-ayuda").to_owned()),
+        container(ui::slider(
+            0..=100,
+            volume,
+            5,
+            DEFAULT_NOTIFICATION_VOLUME,
+            Some(if volume == 0 {
+                Icon::VolumeOff
+            } else {
+                Icon::Volume
+            }),
+            t!("settings-porcentaje", percent = volume),
+            if volume == 0 {
+                SliderClass::AccentMuted
+            } else {
+                SliderClass::Accent
+            },
+            |percent| on(Msg::NotificationVolume(percent)),
+            Some(on(Msg::NotificationVolumeDone)),
+        ))
+        .width(Length::Fixed(TONE_SELECT_WIDTH + 110.0)),
+    );
+    let rows = |events: &[SoundEvent]| events.iter().map(|event| sound_row(app, *event)).collect();
+    let files = if cfg!(target_os = "windows") {
+        t!("settings-tono-ayuda-windows")
+    } else {
+        t!("settings-tono-ayuda-linux")
+    };
+    column![
+        ui::section(t!("settings-avisos-volumen"), None, vec![volume_row]),
+        ui::section(
+            t!("settings-avisos-en-la-sala"),
+            Some(t!("settings-avisos-en-la-sala-ayuda").to_owned()),
+            rows(&[
+                SoundEvent::MemberJoined,
+                SoundEvent::MemberLeft,
+                SoundEvent::ChatMessage,
+            ]),
         ),
+        ui::section(
+            t!("settings-avisos-como-anfitrion"),
+            Some(t!("settings-avisos-como-anfitrion-ayuda").to_owned()),
+            rows(&[SoundEvent::JoinRequest]),
+        ),
+        ui::section(
+            t!("settings-avisos-para-ti"),
+            Some(t!("settings-avisos-para-ti-ayuda").to_owned()),
+            rows(&[
+                SoundEvent::Invitation,
+                SoundEvent::Admitted,
+                SoundEvent::BecameHost,
+                SoundEvent::FriendRequest,
+            ]),
+        ),
+        ui::caption(files).wrapping(Wrapping::WordOrGlyph),
     ]
-    .spacing(space::XS)
-    .align_y(Alignment::Center);
-    if room.chat_sound_file.is_some() {
-        buttons = buttons.push(ui::flat(
-            t!("settings-tono-quitar"),
-            Some(on(Msg::ClearChatSound)),
-        ));
-    }
-    row![texts.width(Length::Fill), buttons]
-        .spacing(space::M)
-        .align_y(Alignment::Center)
-        .padding(Padding::from([10.0, 16.0]))
-        .into()
+    .spacing(space::L)
+    .into()
 }
 
 /// Fila del permiso de pantalla del portal (Linux): para qué fuentes se recuerda y «Olvidar el
@@ -1589,9 +1811,10 @@ fn share_permission_row(app: &App) -> Element<'_, Message> {
 // --- Mandos --------------------------------------------------------------------------------------
 
 /// Qué hace cada atajo del invitado, en el orden de [`Shortcuts::letters`].
-fn shortcut_names() -> [&'static str; 7] {
+fn shortcut_names() -> [&'static str; 8] {
     [
         t!("settings-atajo-inmersivo"),
+        t!("settings-atajo-soltar"),
         t!("settings-atajo-panel-de-conexion"),
         t!("settings-atajo-chat"),
         t!("settings-atajo-salir"),
@@ -2090,9 +2313,21 @@ pub(crate) mod shots {
             app.update(Message::Event(Event::MicLevel(Ok(0.62))));
         }),
         ("18-ajustes-sala", |app| {
-            settings_page(app, SettingsPage::Room);
-            app.settings.room.chat_sound_file =
-                Some(std::path::PathBuf::from("/home/ana/Sonidos/campanita.ogg"));
+            settings_page(app, SettingsPage::Room)
+        }),
+        ("18-ajustes-notificaciones", |app| {
+            use crate::ui::settings::{EventSound, SoundChoice};
+            settings_page(app, SettingsPage::Notifications);
+            let notifications = &mut app.settings.notifications;
+            notifications.chat_message = EventSound {
+                tone: SoundChoice::File,
+                file: Some(std::path::PathBuf::from("/home/ana/Sonidos/campanita.ogg")),
+            };
+            notifications.member_left.tone = SoundChoice::Off;
+            app.settings_page.sound_error = Some((
+                crate::ui::settings::SoundEvent::ChatMessage,
+                "Ese WAV usa un formato que coroom no lee (vale PCM o coma flotante).".to_owned(),
+            ));
         }),
         ("19-ajustes-mandos", |app| {
             settings_page(app, SettingsPage::Gamepads);
@@ -2182,18 +2417,8 @@ mod tests {
         assert_eq!(app.settings.audio.microphone, None);
         change(&mut app, Msg::GuestsMuted(true));
         assert!(app.settings.room.guests_muted);
-        change(&mut app, Msg::ChatSound(false));
-        assert!(!app.settings.room.chat_sound);
-        let dir = tempfile::tempdir().expect("directorio");
-        let tone = dir.path().join("tono.wav");
-        std::fs::write(&tone, sound::chime_wav()).expect("escribir");
-        change(&mut app, Msg::ChatSoundPicked(Ok(Some(tone.clone()))));
-        assert_eq!(
-            app.settings.room.chat_sound_file.as_deref(),
-            Some(tone.as_path())
-        );
-        change(&mut app, Msg::ClearChatSound);
-        assert_eq!(app.settings.room.chat_sound_file, None);
+        change(&mut app, Msg::NotificationVolume(40));
+        assert_eq!(app.settings.notifications.volume, 40);
         change(&mut app, Msg::ChatNotifications(false));
         assert!(!app.settings.room.chat_notifications);
         change(&mut app, Msg::ChatBubbles(false));
@@ -2388,68 +2613,173 @@ mod tests {
         );
     }
 
+    /// Elegir un tono lo guarda y lo hace sonar; «Ninguno» lo apaga (y «Probar» con él);
+    /// «Elegir un fichero…» abre el selector, que vuelve con un fichero que vale, uno que no
+    /// (error en su fila) o nada.
     #[test]
-    fn chat_tone_is_picked_checked_and_tested() {
-        let mut app = open(SettingsPage::Room);
+    fn notification_tones_are_chosen_picked_and_tested() {
+        let mut app = open(SettingsPage::Notifications);
+        let pick = |option: ToneOption| choice(option, "");
+        let joined = SoundEvent::MemberJoined;
+        let effects = app.update(Message::Settings(Msg::Tone(
+            joined,
+            pick(ToneOption::Tone(Builtin::Ping)),
+        )));
+        assert_eq!(effects, [Effect::Sound(joined)], "suena para oírlo");
         assert_eq!(
-            app.update(Message::Settings(Msg::PickChatSound)),
-            [Effect::PickChatSound]
+            app.settings.notifications.member_joined.tone,
+            SoundChoice::Tone(Builtin::Ping)
         );
-        assert!(app.settings_page.chat_sound_picking);
         assert!(
-            app.update(Message::Settings(Msg::PickChatSound)).is_empty(),
+            app.update(Message::Settings(Msg::Tone(joined, pick(ToneOption::Off))))
+                .is_empty()
+        );
+        assert!(!app.settings.notifications.member_joined.is_on());
+        assert!(
+            app.update(Message::Settings(Msg::Tone(joined, pick(ToneOption::File))))
+                .is_empty(),
+            "sin fichero elegido, «fichero» no hace nada"
+        );
+        assert_eq!(
+            app.settings.notifications.member_joined.tone,
+            SoundChoice::Off
+        );
+
+        let chat = SoundEvent::ChatMessage;
+        assert_eq!(
+            app.update(Message::Settings(Msg::Tone(chat, pick(ToneOption::Pick)))),
+            [Effect::PickSound(chat)]
+        );
+        assert_eq!(app.settings_page.sound_picking, Some(chat));
+        assert!(
+            app.update(Message::Settings(Msg::Tone(joined, pick(ToneOption::Pick))))
+                .is_empty(),
             "con el selector abierto no se abre otro"
         );
         // Cancelado: nada cambia.
         assert!(
-            app.update(Message::Settings(Msg::ChatSoundPicked(Ok(None))))
+            app.update(Message::Settings(Msg::SoundPicked(chat, Ok(None))))
                 .is_empty()
         );
-        assert!(!app.settings_page.chat_sound_picking);
-        assert_eq!(app.settings.room.chat_sound_file, None);
-        // Un fichero que no existe: error en la fila y el ajuste como estaba.
+        assert_eq!(app.settings_page.sound_picking, None);
+        assert_eq!(
+            app.settings.notifications.chat_message.tone,
+            SoundChoice::Tone(Builtin::Chime)
+        );
+        // Un fichero que no existe (lo comprueba la tarea del selector, `sound::checked`): error
+        // en su fila y el ajuste como estaba.
         let dir = tempfile::tempdir().expect("directorio");
         let missing = dir.path().join("no-esta.wav");
+        let checked = crate::ui::sound::checked(Ok(Some(missing)));
+        assert!(checked.is_err(), "{checked:?}");
         assert!(
-            app.update(Message::Settings(Msg::ChatSoundPicked(Ok(Some(missing)))))
+            app.update(Message::Settings(Msg::SoundPicked(chat, checked)))
                 .is_empty()
         );
-        assert!(app.settings_page.chat_sound_error.is_some());
-        assert_eq!(app.settings.room.chat_sound_file, None);
+        assert!(matches!(&app.settings_page.sound_error, Some((at, _)) if *at == chat));
+        assert_eq!(app.settings.notifications.chat_message.file, None);
         // El selector falló: se explica.
-        assert!(
-            app.update(Message::Settings(Msg::ChatSoundPicked(Err(
-                "sin portal".into()
-            ))))
-            .is_empty()
-        );
+        app.update(Message::Settings(Msg::SoundPicked(
+            chat,
+            crate::ui::sound::checked(Err("sin portal".into())),
+        )));
         assert!(
             app.settings_page
-                .chat_sound_error
-                .as_deref()
-                .is_some_and(|error| error.contains("sin portal"))
+                .sound_error
+                .as_ref()
+                .is_some_and(|(_, error)| error.contains("sin portal"))
         );
-        // Uno que vale quita el error y se guarda; «Probar» suena sin tocar nada.
+        // Uno que vale quita el error, pasa a ser el tono y suena.
         let tone = dir.path().join("tono.wav");
-        std::fs::write(&tone, sound::chime_wav()).expect("escribir");
-        assert!(
-            app.update(Message::Settings(Msg::ChatSoundPicked(Ok(Some(
-                tone.clone()
-            )))))
-            .is_empty()
-        );
-        assert_eq!(app.settings_page.chat_sound_error, None);
+        std::fs::write(&tone, Builtin::Bells.wav()).expect("escribir");
         assert_eq!(
-            app.settings.room.chat_sound_file.as_deref(),
+            app.update(Message::Settings(Msg::SoundPicked(
+                chat,
+                Ok(Some(tone.clone()))
+            ))),
+            [Effect::Sound(chat)]
+        );
+        assert_eq!(app.settings_page.sound_error, None);
+        assert_eq!(
+            app.settings.notifications.chat_message.tone,
+            SoundChoice::File
+        );
+        assert_eq!(
+            app.settings.notifications.chat_message.file.as_deref(),
             Some(tone.as_path())
         );
+        // Volver a un tono propio recuerda el fichero, y se puede volver a él.
+        app.update(Message::Settings(Msg::Tone(
+            chat,
+            pick(ToneOption::Tone(Builtin::Chime)),
+        )));
+        assert!(app.settings.notifications.chat_message.file.is_some());
+        app.update(Message::Settings(Msg::Tone(chat, pick(ToneOption::File))));
         assert_eq!(
-            app.update(Message::Settings(Msg::TestChatSound)),
-            [Effect::ChatSound]
+            app.settings.notifications.chat_message.tone,
+            SoundChoice::File
+        );
+        // «Probar» suena sin tocar nada; el volumen se guarda al soltar y suena un aviso.
+        assert_eq!(
+            app.update(Message::Settings(Msg::TestSound(chat))),
+            [Effect::Sound(chat)]
+        );
+        assert!(
+            app.update(Message::Settings(Msg::NotificationVolume(130)))
+                .is_empty()
+        );
+        assert_eq!(app.settings.notifications.volume, 100, "como mucho 100 %");
+        assert_eq!(
+            app.update(Message::Settings(Msg::NotificationVolumeDone)),
+            [Effect::Sound(SoundEvent::MemberLeft)],
+            "el primero con sonido (entra alguien está en «Ninguno»)"
         );
         app.now += Duration::from_secs(5);
         let effects = app.update(Message::Tick);
         assert!(effects.contains(&Effect::SaveSettings), "{effects:?}");
+    }
+
+    /// La pantalla no lee el fichero elegido: lo comprobó ya la tarea del selector
+    /// (`sound::pick_checked`), así que el hilo de la interfaz no se para con uno grande o lento.
+    #[test]
+    fn a_picked_tone_is_not_read_on_the_ui_thread() {
+        let mut app = open(SettingsPage::Notifications);
+        let chat = SoundEvent::ChatMessage;
+        app.update(Message::Settings(Msg::Tone(
+            chat,
+            choice(ToneOption::Pick, ""),
+        )));
+        // Una ruta que no existe: si la pantalla la leyera, la rechazaría.
+        let unread = PathBuf::from("/nonexistent/coroom/tono.wav");
+        assert_eq!(
+            app.update(Message::Settings(Msg::SoundPicked(
+                chat,
+                Ok(Some(unread.clone()))
+            ))),
+            [Effect::Sound(chat)]
+        );
+        assert_eq!(
+            app.settings.notifications.chat_message.file.as_deref(),
+            Some(unread.as_path())
+        );
+    }
+
+    /// Cada aviso ofrece todos los tonos propios (el suyo primero), «Ninguno», el fichero si lo
+    /// hay y elegir otro.
+    #[test]
+    fn every_notification_offers_every_tone() {
+        for event in SoundEvent::ALL {
+            let options = tone_options(event, None);
+            assert_eq!(options[0].value, ToneOption::Tone(event.default_tone()));
+            assert_eq!(options.len(), Builtin::ALL.len() + 2);
+            assert_eq!(options.last().map(|o| o.value), Some(ToneOption::Pick));
+            let with_file = tone_options(event, Some(std::path::Path::new("/home/ana/tono.ogg")));
+            assert!(
+                with_file
+                    .iter()
+                    .any(|o| o.value == ToneOption::File && o.label == "tono.ogg")
+            );
+        }
     }
 
     #[test]
@@ -2493,7 +2823,7 @@ mod tests {
     #[test]
     fn shortcuts_are_captured_and_must_not_collide() {
         let mut app = open(SettingsPage::Gamepads);
-        assert_eq!(Shortcuts::default().letters().len(), 7);
+        assert_eq!(Shortcuts::default().letters().len(), 8);
         app.update(Message::Settings(Msg::Capture(Capture::Shortcut(0))));
         assert!(
             app.update(Message::Settings(Msg::KeyCaptured("k".into())))
@@ -2501,7 +2831,7 @@ mod tests {
         );
         assert_eq!(app.settings.input.shortcuts.immersive, 'K');
         // Una letra que ya usa otro atajo se rechaza y lo dice.
-        app.update(Message::Settings(Msg::Capture(Capture::Shortcut(6))));
+        app.update(Message::Settings(Msg::Capture(Capture::Shortcut(7))));
         app.update(Message::Settings(Msg::KeyCaptured("K".into())));
         assert_eq!(app.settings.input.shortcuts.pads, 'J');
         assert!(
@@ -2512,13 +2842,17 @@ mod tests {
             app.toasts
         );
         // Lo que no es una letra, también.
-        app.update(Message::Settings(Msg::Capture(Capture::Shortcut(2))));
+        app.update(Message::Settings(Msg::Capture(Capture::Shortcut(3))));
         app.update(Message::Settings(Msg::KeyCaptured("F5".into())));
         assert_eq!(app.settings.input.shortcuts.chat, 'C');
         assert_eq!(app.settings_page.capturing, None);
         app.update(Message::Settings(Msg::Capture(Capture::PushToTalk)));
         app.update(Message::Settings(Msg::KeyCaptured("CapsLock".into())));
         assert_eq!(app.settings.audio.push_to_talk_key, "CapsLock");
+        // Soltar el teclado y el ratón es el segundo.
+        app.update(Message::Settings(Msg::Capture(Capture::Shortcut(1))));
+        app.update(Message::Settings(Msg::KeyCaptured("t".into())));
+        assert_eq!(app.settings.input.shortcuts.release, 'T');
         app.update(Message::Settings(Msg::Capture(Capture::Shortcut(1))));
         app.update(Message::Settings(Msg::CancelCapture));
         assert_eq!(app.settings_page.capturing, None);

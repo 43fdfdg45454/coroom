@@ -40,7 +40,10 @@ use iced_widget::{
 };
 
 use crate::ui::app::{App, Effect, Event, Message, Page, Screen};
+use crate::ui::avatars;
+use crate::ui::notify;
 use crate::ui::screens::guest::Tab;
+use crate::ui::settings::SoundEvent;
 
 /// Identificador del campo de escritura (para darle el foco y saber si lo tiene).
 pub const INPUT_ID: &str = "chat-input";
@@ -731,14 +734,14 @@ fn arrived(app: &mut App, line: &ChatLine) -> Vec<Effect> {
             body: ui::ellipsize(&line.text, 200).into_owned(),
         });
     }
-    if room.chat_sound
-        && (!seen || !chat.window_focused)
+    if (!seen || !chat.window_focused)
         && chat
             .last_sound
             .is_none_or(|at| now.duration_since(at) >= SOUND_GAP)
     {
+        // El tono, el volumen y si suena, en «Notificaciones» (`ui::notify`).
         chat.last_sound = Some(now);
-        effects.push(Effect::ChatSound);
+        effects.extend(notify::sound(app, SoundEvent::ChatMessage));
     }
     effects
 }
@@ -1097,7 +1100,12 @@ fn message_row<'a>(
             .class(look.secondary()),
     );
     let body = row![
-        ui::avatar(&app.theme, &seed, 28.0),
+        avatars::view(
+            app,
+            &seed,
+            avatars::of_member(app, line.author.guest, line.own),
+            28.0,
+        ),
         column![who, message_text(app, look, &line.text, pieces)]
             .spacing(2)
             .width(Length::Fill)
@@ -1370,7 +1378,12 @@ pub fn bubbles(app: &App) -> Option<Element<'_, Message>> {
             mouse_area(
                 container(
                     row![
-                        ui::avatar(&app.theme, &name, 28.0),
+                        avatars::view(
+                            app,
+                            &name,
+                            avatars::of_member(app, bubble.line.author.guest, bubble.line.own),
+                            28.0,
+                        ),
                         column![who, body].spacing(2)
                     ]
                     .spacing(space::XS)
@@ -1493,6 +1506,7 @@ mod tests {
     use super::*;
     use crate::ui::app::tests::app;
     use crate::ui::screens::guest;
+    use crate::ui::settings::SoundChoice;
     use crate::ui::video::VideoFeed;
 
     fn line(guest: u32, name: &str, text: &str, own: bool) -> ChatLine {
@@ -1566,9 +1580,12 @@ mod tests {
     #[test]
     fn unread_and_bubbles_with_the_panel_closed() {
         let mut app = guest_app();
-        app.settings.room.chat_sound = true;
         let effects = message(&mut app, line(0, "Bea", "uno", false));
-        assert_eq!(effects, [Effect::ChatSound], "con el panel cerrado suena");
+        assert_eq!(
+            effects,
+            [Effect::Sound(SoundEvent::ChatMessage)],
+            "con el panel cerrado suena"
+        );
         for n in 0..4 {
             message(&mut app, line(2, "Carla", &format!("{n}"), false));
         }
@@ -1601,7 +1618,7 @@ mod tests {
     #[test]
     fn notifications_only_without_window_focus() {
         let mut app = guest_app();
-        app.settings.room.chat_sound = false;
+        app.settings.notifications.chat_message.tone = SoundChoice::Off;
         app.update(Message::Chat(Msg::Open));
         assert!(message(&mut app, line(0, "Bea", "hola", false)).is_empty());
         app.update(Message::WindowFocused(false));
@@ -1714,6 +1731,8 @@ mod tests {
             leaf: guest,
             name: name.into(),
             you,
+            user: u64::from(guest) + 1,
+            avatar: None,
         };
         let members =
             |list: Vec<RoomMember>| Message::Event(Event::Guest(SessionEvent::Members(list)));

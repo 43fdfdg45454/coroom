@@ -3,6 +3,8 @@
 //!
 //! - arrastrar selecciona y `Ctrl+C` copia lo seleccionado, también a través de varias líneas;
 //! - triple clic selecciona la línea; un clic en otro sitio quita la selección;
+//! - arrastrar desde el hueco a la derecha de una línea corta, o por debajo del texto, no
+//!   selecciona: la selección empieza sobre las letras;
 //! - un clic sin arrastrar sobre un enlace lo abre; empezar a arrastrar sobre él no;
 //! - el botón derecho copia la selección y, sin selección, no publica nada (sigue al padre).
 //!
@@ -167,6 +169,19 @@ fn chat_text_selects_copies_and_opens_links() {
     events.extend([moved(away), press(away), release(away), ctrl_c(away)]);
     let (out, _) = run(&mut renderer, text, None, &events);
     assert_eq!(out, []);
+
+    // Empezar a arrastrar fuera de las letras no selecciona: desde el hueco a la derecha de una
+    // línea corta hacia el texto, ni desde debajo del texto.
+    for from in [
+        Point::new(400.0, 8.0),
+        Point::new(300.0, 30.0),
+        Point::new(20.0, 100.0),
+    ] {
+        let mut events = drag(from, Point::new(5.0, 8.0));
+        events.push(ctrl_c(from));
+        let (out, _) = run(&mut renderer, two, None, &events);
+        assert_eq!(out, [], "arrastrar desde {from:?} no debe seleccionar");
+    }
 
     // Sin selección, ni Ctrl+C ni el botón derecho publican (el derecho sigue al padre).
     let (out, _) = run(

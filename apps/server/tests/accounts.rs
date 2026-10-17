@@ -1083,3 +1083,77 @@ async fn health_over_tcp(server: &common::Running) -> Value {
         .to_bytes();
     serde_json::from_slice(&body).expect("JSON")
 }
+
+/// Una solicitud de amistad nueva le llega en vivo a quien la recibe (con el nombre de quien la
+/// pide); aceptar una que ya existía en sentido contrario no avisa de otra.
+#[tokio::test]
+async fn friend_requests_reach_the_recipient_live() {
+    let server = start(|_| {}).await;
+    let admin = server.admin().await;
+    let (_ana_id, ana) = server.user(&admin, "ana").await;
+    let (bea_id, bea) = server.user(&admin, "bea").await;
+    let ana_api = server.api_with(&ana.token);
+    let bea_api = server.api_with(&bea.token);
+    let (_bea_endpoint, mut bea_signal) = server.signal(&bea_id, &bea.token).await;
+    ana_api.add_friend("bea").await.expect("solicitud");
+    let requested = next_matching(&mut bea_signal, |message| match message {
+        SignalMessage::FriendRequested {
+            from_user,
+            from_name,
+        } => Some((from_user, from_name)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(requested, (ana.user.id, "ana (prueba)".to_owned()));
+    // Repetirla no vuelve a avisar: el aviso siguiente que recibe bea es el de carla.
+    let (_carla_id, carla) = server.user(&admin, "carla").await;
+    let again = ana_api.add_friend("bea").await.expect("repetida");
+    assert!(!again.accepted);
+    server
+        .api_with(&carla.token)
+        .add_friend("bea")
+        .await
+        .expect("solicitud de carla");
+    let requested = next_matching(&mut bea_signal, |message| match message {
+        SignalMessage::FriendRequested { from_user, .. } => Some(from_user),
+        _ => None,
+    })
+    .await;
+    assert_eq!(requested, carla.user.id);
+    // bea pide a su vez: quedan amigos (sin otra solicitud que avisar).
+    let result = bea_api.add_friend("ana").await.expect("solicitud");
+    assert!(result.accepted);
+}
+
+/// Cada cuenta pide amistad como mucho `MAX_FRIEND_REQUESTS` veces por minuto (también a nombres
+/// que no existen: así tampoco se recorren los nombres de usuario); después, `429`.
+#[tokio::test]
+async fn friend_requests_have_a_cap_per_minute() {
+    let server = start(|_| {}).await;
+    let admin = server.admin().await;
+    let (_ana_id, ana) = server.user(&admin, "ana").await;
+    let (_bea_id, bea) = server.user(&admin, "bea").await;
+    let ana_api = server.api_with(&ana.token);
+    let mut answered = 0;
+    let limited = loop {
+        match ana_api.add_friend(&format!("nadie{answered}")).await {
+            Err(TransportError::Api { status: 404, .. }) => answered += 1,
+            Err(TransportError::Api { status, code, .. }) => break (status, code),
+            other => panic!("respuesta inesperada: {other:?}"),
+        }
+        assert!(answered < 64, "sin tope");
+    };
+    assert!(answered > 0);
+    assert_eq!(limited, (429, "too_many_requests".to_owned()));
+    // Una solicitud de verdad, también limitada; otra cuenta no hereda el tope.
+    assert!(matches!(
+        ana_api.add_friend("bea").await,
+        Err(TransportError::Api { status: 429, .. })
+    ));
+    let result = server
+        .api_with(&bea.token)
+        .add_friend("ana")
+        .await
+        .expect("bea sí");
+    assert!(!result.accepted);
+}
