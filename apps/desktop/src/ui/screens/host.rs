@@ -2898,6 +2898,15 @@ fn room_header<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
                 room.code.as_ref().map(|_| on(Msg::CopyCode)),
             ),
             ui::button_with(
+                Kind::Normal,
+                t!("app-diagnostico"),
+                Some(Icon::Stethoscope),
+                Some(Message::Diagnostics(
+                    crate::ui::screens::diagnostics::Msg::Open,
+                )),
+            )
+            .into(),
+            ui::button_with(
                 Kind::Destructive,
                 t!("host-cerrar-la-sala"),
                 Some(Icon::Close),

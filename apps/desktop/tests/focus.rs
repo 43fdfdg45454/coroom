@@ -36,8 +36,8 @@ const EXPECTED: &[(&str, &[&str])] = &[
         ],
     ),
     ("05-inicio", &["room-code"]),
-    ("07-agregar-amigo", &["room-code", "friend-name"]),
-    ("16-ajustes-cuenta", &["local-port"]),
+    ("07-agregar-amigo", &["friend-name"]),
+    ("16-ajustes-servidor", &["local-port"]),
 ];
 
 #[test]

@@ -27,7 +27,7 @@ use iced_widget::{column, container, row};
 use super::avatars;
 use super::notify;
 use super::screens::{
-    chat, diagnostics, friends, guest, home, host, login, settings as settings_screen,
+    account, chat, diagnostics, friends, guest, home, host, login, settings as settings_screen,
 };
 use super::settings::{ServerEntry, Settings, SoundEvent, ThemeChoice};
 use super::system::SystemAppearance;
@@ -139,17 +139,55 @@ impl<T> Load<T> {
     }
 }
 
-/// Páginas bajo la cabecera.
+/// Páginas bajo la cabecera: los destinos del riel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Page {
-    /// Inicio: compartir, entrar con código, invitaciones y amigos.
+    /// Inicio: compartir, entrar con código, la bandeja y quién está en línea.
     #[default]
     Home,
-    /// Compartir (anfitrión): preparar la sala y, abierta, la sala misma.
+    /// Amigos: la lista por estado, las solicitudes y «Agregar amigo».
+    Friends,
+    /// Sala: sin sala, Compartir (prepararla); abierta, la sala misma.
     Host,
     /// Ajustes.
     Settings,
+    /// Cuenta: perfil, avatar, servidor, dispositivos y números de seguridad.
+    Account,
 }
+
+impl Page {
+    /// Todas, en el orden del riel (arriba Inicio, Amigos y Sala; abajo Ajustes y Cuenta).
+    pub const ALL: [Page; 5] = [
+        Page::Home,
+        Page::Friends,
+        Page::Host,
+        Page::Settings,
+        Page::Account,
+    ];
+
+    /// Posición en el riel: la página nueva entra desde abajo si está más abajo que la de antes.
+    pub fn order(self) -> usize {
+        match self {
+            Page::Home => 0,
+            Page::Friends => 1,
+            Page::Host => 2,
+            Page::Settings => 3,
+            Page::Account => 4,
+        }
+    }
+}
+
+/// El último cambio de página, para la entrada de la nueva.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageChange {
+    /// Cuándo.
+    pub at: Instant,
+    /// Si la nueva está más abajo en el riel (entra desde abajo) o más arriba.
+    pub from_below: bool,
+}
+
+/// Cuántas páginas recuerda «atrás» (`Alt+←`).
+const HISTORY: usize = 16;
 
 /// Estado del servidor para la insignia de la cabecera (lo mide la sala de espera).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -180,8 +218,12 @@ pub enum Shortcut {
     Settings,
     /// `F11`.
     Fullscreen,
-    /// `Esc`.
+    /// `Esc`: cierra la capa de arriba.
     Escape,
+    /// `Ctrl+1`, `Ctrl+2` y `Ctrl+3`: Inicio, Amigos y Sala.
+    Go(Page),
+    /// `Alt+←` o el botón «atrás» del ratón: un nivel atrás.
+    Back,
 }
 
 /// Lo que ha llegado de la red o de una sesión (lo envía el backend).
@@ -420,8 +462,6 @@ pub enum Message {
     SignOut,
     /// Volver a la lista de servidores.
     SwitchServer,
-    /// Abrir o cerrar el menú de la cuenta.
-    ToggleAccountMenu,
     /// Inicio de sesión.
     Login(login::Msg),
     /// Inicio.
@@ -434,7 +474,9 @@ pub enum Message {
     Guest(guest::Msg),
     /// Ajustes.
     Settings(settings_screen::Msg),
-    /// El avatar propio (Ajustes → Cuenta).
+    /// Cuenta.
+    Account(account::Msg),
+    /// El avatar propio (Cuenta).
     Avatar(avatars::Msg),
     /// Diagnóstico (encima de cualquier pantalla).
     Diagnostics(diagnostics::Msg),
@@ -823,8 +865,17 @@ pub struct App {
     pub dark: Palette,
     /// Pantalla.
     pub screen: Screen,
-    /// Página de la barra lateral.
+    /// Página del riel.
     pub page: Page,
+    /// El último cambio de página (la nueva entra deslizándose).
+    pub page_change: Option<PageChange>,
+    /// Las páginas de antes, para volver con `Alt+←` (la última, la más reciente).
+    pub history: Vec<Page>,
+    /// Tamaño lógico de la ventana (lo pone la ventana): con ella ancha, el riel enseña los
+    /// nombres.
+    pub window: iced_core::Size,
+    /// Desde cuándo se comparte la pantalla (el punto de «Sala» late una vez al empezar).
+    pub live_since: Option<Instant>,
     /// Cuenta.
     pub account: Option<AccountInfo>,
     /// Amigos (Inicio, Amigos y el anfitrión los usan).
@@ -845,6 +896,8 @@ pub struct App {
     pub guest: Option<guest::State>,
     /// Ajustes.
     pub settings_page: settings_screen::State,
+    /// Cuenta.
+    pub account_page: account::State,
     /// Diagnóstico (se abre encima de cualquier pantalla).
     pub diagnostics: diagnostics::State,
     /// Chat de la sala abierta o en la que se está.
@@ -862,7 +915,8 @@ pub struct App {
     settings_dirty: Option<Instant>,
     /// Diálogo abierto.
     pub dialog: Option<Dialog>,
-    /// Menú de la cuenta abierto.
+    /// Un menú abierto sobre la página (`Esc` lo cierra). El de la cuenta pasó a ser la página
+    /// Cuenta; el invitado todavía lo cierra al entrar en una sala.
     pub account_menu: bool,
     /// A pantalla completa.
     pub fullscreen: bool,
@@ -899,6 +953,10 @@ impl App {
             fonts,
             screen: Screen::Login,
             page: Page::Home,
+            page_change: None,
+            history: Vec::new(),
+            window: iced_core::Size::new(1180.0, 780.0),
+            live_since: None,
             account: None,
             friends: Load::Idle,
             usage: None,
@@ -909,6 +967,7 @@ impl App {
             host: host::State::default(),
             guest: None,
             settings_page: settings_screen::State::default(),
+            account_page: account::State::default(),
             diagnostics: diagnostics::State::default(),
             chat: chat::State::default(),
             notify: notify::State::default(),
@@ -1022,6 +1081,11 @@ impl App {
         self.toasts.iter().any(|toast| {
             toast.leaving_at.is_some() || self.now.duration_since(toast.shown_at) < enter
         }) || self.overlay_shown() < 1.0
+            || self.page_entered() < 1.0
+            || self.live_pulse().is_some()
+            || home::animating(self)
+            || account::animating(self)
+            || friends::animating(self)
             || self.login.probe.is_checking()
             || self.guest.as_ref().is_some_and(guest::State::animating)
             || self.host.starting
@@ -1105,13 +1169,102 @@ impl App {
     /// Reduce un mensaje.
     pub fn update(&mut self, message: Message) -> Vec<Effect> {
         let had_overlay = self.overlay_open();
+        let (screen, page) = (self.screen, self.page);
+        let sharing = self.sharing_screen();
+        let handing_to = self.host.handoff.as_ref().map(|(_, name)| name.clone());
+        let back = matches!(message, Message::Shortcut(Shortcut::Back));
         let effects = self.reduce(message);
         match (had_overlay, self.overlay_open()) {
             (false, true) => self.overlay_since = Some(self.now),
             (_, false) => self.overlay_since = None,
             _ => {}
         }
+        if self.screen == Screen::Main && self.page != page {
+            self.page_change = Some(PageChange {
+                at: self.now,
+                from_below: self.page.order() > page.order(),
+            });
+            if screen == Screen::Main && !back {
+                self.history.retain(|known| *known != page);
+                self.history.push(page);
+                if self.history.len() > HISTORY {
+                    self.history.remove(0);
+                }
+            }
+        }
+        if self.account.is_none() {
+            self.history.clear();
+        }
+        if !sharing && self.sharing_screen() {
+            self.live_since = Some(self.now);
+        } else if !self.sharing_screen() {
+            self.live_since = None;
+        }
+        self.role_changed(screen, handing_to);
         effects
+    }
+
+    /// Un cambio de rol (te pasan la sala o se la pasas a otro) no se siente como un salto: el
+    /// riel y la cabecera cambian y un aviso dice qué pasó.
+    fn role_changed(&mut self, screen: Screen, handing_to: Option<String>) {
+        match (screen, self.screen) {
+            (Screen::Guest, Screen::Main) if self.guest.is_none() && self.host.room.is_some() => {
+                self.toast(Tone::Success, t!("app-ahora-eres-el-anfitrion"));
+            }
+            (Screen::Main, Screen::Guest) if self.guest.is_some() => {
+                if let Some(name) = handing_to {
+                    self.toast(Tone::Info, t!("app-ahora-eres-invitado", name = name));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Lo que lleva de su entrada la página nueva (0 a 1, con su curva).
+    fn page_entered(&self) -> f32 {
+        let Some(change) = self.page_change else {
+            return 1.0;
+        };
+        let token = coroom_ui::motion::Token::Screen;
+        let duration = self.motion().duration(token);
+        if duration.is_zero() {
+            return 1.0;
+        }
+        let t = (self.now.duration_since(change.at).as_secs_f32() / duration.as_secs_f32())
+            .clamp(0.0, 1.0);
+        if t >= 1.0 {
+            1.0
+        } else {
+            token.easing().value(t)
+        }
+    }
+
+    /// Desplazamiento vertical de la página que entra: 36 px desde abajo (o desde arriba) hasta su
+    /// sitio. Solo se dibuja desplazada: los clics van a lo que se ve.
+    pub fn page_offset(&self) -> f32 {
+        let entered = self.page_entered();
+        if entered >= 1.0 {
+            return 0.0;
+        }
+        let distance = self.motion().slide(coroom_ui::tokens::motion::SLIDE);
+        let side = match self.page_change {
+            Some(PageChange {
+                from_below: false, ..
+            }) => -1.0,
+            _ => 1.0,
+        };
+        side * distance * (1.0 - entered)
+    }
+
+    /// El latido del punto «en vivo» de «Sala» al empezar a compartir (0 a 1), mientras dura.
+    pub fn live_pulse(&self) -> Option<f32> {
+        let since = self.live_since?;
+        let duration = self.motion().duration(coroom_ui::motion::Token::Moment);
+        if duration.is_zero() || self.motion().is_reduced() {
+            return None;
+        }
+        let t = self.now.duration_since(since).as_secs_f32() / duration.as_secs_f32();
+        (t < 1.0).then_some(t.max(0.0))
     }
 
     /// Si hay un diálogo (o el diagnóstico) encima de todo.
@@ -1236,16 +1389,13 @@ impl App {
                 }
                 self.switch_server()
             }
-            Message::ToggleAccountMenu => {
-                self.account_menu = !self.account_menu;
-                Vec::new()
-            }
             Message::Login(msg) => login::update(self, msg),
             Message::Home(msg) => home::update(self, msg),
             Message::Friends(msg) => friends::update(self, msg),
             Message::Host(msg) => host::update(self, msg),
             Message::Guest(msg) => guest::update(self, msg),
             Message::Settings(msg) => settings_screen::update(self, msg),
+            Message::Account(msg) => account::update(self, msg),
             Message::Avatar(msg) => avatars::update(self, msg),
             Message::Diagnostics(msg) => diagnostics::update(self, msg),
             Message::Chat(msg) => chat::update(self, msg),
@@ -1328,7 +1478,7 @@ impl App {
         self.page = page;
         let mut effects = Vec::new();
         match page {
-            Page::Home if !self.friends.is_loading() => {
+            Page::Home | Page::Friends if !self.friends.is_loading() => {
                 self.friends = match std::mem::take(&mut self.friends) {
                     Load::Loaded(friends) => Load::Loaded(friends),
                     _ => Load::Loading,
@@ -1337,6 +1487,7 @@ impl App {
             }
             Page::Settings => effects.extend(settings_screen::on_open(self)),
             Page::Host if !self.host.refreshing => effects.extend(host::refresh(self)),
+            Page::Account => effects.extend(account::on_open(self)),
             _ => {}
         }
         effects.extend(self.preview_visibility());
@@ -1399,6 +1550,14 @@ impl App {
                 }
             }
             Shortcut::Fullscreen => vec![Effect::SetFullscreen(!self.fullscreen)],
+            Shortcut::Go(page) => {
+                if self.screen == Screen::Main && self.dialog.is_none() {
+                    self.navigate(page)
+                } else {
+                    Vec::new()
+                }
+            }
+            Shortcut::Back => self.back(),
             Shortcut::Escape => {
                 if self.dialog.take().is_some() {
                     return Vec::new();
@@ -1413,6 +1572,12 @@ impl App {
                 if self.chat.takes_escape() {
                     return chat::update(self, chat::Msg::Escape);
                 }
+                if self.screen == Screen::Main
+                    && self.page == Page::Friends
+                    && self.friends_page.adding
+                {
+                    return friends::update(self, friends::Msg::ToggleAdd);
+                }
                 if self.fullscreen {
                     return vec![Effect::SetFullscreen(false)];
                 }
@@ -1424,6 +1589,31 @@ impl App {
                 }
                 Vec::new()
             }
+        }
+    }
+
+    /// Un nivel atrás (`Alt+←`, el botón «atrás» del ratón): en Entrar, el paso anterior; en las
+    /// páginas, la de antes (o Inicio). Con un diálogo encima, nada: primero se cierra.
+    fn back(&mut self) -> Vec<Effect> {
+        if self.overlay_open() {
+            return Vec::new();
+        }
+        match self.screen {
+            Screen::Login => login::back(self),
+            Screen::Main => {
+                let page = self.page;
+                while let Some(previous) = self.history.pop() {
+                    if previous != page {
+                        return self.navigate(previous);
+                    }
+                }
+                if page == Page::Home {
+                    Vec::new()
+                } else {
+                    self.navigate(Page::Home)
+                }
+            }
+            Screen::Guest => Vec::new(),
         }
     }
 
@@ -1754,59 +1944,55 @@ impl App {
         self.motion().exit_duration(coroom_ui::motion::Token::Panel)
     }
 
-    /// Cabecera y página; el menú de la cuenta, desplegado bajo la cabecera.
+    /// Cabecera arriba y, debajo, el riel y la página (que entra deslizándose al cambiar).
     fn shell(&self) -> Element<'_, Message> {
+        use coroom_ui::animate::Shift;
         let page: Element<'_, Message> = match self.page {
             Page::Home => home::view(self),
+            Page::Friends => friends::view(self),
             Page::Host => host::view(self),
             Page::Settings => settings_screen::view(self),
+            Page::Account => account::view(self),
         };
+        // La página, siempre dentro del mismo desplazamiento (cero en reposo) y recortada: al
+        // entrar no se dibuja sobre la cabecera ni el riel.
+        let page = container(Shift::new(
+            container(page)
+                .id(iced_widget::Id::new(PAGE_ID))
+                .width(Length::Fill)
+                .height(Length::Fill),
+            iced_core::Vector::new(0.0, self.page_offset()),
+        ))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .clip(true);
         // Una línea fina por encima y por debajo de la cabecera, que además lleva el tono de las
         // tarjetas y más aire vertical: con la barra de título del sistema (KDE) encima, del mismo
         // gris que la barra lateral, las dos se leían como una sola barra gruesa con el título
         // pegado arriba.
-        let shell = column![
+        column![
             iced_widget::rule::horizontal(1),
             self.headerbar(),
             iced_widget::rule::horizontal(1),
-            page
+            row![self.rail(), iced_widget::rule::vertical(1), page].height(Length::Fill)
         ]
-        .height(Length::Fill);
-        // Siempre una pila de dos capas, con el menú o sin él: si la raíz cambiara de tipo, iced
-        // tiraría el estado de la página (su desplazamiento, el foco) al abrir o cerrar el menú.
-        let menu: Element<'_, Message> = if self.account_menu {
-            iced_widget::opaque(
-                iced_widget::mouse_area(
-                    container(iced_widget::opaque(self.account_menu_view()))
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .align_x(iced_core::alignment::Horizontal::Right)
-                        .align_y(iced_core::alignment::Vertical::Top)
-                        .padding(Padding {
-                            top: HEADERBAR_HEIGHT + 5.0,
-                            right: 12.0,
-                            bottom: 0.0,
-                            left: 0.0,
-                        }),
-                )
-                .on_press(Message::ToggleAccountMenu),
-            )
-        } else {
-            iced_widget::Space::new().width(0).height(0).into()
-        };
-        iced_widget::stack![shell, menu].into()
+        .height(Length::Fill)
+        .into()
     }
 
-    /// Título de la página para la cabecera (`None` en Inicio: va la marca).
-    pub fn page_title(&self) -> Option<&'static str> {
+    /// Título de la página para la cabecera.
+    pub fn page_title(&self) -> &'static str {
         match self.page {
-            Page::Home => None,
-            Page::Host => Some(t!("app-compartir")),
-            Page::Settings => Some(t!("app-ajustes")),
+            Page::Home => t!("app-inicio"),
+            Page::Friends => t!("app-amigos"),
+            Page::Host if self.host.is_open() => t!("app-sala"),
+            Page::Host => t!("app-compartir"),
+            Page::Settings => t!("app-ajustes"),
+            Page::Account => t!("app-cuenta"),
         }
     }
 
-    /// Subtítulo bajo el título de la cabecera (Ajustes: «Se guardan al cambiarlos»).
+    /// Subtítulo junto al título de la cabecera (Ajustes: «Se guardan al cambiarlos»).
     pub fn page_subtitle(&self) -> Option<&'static str> {
         match self.page {
             Page::Settings => Some(settings_screen::subtitle()),
@@ -1865,135 +2051,272 @@ impl App {
         }
     }
 
-    /// Cabecera: atrás y título (o la marca) a la izquierda; a la derecha la insignia del
-    /// servidor, «En vivo» si se comparte desde otra página, Ajustes y la cuenta.
+    /// Cabecera: el título de la página a la izquierda y la insignia del servidor a la derecha
+    /// (un clic abre el diagnóstico). Los destinos, la sala en vivo y la cuenta están en el riel.
     fn headerbar(&self) -> Element<'_, Message> {
-        use coroom_ui::icon::{Icon, icon_with};
-        use coroom_ui::style::{ContainerClass, SvgClass};
+        use coroom_ui::style::ContainerClass;
         use iced_widget::button;
-        let mut left = row![].spacing(8).align_y(Alignment::Center);
-        match self.page_title() {
-            None => {
-                left = left.push(icon_with(Icon::RadioTower, BRAND_ICON, SvgClass::Accent));
-                left = left.push(ui::heading("coroom"));
-            }
-            Some(title) => {
-                left = left.push(ui::icon_button(
-                    Icon::ArrowLeft,
-                    t!("app-inicio"),
-                    Some(Message::Navigate(Page::Home)),
-                ));
-                // El subtítulo va al lado del título y no debajo: en dos líneas no cabría con aire
-                // en el alto de la cabecera.
-                left = left.push(ui::heading(title));
-                if let Some(subtitle) = self.page_subtitle() {
-                    left = left.push(ui::caption(subtitle));
-                }
-            }
+        let mut left = row![ui::heading(self.page_title())]
+            .spacing(8)
+            .align_y(Alignment::Center);
+        // El subtítulo va al lado del título y no debajo: en dos líneas no cabría con aire en el
+        // alto de la cabecera.
+        if let Some(subtitle) = self.page_subtitle() {
+            left = left.push(ui::caption(subtitle));
         }
-        let server = button(self.server_badge())
-            .padding(0)
-            .class(coroom_ui::style::ButtonClass::Flat)
-            .on_press(Message::Diagnostics(diagnostics::Msg::Open));
-        let mut right = row![server].spacing(8).align_y(Alignment::Center);
-        if self.host.is_open() && self.page != Page::Host {
-            right = right.push(
-                button(ui::status_badge(Tone::Success, t!("app-en-vivo")))
-                    .padding(0)
-                    .class(coroom_ui::style::ButtonClass::Flat)
-                    .on_press(Message::Navigate(Page::Host)),
-            );
-        }
-        right = right.push(ui::icon_button(
-            Icon::Settings,
-            t!("app-ajustes"),
-            (self.page != Page::Settings).then_some(Message::Navigate(Page::Settings)),
-        ));
-        if let Some(account) = &self.account {
-            right = right.push(
-                button(super::avatars::view(
-                    self,
-                    &account.display_name,
-                    account.avatar,
-                    28.0,
-                ))
-                .padding(2)
+        let server = ui::with_tooltip(
+            button(self.server_badge())
+                .padding(0)
                 .class(coroom_ui::style::ButtonClass::Flat)
-                .on_press(Message::ToggleAccountMenu),
-            );
-        }
+                .on_press(Message::Diagnostics(diagnostics::Msg::Open)),
+            t!("app-abrir-el-diagnostico"),
+        );
         container(
-            row![left, ui::fill(), right]
+            row![left, ui::fill(), server]
                 .align_y(Alignment::Center)
                 .width(Length::Fill),
         )
         // Centrado en vertical: sin `center_y`, la fila (del alto de un botón) quedaba arriba,
         // pegada a la barra de título del sistema.
-        .padding(Padding::from([0.0, coroom_ui::tokens::space::S]))
+        .padding(Padding::from([0.0, coroom_ui::tokens::space::M]))
         .center_y(Length::Fixed(HEADERBAR_HEIGHT))
         .class(ContainerClass::Headerbar)
         .into()
     }
 
-    /// Menú de la cuenta: quién eres y en qué servidor, cambiar de servidor y cerrar sesión.
-    fn account_menu_view(&self) -> Element<'_, Message> {
+    /// El riel: Inicio, Amigos y Sala arriba; Ajustes y Cuenta abajo y, con la sala abierta, el
+    /// micrófono y las peticiones de entrada encima de ellos.
+    fn rail(&self) -> Element<'_, Message> {
         use coroom_ui::icon::{Icon, icon_with};
-        use coroom_ui::style::{ButtonClass, ContainerClass, SvgClass};
-        use iced_core::text::Wrapping;
-        use iced_widget::button;
-        let Some(account) = &self.account else {
-            return ui::gap(0.0);
-        };
-        let who = row![
-            super::avatars::view(self, &account.display_name, account.avatar, 32.0),
-            column![
-                ui::strong(account.display_name.as_str()),
-                ui::caption(account.host())
-            ]
-            .spacing(2)
-        ]
-        .spacing(10)
-        .align_y(Alignment::Center);
-        let item = |label: &'static str, icon: Icon, destructive: bool, message: Message| {
-            let (class, tint) = if destructive {
-                (ButtonClass::DestructiveFlat, SvgClass::Tone(Tone::Error))
-            } else {
-                (ButtonClass::Flat, SvgClass::Text)
-            };
-            button(
-                row![
-                    icon_with(icon, 18.0, tint),
-                    ui::strong(label).wrapping(Wrapping::None)
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
+        use coroom_ui::style::SvgClass;
+        use ui::RailItem;
+        let wide = ui::rail_is_wide(self.window.width);
+        let glyph = |page: Page, icon: Icon| -> Element<'_, Message> {
+            icon_with(
+                icon,
+                RAIL_ICON,
+                if self.page == page {
+                    SvgClass::Accent
+                } else {
+                    SvgClass::Secondary
+                },
             )
-            .padding(Padding::from([8.0, 10.0]))
-            .width(Length::Fill)
-            .class(class)
-            .on_press(message)
         };
-        container(
-            column![
-                container(who).padding(Padding::from([6.0, 10.0])),
-                item(
-                    t!("app-cambiar-de-servidor"),
-                    Icon::Server,
-                    false,
-                    Message::SwitchServer
+        let item = |page: Page, icon: Icon, label: &'static str, keys: &'static str| RailItem {
+            glyph: glyph(page, icon),
+            label: label.to_owned(),
+            tip: t!("app-destino-atajo", destino = label, atajo = keys),
+            mark: None,
+            count: None,
+            on_press: Message::Navigate(page),
+        };
+        let room = self.host.room.as_ref();
+        let mut sala = item(Page::Host, Icon::ShareScreen, t!("app-sala"), "Ctrl+3");
+        if self.host.is_open() {
+            sala.mark = self.sharing_screen().then(|| self.live_mark());
+            let guests = room.map_or(0, |room| room.guests.len());
+            sala.count = (guests > 0).then(|| guests.to_string());
+            sala.tip = match guests {
+                0 => t!("app-sala-abierta-sin-invitados").to_owned(),
+                1 => t!("app-sala-abierta-un-invitado").to_owned(),
+                n => t!("app-sala-abierta-invitados", n = n),
+            };
+        }
+        let top = vec![
+            item(Page::Home, Icon::Home, t!("app-inicio"), "Ctrl+1"),
+            item(Page::Friends, Icon::Users, t!("app-amigos"), "Ctrl+2"),
+            sala,
+        ];
+        let account_glyph: Element<'_, Message> = match &self.account {
+            Some(account) => {
+                avatars::view(self, &account.display_name, account.avatar, RAIL_AVATAR)
+            }
+            None => glyph(Page::Account, Icon::UserRound),
+        };
+        let bottom = vec![
+            item(Page::Settings, Icon::Settings, t!("app-ajustes"), "Ctrl+,"),
+            RailItem {
+                glyph: container(account_glyph)
+                    .id(iced_widget::Id::new(RAIL_ACCOUNT_ID))
+                    .into(),
+                label: t!("app-cuenta").to_owned(),
+                tip: self.account.as_ref().map_or_else(
+                    || t!("app-cuenta").to_owned(),
+                    |account| t!("app-cuenta-de", name = account.display_name.as_str()),
                 ),
-                item(
-                    t!("app-cerrar-sesion"),
-                    Icon::LogOut,
-                    true,
-                    Message::SignOut
-                ),
+                mark: None,
+                count: None,
+                on_press: Message::Navigate(Page::Account),
+            },
+        ];
+        let header: Element<'_, Message> = if wide {
+            row![
+                icon_with(Icon::RadioTower, BRAND_ICON, SvgClass::Accent),
+                ui::heading("coroom")
             ]
-            .spacing(2),
-        )
-        .padding(4)
-        .width(Length::Fixed(260.0))
-        .class(ContainerClass::Dialog)
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            icon_with(Icon::RadioTower, BRAND_ICON, SvgClass::Accent)
+        };
+        let footer = room.map(|room| self.rail_footer(room, wide));
+        let selected = Page::ALL.iter().position(|page| *page == self.page);
+        container(ui::rail(header, top, footer, bottom, selected, wide))
+            .id(iced_widget::Id::new(RAIL_ID))
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// El punto rojo de «Sala» mientras se comparte: late una vez al empezar (un anillo que se
+    /// abre) y después queda quieto. En una caja fija: el latido no mueve nada.
+    fn live_mark(&self) -> Element<'_, Message> {
+        use coroom_ui::style::ContainerClass;
+        let dot = coroom_ui::tokens::size::DOT;
+        let ring: Element<'_, Message> = match self.live_pulse() {
+            Some(t) => {
+                let side = dot + (LIVE_MARK - dot) * t;
+                container(iced_widget::Space::new())
+                    .width(Length::Fixed(side))
+                    .height(Length::Fixed(side))
+                    .class(ContainerClass::AvatarRing(Tone::Error))
+                    .into()
+            }
+            None => iced_widget::Space::new().into(),
+        };
+        iced_widget::stack![
+            iced_widget::center(ring),
+            iced_widget::center(
+                container(iced_widget::Space::new())
+                    .width(Length::Fixed(dot))
+                    .height(Length::Fixed(dot))
+                    .class(ContainerClass::Dot(Tone::Error))
+            ),
+        ]
+        .width(Length::Fixed(LIVE_MARK))
+        .height(Length::Fixed(LIVE_MARK))
+        .into()
+    }
+
+    /// El pie del riel con la sala abierta: tu micrófono (silenciarte sin volver a la sala) y las
+    /// peticiones de entrada pendientes (llevan a la sala). Plegado, el icono del micrófono y un
+    /// número. Todo en cajas de tamaño fijo: un cambio de micrófono o una petición que llega no
+    /// mueve nada.
+    fn rail_footer<'a>(&'a self, room: &'a host::Room, wide: bool) -> Element<'a, Message> {
+        use coroom_ui::icon::{Icon, icon_with};
+        use coroom_ui::style::{ButtonClass, SvgClass};
+        use coroom_ui::tokens::{size, space};
+        let voice = &room.voice;
+        let muted = voice.mic_muted;
+        let (mic_icon, mic_label, mic_tip) = if !voice.enabled {
+            (
+                Icon::MicOff,
+                t!("app-sin-microfono"),
+                t!("app-sin-microfono-detalle"),
+            )
+        } else if muted {
+            (
+                Icon::MicOff,
+                t!("app-microfono-silenciado"),
+                t!("app-activar-tu-microfono"),
+            )
+        } else {
+            (
+                Icon::Mic,
+                t!("app-microfono-abierto"),
+                t!("app-silenciarte"),
+            )
+        };
+        let mic_tint = if voice.enabled && muted {
+            SvgClass::Tone(Tone::Error)
+        } else {
+            SvgClass::Text
+        };
+        let on_mic = voice
+            .enabled
+            .then(|| Message::Host(host::Msg::SelfMute(!muted)));
+        let requests = self.host.join_requests.len();
+        let requests_tip = match self.host.join_requests.as_slice() {
+            [] => String::new(),
+            [one] => t!("app-name-pide-entrar", name = one.name.as_str()),
+            many => t!("app-n-piden-entrar", n = many.len()),
+        };
+        let line =
+            |icon: Icon, tint: SvgClass, label: Element<'a, Message>| -> Element<'a, Message> {
+                row![icon_with(icon, size::ICON, tint), label]
+                    .spacing(space::XS)
+                    .align_y(Alignment::Center)
+                    .into()
+            };
+        let (mic, pending): (Element<'a, Message>, Option<Element<'a, Message>>) = if wide {
+            let mic = coroom_ui::animate::button(line(
+                mic_icon,
+                mic_tint,
+                ui::one_line(mic_label, ui::badge_text).into(),
+            ))
+            .width(Length::Fill)
+            .height(Length::Fixed(size::CONTROL))
+            .padding(Padding::from([0.0, space::S]))
+            .class(ButtonClass::Flat)
+            .on_press_maybe(on_mic);
+            let pending = (requests > 0).then(|| {
+                coroom_ui::animate::button(line(
+                    Icon::UserPlus,
+                    SvgClass::Accent,
+                    ui::one_line(requests_tip.clone(), ui::badge_text).into(),
+                ))
+                .width(Length::Fill)
+                .height(Length::Fixed(size::CONTROL))
+                .padding(Padding::from([0.0, space::S]))
+                .class(ButtonClass::Flat)
+                .on_press(Message::Navigate(Page::Host))
+                .into()
+            });
+            (ui::with_tooltip(mic, mic_tip), pending)
+        } else {
+            let mic = coroom_ui::animate::button(iced_widget::center(icon_with(
+                mic_icon,
+                size::ICON,
+                mic_tint,
+            )))
+            .width(Length::Fixed(size::CONTROL))
+            .height(Length::Fixed(size::CONTROL))
+            .padding(0)
+            .class(ButtonClass::Flat)
+            .press_scale(true)
+            .on_press_maybe(on_mic);
+            let pending = (requests > 0).then(|| {
+                ui::rail_tooltip(
+                    coroom_ui::animate::button(
+                        row![
+                            icon_with(Icon::UserPlus, size::ICON, SvgClass::Accent),
+                            ui::badge_text(requests.to_string())
+                        ]
+                        .spacing(2)
+                        .align_y(Alignment::Center),
+                    )
+                    .height(Length::Fixed(size::CONTROL))
+                    .padding(Padding::from([0.0, 4.0]))
+                    .class(ButtonClass::Flat)
+                    .on_press(Message::Navigate(Page::Host)),
+                    requests_tip.clone(),
+                )
+            });
+            (ui::rail_tooltip(mic, mic_tip), pending)
+        };
+        let width = if wide {
+            ui::RAIL_WIDE - 2.0 * space::XS
+        } else {
+            ui::RAIL_ITEM
+        };
+        column![
+            container(mic).id(iced_widget::Id::new(RAIL_MIC_ID)),
+            ui::reserved(width, size::CONTROL, pending),
+            iced_widget::rule::horizontal(1),
+        ]
+        .spacing(2)
+        .width(Length::Fixed(width))
+        .align_x(Alignment::Center)
         .into()
     }
 
@@ -2118,6 +2441,28 @@ impl App {
 /// Tamaño de la marca (el icono de la antena) en la cabecera.
 const BRAND_ICON: f32 = 22.0;
 
+/// Lado de los iconos de los destinos del riel.
+const RAIL_ICON: f32 = 20.0;
+
+/// Lado del avatar de «Cuenta» en el riel.
+const RAIL_AVATAR: f32 = 24.0;
+
+/// Lado de la caja del punto «en vivo» de «Sala» (lo que se abre el anillo al latir).
+const LIVE_MARK: f32 = 14.0;
+
+/// Identificador del contenedor de la página (las pruebas miden que no se mueva).
+pub const PAGE_ID: &str = "page";
+
+/// Identificador del riel.
+pub const RAIL_ID: &str = "rail";
+
+/// Identificador del micrófono del pie del riel.
+pub const RAIL_MIC_ID: &str = "rail-mic";
+
+/// Identificador del avatar de «Cuenta» en el riel (el último destino: si no se mueve, no se
+/// movió nada del riel).
+pub const RAIL_ACCOUNT_ID: &str = "rail-account";
+
 /// Alto de la cabecera en píxeles lógicos: la marca, centrada, queda a la misma distancia del
 /// borde de arriba (la barra de título del sistema) y de abajo que del borde izquierdo de la
 /// ventana (`space::S`), como en la barra de cabecera de GNOME.
@@ -2218,6 +2563,176 @@ pub(crate) mod tests {
         app.screen = Screen::Main;
         app.update(Message::Shortcut(Shortcut::Settings));
         assert_eq!(app.page, Page::Settings);
+    }
+
+    /// Una sesión iniciada en Inicio, como al entrar.
+    fn signed_in() -> App {
+        let mut app = app();
+        app.account = Some(account());
+        app.screen = Screen::Main;
+        app.page = Page::Home;
+        app
+    }
+
+    /// Ctrl+1/2/3 van a Inicio, Amigos y Sala; con un diálogo encima, nada se mueve debajo.
+    #[test]
+    fn ctrl_digits_go_to_the_rail_destinations() {
+        let mut app = signed_in();
+        app.update(Message::Shortcut(Shortcut::Go(Page::Friends)));
+        assert_eq!(app.page, Page::Friends);
+        assert!(
+            app.page_change.is_some_and(|change| change.from_below),
+            "Amigos está debajo de Inicio en el riel: entra desde abajo"
+        );
+        app.update(Message::Shortcut(Shortcut::Go(Page::Host)));
+        assert_eq!(app.page, Page::Host);
+        app.update(Message::Shortcut(Shortcut::Go(Page::Home)));
+        assert_eq!(app.page, Page::Home);
+        assert!(
+            app.page_change.is_some_and(|change| !change.from_below),
+            "Inicio está arriba: entra desde arriba"
+        );
+        app.dialog = Some(Dialog::SignOut);
+        app.update(Message::Shortcut(Shortcut::Go(Page::Friends)));
+        assert_eq!(app.page, Page::Home, "con un diálogo encima no se navega");
+        // Sin sesión (inicio de sesión), tampoco.
+        let mut login = crate::ui::app::tests::app();
+        login.update(Message::Shortcut(Shortcut::Go(Page::Friends)));
+        assert_eq!(login.screen, Screen::Login);
+    }
+
+    /// Alt+← (o el botón «atrás» del ratón) vuelve por donde se vino, sin repetir destinos, y
+    /// acaba en Inicio.
+    #[test]
+    fn back_walks_the_history_to_home() {
+        let mut app = signed_in();
+        app.update(Message::Navigate(Page::Friends));
+        app.update(Message::Navigate(Page::Settings));
+        app.update(Message::Navigate(Page::Account));
+        app.update(Message::Shortcut(Shortcut::Back));
+        assert_eq!(app.page, Page::Settings);
+        app.update(Message::Shortcut(Shortcut::Back));
+        assert_eq!(app.page, Page::Friends);
+        app.update(Message::Shortcut(Shortcut::Back));
+        assert_eq!(app.page, Page::Home);
+        assert!(app.update(Message::Shortcut(Shortcut::Back)).is_empty());
+        assert_eq!(app.page, Page::Home, "en Inicio no hay más atrás");
+        // Sin historial (otra sesión), atrás lleva a Inicio.
+        app.history.clear();
+        app.page = Page::Account;
+        app.update(Message::Shortcut(Shortcut::Back));
+        assert_eq!(app.page, Page::Home);
+        // Con el diagnóstico abierto, atrás no cambia la página de debajo.
+        app.update(Message::Navigate(Page::Friends));
+        app.diagnostics.open = true;
+        app.update(Message::Shortcut(Shortcut::Back));
+        assert_eq!(app.page, Page::Friends);
+    }
+
+    /// En el inicio de sesión, atrás es la «←» de la barra: de entrar a la lista de servidores y,
+    /// tras «Cambiar de servidor», a la cuenta abierta.
+    #[test]
+    fn back_on_the_login_steps() {
+        use crate::ui::screens::login::Step;
+        let mut app = app();
+        app.settings.servers.push(crate::ui::shots::server_entry());
+        app.login.step = Step::SignIn;
+        app.update(Message::Shortcut(Shortcut::Back));
+        assert_eq!(app.login.step, Step::Servers);
+        assert!(
+            app.update(Message::Shortcut(Shortcut::Back)).is_empty(),
+            "sin cuenta abierta no hay adónde volver"
+        );
+        assert_eq!(app.screen, Screen::Login);
+        app.account = Some(account());
+        assert_eq!(
+            app.update(Message::Shortcut(Shortcut::Back)),
+            [Effect::StartLobby]
+        );
+        assert_eq!(app.screen, Screen::Main);
+    }
+
+    /// Esc cierra la capa de arriba, de una en una: el diálogo, el diagnóstico y «Agregar
+    /// amigo».
+    #[test]
+    fn escape_closes_the_top_layer_first() {
+        let mut app = signed_in();
+        app.update(Message::Navigate(Page::Friends));
+        app.update(Message::Friends(friends::Msg::ToggleAdd));
+        app.diagnostics.open = true;
+        app.dialog = Some(Dialog::SignOut);
+        app.update(Message::Shortcut(Shortcut::Escape));
+        assert_eq!(app.dialog, None);
+        assert!(app.diagnostics.open, "una capa cada vez");
+        app.update(Message::Shortcut(Shortcut::Escape));
+        assert!(!app.diagnostics.open);
+        assert!(app.friends_page.adding);
+        app.update(Message::Shortcut(Shortcut::Escape));
+        assert!(!app.friends_page.adding, "Esc recoge «Agregar amigo»");
+        assert_eq!(app.page, Page::Friends, "y no cambia de página");
+    }
+
+    /// Navegar no cierra la sala: sigue abierta en cada destino y «Sala» vuelve a ella.
+    #[test]
+    fn the_room_stays_open_across_destinations() {
+        let mut app = app();
+        crate::ui::screens::host::shots::host_room(&mut app);
+        assert!(app.host.is_open());
+        for page in [Page::Home, Page::Friends, Page::Settings, Page::Account] {
+            let effects = app.update(Message::Navigate(page));
+            assert!(
+                !effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::StopHost)),
+                "{page:?}: {effects:?}"
+            );
+            assert!(app.host.is_open(), "{page:?}: la sala sigue");
+        }
+        app.update(Message::Shortcut(Shortcut::Go(Page::Host)));
+        assert_eq!(app.page, Page::Host);
+        assert!(app.host.room.is_some());
+        assert_eq!(app.page_title(), t!("app-sala"));
+    }
+
+    /// Al recibir la sala del anfitrión no hay salto sin explicar: un aviso dice que ahora eres
+    /// el anfitrión.
+    #[test]
+    fn taking_over_the_room_says_so() {
+        use coroom_session::remote::SessionEvent;
+        let mut app = app();
+        app.account = Some(account());
+        crate::ui::screens::guest::start(&mut app, "K7Q2MZ".into());
+        app.update(Message::Event(Event::GuestStarted(Ok(
+            crate::ui::video::VideoFeed::detached(),
+        ))));
+        app.update(Message::Event(Event::Guest(SessionEvent::Joined {
+            host_name: "Bea".to_owned(),
+            host_fingerprint: "b7".repeat(32),
+            safety_number: crate::ui::shots::safety(),
+        })));
+        app.update(Message::Event(Event::Guest(SessionEvent::HandoffOffered)));
+        app.update(Message::ConfirmDialog);
+        app.update(Message::Event(Event::HostStarted(Ok(
+            crate::ui::video::VideoFeed::detached(),
+        ))));
+        app.update(Message::Event(Event::Host(SessionEvent::RoomCreated {
+            code: "NEWRM2".into(),
+            fingerprint: "ab".repeat(32),
+        })));
+        app.toasts.clear();
+        app.update(Message::Event(Event::Guest(SessionEvent::MoveToRoom {
+            code: "NEWRM2".into(),
+            host_name: "Ana".into(),
+        })));
+        app.update(Message::Event(Event::GuestEnded(None)));
+        assert_eq!((app.screen, app.page), (Screen::Main, Page::Host));
+        assert!(
+            app.toasts
+                .iter()
+                .any(|toast| toast.text == t!("app-ahora-eres-el-anfitrion")),
+            "{:?}",
+            app.toasts
+        );
     }
 
     /// Aviso de versión nueva: la comprobación automática sale en el `Tick` cuando toca, el

@@ -8,7 +8,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
-use coroom_desktop::ui::shots::{SIZE, ShotRenderer, scenes};
+use coroom_desktop::ui::shots::{NARROW, SIZE, ShotRenderer, WIDE, scenes};
 
 fn write_png(dir: Option<&Path>, name: &str, width: u32, height: u32, rgba: &[u8]) {
     let Some(dir) = dir else { return };
@@ -46,7 +46,12 @@ fn every_screen_renders_in_light_and_dark() {
     assert_eq!(scenes.len() % 2, 0, "cada escena en claro y en oscuro");
     for scene in &scenes {
         let (width, height, rgba) = renderer.render(&scene.app, 1.0);
-        assert_eq!((width, height), SIZE);
+        let window = (
+            scene.app.window.width as u32,
+            scene.app.window.height as u32,
+        );
+        assert_eq!((width, height), window);
+        assert!([SIZE, NARROW, WIDE].contains(&window), "{}", scene.name);
         assert_eq!(rgba.len(), (width * height * 4) as usize);
         let colors = distinct_colors(&rgba);
         assert!(

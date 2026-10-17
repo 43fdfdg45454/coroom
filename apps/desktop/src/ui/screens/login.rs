@@ -4,6 +4,10 @@
 //! certificado, con "Confiar" si es autofirmado); inicio de sesión (usuario, contraseña y nombre de
 //! este dispositivo) o cuenta nueva con un código de invitación. Los errores del servidor se leen
 //! en línea, con su causa.
+//!
+//! Arriba, la misma barra que el resto de la aplicación (sin riel): «←» para volver un paso
+//! (también con Alt+← o el botón «atrás» del ratón, [`back`]) y el diagnóstico. La acción
+//! principal de cada paso va abajo a la derecha.
 
 use std::time::Instant;
 
@@ -489,18 +493,119 @@ pub fn view(app: &App) -> Element<'_, Message> {
             container(ui::banner(Tone::Error, error.as_str(), None)).max_width(size::NARROW + 80.0),
         );
     }
-    content = content.push(
-        container(body)
-            .max_width(size::NARROW + 80.0)
-            .width(Length::Fill),
-    );
-    scrollable(
+    // La lista de servidores, más ancha: el nombre y la dirección caben en una línea junto a la
+    // insignia y el menú.
+    let column_width = match state.step {
+        Step::Servers => size::NARROW + 200.0,
+        _ => size::NARROW + 80.0,
+    };
+    content = content.push(container(body).max_width(column_width).width(Length::Fill));
+    let body = scrollable(
         container(content)
             .padding(Padding::from([space::XL * 1.5, space::L]))
             .center_x(Length::Fill),
     )
-    .height(Length::Fill)
+    .height(Length::Fill);
+    column![
+        iced_widget::rule::horizontal(1),
+        header(app),
+        iced_widget::rule::horizontal(1),
+        body
+    ]
     .into()
+}
+
+/// Si hay un paso al que volver: a la cuenta abierta (desde «Cambiar de servidor») o a la lista
+/// de servidores.
+pub fn can_go_back(app: &App) -> bool {
+    match app.login.step {
+        Step::Servers => app.account.is_some() && !app.login.restoring,
+        Step::AddServer => !app.settings.servers.is_empty(),
+        Step::SignIn => !app.login.busy,
+    }
+}
+
+/// Vuelve un paso (la flecha de la barra, Alt+← o el botón «atrás» del ratón).
+pub fn back(app: &mut App) -> Vec<Effect> {
+    if !can_go_back(app) {
+        return Vec::new();
+    }
+    match app.login.step {
+        Step::Servers => stay_here(app),
+        _ => update(app, Msg::Back),
+    }
+}
+
+/// La barra de arriba: «←» (si hay adónde volver), la marca y el diagnóstico.
+fn header(app: &App) -> Element<'_, Message> {
+    let back = can_go_back(app).then(|| {
+        ui::icon_button(
+            Icon::ArrowLeft,
+            t!("pantalla-login-volver-atajo"),
+            Some(Message::Shortcut(crate::ui::app::Shortcut::Back)),
+        )
+    });
+    container(
+        row![
+            ui::slot(back),
+            icon_with(Icon::RadioTower, 20.0, SvgClass::Accent),
+            ui::heading("coroom"),
+            ui::fill(),
+            ui::with_tooltip(
+                ui::button_with(
+                    Kind::Flat,
+                    t!("app-diagnostico"),
+                    Some(Icon::Stethoscope),
+                    Some(Message::Diagnostics(
+                        crate::ui::screens::diagnostics::Msg::Open
+                    )),
+                ),
+                t!("app-abrir-el-diagnostico"),
+            ),
+        ]
+        .spacing(space::XS)
+        .align_y(Alignment::Center)
+        .width(Length::Fill),
+    )
+    .padding(Padding::from([0.0, space::M]))
+    .center_y(Length::Fixed(crate::ui::app::HEADERBAR_HEIGHT))
+    .class(coroom_ui::style::ContainerClass::Headerbar)
+    .into()
+}
+
+/// El menú «⋯» de la fila de un servidor (sin flecha: es el botón de «más» de GNOME). Elegir
+/// una opción no abre el servidor: el menú se come el clic.
+fn server_menu(server: &ServerEntry) -> Element<'_, Message> {
+    let menu = coroom_ui::release::release_to_pick(
+        iced_widget::pick_list(
+            vec![ServerAction::Forget(server.url.clone())],
+            None::<ServerAction>,
+            |action| match action {
+                ServerAction::Forget(url) => on(Msg::Forget(url)),
+            },
+        )
+        .placeholder("⋯")
+        .handle(iced_widget::pick_list::Handle::None)
+        .padding(Padding::from([6.0, 10.0]))
+        .text_size(coroom_ui::tokens::text::SECONDARY)
+        .font(coroom_ui::font::UI),
+    );
+    ui::with_tooltip(menu, t!("pantalla-login-mas-acciones"))
+}
+
+/// Lo que se puede hacer con un servidor de la lista (el menú «⋯» de su fila).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerAction {
+    /// Quitarlo de la lista.
+    Forget(String),
+}
+
+impl std::fmt::Display for ServerAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ServerAction::Forget(_) => f.write_str(t!("pantalla-login-olvidar-servidor")),
+        }
+    }
 }
 
 fn on(msg: Msg) -> Message {
@@ -532,11 +637,7 @@ fn servers(app: &App) -> Element<'_, Message> {
                     t!("pantalla-login-certificado-propio"),
                 ));
             }
-            trailing.push(ui::icon_button(
-                Icon::Close,
-                t!("pantalla-login-olvidar-este-servidor"),
-                Some(on(Msg::Forget(server.url.clone()))),
-            ));
+            trailing.push(server_menu(server));
             trailing.push(icon_with(Icon::ChevronRight, 18.0, SvgClass::Secondary));
             let line = ui::list_row(
                 Some(icon_with(Icon::Server, 22.0, SvgClass::Accent)),
@@ -552,22 +653,16 @@ fn servers(app: &App) -> Element<'_, Message> {
                 .into()
         })
         .collect();
-    let mut actions = row![];
-    if app.account.is_some() {
-        // Se llegó desde «Cambiar de servidor»: la cuenta sigue abierta.
-        actions = actions.push(ui::button_with(
+    // Volver a la cuenta abierta (si se llegó desde «Cambiar de servidor») es la «←» de la barra.
+    let actions = row![
+        ui::fill(),
+        ui::button_with(
             Kind::Normal,
-            t!("pantalla-login-volver"),
-            Some(Icon::ChevronLeft),
-            Some(on(Msg::StayHere)),
-        ));
-    }
-    let actions = actions.push(ui::fill()).push(ui::button_with(
-        Kind::Normal,
-        t!("pantalla-login-anadir-servidor"),
-        Some(Icon::Plus),
-        Some(on(Msg::AddServer)),
-    ));
+            t!("pantalla-login-anadir-servidor"),
+            Some(Icon::Plus),
+            Some(on(Msg::AddServer)),
+        )
+    ];
     column![
         ui::section(t!("pantalla-login-elige-un-servidor"), None, rows),
         actions
@@ -624,11 +719,9 @@ fn add_server(app: &App) -> Element<'_, Message> {
     }
     let ready = matches!(&state.probe, Probe::Done { probe, .. }
         if probe.untrusted.is_none() || state.trusted);
-    let mut actions = row![].spacing(space::XS).align_y(Alignment::Center);
-    if !app.settings.servers.is_empty() {
-        actions = actions.push(ui::flat(t!("pantalla-login-volver"), Some(on(Msg::Back))));
-    }
-    actions = actions.push(ui::fill());
+    let mut actions = row![ui::fill()]
+        .spacing(space::XS)
+        .align_y(Alignment::Center);
     actions = if ready {
         actions.push(ui::primary(
             t!("pantalla-login-continuar"),
@@ -829,9 +922,7 @@ fn sign_in(app: &App) -> Element<'_, Message> {
         )
         .on_input(|value| on(Msg::Device(value)))
         .error(state.errors.device.as_deref())
-        .hint(Some(t!(
-            "pantalla-login-aparece-en-ajustes-dispositivos-desde-donde"
-        )))
+        .hint(Some(t!("pantalla-login-aparece-en-cuenta-dispositivos")))
         .id("device"),
     ));
     let main: Element<'_, Message> = if state.busy {
@@ -857,13 +948,9 @@ fn sign_in(app: &App) -> Element<'_, Message> {
         )
         .into()
     };
-    let actions = row![
-        ui::flat(t!("pantalla-login-volver"), Some(on(Msg::Back))),
-        ui::fill(),
-        main
-    ]
-    .spacing(space::XS)
-    .align_y(Alignment::Center);
+    let actions = row![ui::fill(), main]
+        .spacing(space::XS)
+        .align_y(Alignment::Center);
     let switch = row![
         ui::fill(),
         ui::button_with(

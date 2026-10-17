@@ -958,6 +958,7 @@ pub struct Segments<'a, M> {
     content: Element<'a, M>,
     selected: Option<usize>,
     thumb: crate::style::ButtonClass,
+    stops: Option<Vec<usize>>,
 }
 
 impl<'a, M> Segments<'a, M> {
@@ -971,6 +972,27 @@ impl<'a, M> Segments<'a, M> {
             content: content.into(),
             selected,
             thumb,
+            stops: None,
+        }
+    }
+
+    /// Solo algunos hijos son segmentos (`stops`, sus índices en orden): los demás (un hueco que
+    /// separa dos grupos, un pie) no cuentan, y `selected` es la posición entre los segmentos. El
+    /// fondo va de un segmento al siguiente por encima de lo que hay entre ellos (el riel).
+    pub fn stops(mut self, stops: Vec<usize>) -> Self {
+        self.stops = Some(stops);
+        self
+    }
+
+    /// Los rectángulos de los segmentos entre los hijos de `layout`.
+    fn segment_bounds(&self, layout: Layout<'_>) -> Vec<Rectangle> {
+        let children: Vec<Rectangle> = layout.children().map(|child| child.bounds()).collect();
+        match &self.stops {
+            None => children,
+            Some(stops) => stops
+                .iter()
+                .filter_map(|index| children.get(*index).copied())
+                .collect(),
         }
     }
 }
@@ -1115,7 +1137,7 @@ impl<M> iced_core::Widget<M, Theme, Renderer> for Segments<'_, M> {
         let state = tree.state.downcast_ref::<SegmentsState>();
         state.motion.set(theme.motion);
         if state.selected.is_some() {
-            let segments: Vec<Rectangle> = layout.children().map(|child| child.bounds()).collect();
+            let segments = self.segment_bounds(layout);
             if let Some(bounds) = thumb_bounds(&segments, state.position()) {
                 let thumb = theme.button_style(self.thumb, iced_button::Status::Active);
                 renderer.fill_quad(

@@ -1,81 +1,77 @@
 # Textos de la pantalla «settings» (identificadores con el prefijo `settings-`; los comunes están en coroom.ftl).
 
 settings-se-guardan-al-cambiarlos = Se guardan al cambiarlos
-settings-video-esta-en-compartir = Lo de vídeo y calidad está en Compartir y en el panel de la sala.
-settings-en-vivo = En vivo
-settings-al-abrir-la-sala = Al abrir la sala
-settings-al-entrar-en-la-sala = Al entrar en la sala
+
+## Cuándo surte efecto un ajuste (la columna de etiquetas de cada fila)
+settings-al-momento = Al momento
 settings-en-la-proxima-sala = En la próxima sala
+settings-al-entrar = Al entrar
+
+## Comunes
 settings-copiar = Copiar
 settings-cambiar = Cambiar
 settings-cancelar = Cancelar
 settings-restablecer = Restablecer
-settings-reintentar = Reintentar
-settings-ver = Ver
 settings-como-anfitrion = Como anfitrión
 settings-como-invitado = Como invitado
 settings-quien-habla = Ver quién habla
 settings-quien-habla-ayuda = Quién habla, una fila por persona con su avatar, arriba a la izquierda del vídeo.
 
 ## Navegación
-settings-cuenta-y-servidor = Cuenta y servidor
+settings-servidor-y-red = Servidor y red
 settings-audio-y-voz = Audio y voz
+settings-video = Vídeo
 settings-sala = Sala
 settings-mandos = Mandos
+settings-atajos-de-teclado = Atajos de teclado
 settings-apariencia = Apariencia
 settings-acerca-de = Acerca de
 
-## Cuenta y servidor
-settings-el-servidor-no-responde = { $host } no responde a la señalización desde este equipo: hasta que vuelva, no ves a tus amigos ni puedes abrir salas ni entrar en ellas. Prueba que tengas red (o la VPN conectada), que el servidor esté encendido y que su cortafuegos deje pasar sus puertos. Diagnóstico dice qué falla.
-settings-abrir-diagnostico = Abrir diagnóstico
-settings-sin-sesion = Sin sesión
-settings-sin-sesion-texto = Inicia sesión en un servidor para ver tu cuenta y los equipos vinculados.
-settings-cuenta = Cuenta
-settings-usuario-en-este-equipo = { $username } · en { $device }
-settings-cerrar-sesion = Cerrar sesión
-settings-servidor-responde-en = Conectado · responde en { $rtt } ms
-settings-servidor-no-responde-corto = No responde
-settings-servidor-comprobando = Comprobando la conexión…
-settings-cambiar-de-servidor = Cambiar de servidor
-settings-certificado-del-servidor = Certificado del servidor
-settings-certificado-del-servidor-ayuda = La huella SHA-256 en la que confiaste al añadirlo. Si el servidor cambia de certificado, coroom te lo pregunta otra vez.
-settings-identidad-de-este-equipo = Identidad de este equipo
-settings-identidad-de-este-equipo-ayuda = Tu clave Ed25519: tus amigos ven esta huella al compartir contigo.
-settings-dispositivos-de-tu-cuenta = Dispositivos de tu cuenta
-settings-dispositivos-de-tu-cuenta-ayuda = Cada equipo con el que inicias sesión. Al desvincular uno, ya no puede entrar en salas hasta que vuelva a iniciar sesión.
-settings-cargando-los-dispositivos = Cargando los dispositivos de tu cuenta…
-settings-no-se-pudieron-cargar-los-dispositivos = No se pudieron cargar los dispositivos
-settings-este-equipo = Este equipo
-settings-desvincular = Desvincular
-settings-visto-huella = Visto { $seen } · huella { $short }…
+## Cuándo pasó algo (redondeado: no cambia cada segundo)
 settings-ahora-mismo = ahora mismo
 settings-hace-min = hace { $valor } min
 settings-hace-h = hace { $valor } h
 settings-ayer = ayer
 settings-hace-dias = hace { $days } días
+
+## Servidor y red
+settings-sin-sesion = Sin sesión
+settings-abrir-diagnostico = Abrir diagnóstico
+settings-sin-servidor-texto = Inicia sesión en un servidor para verlo aquí, con su certificado y el uso del relay.
+settings-servidor-conectado = Conectado
+settings-servidor-no-responde-corto = No responde
+settings-servidor-comprobando = Comprobando la conexión…
+settings-cambiar-de-servidor = Cambiar de servidor
+settings-certificado-del-servidor = Certificado del servidor
+settings-certificado-del-servidor-ayuda = La huella SHA-256 en la que confiaste al añadirlo. Si el servidor cambia de certificado, coroom te lo pregunta otra vez.
+settings-diagnostico = Diagnóstico
+settings-diagnostico-sin-respuesta = El servidor no responde desde este equipo: revisa que tengas red (o la VPN conectada) y que esté encendido. Diagnóstico dice qué falla.
+settings-diagnostico-ayuda = Prueba paso a paso la señalización, el relay y la conexión directa con este servidor, y dice qué falla.
+settings-uso-del-relay = Uso del relay este mes
+settings-uso-del-relay-ayuda = El relay reenvía el vídeo cuando la conexión directa entre equipos no es posible; al llegar a la cuota del mes, solo funciona la directa.
+settings-relay-consultando = Consultando el uso…
+settings-relay-sin-relay = Este servidor no tiene relay: solo funciona la conexión directa.
+settings-relay-uso = { $used } de { $quota } ({ $percent } %)
+settings-relay-sin-limite = { $used }, sin límite
+settings-relay-agotado = Has usado toda la cuota de este mes ({ $quota }): hasta el próximo, solo funciona la conexión directa.
 settings-red = Red
-settings-red-ayuda = Se aplican a la próxima sala que abras o en la que entres.
 settings-forzar-el-relay = Forzar el relay
 settings-forzar-el-relay-ayuda = Sin intentar la conexión directa: útil en redes que bloquean el UDP entre equipos. Añade algo de latencia y gasta cuota del relay.
 settings-abrir-el-puerto-en-el-router = Abrir el puerto en el router
 settings-abrir-el-puerto-en-el-router-ayuda = Pide al router (UPnP, NAT-PMP o PCP) que deje entrar la conexión directa. Si el router no lo admite, no cambia nada.
 settings-puerto-local = Puerto local
 settings-puerto-local-ayuda = Fíjalo si tu router reenvía un puerto a este equipo; vacío, el sistema elige.
-settings-puerto-udp = Puerto UDP
 settings-cualquiera = Cualquiera
 settings-un-puerto-de-1024-a-65535 = Un puerto de 1024 a 65535, o vacío para cualquiera
-settings-numeros-de-seguridad = Números de seguridad
-settings-numeros-de-seguridad-ayuda = Compáralos en persona o por otro canal: si coinciden, nadie se ha puesto en medio.
-settings-numeros-de-seguridad-vacio = Aparecen al entrar en una sala o recibir a alguien en la tuya.
-settings-numero-recortado = { $preview }…
 
 ## Audio y voz
 settings-dispositivos = Dispositivos
-settings-dispositivos-en-vivo = En vivo: la lista cambia al conectar o quitar uno
-settings-actualizado-hace = { $lead } · actualizado { $ago }
+settings-dispositivos-se-actualizan = La lista se actualiza sola al conectar o quitar un dispositivo
+settings-actualizado-hace = { $lead } · actualizada { $ago }
 settings-buscando-dispositivos = { $lead } · buscando dispositivos…
+settings-no-se-pudo-actualizar-la-lista = No se pudo actualizar la lista: { $err }. Se sigue viendo la anterior.
 settings-salida = Salida
-settings-salida-ayuda = Donde oyes el juego y la voz. Con una sala abierta, cambia al momento.
+settings-salida-ayuda = Donde oyes el juego, las voces y los avisos.
 settings-microfono = Micrófono
 settings-volumen-de-tu-voz = Volumen de tu voz
 settings-volumen-de-tu-voz-ayuda = Lo alto que te oyen los demás en la sala; también al probar el micrófono.
@@ -105,25 +101,34 @@ settings-audio-error-no-disponible = no está disponible ({ $detail })
 settings-audio-error-codec = falló el códec de audio ({ $detail })
 settings-audio-error-sistema = el sistema de audio dio un error ({ $detail })
 settings-audio-error-interno = error interno del audio
-settings-microfono-ayuda = El que lleva tu voz a la sala. Con una sala abierta, cambia al momento.
+settings-microfono-ayuda = El que lleva tu voz a la sala.
 settings-el-del-sistema = Predeterminado del sistema
 settings-el-del-sistema-con = Predeterminado del sistema ({ $name })
 settings-no-conectado = { $name } (no conectado)
 settings-no-se-pudieron-listar-los-dispositivos = No se pudieron listar los dispositivos: { $err }
 settings-supresion-de-ruido = Supresión de ruido
 settings-supresion-de-ruido-ayuda = Quita el ruido de fondo de tu micrófono (procesado de voz de WebRTC), como anfitrión y como invitado. La cancelación de eco va siempre.
-settings-voz-como-anfitrion = Voz · como anfitrión
+settings-tu-voz = Tu voz
 settings-compartir-mi-microfono = Compartir mi micrófono con la sala
-settings-compartir-mi-microfono-ayuda = Los invitados te oyen mientras la sala esté abierta.
-settings-voz-como-invitado = Voz · como invitado
+settings-compartir-mi-microfono-ayuda = Como anfitrión: los invitados te oyen mientras la sala esté abierta.
 settings-pulsar-para-hablar = Pulsar para hablar
-settings-pulsar-para-hablar-ayuda = Si está apagado, el micrófono va abierto mientras estés en la sala (lo silencias con Ctrl+Alt+{ $letter }).
+settings-pulsar-para-hablar-ayuda = Con la tecla { $key }, que cambias en Atajos de teclado. Apagado, el micrófono va abierto mientras estés en la sala y lo silencias con Ctrl+Alt+{ $letter }.
+settings-audio-del-juego = Audio del juego
+settings-volumen-del-juego = Volumen del juego
+settings-volumen-del-juego-ayuda = Lo alto que oyes el juego de la sala en la que entras, aparte de las voces.
+
+## Vídeo
+settings-calidad-por-defecto = Calidad por defecto
+settings-calidad-ayuda = Con la que se abre la sala; dentro de ella se puede cambiar al momento.
+settings-perfil = { $name }. { $help }
+settings-en-tu-pantalla = En tu pantalla
+settings-en-tu-pantalla-ayuda = Cómo ves el vídeo de los demás al entrar en su sala.
 settings-pulsa-una-tecla = Pulsa una tecla…
 settings-la-tecla-no-sirve-para-hablar = La tecla «{ $name }» no sirve para hablar
 
 ## Notificaciones
 settings-notificaciones = Notificaciones
-settings-avisos-volumen = Volumen
+settings-sonido = Sonido
 settings-volumen-de-los-avisos = Volumen de los avisos
 settings-volumen-de-los-avisos-ayuda = Suenan por la salida de «Audio y voz» y nunca llegan a la sala: los demás no los oyen.
 settings-avisos-en-la-sala = En la sala
@@ -179,7 +184,7 @@ settings-tono-sin-selector = No hay selector de ficheros en este sistema.
 settings-los-invitados-entran-callados = Los invitados entran callados
 settings-los-invitados-entran-callados-ayuda = Entran sin permiso de voz; se lo das a cada uno desde el panel de la sala.
 settings-chat-de-la-sala = Chat de la sala
-settings-chat-de-la-sala-ayuda = Como anfitrión y como invitado. El sonido de los mensajes está en Notificaciones.
+settings-chat-de-la-sala-ayuda = Como anfitrión y como invitado.
 settings-permiso-de-pantalla = Permiso de pantalla
 settings-permiso-recordado-pantalla = Recordado para compartir la pantalla
 settings-permiso-recordado-ventana = Recordado para compartir una ventana
@@ -191,6 +196,8 @@ settings-notificacion-del-escritorio = Notificación del escritorio con la venta
 settings-notificacion-del-escritorio-ayuda = Con el nombre de quien escribe y el texto; un clic trae la ventana con el chat abierto.
 settings-burbuja-sobre-el-video = Burbuja sobre el vídeo
 settings-burbuja-sobre-el-video-ayuda = Con el chat cerrado, el mensaje aparece unos segundos sobre el vídeo.
+settings-sonidos-de-la-interfaz = Sonidos de la interfaz
+settings-sonidos-de-la-interfaz-ayuda = Un sonido corto y suave al pulsar, abrir paneles y confirmar, aparte de los avisos. Solo los oyes tú y no suenan con el teclado y el ratón tomados.
 
 ## Mandos
 settings-mando-que-envias = Mando que envías
@@ -202,8 +209,12 @@ settings-ranura-preferida = Ranura preferida al dar mando
 settings-ranura-preferida-ayuda = La que se ofrece primero al dar el mando a un invitado.
 settings-la-primera-libre = La primera libre
 settings-ranura = Ranura { $slot }
-settings-atajos-del-invitado = Atajos del invitado
-settings-atajos-del-invitado-ayuda = Siempre con Ctrl+Alt, para no chocar con los del juego.
+
+## Atajos de teclado
+settings-atajos-ayuda = Los de la sala van siempre con Ctrl+Alt, para no chocar con los del juego. Con «Cambiar», pulsa la letra nueva.
+settings-atajo-en-la-sala = En la sala, como invitado
+settings-atajo-pulsar-para-hablar = En la sala, con pulsar para hablar encendido (Audio y voz)
+settings-atajo-en-toda-la-app = En toda la aplicación
 settings-atajo-inmersivo = Modo inmersivo o escritorio
 settings-atajo-soltar = Soltar el teclado y el ratón
 settings-atajo-panel-de-conexion = Panel de conexión
@@ -215,7 +226,6 @@ settings-atajo-mandos = Panel de mandos
 settings-pulsa-una-letra = Pulsa una letra…
 settings-los-atajos-usan-una-letra = Los atajos usan una letra con Ctrl+Alt
 settings-ya-es-otro-atajo = Ctrl+Alt+{ $letter } ya es otro atajo
-settings-atajos-de-la-aplicacion = Atajos de la aplicación
 settings-atajo-ajustes = Ajustes
 settings-atajo-pantalla-completa = Pantalla completa
 settings-atajo-cerrar-dialogos = Cerrar diálogos y paneles
@@ -239,7 +249,6 @@ settings-fuente-del-escritorio = { $family }, la de tu escritorio. coroom usa si
 settings-fuente-incluida = { $family }, incluida con coroom: no se encontró la de tu escritorio.
 settings-fuente-instalada = { $family }, instalada en el sistema: el escritorio no dice cuál usa.
 settings-animaciones = Animaciones
-settings-como-el-sistema = Como el sistema
 settings-reducidas = Reducidas
 settings-completas = Completas
 settings-ahora-completas = ahora completas
@@ -267,7 +276,7 @@ settings-buscar-versiones-nuevas = Buscar versiones nuevas
 settings-buscar-versiones-nuevas-ayuda = Avisa en Inicio cuando hay una versión nueva.
 settings-una-vez-al-dia = Una vez al día
 settings-una-vez-a-la-semana = Una vez a la semana
-settings-licencias = Licencias
+settings-licencias = Licencias y atribuciones
 settings-licencia-coroom = Apache-2.0
 settings-servidor = Servidor
 settings-licencia-servidor = AGPL-3.0 o posterior

@@ -1,5 +1,7 @@
-//! Etiquetas de cuándo surte efecto un ajuste: «En vivo» (verde: se aplica al momento, con la
-//! sala abierta) y «Al abrir la sala» / «Al entrar en la sala» (gris: se guarda para la próxima).
+//! Etiquetas de cuándo surte efecto un ajuste: «Al momento» (verde: se aplica ya, también con la
+//! sala abierta) y «En la próxima sala» / «Al entrar» (gris: se guarda para la próxima).
+//!
+//! En las filas de Ajustes van en una columna de ancho fijo ([`column`]).
 //!
 //! Son píldoras pequeñas sin punto, distintas de las insignias de estado
 //! ([`crate::widget::status_badge`]): no dicen cómo está algo, sino cuándo cambia. El texto lo da
@@ -49,14 +51,29 @@ pub fn tag<'a, M: 'a>(when: When, label: impl text::IntoFragment<'a>) -> Element
     .into()
 }
 
-/// «En vivo».
+/// «Al momento».
 pub fn live<'a, M: 'a>(label: impl text::IntoFragment<'a>) -> Element<'a, M> {
     tag(When::Live, label)
 }
 
-/// «Al abrir la sala» o «Al entrar en la sala».
+/// «En la próxima sala» o «Al entrar».
 pub fn later<'a, M: 'a>(label: impl text::IntoFragment<'a>) -> Element<'a, M> {
     tag(When::Later, label)
+}
+
+/// La columna de «cuándo aplica» de una fila de ajuste ([`crate::widget::setting_row`]): de ancho
+/// fijo, el de la más ancha de `labels` (todas las etiquetas que pueden salir en la pantalla,
+/// medidas con la letra de verdad), con la de esta fila (`current`) o vacía. Así las etiquetas
+/// de las filas quedan en columna y la fila no cambia cuando la etiqueta cambia o no está.
+pub fn column<'a, M: 'a>(
+    labels: &[(When, &'a str)],
+    current: Option<(When, &'a str)>,
+) -> Element<'a, M> {
+    crate::widget::reserve(
+        labels.iter().map(|(when, label)| tag(*when, *label)),
+        current.map(|(when, label)| tag(when, label)),
+    )
+    .into()
 }
 
 #[cfg(test)]

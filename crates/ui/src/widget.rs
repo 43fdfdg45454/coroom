@@ -988,6 +988,209 @@ pub fn sidebar<'a, M: Clone + 'a>(
     .into()
 }
 
+// --- Riel -----------------------------------------------------------------------------------------
+
+/// Lado de un destino del riel (su zona pulsable, alta como un control y un poco más).
+pub const RAIL_ITEM: f32 = size::CONTROL + gap::XS;
+
+/// Lado de la caja del icono de un destino (el icono de 20 px y su marca en la esquina).
+pub const RAIL_GLYPH: f32 = 28.0;
+
+/// Ancho del riel plegado: solo los iconos.
+pub const RAIL_NARROW: f32 = RAIL_ITEM + 2.0 * gap::XS;
+
+/// Ancho del riel desplegado: iconos y nombres.
+pub const RAIL_WIDE: f32 = size::SIDEBAR - gap::XL;
+
+/// Desde qué ancho de ventana el riel se despliega: el del riel desplegado, el del contenido y el
+/// de una columna lateral (el chat de la sala, las secciones de Ajustes), unos 1300 px lógicos;
+/// una ventana maximizada en una pantalla de 1366 px o más ya lo tiene. Con menos, la página se
+/// queda con el sitio y el riel con los iconos, como la barra lateral adaptable de GNOME.
+pub const RAIL_WIDE_FROM: f32 = RAIL_WIDE + size::CONTENT + size::SIDEBAR;
+
+/// Si con una ventana de `width` (lógico) el riel va desplegado.
+pub fn rail_is_wide(width: f32) -> bool {
+    width >= RAIL_WIDE_FROM
+}
+
+/// Un destino del riel.
+pub struct RailItem<'a, M> {
+    /// Icono (o avatar) de 20 px; el elegido lo lleva en el acento.
+    pub glyph: Element<'a, M>,
+    /// Nombre (desplegado).
+    pub label: String,
+    /// Texto emergente del riel plegado (el nombre y su atajo).
+    pub tip: String,
+    /// Marca sobre la esquina del icono (el punto «en vivo»), si hay.
+    pub mark: Option<Element<'a, M>>,
+    /// Cantidad (invitados), si hay: al final desplegado, abajo a la derecha plegado.
+    pub count: Option<String>,
+    /// Al pulsar.
+    pub on_press: M,
+}
+
+/// Contador pequeño del riel (una cifra o dos, en una ranura del ancho de «88»).
+pub fn rail_count<'a, M: 'a>(count: impl Into<String>) -> Element<'a, M> {
+    container(figure(badge_text, count, &["88"]))
+        .padding(Padding::from([0.0, 5.0]))
+        .class(ContainerClass::Badge(Tone::Neutral))
+        .into()
+}
+
+fn rail_entry<'a, M: Clone + 'a>(
+    item: RailItem<'a, M>,
+    selected: bool,
+    wide: bool,
+) -> Element<'a, M> {
+    let RailItem {
+        glyph,
+        label,
+        tip,
+        mark,
+        count,
+        on_press,
+    } = item;
+    // Siempre las mismas capas (icono y marca; contenido y cifra): que aparezcan la marca o la
+    // cifra no cambia el árbol ni mueve el icono.
+    let glyph = stack![
+        container(glyph)
+            .center_x(Length::Fixed(RAIL_GLYPH))
+            .center_y(Length::Fixed(RAIL_GLYPH)),
+        container(slot(mark))
+            .width(Length::Fixed(RAIL_GLYPH))
+            .height(Length::Fixed(RAIL_GLYPH))
+            .align_x(Horizontal::Right)
+            .align_y(Vertical::Top),
+    ];
+    let count = count.map(rail_count);
+    let content: Element<'a, M> = if wide {
+        row![
+            glyph,
+            text(label)
+                .size(type_size::BODY)
+                .font(if selected { SEMIBOLD } else { UI })
+                .wrapping(Wrapping::None)
+                .width(Length::Fill),
+            slot(count)
+        ]
+        .spacing(gap::S)
+        .align_y(Alignment::Center)
+        .into()
+    } else {
+        stack![
+            center(glyph),
+            container(slot(count))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(Horizontal::Right)
+                .align_y(Vertical::Bottom),
+        ]
+        .into()
+    };
+    let control = button(
+        container(content)
+            .height(Length::Fill)
+            .center_y(Length::Fill),
+    )
+    .width(if wide {
+        Length::Fill
+    } else {
+        Length::Fixed(RAIL_ITEM)
+    })
+    .height(Length::Fixed(RAIL_ITEM))
+    .padding(if wide {
+        Padding::from([0.0, gap::XS])
+    } else {
+        Padding::from(2.0)
+    })
+    .class(ButtonClass::Segment { selected })
+    .on_press(on_press);
+    rail_tooltip(control, tip)
+}
+
+/// El texto emergente de un destino o de un botón del riel: a la derecha, sobre la página.
+pub fn rail_tooltip<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+    tip: impl text::IntoFragment<'a>,
+) -> Element<'a, M> {
+    tooltip(
+        content,
+        container(text(tip).size(type_size::CAPTION).font(UI))
+            .padding(Padding::from([4.0, 8.0]))
+            .class(ContainerClass::Toast),
+        tooltip::Position::Right,
+    )
+    .gap(gap::XS)
+    .into()
+}
+
+/// Riel de navegación a la izquierda (la barra lateral adaptable de GNOME): `header` (la marca)
+/// arriba, los destinos de `top`, un hueco, `footer` (lo de la sala abierta) y los destinos de
+/// `bottom` abajo. `selected` es la posición del elegido entre todos (`top` y luego `bottom`): su
+/// fondo se desliza con un resorte hasta el nuevo ([`crate::animate::Segments`]). Plegado
+/// (`wide` falso) solo enseña los iconos, con el nombre al pasar el ratón. El ancho es fijo en
+/// cada modo y el pie tiene su sitio aunque falte, así que lo que cambie en el riel no mueve la
+/// página.
+pub fn rail<'a, M: Clone + 'a>(
+    header: Element<'a, M>,
+    top: Vec<RailItem<'a, M>>,
+    footer: Option<Element<'a, M>>,
+    bottom: Vec<RailItem<'a, M>>,
+    selected: Option<usize>,
+    wide: bool,
+) -> Element<'a, M> {
+    let first = top.len();
+    let mut entries: Vec<Element<'a, M>> = Vec::new();
+    for (index, item) in top.into_iter().enumerate() {
+        entries.push(rail_entry(item, selected == Some(index), wide));
+    }
+    entries.push(space::vertical().into());
+    entries.push(
+        container(slot(footer))
+            .width(Length::Fill)
+            .align_x(Horizontal::Center)
+            .into(),
+    );
+    let stops: Vec<usize> = (0..first)
+        .chain((0..bottom.len()).map(|index| first + 2 + index))
+        .collect();
+    for (index, item) in bottom.into_iter().enumerate() {
+        entries.push(rail_entry(item, selected == Some(first + index), wide));
+    }
+    let entries = Column::with_children(entries)
+        .spacing(2)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(if wide {
+            Alignment::Start
+        } else {
+            Alignment::Center
+        });
+    container(
+        column![
+            container(header)
+                .width(Length::Fill)
+                .height(Length::Fixed(RAIL_ITEM))
+                .align_x(if wide {
+                    Horizontal::Left
+                } else {
+                    Horizontal::Center
+                })
+                .align_y(Vertical::Center)
+                .padding(Padding::from([0.0, if wide { gap::XS } else { 0.0 }])),
+            crate::animate::Segments::new(entries, selected, ButtonClass::Nav { selected: true })
+                .stops(stops),
+        ]
+        .spacing(gap::XS)
+        .height(Length::Fill),
+    )
+    .padding(Padding::from([gap::XS, gap::XS]))
+    .width(Length::Fixed(if wide { RAIL_WIDE } else { RAIL_NARROW }))
+    .height(Length::Fill)
+    .class(ContainerClass::Sidebar)
+    .into()
+}
+
 /// Cabecera de página: título, subtítulo y acciones a la derecha.
 pub fn page_header<'a, M: 'a>(
     title_text: impl text::IntoFragment<'a>,
@@ -1130,28 +1333,72 @@ pub fn section<'a, M: 'a>(
     description: Option<String>,
     rows: Vec<Element<'a, M>>,
 ) -> Element<'a, M> {
+    section_with(title_text, description, None, rows)
+}
+
+/// [`section`] con algo al final de la cabecera, alineado con el título: un icono de estado con
+/// su detalle al pasar el ratón, un botón «Restablecer». Va siempre (o su ranura): la cabecera no
+/// cambia de alto al aparecer.
+pub fn section_with<'a, M: 'a>(
+    title_text: impl text::IntoFragment<'a>,
+    description: Option<String>,
+    trailing: Option<Element<'a, M>>,
+    rows: Vec<Element<'a, M>>,
+) -> Element<'a, M> {
     let mut header = column![strong(title_text)].spacing(2);
     if let Some(description) = description {
         header = header.push(secondary(description).wrapping(Wrapping::WordOrGlyph));
     }
+    let header: Element<'a, M> = match trailing {
+        Some(trailing) => row![header.width(Length::Fill), trailing]
+            .spacing(gap::S)
+            .align_y(Alignment::End)
+            .into(),
+        None => header.into(),
+    };
     column![header, boxed_list(rows)].spacing(gap::XS).into()
 }
 
-/// Fila de ajuste: título, subtítulo y el control a la derecha.
+/// Fila de ajuste uniforme, la misma en todas las secciones: título y lo de debajo (la
+/// descripción, un aviso) a la izquierda, la columna de «cuándo aplica» (de ancho fijo, una
+/// [`crate::tag::column`]; `None`, sin columna) y el control a la derecha. Para que la fila no
+/// cambie de alto al cambiar un valor, lo que cambia con él (un control que se ensancha, una
+/// descripción más larga) va en una ranura del tamaño de su variante mayor ([`reserve`]).
+pub fn setting_row<'a, M: 'a>(
+    title_text: impl text::IntoFragment<'a>,
+    below: Option<Element<'a, M>>,
+    when: Option<Element<'a, M>>,
+    control: impl Into<Element<'a, M>>,
+) -> Element<'a, M> {
+    let mut texts = column![body(title_text)].spacing(2);
+    if let Some(below) = below {
+        texts = texts.push(below);
+    }
+    let mut line = Row::new()
+        .spacing(gap::M)
+        .align_y(Alignment::Center)
+        .push(texts.width(Length::Fill));
+    if let Some(when) = when {
+        line = line.push(when);
+    }
+    line.push(control.into())
+        .padding(Padding::from([10.0, 16.0]))
+        .into()
+}
+
+/// Fila de ajuste: título, subtítulo y el control a la derecha ([`setting_row`] sin columna de
+/// «cuándo aplica»).
 pub fn pref_row<'a, M: 'a>(
     title_text: impl text::IntoFragment<'a>,
     subtitle: Option<String>,
     control: impl Into<Element<'a, M>>,
 ) -> Element<'a, M> {
-    let mut texts = column![body(title_text)].spacing(2);
-    if let Some(subtitle) = subtitle {
-        texts = texts.push(secondary(subtitle).wrapping(Wrapping::WordOrGlyph));
-    }
-    row![texts.width(Length::Fill), control.into()]
-        .spacing(gap::M)
-        .align_y(Alignment::Center)
-        .padding(Padding::from([10.0, 16.0]))
-        .into()
+    setting_row(
+        title_text,
+        subtitle.map(|subtitle| secondary(subtitle).wrapping(Wrapping::WordOrGlyph).into()),
+        None,
+        control,
+    )
 }
 
 /// [`pref_row`] con lo que se quiera bajo el título (texto de ayuda y un aviso, por ejemplo).
@@ -1160,12 +1407,7 @@ pub fn pref_row_with<'a, M: 'a>(
     below: impl Into<Element<'a, M>>,
     control: impl Into<Element<'a, M>>,
 ) -> Element<'a, M> {
-    let texts = column![body(title_text), below.into()].spacing(2);
-    row![texts.width(Length::Fill), control.into()]
-        .spacing(gap::M)
-        .align_y(Alignment::Center)
-        .padding(Padding::from([10.0, 16.0]))
-        .into()
+    setting_row(title_text, Some(below.into()), None, control)
 }
 
 /// Valor monoespaciado con un botón de copiar.

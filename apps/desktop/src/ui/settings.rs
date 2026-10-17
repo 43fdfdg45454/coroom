@@ -506,6 +506,9 @@ pub struct Notifications {
     pub became_host: EventSound,
     /// Solicitud de amistad.
     pub friend_request: EventSound,
+    /// Sonidos de la interfaz (al pulsar, abrir paneles, confirmar), aparte de los avisos.
+    /// Encendidos de partida.
+    pub interface_sounds: bool,
 }
 
 impl Default for Notifications {
@@ -521,6 +524,7 @@ impl Default for Notifications {
             admitted: tone(SoundEvent::Admitted),
             became_host: tone(SoundEvent::BecameHost),
             friend_request: tone(SoundEvent::FriendRequest),
+            interface_sounds: true,
         }
     }
 }
@@ -541,6 +545,7 @@ struct NotificationsFile {
     admitted: EventSoundFile,
     became_host: EventSoundFile,
     friend_request: EventSoundFile,
+    interface_sounds: Option<toml::Value>,
 }
 
 /// [`EventSound`] tal como viene en `settings.toml` (ver [`NotificationsFile`]).
@@ -581,6 +586,10 @@ impl From<NotificationsFile> for Notifications {
             admitted: file.admitted.into_sound(SoundEvent::Admitted),
             became_host: file.became_host.into_sound(SoundEvent::BecameHost),
             friend_request: file.friend_request.into_sound(SoundEvent::FriendRequest),
+            interface_sounds: file
+                .interface_sounds
+                .and_then(|on| on.as_bool())
+                .unwrap_or(true),
         }
     }
 }

@@ -1,11 +1,14 @@
-//! Pantalla 1: inicio.
+//! Inicio: lo primero del riel.
 //!
-//! Una sola pantalla bajo la cabecera: dos tarjetas grandes («Compartir mi pantalla» y «Unirse
-//! con código»), las invitaciones que llegan (con su cuenta atrás de [`INVITATION_TTL`]) y la
-//! lista de amigos, que se actualiza sola con la presencia y la actividad de la señalización
-//! (también con la sala abierta o desde dentro de una), con las solicitudes pendientes y «Agregar
-//! amigo». A un amigo con sala abierta se le puede **pedir entrar** ([`Msg::AskToJoin`]): el botón
-//! queda en «Pedido…» hasta que invita (se entra solo), dice que no o pasa [`JOIN_REQUEST_TTL`].
+//! Arriba, dos tarjetas grandes («Compartir mi pantalla» y «Unirse con código»); debajo, la
+//! **bandeja**, con lo que llega y vence (las invitaciones, con su cuenta atrás de
+//! [`INVITATION_TTL`] y una barra fina del tiempo que queda; las solicitudes de amistad; los
+//! avisos de versión y del relay), y **En línea ahora**, los amigos conectados. Cada entrada de la
+//! bandeja cae desde arriba al llegar y se pliega con su altura al vencer o descartarla: lo que
+//! hay debajo se desliza en lugar de saltar. La lista completa de amigos está en su página
+//! ([`super::friends`]); aquí queda la lógica de invitar y de **pedir entrar** en la sala de un
+//! amigo ([`Msg::AskToJoin`]): el botón queda en «Pedido…» hasta que invita (se entra solo), dice
+//! que no o pasa [`JOIN_REQUEST_TTL`].
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -13,15 +16,19 @@ use std::time::{Duration, Instant};
 use coroom_transport::proto::api::{Friend, Friends};
 use coroom_transport::proto::signal::{Activity, ROOM_CODE_LEN, is_valid_room_code};
 use coroom_ui::Element;
+use coroom_ui::animate::{Collapse, Shift};
 use coroom_ui::font::MONO;
 use coroom_ui::icon::{Icon, icon_with};
-use coroom_ui::style::{ContainerClass, InputClass, SvgClass, TextClass};
+use coroom_ui::motion::{EXIT_EASING, Token};
+use coroom_ui::style::{
+    ButtonClass, ContainerClass, InputClass, ProgressClass, SvgClass, TextClass,
+};
 use coroom_ui::theme::Tone;
 use coroom_ui::tokens::{size, space, text as type_size};
 use coroom_ui::widget::{self as ui, Kind};
 use iced_core::text::{LineHeight, Wrapping};
 use iced_core::{Alignment, Length, Padding};
-use iced_widget::{Column, column, container, row, text, text_input};
+use iced_widget::{Column, Row, column, container, progress_bar, row, text, text_input};
 
 use crate::ui::app::{
     App, Effect, Event, Invitation, JOIN_REQUEST_TTL, Load, Message, Page, Screen,
@@ -37,6 +44,23 @@ pub const INVITATION_TTL: Duration = Duration::from_secs(60);
 /// Invitaciones que se ven a la vez (las más nuevas).
 const INVITATIONS_SHOWN: usize = 3;
 
+/// Amigos conectados que se ven en «En línea ahora» (el resto, en Amigos).
+const ONLINE_SHOWN: usize = 12;
+
+/// Grosor de la barra del tiempo que le queda a una invitación.
+const TIME_BAR: f32 = 3.0;
+
+/// Una invitación que se va de la bandeja (venció o se descartó) y se pliega con su altura.
+#[derive(Debug, Clone)]
+pub struct Leaving {
+    /// La invitación.
+    pub invitation: Invitation,
+    /// Cuándo llegó (para la cuenta atrás congelada).
+    pub received: Instant,
+    /// Cuándo empezó a irse.
+    pub since: Instant,
+}
+
 /// Estado.
 #[derive(Debug, Clone, Default)]
 pub struct State {
@@ -50,6 +74,10 @@ pub struct State {
     pub friends_updated: Option<Instant>,
     /// A qué amigos se les pidió entrar en su sala y cuándo (sin respuesta todavía).
     pub asked_at: HashMap<u64, Instant>,
+    /// Invitaciones que se van de la bandeja, plegándose.
+    pub leaving: Vec<Leaving>,
+    /// Cuándo apareció cada solicitud de amistad recibida (por solicitud: cae desde arriba).
+    pub requests_seen: HashMap<u64, Instant>,
 }
 
 /// Mensajes.
@@ -87,7 +115,7 @@ pub fn server_down(app: &App) -> bool {
 
 /// Si se puede pedir entrar en la sala de alguien: sin sala propia (abierta o abriéndose) y sin
 /// estar en otra.
-fn can_ask(app: &App) -> bool {
+pub(crate) fn can_ask(app: &App) -> bool {
     !app.host.is_open() && app.guest.is_none()
 }
 
@@ -138,8 +166,15 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             guest::start(app, code)
         }
         Msg::Ignore(user) => {
-            app.invitations
-                .retain(|invitation| invitation.from_user != user);
+            let now = app.now;
+            let (gone, kept): (Vec<Invitation>, Vec<Invitation>) =
+                std::mem::take(&mut app.invitations)
+                    .into_iter()
+                    .partition(|invitation| invitation.from_user == user);
+            app.invitations = kept;
+            for invitation in gone {
+                start_leaving(app, invitation, now);
+            }
             prune_times(app);
             Vec::new()
         }
@@ -185,7 +220,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
 }
 
 /// Código de la sala abierta, si el servidor ya la creó.
-fn room_code(app: &App) -> Option<&str> {
+pub(crate) fn room_code(app: &App) -> Option<&str> {
     app.host.room.as_ref().and_then(|room| room.code.as_deref())
 }
 
@@ -197,6 +232,22 @@ pub fn on_event(app: &mut App, event: &Event) {
         }
         Event::Friends(Ok(_)) | Event::Presence { .. } | Event::Activity { .. } => {
             app.home.friends_updated = Some(app.now);
+            if let Event::Friends(Ok(list)) = event {
+                // Las solicitudes nuevas caen en la bandeja; las que ya no están se olvidan. Las
+                // de la primera lista ya estaban: se ven quietas.
+                let now = if app.friends.loaded().is_some() {
+                    app.now
+                } else {
+                    app.now
+                        .checked_sub(Duration::from_secs(60))
+                        .unwrap_or(app.now)
+                };
+                let seen = &mut app.home.requests_seen;
+                seen.retain(|id, _| list.incoming.iter().any(|request| request.id == *id));
+                for request in &list.incoming {
+                    seen.entry(request.id).or_insert(now);
+                }
+            }
             // Si al que se le pidió entrar cierra la sala o se desconecta, ya no hay a qué esperar.
             match event {
                 Event::Presence {
@@ -238,19 +289,47 @@ fn prune_times(app: &mut App) {
         .retain(|user, _| invitations.iter().any(|known| known.from_user == *user));
 }
 
-/// Pasa el tiempo: las invitaciones caducadas desaparecen y las peticiones de entrar sin
-/// respuesta se dan por perdidas (con un aviso).
+/// Una invitación empieza a irse de la bandeja (se pliega con su altura).
+fn start_leaving(app: &mut App, invitation: Invitation, now: Instant) {
+    let received = received_at(app, &invitation);
+    if app.motion().exit_duration(Token::Panel).is_zero() {
+        return;
+    }
+    app.home.leaving.push(Leaving {
+        invitation,
+        received,
+        since: now,
+    });
+}
+
+/// Lo que tarda en plegarse una entrada que se va.
+fn exit_duration(app: &App) -> Duration {
+    app.motion().exit_duration(Token::Panel)
+}
+
+/// Pasa el tiempo: las invitaciones caducadas se pliegan y desaparecen, y las peticiones de
+/// entrar sin respuesta se dan por perdidas (con un aviso).
 pub fn tick(app: &mut App) {
     let now = app.now;
     let times = &mut app.home.invited_at;
     for invitation in &app.invitations {
         times.entry(invitation.from_user).or_insert(now);
     }
-    app.invitations.retain(|invitation| {
-        times
-            .get(&invitation.from_user)
-            .is_none_or(|at| now.saturating_duration_since(*at) < INVITATION_TTL)
-    });
+    let (expired, kept): (Vec<Invitation>, Vec<Invitation>) = std::mem::take(&mut app.invitations)
+        .into_iter()
+        .partition(|invitation| {
+            times
+                .get(&invitation.from_user)
+                .is_some_and(|at| now.saturating_duration_since(*at) >= INVITATION_TTL)
+        });
+    app.invitations = kept;
+    for invitation in expired {
+        start_leaving(app, invitation, now);
+    }
+    let exit = exit_duration(app);
+    app.home
+        .leaving
+        .retain(|leaving| now.saturating_duration_since(leaving.since) < exit);
     prune_times(app);
     let expired: Vec<u64> = app
         .home
@@ -273,19 +352,9 @@ fn next_step(since: Instant, now: Instant, step: Duration) -> Instant {
     since + Duration::from_secs((elapsed / step_secs + 1) * step_secs)
 }
 
-/// Cada cuánto cambia el texto «actualizado hace…».
-fn updated_step(elapsed: Duration) -> Duration {
-    if elapsed < Duration::from_secs(60) {
-        Duration::from_secs(1)
-    } else if elapsed < Duration::from_secs(3600) {
-        Duration::from_secs(60)
-    } else {
-        Duration::from_secs(3600)
-    }
-}
-
-/// Cuándo hace falta el próximo `Tick`: al caducar cada invitación y, con Inicio a la vista,
-/// cuando cambian la cuenta atrás y el «actualizado hace…» (siempre después de `now`).
+/// Cuándo hace falta el próximo `Tick`: al caducar cada invitación, al acabar de plegarse las
+/// que se van y, con Inicio a la vista, cuando cambia la cuenta atrás (siempre después de `now`).
+/// El «actualizado hace…» de los amigos va al pasar el ratón: no pide ninguno.
 pub fn next_tick(app: &App) -> Option<Instant> {
     let now = app.now;
     let visible = app.screen == Screen::Main && app.page == Page::Home;
@@ -300,14 +369,59 @@ pub fn next_tick(app: &App) -> Option<Instant> {
             consider(next_step(at, now, Duration::from_secs(1)));
         }
     }
-    if visible && let Some(at) = app.home.friends_updated {
-        let step = updated_step(now.saturating_duration_since(at));
-        consider(next_step(at, now, step));
+    let exit = exit_duration(app);
+    for leaving in &app.home.leaving {
+        consider((leaving.since + exit).max(now + Duration::from_millis(1)));
     }
     for at in app.home.asked_at.values() {
         consider((*at + JOIN_REQUEST_TTL).max(now + Duration::from_millis(1)));
     }
     next
+}
+
+/// Lo que lleva de su entrada una entrada de la bandeja que llegó en `since` (0 a 1, con su curva).
+fn entered(app: &App, since: Instant) -> f32 {
+    let duration = app.motion().duration(Token::Panel);
+    if duration.is_zero() {
+        return 1.0;
+    }
+    let t = (app.now.saturating_duration_since(since).as_secs_f32() / duration.as_secs_f32())
+        .clamp(0.0, 1.0);
+    if t >= 1.0 {
+        1.0
+    } else {
+        Token::Panel.easing().value(t)
+    }
+}
+
+/// Lo que lleva de su salida una entrada que empezó a irse en `since` (0 a 1).
+fn left(app: &App, since: Instant) -> f32 {
+    let duration = exit_duration(app);
+    if duration.is_zero() {
+        return 1.0;
+    }
+    let t = (app.now.saturating_duration_since(since).as_secs_f32() / duration.as_secs_f32())
+        .clamp(0.0, 1.0);
+    if t >= 1.0 { 1.0 } else { EXIT_EASING.value(t) }
+}
+
+/// Si algo de la bandeja se mueve (una entrada que cae o una que se pliega), con Inicio delante.
+pub fn animating(app: &App) -> bool {
+    if app.screen != Screen::Main || app.page != Page::Home {
+        return false;
+    }
+    let arriving = app
+        .invitations
+        .iter()
+        .map(|invitation| received_at(app, invitation))
+        .chain(app.home.requests_seen.values().copied())
+        .any(|since| entered(app, since) < 1.0);
+    arriving
+        || app
+            .home
+            .leaving
+            .iter()
+            .any(|leaving| left(app, leaving.since) < 1.0)
 }
 
 /// Amigos en el orden de la lista: conectados primero, entre ellos los que tienen una sala
@@ -340,58 +454,26 @@ fn on(msg: Msg) -> Message {
     Message::Home(msg)
 }
 
-fn on_friends(msg: FriendsMsg) -> Message {
-    Message::Friends(msg)
-}
-
-/// Dibuja la página.
+/// Dibuja la página: compartir y unirse arriba, la bandeja y quién está en línea.
 pub fn view<'a>(app: &'a App) -> Element<'a, Message> {
-    // Los avisos y las invitaciones van cada uno en un bloque que está siempre (vacío si no hay),
-    // con el espacio que los separa dentro: lo de después (el campo del código, los amigos) no
-    // cambia de posición entre los hijos y no pierde el foco ni lo escrito cuando llegan o se van.
-    let spaced =
-        |blocks: Vec<Element<'a, Message>>, padding: Padding| -> Option<Element<'a, Message>> {
-            (!blocks.is_empty()).then(|| {
-                container(Column::with_children(blocks).spacing(space::M))
-                    .padding(padding)
-                    .into()
-            })
-        };
-    let notices = spaced(
-        notices(app),
-        Padding {
-            bottom: space::M,
-            ..Padding::ZERO
-        },
-    );
-    let mut invitations: Vec<&Invitation> = app.invitations.iter().collect();
-    invitations.sort_by_key(|invitation| std::cmp::Reverse(received_at(app, invitation)));
-    let invitations = spaced(
-        invitations
-            .into_iter()
-            .take(INVITATIONS_SHOWN)
-            .map(|invitation| invitation_card(app, invitation))
-            .collect(),
-        Padding {
-            top: space::M,
-            ..Padding::ZERO
-        },
-    );
     let page = column![
-        ui::slot(notices),
         ui::equal_height_row(
             |real| vec![share_card(app, real), join_card(app, real)],
             space::M,
         ),
-        ui::slot(invitations),
-        container(friends_section(app)).padding(Padding {
-            top: space::M + space::XXS + space::M,
+        container(tray(app)).padding(Padding {
+            top: space::L,
+            ..Padding::ZERO
+        }),
+        container(online_now(app)).padding(Padding {
+            top: space::L,
             ..Padding::ZERO
         }),
     ];
     ui::page("home", page)
 }
 
+/// Avisos de la bandeja: versión nueva y el uso del relay.
 fn notices(app: &App) -> Vec<Element<'_, Message>> {
     let mut out = Vec::new();
     if let Some(update) = &app.update.available {
@@ -578,6 +660,100 @@ fn join_card(app: &App, real: bool) -> Element<'_, Message> {
     big_card(content, real)
 }
 
+// --- Bandeja --------------------------------------------------------------------------------------
+
+/// La bandeja: lo que llega y vence. Siempre está, con su título; cada entrada cae desde arriba
+/// al llegar y se pliega con su altura al irse, así que lo de debajo se desliza en vez de saltar.
+fn tray<'a>(app: &'a App) -> Element<'a, Message> {
+    let mut invitations: Vec<&Invitation> = app.invitations.iter().collect();
+    invitations.sort_by_key(|invitation| std::cmp::Reverse(received_at(app, invitation)));
+    let invitations: Vec<&Invitation> = invitations.into_iter().take(INVITATIONS_SHOWN).collect();
+    let requests = app
+        .friends
+        .loaded()
+        .map(|friends| friends.incoming.as_slice())
+        .unwrap_or_default();
+    let notices = notices(app);
+    let count = invitations.len() + requests.len() + notices.len();
+    let summary = match count {
+        0 => t!("home-tray-empty").to_owned(),
+        _ => t!("home-tray-detail").to_owned(),
+    };
+    let header = row![
+        ui::heading(t!("home-tray")),
+        ui::slot((count > 0).then(|| ui::rail_count(count.to_string()))),
+        ui::caption(summary).wrapping(Wrapping::None),
+    ]
+    .spacing(space::XS)
+    .align_y(Alignment::Center);
+    let mut entries: Vec<Element<'a, Message>> = Vec::new();
+    for invitation in invitations {
+        let since = received_at(app, invitation);
+        entries.push(tray_entry(
+            app,
+            invitation_card(app, invitation, since, false),
+            entered(app, since),
+            0.0,
+        ));
+    }
+    for leaving in &app.home.leaving {
+        entries.push(tray_entry(
+            app,
+            invitation_card(app, &leaving.invitation, leaving.received, true),
+            1.0,
+            left(app, leaving.since),
+        ));
+    }
+    for request in requests {
+        let since = app
+            .home
+            .requests_seen
+            .get(&request.id)
+            .copied()
+            .unwrap_or(app.now);
+        entries.push(tray_entry(
+            app,
+            request_card(app, request),
+            entered(app, since),
+            0.0,
+        ));
+    }
+    for notice in notices {
+        entries.push(tray_entry(app, notice, 1.0, 0.0));
+    }
+    column![
+        header,
+        container(Column::with_children(entries)).padding(Padding {
+            top: space::S,
+            ..Padding::ZERO
+        })
+    ]
+    .into()
+}
+
+/// Una entrada de la bandeja con su movimiento: al llegar (`entered` de 0 a 1) crece y cae desde
+/// arriba; al irse (`left` de 0 a 1) se pliega. El espacio de debajo va dentro: plegada no ocupa
+/// nada.
+fn tray_entry<'a>(
+    app: &App,
+    content: Element<'a, Message>,
+    entered: f32,
+    left: f32,
+) -> Element<'a, Message> {
+    let fall = app.motion().slide(space::M) * (1.0 - entered);
+    Collapse::new(
+        Shift::new(
+            container(content).padding(Padding {
+                bottom: space::XS,
+                ..Padding::ZERO
+            }),
+            iced_core::Vector::new(0.0, -fall),
+        ),
+        entered * (1.0 - left),
+    )
+    .into()
+}
+
 /// «Entrar» de una invitación; con la sala propia abierta, desactivado y con el motivo al pasar
 /// el ratón.
 fn enter_invitation(invitation: &Invitation, blocked: bool, hosting: bool) -> Element<'_, Message> {
@@ -594,45 +770,59 @@ fn enter_invitation(invitation: &Invitation, blocked: bool, hosting: bool) -> El
     }
 }
 
-/// Tarjeta de una invitación que llega, con el borde del acento y su cuenta atrás.
-fn invitation_card<'a>(app: &'a App, invitation: &'a Invitation) -> Element<'a, Message> {
+/// Tarjeta de una invitación que llega, con el borde del acento, su cuenta atrás y una barra fina
+/// del tiempo que queda. `leaving`: se va (sin botones que hagan nada).
+fn invitation_card<'a>(
+    app: &'a App,
+    invitation: &'a Invitation,
+    received: Instant,
+    leaving: bool,
+) -> Element<'a, Message> {
     let ago = app
         .now
-        .saturating_duration_since(received_at(app, invitation))
+        .saturating_duration_since(received)
         .min(INVITATION_TTL);
-    let left = INVITATION_TTL.saturating_sub(ago).as_secs().max(1);
+    let remaining = INVITATION_TTL.saturating_sub(ago);
+    let left = remaining.as_secs().max(u64::from(!leaving));
     let hosting = app.host.is_open();
-    let blocked = server_down(app) || hosting;
+    let blocked = server_down(app) || hosting || leaving;
+    let fraction = remaining.as_secs_f32() / INVITATION_TTL.as_secs_f32();
     container(
-        row![
-            avatars::view(
-                app,
-                &invitation.from_name,
-                avatars::of_user(app, invitation.from_user),
-                size::AVATAR,
-            ),
-            column![
-                ui::strong(t!("home-invite-title", name = invitation.from_name))
-                    .wrapping(Wrapping::WordOrGlyph),
-                // La cuenta atrás en m:ss en una ranura de ancho fijo: cambia cada segundo sin
-                // mover el texto ni repartir las líneas.
-                row![
-                    ui::secondary(t!("home-invite-detail", code = invitation.code))
-                        .wrapping(Wrapping::None),
-                    ui::figure(ui::secondary, stats::clock(left), &[stats::CLOCK_WIDEST]),
+        column![
+            row![
+                avatars::view(
+                    app,
+                    &invitation.from_name,
+                    avatars::of_user(app, invitation.from_user),
+                    size::AVATAR,
+                ),
+                column![
+                    ui::strong(t!("home-invite-title", name = invitation.from_name))
+                        .wrapping(Wrapping::WordOrGlyph),
+                    // La cuenta atrás en m:ss en una ranura de ancho fijo: cambia cada segundo
+                    // sin mover el texto ni repartir las líneas.
+                    row![
+                        ui::secondary(t!("home-invite-detail", code = invitation.code))
+                            .wrapping(Wrapping::None),
+                        ui::figure(ui::secondary, stats::clock(left), &[stats::CLOCK_WIDEST]),
+                    ]
+                    .spacing(space::XXS)
                 ]
-                .spacing(space::XXS)
+                .spacing(2)
+                .width(Length::Fill),
+                ui::flat(
+                    t!("home-ignore"),
+                    (!leaving).then(|| on(Msg::Ignore(invitation.from_user)))
+                ),
+                enter_invitation(invitation, blocked, hosting)
             ]
-            .spacing(2)
-            .width(Length::Fill),
-            ui::flat(
-                t!("home-ignore"),
-                Some(on(Msg::Ignore(invitation.from_user)))
-            ),
-            enter_invitation(invitation, blocked, hosting)
+            .spacing(space::S)
+            .align_y(Alignment::Center),
+            progress_bar(0.0..=1.0, fraction)
+                .girth(Length::Fixed(TIME_BAR))
+                .class(ProgressClass::Accent),
         ]
-        .spacing(space::S)
-        .align_y(Alignment::Center),
+        .spacing(space::S),
     )
     .padding(Padding::from([12.0, 16.0]))
     .width(Length::Fill)
@@ -640,248 +830,133 @@ fn invitation_card<'a>(app: &'a App, invitation: &'a Invitation) -> Element<'a, 
     .into()
 }
 
-/// «3 conectados · actualizado ahora mismo» (redondeado: no cambia cada segundo).
-fn friends_summary(app: &App, friends: &Friends) -> String {
-    let online = friends.friends.iter().filter(|f| f.online).count();
-    let count = match online {
-        0 => t!("home-online-none").to_owned(),
-        1 => t!("home-online-one").to_owned(),
-        count => t!("home-online-many", count = count),
-    };
-    let Some(at) = app.home.friends_updated else {
-        return count;
-    };
-    let elapsed = app.now.saturating_duration_since(at).as_secs();
-    let updated = t!("home-updated", ago = super::settings::ago_secs(elapsed));
-    format!("{count} · {updated}")
-}
-
-fn friends_section<'a>(app: &'a App) -> Element<'a, Message> {
-    let state = &app.friends_page;
-    let mut title = row![ui::heading(t!("home-friends"))]
-        .spacing(space::XS)
-        .align_y(Alignment::Center);
-    if let Some(friends) = app.friends.loaded() {
-        title = title.push(ui::caption(friends_summary(app, friends)));
-    }
-    let header = row![
-        title.width(Length::Fill),
-        ui::button_with(
-            Kind::Link,
-            if state.adding {
-                t!("home-add-friend-close")
-            } else {
-                t!("home-add-friend")
-            },
-            (!state.adding).then_some(Icon::UserPlus),
-            Some(on_friends(FriendsMsg::ToggleAdd))
-        )
-    ]
-    .spacing(space::S)
-    .align_y(Alignment::Center);
-    // El campo de agregar y las solicitudes tienen su sitio aunque falten (con el espacio de
-    // encima dentro): una solicitud que llega no cambia de posición la lista ni sus menús.
-    let below = |content: Element<'a, Message>| -> Element<'a, Message> {
-        container(content)
-            .padding(Padding {
-                top: space::S,
-                ..Padding::ZERO
-            })
-            .into()
-    };
-    let add = state.adding.then(|| below(add_friend(app)));
-    let mut pending = None;
-    let body = match &app.friends {
-        Load::Idle | Load::Loading => ui::skeleton(t!("home-loading"), 3),
-        Load::Failed(err) => ui::card(ui::error_state(
-            t!("home-load-failed"),
-            err.as_str(),
-            Some((t!("home-retry"), on_friends(FriendsMsg::Reload))),
-        )),
-        Load::Loaded(friends) => {
-            pending = requests(app, friends).map(below);
-            if friends.friends.is_empty() {
-                ui::card(ui::empty_state(
-                    Icon::Users,
-                    t!("home-empty-title"),
-                    t!("home-empty-text"),
-                    (!state.adding).then(|| {
-                        ui::button_with(
-                            Kind::Normal,
-                            t!("home-add-friend"),
-                            Some(Icon::UserPlus),
-                            Some(on_friends(FriendsMsg::ToggleAdd)),
-                        )
-                        .into()
-                    }),
-                ))
-            } else {
-                ui::boxed_list(
-                    sorted_friends(friends)
-                        .into_iter()
-                        .map(|friend| friend_row(app, friend))
-                        .collect(),
-                )
-            }
-        }
-    };
-    column![header, ui::slot(add), ui::slot(pending), below(body)].into()
-}
-
-/// El campo desplegado de «Agregar amigo».
-fn add_friend(app: &App) -> Element<'_, Message> {
-    let state = &app.friends_page;
-    ui::card(
-        column![
-            row![
-                container(Element::from(
-                    ui::field(t!("home-username"), &state.add_name)
-                        .placeholder("bea")
-                        .on_input(|value| on_friends(FriendsMsg::AddName(value)))
-                        .on_submit((!state.busy).then(|| on_friends(FriendsMsg::Add)))
-                        .error(state.add_error.as_deref())
-                        .id("friend-name")
-                ))
-                .width(Length::Fill),
-                ui::button_with(
-                    Kind::Primary,
-                    t!("home-send-request"),
-                    Some(Icon::UserPlus),
-                    (!state.busy).then(|| on_friends(FriendsMsg::Add))
-                )
-            ]
-            .spacing(space::XS)
-            // Con un error debajo del campo, el botón sigue a la altura del campo.
-            .align_y(if state.add_error.is_some() {
-                Alignment::Center
-            } else {
-                Alignment::End
-            }),
-            ui::caption(t!("home-request-hint")).wrapping(Wrapping::WordOrGlyph)
-        ]
-        .spacing(space::XS),
-    )
-}
-
-/// Solicitudes pendientes: las recibidas (aceptar o rechazar) y las enviadas (retirar).
-fn requests<'a>(app: &'a App, friends: &'a Friends) -> Option<Element<'a, Message>> {
-    if friends.incoming.is_empty() && friends.outgoing.is_empty() {
-        return None;
-    }
+/// Una solicitud de amistad recibida: aceptar o rechazar sin ir a Amigos.
+fn request_card<'a>(
+    app: &'a App,
+    request: &'a coroom_transport::proto::api::FriendRequest,
+) -> Element<'a, Message> {
     let busy = app.friends_page.busy;
-    let incoming = friends.incoming.iter().map(|request| {
-        ui::list_row(
-            Some(avatars::view(
-                app,
-                &request.user.display_name,
-                request.user.avatar,
-                size::AVATAR,
-            )),
-            request.user.display_name.as_str(),
-            Some(t!(
-                "home-wants-to-be-friend",
-                username = request.user.username
-            )),
-            vec![
-                ui::flat(
-                    t!("home-decline"),
-                    (!busy).then(|| on_friends(FriendsMsg::Decline(request.id))),
-                )
-                .into(),
-                ui::primary(
-                    t!("home-accept"),
-                    (!busy).then(|| on_friends(FriendsMsg::Accept(request.id))),
-                )
-                .into(),
-            ],
-        )
-    });
-    let outgoing = friends.outgoing.iter().map(|request| {
-        ui::list_row(
-            Some(avatars::view(
-                app,
-                &request.user.display_name,
-                request.user.avatar,
-                size::AVATAR,
-            )),
-            request.user.display_name.as_str(),
-            Some(t!("home-pending", username = request.user.username)),
-            vec![
-                ui::flat(
-                    t!("home-withdraw"),
-                    (!busy).then(|| on_friends(FriendsMsg::Decline(request.id))),
-                )
-                .into(),
-            ],
-        )
-    });
-    Some(
-        column![
-            ui::caption(t!("home-requests")),
-            ui::boxed_list(incoming.chain(outgoing).collect())
-        ]
-        .spacing(space::XS)
-        .into(),
-    )
-}
-
-/// Fila de un amigo: avatar, nombre, usuario, estado, «Invitar» (o «Pedir entrar» si tiene una
-/// sala abierta y aquí no hay ninguna) y quitar.
-fn friend_row<'a>(app: &'a App, friend: &'a Friend) -> Element<'a, Message> {
-    let badge = activity_badge(friend);
-    let invite_button = |on_press: Option<Message>| {
-        ui::button_with(Kind::Normal, t!("home-invite"), None, on_press)
-    };
-    let hosting = friend.online && friend.activity == Activity::Hosting;
-    let invite: Element<'_, Message> = if hosting && can_ask(app) {
-        if app.home.asked_at.contains_key(&friend.id) {
-            ui::with_tooltip(
-                ui::button_with(Kind::Normal, t!("home-asked"), Some(Icon::LogIn), None),
-                t!("home-asked-tip", name = friend.display_name),
-            )
-        } else {
-            ui::button_with(
-                Kind::Primary,
-                t!("home-ask-to-join"),
-                Some(Icon::LogIn),
-                (!server_down(app)).then(|| on(Msg::AskToJoin(friend.id))),
-            )
-            .into()
-        }
-    } else if !friend.online {
-        ui::with_tooltip(invite_button(None), t!("home-invite-offline-tip"))
-    } else if !app.host.is_open() {
-        ui::with_tooltip(
-            invite_button(Some(on(Msg::Invite(friend.id)))),
-            t!("home-invite-no-room-tip"),
-        )
-    } else if room_code(app).is_none() {
-        ui::with_tooltip(invite_button(None), t!("home-invite-opening-tip"))
-    } else {
-        invite_button(Some(on(Msg::Invite(friend.id)))).into()
-    };
-    ui::list_row(
+    container(ui::list_row(
         Some(avatars::view(
             app,
-            &friend.display_name,
-            friend.avatar,
+            &request.user.display_name,
+            request.user.avatar,
             size::AVATAR,
         )),
-        friend.display_name.as_str(),
-        Some(format!("@{}", friend.username)),
+        t!(
+            "app-name-quiere-ser-tu-amigo",
+            name = request.user.display_name
+        ),
+        Some(format!("@{}", request.user.username)),
         vec![
-            badge,
-            invite,
-            ui::icon_button(
-                Icon::Trash,
-                t!("home-remove-friend"),
-                Some(on_friends(FriendsMsg::Remove {
-                    user: friend.id,
-                    name: friend.display_name.clone(),
-                })),
-            ),
+            ui::flat(
+                t!("home-decline"),
+                (!busy).then(|| Message::Friends(FriendsMsg::Decline(request.id))),
+            )
+            .into(),
+            ui::primary(
+                t!("home-accept"),
+                (!busy).then(|| Message::Friends(FriendsMsg::Accept(request.id))),
+            )
+            .into(),
         ],
-    )
+    ))
+    .width(Length::Fill)
+    .class(ContainerClass::Card)
+    .into()
+}
+
+// --- En línea ahora -------------------------------------------------------------------------------
+
+/// Quién está conectado ahora: sus avatares (con su nombre y qué hace al pasar el ratón), que
+/// llevan a Amigos.
+fn online_now(app: &App) -> Element<'_, Message> {
+    let online: Vec<&Friend> = app
+        .friends
+        .loaded()
+        .map(|friends| {
+            sorted_friends(friends)
+                .into_iter()
+                .filter(|friend| friend.online)
+                .collect()
+        })
+        .unwrap_or_default();
+    let summary = match online.len() {
+        0 => t!("home-online-now-none").to_owned(),
+        1 => t!("home-online-now-one").to_owned(),
+        n => t!("home-online-now-many", count = n),
+    };
+    let header = row![
+        ui::heading(t!("home-online-now")),
+        ui::caption(summary).wrapping(Wrapping::None),
+        ui::fill(),
+        ui::button_with(
+            Kind::Link,
+            t!("home-see-friends"),
+            Some(Icon::Users),
+            Some(Message::Navigate(Page::Friends))
+        ),
+    ]
+    .spacing(space::XS)
+    .align_y(Alignment::Center);
+    let body: Element<'_, Message> = match &app.friends {
+        Load::Idle | Load::Loading => ui::caption(t!("home-loading")).into(),
+        Load::Failed(err) => row![
+            ui::caption(t!("home-load-failed-detail", err = err)).wrapping(Wrapping::WordOrGlyph),
+            ui::button_with(
+                Kind::Link,
+                t!("home-retry"),
+                Some(Icon::Refresh),
+                Some(Message::Friends(FriendsMsg::Reload))
+            )
+        ]
+        .spacing(space::XS)
+        .align_y(Alignment::Center)
+        .into(),
+        Load::Loaded(_) if online.is_empty() => ui::caption(t!("home-online-now-empty"))
+            .wrapping(Wrapping::WordOrGlyph)
+            .into(),
+        Load::Loaded(_) => {
+            let mut faces = Row::new().spacing(space::XS).align_y(Alignment::Center);
+            for friend in online.iter().take(ONLINE_SHOWN) {
+                faces = faces.push(ui::with_tooltip(
+                    coroom_ui::animate::button(avatars::view(
+                        app,
+                        &friend.display_name,
+                        friend.avatar,
+                        size::AVATAR,
+                    ))
+                    .padding(2)
+                    .class(ButtonClass::Flat)
+                    .press_scale(true)
+                    .on_press(Message::Navigate(Page::Friends)),
+                    t!(
+                        "home-online-face",
+                        name = friend.display_name,
+                        status = activity_text(friend)
+                    ),
+                ));
+            }
+            if online.len() > ONLINE_SHOWN {
+                faces = faces.push(ui::caption(t!(
+                    "home-online-more",
+                    count = online.len() - ONLINE_SHOWN
+                )));
+            }
+            faces.wrap().into()
+        }
+    };
+    column![header, body].spacing(space::S).into()
+}
+
+/// Qué hace un amigo, en palabras (el texto de su insignia).
+pub fn activity_text(friend: &Friend) -> &'static str {
+    match (friend.online, friend.activity) {
+        (false, _) => t!("home-offline"),
+        (true, Activity::Idle) => t!("home-available"),
+        (true, Activity::Hosting) => t!("home-hosting"),
+        (true, Activity::Playing) => t!("home-playing"),
+    }
 }
 
 /// Escenas de Inicio para las capturas.
@@ -962,25 +1037,12 @@ pub(crate) mod shots {
         app.home.friends_updated = Some(ago(app, 75));
     }
 
-    pub(crate) fn add_friend(app: &mut App) {
-        signed_in(app, Page::Home);
-        app.home.friends_updated = Some(ago(app, 2));
-        app.friends_page.adding = true;
-        app.friends_page.add_name = "hugo".to_owned();
-        app.friends_page.add_error = Some("No existe ningún usuario «hugo».".to_owned());
-    }
-
     /// Escenas de esta pantalla.
     pub(crate) const BUILDERS: &[(&str, Builder)] = &[
         ("05-inicio", home),
-        ("05-inicio-menu-cuenta", |app| {
-            home(app);
-            app.update(Message::ToggleAccountMenu);
-        }),
         ("05-inicio-pedido", home_asked),
         ("06-inicio-vacio", home_empty),
         ("06-inicio-sin-servidor", home_offline),
-        ("07-agregar-amigo", add_friend),
     ];
 }
 
@@ -1107,6 +1169,17 @@ mod tests {
         app.update(Message::Tick);
         assert!(app.invitations.is_empty(), "caducó");
         assert!(app.home.invited_at.is_empty());
+        // Se pliega con su altura antes de irse del todo (sin movimiento, se va ya).
+        let exit = app.motion().exit_duration(Token::Panel);
+        if exit.is_zero() {
+            assert!(app.home.leaving.is_empty());
+        } else {
+            assert_eq!(app.home.leaving.len(), 1, "se está plegando");
+            assert_eq!(app.next_tick(), Some(app.now + exit));
+            app.now += exit;
+            app.update(Message::Tick);
+            assert!(app.home.leaving.is_empty());
+        }
         assert_eq!(app.next_tick(), None);
     }
 
@@ -1124,7 +1197,7 @@ mod tests {
     }
 
     #[test]
-    fn friends_update_time_is_recorded_and_ticks_slow_down() {
+    fn friends_update_time_is_recorded_without_ticks() {
         let mut app = main_app();
         let start = app.now;
         app.update(Message::Event(Event::Friends(Ok(Friends {
@@ -1133,9 +1206,15 @@ mod tests {
             outgoing: Vec::new(),
         }))));
         assert_eq!(app.home.friends_updated, Some(start));
-        assert_eq!(app.next_tick(), Some(start + Duration::from_secs(1)));
+        // El «actualizado hace…» va al pasar el ratón: no pide ticks.
+        assert_eq!(app.next_tick(), None);
         app.now = start + Duration::from_secs(90);
-        assert_eq!(app.next_tick(), Some(start + Duration::from_secs(120)));
+        assert_eq!(app.next_tick(), None);
+        assert!(
+            friends::updated(&app).is_some_and(|text| text.contains("actualizado")),
+            "{:?}",
+            friends::updated(&app)
+        );
         // La presencia también cuenta como actualización (y llega con la sala abierta).
         app.update(Message::Event(Event::Presence {
             user: 2,
@@ -1143,8 +1222,8 @@ mod tests {
         }));
         assert_eq!(app.home.friends_updated, Some(app.now));
         assert!(app.friends.loaded().is_some_and(|f| f.friends[0].online));
-        let summary = friends_summary(&app, app.friends.loaded().unwrap());
-        assert!(summary.starts_with("1 conectado"), "{summary}");
+        let summary = friends::summary(app.friends.loaded().unwrap());
+        assert_eq!(summary, "1 conectado");
     }
 
     #[test]

@@ -66,7 +66,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{CursorGrabMode, Fullscreen, Window, WindowId};
 
-use super::app::{App, Effect, Message, Screen, Shortcut};
+use super::app::{App, Effect, Message, Page, Screen, Shortcut};
 use super::backend::{Backend, GuestControls, Notify};
 use super::compose::{Compositor, Present};
 use super::pacing::{self, FrameClock, NextFrame};
@@ -362,6 +362,7 @@ impl Runner {
         }));
 
         let mut app = App::new(settings, appearance, fonts, Instant::now());
+        app.window = viewport.logical_size();
         app.host.restore_tokens = crate::portal::load_restore_tokens();
         if let Some(warning) = warning {
             app.toast(coroom_ui::theme::Tone::Warning, warning);
@@ -877,9 +878,14 @@ impl Ready {
         }
         let ctrl = self.modifiers.control_key();
         let shift = self.modifiers.shift_key();
+        let alt = self.modifiers.alt_key();
         let shortcut = match code {
             KeyCode::KeyQ if ctrl => Shortcut::Quit,
             KeyCode::Comma if ctrl => Shortcut::Settings,
+            KeyCode::Digit1 if ctrl && !alt => Shortcut::Go(Page::Home),
+            KeyCode::Digit2 if ctrl && !alt => Shortcut::Go(Page::Friends),
+            KeyCode::Digit3 if ctrl && !alt => Shortcut::Go(Page::Host),
+            KeyCode::ArrowLeft if alt && !ctrl && !shift => Shortcut::Back,
             KeyCode::F11 => Shortcut::Fullscreen,
             KeyCode::Escape => Shortcut::Escape,
             KeyCode::Tab => {
@@ -1028,6 +1034,16 @@ impl Ready {
                     return;
                 }
             }
+            // El botón «atrás» del ratón: un nivel atrás, como Alt+← (sobre el vídeo es del
+            // anfitrión).
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: winit::event::MouseButton::Back,
+                ..
+            } if !in_front => {
+                self.dispatch(Message::Shortcut(Shortcut::Back));
+                return;
+            }
             WindowEvent::CursorMoved { .. }
             | WindowEvent::MouseInput { .. }
             | WindowEvent::MouseWheel { .. } => {
@@ -1116,6 +1132,8 @@ impl Ready {
         );
         self.compositor.resize(size.width, size.height);
         self.resized = false;
+        // El riel se estrecha o se ensancha con la ventana.
+        self.app.window = self.viewport.logical_size();
     }
 
     /// Rehace la superficie y el motor de `iced` si cambió el ajuste de HDR.

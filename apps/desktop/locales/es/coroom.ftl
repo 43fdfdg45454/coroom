@@ -8,7 +8,6 @@
 ## app
 
 app-ajustes = Ajustes
-app-cambiar-de-servidor = Cambiar de servidor
 app-cancelar = Cancelar
 app-cerrar = Cerrar
 app-cerrar-la-sala-y-salir = ¿Cerrar la sala y salir?
@@ -35,7 +34,6 @@ app-ahora-no = Ahora no
 app-abrir-mi-sala = Abrir mi sala
 app-dejaras-de-ver-y-controlar-la = Dejarás de ver y controlar la pantalla del anfitrión. Puedes volver a entrar con el mismo código mientras la sala siga abierta.
 app-dejareis-de-ver-si-el-otro = Dejaréis de ver si el otro está conectado y no podréis invitaros a salas. { $name } no recibe ningún aviso; para volver, tendréis que pediros amistad otra vez.
-app-en-vivo = en vivo
 app-ese-dispositivo-queda-desvinculado-de-tu = Ese dispositivo queda desvinculado de tu cuenta: tendrá que volver a iniciar sesión para entrar en salas.
 app-estas-compartiendo-la-pantalla-al-salir = Estás compartiendo la pantalla: al salir, la sala se cierra para todos.
 app-expulsar = Expulsar
@@ -59,6 +57,59 @@ app-te-invita-a-su-sala = { $from_name } te invita a su sala { $code }
 app-tienes-la-ultima-version = Tienes la última versión
 app-volver-al-inicio = Volver al inicio
 
+## Navegación: el riel, la cabecera y los cambios de rol
+
+app-amigos = Amigos
+app-sala = Sala
+app-cuenta = Cuenta
+app-cuenta-de = Cuenta de { $name }
+app-destino-atajo = { $destino } · { $atajo }
+app-sala-abierta-sin-invitados = Tu sala · todavía sin invitados
+app-sala-abierta-un-invitado = Tu sala · 1 invitado
+app-sala-abierta-invitados = Tu sala · { $n } invitados
+app-abrir-el-diagnostico = Abrir el diagnóstico
+app-diagnostico = Diagnóstico
+app-sin-microfono = Sin micrófono
+app-sin-microfono-detalle = No compartes el micrófono en esta sala
+app-microfono-silenciado = Silenciado
+app-microfono-abierto = Micrófono abierto
+app-activar-tu-microfono = Activar tu micrófono
+app-silenciarte = Silenciarte
+app-name-pide-entrar = { $name } pide entrar
+app-n-piden-entrar = { $n } piden entrar
+app-ahora-eres-el-anfitrion = Ahora eres el anfitrión: la sala es tuya.
+app-ahora-eres-invitado = Le pasaste la sala a { $name }: ahora eres invitado.
+
+## account
+
+account-sin-sesion = Sin sesión
+account-sin-sesion-texto = Inicia sesión en un servidor para ver tu cuenta y los equipos vinculados.
+account-perfil = Perfil
+account-usuario-en-este-equipo = @{ $username } · en { $device }
+account-cerrar-sesion = Cerrar sesión
+account-servidor = Servidor
+account-servidor-ayuda = Donde está tu cuenta. Su estado, el certificado y el diagnóstico están en Ajustes → Servidor y red.
+account-cambiar-de-servidor = Cambiar de servidor
+account-dispositivos = Dispositivos de tu cuenta
+account-dispositivos-ayuda = Cada equipo con el que inicias sesión. Al desvincular uno, ya no puede entrar en salas hasta que vuelva a iniciar sesión.
+account-cargando-los-dispositivos = Cargando los dispositivos de tu cuenta…
+account-no-se-pudieron-cargar-los-dispositivos = No se pudieron cargar los dispositivos
+account-reintentar = Reintentar
+account-este-equipo = Este equipo
+account-desvincular = Desvincular
+account-ahora-mismo = ahora mismo
+account-visto-huella = Visto { $seen } · huella { $short }…
+account-numeros-de-seguridad = Números de seguridad
+account-numeros-de-seguridad-ayuda = Compáralos en persona o por otro canal: si coinciden, nadie se ha puesto en medio.
+account-numeros-de-seguridad-vacio = Aparecen al entrar en una sala o recibir a alguien en la tuya.
+account-numero-recortado = { $preview }…
+account-ver = Ver
+account-detalles-de-seguridad = Detalles de seguridad
+account-detalles-de-seguridad-ayuda = La huella completa de la identidad de este equipo, para compararla con la que ven tus amigos.
+account-identidad-de-este-equipo = Identidad de este equipo
+account-identidad-de-este-equipo-ayuda = Tu clave Ed25519: tus amigos ven esta huella al compartir contigo.
+account-copiar = Copiar
+
 ## backend
 
 backend-el-servidor-cerro-la-senalizacion = el servidor cerró la señalización
@@ -78,7 +129,7 @@ pantalla-login-abcd-efgh-jklm = ABCD-EFGH-JKLM
 pantalla-login-al-menos-12-caracteres = Al menos 12 caracteres.
 pantalla-login-ana = Ana
 pantalla-login-anadir-servidor = Añadir servidor
-pantalla-login-aparece-en-ajustes-dispositivos-desde-donde = Aparece en Ajustes → Dispositivos, desde donde puedes cerrar su sesión.
+pantalla-login-aparece-en-cuenta-dispositivos = Aparece en Cuenta → Dispositivos, desde donde puedes cerrar su sesión.
 pantalla-login-certificado-autofirmado = Certificado autofirmado
 pantalla-login-certificado-propio = Certificado propio
 pantalla-login-certificado-valido = Certificado válido
@@ -121,7 +172,8 @@ pantalla-login-no-se-pudo-conectar-err-comprueba = No se pudo conectar: { $err }
 pantalla-login-no-se-pudo-recuperar-la-sesion = No se pudo recuperar la sesión guardada: { $err }
 pantalla-login-nombre-de-este-dispositivo = Nombre de este dispositivo
 pantalla-login-nombre-visible = Nombre visible
-pantalla-login-olvidar-este-servidor = Olvidar este servidor
+pantalla-login-olvidar-servidor = Olvidar servidor
+pantalla-login-mas-acciones = Más acciones
 pantalla-login-otra-version = Otra versión
 pantalla-login-ponle-nombre-a-este-equipo-por = Ponle nombre a este equipo (por ejemplo, «Portátil»)
 pantalla-login-protocolo = Protocolo { $protocol }
@@ -132,7 +184,7 @@ pantalla-login-solo-letras-sin-tilde-cifras-y = Solo letras sin tilde, cifras, �
 pantalla-login-solo-tcp = Solo TCP
 pantalla-login-tengo-un-codigo-de-invitacion = Tengo un código de invitación
 pantalla-login-usuario = Usuario
-pantalla-login-volver = Volver
+pantalla-login-volver-atajo = Volver (Alt+←)
 pantalla-login-ya-tengo-cuenta = Ya tengo cuenta
 
 ## portal

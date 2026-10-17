@@ -21,6 +21,21 @@ home-code-length = El código tiene { $length } caracteres
 home-code-invalid = Ese código no es de una sala (sin «0», «1», «I» ni «O»)
 home-enter = Entrar
 
+## Bandeja y «En línea ahora»
+
+home-tray = Bandeja
+home-tray-empty = Nada pendiente: aquí llegan las invitaciones y las solicitudes.
+home-tray-detail = invitaciones y solicitudes; vencen solas
+home-online-now = En línea ahora
+home-online-now-none = nadie
+home-online-now-one = 1 amigo
+home-online-now-many = { $count } amigos
+home-online-now-empty = Ninguno de tus amigos está conectado ahora.
+home-online-face = { $name } · { $status }
+home-online-more = y { $count } más
+home-see-friends = Ver amigos
+home-load-failed-detail = No se pudo cargar la lista de amigos: { $err }
+
 ## Invitaciones
 
 home-invite-title = { $name } te invita a su sala
@@ -29,7 +44,6 @@ home-ignore = Ignorar
 
 ## Amigos
 
-home-friends = Amigos
 home-online-none = Nadie conectado
 home-online-one = 1 conectado
 home-online-many = { $count } conectados
@@ -56,7 +70,6 @@ home-asked = Pedido…
 home-asked-tip = Esperando a { $name }
 home-ask-sent = Le pediste entrar a { $name }
 home-ask-no-answer = { $name } no respondió
-home-invite-offline-tip = Está desconectado
 home-invite-opening-tip = La sala se está abriendo
 home-invite-no-room-tip = Abre una sala para invitar
 home-invitation-sent = Invitación enviada a { $name }
@@ -68,3 +81,13 @@ home-pending = @{ $username } · pendiente de aceptar
 home-accept = Aceptar
 home-decline = Rechazar
 home-withdraw = Retirar
+
+## Página de Amigos
+
+friends-group = { $group } · { $count }
+friends-group-hosting = En sala
+friends-group-playing = Jugando
+friends-group-online = Conectados
+friends-group-offline = Desconectados
+friends-show-offline = Mostrar a los desconectados
+friends-hide-offline = Ocultar a los desconectados

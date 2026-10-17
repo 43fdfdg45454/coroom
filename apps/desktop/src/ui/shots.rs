@@ -24,7 +24,7 @@ use iced_wgpu::{Engine, Renderer, wgpu};
 
 use super::app::{AccountInfo, App, Event, Message, Page, Screen};
 use super::screens::login::{self, Probe, Step};
-use super::screens::{diagnostics, guest, home, host, settings};
+use super::screens::{account, diagnostics, friends, guest, home, host, settings};
 use super::settings::{KnownPeer, ServerEntry, Settings, ThemeChoice};
 use super::system::SystemAppearance;
 
@@ -76,9 +76,11 @@ impl ShotRenderer {
 
     /// Dibuja `app` a `scale` (1.0, o 2.0 para HiDPI); devuelve el ancho, el alto y los píxeles
     /// RGBA.
+    /// El tamaño es el de la ventana de `app` ([`App::window`]; [`SIZE`] salvo en las escenas
+    /// del riel estrecho).
     pub fn render(&mut self, app: &App, scale: f32) -> (u32, u32, Vec<u8>) {
-        let width = (SIZE.0 as f32 * scale).round() as u32;
-        let height = (SIZE.1 as f32 * scale).round() as u32;
+        let width = (app.window.width * scale).round() as u32;
+        let height = (app.window.height * scale).round() as u32;
         let viewport = Viewport::with_physical_size(Size::new(width, height), scale);
         let theme = app.theme;
         let mut cache = user_interface::Cache::new();
@@ -229,6 +231,8 @@ pub fn scenes() -> Vec<Scene> {
         for (name, build) in builders() {
             let mut app = base(mode, fonts);
             build(&mut app);
+            // Las capturas muestran la página ya entrada (sin el desliz del cambio de destino).
+            app.page_change = None;
             app.refresh_theme();
             scenes.push(Scene {
                 name: format!("{name}-{suffix}"),
@@ -254,15 +258,43 @@ const LOGIN_BUILDERS: &[(&str, Builder)] = &[
     ("04-crear-cuenta", create_account),
 ];
 
+/// Ventana estrecha (sigue con el riel plegado, como [`SIZE`]).
+pub const NARROW: (u32, u32) = (900, 780);
+
+/// Ventana ancha (maximizada en una pantalla de 1366 px): el riel con iconos y nombres.
+pub const WIDE: (u32, u32) = (1366, 780);
+
+/// Escenas del riel con la sala abierta (el pie con el micrófono y las peticiones), ancho y
+/// estrecho.
+const RAIL_BUILDERS: &[(&str, Builder)] = &[
+    ("09-riel-ancho-inicio", |app| {
+        host::shots::host_room_join_request(app);
+        app.window = iced_core::Size::new(WIDE.0 as f32, WIDE.1 as f32);
+        app.update(Message::Navigate(Page::Home));
+    }),
+    ("09-riel-ancho-sala", |app| {
+        host::shots::host_room_join_request(app);
+        app.window = iced_core::Size::new(WIDE.0 as f32, WIDE.1 as f32);
+    }),
+    ("09-riel-estrecho-amigos", |app| {
+        host::shots::host_room_join_request(app);
+        app.window = iced_core::Size::new(NARROW.0 as f32, NARROW.1 as f32);
+        app.update(Message::Navigate(Page::Friends));
+    }),
+];
+
 /// Todas las escenas, en el orden de las pantallas.
 fn builders() -> Vec<(&'static str, Builder)> {
     LOGIN_BUILDERS
         .iter()
         .chain(home::shots::BUILDERS)
+        .chain(friends::shots::BUILDERS)
+        .chain(account::shots::BUILDERS)
         .chain(host::shots::BUILDERS)
         .chain(guest::shots::BUILDERS)
         .chain(settings::shots::BUILDERS)
         .chain(diagnostics::shots::BUILDERS)
+        .chain(RAIL_BUILDERS)
         .copied()
         .collect()
 }

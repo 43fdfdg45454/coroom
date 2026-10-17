@@ -44,6 +44,8 @@ fn renderer() -> Option<Renderer> {
 /// Un fotograma de la ventana: construye la interfaz sobre la caché, le pasa el ratón y el
 /// redibujado, la dibuja y aplica los mensajes que produjo.
 fn frame(app: &mut App, renderer: &mut Renderer, size: (f32, f32), cache: Cache) -> Cache {
+    // Como la ventana: el riel se estrecha o se ensancha con el tamaño.
+    app.window = Size::new(size.0, size.1);
     let theme = app.theme;
     let mut interface =
         UserInterface::build(app.view(), Size::new(size.0, size.1), cache, renderer);

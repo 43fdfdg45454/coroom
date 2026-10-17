@@ -1,22 +1,30 @@
 //! Ajustes: lo que no depende de una sala.
 //!
-//! Siete páginas con su navegación lateral: **Cuenta y servidor** (quién eres, el servidor y su
-//! huella, los dispositivos de la cuenta, la red y los números de seguridad), **Audio y voz**
-//! (salida y micrófono con la lista en vivo, la voz como anfitrión y como invitado), **Sala** (cómo
-//! entran los invitados y los avisos del chat), **Notificaciones** (el volumen de los avisos con
-//! sonido y el tono de cada uno, con «Probar»), **Mandos** (qué mando envías, la ranura que
-//! ofreces y los atajos `Ctrl+Alt+letra`), **Apariencia** (tema, acento y la fuente del
-//! escritorio) y **Acerca de** (versión, versiones nuevas y licencias). Lo de vídeo y calidad vive
-//! en Compartir y en el panel de la sala; el diagnóstico se abre desde la cabecera y la sala.
+//! Nueve secciones con su navegación lateral, cada cosa en un solo sitio y con un solo nombre:
+//! **Servidor y red** (el servidor con su certificado, el uso del relay del mes, el diagnóstico y
+//! la red), **Audio y voz** (salida y micrófono con la lista en vivo, tu voz y el volumen del
+//! juego), **Vídeo** (la calidad por defecto y Avanzado, y cómo ves el vídeo de los demás),
+//! **Sala** (cómo se comporta la sala como anfitrión y como invitado), **Notificaciones** (el
+//! volumen y el tono de cada aviso, todo lo del chat y los sonidos de la interfaz), **Mandos** (el
+//! que envías y la ranura que ofreces), **Atajos de teclado** (todos en una tabla), **Apariencia**
+//! (tema, acento, fuente y animaciones) y **Acerca de** (versión, versiones nuevas y licencias).
+//! La cuenta tiene su página en el riel (`screens::account`); sus acciones (desvincular un
+//! dispositivo, ver un número de seguridad) siguen siendo mensajes de aquí ([`Msg`]).
 //!
-//! Cada cambio se guarda solo, poco después ([`App::settings_changed`]); las filas cuyo cambio no
-//! llega a la sala abierta lo dicen con una etiqueta («Al abrir la sala», «Al entrar en la sala»).
+//! Todas las filas son iguales ([`ui::setting_row`]): título y descripción a la izquierda, la
+//! etiqueta de cuándo surte efecto («Al momento», «En la próxima sala», «Al entrar») en una
+//! columna de ancho fijo y el control a la derecha. Ninguna cambia de alto al cambiar su valor
+//! (lo que cambia con él va en una ranura del tamaño de su variante mayor) ni al llegar una
+//! lista de dispositivos nueva (su hora va en un icono, con el detalle al pasar el ratón).
+//!
+//! Cada cambio se guarda solo, poco después ([`App::settings_changed`]).
 
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use coroom_session::audio::AudioError;
 use coroom_session::capture::ShareKind;
+use coroom_session::codec::Codec;
 use coroom_session::input::gamepad::PadChoice;
 use coroom_session::remote::audio::{AudioIssue, DeviceSwitchError};
 use coroom_transport::proto::PROTOCOL_VERSION;
@@ -24,45 +32,53 @@ use coroom_transport::proto::api::Devices;
 use coroom_ui::Element;
 use coroom_ui::icon::{Icon, icon_with};
 use coroom_ui::style::{
-    ButtonClass, ContainerClass, ProgressClass, SliderClass, SvgClass, TextClass,
+    ButtonClass, ContainerClass, InputClass, ProgressClass, SliderClass, SvgClass, TextClass,
 };
 use coroom_ui::tag;
 use coroom_ui::theme::{Accent, Tone};
-use coroom_ui::tokens::{space, text as type_size};
+use coroom_ui::tokens::{size, space, text as type_size};
 use coroom_ui::widget::{self as ui, Kind};
+use iced_core::alignment::{Horizontal, Vertical};
 use iced_core::text::Wrapping;
+use iced_core::widget::Id;
 use iced_core::{Alignment, Length, Padding};
-use iced_widget::{Column, Row, button, column, container, progress_bar, row, text};
+use iced_widget::{Column, Row, button, column, container, progress_bar, row, text, text_input};
 
 use crate::portal::{REMEMBERS_SHARE_PERMISSION, RestoreTokens};
 use crate::ui::app::{
     App, AudioDevice, Dialog, Effect, Event, Load, Message, MicTest, MicTestError, Page, Screen,
+    VideoSupport,
 };
-use crate::ui::screens::diagnostics;
+use crate::ui::screens::{diagnostics, host};
 use crate::ui::settings::{
-    DEFAULT_NOTIFICATION_VOLUME, DEFAULT_VOICE_VOLUME, MAX_VOICE_VOLUME, MotionChoice, Shortcuts,
-    SoundChoice, SoundEvent, ThemeChoice, VoiceMode, voice_gain,
+    CodecChoice, DEFAULT_NOTIFICATION_VOLUME, DEFAULT_VOICE_VOLUME, DecoderChoice, EncoderChoice,
+    FPS_CHOICES, MAX_VOICE_VOLUME, MotionChoice, QualityPreset, Resolution, Shortcuts, SoundChoice,
+    SoundEvent, ThemeChoice, Video, VideoOption, VoiceMode, When, voice_gain,
 };
 use crate::ui::tones::Builtin;
 
 /// Cada cuánto se vuelve a pedir la lista de micrófonos y salidas con «Audio y voz» abierta.
 pub const AUDIO_REFRESH: Duration = Duration::from_secs(3);
 
-/// Páginas de Ajustes.
+/// Secciones de Ajustes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SettingsPage {
-    /// Cuenta, servidor, dispositivos de la cuenta y red.
+    /// El servidor, su certificado, el uso del relay, el diagnóstico y la red.
     #[default]
-    Account,
-    /// Dispositivos de audio y voz.
+    Network,
+    /// Dispositivos de audio, tu voz y el volumen del juego.
     Audio,
-    /// Cómo entran los invitados y los avisos del chat.
+    /// La calidad por defecto, Avanzado y cómo se ve el vídeo de los demás.
+    Video,
+    /// Cómo se comporta la sala como anfitrión y como invitado.
     Room,
-    /// Los avisos con sonido.
+    /// Los avisos con sonido, el chat y los sonidos de la interfaz.
     Notifications,
-    /// Mandos y atajos.
+    /// El mando que se envía y la ranura que se ofrece.
     Gamepads,
-    /// Tema, acento y fuente.
+    /// Todos los atajos de teclado.
+    Shortcuts,
+    /// Tema, acento, fuente y animaciones.
     Appearance,
     /// Versión, versiones nuevas y licencias.
     About,
@@ -70,12 +86,14 @@ pub enum SettingsPage {
 
 impl SettingsPage {
     /// Todas, en el orden de la navegación.
-    pub const ALL: [SettingsPage; 7] = [
-        SettingsPage::Account,
+    pub const ALL: [SettingsPage; 9] = [
+        SettingsPage::Network,
         SettingsPage::Audio,
+        SettingsPage::Video,
         SettingsPage::Room,
         SettingsPage::Notifications,
         SettingsPage::Gamepads,
+        SettingsPage::Shortcuts,
         SettingsPage::Appearance,
         SettingsPage::About,
     ];
@@ -83,11 +101,13 @@ impl SettingsPage {
     /// Nombre en la navegación.
     pub fn label(self) -> &'static str {
         match self {
-            SettingsPage::Account => t!("settings-cuenta-y-servidor"),
+            SettingsPage::Network => t!("settings-servidor-y-red"),
             SettingsPage::Audio => t!("settings-audio-y-voz"),
+            SettingsPage::Video => t!("settings-video"),
             SettingsPage::Room => t!("settings-sala"),
             SettingsPage::Notifications => t!("settings-notificaciones"),
             SettingsPage::Gamepads => t!("settings-mandos"),
+            SettingsPage::Shortcuts => t!("settings-atajos-de-teclado"),
             SettingsPage::Appearance => t!("settings-apariencia"),
             SettingsPage::About => t!("settings-acerca-de"),
         }
@@ -95,11 +115,13 @@ impl SettingsPage {
 
     fn icon(self) -> Icon {
         match self {
-            SettingsPage::Account => Icon::UserRound,
+            SettingsPage::Network => Icon::Server,
             SettingsPage::Audio => Icon::Headphones,
+            SettingsPage::Video => Icon::Monitor,
             SettingsPage::Room => Icon::Users,
             SettingsPage::Notifications => Icon::Bell,
             SettingsPage::Gamepads => Icon::Gamepad,
+            SettingsPage::Shortcuts => Icon::Keyboard,
             SettingsPage::Appearance => Icon::Palette,
             SettingsPage::About => Icon::Info,
         }
@@ -132,7 +154,7 @@ pub struct State {
     /// Cuándo llegó la última respuesta (lista o error): la siguiente se pide
     /// [`AUDIO_REFRESH`] después.
     pub audio_answered_at: Option<Instant>,
-    /// Cuándo llegó la última lista («actualizado hace N s»).
+    /// Cuándo llegó la última lista (en el detalle del icono de la lista).
     pub audio_updated_at: Option<Instant>,
     /// Error de la última petición si ya había una lista (se sigue mostrando la anterior).
     pub audio_error: Option<String>,
@@ -218,6 +240,16 @@ pub enum Msg {
     MicVolumeDone,
     /// Como invitado, quién habla sobre el vídeo.
     TalkingOverlay(bool),
+    /// Volumen del audio del juego como invitado (porcentaje), mientras se arrastra.
+    GameVolume(u8),
+    /// Al soltar el deslizador del volumen del juego.
+    GameVolumeDone,
+    /// Como invitado, sincronizar la presentación con el refresco de la pantalla.
+    Vsync(bool),
+    /// Como invitado, decodificar por software.
+    SoftwareDecoder(bool),
+    /// Sonidos de la interfaz.
+    InterfaceSounds(bool),
     /// Como invitado, volver a enviar el último mando que se conecte.
     PadAuto,
     /// Ranura que se ofrece primero al dar mando.
@@ -291,15 +323,8 @@ pub fn on_open(app: &mut App) -> Vec<Effect> {
 
 fn page_effects(app: &mut App, page: SettingsPage) -> Vec<Effect> {
     match page {
-        SettingsPage::Account
-            if !app.settings_page.devices.is_loading() && app.account.is_some() =>
-        {
-            app.settings_page.devices = match std::mem::take(&mut app.settings_page.devices) {
-                Load::Loaded(devices) => Load::Loaded(devices),
-                _ => Load::Loading,
-            };
-            vec![Effect::LoadDevices]
-        }
+        // El uso del relay del mes, al día cada vez que se abre.
+        SettingsPage::Network if app.account.is_some() => vec![Effect::LoadUsage],
         SettingsPage::Audio => request_audio(app),
         _ => Vec::new(),
     }
@@ -325,25 +350,19 @@ fn audio_visible(app: &App) -> bool {
         && app.settings_page.page == SettingsPage::Audio
 }
 
-/// Cuándo necesita Ajustes el próximo [`Message::Tick`]: con «Audio y voz» abierta, cada
-/// segundo para «actualizado hace N s» y a los [`AUDIO_REFRESH`] de la última respuesta para
-/// volver a pedir la lista. Nunca una hora pasada mientras la lista está pedida (no hay bucle).
+/// Cuándo necesita Ajustes el próximo [`Message::Tick`]: con «Audio y voz» abierta, a los
+/// [`AUDIO_REFRESH`] de la última respuesta para volver a pedir la lista (ningún texto cambia
+/// cada segundo: la hora de la lista va en el detalle de su icono). Nunca una hora pasada
+/// mientras la lista está pedida (no hay bucle).
 pub fn next_tick(app: &App) -> Option<Instant> {
     if !audio_visible(app) {
         return None;
     }
     let state = &app.settings_page;
-    let mut next = state.audio_updated_at.map(|at| {
-        let elapsed = app.now.saturating_duration_since(at).as_secs();
-        at + Duration::from_secs(elapsed + 1)
-    });
-    if !state.audio_refreshing
-        && let Some(at) = state.audio_answered_at
-    {
-        let due = at + AUDIO_REFRESH;
-        next = Some(next.map_or(due, |next| next.min(due)));
+    if state.audio_refreshing {
+        return None;
     }
-    next
+    state.audio_answered_at.map(|at| at + AUDIO_REFRESH)
 }
 
 /// En cada [`Message::Tick`]: vuelve a pedir la lista de audio si toca.
@@ -460,6 +479,32 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::ChatNotifications(on) => settings.room.chat_notifications = on,
         Msg::ChatBubbles(on) => settings.room.chat_bubbles = on,
         Msg::TalkingOverlay(on) => settings.room.talking_overlay = on,
+        Msg::GameVolume(percent) => {
+            let percent = percent.min(MAX_VOICE_VOLUME);
+            settings.audio.game_volume = percent;
+            // Como invitado, suena así ya (el panel de la sala lo ve igual).
+            if let Some(guest) = &mut app.guest {
+                guest.game_volume = percent;
+                return vec![Effect::SetGameGain {
+                    gain: voice_gain(percent),
+                }];
+            }
+            return Vec::new();
+        }
+        Msg::GameVolumeDone => {}
+        // Al momento: la ventana lo lee de los ajustes.
+        Msg::Vsync(on) => settings.video.vsync = on,
+        Msg::SoftwareDecoder(software) => {
+            settings.video.decoder = if software {
+                DecoderChoice::Software
+            } else {
+                DecoderChoice::Auto
+            };
+            let mut effects = app.settings_changed();
+            effects.push(Effect::SetSoftwareDecoder(software));
+            return effects;
+        }
+        Msg::InterfaceSounds(on) => settings.notifications.interface_sounds = on,
         Msg::MicTest(on) => {
             app.settings_page.mic_test_error = None;
             app.settings_page.mic_test = on.then_some(0.0);
@@ -743,55 +788,75 @@ fn on(msg: Msg) -> Message {
     Message::Settings(msg)
 }
 
-/// Dibuja la página: la navegación a la izquierda y la página elegida a la derecha.
+/// Prefijo del identificador de cada fila de ajuste (las pruebas miden sus rectángulos): el
+/// prefijo y el título de la fila.
+pub const ROW_ID: &str = "ajuste:";
+
+/// Prefijo del identificador de cada entrada de la navegación: el prefijo y su índice en
+/// [`SettingsPage::ALL`].
+pub const NAV_ID: &str = "ajustes-nav:";
+
+/// Dibuja la página: la navegación a la izquierda y la sección elegida a la derecha. El fondo
+/// del elegido se desliza con un resorte hasta el nuevo ([`coroom_ui::animate::Segments`]); el
+/// contenido cambia en su sitio, sin desplazarse.
 pub fn view(app: &App) -> Element<'_, Message> {
     let state = &app.settings_page;
     let offline = app.server_status.online == Some(false);
-    let entries = Column::with_children(SettingsPage::ALL.iter().map(|page| {
-        let selected = state.page == *page;
-        let mut line = row![
-            icon_with(page.icon(), 18.0, SvgClass::Text),
-            text(page.label())
-                .size(type_size::BODY)
-                .font(if selected {
-                    coroom_ui::font::SEMIBOLD
-                } else {
-                    coroom_ui::font::UI
-                })
-                .width(Length::Fill)
-        ]
-        .spacing(space::S)
-        .align_y(Alignment::Center);
-        if *page == SettingsPage::Account && offline {
-            line = line.push(ui::dot(Tone::Error));
-        }
-        button(line)
-            .padding(Padding::from([9.0, 12.0]))
-            .width(Length::Fill)
-            .class(ButtonClass::Nav { selected })
-            .on_press(on(Msg::Page(*page)))
+    let chosen = SettingsPage::ALL
+        .iter()
+        .position(|page| *page == state.page);
+    let entries =
+        Column::with_children(SettingsPage::ALL.iter().enumerate().map(|(index, page)| {
+            let selected = state.page == *page;
+            // El punto del servidor que no responde tiene su sitio siempre.
+            let alert = (*page == SettingsPage::Network && offline).then(|| ui::dot(Tone::Error));
+            let line = row![
+                icon_with(page.icon(), 18.0, SvgClass::Text),
+                text(page.label())
+                    .size(type_size::BODY)
+                    .font(if selected {
+                        coroom_ui::font::SEMIBOLD
+                    } else {
+                        coroom_ui::font::UI
+                    })
+                    .width(Length::Fill),
+                ui::reserved(size::DOT, size::DOT, alert),
+            ]
+            .spacing(space::S)
+            .align_y(Alignment::Center);
+            // El elegido no pinta su fondo: lo pinta el que se desliza debajo.
+            container(
+                coroom_ui::animate::button(line)
+                    .padding(Padding::from([9.0, 12.0]))
+                    .width(Length::Fill)
+                    .class(if selected {
+                        ButtonClass::Segment { selected: true }
+                    } else {
+                        ButtonClass::Nav { selected: false }
+                    })
+                    .on_press(on(Msg::Page(*page))),
+            )
+            .id(Id::from(format!("{NAV_ID}{index}")))
             .into()
-    }))
-    .spacing(2);
-    let nav = container(
-        column![
-            entries,
-            iced_widget::space::vertical(),
-            container(ui::caption(t!("settings-video-esta-en-compartir")).wrapping(Wrapping::Word))
-                .padding(Padding::from([8.0, 12.0]))
-        ]
-        .height(Length::Fill),
-    )
+        }))
+        .spacing(2);
+    let nav = container(coroom_ui::animate::Segments::new(
+        entries,
+        chosen,
+        ButtonClass::Nav { selected: true },
+    ))
     .padding(Padding::from([12.0, 8.0]))
     .width(Length::Fixed(NAV_WIDTH))
     .height(Length::Fill)
     .class(ContainerClass::Sidebar);
     let content: Element<'_, Message> = match state.page {
-        SettingsPage::Account => account(app),
+        SettingsPage::Network => network(app),
         SettingsPage::Audio => audio(app),
+        SettingsPage::Video => video(app),
         SettingsPage::Room => room(app),
         SettingsPage::Notifications => notifications(app),
         SettingsPage::Gamepads => gamepads(app),
+        SettingsPage::Shortcuts => shortcuts(app),
         SettingsPage::Appearance => appearance(app),
         SettingsPage::About => about(app),
     };
@@ -807,162 +872,143 @@ pub fn view(app: &App) -> Element<'_, Message> {
 /// Ancho de la navegación de Ajustes.
 const NAV_WIDTH: f32 = 220.0;
 
-/// Fila de ajuste con una etiqueta de cuándo surte efecto delante del control.
-fn tagged_row<'a>(
-    title: impl text::IntoFragment<'a>,
-    subtitle: Option<String>,
-    when: Option<tag::When>,
-    control: impl Into<Element<'a, Message>>,
-) -> Element<'a, Message> {
-    let mut trailing = Row::new().spacing(space::S).align_y(Alignment::Center);
-    if let Some(when) = when {
-        trailing = trailing.push(tag::tag(
-            when,
-            match when {
-                tag::When::Live => t!("settings-en-vivo"),
-                tag::When::Later => t!("settings-al-abrir-la-sala"),
-            },
-        ));
-    }
-    ui::pref_row(title, subtitle, trailing.push(control))
+// --- Filas ---------------------------------------------------------------------------------------
+
+/// Cuándo surte efecto un ajuste: la etiqueta de su fila, en la columna de «cuándo aplica».
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Applies {
+    /// Ya, también en la sala abierta («Al momento»).
+    Now,
+    /// En la próxima sala que se abra o en la que se entre («En la próxima sala»).
+    NextRoom,
+    /// Al entrar en una sala como invitado («Al entrar»).
+    OnJoin,
 }
 
-/// Etiqueta gris con otro texto («Al entrar en la sala»).
-fn later_row<'a>(
-    title: impl text::IntoFragment<'a>,
-    subtitle: Option<String>,
-    label: &'a str,
+impl Applies {
+    /// Todas: la columna mide lo que la más ancha.
+    pub const ALL: [Applies; 3] = [Applies::Now, Applies::NextRoom, Applies::OnJoin];
+
+    /// Texto de la etiqueta.
+    pub fn label(self) -> &'static str {
+        match self {
+            Applies::Now => t!("settings-al-momento"),
+            Applies::NextRoom => t!("settings-en-la-proxima-sala"),
+            Applies::OnJoin => t!("settings-al-entrar"),
+        }
+    }
+
+    fn when(self) -> tag::When {
+        match self {
+            Applies::Now => tag::When::Live,
+            Applies::NextRoom | Applies::OnJoin => tag::When::Later,
+        }
+    }
+
+    /// Cuándo surte efecto una opción de vídeo ([`Video::when`]).
+    fn of_video(option: VideoOption) -> Applies {
+        match Video::when(option) {
+            When::Live => Applies::Now,
+            When::NextRoom => Applies::NextRoom,
+        }
+    }
+}
+
+/// La columna de «cuándo aplica» de una fila con su etiqueta: del ancho de la más ancha, así las
+/// etiquetas de las filas con el mismo control quedan una debajo de otra.
+fn when_column<'a>(applies: Applies) -> Element<'a, Message> {
+    let labels = Applies::ALL.map(|applies| (applies.when(), applies.label()));
+    tag::column(&labels, Some((applies.when(), applies.label())))
+}
+
+/// Identificador de la fila de ajuste `title` ([`ROW_ID`]).
+pub fn row_id(title: &str) -> Id {
+    Id::from(format!("{ROW_ID}{title}"))
+}
+
+/// Fila de ajuste, la misma en todas las secciones: título y `below` a la izquierda, la columna
+/// de «cuándo aplica» y el control a la derecha ([`ui::setting_row`]). Las filas de lo que no
+/// tiene que ver con una sala (`applies` vacío: el tema, un tono) no llevan la columna y dejan
+/// ese ancho a su descripción; ninguna fila la pone o la quita según su valor.
+fn setting<'a>(
+    title: impl Into<std::borrow::Cow<'a, str>>,
+    below: Option<Element<'a, Message>>,
+    applies: Option<Applies>,
     control: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    ui::pref_row(
+    let title = title.into();
+    let id = row_id(&title);
+    container(ui::setting_row(
         title,
-        subtitle,
-        row![tag::later(label), control.into()]
-            .spacing(space::S)
-            .align_y(Alignment::Center),
-    )
+        below,
+        applies.map(when_column),
+        control,
+    ))
+    .id(id)
+    .width(Length::Fill)
+    .into()
 }
 
-/// Valor monoespaciado con «Copiar», en una fila de ajuste.
-fn copy_row<'a>(title: &'a str, subtitle: Option<String>, value: &'a str) -> Element<'a, Message> {
-    let mut texts = column![ui::body(title)].spacing(2);
-    if let Some(subtitle) = subtitle {
-        texts = texts.push(ui::secondary(subtitle).wrapping(Wrapping::WordOrGlyph));
-    }
-    texts = texts.push(
-        container(ui::mono(value, type_size::SECONDARY).wrapping(Wrapping::WordOrGlyph))
-            .padding(Padding::from([6.0, 10.0]))
-            .width(Length::Fill)
-            .class(ContainerClass::Code),
-    );
-    row![
-        texts.width(Length::Fill),
+/// Descripción de una fila.
+fn help<'a>(content: impl text::IntoFragment<'a>) -> Element<'a, Message> {
+    ui::secondary(content)
+        .wrapping(Wrapping::WordOrGlyph)
+        .into()
+}
+
+/// Descripción en rojo (un error en el sitio de la descripción).
+fn help_error<'a>(content: impl text::IntoFragment<'a>) -> Element<'a, Message> {
+    ui::secondary(content)
+        .class(TextClass::Tone(Tone::Error))
+        .wrapping(Wrapping::WordOrGlyph)
+        .into()
+}
+
+/// Descripción que cambia con el valor («Sigue al sistema», «Siempre claro»): ocupa lo que la
+/// más larga de `variants`, así la fila no cambia de alto al cambiar el valor.
+fn varying<'a>(variants: Vec<String>, current: Element<'a, Message>) -> Element<'a, Message> {
+    ui::reserve(variants.into_iter().map(help), Some(current))
+        .align_y(Vertical::Top)
+        .into()
+}
+
+/// Control que cambia con el valor («Probar» o «Parar»), en una ranura del tamaño del mayor de
+/// `variants` y alineado a la derecha: la descripción no se estrecha ni corta línea de otra forma.
+fn steady<'a>(
+    variants: Vec<Element<'a, Message>>,
+    current: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    ui::reserve(variants, Some(current.into()))
+        .align_x(Horizontal::Right)
+        .into()
+}
+
+/// Valor monoespaciado con «Copiar» (huellas).
+fn copy_row<'a>(title: &'a str, subtitle: &'a str, value: &'a str) -> Element<'a, Message> {
+    setting(
+        title,
+        Some(
+            column![
+                help(subtitle),
+                container(ui::mono(value, type_size::SECONDARY).wrapping(Wrapping::WordOrGlyph))
+                    .padding(Padding::from([6.0, 10.0]))
+                    .width(Length::Fill)
+                    .class(ContainerClass::Code),
+            ]
+            .spacing(space::XS)
+            .into(),
+        ),
+        None,
         ui::button_with(
             Kind::Normal,
             t!("settings-copiar"),
             Some(Icon::Copy),
             Some(Message::Copy(value.to_owned())),
-        )
-    ]
-    .spacing(space::M)
-    .align_y(Alignment::Center)
-    .padding(Padding::from([10.0, 16.0]))
-    .into()
+        ),
+    )
 }
 
-// --- Cuenta y servidor ---------------------------------------------------------------------------
-
-fn account(app: &App) -> Element<'_, Message> {
-    let mut page = Column::new().spacing(space::L);
-    if app.server_status.online == Some(false) {
-        let host = app
-            .account
-            .as_ref()
-            .map(crate::ui::app::AccountInfo::host)
-            .unwrap_or_default();
-        page = page.push(ui::banner(
-            Tone::Error,
-            t!("settings-el-servidor-no-responde", host = host),
-            Some((
-                t!("settings-abrir-diagnostico"),
-                Message::Diagnostics(diagnostics::Msg::Open),
-            )),
-        ));
-    }
-    let Some(account) = &app.account else {
-        return page
-            .push(ui::empty_state(
-                Icon::UserRound,
-                t!("settings-sin-sesion"),
-                t!("settings-sin-sesion-texto"),
-                None,
-            ))
-            .into();
-    };
-    let server_status = match (app.server_status.online, app.server_status.rtt_ms) {
-        (Some(false), _) => t!("settings-servidor-no-responde-corto").to_owned(),
-        (_, Some(rtt)) => t!("settings-servidor-responde-en", rtt = rtt.round() as u64),
-        _ => t!("settings-servidor-comprobando").to_owned(),
-    };
-    let mut rows = vec![ui::list_row(
-        Some(crate::ui::avatars::view(
-            app,
-            &account.display_name,
-            account.avatar,
-            crate::ui::avatars::SETTINGS_SIDE,
-        )),
-        account.display_name.as_str(),
-        Some(t!(
-            "settings-usuario-en-este-equipo",
-            username = account.username,
-            device = account.device
-        )),
-        vec![
-            ui::button_with(
-                Kind::DestructiveSoft,
-                t!("settings-cerrar-sesion"),
-                Some(Icon::LogOut),
-                Some(Message::SignOut),
-            )
-            .into(),
-        ],
-    )];
-    rows.extend(crate::ui::avatars::settings_row(app));
-    rows.extend([ui::list_row(
-        Some(icon_with(Icon::Server, 22.0, SvgClass::Secondary)),
-        account.host(),
-        Some(server_status),
-        vec![
-            ui::normal(
-                t!("settings-cambiar-de-servidor"),
-                Some(Message::SwitchServer),
-            )
-            .into(),
-        ],
-    )]);
-    if let Some(certificate) = &account.server.fingerprint {
-        rows.push(copy_row(
-            t!("settings-certificado-del-servidor"),
-            Some(t!("settings-certificado-del-servidor-ayuda").to_owned()),
-            certificate.as_str(),
-        ));
-    }
-    rows.push(copy_row(
-        t!("settings-identidad-de-este-equipo"),
-        Some(t!("settings-identidad-de-este-equipo-ayuda").to_owned()),
-        account.fingerprint.as_str(),
-    ));
-    page = page.push(ui::section(t!("settings-cuenta"), None, rows));
-    page = page.push(devices(app));
-    page = page.push(network(app));
-    page = page.push(peers(app));
-    page.into()
-}
-
-/// "hace 5 min", "hace 3 h", "hace 2 días".
-pub fn ago(unix: i64, now: i64) -> String {
-    ago_secs((now - unix).max(0) as u64)
-}
+// --- Tiempo ---------------------------------------------------------------------------------------
 
 /// Cuánto hace, redondeado para que no cambie cada segundo (ni el ancho del texto con él):
 /// «ahora mismo» durante el primer minuto, después «hace 5 min», «hace 3 h», «ayer»…
@@ -978,73 +1024,144 @@ pub fn ago_secs(seconds: u64) -> String {
     }
 }
 
-fn now_unix() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs() as i64)
-        .unwrap_or_default()
-}
-
-fn devices(app: &App) -> Element<'_, Message> {
-    let body: Element<'_, Message> = match &app.settings_page.devices {
-        Load::Idle | Load::Loading => ui::skeleton(t!("settings-cargando-los-dispositivos"), 2),
-        Load::Failed(err) => ui::error_state(
-            t!("settings-no-se-pudieron-cargar-los-dispositivos"),
-            err.as_str(),
-            Some((t!("settings-reintentar"), on(Msg::ReloadDevices))),
-        ),
-        Load::Loaded(list) => {
-            let now = now_unix();
-            let rows = list
-                .devices
-                .iter()
-                .map(|device| {
-                    let current = list.current == Some(device.id);
-                    let short: String = device.fingerprint.chars().take(16).collect();
-                    let trailing = if current {
-                        ui::status_badge(Tone::Info, t!("settings-este-equipo"))
-                    } else {
-                        ui::button_with(
-                            Kind::DestructiveFlat,
-                            t!("settings-desvincular"),
-                            Some(Icon::UserX),
-                            Some(on(Msg::Revoke {
-                                id: device.id,
-                                name: device.name.clone(),
-                            })),
-                        )
-                        .into()
-                    };
-                    let seen = if current {
-                        t!("settings-ahora-mismo").to_owned()
-                    } else {
-                        ago(device.last_seen_at, now)
-                    };
-                    ui::list_row(
-                        Some(icon_with(Icon::Laptop, 22.0, SvgClass::Secondary)),
-                        device.name.as_str(),
-                        Some(t!("settings-visto-huella", seen = seen, short = short)),
-                        vec![trailing],
-                    )
-                })
-                .collect();
-            ui::boxed_list(rows)
-        }
-    };
-    column![
-        column![
-            ui::strong(t!("settings-dispositivos-de-tu-cuenta")),
-            ui::secondary(t!("settings-dispositivos-de-tu-cuenta-ayuda"))
-                .wrapping(Wrapping::WordOrGlyph)
-        ]
-        .spacing(2),
-        body
-    ]
-    .spacing(space::XS)
-    .into()
-}
+// --- Servidor y red ------------------------------------------------------------------------------
 
 fn network(app: &App) -> Element<'_, Message> {
+    column![server(app), net(app)].spacing(space::L).into()
+}
+
+/// El servidor: su estado con «Cambiar de servidor», su certificado, el uso del relay del mes y
+/// el diagnóstico.
+fn server(app: &App) -> Element<'_, Message> {
+    let Some(account) = &app.account else {
+        return ui::section(
+            t!("settings-servidor"),
+            None,
+            vec![ui::empty_state(
+                Icon::Server,
+                t!("settings-sin-sesion"),
+                t!("settings-sin-servidor-texto"),
+                None,
+            )],
+        );
+    };
+    let (tone, status) = match (app.server_status.online, app.server_status.rtt_ms) {
+        (Some(false), _) => (Tone::Error, t!("settings-servidor-no-responde-corto")),
+        (_, Some(_)) => (Tone::Success, t!("settings-servidor-conectado")),
+        _ => (Tone::Neutral, t!("settings-servidor-comprobando")),
+    };
+    let mut rows = vec![setting(
+        account.host(),
+        Some(
+            row![ui::status_badge(tone, status)]
+                .padding(Padding {
+                    top: 2.0,
+                    ..Padding::ZERO
+                })
+                .into(),
+        ),
+        None,
+        ui::normal(
+            t!("settings-cambiar-de-servidor"),
+            Some(Message::SwitchServer),
+        ),
+    )];
+    if let Some(certificate) = &account.server.fingerprint {
+        rows.push(copy_row(
+            t!("settings-certificado-del-servidor"),
+            t!("settings-certificado-del-servidor-ayuda"),
+            certificate.as_str(),
+        ));
+    }
+    rows.push(relay_usage(app));
+    // El diagnóstico, con lo que pasa cuando el servidor no responde en el sitio de su
+    // descripción (del alto de la más larga: la fila no cambia cuando deja de responder).
+    let offline = t!("settings-diagnostico-sin-respuesta").to_owned();
+    let below = if app.server_status.online == Some(false) {
+        help_error(offline.clone())
+    } else {
+        help(t!("settings-diagnostico-ayuda"))
+    };
+    rows.push(setting(
+        t!("settings-diagnostico"),
+        Some(varying(
+            vec![t!("settings-diagnostico-ayuda").to_owned(), offline],
+            below,
+        )),
+        None,
+        ui::button_with(
+            Kind::Normal,
+            t!("settings-abrir-diagnostico"),
+            Some(Icon::Stethoscope),
+            Some(Message::Diagnostics(diagnostics::Msg::Open)),
+        ),
+    ));
+    ui::section(t!("settings-servidor"), None, rows)
+}
+
+/// Ancho de la barra del uso del relay.
+const RELAY_BAR: f32 = 160.0;
+
+/// El uso del relay del mes, siempre a la vista (no solo al acercarse a la cuota).
+fn relay_usage(app: &App) -> Element<'_, Message> {
+    let bytes = crate::ui::stats::bytes;
+    let (summary, fraction) = match &app.usage {
+        None => (t!("settings-relay-consultando").to_owned(), None),
+        Some(usage) if !usage.relay_enabled => (t!("settings-relay-sin-relay").to_owned(), None),
+        Some(usage) => match usage.quota_bytes.filter(|quota| *quota > 0) {
+            Some(quota) => {
+                let used = usage.bytes as f64 / quota as f64;
+                let summary = if used >= 1.0 {
+                    t!("settings-relay-agotado", quota = bytes(quota))
+                } else {
+                    t!(
+                        "settings-relay-uso",
+                        used = bytes(usage.bytes),
+                        quota = bytes(quota),
+                        percent = format!("{:.0}", used * 100.0)
+                    )
+                };
+                (summary, Some(used.min(1.0) as f32))
+            }
+            None => (
+                t!("settings-relay-sin-limite", used = bytes(usage.bytes)),
+                None,
+            ),
+        },
+    };
+    let bar = fraction.map(|fraction| {
+        progress_bar(0.0..=1.0, fraction)
+            .length(Length::Fixed(RELAY_BAR))
+            .girth(Length::Fixed(8.0))
+            .class(if fraction >= 1.0 {
+                ProgressClass::Tone(Tone::Error)
+            } else if fraction >= 0.8 {
+                ProgressClass::Tone(Tone::Warning)
+            } else {
+                ProgressClass::Accent
+            })
+            .into()
+    });
+    setting(
+        t!("settings-uso-del-relay"),
+        Some(
+            column![
+                help(summary),
+                ui::caption(t!("settings-uso-del-relay-ayuda")).wrapping(Wrapping::WordOrGlyph)
+            ]
+            .spacing(2)
+            .into(),
+        ),
+        None,
+        ui::reserved(RELAY_BAR, 8.0, bar),
+    )
+}
+
+/// Ancho del campo del puerto local.
+const PORT_WIDTH: f32 = 140.0;
+
+/// La red: relay forzado, UPnP y el puerto local, para la próxima sala.
+fn net(app: &App) -> Element<'_, Message> {
     let net = &app.settings.network;
     let state = &app.settings_page;
     let port_text = state.port.clone().unwrap_or_else(|| {
@@ -1054,68 +1171,64 @@ fn network(app: &App) -> Element<'_, Message> {
             net.local_port.to_string()
         }
     });
-    let port = container(Element::from(
-        ui::field(t!("settings-puerto-udp"), port_text)
-            .placeholder(t!("settings-cualquiera"))
-            .on_input(|value| on(Msg::Port(value)))
-            .error(state.port_error.as_deref())
-            .id("local-port"),
-    ))
-    .width(Length::Fixed(180.0));
+    // El campo sin etiqueta propia (la de la fila) y el error en el sitio de la descripción,
+    // del alto de la más larga: la fila no crece al aparecer.
+    let error = state.port_error.as_deref();
+    let shake = error.map(|error| {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        error.hash(&mut hasher);
+        hasher.finish()
+    });
+    let input = text_input(t!("settings-cualquiera"), &port_text)
+        .padding(Padding::from([8.0, 12.0]))
+        .size(type_size::BODY)
+        .font(coroom_ui::font::UI)
+        .class(if error.is_some() {
+            InputClass::Invalid
+        } else {
+            InputClass::Normal
+        })
+        .on_input(|value| on(Msg::Port(value)))
+        .id("local-port")
+        .width(Length::Fixed(PORT_WIDTH));
+    let port_help = t!("settings-puerto-local-ayuda");
+    let port_below = match error {
+        Some(error) => help_error(error),
+        None => help(port_help),
+    };
     ui::section(
         t!("settings-red"),
-        Some(t!("settings-red-ayuda").to_owned()),
+        None,
         vec![
-            ui::pref_row(
+            setting(
                 t!("settings-forzar-el-relay"),
-                Some(t!("settings-forzar-el-relay-ayuda").to_owned()),
+                Some(help(t!("settings-forzar-el-relay-ayuda"))),
+                Some(Applies::NextRoom),
                 ui::switch(net.force_relay, Some(|on_off| on(Msg::ForceRelay(on_off)))),
             ),
-            ui::pref_row(
+            setting(
                 t!("settings-abrir-el-puerto-en-el-router"),
-                Some(t!("settings-abrir-el-puerto-en-el-router-ayuda").to_owned()),
+                Some(help(t!("settings-abrir-el-puerto-en-el-router-ayuda"))),
+                Some(Applies::NextRoom),
                 ui::switch(
                     net.port_mapping,
                     Some(|on_off| on(Msg::PortMapping(on_off))),
                 ),
             ),
-            ui::pref_row(
+            setting(
                 t!("settings-puerto-local"),
-                Some(t!("settings-puerto-local-ayuda").to_owned()),
-                port,
+                Some(varying(
+                    vec![
+                        port_help.to_owned(),
+                        t!("settings-un-puerto-de-1024-a-65535").to_owned(),
+                    ],
+                    port_below,
+                )),
+                Some(Applies::NextRoom),
+                coroom_ui::animate::Shake::new(input, shake),
             ),
         ],
-    )
-}
-
-fn peers(app: &App) -> Element<'_, Message> {
-    let rows: Vec<Element<'_, Message>> = if app.settings.peers.is_empty() {
-        vec![
-            container(ui::caption(t!("settings-numeros-de-seguridad-vacio")))
-                .padding(Padding::from([12.0, 16.0]))
-                .into(),
-        ]
-    } else {
-        app.settings
-            .peers
-            .iter()
-            .enumerate()
-            .take(8)
-            .map(|(index, peer)| {
-                let preview: String = peer.safety_number.chars().take(17).collect();
-                ui::list_row(
-                    Some(ui::avatar(&app.theme, &peer.name, 28.0)),
-                    peer.name.as_str(),
-                    Some(t!("settings-numero-recortado", preview = preview)),
-                    vec![ui::normal(t!("settings-ver"), Some(on(Msg::Peer(index)))).into()],
-                )
-            })
-            .collect()
-    };
-    ui::section(
-        t!("settings-numeros-de-seguridad"),
-        Some(t!("settings-numeros-de-seguridad-ayuda").to_owned()),
-        rows,
     )
 }
 
@@ -1307,20 +1420,34 @@ pub(crate) fn device_choices(
     out
 }
 
-/// «En vivo: …» con la edad de la lista, redondeada.
-fn audio_freshness(app: &App) -> String {
+/// El estado de la lista de dispositivos, en un icono con el detalle al pasar el ratón: se
+/// actualiza sola (y cuándo fue la última vez) o por qué no se pudo. Ningún texto de la página
+/// cambia al llegar una lista nueva.
+fn devices_freshness(app: &App) -> Element<'_, Message> {
     let state = &app.settings_page;
-    let lead = t!("settings-dispositivos-en-vivo");
-    match state.audio_updated_at {
-        // Redondeado: con los segundos, la descripción cambiaba de ancho, repartía las líneas
-        // de otra forma y movía toda la página.
-        Some(at) => t!(
-            "settings-actualizado-hace",
-            lead = lead,
-            ago = ago_secs(app.now.saturating_duration_since(at).as_secs())
+    let lead = t!("settings-dispositivos-se-actualizan");
+    let (glyph, class, tip) = match (&state.audio_error, state.audio_updated_at) {
+        (Some(err), _) => (
+            Icon::Warning,
+            SvgClass::Tone(Tone::Warning),
+            t!("settings-no-se-pudo-actualizar-la-lista", err = err),
         ),
-        None => t!("settings-buscando-dispositivos", lead = lead),
-    }
+        (None, Some(at)) => (
+            Icon::Refresh,
+            SvgClass::Secondary,
+            t!(
+                "settings-actualizado-hace",
+                lead = lead,
+                ago = ago_secs(app.now.saturating_duration_since(at).as_secs())
+            ),
+        ),
+        (None, None) => (
+            Icon::Refresh,
+            SvgClass::Secondary,
+            t!("settings-buscando-dispositivos", lead = lead),
+        ),
+    };
+    ui::with_tooltip(icon_with(glyph, 16.0, class), tip)
 }
 
 fn audio(app: &App) -> Element<'_, Message> {
@@ -1331,10 +1458,11 @@ fn audio(app: &App) -> Element<'_, Message> {
     let speaker = speakers.iter().find(|c| c.value == audio.speaker).cloned();
     let mics = device_choices(&devices, true, &audio.microphone);
     let mic = mics.iter().find(|c| c.value == audio.microphone).cloned();
-    let mut rows = vec![
-        ui::pref_row(
+    let mut device_rows = vec![
+        setting(
             t!("settings-salida"),
-            Some(t!("settings-salida-ayuda").to_owned()),
+            Some(help(t!("settings-salida-ayuda"))),
+            Some(Applies::Now),
             ui::select_fixed(
                 speakers,
                 speaker,
@@ -1342,14 +1470,33 @@ fn audio(app: &App) -> Element<'_, Message> {
                 DEVICE_SELECT_WIDTH,
             ),
         ),
-        ui::pref_row(
+        setting(
             t!("settings-microfono"),
-            Some(t!("settings-microfono-ayuda").to_owned()),
+            Some(help(t!("settings-microfono-ayuda"))),
+            Some(Applies::Now),
             ui::select_fixed(mics, mic, |c| on(Msg::Microphone(c)), DEVICE_SELECT_WIDTH),
         ),
-        ui::pref_row(
+    ];
+    // Sin ninguna lista (la primera petición falló), el motivo debajo; con una lista, un fallo
+    // al actualizarla se dice en el icono de la cabecera y la lista anterior sigue.
+    if let Load::Failed(err) = &state.audio_devices {
+        device_rows.push(
+            container(ui::banner(
+                Tone::Warning,
+                t!("settings-no-se-pudieron-listar-los-dispositivos", err = err),
+                None,
+            ))
+            .padding(Padding::from([8.0, 12.0]))
+            .into(),
+        );
+    }
+    let ptt_on = audio.voice_mode == VoiceMode::PushToTalk;
+    let mic_letter = app.settings.input.shortcuts.mic.to_string();
+    let voice_rows = vec![
+        setting(
             t!("settings-volumen-de-tu-voz"),
-            Some(t!("settings-volumen-de-tu-voz-ayuda").to_owned()),
+            Some(help(t!("settings-volumen-de-tu-voz-ayuda"))),
+            Some(Applies::Now),
             container(ui::slider(
                 0..=MAX_VOICE_VOLUME,
                 audio.mic_volume,
@@ -1364,84 +1511,67 @@ fn audio(app: &App) -> Element<'_, Message> {
             .width(Length::Fixed(DEVICE_SELECT_WIDTH)),
         ),
         mic_test_row(app),
-        later_row(
+        setting(
             t!("settings-supresion-de-ruido"),
-            Some(t!("settings-supresion-de-ruido-ayuda").to_owned()),
-            t!("settings-en-la-proxima-sala"),
+            Some(help(t!("settings-supresion-de-ruido-ayuda"))),
+            Some(Applies::NextRoom),
             ui::switch(
                 audio.noise_suppression,
                 Some(|on_off| on(Msg::NoiseSuppression(on_off))),
             ),
         ),
+        setting(
+            t!("settings-pulsar-para-hablar"),
+            Some(help(t!(
+                "settings-pulsar-para-hablar-ayuda",
+                key = audio.push_to_talk_key.as_str(),
+                letter = mic_letter
+            ))),
+            Some(Applies::OnJoin),
+            ui::switch(ptt_on, Some(|on_off| on(Msg::PushToTalk(on_off)))),
+        ),
+        setting(
+            t!("settings-compartir-mi-microfono"),
+            Some(help(t!("settings-compartir-mi-microfono-ayuda"))),
+            Some(Applies::NextRoom),
+            ui::switch(audio.host_voice, Some(|on_off| on(Msg::HostVoice(on_off)))),
+        ),
     ];
-    let error = match &state.audio_devices {
-        Load::Failed(err) => Some(err.as_str()),
-        _ => state.audio_error.as_deref(),
-    };
-    if let Some(err) = error {
-        rows.push(
-            container(ui::banner(
-                Tone::Warning,
-                t!("settings-no-se-pudieron-listar-los-dispositivos", err = err),
-                None,
-            ))
-            .padding(Padding::from([8.0, 12.0]))
-            .into(),
-        );
-    }
-    let ptt_on = audio.voice_mode == VoiceMode::PushToTalk;
-    let key: Element<'_, Message> = if state.capturing == Some(Capture::PushToTalk) {
-        row![
-            ui::caption(t!("settings-pulsa-una-tecla")),
-            ui::flat(t!("settings-cancelar"), Some(on(Msg::CancelCapture)))
-        ]
-        .spacing(space::XS)
-        .align_y(Alignment::Center)
-        .into()
-    } else {
-        row![
-            ui::shortcut(&[audio.push_to_talk_key.as_str()]),
-            ui::normal(
-                t!("settings-cambiar"),
-                Some(on(Msg::Capture(Capture::PushToTalk)))
-            )
-        ]
-        .spacing(space::XS)
-        .align_y(Alignment::Center)
-        .into()
-    };
-    let mic_letter = app.settings.input.shortcuts.mic.to_string();
+    let game = audio.game_volume;
+    let game_row = setting(
+        t!("settings-volumen-del-juego"),
+        Some(help(t!("settings-volumen-del-juego-ayuda"))),
+        Some(Applies::Now),
+        container(ui::slider(
+            0..=MAX_VOICE_VOLUME,
+            game,
+            5,
+            DEFAULT_VOICE_VOLUME,
+            Some(if game == 0 {
+                Icon::VolumeOff
+            } else {
+                Icon::Volume
+            }),
+            t!("settings-porcentaje", percent = game),
+            if game == 0 {
+                SliderClass::AccentMuted
+            } else {
+                SliderClass::Accent
+            },
+            |value| on(Msg::GameVolume(value)),
+            Some(on(Msg::GameVolumeDone)),
+        ))
+        .width(Length::Fixed(DEVICE_SELECT_WIDTH)),
+    );
     column![
-        ui::section(
+        ui::section_with(
             t!("settings-dispositivos"),
-            Some(audio_freshness(app)),
-            rows
-        ),
-        ui::section(
-            t!("settings-voz-como-anfitrion"),
             None,
-            vec![tagged_row(
-                t!("settings-compartir-mi-microfono"),
-                Some(t!("settings-compartir-mi-microfono-ayuda").to_owned()),
-                Some(tag::When::Later),
-                ui::switch(audio.host_voice, Some(|on_off| on(Msg::HostVoice(on_off)))),
-            )],
+            Some(devices_freshness(app)),
+            device_rows
         ),
-        ui::section(
-            t!("settings-voz-como-invitado"),
-            None,
-            vec![later_row(
-                t!("settings-pulsar-para-hablar"),
-                Some(t!("settings-pulsar-para-hablar-ayuda", letter = mic_letter)),
-                t!("settings-al-entrar-en-la-sala"),
-                row![
-                    key,
-                    ui::switch(ptt_on, Some(|on_off| on(Msg::PushToTalk(on_off))))
-                ]
-                .spacing(space::S)
-                .align_y(Alignment::Center),
-            )],
-        ),
+        ui::section(t!("settings-tu-voz"), None, voice_rows),
+        ui::section(t!("settings-audio-del-juego"), None, vec![game_row]),
     ]
     .spacing(space::L)
     .into()
@@ -1451,14 +1581,7 @@ fn audio(app: &App) -> Element<'_, Message> {
 fn mic_test_row(app: &App) -> Element<'_, Message> {
     let state = &app.settings_page;
     let running = state.mic_test.is_some();
-    let button = if running {
-        ui::button_with(
-            Kind::Normal,
-            t!("settings-parar-la-prueba"),
-            Some(Icon::Pause),
-            Some(on(Msg::MicTest(false))),
-        )
-    } else {
+    let start = || {
         ui::button_with(
             Kind::Normal,
             t!("settings-probar"),
@@ -1466,6 +1589,19 @@ fn mic_test_row(app: &App) -> Element<'_, Message> {
             Some(on(Msg::MicTest(true))),
         )
     };
+    let stop = || {
+        ui::button_with(
+            Kind::Normal,
+            t!("settings-parar-la-prueba"),
+            Some(Icon::Pause),
+            Some(on(Msg::MicTest(false))),
+        )
+    };
+    // «Probar» y «Parar» en una ranura del ancho del mayor.
+    let button = steady(
+        vec![start().into(), stop().into()],
+        if running { stop() } else { start() },
+    );
     let level = state.mic_test.unwrap_or(0.0);
     let meter = progress_bar(0.0..=1.0, level)
         .length(Length::Fixed(DEVICE_SELECT_WIDTH - 140.0))
@@ -1487,25 +1623,19 @@ fn mic_test_row(app: &App) -> Element<'_, Message> {
     ]
     .spacing(space::XS)
     .align_y(Alignment::Center);
-    let mut help = column![
-        ui::secondary(t!("settings-probar-el-microfono-ayuda")).wrapping(Wrapping::WordOrGlyph)
-    ]
-    .spacing(2);
+    let mut below = column![help(t!("settings-probar-el-microfono-ayuda"))].spacing(2);
     if in_room {
-        help = help.push(
+        below = below.push(
             ui::caption(t!("settings-oirte-con-sala-abierta")).wrapping(Wrapping::WordOrGlyph),
         );
     }
     if let Some(err) = &state.mic_test_error {
-        help = help.push(
-            ui::caption(err.as_str())
-                .class(TextClass::Tone(Tone::Error))
-                .wrapping(Wrapping::WordOrGlyph),
-        );
+        below = below.push(help_error(err.as_str()));
     }
-    ui::pref_row_with(
+    setting(
         t!("settings-probar-el-microfono"),
-        help,
+        Some(below.into()),
+        None,
         column![
             row![button, hear]
                 .spacing(space::S)
@@ -1520,14 +1650,363 @@ fn mic_test_row(app: &App) -> Element<'_, Message> {
 /// Ancho de los selectores de audio (los nombres de los dispositivos son largos).
 const DEVICE_SELECT_WIDTH: f32 = 280.0;
 
+// --- Vídeo ---------------------------------------------------------------------------------------
+
+fn preset_name(preset: QualityPreset) -> &'static str {
+    match preset {
+        QualityPreset::MinLatency => t!("host-perfil-min-latencia"),
+        QualityPreset::Balanced => t!("host-perfil-equilibrado"),
+        QualityPreset::MaxQuality => t!("host-perfil-max-calidad"),
+        QualityPreset::Custom => t!("host-perfil-personalizado"),
+    }
+}
+
+fn preset_short(preset: QualityPreset) -> &'static str {
+    match preset {
+        QualityPreset::MinLatency => t!("host-perfil-min-latencia-corto"),
+        QualityPreset::Balanced => t!("host-perfil-equilibrado"),
+        QualityPreset::MaxQuality => t!("host-perfil-max-calidad-corto"),
+        QualityPreset::Custom => t!("host-perfil-personalizado"),
+    }
+}
+
+fn preset_help(preset: QualityPreset) -> &'static str {
+    match preset {
+        QualityPreset::MinLatency => t!("host-perfil-min-latencia-ayuda"),
+        QualityPreset::Balanced => t!("host-perfil-equilibrado-ayuda"),
+        QualityPreset::MaxQuality => t!("host-perfil-max-calidad-ayuda"),
+        QualityPreset::Custom => t!("host-perfil-personalizado-ayuda"),
+    }
+}
+
+/// Resolución máxima en el desplegable.
+fn resolution_label(resolution: Resolution) -> String {
+    match resolution {
+        Resolution::P2160 => t!("host-nativa-hasta-4k").to_owned(),
+        other => {
+            let (width, height) = other.size();
+            format!("{height}p ({width} × {height})")
+        }
+    }
+}
+
+fn pick<T>(value: T, label: impl Into<String>) -> host::Pick<T> {
+    host::Pick {
+        value,
+        label: label.into(),
+    }
+}
+
+fn codec_choices() -> Vec<host::Pick<CodecChoice>> {
+    vec![
+        pick(CodecChoice::Auto, t!("host-automatico")),
+        pick(CodecChoice::Av1, "AV1"),
+        pick(CodecChoice::Hevc, "HEVC"),
+        pick(CodecChoice::H264, "H.264"),
+    ]
+}
+
+/// Codificadores de esta plataforma.
+fn encoder_choices() -> Vec<host::Pick<EncoderChoice>> {
+    let mut encoders = vec![pick(EncoderChoice::Auto, t!("host-automatico"))];
+    encoders.extend(
+        [
+            (EncoderChoice::Nvenc, "NVENC (NVIDIA)"),
+            (EncoderChoice::Amf, "AMF (AMD)"),
+            (EncoderChoice::Qsv, "Quick Sync (Intel)"),
+            (EncoderChoice::Vulkan, "Vulkan Video"),
+            (EncoderChoice::Vaapi, "VA-API"),
+        ]
+        .into_iter()
+        .filter(|(c, _)| cfg!(target_os = "linux") || *c != EncoderChoice::Vaapi)
+        .map(|(c, label)| pick(c, label)),
+    );
+    encoders.push(pick(EncoderChoice::Software, t!("host-por-software")));
+    encoders
+}
+
+/// El códec de una elección (`None`: automático).
+fn codec_of(choice: CodecChoice) -> Option<Codec> {
+    match choice {
+        CodecChoice::Auto => None,
+        CodecChoice::Av1 => Some(Codec::Av1),
+        CodecChoice::Hevc => Some(Codec::Hevc),
+        CodecChoice::H264 => Some(Codec::H264),
+    }
+}
+
+/// «AV1», «AV1 y HEVC», «AV1, HEVC y H.264».
+fn join_names(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => t!("host-y-last", valor = rest.join(", "), last = last),
+    }
+}
+
+/// Explicación de 4:4:4 con lo que hace este equipo y el códec `codec` (los mismos textos que en
+/// Compartir; aquí con el códec como parámetro, para reservar el alto de la más larga).
+fn chroma_hint(support: Option<&VideoSupport>, codec: Option<Codec>) -> String {
+    let lead = t!("host-croma-lead");
+    let Some(support) = support else {
+        return t!("host-croma-comprobando", lead = lead);
+    };
+    if support.yuv444.is_empty() {
+        let decode = if support.decode_yuv444.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<String> = support
+                .decode_yuv444
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            t!("host-croma-como-invitado", valor = join_names(&names))
+        };
+        return t!("host-croma-no-disponible", lead = lead, decode = decode);
+    }
+    let names: Vec<String> = support
+        .yuv444
+        .iter()
+        .map(|(_, label)| label.clone())
+        .collect();
+    let with = join_names(&names);
+    match codec {
+        Some(codec) if !support.yuv444.iter().any(|(c, _)| *c == codec) => t!(
+            "host-croma-no-con-este-codec",
+            lead = lead,
+            codec = codec,
+            valor = with
+        ),
+        _ => t!("host-croma-disponible-con", lead = lead, valor = with),
+    }
+}
+
+/// Explicación de HDR con lo que hace este equipo y el códec `codec`.
+fn hdr_hint(support: Option<&VideoSupport>, codec: Option<Codec>) -> String {
+    let Some(support) = support else {
+        return t!("host-hdr-comprobando").to_owned();
+    };
+    let share = if support.hdr10.is_empty() {
+        t!("host-hdr-no-disponible").to_owned()
+    } else {
+        let names: Vec<String> = support
+            .hdr10
+            .iter()
+            .map(|(_, label)| label.clone())
+            .collect();
+        let with = join_names(&names);
+        match codec {
+            Some(codec) if !support.hdr10.iter().any(|(c, _)| *c == codec) => {
+                t!("host-hdr-no-con-este-codec", codec = codec, valor = with)
+            }
+            _ => t!("host-hdr-disponible-con", valor = with),
+        }
+    };
+    let display = match support.hdr_display {
+        Some(true) => t!("host-hdr-pantalla-si"),
+        Some(false) => t!("host-hdr-pantalla-no"),
+        None => t!("host-hdr-pantalla-quiza"),
+    };
+    format!("{share} {display}")
+}
+
+/// La descripción de una opción de vídeo según el códec, del alto de la más larga de las de todos
+/// los códecs (cambiar de códec no mueve la página).
+fn codec_dependent(
+    app: &App,
+    hint: fn(Option<&VideoSupport>, Option<Codec>) -> String,
+) -> Element<'_, Message> {
+    let support = app.video_support.as_ref();
+    let variants = [
+        CodecChoice::Auto,
+        CodecChoice::Av1,
+        CodecChoice::Hevc,
+        CodecChoice::H264,
+    ]
+    .map(|choice| hint(support, codec_of(choice)))
+    .to_vec();
+    varying(
+        variants,
+        help(hint(support, codec_of(app.settings.video.codec))),
+    )
+}
+
+/// Vídeo: la calidad con la que se abre la sala y Avanzado (los mismos ajustes que en Compartir,
+/// con sus mismos mensajes: con la sala abierta se aplican igual), y cómo se ve el vídeo de los
+/// demás en tu pantalla.
+fn video(app: &App) -> Element<'_, Message> {
+    let video = &app.settings.video;
+    let host_msg = Message::Host;
+    // Los cuatro segmentos siempre, también «Personalizado»: el selector no cambia de ancho.
+    let presets = ui::segmented(
+        QualityPreset::PRESETS
+            .into_iter()
+            .chain([QualityPreset::Custom])
+            .map(|preset| {
+                (
+                    preset_short(preset).to_owned(),
+                    host_msg(host::Msg::Preset(preset)),
+                    video.preset == preset,
+                )
+            })
+            .collect(),
+    );
+    let preset_variants = QualityPreset::PRESETS
+        .into_iter()
+        .chain([QualityPreset::Custom])
+        .map(|preset| {
+            t!(
+                "settings-perfil",
+                name = preset_name(preset),
+                help = preset_help(preset)
+            )
+        })
+        .collect();
+    // El selector bajo la descripción: con sus cuatro segmentos no cabe al lado.
+    let quality = setting(
+        t!("settings-calidad-por-defecto"),
+        Some(
+            column![
+                varying(
+                    preset_variants,
+                    help(t!(
+                        "settings-perfil",
+                        name = preset_name(video.preset),
+                        help = preset_help(video.preset)
+                    )),
+                ),
+                presets
+            ]
+            .spacing(space::S)
+            .into(),
+        ),
+        None,
+        ui::gap(0.0),
+    );
+    let resolutions: Vec<host::Pick<Resolution>> = Resolution::ALL
+        .iter()
+        .rev()
+        .map(|r| pick(*r, resolution_label(*r)))
+        .collect();
+    let resolution = resolutions
+        .iter()
+        .find(|c| c.value == video.max_resolution)
+        .cloned();
+    let fps = ui::segmented(
+        FPS_CHOICES
+            .iter()
+            .map(|fps| {
+                (
+                    fps.to_string(),
+                    host_msg(host::Msg::Fps(*fps)),
+                    video.fps == *fps,
+                )
+            })
+            .collect(),
+    );
+    let codecs = codec_choices();
+    let codec = codecs.iter().find(|c| c.value == video.codec).cloned();
+    let encoders = encoder_choices();
+    let encoder = encoders.iter().find(|c| c.value == video.encoder).cloned();
+    let advanced = vec![
+        setting(
+            t!("host-resolucion-maxima"),
+            Some(help(t!("host-resolucion-ayuda"))),
+            Some(Applies::of_video(VideoOption::Resolution)),
+            ui::select(resolutions, resolution, move |c| {
+                host_msg(host::Msg::Resolution(c))
+            }),
+        ),
+        setting(
+            t!("host-fotogramas-por-segundo"),
+            None,
+            Some(Applies::of_video(VideoOption::Fps)),
+            fps,
+        ),
+        setting(
+            t!("host-codec"),
+            Some(help(t!("host-codec-ayuda"))),
+            Some(Applies::of_video(VideoOption::Codec)),
+            ui::select(codecs, codec, move |c| host_msg(host::Msg::Codec(c))),
+        ),
+        setting(
+            t!("host-codificador"),
+            Some(help(t!("host-codificador-ayuda"))),
+            Some(Applies::of_video(VideoOption::Codec)),
+            ui::select(encoders, encoder, move |c| host_msg(host::Msg::Encoder(c))),
+        ),
+        setting(
+            t!("host-croma"),
+            Some(codec_dependent(app, chroma_hint)),
+            Some(Applies::of_video(VideoOption::Chroma444)),
+            ui::switch(
+                video.chroma_444,
+                Some(move |on_off| host_msg(host::Msg::Chroma444(on_off))),
+            ),
+        ),
+        setting(
+            "HDR",
+            Some(codec_dependent(app, hdr_hint)),
+            Some(Applies::of_video(VideoOption::Hdr)),
+            ui::switch(
+                video.hdr,
+                Some(move |on_off| host_msg(host::Msg::Hdr(on_off))),
+            ),
+        ),
+    ];
+    // Escalado: por ahora solo «Ajustar» (no hay nada que elegir).
+    let screen = vec![
+        setting(
+            t!("room-escalado"),
+            Some(help(t!("room-escalado-nota"))),
+            None,
+            ui::secondary(t!("room-ajustar")),
+        ),
+        setting(
+            t!("room-vsync"),
+            Some(help(t!("room-vsync-nota"))),
+            Some(Applies::Now),
+            ui::switch(video.vsync, Some(|on_off| on(Msg::Vsync(on_off)))),
+        ),
+        setting(
+            t!("room-decodificar-por-software"),
+            Some(help(t!("room-decodificar-nota"))),
+            Some(Applies::Now),
+            ui::switch(
+                video.decoder == DecoderChoice::Software,
+                Some(|on_off| on(Msg::SoftwareDecoder(on_off))),
+            ),
+        ),
+    ];
+    column![
+        ui::section(
+            t!("host-calidad"),
+            Some(t!("settings-calidad-ayuda").to_owned()),
+            vec![quality]
+        ),
+        ui::section(
+            t!("host-avanzado"),
+            Some(t!("host-avanzado-desplegado").to_owned()),
+            advanced
+        ),
+        ui::section(
+            t!("settings-en-tu-pantalla"),
+            Some(t!("settings-en-tu-pantalla-ayuda").to_owned()),
+            screen
+        ),
+    ]
+    .spacing(space::L)
+    .into()
+}
+
 // --- Sala ----------------------------------------------------------------------------------------
 
 fn room(app: &App) -> Element<'_, Message> {
     let room = &app.settings.room;
-    let mut as_host = vec![tagged_row(
+    let mut as_host = vec![setting(
         t!("settings-los-invitados-entran-callados"),
-        Some(t!("settings-los-invitados-entran-callados-ayuda").to_owned()),
-        Some(tag::When::Later),
+        Some(help(t!("settings-los-invitados-entran-callados-ayuda"))),
+        Some(Applies::NextRoom),
         ui::switch(
             room.guests_muted,
             Some(|on_off| on(Msg::GuestsMuted(on_off))),
@@ -1541,40 +2020,57 @@ fn room(app: &App) -> Element<'_, Message> {
         ui::section(
             t!("settings-como-invitado"),
             None,
-            vec![ui::pref_row(
+            vec![setting(
                 t!("settings-quien-habla"),
-                Some(t!("settings-quien-habla-ayuda").to_owned()),
+                Some(help(t!("settings-quien-habla-ayuda"))),
+                Some(Applies::Now),
                 ui::switch(
                     room.talking_overlay,
                     Some(|on_off| on(Msg::TalkingOverlay(on_off))),
                 ),
             )],
         ),
-        ui::section(
-            t!("settings-chat-de-la-sala"),
-            Some(t!("settings-chat-de-la-sala-ayuda").to_owned()),
-            vec![
-                ui::pref_row(
-                    t!("settings-notificacion-del-escritorio"),
-                    Some(t!("settings-notificacion-del-escritorio-ayuda").to_owned()),
-                    ui::switch(
-                        room.chat_notifications,
-                        Some(|on_off| on(Msg::ChatNotifications(on_off))),
-                    ),
-                ),
-                ui::pref_row(
-                    t!("settings-burbuja-sobre-el-video"),
-                    Some(t!("settings-burbuja-sobre-el-video-ayuda").to_owned()),
-                    ui::switch(
-                        room.chat_bubbles,
-                        Some(|on_off| on(Msg::ChatBubbles(on_off)))
-                    ),
-                ),
-            ],
-        ),
     ]
     .spacing(space::L)
     .into()
+}
+
+/// Fila del permiso de pantalla del portal (Linux): para qué fuentes se recuerda y «Olvidar el
+/// permiso de pantalla», que borra `portal.json`; el diálogo del sistema volverá a salir una vez.
+fn share_permission_row(app: &App) -> Element<'_, Message> {
+    let tokens = &app.host.restore_tokens;
+    let screen = tokens.get(ShareKind::Screen).is_some();
+    let window = tokens.get(ShareKind::App).is_some();
+    let current = match (screen, window) {
+        (true, true) => t!("settings-permiso-recordado-pantalla-y-ventana"),
+        (true, false) => t!("settings-permiso-recordado-pantalla"),
+        (false, true) => t!("settings-permiso-recordado-ventana"),
+        (false, false) => t!("settings-permiso-sin-recordar"),
+    };
+    let variants = [
+        t!("settings-permiso-recordado-pantalla-y-ventana"),
+        t!("settings-permiso-recordado-pantalla"),
+        t!("settings-permiso-recordado-ventana"),
+        t!("settings-permiso-sin-recordar"),
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    let below = column![
+        varying(variants, help(current)),
+        ui::caption(t!("settings-permiso-de-pantalla-ayuda")).wrapping(Wrapping::WordOrGlyph),
+    ]
+    .spacing(2);
+    setting(
+        t!("settings-permiso-de-pantalla"),
+        Some(below.into()),
+        None,
+        ui::button_with(
+            Kind::DestructiveSoft,
+            t!("settings-olvidar-el-permiso-de-pantalla"),
+            None,
+            (!tokens.is_empty()).then(|| on(Msg::ForgetSharePermission)),
+        ),
+    )
 }
 
 // --- Notificaciones ------------------------------------------------------------------------------
@@ -1670,7 +2166,7 @@ const TONE_SELECT_WIDTH: f32 = 230.0;
 fn sound_row(app: &App, event: SoundEvent) -> Element<'_, Message> {
     let sound = app.settings.notifications.sound(event);
     let state = &app.settings_page;
-    let (title, help) = sound_texts(event);
+    let (title, about) = sound_texts(event);
     let options = tone_options(event, sound.file.as_deref());
     let current = match sound.tone {
         SoundChoice::Tone(tone) => ToneOption::Tone(tone),
@@ -1681,7 +2177,7 @@ fn sound_row(app: &App, event: SoundEvent) -> Element<'_, Message> {
         .iter()
         .find(|option| option.value == current)
         .cloned();
-    let mut below = column![ui::secondary(help).wrapping(Wrapping::WordOrGlyph)].spacing(2);
+    let mut below = column![help(about)].spacing(2);
     if let Some((_, error)) = state.sound_error.as_ref().filter(|(at, _)| *at == event) {
         below = below.push(
             row![
@@ -1696,19 +2192,20 @@ fn sound_row(app: &App, event: SoundEvent) -> Element<'_, Message> {
         );
     }
     let picking = state.sound_picking.is_some();
-    let select = ui::select_fixed(
-        options,
-        selected,
-        move |option: Choice<ToneOption>| on(Msg::Tone(event, option)),
-        TONE_SELECT_WIDTH,
-    );
-    // Con el selector de ficheros abierto, los tonos esperan (el que vuelva manda).
-    let select: Element<'_, Message> = if picking {
-        container(ui::secondary(t!("settings-tono-eligiendo")))
-            .width(Length::Fixed(TONE_SELECT_WIDTH))
-            .into()
+    let select = || {
+        ui::select_fixed(
+            options.clone(),
+            selected.clone(),
+            move |option: Choice<ToneOption>| on(Msg::Tone(event, option)),
+            TONE_SELECT_WIDTH,
+        )
+    };
+    // Con el selector de ficheros abierto, los tonos esperan (el que vuelva manda), en el sitio
+    // del selector.
+    let control: Element<'_, Message> = if picking {
+        ui::secondary(t!("settings-tono-eligiendo")).into()
     } else {
-        select
+        select()
     };
     let test = ui::button_with(
         Kind::Flat,
@@ -1716,21 +2213,27 @@ fn sound_row(app: &App, event: SoundEvent) -> Element<'_, Message> {
         Some(Icon::Play),
         sound.is_on().then(|| on(Msg::TestSound(event))),
     );
-    ui::pref_row_with(
+    setting(
         title,
-        below,
-        row![select, test]
-            .spacing(space::XS)
-            .align_y(Alignment::Center),
+        Some(below.into()),
+        None,
+        row![
+            ui::reserve([select()], Some(control)).align_x(Horizontal::Left),
+            test
+        ]
+        .spacing(space::XS)
+        .align_y(Alignment::Center),
     )
 }
 
-fn notifications(app: &App) -> Element<'_, Message> {
+fn notifications<'a>(app: &'a App) -> Element<'a, Message> {
     let notifications = &app.settings.notifications;
+    let room = &app.settings.room;
     let volume = notifications.volume;
-    let volume_row = ui::pref_row(
+    let volume_row = setting(
         t!("settings-volumen-de-los-avisos"),
-        Some(t!("settings-volumen-de-los-avisos-ayuda").to_owned()),
+        Some(help(t!("settings-volumen-de-los-avisos-ayuda"))),
+        None,
         container(ui::slider(
             0..=100,
             volume,
@@ -1752,22 +2255,54 @@ fn notifications(app: &App) -> Element<'_, Message> {
         ))
         .width(Length::Fixed(TONE_SELECT_WIDTH + 110.0)),
     );
-    let rows = |events: &[SoundEvent]| events.iter().map(|event| sound_row(app, *event)).collect();
+    let rows = |events: &[SoundEvent]| -> Vec<Element<'a, Message>> {
+        events.iter().map(|event| sound_row(app, *event)).collect()
+    };
     let files = if cfg!(target_os = "windows") {
         t!("settings-tono-ayuda-windows")
     } else {
         t!("settings-tono-ayuda-linux")
     };
+    let mut chat = rows(&[SoundEvent::ChatMessage]);
+    chat.extend([
+        setting(
+            t!("settings-notificacion-del-escritorio"),
+            Some(help(t!("settings-notificacion-del-escritorio-ayuda"))),
+            Some(Applies::Now),
+            ui::switch(
+                room.chat_notifications,
+                Some(|on_off| on(Msg::ChatNotifications(on_off))),
+            ),
+        ),
+        setting(
+            t!("settings-burbuja-sobre-el-video"),
+            Some(help(t!("settings-burbuja-sobre-el-video-ayuda"))),
+            Some(Applies::Now),
+            ui::switch(
+                room.chat_bubbles,
+                Some(|on_off| on(Msg::ChatBubbles(on_off))),
+            ),
+        ),
+    ]);
+    let interface_sounds = setting(
+        t!("settings-sonidos-de-la-interfaz"),
+        Some(help(t!("settings-sonidos-de-la-interfaz-ayuda"))),
+        None,
+        ui::switch(
+            notifications.interface_sounds,
+            Some(|on_off| on(Msg::InterfaceSounds(on_off))),
+        ),
+    );
     column![
-        ui::section(t!("settings-avisos-volumen"), None, vec![volume_row]),
+        ui::section(
+            t!("settings-sonido"),
+            None,
+            vec![volume_row, interface_sounds]
+        ),
         ui::section(
             t!("settings-avisos-en-la-sala"),
             Some(t!("settings-avisos-en-la-sala-ayuda").to_owned()),
-            rows(&[
-                SoundEvent::MemberJoined,
-                SoundEvent::MemberLeft,
-                SoundEvent::ChatMessage,
-            ]),
+            rows(&[SoundEvent::MemberJoined, SoundEvent::MemberLeft]),
         ),
         ui::section(
             t!("settings-avisos-como-anfitrion"),
@@ -1784,44 +2319,76 @@ fn notifications(app: &App) -> Element<'_, Message> {
                 SoundEvent::FriendRequest,
             ]),
         ),
+        ui::section(
+            t!("settings-chat-de-la-sala"),
+            Some(t!("settings-chat-de-la-sala-ayuda").to_owned()),
+            chat
+        ),
         ui::caption(files).wrapping(Wrapping::WordOrGlyph),
     ]
     .spacing(space::L)
     .into()
 }
 
-/// Fila del permiso de pantalla del portal (Linux): para qué fuentes se recuerda y «Olvidar el
-/// permiso de pantalla», que borra `portal.json`; el diálogo del sistema volverá a salir una vez.
-fn share_permission_row(app: &App) -> Element<'_, Message> {
-    let tokens = &app.host.restore_tokens;
-    let screen = tokens.get(ShareKind::Screen).is_some();
-    let window = tokens.get(ShareKind::App).is_some();
-    let current = match (screen, window) {
-        (true, true) => t!("settings-permiso-recordado-pantalla-y-ventana"),
-        (true, false) => t!("settings-permiso-recordado-pantalla"),
-        (false, true) => t!("settings-permiso-recordado-ventana"),
-        (false, false) => t!("settings-permiso-sin-recordar"),
-    };
-    let texts = column![
-        ui::body(t!("settings-permiso-de-pantalla")),
-        ui::secondary(current).wrapping(Wrapping::WordOrGlyph),
-        ui::caption(t!("settings-permiso-de-pantalla-ayuda")).wrapping(Wrapping::WordOrGlyph),
-    ]
-    .spacing(2);
-    let forget = ui::button_with(
-        Kind::DestructiveSoft,
-        t!("settings-olvidar-el-permiso-de-pantalla"),
-        None,
-        (!tokens.is_empty()).then(|| on(Msg::ForgetSharePermission)),
-    );
-    row![texts.width(Length::Fill), forget]
-        .spacing(space::M)
-        .align_y(Alignment::Center)
-        .padding(Padding::from([10.0, 16.0]))
+// --- Mandos --------------------------------------------------------------------------------------
+
+fn gamepads<'a>(app: &'a App) -> Element<'a, Message> {
+    let input = &app.settings.input;
+    let pads_letter = input.shortcuts.pads.to_string();
+    let auto_help = t!("settings-mando-automatico-ayuda", letter = pads_letter);
+    let auto_control =
+        || -> Element<'a, Message> { ui::secondary(t!("settings-el-ultimo-que-conectes")).into() };
+    let back_to_auto = || -> Element<'a, Message> {
+        ui::normal(
+            t!("settings-usar-el-ultimo-que-conectes"),
+            Some(on(Msg::PadAuto)),
+        )
         .into()
+    };
+    let (pad_help, pad_control, variants) = match &input.pad {
+        PadChoice::Auto => (auto_help.clone(), auto_control(), vec![auto_help]),
+        PadChoice::Pad(key) => {
+            let chosen = t!(
+                "settings-mando-elegido-ayuda",
+                name = key.name,
+                letter = pads_letter
+            );
+            (chosen.clone(), back_to_auto(), vec![auto_help, chosen])
+        }
+    };
+    // Lo que cambia al volver a «El último que conectes» va en ranuras del tamaño de su variante
+    // mayor: la fila no cambia de alto.
+    let pad_row = setting(
+        t!("settings-mando-que-envias"),
+        Some(varying(variants, help(pad_help))),
+        Some(Applies::Now),
+        steady(vec![auto_control(), back_to_auto()], pad_control),
+    );
+    let max = coroom_session::input::max_gamepads();
+    let mut slots = vec![choice(0u8, t!("settings-la-primera-libre"))];
+    slots.extend((1..=max).map(|slot| choice(slot, t!("settings-ranura", slot = slot))));
+    let slot = slots
+        .iter()
+        .find(|c| c.value == input.preferred_slot)
+        .cloned();
+    column![
+        ui::section(t!("settings-como-invitado"), None, vec![pad_row]),
+        ui::section(
+            t!("settings-como-anfitrion"),
+            None,
+            vec![setting(
+                t!("settings-ranura-preferida"),
+                Some(help(t!("settings-ranura-preferida-ayuda"))),
+                None,
+                ui::select(slots, slot, |c| on(Msg::PreferredSlot(c))),
+            )],
+        ),
+    ]
+    .spacing(space::L)
+    .into()
 }
 
-// --- Mandos --------------------------------------------------------------------------------------
+// --- Atajos de teclado ---------------------------------------------------------------------------
 
 /// Qué hace cada atajo del invitado, en el orden de [`Shortcuts::letters`].
 fn shortcut_names() -> [&'static str; 8] {
@@ -1837,123 +2404,111 @@ fn shortcut_names() -> [&'static str; 8] {
     ]
 }
 
-fn gamepads(app: &App) -> Element<'_, Message> {
-    let input = &app.settings.input;
-    let state = &app.settings_page;
-    let pads_letter = input.shortcuts.pads.to_string();
-    let pad_row = match &input.pad {
-        PadChoice::Auto => ui::pref_row(
-            t!("settings-mando-que-envias"),
-            Some(t!("settings-mando-automatico-ayuda", letter = pads_letter)),
-            ui::secondary(t!("settings-el-ultimo-que-conectes")),
-        ),
-        PadChoice::Pad(key) => ui::pref_row(
-            t!("settings-mando-que-envias"),
-            Some(t!(
-                "settings-mando-elegido-ayuda",
-                name = key.name,
-                letter = pads_letter
-            )),
-            ui::normal(
-                t!("settings-usar-el-ultimo-que-conectes"),
-                Some(on(Msg::PadAuto)),
-            ),
-        ),
+/// Una fila de la tabla de atajos: qué hace y dónde vale a la izquierda; sus teclas (o «Pulsa
+/// una letra…» mientras se cambia) y «Cambiar» o «Cancelar» a la derecha, cada cosa en su
+/// columna de ancho fijo. `capture`: cómo se cambia (sin él, el atajo es fijo).
+fn shortcut_row<'a>(
+    app: &App,
+    name: &'a str,
+    context: &'a str,
+    keys: Element<'a, Message>,
+    capture: Option<Capture>,
+) -> Element<'a, Message> {
+    let capturing = capture.is_some() && app.settings_page.capturing == capture;
+    let prompt = match capture {
+        Some(Capture::PushToTalk) => t!("settings-pulsa-una-tecla"),
+        _ => t!("settings-pulsa-una-letra"),
     };
-    let max = coroom_session::input::max_gamepads();
-    let mut slots = vec![choice(0u8, t!("settings-la-primera-libre"))];
-    slots.extend((1..=max).map(|slot| choice(slot, t!("settings-ranura", slot = slot))));
-    let slot = slots
-        .iter()
-        .find(|c| c.value == input.preferred_slot)
-        .cloned();
+    let keys_slot = ui::reserve(
+        [
+            shortcut_caps('W'),
+            ui::caption(t!("settings-pulsa-una-letra")).into(),
+            ui::caption(t!("settings-pulsa-una-tecla")).into(),
+        ],
+        Some(if capturing {
+            ui::caption(prompt).into()
+        } else {
+            keys
+        }),
+    )
+    .align_x(Horizontal::Right);
+    let action = capture.map(|capture| -> Element<'a, Message> {
+        if capturing {
+            ui::flat(t!("settings-cancelar"), Some(on(Msg::CancelCapture))).into()
+        } else {
+            ui::normal(t!("settings-cambiar"), Some(on(Msg::Capture(capture)))).into()
+        }
+    });
+    let action_slot = ui::reserve(
+        [
+            ui::normal(t!("settings-cambiar"), None::<Message>).into(),
+            ui::flat(t!("settings-cancelar"), None::<Message>).into(),
+        ],
+        action,
+    )
+    .align_x(Horizontal::Right);
+    setting(
+        name,
+        Some(help(context)),
+        None,
+        row![keys_slot, action_slot]
+            .spacing(space::S)
+            .align_y(Alignment::Center),
+    )
+}
+
+/// Todos los atajos en una tabla: los del invitado, pulsar para hablar y los de la aplicación.
+fn shortcuts(app: &App) -> Element<'_, Message> {
+    let input = &app.settings.input;
     let letters = input.shortcuts.letters();
     let mut rows: Vec<Element<'_, Message>> = shortcut_names()
         .into_iter()
         .zip(letters)
         .enumerate()
         .map(|(index, (name, letter))| {
-            let control: Element<'_, Message> = if state.capturing == Some(Capture::Shortcut(index))
-            {
-                row![
-                    ui::caption(t!("settings-pulsa-una-letra")),
-                    ui::flat(t!("settings-cancelar"), Some(on(Msg::CancelCapture)))
-                ]
-                .spacing(space::XS)
-                .align_y(Alignment::Center)
-                .into()
-            } else {
-                row![
-                    shortcut_caps(letter),
-                    ui::normal(
-                        t!("settings-cambiar"),
-                        Some(on(Msg::Capture(Capture::Shortcut(index))))
-                    )
-                ]
-                .spacing(space::XS)
-                .align_y(Alignment::Center)
-                .into()
-            };
-            ui::pref_row(name, None, control)
+            shortcut_row(
+                app,
+                name,
+                t!("settings-atajo-en-la-sala"),
+                shortcut_caps(letter),
+                Some(Capture::Shortcut(index)),
+            )
         })
         .collect();
+    rows.push(shortcut_row(
+        app,
+        t!("settings-pulsar-para-hablar"),
+        t!("settings-atajo-pulsar-para-hablar"),
+        ui::shortcut(&[app.settings.audio.push_to_talk_key.as_str()]),
+        Some(Capture::PushToTalk),
+    ));
+    for (name, keys) in [
+        (t!("settings-atajo-ajustes"), &["Ctrl", ","][..]),
+        (t!("settings-atajo-pantalla-completa"), &["F11"][..]),
+        (t!("settings-atajo-cerrar-dialogos"), &["Esc"][..]),
+        (t!("settings-atajo-salir-de-coroom"), &["Ctrl", "Q"][..]),
+    ] {
+        rows.push(shortcut_row(
+            app,
+            name,
+            t!("settings-atajo-en-toda-la-app"),
+            ui::shortcut(keys),
+            None,
+        ));
+    }
     let defaults = input.shortcuts == Shortcuts::default();
-    rows.push(
-        container(row![
-            ui::fill(),
+    ui::section_with(
+        t!("settings-atajos-de-teclado"),
+        Some(t!("settings-atajos-ayuda").to_owned()),
+        Some(
             ui::flat(
                 t!("settings-restablecer"),
-                (!defaults).then_some(on(Msg::ResetShortcuts))
+                (!defaults).then_some(on(Msg::ResetShortcuts)),
             )
-        ])
-        .padding(Padding::from([4.0, 8.0]))
-        .into(),
-    );
-    column![
-        ui::section(t!("settings-como-invitado"), None, vec![pad_row]),
-        ui::section(
-            t!("settings-como-anfitrion"),
-            None,
-            vec![ui::pref_row(
-                t!("settings-ranura-preferida"),
-                Some(t!("settings-ranura-preferida-ayuda").to_owned()),
-                ui::select(slots, slot, |c| on(Msg::PreferredSlot(c))),
-            )],
+            .into(),
         ),
-        ui::section(
-            t!("settings-atajos-del-invitado"),
-            Some(t!("settings-atajos-del-invitado-ayuda").to_owned()),
-            rows
-        ),
-        ui::section(
-            t!("settings-atajos-de-la-aplicacion"),
-            None,
-            vec![
-                ui::pref_row(
-                    t!("settings-atajo-ajustes"),
-                    None,
-                    ui::shortcut(&["Ctrl", ","])
-                ),
-                ui::pref_row(
-                    t!("settings-atajo-pantalla-completa"),
-                    None,
-                    ui::shortcut(&["F11"])
-                ),
-                ui::pref_row(
-                    t!("settings-atajo-cerrar-dialogos"),
-                    None,
-                    ui::shortcut(&["Esc"])
-                ),
-                ui::pref_row(
-                    t!("settings-atajo-salir-de-coroom"),
-                    None,
-                    ui::shortcut(&["Ctrl", "Q"])
-                ),
-            ]
-        ),
-    ]
-    .spacing(space::L)
-    .into()
+        rows,
+    )
 }
 
 fn shortcut_caps<'a>(letter: char) -> Element<'a, Message> {
@@ -1990,18 +2545,24 @@ fn appearance(app: &App) -> Element<'_, Message> {
             current.theme == ThemeChoice::Dark,
         ),
     ]);
+    let system_theme = t!(
+        "settings-sigue-al-sistema",
+        valor = match app.system.mode {
+            Some(coroom_ui::theme::Mode::Dark) => t!("settings-ahora-oscuro"),
+            Some(coroom_ui::theme::Mode::Light) => t!("settings-ahora-claro"),
+            None => t!("settings-sin-preferencia-claro"),
+        }
+    );
     let theme_hint = match current.theme {
-        ThemeChoice::System => t!(
-            "settings-sigue-al-sistema",
-            valor = match app.system.mode {
-                Some(coroom_ui::theme::Mode::Dark) => t!("settings-ahora-oscuro"),
-                Some(coroom_ui::theme::Mode::Light) => t!("settings-ahora-claro"),
-                None => t!("settings-sin-preferencia-claro"),
-            }
-        ),
+        ThemeChoice::System => system_theme.clone(),
         ThemeChoice::Light => t!("settings-siempre-claro").to_owned(),
         ThemeChoice::Dark => t!("settings-siempre-oscuro").to_owned(),
     };
+    let theme_variants = vec![
+        system_theme,
+        t!("settings-siempre-claro").to_owned(),
+        t!("settings-siempre-oscuro").to_owned(),
+    ];
     let follows_system = current.accent == "system";
     let mut swatches = Row::new().spacing(space::XS).align_y(Alignment::Center);
     swatches = swatches.push(ui::button_with(
@@ -2019,15 +2580,18 @@ fn appearance(app: &App) -> Element<'_, Message> {
         let selected = current.accent == key;
         swatches = swatches.push(swatch(accent, key, selected));
     }
+    let system_accent = t!(
+        "settings-acento-del-sistema",
+        valor = app.system.accent.unwrap_or_default().label(),
+        source = app.system.source
+    );
     let accent_hint = if follows_system {
-        t!(
-            "settings-acento-del-sistema",
-            valor = app.accent().label(),
-            source = app.system.source
-        )
+        system_accent.clone()
     } else {
         app.accent().label()
     };
+    let mut accent_variants = vec![system_accent];
+    accent_variants.extend(Accent::NAMED.iter().map(|accent| accent.label()));
     let from_desktop = app.system.font.as_deref().is_some_and(|font| {
         coroom_ui::font::family_of(font).eq_ignore_ascii_case(app.fonts.family)
     });
@@ -2040,60 +2604,76 @@ fn appearance(app: &App) -> Element<'_, Message> {
     };
     let motion = ui::segmented(vec![
         (
-            t!("settings-como-el-sistema").to_owned(),
+            t!("settings-del-sistema").to_owned(),
             on(Msg::Motion(MotionChoice::System)),
             current.motion == MotionChoice::System,
-        ),
-        (
-            t!("settings-reducidas").to_owned(),
-            on(Msg::Motion(MotionChoice::Reduced)),
-            current.motion == MotionChoice::Reduced,
         ),
         (
             t!("settings-completas").to_owned(),
             on(Msg::Motion(MotionChoice::Full)),
             current.motion == MotionChoice::Full,
         ),
+        (
+            t!("settings-reducidas").to_owned(),
+            on(Msg::Motion(MotionChoice::Reduced)),
+            current.motion == MotionChoice::Reduced,
+        ),
     ]);
     let system_motion = app.system.motion();
+    let system_motion_hint = t!(
+        "settings-sigue-al-sistema",
+        valor = if system_motion.is_off() {
+            t!("settings-ahora-sin-animaciones")
+        } else if system_motion.is_reduced() {
+            t!("settings-ahora-reducidas")
+        } else {
+            t!("settings-ahora-completas")
+        }
+    );
     let motion_hint = match current.motion {
-        MotionChoice::System => t!(
-            "settings-sigue-al-sistema",
-            valor = if system_motion.is_off() {
-                t!("settings-ahora-sin-animaciones")
-            } else if system_motion.is_reduced() {
-                t!("settings-ahora-reducidas")
-            } else {
-                t!("settings-ahora-completas")
-            }
-        ),
+        MotionChoice::System => system_motion_hint.clone(),
         MotionChoice::Reduced => t!("settings-solo-fundidos-cortos").to_owned(),
         MotionChoice::Full => t!("settings-siempre-completas").to_owned(),
     };
-    column![ui::section(
+    let motion_variants = vec![
+        system_motion_hint,
+        t!("settings-solo-fundidos-cortos").to_owned(),
+        t!("settings-siempre-completas").to_owned(),
+    ];
+    ui::section(
         t!("settings-apariencia"),
         None,
         vec![
-            ui::pref_row(t!("settings-tema"), Some(theme_hint), theme),
-            container(
-                column![
-                    ui::body(t!("settings-color-de-acento")),
-                    ui::secondary(accent_hint),
-                    swatches.wrap()
-                ]
-                .spacing(space::XS)
-            )
-            .padding(Padding::from([10.0, 16.0]))
-            .into(),
-            ui::pref_row(
-                t!("settings-fuente"),
-                Some(font_hint),
-                icon_with(Icon::Lock, 16.0, SvgClass::Secondary)
+            setting(
+                t!("settings-tema"),
+                Some(varying(theme_variants, help(theme_hint))),
+                None,
+                theme,
             ),
-            ui::pref_row(t!("settings-animaciones"), Some(motion_hint), motion),
-        ]
-    )]
-    .into()
+            setting(
+                t!("settings-color-de-acento"),
+                Some(
+                    column![varying(accent_variants, help(accent_hint)), swatches.wrap()]
+                        .spacing(space::XS)
+                        .into(),
+                ),
+                None,
+                ui::gap(0.0),
+            ),
+            setting(
+                t!("settings-fuente"),
+                Some(help(font_hint)),
+                None,
+                icon_with(Icon::Lock, 16.0, SvgClass::Secondary),
+            ),
+            setting(
+                t!("settings-animaciones"),
+                Some(varying(motion_variants, help(motion_hint))),
+                None,
+                motion,
+            ),
+        ],
+    )
 }
 
 /// Muestra de un acento de GNOME, con su nombre al pasar el ratón.
@@ -2127,7 +2707,7 @@ pub fn release_page(version: &str) -> String {
     format!("{}/tag/v{version}", crate::update::RELEASES_PAGE)
 }
 
-fn updates(app: &App) -> Vec<Element<'_, Message>> {
+fn updates<'a>(app: &'a App) -> Vec<Element<'a, Message>> {
     let state = &app.update;
     let updates = &app.settings.updates;
     let disabled = crate::update::disabled_by_env();
@@ -2151,23 +2731,38 @@ fn updates(app: &App) -> Vec<Element<'_, Message>> {
     } else {
         t!("settings-pregunta-a-las-publicaciones").to_owned()
     };
-    let mut action = row![].spacing(space::S).align_y(Alignment::Center);
-    if let Some(update) = &state.available {
-        action = action.push(ui::button_with(
+    // Del alto de la más larga de las que pueden salir sin más datos (y de la de ahora).
+    let status_variants = vec![
+        t!("settings-comprobando-en-las-publicaciones").to_owned(),
+        t!("settings-tienes-la-ultima-version").to_owned(),
+        t!("settings-pregunta-a-las-publicaciones").to_owned(),
+        status.clone(),
+    ];
+    let see = |url: Option<String>| -> Element<'a, Message> {
+        ui::button_with(
             Kind::Primary,
             t!("settings-ver-la-version-nueva"),
             Some(Icon::ExternalLink),
-            Some(Message::OpenUrl(update.url.clone())),
-        ));
-    }
-    action = action.push(ui::normal(
-        if state.checking {
-            t!("settings-comprobando")
-        } else {
-            t!("settings-comprobar-ahora")
-        },
-        (!state.checking && !disabled).then_some(on(Msg::CheckUpdates)),
-    ));
+            url.map(Message::OpenUrl),
+        )
+        .into()
+    };
+    let check = |enabled: bool| -> Element<'a, Message> {
+        ui::normal(
+            if state.checking {
+                t!("settings-comprobando")
+            } else {
+                t!("settings-comprobar-ahora")
+            },
+            enabled.then_some(on(Msg::CheckUpdates)),
+        )
+        .into()
+    };
+    // Con una versión nueva, «Ver la versión nueva» en el sitio de «Comprobar ahora».
+    let action = match &state.available {
+        Some(update) => see(Some(update.url.clone())),
+        None => check(!state.checking && !disabled),
+    };
     let intervals: Vec<Choice<u32>> = crate::update::INTERVAL_CHOICES
         .iter()
         .map(|hours| {
@@ -2186,27 +2781,47 @@ fn updates(app: &App) -> Vec<Element<'_, Message>> {
         .find(|c| c.value == updates.interval_hours)
         .cloned();
     let checks = updates.check && !disabled;
+    let interval_sample: Element<'a, Message> = row![
+        ui::select(intervals.clone(), interval.clone(), |c| on(
+            Msg::UpdateInterval(c)
+        )),
+        ui::switch(checks, None::<fn(bool) -> Message>)
+    ]
+    .spacing(space::S)
+    .align_y(Alignment::Center)
+    .into();
     vec![
-        ui::pref_row(t!("settings-version-nueva"), Some(status), action),
-        ui::pref_row(
+        setting(
+            t!("settings-version-nueva"),
+            Some(varying(status_variants, help(status))),
+            None,
+            steady(vec![see(None), check(false)], action),
+        ),
+        setting(
             t!("settings-buscar-versiones-nuevas"),
-            Some(t!("settings-buscar-versiones-nuevas-ayuda").to_owned()),
-            row![]
-                .push(
-                    checks.then(|| ui::select(intervals, interval, |c| on(Msg::UpdateInterval(c)))),
-                )
-                .push(ui::switch(
-                    checks,
-                    (!disabled).then_some(|on_off| on(Msg::UpdateChecks(on_off))),
-                ))
-                .spacing(space::S)
-                .align_y(Alignment::Center),
+            Some(help(t!("settings-buscar-versiones-nuevas-ayuda"))),
+            None,
+            steady(
+                vec![interval_sample],
+                row![]
+                    .push(
+                        checks.then(|| {
+                            ui::select(intervals, interval, |c| on(Msg::UpdateInterval(c)))
+                        }),
+                    )
+                    .push(ui::switch(
+                        checks,
+                        (!disabled).then_some(|on_off| on(Msg::UpdateChecks(on_off))),
+                    ))
+                    .spacing(space::S)
+                    .align_y(Alignment::Center),
+            ),
         ),
     ]
 }
 
 fn license_row<'a>(name: &'a str, license: &'a str) -> Element<'a, Message> {
-    ui::pref_row(name, Some(license.to_owned()), ui::gap(0.0))
+    setting(name, Some(help(license)), None, ui::gap(0.0))
 }
 
 fn about(app: &App) -> Element<'_, Message> {
@@ -2263,7 +2878,7 @@ pub(crate) mod shots {
     use std::time::Duration;
 
     use coroom_session::input::gamepad::{PadChoice, PadKey};
-    use coroom_transport::proto::api::{Device, Devices};
+    use coroom_transport::proto::api::{Device, Devices, Usage};
 
     use super::SettingsPage;
     use crate::ui::app::{App, AudioDevice, Event, Load, Message, Page};
@@ -2324,6 +2939,13 @@ pub(crate) mod shots {
         app.settings.audio.speaker = Some("usb-headset".to_owned());
         app.settings.audio.microphone = Some("usb-headset-mic".to_owned());
         app.settings.updates.last_check = Some(1_790_000_000);
+        app.usage = Some(Usage {
+            month: "2026-10".to_owned(),
+            bytes: 12_400_000_000,
+            quota_bytes: Some(50_000_000_000),
+            relay_enabled: true,
+            days: Vec::new(),
+        });
         app.settings.peers = vec![KnownPeer {
             name: "Bea".to_owned(),
             fingerprint: "cd".repeat(32),
@@ -2333,15 +2955,15 @@ pub(crate) mod shots {
 
     /// Escenas de esta pantalla.
     pub(crate) const BUILDERS: &[(&str, Builder)] = &[
-        ("16-ajustes-cuenta", |app| {
-            settings_page(app, SettingsPage::Account);
+        ("16-ajustes-servidor", |app| {
+            settings_page(app, SettingsPage::Network);
             // Un servidor con certificado propio: se ve la huella en la que se confió.
             if let Some(account) = &mut app.account {
                 account.server.fingerprint = Some("9c4e".repeat(16));
             }
         }),
         ("16-ajustes-sin-servidor", |app| {
-            settings_page(app, SettingsPage::Account);
+            settings_page(app, SettingsPage::Network);
             app.update(Message::Event(Event::ServerStatus {
                 rtt_ms: None,
                 online: false,
@@ -2357,6 +2979,10 @@ pub(crate) mod shots {
             app.update(Message::Settings(super::Msg::MicTestHear(true)));
             app.update(Message::Settings(super::Msg::MicTest(true)));
             app.update(Message::Event(Event::MicLevel(Ok(0.62))));
+        }),
+        ("17-ajustes-video", |app| {
+            settings_page(app, SettingsPage::Video);
+            app.settings.video.vsync = true;
         }),
         ("18-ajustes-sala", |app| {
             settings_page(app, SettingsPage::Room)
@@ -2382,6 +3008,13 @@ pub(crate) mod shots {
                 product: 0x0b13,
                 name: "Mando inalámbrico Xbox".to_owned(),
             });
+        }),
+        ("19-ajustes-atajos", |app| {
+            settings_page(app, SettingsPage::Shortcuts);
+            app.settings.input.shortcuts.chat = 'H';
+            app.update(Message::Settings(super::Msg::Capture(
+                super::Capture::Shortcut(1),
+            )));
         }),
         ("20-ajustes-apariencia", |app| {
             settings_page(app, SettingsPage::Appearance)
@@ -2430,7 +3063,7 @@ mod tests {
     /// `Tick` pasado el retardo (una ráfaga de cambios es una sola escritura).
     #[test]
     fn every_change_is_saved_after_a_delay() {
-        let mut app = open(SettingsPage::Account);
+        let mut app = open(SettingsPage::Network);
         let change = |app: &mut App, msg: Msg| {
             let effects = app.update(Message::Settings(msg));
             assert!(effects.is_empty(), "{effects:?}");
@@ -2475,6 +3108,19 @@ mod tests {
         );
         change(&mut app, Msg::TalkingOverlay(false));
         assert!(!app.settings.room.talking_overlay);
+        change(&mut app, Msg::GameVolume(250));
+        assert_eq!(
+            app.settings.audio.game_volume, MAX_VOICE_VOLUME,
+            "sin sala, solo se guarda (y como mucho el máximo)"
+        );
+        change(&mut app, Msg::Vsync(true));
+        assert!(app.settings.video.vsync);
+        assert!(
+            app.settings.notifications.interface_sounds,
+            "encendidos de partida"
+        );
+        change(&mut app, Msg::InterfaceSounds(false));
+        assert!(!app.settings.notifications.interface_sounds);
         change(&mut app, Msg::PreferredSlot(choice(2, "Ranura 2")));
         assert_eq!(app.settings.input.preferred_slot, 2);
         change(&mut app, Msg::Theme(ThemeChoice::Dark));
@@ -2836,7 +3482,7 @@ mod tests {
 
     #[test]
     fn actions_ask_for_what_they_need() {
-        let mut app = open(SettingsPage::Account);
+        let mut app = open(SettingsPage::Network);
         app.settings.input.pad = PadChoice::Pad(coroom_session::input::gamepad::PadKey {
             vendor: 1,
             product: 2,
@@ -2916,7 +3562,7 @@ mod tests {
     /// última respuesta; fuera de la página, nunca.
     #[test]
     fn audio_devices_refresh_every_three_seconds_while_open() {
-        let mut app = open(SettingsPage::Account);
+        let mut app = open(SettingsPage::Network);
         assert_eq!(
             app.update(Message::Settings(Msg::Page(SettingsPage::Audio))),
             [Effect::LoadAudioDevices]
@@ -2933,8 +3579,8 @@ mod tests {
         }]))));
         let answered = app.now;
         assert_eq!(app.settings_page.audio_updated_at, Some(answered));
-        // «actualizado hace N s» se redibuja cada segundo.
-        assert_eq!(next_tick(&app), Some(answered + Duration::from_secs(1)));
+        // Nada se redibuja cada segundo: el próximo `Tick` es el de volver a pedirla.
+        assert_eq!(next_tick(&app), Some(answered + AUDIO_REFRESH));
         app.now = answered + Duration::from_secs(2);
         assert!(app.update(Message::Tick).is_empty(), "aún no toca");
         app.now = answered + AUDIO_REFRESH;
@@ -2944,9 +3590,10 @@ mod tests {
             matches!(app.settings_page.audio_devices, Load::Loaded(_)),
             "la lista anterior sigue a la vista"
         );
-        assert!(
-            next_tick(&app).is_some_and(|at| at > app.now),
-            "pedida, nunca una hora pasada"
+        assert_eq!(
+            next_tick(&app),
+            None,
+            "pedida, ningún `Tick` hasta la respuesta (nunca una hora pasada)"
         );
         // Un error con lista: se avisa y se mantiene la anterior.
         app.update(Message::Event(Event::AudioDevices(Err(
@@ -2971,17 +3618,24 @@ mod tests {
     }
 
     #[test]
-    fn the_account_page_loads_the_devices() {
+    fn opening_the_server_section_asks_for_the_relay_usage() {
         let mut app = open(SettingsPage::Audio);
         assert!(
-            app.update(Message::Settings(Msg::Page(SettingsPage::Account)))
+            app.update(Message::Settings(Msg::Page(SettingsPage::Network)))
                 .is_empty(),
-            "sin cuenta no hay dispositivos que pedir"
+            "sin cuenta no hay uso del relay que pedir"
         );
-        assert_eq!(ago(100, 100), "ahora mismo");
-        assert_eq!(ago(0, 7200), "hace 2 h");
-        assert_eq!(ago(0, 86_400), "ayer");
-        assert_eq!(ago(0, 86_400 * 3), "hace 3 días");
+        crate::ui::shots::signed_in(&mut app, Page::Settings);
+        // Servidor y red pide el uso del relay del mes cada vez que se abre.
+        app.update(Message::Settings(Msg::Page(SettingsPage::Audio)));
+        assert_eq!(
+            app.update(Message::Settings(Msg::Page(SettingsPage::Network))),
+            [Effect::LoadUsage]
+        );
+        assert_eq!(ago_secs(10), "ahora mismo");
+        assert_eq!(ago_secs(7200), "hace 2 h");
+        assert_eq!(ago_secs(86_400), "ayer");
+        assert_eq!(ago_secs(86_400 * 3), "hace 3 días");
         assert!(release_page("1.2.3").ends_with("/tag/v1.2.3"));
     }
 
@@ -2997,5 +3651,101 @@ mod tests {
         assert_eq!(choices.len(), 3);
         assert!(choices[2].label.contains("bt"), "{}", choices[2].label);
         assert_eq!(device_choices(&devices, false, &None).len(), 1);
+    }
+
+    /// Las nueve secciones, en el orden de la especificación, con Servidor y red de partida y
+    /// la cuenta fuera (tiene su página en el riel).
+    #[test]
+    fn the_sections_come_in_their_order() {
+        let labels: Vec<&str> = SettingsPage::ALL.iter().map(|page| page.label()).collect();
+        assert_eq!(
+            labels,
+            [
+                "Servidor y red",
+                "Audio y voz",
+                "Vídeo",
+                "Sala",
+                "Notificaciones",
+                "Mandos",
+                "Atajos de teclado",
+                "Apariencia",
+                "Acerca de",
+            ]
+        );
+        assert_eq!(SettingsPage::default(), SettingsPage::Network);
+        // Cada sección se elige con su entrada y abre su contenido (sin pánicos al dibujarla).
+        let mut app = open(SettingsPage::Network);
+        for page in SettingsPage::ALL {
+            app.update(Message::Settings(Msg::Page(page)));
+            assert_eq!(app.settings_page.page, page);
+            let _ = view(&app);
+        }
+    }
+
+    /// Un solo nombre para cada cosa (la tabla de la especificación) y las etiquetas de cuándo
+    /// aplica un ajuste.
+    #[test]
+    fn every_setting_has_one_name() {
+        assert_eq!(t!("settings-salida"), "Salida");
+        assert_eq!(t!("settings-microfono"), "Micrófono");
+        assert_eq!(
+            Applies::ALL.map(Applies::label),
+            ["Al momento", "En la próxima sala", "Al entrar"]
+        );
+        assert_eq!(
+            Applies::of_video(VideoOption::Resolution),
+            Applies::Now,
+            "lo de Avanzado lleva la etiqueta de cuándo se aplica en la sala"
+        );
+        assert_eq!(Applies::of_video(VideoOption::Hdr), Applies::NextRoom);
+    }
+
+    /// El volumen del juego y el decodificador cambian también en la sala abierta como invitado.
+    #[test]
+    fn video_and_game_audio_apply_in_the_open_room() {
+        let mut app = open(SettingsPage::Audio);
+        in_a_room(&mut app);
+        assert_eq!(
+            app.update(Message::Settings(Msg::GameVolume(60))),
+            [Effect::SetGameGain {
+                gain: voice_gain(60)
+            }]
+        );
+        assert_eq!(app.guest.as_ref().map(|guest| guest.game_volume), Some(60));
+        assert_eq!(app.settings.audio.game_volume, 60);
+        app.update(Message::Settings(Msg::GameVolumeDone));
+        assert!(app.flush_settings().is_some(), "se guarda al soltar");
+        let effects = app.update(Message::Settings(Msg::SoftwareDecoder(true)));
+        assert!(
+            effects.contains(&Effect::SetSoftwareDecoder(true)),
+            "{effects:?}"
+        );
+        assert_eq!(app.settings.video.decoder, DecoderChoice::Software);
+        app.update(Message::Settings(Msg::SoftwareDecoder(false)));
+        assert_eq!(app.settings.video.decoder, DecoderChoice::Auto);
+    }
+
+    /// Las descripciones de 4:4:4 y HDR se calculan para cada códec (la fila reserva la más
+    /// larga) y dicen lo mismo que en Compartir.
+    #[test]
+    fn the_codec_hints_match_share() {
+        let support = VideoSupport {
+            yuv444: vec![(Codec::Hevc, "HEVC (NVENC)".to_owned())],
+            hdr10: vec![],
+            decode_yuv444: vec![],
+            decode_hdr10: vec![],
+            hdr_display: Some(false),
+        };
+        let mut app = open(SettingsPage::Video);
+        app.video_support = Some(support.clone());
+        for (choice, codec) in [
+            (CodecChoice::Auto, None),
+            (CodecChoice::Av1, Some(Codec::Av1)),
+            (CodecChoice::Hevc, Some(Codec::Hevc)),
+        ] {
+            app.settings.video.codec = choice;
+            assert_eq!(chroma_hint(Some(&support), codec), host::chroma_hint(&app));
+            assert_eq!(hdr_hint(Some(&support), codec), host::hdr_hint(&app));
+        }
     }
 }
