@@ -74,6 +74,21 @@ pub(crate) const MIN_PSNR_DB: f64 = 25.0;
 /// Tiempo límite de la comprobación de un codificador (abrirlo, 300 fotogramas y decodificarlos).
 const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Lo más que puede tardar [`probe`]: cada paso espera como mucho su tiempo límite (el hilo que
+/// no responde se abandona), así que la suma de todos acota el sondeo entero. Lo usa el padre del
+/// sondeo en proceso hijo ([`super::probe_child`]) para no esperar a un hijo colgado.
+pub(crate) fn worst_case() -> Duration {
+    let child = super::probe_child::CHILD_TIMEOUT;
+    let combinations = |backends: usize, codecs: usize| (backends * codecs) as u32;
+    let encoders = combinations(platform_encoders().len(), Codec::PREFERENCE.len());
+    let decoders = combinations(platform_decoders().len(), Codec::PREFERENCE.len());
+    // Codificador: el hijo de Vulkan Video, abrir y la comprobación de imagen. Muestras: H.264 y
+    // AV1. Decodificador: el hijo de Vulkan, decodificar la muestra o abrir con `hwaccel`.
+    (child + PROBE_TIMEOUT + CHECK_TIMEOUT) * encoders
+        + PROBE_TIMEOUT * 2
+        + (child + PROBE_TIMEOUT) * decoders
+}
+
 /// Backends de codificación que tienen sentido en este sistema.
 fn platform_encoders() -> Vec<Backend> {
     Backend::ALL

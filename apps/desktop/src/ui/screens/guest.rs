@@ -1080,7 +1080,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::ToggleGame => return vec![Effect::ToggleGameAudio],
         Msg::ToggleFullscreen => return vec![Effect::SetFullscreen(!fullscreen)],
         Msg::Leave => {
-            if state.probe {
+            if app.probe {
                 return vec![Effect::Quit];
             }
             app.dialog = Some(Dialog::Leave);
@@ -1269,8 +1269,13 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                 }
                 return start(app, code);
             }
+            // Desde la línea de órdenes (`coroom probe`, `coroom join`) no hay a quién preguntar:
+            // al terminar la sesión, por lo que sea, se cierra y se da el resumen.
+            if app.probe {
+                return close(app);
+            }
             match reason {
-                None if state.leaving || state.probe => return close(app),
+                None if state.leaving => return close(app),
                 None => {
                     app.dialog = Some(Dialog::SessionEnded {
                         title: t!("room-la-sesion-ha-terminado").to_owned(),
@@ -3905,6 +3910,33 @@ mod tests {
             shots::sample_stats(),
         ))));
         app
+    }
+
+    /// `coroom join` con ventana: cuando la sesión termina (los fotogramas pedidos, el anfitrión
+    /// que cierra o un error) la aplicación sale sola, sin quedarse en un diálogo.
+    #[test]
+    fn a_join_from_the_command_line_quits_when_the_session_ends() {
+        let ends = [
+            None,
+            Some(crate::ui::app::GuestEnd {
+                kind: EndKind::RoomClosed,
+                text: "El anfitrión cerró la sala.".to_owned(),
+            }),
+        ];
+        for end in ends {
+            let mut app = watching();
+            app.probe = true;
+            let effects = app.update(Message::Event(Event::GuestEnded(end.clone())));
+            assert!(effects.contains(&Effect::Quit), "{end:?}: {effects:?}");
+            assert!(app.dialog.is_none(), "{end:?}: {:?}", app.dialog);
+            assert!(app.guest.is_none(), "{end:?}");
+        }
+        // «Salir» tampoco pregunta.
+        let mut app = watching();
+        app.probe = true;
+        let effects = app.update(Message::Guest(Msg::Leave));
+        assert_eq!(effects, vec![Effect::Quit]);
+        assert!(app.dialog.is_none());
     }
 
     fn set_added(app: &mut App, added_ms: u64, loss: f64, rtt: f64) {

@@ -168,6 +168,21 @@ impl CachedProbe {
     }
 }
 
+/// `caps` en una línea de texto (el formato de la caché, sin huella): así las pasa el hijo del
+/// sondeo aislado (`ffmpeg::probe_child`) a la aplicación.
+#[cfg_attr(not(feature = "ffmpeg"), allow(dead_code))]
+pub(crate) fn to_wire(caps: &Capabilities) -> String {
+    serde_json::to_string(&CachedProbe::new(String::new(), caps)).unwrap_or_default()
+}
+
+/// Lo contrario de [`to_wire`] (`None` si el texto no se entiende).
+#[cfg_attr(not(feature = "ffmpeg"), allow(dead_code))]
+pub(crate) fn from_wire(text: &str) -> Option<Capabilities> {
+    serde_json::from_str::<CachedProbe>(text)
+        .ok()?
+        .capabilities()
+}
+
 /// Las capacidades guardadas en `path` si su huella es `fingerprint`.
 fn load_cached(path: &Path, fingerprint: &str) -> Option<Capabilities> {
     let bytes = std::fs::read(path).ok()?;
@@ -233,9 +248,10 @@ impl Capabilities {
                     let _ = FROM_CACHE.set(true);
                     return caps;
                 }
-                let caps = Self::run_probe();
+                let (caps, complete) = Self::run_probe();
                 let _ = FROM_CACHE.set(false);
-                if let Some((path, fingerprint)) = cache {
+                // Un sondeo que no terminó no se guarda: el próximo arranque lo repite.
+                if let Some((path, fingerprint)) = cache.filter(|_| complete) {
                     // Sin caché solo se vuelve a sondear en el próximo arranque.
                     let _ = store_cached(path, fingerprint, &caps);
                 }
@@ -269,7 +285,25 @@ impl Capabilities {
         FROM_CACHE.get().copied()
     }
 
-    fn run_probe() -> Capabilities {
+    /// El sondeo, en un proceso hijo cuando el binario lo activó (`ffmpeg::probe_child`): así no
+    /// traba la interfaz de la aplicación. `false` si no terminó (el hijo murió o se colgó):
+    /// entonces queda solo OpenH264, con el motivo en [`Self::unavailable`].
+    fn run_probe() -> (Capabilities, bool) {
+        #[cfg(feature = "ffmpeg")]
+        match crate::ffmpeg::probe_child::isolated_probe() {
+            Some(Ok(caps)) => return (caps, true),
+            Some(Err(reason)) => {
+                let mut caps = Self::openh264_only();
+                caps.unavailable.push(reason);
+                return (caps, false);
+            }
+            None => {}
+        }
+        (Self::probe_in_process(), true)
+    }
+
+    /// El sondeo en este mismo proceso.
+    pub(crate) fn probe_in_process() -> Capabilities {
         let mut caps = Self::openh264_only();
         #[cfg(feature = "ffmpeg")]
         {
@@ -417,6 +451,29 @@ impl fmt::Display for Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lo que el hijo del sondeo aislado escribe es lo que la aplicación lee, en una sola línea.
+    #[test]
+    fn capabilities_cross_the_child_process_intact() {
+        let mut caps = Capabilities::with(
+            vec![
+                (Codec::Av1, Backend::Nvenc),
+                (Codec::Hevc, Backend::VulkanVideo),
+                (Codec::H264, Backend::Software),
+            ],
+            vec![
+                (Codec::Av1, DecoderBackend::Software),
+                (Codec::H264, DecoderBackend::Software),
+            ],
+        );
+        caps.ffmpeg_version = Some("8.1".to_owned());
+        caps.rejected = vec!["codificar AV1 con Vulkan Video: imagen dañada".to_owned()];
+        caps.unavailable = vec!["codificar HEVC con QSV: sin GPU\ny otra línea".to_owned()];
+        let wire = to_wire(&caps);
+        assert!(!wire.contains('\n'), "{wire}");
+        assert_eq!(from_wire(&wire), Some(caps));
+        assert_eq!(from_wire("no es json"), None);
+    }
 
     /// La columna «Decodificar» queda alineada aunque la lista de codificadores sea larga.
     #[test]
