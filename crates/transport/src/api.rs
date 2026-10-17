@@ -48,6 +48,10 @@ pub const H3_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Espera máxima de una petición por HTTP/3 antes de pasar al respaldo por TCP.
 pub const H3_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Espera máxima de la conexión TCP y el handshake TLS del respaldo: un servidor colgado (el
+/// puerto abierto, sin respuesta) no retiene la petición todo [`REQUEST_TIMEOUT`].
+pub const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Espera máxima de una petición por TCP.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -372,11 +376,15 @@ impl ApiClient {
             TransportError::InvalidUrl(format!("{}: nombre no válido", self.url.host))
         })?;
         let addrs = self.resolve(self.tcp_port).await?;
-        let tcp = first_to_connect(&self.url.host, addrs, |addr| {
-            Box::pin(async move { Ok(tokio::net::TcpStream::connect(addr).await?) })
+        let tls = tokio::time::timeout(TCP_CONNECT_TIMEOUT, async {
+            let tcp = first_to_connect(&self.url.host, addrs, |addr| {
+                Box::pin(async move { Ok(tokio::net::TcpStream::connect(addr).await?) })
+            })
+            .await?;
+            Ok::<_, TransportError>(connector.connect(name, tcp).await?)
         })
-        .await?;
-        let tls = connector.connect(name, tcp).await?;
+        .await
+        .map_err(|_| TransportError::Timeout("conexión TLS con el servidor"))??;
         let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
         let io = TokioIo::new(tls);
         let content_type = body.as_ref().map(|(_, kind)| *kind);

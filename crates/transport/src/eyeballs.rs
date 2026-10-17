@@ -5,13 +5,15 @@
 //! se entera del ICMP de puerto cerrado). Aquí cada intento empieza [`ATTEMPT_DELAY`] después del
 //! anterior, o en cuanto el anterior falla, y gana el primero que conecta. La dirección que ganó
 //! se recuerda para ese servidor y la próxima conexión empieza por ella (el historial que permite
-//! RFC 8305 §4): solo la primera conexión paga la espera del intento que no contesta.
+//! RFC 8305 §4): solo la primera conexión paga la espera del intento que no contesta. Con
+//! [`remember_addresses_in`], también entre arranques.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -48,6 +50,52 @@ pub(crate) fn interleave(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
 /// La dirección que ganó la última vez, por nombre de servidor y puerto.
 static WINNERS: LazyLock<Mutex<HashMap<(String, u16), IpAddr>>> = LazyLock::new(Mutex::default);
 
+/// Fichero donde se guardan entre arranques ([`remember_addresses_in`]).
+static WINNERS_FILE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Guarda en `path` la dirección que ganó con cada servidor y carga las que ya hubiera: así el
+/// primer arranque con un servidor que solo contesta por una familia paga la espera del intento
+/// que no contesta, y los siguientes no. Hay que darlo antes de la primera conexión; después no
+/// cambia nada. Una línea por servidor: `nombre puerto dirección`.
+pub fn remember_addresses_in(path: PathBuf) {
+    let loaded = std::fs::read_to_string(&path)
+        .map(|text| parse_winners(&text))
+        .unwrap_or_default();
+    if WINNERS_FILE.set(path).is_ok()
+        && let Ok(mut winners) = WINNERS.lock()
+    {
+        for (key, ip) in loaded {
+            winners.entry(key).or_insert(ip);
+        }
+    }
+}
+
+fn parse_winners(text: &str) -> Vec<((String, u16), IpAddr)> {
+    text.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let host = fields.next()?.to_owned();
+            let port = fields.next()?.parse().ok()?;
+            let ip = fields.next()?.parse().ok()?;
+            Some(((host, port), ip))
+        })
+        .collect()
+}
+
+/// Escribe `winners` en `path` (un temporal y lo renombra: nunca queda a medias).
+fn store_winners(path: &Path, winners: &HashMap<(String, u16), IpAddr>) -> std::io::Result<()> {
+    let mut text = String::new();
+    for ((host, port), ip) in winners {
+        text.push_str(&format!("{host} {port} {ip}\n"));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, text)?;
+    std::fs::rename(&temporary, path)
+}
+
 /// Pone delante la dirección que ganó la última vez con `host` (si sigue entre `addrs`), y con
 /// ella su familia en [`interleave`].
 fn prefer_last_winner(host: &str, mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
@@ -67,7 +115,12 @@ fn prefer_last_winner(host: &str, mut addrs: Vec<SocketAddr>) -> Vec<SocketAddr>
 
 fn remember_winner(host: &str, addr: SocketAddr) {
     if let Ok(mut winners) = WINNERS.lock() {
-        winners.insert((host.to_owned(), addr.port()), addr.ip());
+        let previous = winners.insert((host.to_owned(), addr.port()), addr.ip());
+        if previous != Some(addr.ip())
+            && let Some(path) = WINNERS_FILE.get()
+        {
+            let _ = store_winners(path, &winners);
+        }
     }
 }
 
@@ -205,6 +258,26 @@ mod tests {
         let none =
             first_to_connect("none.example", Vec::new(), |_| Box::pin(async { Ok(()) })).await;
         assert!(matches!(none, Err(TransportError::Unreachable)));
+    }
+
+    #[test]
+    fn the_winners_file_reads_back() {
+        let dir = std::env::temp_dir().join(format!("coroom-eyeballs-{}", std::process::id()));
+        let path = dir.join("addresses");
+        let winners = HashMap::from([
+            (
+                ("coroom.example.com".to_owned(), 4433),
+                "127.0.0.1".parse().expect("ip"),
+            ),
+            (("localhost".to_owned(), 8443), "::1".parse().expect("ip")),
+        ]);
+        store_winners(&path, &winners).expect("guardar");
+        let text = std::fs::read_to_string(&path).expect("leer");
+        let read: HashMap<_, _> = parse_winners(&format!("{text}línea rota\n"))
+            .into_iter()
+            .collect();
+        assert_eq!(read, winners);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Tras ganar la segunda dirección, la próxima conexión empieza por ella y no espera a la

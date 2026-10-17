@@ -42,6 +42,7 @@ pub use connect::{
     RelayInfo,
 };
 pub use error::TransportError;
+pub use eyeballs::remember_addresses_in;
 pub use media::{
     CompleteFrame, MediaReceiver, MediaReceiverConfig, MediaSender, MediaSenderConfig,
 };
