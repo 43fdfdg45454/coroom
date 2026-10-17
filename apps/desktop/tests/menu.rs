@@ -186,3 +186,42 @@ fn a_menu_closed_with_the_button_held_does_not_pick_on_the_next_open() {
         "la pulsación del menú anterior eligió en el nuevo"
     );
 }
+
+/// Un selector dentro de lo que se pliega (el mando de un invitado, en su desplegable de la sala)
+/// también se abre y elige.
+#[test]
+fn a_select_inside_a_collapse_opens() {
+    let mut renderer = match ShotRenderer::new() {
+        Ok(renderer) => renderer,
+        Err(err) => {
+            eprintln!("sin prueba de menús: {err}");
+            return;
+        }
+    };
+    let theme = Theme::new(Mode::Dark, Accent::Blue, Fonts::default());
+    let select = coroom_ui::widget::select(
+        ACTIONS
+            .iter()
+            .map(|action| action.to_string())
+            .collect::<Vec<_>>(),
+        Some(ACTIONS[0].to_owned()),
+        |action| action,
+    );
+    let folded = coroom_ui::animate::Collapse::new(select, 1.0);
+    let header = Point::new(15.0, 15.0);
+    let option = Point::new(30.0, 80.0);
+    let (picked, _) = renderer.interact(
+        folded.into(),
+        SIZE,
+        &theme,
+        &[
+            moved(header),
+            press(header),
+            release(header),
+            moved(option),
+            press(option),
+            release(option),
+        ],
+    );
+    assert_eq!(picked.len(), 1, "el selector se abrió y eligió: {picked:?}");
+}

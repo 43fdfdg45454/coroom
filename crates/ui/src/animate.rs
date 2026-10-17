@@ -766,6 +766,29 @@ impl<M> iced_core::Widget<M, Theme, Renderer> for Collapse<'_, M> {
             _ => mouse::Interaction::None,
         }
     }
+
+    /// Lo que el contenido despliega por encima (el menú de un selector): sin esto, un selector
+    /// dentro de lo plegable no se abría.
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, M, Theme, Renderer>> {
+        if self.factor <= 0.0 {
+            return None;
+        }
+        let child = layout.children().next()?;
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            child,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
 }
 
 impl<'a, M: 'a> From<Collapse<'a, M>> for Element<'a, M> {
