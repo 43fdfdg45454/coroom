@@ -256,6 +256,16 @@ const LOGIN_BUILDERS: &[(&str, Builder)] = &[
     ("02-servidor-nuevo", new_server),
     ("03-entrar", sign_in),
     ("04-crear-cuenta", create_account),
+    ("04-recuperando-sin-respuesta", |app| {
+        servers(app);
+        app.login.restoring = true;
+        app.login.waiting_since = app.now - Duration::from_secs(6);
+    }),
+    ("04-entrando-sin-respuesta", |app| {
+        sign_in(app);
+        app.login.busy = true;
+        app.login.waiting_since = app.now - Duration::from_millis(4_600);
+    }),
 ];
 
 /// Ventana estrecha (sigue con el riel plegado, como [`SIZE`]).

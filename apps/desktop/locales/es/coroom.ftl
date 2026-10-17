@@ -178,6 +178,7 @@ pantalla-login-otra-version = Otra versión
 pantalla-login-ponle-nombre-a-este-equipo-por = Ponle nombre a este equipo (por ejemplo, «Portátil»)
 pantalla-login-protocolo = Protocolo { $protocol }
 pantalla-login-recuperando-la-sesion-guardada = Recuperando la sesión guardada…
+pantalla-login-el-servidor-todavia-no-contesta = El servidor todavía no contesta ({ $segundos } s). Si no responde, verás aquí el motivo.
 pantalla-login-reintentar = Reintentar
 pantalla-login-repite-la-contrasena = Repite la contraseña
 pantalla-login-solo-letras-sin-tilde-cifras-y = Solo letras sin tilde, cifras, «.», «-» y «_» (sin espacios)

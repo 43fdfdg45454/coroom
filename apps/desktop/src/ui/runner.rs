@@ -380,6 +380,7 @@ impl Runner {
         match self.launch.take().unwrap_or(Launch::App) {
             Launch::App => {
                 app.login.restoring = !app.settings.servers.is_empty();
+                app.login.waiting_since = app.now;
                 backend.execute(Effect::Restore, &app);
                 backend.execute(Effect::LoadVideoSupport, &app);
                 let updates = &app.settings.updates;

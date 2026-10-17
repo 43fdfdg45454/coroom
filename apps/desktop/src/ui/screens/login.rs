@@ -123,6 +123,9 @@ pub struct State {
     pub busy: bool,
     /// Recuperando la sesión guardada al arrancar.
     pub restoring: bool,
+    /// Desde cuándo se espera al servidor (con `busy` o `restoring`): anima la barra y, si tarda,
+    /// dice cuánto lleva sin contestar.
+    pub waiting_since: Instant,
     /// Error del servidor.
     pub error: Option<String>,
     /// Errores de validación.
@@ -152,6 +155,7 @@ impl State {
             invitation: false,
             busy: false,
             restoring: false,
+            waiting_since: Instant::now(),
             error: None,
             errors: FieldErrors::default(),
         }
@@ -288,6 +292,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 state.errors = FieldErrors::default();
                 // Con la sesión guardada se entra sin la contraseña; si no hay, se pide.
                 state.restoring = true;
+                state.waiting_since = app.now;
                 return vec![Effect::Resume(entry.clone())];
             }
         }
@@ -366,6 +371,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 return Vec::new();
             }
             state.busy = true;
+            state.waiting_since = app.now;
             state.error = None;
             let display = state.display_name.trim();
             return vec![Effect::SignIn {
@@ -615,11 +621,16 @@ fn on(msg: Msg) -> Message {
 fn servers(app: &App) -> Element<'_, Message> {
     let state = &app.login;
     if state.restoring {
-        return ui::card(ui::progress(
+        let mut waiting = column![ui::progress(
             t!("pantalla-login-recuperando-la-sesion-guardada"),
             None,
             phase(app),
-        ));
+        )]
+        .spacing(space::XS);
+        if let Some(silent) = silent_for(app) {
+            waiting = waiting.push(silent);
+        }
+        return ui::card(waiting);
     }
     let rows = app
         .settings
@@ -672,11 +683,32 @@ fn servers(app: &App) -> Element<'_, Message> {
 }
 
 fn phase(app: &App) -> f32 {
-    let since = match &app.login.probe {
+    let state = &app.login;
+    let since = match &state.probe {
+        _ if state.busy || state.restoring => state.waiting_since,
         Probe::Checking { since, .. } => *since,
         _ => app.now,
     };
     app.now.duration_since(since).as_secs_f32() / 1.4
+}
+
+/// Desde cuántos segundos enteros se espera al servidor sin respuesta, a partir del tercero: antes
+/// basta la barra.
+pub fn silent_seconds(state: &State, now: Instant) -> Option<u64> {
+    let seconds = now.duration_since(state.waiting_since).as_secs();
+    ((state.busy || state.restoring) && seconds >= 3).then_some(seconds)
+}
+
+/// «El servidor todavía no contesta (N s)» si lleva un rato sin respuesta.
+fn silent_for(app: &App) -> Option<Element<'_, Message>> {
+    silent_seconds(&app.login, app.now).map(|seconds| {
+        ui::secondary(t!(
+            "pantalla-login-el-servidor-todavia-no-contesta",
+            segundos = seconds
+        ))
+        .wrapping(Wrapping::WordOrGlyph)
+        .into()
+    })
 }
 
 fn add_server(app: &App) -> Element<'_, Message> {
@@ -933,7 +965,7 @@ fn sign_in(app: &App) -> Element<'_, Message> {
                 t!("pantalla-login-iniciando-sesion")
             },
             None,
-            app.now.elapsed().as_secs_f32(),
+            phase(app),
         ))
         .width(Length::Fixed(180.0))
         .into()
@@ -948,9 +980,15 @@ fn sign_in(app: &App) -> Element<'_, Message> {
         )
         .into()
     };
-    let actions = row![ui::fill(), main]
-        .spacing(space::XS)
-        .align_y(Alignment::Center);
+    let mut actions = column![
+        row![ui::fill(), main]
+            .spacing(space::XS)
+            .align_y(Alignment::Center)
+    ]
+    .spacing(space::XS);
+    if let Some(silent) = silent_for(app) {
+        actions = actions.push(row![ui::fill(), silent]);
+    }
     let switch = row![
         ui::fill(),
         ui::button_with(
@@ -1189,10 +1227,16 @@ mod tests {
             "{effects:?}"
         );
         assert!(app.login.restoring, "se ve que está recuperando la sesión");
+        // La barra se anima mientras espera y, si el servidor tarda, se dice cuánto lleva.
+        assert!(app.animating());
+        assert_eq!(silent_seconds(&app.login, app.now), None);
+        let later = app.now + std::time::Duration::from_secs(4);
+        assert_eq!(silent_seconds(&app.login, later), Some(4));
         // Sin sesión guardada en ese servidor: se pide la contraseña.
         on_event(&mut app, Event::NoSavedSession);
         assert_eq!(app.login.step, Step::SignIn);
         assert!(!app.login.restoring);
         assert_eq!(app.login.username, "ana");
+        assert_eq!(silent_seconds(&app.login, later), None);
     }
 }

@@ -1087,6 +1087,7 @@ impl App {
             || account::animating(self)
             || friends::animating(self)
             || self.login.probe.is_checking()
+            || (self.screen == Screen::Login && (self.login.busy || self.login.restoring))
             || (self.screen == Screen::Guest
                 && self
                     .guest
