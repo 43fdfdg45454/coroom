@@ -1,7 +1,10 @@
-//! Que el escritorio no se bloquee ni apague la pantalla mientras se mira una transmisión.
+//! Que el escritorio no se bloquee ni apague la pantalla mientras se mira o se comparte una
+//! transmisión.
 //!
 //! Quien mira (y juega con un mando, que el sistema no cuenta como actividad) no toca el teclado
-//! ni el ratón del equipo, así que sin esto la sesión se bloquea al rato. [`IdleInhibitor`] lo
+//! ni el ratón del equipo, así que sin esto la sesión se bloquea al rato. Al anfitrión le pasa lo
+//! mismo cuando el invitado juega con un mando, y con la sesión bloqueada se capturaría la
+//! pantalla de bloqueo. [`IdleInhibitor`] lo
 //! impide mientras existe:
 //!
 //! - **Linux**: el portal `Inhibit` con la marca `Idle` (GNOME, KDE y los demás lo atienden, también
@@ -39,11 +42,10 @@ impl IdleInhibitor {
 
 impl Drop for IdleInhibitor {
     fn drop(&mut self) {
-        // Al soltar el emisor, el hilo deja de esperar y quita la inhibición.
+        // Al soltar el emisor, el hilo deja de esperar y quita la inhibición. No se lo espera: se
+        // suelta desde el hilo de la interfaz y el portal puede tardar en contestar.
         self.stop.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.thread.take();
     }
 }
 
@@ -88,12 +90,15 @@ fn hold(reason: &str, stopped: mpsc::Receiver<()>) {
                 return;
             }
         };
-        tracing::info!("bloqueo de la pantalla impedido mientras se mira la transmisión");
+        tracing::info!("bloqueo de la pantalla impedido mientras dure la transmisión");
         // Hasta que se suelte el inhibidor (el emisor se cae y `recv` devuelve error). La espera va
         // aparte para que la conexión con el portal siga atendida.
         let _ = tokio::task::spawn_blocking(move || stopped.recv()).await;
-        if let Err(err) = request.close().await {
-            tracing::debug!(error = %err, "cerrar la inhibición");
+        match tokio::time::timeout(PORTAL_TIMEOUT, request.close()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::debug!(error = %err, "cerrar la inhibición"),
+            // Se cierra igual al soltar la conexión con el portal.
+            Err(_) => tracing::debug!("el portal no contestó al cerrar la inhibición"),
         }
         drop(proxy);
         tracing::info!("la pantalla se vuelve a poder bloquear");
@@ -110,7 +115,7 @@ fn hold(reason: &str, stopped: mpsc::Receiver<()>) {
     // SAFETY: solo cambia el estado de ejecución de este hilo; las marcas son constantes del
     // sistema.
     unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED) };
-    tracing::info!("bloqueo de la pantalla impedido mientras se mira la transmisión");
+    tracing::info!("bloqueo de la pantalla impedido mientras dure la transmisión");
     // Hasta que se suelte el inhibidor (el emisor se cae y `recv` devuelve error).
     let _ = stopped.recv();
     // SAFETY: como arriba; `ES_CONTINUOUS` solo quita lo que pidió este hilo.

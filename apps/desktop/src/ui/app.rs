@@ -962,14 +962,21 @@ impl App {
     }
 
     /// Si hay que impedir que el escritorio se bloquee: con el vídeo del invitado delante y el
-    /// anfitrión compartiendo algo. Quien mira (o juega con un mando, que el sistema no cuenta como
-    /// actividad) no toca el teclado ni el ratón.
+    /// anfitrión compartiendo algo, o con la sala propia compartiendo. Quien mira (o juega con un
+    /// mando, que el sistema no cuenta como actividad) no toca el teclado ni el ratón.
     pub fn wants_idle_inhibit(&self) -> bool {
-        self.video_in_front()
+        let watching = self.video_in_front()
             && self
                 .guest
                 .as_ref()
-                .is_some_and(|guest| !guest.nothing_shared())
+                .is_some_and(|guest| !guest.nothing_shared());
+        watching || self.sharing_screen()
+    }
+
+    /// Con la sala propia abierta y algo compartido: quien juega desde lejos con un mando tampoco
+    /// cuenta como actividad, y con la sesión bloqueada se capturaría la pantalla de bloqueo.
+    pub fn sharing_screen(&self) -> bool {
+        self.host.room.is_some() && self.host.source() != host::SourceChoice::Nothing
     }
 
     /// Fondo bajo la interfaz y el vídeo para el compositor de la ventana: el del vídeo con el

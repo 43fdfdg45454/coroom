@@ -143,7 +143,7 @@ portal-no-se-pudo-olvidar-el-permiso = no se pudo olvidar el permiso de pantalla
 ## runner
 
 runner-error-del-bucle-de-la-ventana = error del bucle de la ventana: { $err }
-runner-mirando-una-transmision = Mirando una transmisión de coroom
+runner-transmision-en-curso = Transmisión de coroom en curso
 runner-este-equipo = este equipo
 runner-no-hay-pantalla-disponible-cause-prueba = no hay pantalla disponible ({ $cause }); prueba las órdenes sin ventana (`coroom --help`)
 runner-no-se-pudo-abrir-la-ventana = no se pudo abrir la ventana: { $err }

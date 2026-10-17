@@ -3913,6 +3913,18 @@ mod tests {
         )));
     }
 
+    /// Compartiendo, el escritorio del anfitrión no se bloquea (quien juega desde lejos con un mando
+    /// no cuenta como actividad); en una sala solo de voz, sí.
+    #[test]
+    fn the_screen_does_not_lock_while_sharing() {
+        let mut app = app();
+        assert!(!app.wants_idle_inhibit());
+        open_room(&mut app);
+        assert!(app.wants_idle_inhibit());
+        app.update(Message::Host(Msg::StopSharing));
+        assert!(!app.wants_idle_inhibit(), "solo voz: nada que capturar");
+    }
+
     /// Con la sala abierta, cambiar de servidor pregunta antes (la cierra para todos) y no se
     /// puede entrar en otra sala con un código ni con una invitación.
     #[test]

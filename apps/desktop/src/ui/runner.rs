@@ -149,7 +149,7 @@ struct Ready {
     quit: bool,
     /// Eventos ya convertidos que la interfaz recibe de golpe en el próximo dibujo.
     pending: Vec<UiEvent>,
-    /// Mientras se mira una transmisión, el escritorio no se bloquea
+    /// Mientras se mira o se comparte una transmisión, el escritorio no se bloquea
     /// ([`App::wants_idle_inhibit`]).
     idle_inhibit: Option<crate::inhibit::IdleInhibitor>,
 }
@@ -572,7 +572,7 @@ impl Ready {
         let wanted = self.app.wants_idle_inhibit();
         if wanted && self.idle_inhibit.is_none() {
             self.idle_inhibit = Some(crate::inhibit::IdleInhibitor::start(t!(
-                "runner-mirando-una-transmision"
+                "runner-transmision-en-curso"
             )));
         } else if !wanted {
             self.idle_inhibit = None;
