@@ -37,6 +37,7 @@ use coroom_proto::api::{
 use coroom_proto::{Alpn, hex};
 
 use crate::TransportError;
+use crate::eyeballs::first_to_connect;
 use crate::quic::canonical;
 use crate::signal::ServerUrl;
 use crate::tls::{self, ServerTrust};
@@ -210,55 +211,41 @@ impl ApiClient {
             QuicClientConfig::try_from(self.client_config(&[Alpn::H3.as_bytes()])?)
                 .map_err(|err| TransportError::Tls(err.to_string()))?,
         );
-        let mut last = None;
-        for addr in self.resolve(self.url.port).await? {
-            let local: SocketAddr = if addr.is_ipv6() {
-                "[::]:0".parse().map_err(protocol)?
-            } else {
-                "0.0.0.0:0".parse().map_err(protocol)?
-            };
-            let endpoint = match quinn::Endpoint::client(local) {
-                Ok(endpoint) => endpoint,
-                Err(err) => {
-                    last = Some(TransportError::Io(err));
-                    continue;
+        let addrs = self.resolve(self.url.port).await?;
+        let host = self.url.host.as_str();
+        // Todas las direcciones a la vez, escalonadas: una que no contesta no retiene a la otra.
+        let (endpoint, connection) = first_to_connect(addrs, |addr| {
+            let crypto = Arc::clone(&crypto);
+            Box::pin(async move {
+                let local: SocketAddr = if addr.is_ipv6() {
+                    "[::]:0".parse().map_err(protocol)?
+                } else {
+                    "0.0.0.0:0".parse().map_err(protocol)?
+                };
+                let endpoint = quinn::Endpoint::client(local)?;
+                let config =
+                    quinn::ClientConfig::new(crypto as Arc<dyn quinn::crypto::ClientConfig>);
+                let connecting = endpoint.connect_with(config, addr, host)?;
+                match tokio::time::timeout(H3_CONNECT_TIMEOUT, connecting).await {
+                    Ok(Ok(connection)) => Ok((endpoint, connection)),
+                    Ok(Err(err)) => Err(err.into()),
+                    Err(_) => Err(TransportError::Timeout("handshake HTTP/3 con el servidor")),
                 }
-            };
-            let config = quinn::ClientConfig::new(
-                Arc::clone(&crypto) as Arc<dyn quinn::crypto::ClientConfig>
-            );
-            let connecting = match endpoint.connect_with(config, addr, &self.url.host) {
-                Ok(connecting) => connecting,
-                Err(err) => {
-                    last = Some(err.into());
-                    continue;
-                }
-            };
-            let connection = match tokio::time::timeout(H3_CONNECT_TIMEOUT, connecting).await {
-                Ok(Ok(connection)) => connection,
-                Ok(Err(err)) => {
-                    last = Some(err.into());
-                    continue;
-                }
-                Err(_) => {
-                    last = Some(TransportError::Timeout("handshake HTTP/3 con el servidor"));
-                    continue;
-                }
-            };
-            let (mut driver, send) = h3::client::new(h3_quinn::Connection::new(connection.clone()))
-                .await
-                .map_err(|err| protocol(format!("HTTP/3: {err}")))?;
-            let driver = tokio::spawn(async move {
-                let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
-            });
-            return Ok(H3Conn {
-                endpoint,
-                connection,
-                send,
-                driver,
-            });
-        }
-        Err(last.unwrap_or(TransportError::Unreachable))
+            })
+        })
+        .await?;
+        let (mut driver, send) = h3::client::new(h3_quinn::Connection::new(connection.clone()))
+            .await
+            .map_err(|err| protocol(format!("HTTP/3: {err}")))?;
+        let driver = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+        Ok(H3Conn {
+            endpoint,
+            connection,
+            send,
+            driver,
+        })
     }
 
     /// Configuración TLS según la confianza (la de inspección solo la usa [`ApiClient::probe`]).

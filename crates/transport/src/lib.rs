@@ -23,6 +23,7 @@ pub use coroom_proto as proto;
 pub mod api;
 pub mod connect;
 mod error;
+mod eyeballs;
 pub mod fec;
 pub mod loopback;
 #[cfg(feature = "test-util")]

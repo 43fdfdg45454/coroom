@@ -54,7 +54,7 @@ bytes.workspace = true
 quinn.workspace = true
 rustls.workspace = true
 coroom-transport = { path = ".", features = ["test-util"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "sync", "test-util"] }
 
 [lints]
 workspace = true

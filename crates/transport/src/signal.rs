@@ -16,6 +16,7 @@ use coroom_proto::signal::SignalMessage;
 use coroom_proto::{Alpn, PROTOCOL_VERSION};
 
 use crate::TransportError;
+use crate::eyeballs::first_to_connect;
 use crate::quic::{Endpoint, canonical, spawn_writer};
 use crate::tls::ServerTrust;
 use crate::webtransport::Session;
@@ -147,12 +148,20 @@ impl SignalClient {
         if local.is_ipv4() {
             addrs.retain(SocketAddr::is_ipv4);
         }
-        let server_addr = *addrs
-            .first()
-            .ok_or_else(|| TransportError::InvalidUrl(format!("{server_url}: no resuelve")))?;
-        let (connection, _) = endpoint
-            .connect_server(server_addr, &url.host, trust, Alpn::H3)
-            .await?;
+        if addrs.is_empty() {
+            return Err(TransportError::InvalidUrl(format!(
+                "{server_url}: no resuelve"
+            )));
+        }
+        // Todas las direcciones a la vez, escalonadas: una que no contesta no retiene a la otra.
+        let host = url.host.as_str();
+        let (connection, server_addr) = first_to_connect(addrs, |addr| {
+            Box::pin(async move {
+                let (connection, _) = endpoint.connect_server(addr, host, trust, Alpn::H3).await?;
+                Ok((connection, addr))
+            })
+        })
+        .await?;
         let session = Session::connect(connection, &url.authority, &url.path).await?;
         let (send, recv) = session.open_bi().await?;
         let sender = SignalSender {
