@@ -72,7 +72,7 @@ settings-numero-recortado = { $preview }…
 ## Audio y voz
 settings-dispositivos = Dispositivos
 settings-dispositivos-en-vivo = En vivo: la lista cambia al conectar o quitar uno
-settings-actualizado-hace = { $lead } · actualizado hace { $seconds } s
+settings-actualizado-hace = { $lead } · actualizado { $ago }
 settings-buscando-dispositivos = { $lead } · buscando dispositivos…
 settings-salida = Salida
 settings-salida-ayuda = Donde oyes el juego y la voz. Con una sala abierta, cambia al momento.

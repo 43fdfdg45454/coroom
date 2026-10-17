@@ -352,7 +352,7 @@ pub fn settings_row(app: &App) -> Option<Element<'_, Message>> {
         .align_y(Alignment::Center);
     if account.avatar.is_some() {
         actions = actions.push(ui::button_with(
-            Kind::DestructiveFlat,
+            Kind::DestructiveSoft,
             t!("avatar-quitar"),
             Some(Icon::Trash),
             (!store.busy).then_some(Message::Avatar(Msg::Remove)),

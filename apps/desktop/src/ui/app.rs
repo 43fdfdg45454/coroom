@@ -690,6 +690,8 @@ pub struct Toast {
     pub text: String,
     /// Cuándo apareció.
     pub shown_at: Instant,
+    /// Cuándo empezó a irse (venció o se descartó): sale hacia la derecha y se pliega.
+    pub leaving_at: Option<Instant>,
 }
 
 /// Diálogo modal.
@@ -870,6 +872,8 @@ pub struct App {
     pub now: Instant,
     /// Lo que tardaron los últimos dibujos de la interfaz (la ventana los anota).
     pub ui_draws: super::pacing::DrawTimes,
+    /// Cuándo apareció el diálogo (o el diagnóstico) de encima, para su entrada.
+    pub overlay_since: Option<Instant>,
     /// Prueba local (`coroom probe` con ventana): solo el vídeo.
     pub probe: bool,
     /// Versión de la aplicación.
@@ -919,6 +923,7 @@ impl App {
             window_hidden: false,
             now,
             ui_draws: super::pacing::DrawTimes::default(),
+            overlay_since: None,
             probe: false,
             version: env!("CARGO_PKG_VERSION"),
             update: UpdateState::default(),
@@ -1013,10 +1018,10 @@ impl App {
 
     /// Si hay algo animándose (hay que dibujar a menudo).
     pub fn animating(&self) -> bool {
-        let quick = Duration::from_millis(260);
-        self.toasts
-            .iter()
-            .any(|toast| self.now.duration_since(toast.shown_at) < quick)
+        let enter = self.motion().duration(coroom_ui::motion::Token::Panel);
+        self.toasts.iter().any(|toast| {
+            toast.leaving_at.is_some() || self.now.duration_since(toast.shown_at) < enter
+        }) || self.overlay_shown() < 1.0
             || self.login.probe.is_checking()
             || self.guest.as_ref().is_some_and(guest::State::animating)
             || self.host.starting
@@ -1030,7 +1035,10 @@ impl App {
             next = Some(next.map_or(at, |next| next.min(at)));
         };
         for toast in &self.toasts {
-            consider(toast.shown_at + coroom_ui::tokens::motion::TOAST);
+            match toast.leaving_at {
+                Some(at) => consider(at + self.toast_exit()),
+                None => consider(toast.shown_at + coroom_ui::tokens::motion::TOAST),
+            }
         }
         if let Some(at) = self.update.next_check {
             consider(at);
@@ -1087,6 +1095,7 @@ impl App {
             tone,
             text: text.into(),
             shown_at: self.now,
+            leaving_at: None,
         });
         if self.toasts.len() > 3 {
             self.toasts.remove(0);
@@ -1095,12 +1104,58 @@ impl App {
 
     /// Reduce un mensaje.
     pub fn update(&mut self, message: Message) -> Vec<Effect> {
+        let had_overlay = self.overlay_open();
+        let effects = self.reduce(message);
+        match (had_overlay, self.overlay_open()) {
+            (false, true) => self.overlay_since = Some(self.now),
+            (_, false) => self.overlay_since = None,
+            _ => {}
+        }
+        effects
+    }
+
+    /// Si hay un diálogo (o el diagnóstico) encima de todo.
+    fn overlay_open(&self) -> bool {
+        self.dialog.is_some() || self.diagnostics.open
+    }
+
+    /// Lo que lleva de su entrada el diálogo de encima (0 a 1, con su curva).
+    fn overlay_shown(&self) -> f32 {
+        let Some(since) = self.overlay_since else {
+            return 1.0;
+        };
+        let token = coroom_ui::motion::Token::Panel;
+        let duration = self.motion().duration(token);
+        if duration.is_zero() {
+            return 1.0;
+        }
+        let t =
+            (self.now.duration_since(since).as_secs_f32() / duration.as_secs_f32()).clamp(0.0, 1.0);
+        if t >= 1.0 {
+            1.0
+        } else {
+            token.easing().value(t)
+        }
+    }
+
+    fn reduce(&mut self, message: Message) -> Vec<Effect> {
         match message {
             Message::Tick => {
                 let toast_life = coroom_ui::tokens::motion::TOAST;
                 let now = self.now;
-                self.toasts
-                    .retain(|toast| now.duration_since(toast.shown_at) < toast_life);
+                let exit = self.toast_exit();
+                for toast in &mut self.toasts {
+                    if toast.leaving_at.is_none()
+                        && now.duration_since(toast.shown_at) >= toast_life
+                    {
+                        toast.leaving_at = Some(now);
+                    }
+                }
+                self.toasts.retain(|toast| {
+                    toast
+                        .leaving_at
+                        .is_none_or(|at| now.duration_since(at) < exit)
+                });
                 if let Some(guest) = &mut self.guest {
                     guest.tick(now);
                 }
@@ -1148,7 +1203,13 @@ impl App {
             },
             Message::ConfirmDialog => self.confirm_dialog(),
             Message::DismissToast(id) => {
-                self.toasts.retain(|toast| toast.id != id);
+                let now = self.now;
+                if let Some(toast) = self.toasts.iter_mut().find(|toast| toast.id == id) {
+                    toast.leaving_at.get_or_insert(now);
+                }
+                if self.toast_exit().is_zero() {
+                    self.toasts.retain(|toast| toast.leaving_at.is_none());
+                }
                 Vec::new()
             }
             Message::Copy(text) => {
@@ -1640,19 +1701,9 @@ impl App {
         let toasts = self
             .toasts
             .iter()
-            .map(|toast| ui::toast(toast.tone, toast.text.as_str()))
+            .map(|toast| self.toast_view(toast))
             .collect();
-        let offset = self
-            .toasts
-            .last()
-            .map(|toast| {
-                let age = self.now.duration_since(toast.shown_at).as_secs_f32();
-                let t = (age / coroom_ui::tokens::motion::PANEL.as_secs_f32()).min(1.0);
-                // `ease-out`: rápido al principio, suave al llegar.
-                (1.0 - (1.0 - t) * (1.0 - t)) * -24.0 + 24.0
-            })
-            .unwrap_or(0.0);
-        let with_toasts = ui::with_toasts(content, toasts, offset);
+        let with_toasts = ui::with_toasts(content, toasts);
         // El diagnóstico va encima de cualquier pantalla; un diálogo, encima de todo.
         let (overlay, dismiss) = match &self.dialog {
             Some(dialog) => (Some(self.dialog_view(dialog)), Message::CloseDialog),
@@ -1662,7 +1713,45 @@ impl App {
             ),
             None => (None, Message::CloseDialog),
         };
-        ui::modal(with_toasts, overlay, dismiss)
+        let slide = self.motion().slide(coroom_ui::tokens::space::S);
+        ui::modal(with_toasts, overlay, dismiss, self.overlay_shown(), slide)
+    }
+
+    /// Un toast con su movimiento: entra desde abajo con un leve rebote, sale hacia la derecha y se
+    /// pliega mientras sale, así que los de arriba bajan deslizándose a su sitio.
+    fn toast_view<'a>(&self, toast: &'a Toast) -> Element<'a, Message> {
+        use coroom_ui::animate::{Collapse, Shift};
+        use coroom_ui::motion::{EXIT_EASING, Easing, Token};
+
+        let motion = self.motion();
+        let progress = |since: Instant, duration: Duration, easing: Easing| {
+            if duration.is_zero() {
+                return 1.0;
+            }
+            let t = (self.now.duration_since(since).as_secs_f32() / duration.as_secs_f32())
+                .clamp(0.0, 1.0);
+            if t >= 1.0 { 1.0 } else { easing.value(t) }
+        };
+        let entered = progress(
+            toast.shown_at,
+            motion.duration(Token::Panel),
+            Easing::EaseOutBack,
+        );
+        let left = toast
+            .leaving_at
+            .map_or(0.0, |at| progress(at, self.toast_exit(), EXIT_EASING));
+        let offset = iced_core::Vector::new(
+            motion.slide(coroom_ui::tokens::space::XL) * left,
+            motion.slide(coroom_ui::tokens::space::L) * (1.0 - entered),
+        );
+        let toast = container(ui::toast(toast.tone, toast.text.as_str()))
+            .padding(Padding::from([coroom_ui::tokens::space::XS / 2.0, 0.0]));
+        Shift::new(Collapse::new(toast, 1.0 - left), offset).into()
+    }
+
+    /// Lo que tarda un toast en irse.
+    fn toast_exit(&self) -> Duration {
+        self.motion().exit_duration(coroom_ui::motion::Token::Panel)
     }
 
     /// Cabecera y página; el menú de la cuenta, desplegado bajo la cabecera.
@@ -1739,6 +1828,42 @@ impl App {
         }
     }
 
+    /// La insignia del servidor ([`App::server_badge_text`]) con el RTT en una ranura de ancho
+    /// fijo («888 ms»): no cambia de ancho con cada medida. Un clic abre el diagnóstico donde se
+    /// pone en un botón.
+    pub fn server_badge<'a>(&self) -> Element<'a, Message> {
+        let tone = match self.server_status.online {
+            Some(false) => Tone::Error,
+            Some(true) => Tone::Success,
+            None => Tone::Neutral,
+        };
+        match (self.server_status.online, self.server_status.rtt_ms) {
+            (Some(false), _) | (_, None) => ui::status_badge(tone, self.server_badge_text()),
+            (_, Some(rtt)) => {
+                let host = self
+                    .account
+                    .as_ref()
+                    .map(AccountInfo::host)
+                    .unwrap_or_default();
+                // «host ·» en una línea y la cifra a la derecha en su ranura.
+                let widest = t!("app-rtt-ms", rtt = 888);
+                ui::status_badge_with(
+                    tone,
+                    row![
+                        ui::one_line(t!("app-host-separador", host = host), ui::badge_text),
+                        ui::figure_after(
+                            ui::badge_text,
+                            t!("app-rtt-ms", rtt = rtt.round() as u64),
+                            &[widest.as_str()],
+                        ),
+                    ]
+                    .spacing(4)
+                    .align_y(Alignment::Center),
+                )
+            }
+        }
+    }
+
     /// Cabecera: atrás y título (o la marca) a la izquierda; a la derecha la insignia del
     /// servidor, «En vivo» si se comparte desde otra página, Ajustes y la cuenta.
     fn headerbar(&self) -> Element<'_, Message> {
@@ -1765,12 +1890,7 @@ impl App {
                 }
             }
         }
-        let server_tone = match self.server_status.online {
-            Some(false) => Tone::Error,
-            Some(true) => Tone::Success,
-            None => Tone::Neutral,
-        };
-        let server = button(ui::status_badge(server_tone, self.server_badge_text()))
+        let server = button(self.server_badge())
             .padding(0)
             .class(coroom_ui::style::ButtonClass::Flat)
             .on_press(Message::Diagnostics(diagnostics::Msg::Open));
@@ -2229,7 +2349,23 @@ pub(crate) mod tests {
         assert!(app.next_tick().is_some());
         app.now += coroom_ui::tokens::motion::TOAST + Duration::from_millis(1);
         app.update(Message::Tick);
+        assert!(
+            app.toasts[0].leaving_at.is_some() && app.animating(),
+            "al vencer sale animado"
+        );
+        assert_eq!(app.next_tick(), Some(app.now + app.toast_exit()));
+        app.now += app.toast_exit();
+        app.update(Message::Tick);
         assert!(app.toasts.is_empty());
+        // Sin animaciones se va en el acto.
+        app.settings.appearance.motion = crate::ui::settings::MotionChoice::Reduced;
+        app.system.animation_factor = Some(0.0);
+        app.toast(Tone::Info, "chau");
+        app.now += coroom_ui::tokens::motion::TOAST;
+        app.update(Message::Tick);
+        assert!(app.toasts.is_empty(), "{:?}", app.toasts);
+        app.system.animation_factor = None;
+        app.settings.appearance.motion = crate::ui::settings::MotionChoice::System;
         for n in 0..5 {
             app.toast(Tone::Info, format!("{n}"));
         }

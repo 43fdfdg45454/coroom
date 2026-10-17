@@ -369,6 +369,15 @@ struct Metric {
     label: &'static str,
     detail: Option<String>,
     value: String,
+    /// Los valores más anchos que puede tomar `value`: la columna de valores tiene ese ancho fijo
+    /// y la etiqueta de al lado no reparte sus líneas de otra forma con cada medida. Vacío en los
+    /// que no cambian solos.
+    widest: Vec<String>,
+}
+
+/// Las muestras de una ranura de ancho fijo, para [`Metric::widest`].
+fn widest(samples: &[&str]) -> Vec<String> {
+    samples.iter().map(|sample| (*sample).to_owned()).collect()
 }
 
 fn ok_line(title: String, explanation: String, result: &'static str) -> Line {
@@ -614,6 +623,7 @@ fn probe_metric(probe: Option<Probe>, kbps: Option<u32>, detail: &'static str) -
         label: t!("diagnostics-sonda"),
         detail: Some(detail),
         value: kbps.map_or_else(|| "—".to_owned(), |kbps| stats::kbps(f64::from(kbps))),
+        widest: widest(&stats::KBPS_WIDEST),
     }
 }
 
@@ -622,6 +632,7 @@ fn mtu_metric() -> Metric {
         label: t!("diagnostics-mtu"),
         detail: Some(t!("diagnostics-mtu-detalle").to_owned()),
         value: "—".to_owned(),
+        widest: Vec::new(),
     }
 }
 
@@ -641,11 +652,13 @@ fn guest_metrics(app: &App) -> Vec<Metric> {
             label: t!("diagnostics-rtt-anfitrion"),
             detail: None,
             value: guest_rtt(app).map_or_else(|| "—".to_owned(), stats::ms),
+            widest: widest(&stats::MS_WIDEST),
         },
         Metric {
             label: t!("diagnostics-perdida"),
             detail: Some(t!("diagnostics-perdida-detalle").to_owned()),
             value: link.map_or_else(|| "—".to_owned(), |link| stats::percent(link.loss_percent)),
+            widest: widest(&stats::PERCENT_WIDEST),
         },
         mtu_metric(),
         probe_metric(side.route.probe, None, t!("diagnostics-sonda-hacia-ti")),
@@ -660,6 +673,11 @@ fn guest_metrics(app: &App) -> Vec<Metric> {
                 ),
                 _ => "—".to_owned(),
             },
+            widest: vec![t!(
+                "diagnostics-bitrate-valor",
+                target = "888,8",
+                real = "888,8"
+            )],
         },
     ]
 }
@@ -692,6 +710,7 @@ fn host_guest_metrics(status: &GuestStatus, route: Option<&Route>) -> Vec<Metric
             detail: (status.path == Some(Path::Relayed))
                 .then(|| t!("diagnostics-rtt-tramo-relay").to_owned()),
             value: status.rtt_ms.map_or_else(|| "—".to_owned(), stats::ms),
+            widest: widest(&stats::MS_WIDEST),
         },
         mtu_metric(),
         probe_metric(
@@ -705,11 +724,13 @@ fn host_guest_metrics(status: &GuestStatus, route: Option<&Route>) -> Vec<Metric
             value: status
                 .target_kbps
                 .map_or_else(|| "—".to_owned(), |kbps| stats::kbps(f64::from(kbps))),
+            widest: widest(&stats::KBPS_WIDEST),
         },
         Metric {
             label: t!("diagnostics-entrada"),
             detail: Some(t!("diagnostics-entrada-detalle").to_owned()),
             value: input_value(Some(&status.input)),
+            widest: widest(&["88,8 ms / 88,8 ms", "888 ms / 888 ms"]),
         },
     ]
 }
@@ -1219,10 +1240,14 @@ fn metric_view<'a>(metric: Metric) -> Element<'a, Message> {
         texts = texts.push(ui::caption(detail).wrapping(Wrapping::WordOrGlyph));
     }
     container(
-        row![
-            texts,
-            ui::mono(metric.value, type_size::BODY).wrapping(Wrapping::None)
-        ]
+        row![texts, {
+            let widest: Vec<&str> = metric.widest.iter().map(String::as_str).collect();
+            ui::figure(
+                |value: String| ui::mono(value, type_size::BODY),
+                metric.value,
+                &widest,
+            )
+        }]
         .spacing(gap::S)
         .align_y(Alignment::Center),
     )
@@ -1234,9 +1259,10 @@ fn metric_view<'a>(metric: Metric) -> Element<'a, Message> {
 fn tried_detail(app: &App, route: &Route) -> String {
     let timeout = PUNCH_TIMEOUT.as_secs();
     match route.tried_at {
+        // Redondeado («ahora mismo», «hace 2 min»): junto al título no cambia cada segundo.
         Some(at) => t!(
             "diagnostics-candidatos-detalle",
-            secs = app.now.saturating_duration_since(at).as_secs(),
+            ago = super::settings::ago_secs(app.now.saturating_duration_since(at).as_secs()),
             timeout = timeout
         ),
         None => t!(
@@ -1644,16 +1670,19 @@ fn lobby_body<'a>(app: &App) -> Vec<Element<'a, Message>> {
             label: t!("diagnostics-servidor"),
             detail: None,
             value: server_host(app),
+            widest: Vec::new(),
         }),
         metric_view(Metric {
             label: t!("diagnostics-servidor-estado"),
             detail: None,
             value: server_state(app),
+            widest: Vec::new(),
         }),
         metric_view(Metric {
             label: t!("diagnostics-servidor-relay"),
             detail: None,
             value: relay.to_owned(),
+            widest: Vec::new(),
         }),
     ]);
     vec![
@@ -1710,14 +1739,7 @@ fn header_badge<'a>(app: &App, side: Side) -> Element<'a, Message> {
             };
             ui::status_badge(tone, text)
         }
-        Side::Lobby => {
-            let tone = match app.server_status.online {
-                Some(false) => Tone::Error,
-                Some(true) => Tone::Success,
-                None => Tone::Neutral,
-            };
-            ui::status_badge(tone, app.server_badge_text())
-        }
+        Side::Lobby => app.server_badge(),
     }
 }
 

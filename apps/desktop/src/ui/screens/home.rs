@@ -29,6 +29,7 @@ use crate::ui::app::{
 use crate::ui::avatars;
 use crate::ui::screens::friends::{self, Msg as FriendsMsg};
 use crate::ui::screens::guest;
+use crate::ui::stats;
 
 /// Lo que dura una invitación en Inicio: pasado ese tiempo desaparece sola.
 pub const INVITATION_TTL: Duration = Duration::from_secs(60);
@@ -344,22 +345,50 @@ fn on_friends(msg: FriendsMsg) -> Message {
 }
 
 /// Dibuja la página.
-pub fn view(app: &App) -> Element<'_, Message> {
-    let mut page = Column::new().spacing(space::M);
-    for notice in notices(app) {
-        page = page.push(notice);
-    }
-    page = page.push(ui::equal_height_row(
-        |real| vec![share_card(app, real), join_card(app, real)],
-        space::M,
-    ));
+pub fn view<'a>(app: &'a App) -> Element<'a, Message> {
+    // Los avisos y las invitaciones van cada uno en un bloque que está siempre (vacío si no hay),
+    // con el espacio que los separa dentro: lo de después (el campo del código, los amigos) no
+    // cambia de posición entre los hijos y no pierde el foco ni lo escrito cuando llegan o se van.
+    let spaced =
+        |blocks: Vec<Element<'a, Message>>, padding: Padding| -> Option<Element<'a, Message>> {
+            (!blocks.is_empty()).then(|| {
+                container(Column::with_children(blocks).spacing(space::M))
+                    .padding(padding)
+                    .into()
+            })
+        };
+    let notices = spaced(
+        notices(app),
+        Padding {
+            bottom: space::M,
+            ..Padding::ZERO
+        },
+    );
     let mut invitations: Vec<&Invitation> = app.invitations.iter().collect();
     invitations.sort_by_key(|invitation| std::cmp::Reverse(received_at(app, invitation)));
-    for invitation in invitations.into_iter().take(INVITATIONS_SHOWN) {
-        page = page.push(invitation_card(app, invitation));
-    }
-    page = page.push(ui::gap(space::XXS));
-    page = page.push(friends_section(app));
+    let invitations = spaced(
+        invitations
+            .into_iter()
+            .take(INVITATIONS_SHOWN)
+            .map(|invitation| invitation_card(app, invitation))
+            .collect(),
+        Padding {
+            top: space::M,
+            ..Padding::ZERO
+        },
+    );
+    let page = column![
+        ui::slot(notices),
+        ui::equal_height_row(
+            |real| vec![share_card(app, real), join_card(app, real)],
+            space::M,
+        ),
+        ui::slot(invitations),
+        container(friends_section(app)).padding(Padding {
+            top: space::M + space::XXS + space::M,
+            ..Padding::ZERO
+        }),
+    ];
     ui::page("home", page)
 }
 
@@ -585,13 +614,14 @@ fn invitation_card<'a>(app: &'a App, invitation: &'a Invitation) -> Element<'a, 
             column![
                 ui::strong(t!("home-invite-title", name = invitation.from_name))
                     .wrapping(Wrapping::WordOrGlyph),
-                ui::secondary(t!(
-                    "home-invite-detail",
-                    code = invitation.code,
-                    ago = ago.as_secs(),
-                    left = left
-                ))
-                .wrapping(Wrapping::WordOrGlyph)
+                // La cuenta atrás en m:ss en una ranura de ancho fijo: cambia cada segundo sin
+                // mover el texto ni repartir las líneas.
+                row![
+                    ui::secondary(t!("home-invite-detail", code = invitation.code))
+                        .wrapping(Wrapping::None),
+                    ui::figure(ui::secondary, stats::clock(left), &[stats::CLOCK_WIDEST]),
+                ]
+                .spacing(space::XXS)
             ]
             .spacing(2)
             .width(Length::Fill),
@@ -610,7 +640,7 @@ fn invitation_card<'a>(app: &'a App, invitation: &'a Invitation) -> Element<'a, 
     .into()
 }
 
-/// «3 conectados · actualizado hace 2 s».
+/// «3 conectados · actualizado ahora mismo» (redondeado: no cambia cada segundo).
 fn friends_summary(app: &App, friends: &Friends) -> String {
     let online = friends.friends.iter().filter(|f| f.online).count();
     let count = match online {
@@ -622,16 +652,11 @@ fn friends_summary(app: &App, friends: &Friends) -> String {
         return count;
     };
     let elapsed = app.now.saturating_duration_since(at).as_secs();
-    let updated = match elapsed {
-        0 => t!("home-updated-now").to_owned(),
-        1..60 => t!("home-updated-seconds", seconds = elapsed),
-        60..3600 => t!("home-updated-minutes", minutes = elapsed / 60),
-        _ => t!("home-updated-hours", hours = elapsed / 3600),
-    };
+    let updated = t!("home-updated", ago = super::settings::ago_secs(elapsed));
     format!("{count} · {updated}")
 }
 
-fn friends_section(app: &App) -> Element<'_, Message> {
+fn friends_section<'a>(app: &'a App) -> Element<'a, Message> {
     let state = &app.friends_page;
     let mut title = row![ui::heading(t!("home-friends"))]
         .spacing(space::XS)
@@ -654,26 +679,28 @@ fn friends_section(app: &App) -> Element<'_, Message> {
     ]
     .spacing(space::S)
     .align_y(Alignment::Center);
-    let mut section = column![header].spacing(space::S);
-    if state.adding {
-        section = section.push(add_friend(app));
-    }
-    match &app.friends {
-        Load::Idle | Load::Loading => {
-            section = section.push(ui::skeleton(t!("home-loading"), 3));
-        }
-        Load::Failed(err) => {
-            section = section.push(ui::card(ui::error_state(
-                t!("home-load-failed"),
-                err.as_str(),
-                Some((t!("home-retry"), on_friends(FriendsMsg::Reload))),
-            )));
-        }
+    // El campo de agregar y las solicitudes tienen su sitio aunque falten (con el espacio de
+    // encima dentro): una solicitud que llega no cambia de posición la lista ni sus menús.
+    let below = |content: Element<'a, Message>| -> Element<'a, Message> {
+        container(content)
+            .padding(Padding {
+                top: space::S,
+                ..Padding::ZERO
+            })
+            .into()
+    };
+    let add = state.adding.then(|| below(add_friend(app)));
+    let mut pending = None;
+    let body = match &app.friends {
+        Load::Idle | Load::Loading => ui::skeleton(t!("home-loading"), 3),
+        Load::Failed(err) => ui::card(ui::error_state(
+            t!("home-load-failed"),
+            err.as_str(),
+            Some((t!("home-retry"), on_friends(FriendsMsg::Reload))),
+        )),
         Load::Loaded(friends) => {
-            if let Some(requests) = requests(app, friends) {
-                section = section.push(requests);
-            }
-            section = section.push(if friends.friends.is_empty() {
+            pending = requests(app, friends).map(below);
+            if friends.friends.is_empty() {
                 ui::card(ui::empty_state(
                     Icon::Users,
                     t!("home-empty-title"),
@@ -695,10 +722,10 @@ fn friends_section(app: &App) -> Element<'_, Message> {
                         .map(|friend| friend_row(app, friend))
                         .collect(),
                 )
-            });
+            }
         }
-    }
-    section.into()
+    };
+    column![header, ui::slot(add), ui::slot(pending), below(body)].into()
 }
 
 /// El campo desplegado de «Agregar amigo».

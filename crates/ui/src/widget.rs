@@ -8,10 +8,11 @@ use iced_core::alignment::{Horizontal, Vertical};
 use iced_core::text::Wrapping;
 use iced_core::{Alignment, Length, Padding, Pixels};
 use iced_widget::{
-    Column, Row, Space, button, center, column, container, mouse_area, opaque, pick_list,
-    progress_bar, row, rule, scrollable, space, stack, text, text_input, toggler, tooltip,
+    Column, Row, Space, center, column, container, mouse_area, opaque, pick_list, progress_bar,
+    row, rule, scrollable, space, stack, text, text_input, tooltip,
 };
 
+use crate::animate::button;
 use crate::font::{MONO, SEMIBOLD, UI};
 use crate::icon::{Icon, icon, icon_with};
 use crate::release::release_to_pick;
@@ -25,8 +26,8 @@ use crate::{Element, Renderer, Theme};
 /// Texto con el tema de coroom.
 pub type Text<'a> = iced_widget::Text<'a, Theme, Renderer>;
 
-/// Botón con el tema de coroom.
-pub type Button<'a, M> = iced_widget::Button<'a, M, Theme, Renderer>;
+/// Botón con el tema de coroom, animado ([`crate::animate`]).
+pub type Button<'a, M> = crate::animate::AnimatedButton<'a, M>;
 
 // --- Tipografía ---------------------------------------------------------------------------------
 
@@ -88,6 +89,8 @@ pub enum Kind {
     Destructive,
     /// Plano destructivo.
     DestructiveFlat,
+    /// Destructivo suave (fondo rojo tenue): lo peligroso que no es cerrar ni salir.
+    DestructiveSoft,
 }
 
 impl Kind {
@@ -99,6 +102,7 @@ impl Kind {
             Kind::Link => ButtonClass::Link,
             Kind::Destructive => ButtonClass::Destructive,
             Kind::DestructiveFlat => ButtonClass::DestructiveFlat,
+            Kind::DestructiveSoft => ButtonClass::DestructiveSoft,
         }
     }
 
@@ -107,7 +111,7 @@ impl Kind {
             Kind::Primary => SvgClass::OnAccent,
             Kind::Destructive => SvgClass::OnDestructive,
             Kind::Link => SvgClass::Accent,
-            Kind::DestructiveFlat => SvgClass::Tone(Tone::Error),
+            Kind::DestructiveFlat | Kind::DestructiveSoft => SvgClass::Tone(Tone::Error),
             Kind::Normal | Kind::Flat => SvgClass::Text,
         }
     }
@@ -177,6 +181,7 @@ pub fn icon_button<'a, M: Clone + 'a>(
         .height(Length::Fixed(size::CONTROL))
         .padding(0)
         .class(ButtonClass::Flat)
+        .press_scale(true)
         .on_press_maybe(on_press);
     with_tooltip(control, description)
 }
@@ -305,12 +310,18 @@ impl<'a, M: Clone + 'a> From<Field<'a, M>> for Element<'a, M> {
         if let Some(id) = field.id {
             input = input.id(id);
         }
+        let error = field.error.map(|error| {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            error.hash(&mut hasher);
+            hasher.finish()
+        });
         let mut out = column![
             text(field.label)
                 .size(type_size::SECONDARY)
                 .font(SEMIBOLD)
                 .class(TextClass::Secondary),
-            input
+            crate::animate::Shake::new(input, error)
         ]
         .spacing(6);
         if let Some(error) = field.error {
@@ -336,7 +347,7 @@ pub fn switch<'a, M: Clone + 'a>(
     value: bool,
     on_toggle: Option<impl Fn(bool) -> M + 'a>,
 ) -> Element<'a, M> {
-    toggler(value).size(22).on_toggle_maybe(on_toggle).into()
+    crate::animate::Switch::new(value, on_toggle, 22.0).into()
 }
 
 /// Deslizador de coroom.
@@ -487,8 +498,10 @@ pub fn ellipsize(text: &str, max: usize) -> std::borrow::Cow<'_, str> {
     format!("{}…", kept.trim_end()).into()
 }
 
-/// Selector segmentado: `(texto, mensaje, elegido)` por opción.
+/// Selector segmentado: `(texto, mensaje, elegido)` por opción. El fondo del elegido se desliza
+/// hasta el nuevo ([`crate::animate::Segments`]).
 pub fn segmented<'a, M: Clone + 'a>(options: Vec<(String, M, bool)>) -> Element<'a, M> {
+    let chosen = options.iter().position(|(_, _, selected)| *selected);
     let buttons = options.into_iter().map(|(label, message, selected)| {
         button(
             text(label)
@@ -502,10 +515,14 @@ pub fn segmented<'a, M: Clone + 'a>(options: Vec<(String, M, bool)>) -> Element<
         .on_press(message)
         .into()
     });
-    container(Row::with_children(buttons).spacing(2))
-        .padding(3)
-        .class(ContainerClass::Segmented)
-        .into()
+    container(crate::animate::Segments::new(
+        Row::with_children(buttons).spacing(2),
+        chosen,
+        ButtonClass::SegmentThumb,
+    ))
+    .padding(3)
+    .class(ContainerClass::Segmented)
+    .into()
 }
 
 // --- Listas ---------------------------------------------------------------------------------------
@@ -584,21 +601,44 @@ pub fn boxed_list<'a, M: 'a>(rows: Vec<Element<'a, M>>) -> Element<'a, M> {
 
 /// Insignia de estado: punto del tono y texto.
 pub fn status_badge<'a, M: 'a>(tone: Tone, label: impl text::IntoFragment<'a>) -> Element<'a, M> {
-    container(
-        row![
-            dot(tone),
-            text(label).size(type_size::CAPTION).font(SEMIBOLD)
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center),
+    // En una línea: si no cabe, «…» y el texto entero al pasar el ratón.
+    status_badge_with(
+        tone,
+        one_line(label.into_fragment().into_owned(), badge_text),
     )
-    .padding(Padding::from([3.0, 10.0]))
-    .class(ContainerClass::Badge(tone))
+}
+
+/// [`status_badge`] con lo que se quiera tras el punto (un texto y una cifra de ancho fijo, por
+/// ejemplo, escritos con [`badge_text`]).
+pub fn status_badge_with<'a, M: 'a>(
+    tone: Tone,
+    content: impl Into<Element<'a, M>>,
+) -> Element<'a, M> {
+    crate::animate::ToneFade::new(
+        container(
+            row![dot_shape(tone), content.into()]
+                .spacing(6)
+                .align_y(Alignment::Center),
+        )
+        .padding(Padding::from([3.0, 10.0]))
+        .class(ContainerClass::Badge(tone)),
+        tone,
+    )
     .into()
 }
 
-/// Punto de estado.
+/// El texto de las insignias de estado (12/600).
+pub fn badge_text<'a>(content: String) -> Text<'a> {
+    text(content).size(type_size::CAPTION).font(SEMIBOLD)
+}
+
+/// Punto de estado (cambia de tono con un fundido).
 pub fn dot<'a, M: 'a>(tone: Tone) -> Element<'a, M> {
+    crate::animate::ToneFade::new(dot_shape(tone), tone).into()
+}
+
+/// El punto sin fundido propio (dentro de algo que ya se funde).
+fn dot_shape<'a, M: 'a>(tone: Tone) -> Element<'a, M> {
     container(Space::new())
         .width(Length::Fixed(size::DOT))
         .height(Length::Fixed(size::DOT))
@@ -668,30 +708,28 @@ pub fn toast<'a, M: 'a>(tone: Tone, message: impl text::IntoFragment<'a>) -> Ele
     .into()
 }
 
-/// Los toasts encima de `base`, abajo en el centro; `offset` (0 = en su sitio) los desplaza hacia
-/// abajo durante la animación de entrada.
+/// Los toasts encima de `base`, abajo a la derecha, el más nuevo abajo. Cada uno viene ya con su
+/// movimiento ([`crate::animate`]: entra desde abajo y sale hacia la derecha plegándose, y los
+/// demás se deslizan a su sitio).
 pub fn with_toasts<'a, M: 'a>(
     base: impl Into<Element<'a, M>>,
     toasts: Vec<Element<'a, M>>,
-    offset: f32,
 ) -> Element<'a, M> {
     // Siempre la misma forma (pila de dos capas), con o sin toasts: si la raíz cambiara de tipo,
     // iced tiraría el estado de toda la interfaz (el desplazamiento de la página, el foco) cada
     // vez que aparece o se va un toast.
-    let stacked = Column::with_children(toasts)
-        .spacing(gap::XS)
-        .align_x(Alignment::Center);
+    let stacked = Column::with_children(toasts).align_x(Alignment::End);
     stack![
         base.into(),
         container(stacked)
             .width(Length::Fill)
             .height(Length::Fill)
-            .align_x(Horizontal::Center)
+            .align_x(Horizontal::Right)
             .align_y(Vertical::Bottom)
             .padding(Padding {
                 top: 0.0,
-                right: gap::M,
-                bottom: (gap::L - offset).max(0.0),
+                right: gap::L,
+                bottom: gap::L - gap::XS,
                 left: gap::M,
             })
     ]
@@ -724,20 +762,27 @@ pub fn dialog<'a, M: 'a>(
 }
 
 /// `base` con `dialog` encima, sobre un velo; pulsar fuera del diálogo envía `on_dismiss` (y
-/// `Esc` lo hace la aplicación).
+/// `Esc` lo hace la aplicación). `shown` (0 a 1, ya con su curva) es lo que lleva de su entrada:
+/// el velo se oscurece y el diálogo sube hasta su sitio desde `slide` px más abajo (el texto no se
+/// escala: cambiaría el rasterizado de la letra en cada cuadro).
 pub fn modal<'a, M: Clone + 'a>(
     base: impl Into<Element<'a, M>>,
     dialog: Option<Element<'a, M>>,
     on_dismiss: M,
+    shown: f32,
+    slide: f32,
 ) -> Element<'a, M> {
     // Misma forma con o sin diálogo (ver [`with_toasts`]): abrir o cerrar el diagnóstico no debe
     // devolver la página al principio.
     let overlay: Element<'a, M> = match dialog {
         Some(dialog) => opaque(
             mouse_area(
-                center(opaque(dialog))
-                    .padding(gap::L)
-                    .class(ContainerClass::Scrim),
+                center(opaque(crate::animate::Shift::new(
+                    dialog,
+                    iced_core::Vector::new(0.0, slide * (1.0 - shown)),
+                )))
+                .padding(gap::L)
+                .class(ContainerClass::Scrim(shown)),
             )
             .on_press(on_dismiss),
         ),
@@ -1148,6 +1193,92 @@ pub fn gap<'a, M: 'a>(pixels: f32) -> Element<'a, M> {
 /// Espacio que empuja lo siguiente al final de una fila.
 pub fn fill<'a, M: 'a>() -> Element<'a, M> {
     space::horizontal().into()
+}
+
+// --- Ranuras --------------------------------------------------------------------------------------
+
+/// Hijo que puede no estar: `content` o, sin él, un hueco que guarda su posición entre los hijos
+/// (un `Space` que se encoge, no uno de 0×0, que filas, columnas y pilas descartan). Así lo que va
+/// después no cambia de índice y conserva su estado (scroll, foco, arrastre). No reserva tamaño:
+/// para eso, [`reserved`] o [`reserve`]. En una fila o columna con `spacing`, el hueco también
+/// lleva el espaciado; donde moleste, que el espacio lo ponga lo mostrado (un `padding`).
+pub fn slot<'a, M: 'a>(content: Option<Element<'a, M>>) -> Element<'a, M> {
+    content.unwrap_or_else(|| Space::new().into())
+}
+
+/// Ranura de tamaño fijo, `width` × `height`, con `content` centrado o vacía: mostrar u ocultar
+/// un icono o un botón de tamaño conocido no mueve lo de alrededor.
+pub fn reserved<'a, M: 'a>(
+    width: f32,
+    height: f32,
+    content: Option<Element<'a, M>>,
+) -> Element<'a, M> {
+    container(slot(content))
+        .width(Length::Fixed(width))
+        .height(Length::Fixed(height))
+        .center_x(Length::Fixed(width))
+        .center_y(Length::Fixed(height))
+        .into()
+}
+
+/// Ranura del tamaño de la mayor de `samples` (cada variante de una insignia, por ejemplo), con
+/// `content` o vacía: la mide el renderizador al maquetar, con la letra de verdad
+/// ([`crate::slot::Reserve`]). Alineada a la izquierda; `.align_x` para otra cosa.
+pub fn reserve<'a, M: 'a>(
+    samples: impl IntoIterator<Item = Element<'a, M>>,
+    content: Option<Element<'a, M>>,
+) -> crate::slot::Reserve<'a, M> {
+    crate::slot::Reserve::new(samples, content)
+}
+
+/// Número de ancho fijo: `value` escrito con `style`, alineado a la derecha en una ranura del
+/// ancho de la más ancha de `widest` escrita igual («888 ms», «88,8 Mbit/s»). El ancho no se
+/// calcula con métricas supuestas de la letra: el renderizador maqueta cada muestra con el mismo
+/// estilo y la ranura toma la mayor ([`reserve`]); `iced` no permite pedir cifras tabulares, así
+/// que con letra proporcional conviene que las muestras lleven la cifra más ancha (8) en cada
+/// posición. Si `value` no cabe (no debería), la ranura crece hasta él.
+pub fn figure<'a, M: 'a>(
+    style: impl Fn(String) -> Text<'a>,
+    value: impl Into<String>,
+    widest: &[&str],
+) -> Element<'a, M> {
+    figure_aligned(style, value, widest, Horizontal::Right)
+}
+
+/// [`figure`] alineada a la izquierda: para una cifra que sigue a un texto en la misma línea
+/// («servidor · 12 ms»), donde el hueco de la ranura queda al final y no en medio.
+pub fn figure_after<'a, M: 'a>(
+    style: impl Fn(String) -> Text<'a>,
+    value: impl Into<String>,
+    widest: &[&str],
+) -> Element<'a, M> {
+    figure_aligned(style, value, widest, Horizontal::Left)
+}
+
+fn figure_aligned<'a, M: 'a>(
+    style: impl Fn(String) -> Text<'a>,
+    value: impl Into<String>,
+    widest: &[&str],
+    align: Horizontal,
+) -> Element<'a, M> {
+    let line =
+        |content: String| -> Element<'a, M> { style(content).wrapping(Wrapping::None).into() };
+    reserve(
+        widest.iter().map(|sample| line((*sample).to_owned())),
+        Some(line(value.into())),
+    )
+    .align_x(align)
+    .into()
+}
+
+/// Texto en una línea escrito con `style`: si no cabe en lo que le dejan, se acorta con «…»
+/// (medido con el renderizador) y enseña `full` al pasar el ratón ([`crate::slot::OneLine`]).
+/// Para píldoras, etiquetas y líneas de datos que no deben cortar línea ni cambiar de alto.
+pub fn one_line<'a, M: 'a>(
+    full: impl Into<String>,
+    style: impl Fn(String) -> Text<'a> + 'a,
+) -> crate::slot::OneLine<'a, M> {
+    crate::slot::OneLine::new(full, style)
 }
 
 /// Tamaño de texto en [`Pixels`] (atajo).

@@ -1435,20 +1435,32 @@ fn connecting<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     if let Some(reconnecting) = &state.reconnecting {
         content = content.push(reconnect_banner(app, reconnecting));
     }
-    let mut cards = Column::new()
-        .spacing(space::M)
-        .max_width(size::NARROW + 80.0)
-        .push(ui::card(content));
-    if let Some(estimate) = &state.estimate {
-        cards = cards.push(quality_card(estimate));
-    }
+    // La tarjeta de la calidad tiene su sitio aunque falte (con el espacio de encima dentro, para
+    // que el hueco no lo sume): los botones de después no cambian de posición entre los hijos.
+    let above = |content: Element<'a, Message>| -> Element<'a, Message> {
+        container(content)
+            .padding(Padding {
+                top: space::M,
+                ..Padding::ZERO
+            })
+            .into()
+    };
     let mut actions = row![ui::flat(t!("room-cancelar"), Some(on(Msg::Cancel)))].spacing(space::XS);
     if state.feed.has_frame() {
         actions = actions
             .push(ui::fill())
             .push(ui::primary(t!("room-ver-ya"), Some(on(Msg::Continue))));
     }
-    cards = cards.push(actions);
+    let cards = Column::new()
+        .max_width(size::NARROW + 80.0)
+        .push(ui::card(content))
+        .push(ui::slot(
+            state
+                .estimate
+                .as_ref()
+                .map(|estimate| above(quality_card(estimate))),
+        ))
+        .push(above(actions.into()));
     let body: Element<'a, Message> = scrollable(
         container(cards)
             .padding(Padding::from([space::XL, space::L]))
@@ -1457,34 +1469,32 @@ fn connecting<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     .height(Length::Fill)
     .width(Length::Fill)
     .into();
-    let mut main = row![body].height(Length::Fill);
-    if state.panel == Some(Tab::Chat) {
-        main = main.push(
-            container(chat::panel(app, Surface::Window))
-                .width(Length::Fixed(size::STATS_PANEL))
-                .height(Length::Fill)
-                .padding(Padding {
-                    top: space::S,
-                    right: space::S,
-                    bottom: space::S,
-                    left: 0.0,
-                }),
-        );
-    }
+    let panel = (state.panel == Some(Tab::Chat)).then(|| {
+        container(chat::panel(app, Surface::Window))
+            .width(Length::Fixed(size::STATS_PANEL))
+            .height(Length::Fill)
+            .padding(Padding {
+                top: space::S,
+                right: space::S,
+                bottom: space::S,
+                left: 0.0,
+            })
+            .into()
+    });
+    let main = row![body, ui::slot(panel)].height(Length::Fill);
     let page = column![waiting_header(app, state), main].height(Length::Fill);
-    match chat::bubbles(app) {
-        Some(bubbles) => stack![
-            page,
-            container(bubbles)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(Horizontal::Right)
-                .align_y(Vertical::Bottom)
-                .padding(space::S)
-        ]
-        .into(),
-        None => page.into(),
-    }
+    // La capa de las burbujas está siempre (vacía con el chat abierto o sin mensajes): si la pila
+    // apareciera solo con un mensaje, los pasos y el chat volverían arriba.
+    let bubbles = chat::bubbles(app).map(|bubbles| {
+        container(bubbles)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Horizontal::Right)
+            .align_y(Vertical::Bottom)
+            .padding(space::S)
+            .into()
+    });
+    stack![page, ui::slot(bubbles)].into()
 }
 
 fn reconnect_banner<'a>(app: &'a App, reconnecting: &'a Reconnecting) -> Element<'a, Message> {
@@ -1563,21 +1573,48 @@ fn level_badge<'a>(state: &State, dark: &Palette) -> Element<'a, Message> {
         _ => (Tone::Neutral, t!("room-midiendo-corto").to_owned()),
     };
     // Sobre la barra (siempre oscura), con los colores de la paleta oscura en los dos modos.
-    container(
-        row![
-            ui::dot(tone),
-            text(label)
-                .size(type_size::CAPTION)
-                .font(coroom_ui::font::SEMIBOLD)
-                .class(TextClass::Custom(dark.tone(tone).text.color()))
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center),
-    )
-    .padding(Padding::from([3.0, 10.0]))
-    .class(ContainerClass::OverlayBadge(tone))
-    .into()
+    let badge = |tone: Tone, label: String| -> Element<'a, Message> {
+        container(
+            row![
+                ui::dot(tone),
+                text(label)
+                    .size(type_size::CAPTION)
+                    .font(coroom_ui::font::SEMIBOLD)
+                    .class(TextClass::Custom(dark.tone(tone).text.color()))
+                    .wrapping(Wrapping::None)
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        )
+        .padding(Padding::from([3.0, 10.0]))
+        .class(ContainerClass::OverlayBadge(tone))
+        .into()
+    };
+    // Con el ancho de la variante más ancha (cada nivel con «888 ms», «Midiendo», «Reconectando»):
+    // el título de al lado no se mueve cuando cambian la cifra o el nivel.
+    let samples = LEVELS
+        .iter()
+        .map(|level| {
+            badge(
+                quality_tone(*level),
+                t!("room-nivel-ms", level = level.label(), value = "888"),
+            )
+        })
+        .chain([
+            badge(Tone::Neutral, t!("room-reconectando").to_owned()),
+            badge(Tone::Neutral, t!("room-midiendo-corto").to_owned()),
+        ])
+        .collect::<Vec<_>>();
+    ui::reserve(samples, Some(badge(tone, label))).into()
 }
+
+/// Los niveles de calidad, para medir las ranuras de sus insignias.
+const LEVELS: [QualityLevel; 4] = [
+    QualityLevel::Excellent,
+    QualityLevel::Good,
+    QualityLevel::Acceptable,
+    QualityLevel::Poor,
+];
 
 /// «Directa · AV1 · 1440p60 · 18,4 Mbit/s».
 fn bar_facts(state: &State) -> String {
@@ -1626,9 +1663,14 @@ fn top_bar<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     let game_muted = stats_now.is_some_and(|s| s.game_muted);
     let allowed = stats_now.map(|s| s.allowed).unwrap_or_default();
     let keys = &app.settings.input.shortcuts;
+    // Los botones que dependen de un permiso (la voz, el teclado y el ratón) tienen su sitio
+    // aunque falten: conceder o quitar el permiso no corre los demás.
+    let permitted = |allowed: bool, control: &dyn Fn() -> Element<'a, Message>| {
+        ui::reserved(size::CONTROL, size::CONTROL, allowed.then(control))
+    };
     let mut buttons = row![].spacing(space::XXS).align_y(Alignment::Center);
-    if voice {
-        buttons = buttons.push(bar_button(
+    buttons = buttons.push(permitted(voice, &|| {
+        bar_button(
             if mic_muted { Icon::MicOff } else { Icon::Mic },
             if mic_muted {
                 t!("room-activar-el-microfono", key = keys.mic)
@@ -1637,8 +1679,8 @@ fn top_bar<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
             },
             mic_muted,
             on(Msg::ToggleMic),
-        ));
-    }
+        )
+    }));
     buttons = buttons.push(bar_button(
         if game_muted {
             Icon::VolumeOff
@@ -1653,14 +1695,14 @@ fn top_bar<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         game_muted,
         on(Msg::ToggleGame),
     ));
-    if allowed.keyboard_mouse {
-        buttons = buttons.push(bar_button(
+    buttons = buttons.push(permitted(allowed.keyboard_mouse, &|| {
+        bar_button(
             Icon::Pointer,
             t!("room-modo-inmersivo", key = keys.immersive),
             state.immersive,
             on(Msg::ToggleImmersive),
-        ));
-    }
+        )
+    }));
     buttons = buttons.push(chat::with_unread(
         bar_button(
             Icon::Chat,
@@ -1886,12 +1928,26 @@ fn pill_view<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     if pill.reconnecting {
         lead = lead.push(icon_with(Icon::Refresh, 14.0, SvgClass::Overlay));
     }
-    lead = lead.push(strong(pill.lead.clone()));
+    // Las cifras («48 ms», «RTT 120 ms», «5 s») en ranuras de ancho fijo: la píldora no cambia de
+    // ancho a cada medida. Un texto más largo que la muestra («Midiendo», un motivo del relay)
+    // ensancha la ranura, pero esos cambian de tarde en tarde.
+    lead = lead.push(ui::figure(strong, pill.lead.clone(), &["888 ms"]));
+    let reason_samples = [
+        t!("room-rtt-valor", value = "888"),
+        t!("room-perdida-valor", value = "88"),
+        t!("room-segundos", secs = "88"),
+    ];
     let reason = pill.reason.clone().map(|reason| {
-        text(reason)
-            .size(type_size::SECONDARY)
-            .class(TextClass::OverlaySecondary)
-            .wrapping(Wrapping::None)
+        let samples: Vec<&str> = reason_samples.iter().map(String::as_str).collect();
+        ui::figure(
+            |content: String| {
+                text(content)
+                    .size(type_size::SECONDARY)
+                    .class(TextClass::OverlaySecondary)
+            },
+            reason,
+            &samples,
+        )
     });
     let segment = |content: Element<'a, Message>, message: Message| {
         button(content)
@@ -1937,14 +1993,25 @@ fn pill_view<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         .into()
 }
 
-fn stat_row<'a>(label: impl text::IntoFragment<'a>, value: String) -> Element<'a, Message> {
+/// Fila de un dato del panel: el valor, a la derecha, en una ranura del ancho de la más ancha de
+/// `widest` (no cambia de ancho con cada medida).
+fn stat_row<'a>(
+    label: impl text::IntoFragment<'a>,
+    value: String,
+    widest: &[&str],
+) -> Element<'a, Message> {
     row![
         overlay_text(label).width(Length::Fill),
-        text(value)
-            .size(type_size::SECONDARY)
-            .font(coroom_ui::font::SEMIBOLD)
-            .class(TextClass::Overlay)
-            .align_x(Horizontal::Right)
+        ui::figure(
+            |content: String| {
+                text(content)
+                    .size(type_size::SECONDARY)
+                    .font(coroom_ui::font::SEMIBOLD)
+                    .class(TextClass::Overlay)
+            },
+            value,
+            widest,
+        )
     ]
     .spacing(space::XS)
     .align_y(Alignment::Center)
@@ -1992,12 +2059,15 @@ fn switch_row<'a>(
     .into()
 }
 
-/// Una opción del panel de mandos.
+/// Una opción del panel de mandos. `mode` es la insignia de cómo va el mando que se envía («Tal
+/// cual», «Convertido»): `Some` en los mandos conectados, con su sitio guardado aunque no se vea
+/// (`Some(None)`), para que aparezca sin mover nada; `None` donde no puede salir.
 fn pad_option<'a>(
     selected: bool,
     name: String,
     detail: Option<String>,
     badges: Vec<String>,
+    mode: Option<Option<String>>,
     choice: PadChoice,
 ) -> Element<'a, Message> {
     let mark: Element<'a, Message> = if selected {
@@ -2020,6 +2090,14 @@ fn pad_option<'a>(
         let mut chips = row![].spacing(space::XXS);
         for badge in badges {
             chips = chips.push(ui::status_badge(Tone::Neutral, badge));
+        }
+        if let Some(mode) = mode {
+            let samples = [t!("room-tal-cual"), t!("room-convertido")]
+                .map(|label| ui::status_badge(Tone::Neutral, label));
+            chips = chips.push(ui::reserve(
+                samples,
+                mode.map(|label| ui::status_badge(Tone::Neutral, label)),
+            ));
         }
         texts = texts.push(chips);
     }
@@ -2095,10 +2173,19 @@ fn people_section<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         } else {
             t!("room-invitado")
         };
-        let mut facts = vec![role.to_owned()];
-        if talks {
-            facts.push(t!("room-hablando").to_owned());
-        }
+        // «Hablando» en una ranura reservada detrás del papel: la fila no cambia de ancho ni de
+        // alto cuando alguien empieza o deja de hablar.
+        let talking = || {
+            overlay_text(format!(" · {}", t!("room-hablando")))
+                .size(type_size::CAPTION)
+                .wrapping(Wrapping::None)
+        };
+        let facts = row![
+            overlay_text(role)
+                .size(type_size::CAPTION)
+                .wrapping(Wrapping::None),
+            ui::reserve([talking().into()], talks.then(|| talking().into())),
+        ];
         rows.push(
             row![
                 avatars::ringed_view(
@@ -2116,7 +2203,7 @@ fn people_section<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
                     })
                     .size(type_size::BODY)
                     .class(TextClass::Overlay),
-                    overlay_text(facts.join(" · ")).size(type_size::CAPTION),
+                    facts,
                 ]
                 .spacing(2)
                 .width(Length::Fill),
@@ -2210,6 +2297,7 @@ fn pads_section<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         t!("room-automatico").to_owned(),
         Some(t!("room-el-ultimo-que-conectes").to_owned()),
         Vec::new(),
+        None,
         PadChoice::Auto,
     )];
     for pad in pads {
@@ -2226,22 +2314,23 @@ fn pads_section<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
             PadKind::XInput => "XInput",
             PadKind::Converted(_) => t!("room-solo-convertido"),
         };
-        let mut badges = vec![format!(
+        let badges = vec![format!(
             "{:04x}:{:04x} · {transport}",
             pad.key.vendor, pad.key.product
         )];
-        if pad.active && slot.is_some() {
-            badges.push(if state.pads_raw {
+        let mode = (pad.active && slot.is_some()).then(|| {
+            if state.pads_raw {
                 t!("room-tal-cual").to_owned()
             } else {
                 t!("room-convertido").to_owned()
-            });
-        }
+            }
+        });
         options.push(pad_option(
             *choice == PadChoice::Pad(pad.key.clone()),
             pad.key.name.clone(),
             Some(detail),
             badges,
+            Some(mode),
             PadChoice::Pad(pad.key.clone()),
         ));
     }
@@ -2254,6 +2343,7 @@ fn pads_section<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
             key.name.clone(),
             Some(t!("room-desconectado").to_owned()),
             vec![format!("{:04x}:{:04x}", key.vendor, key.product)],
+            None,
             choice.clone(),
         ));
     }
@@ -2321,15 +2411,25 @@ fn connection_tab<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
 
     // Latencia añadida: la del vídeo de extremo a extremo, con su nivel; y por partes.
     let headline: Element<'a, Message> = match (state.added_ms(), state.level()) {
-        (Some(added), Some(level)) => text(t!(
-            "room-ms-nivel",
-            value = stats::number(added, 0),
-            level = level.label()
-        ))
-        .size(type_size::SECONDARY)
-        .font(coroom_ui::font::MONO)
-        .class(TextClass::Overlay)
-        .into(),
+        (Some(added), Some(level)) => {
+            let widest =
+                LEVELS.map(|level| t!("room-ms-nivel", value = "888", level = level.label()));
+            let widest: Vec<&str> = widest.iter().map(String::as_str).collect();
+            ui::figure(
+                |content: String| {
+                    text(content)
+                        .size(type_size::SECONDARY)
+                        .font(coroom_ui::font::MONO)
+                        .class(TextClass::Overlay)
+                },
+                t!(
+                    "room-ms-nivel",
+                    value = stats::number(added, 0),
+                    level = level.label()
+                ),
+                &widest,
+            )
+        }
         _ => overlay_text(t!("room-midiendo")).into(),
     };
     let input = summary.and_then(|summary| summary.input).map_or_else(
@@ -2352,9 +2452,9 @@ fn connection_tab<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     sections = sections.push(
         column![
             section_title(t!("room-latencia-anadida"), Some(headline)),
-            stat_row(t!("room-entrada-raton-juego"), input),
-            stat_row(t!("room-video-captura-pantalla"), video),
-            stat_row(t!("room-audio"), audio),
+            stat_row(t!("room-entrada-raton-juego"), input, &["888 ms"]),
+            stat_row(t!("room-video-captura-pantalla"), video, &["888 ms"]),
+            stat_row(t!("room-audio"), audio, &["888 ms"]),
         ]
         .spacing(6),
     );
@@ -2405,6 +2505,7 @@ fn connection_tab<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
                     stats::number(link.rtt_ms, 0),
                     stats::percent(link.loss_percent)
                 ),
+                &["888 ms · 88,8 %"],
             ));
         }
         link_rows.push(stat_row(
@@ -2414,6 +2515,7 @@ fn connection_tab<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
                 stats::number(summary.fps_recent, 0),
                 stats::kbps(summary.bitrate_recent_kbps)
             ),
+            &["888 · 888 kbit/s", "888 · 88,8 Mbit/s", "888 · 888 Mbit/s"],
         ));
     } else {
         link_rows.push(overlay_text(t!("room-midiendo")).into());
@@ -2565,19 +2667,31 @@ fn settings_tab<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     } else {
         t!("room-microfono").to_owned()
     };
-    let mut audio_rows = vec![switch_row(
-        mic_label,
-        voice && !stats_now.is_some_and(|s| s.mic_muted),
-        voice.then(|| on(Msg::ToggleMic)),
-    )];
-    if !voice && let Some(stats_now) = stats_now {
-        audio_rows.push(
+    // Sin voz, por qué, bajo el interruptor y en su ranura: los desplegables de después no
+    // cambian de posición (ni pierden el estado) cuando la voz va y viene.
+    let why = stats_now.filter(|_| !voice).map(|stats_now| {
+        container(
             overlay_text(capitalize(&stats_now.audio_status))
                 .size(type_size::CAPTION)
-                .wrapping(Wrapping::WordOrGlyph)
-                .into(),
-        );
-    }
+                .wrapping(Wrapping::WordOrGlyph),
+        )
+        .padding(Padding {
+            top: 6.0,
+            ..Padding::ZERO
+        })
+        .into()
+    });
+    let mut audio_rows = vec![
+        column![
+            switch_row(
+                mic_label,
+                voice && !stats_now.is_some_and(|s| s.mic_muted),
+                voice.then(|| on(Msg::ToggleMic)),
+            ),
+            ui::slot(why),
+        ]
+        .into(),
+    ];
     audio_rows.push(switch_row(
         t!("room-audio-del-juego"),
         !stats_now.is_some_and(|s| s.game_muted),
@@ -2775,46 +2889,53 @@ fn video<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
                 ContainerClass::Video
             })
     };
-    let mut layers: Vec<Element<'a, Message>> = vec![base.into()];
+    // Las capas están siempre, en este orden, vacías cuando no hacen falta: iced casa el estado
+    // de cada una (el scroll del panel, el foco del chat, un deslizador que se arrastra) con su
+    // posición en la pila, y una capa que aparecía delante (quién habla) dejaba el panel arriba,
+    // el chat sin foco y cortaba el arrastre.
     let now = app.now;
     let bar_visible = state.bar_visible(now);
     // La barra entra bajando un poco (200 ms, `ease-out`).
     let entered = (now.duration_since(state.bar_shown_at).as_secs_f32() / BAR_IN.as_secs_f32())
         .clamp(0.0, 1.0);
     let slide = (1.0 - (1.0 - entered) * (1.0 - entered)) * space::S;
-    let mut top = Column::new().spacing(space::S).padding(Padding {
+    // El aviso de reconexión lleva dentro el espacio que lo separa de la barra: así el hueco de
+    // la barra escondida no lo suma.
+    let reconnect = state.reconnecting.as_ref().map(|reconnecting| {
+        container(
+            container(reconnect_banner(app, reconnecting))
+                .center_x(Length::Fill)
+                .max_width(640),
+        )
+        .padding(Padding {
+            top: if bar_visible { space::S } else { 0.0 },
+            ..Padding::ZERO
+        })
+        .into()
+    });
+    let top = column![
+        ui::slot(bar_visible.then(|| top_bar(app, state))),
+        ui::slot(reconnect),
+    ]
+    .padding(Padding {
         top: if bar_visible { slide } else { space::S },
         right: space::S,
         bottom: 0.0,
         left: space::S,
     });
-    if bar_visible {
-        top = top.push(top_bar(app, state));
-    }
-    if let Some(reconnecting) = &state.reconnecting {
-        top = top.push(
-            container(reconnect_banner(app, reconnecting))
-                .center_x(Length::Fill)
-                .max_width(640),
-        );
-    }
-    layers.push(
-        container(top)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_y(Vertical::Top)
-            .into(),
-    );
     // Quién habla, arriba a la izquierda (debajo de la barra si se ve).
-    if app.settings.room.talking_overlay
-        && let Some(talking) = talking_view(app, state)
-    {
-        let below_bar = if bar_visible {
-            space::S + size::VIDEO_BAR + space::S
-        } else {
-            space::S
-        };
-        layers.push(
+    let talking = app
+        .settings
+        .room
+        .talking_overlay
+        .then(|| talking_view(app, state))
+        .flatten()
+        .map(|talking| {
+            let below_bar = if bar_visible {
+                space::S + size::VIDEO_BAR + space::S
+            } else {
+                space::S
+            };
             container(talking)
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -2824,55 +2945,81 @@ fn video<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
                     bottom: space::S,
                     left: space::S,
                 })
-                .into(),
-        );
-    }
-    if let Some(tab) = state.panel {
+                .into()
+        });
+    let panel = state.panel.map(|tab| {
         let below_bar = space::S + size::VIDEO_BAR + space::S;
-        layers.push(
-            container(side_panel(app, state, tab))
+        container(side_panel(app, state, tab))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Horizontal::Right)
+            .padding(Padding {
+                top: below_bar,
+                right: space::S,
+                bottom: space::S,
+                left: space::S,
+            })
+            .into()
+    });
+    // La píldora abajo a la izquierda y la indicación del teclado y el ratón centrada abajo,
+    // aparte: lo que cambia de ancho en la píldora no la empuja.
+    let pill_visible = state.pill_visible(now, app.fullscreen);
+    let pill = pill_visible.then(|| {
+        container(pill_view(app, state))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_y(Vertical::Bottom)
+            .padding(space::S)
+            .into()
+    });
+    let hint = pill_visible
+        .then(|| input_hint_view(app, state))
+        .flatten()
+        .map(|hint| {
+            // Con el panel abierto, centrada en lo que queda a su izquierda.
+            let right = if state.panel.is_some() {
+                size::STATS_PANEL + 2.0 * space::S
+            } else {
+                space::S
+            };
+            container(hint)
                 .width(Length::Fill)
                 .height(Length::Fill)
-                .align_x(Horizontal::Right)
-                .padding(Padding {
-                    top: below_bar,
-                    right: space::S,
-                    bottom: space::S,
-                    left: space::S,
-                })
-                .into(),
-        );
-    }
-    if state.pill_visible(now, app.fullscreen) {
-        let mut status = row![pill_view(app, state)]
-            .spacing(space::XS)
-            .align_y(Alignment::Center);
-        if let Some(hint) = input_hint_view(app, state) {
-            status = status.push(hint);
-        }
-        layers.push(
-            container(status)
-                .width(Length::Fill)
-                .height(Length::Fill)
+                .align_x(Horizontal::Center)
                 .align_y(Vertical::Bottom)
-                .padding(space::S)
-                .into(),
-        );
-    }
-    if state.panel.is_none()
-        && let Some(bubbles) = chat::bubbles(app)
-    {
-        layers.push(
+                .padding(Padding {
+                    right,
+                    ..Padding::new(space::S)
+                })
+                .into()
+        });
+    let bubbles = state
+        .panel
+        .is_none()
+        .then(|| chat::bubbles(app))
+        .flatten()
+        .map(|bubbles| {
             container(bubbles)
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .align_x(Horizontal::Right)
                 .align_y(Vertical::Bottom)
                 .padding(space::S)
-                .into(),
-        );
-    }
-    stack(layers).into()
+                .into()
+        });
+    stack![
+        base,
+        container(top)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_y(Vertical::Top),
+        ui::slot(talking),
+        ui::slot(panel),
+        ui::slot(pill),
+        ui::slot(hint),
+        ui::slot(bubbles),
+    ]
+    .into()
 }
 
 /// Escenas del invitado para las capturas.

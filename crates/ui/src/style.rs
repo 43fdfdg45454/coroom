@@ -12,16 +12,46 @@ use iced_widget::{
 };
 
 use crate::font::Fonts;
+use crate::motion::Motion;
 use crate::theme::{Accent, Mode, Palette, Rgb, Tone};
 use crate::tokens::radius;
 
-/// Tema de la interfaz: paleta y fuentes.
+/// Tema de la interfaz: paleta, fuentes y movimiento.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Theme {
     /// Colores.
     pub palette: Palette,
     /// Fuentes.
     pub fonts: Fonts,
+    /// Cuánto se animan los componentes (la ventana lo pone en cada dibujo: el del sistema y
+    /// Apariencia, o ninguno con la entrada tomada).
+    pub motion: Motion,
+    /// Transición en curso del componente que se dibuja ([`crate::animate`]); `None` fuera de
+    /// ellos.
+    pub blend: Option<Blend>,
+    /// Cambio de tono en curso de una insignia o un punto de estado
+    /// ([`crate::animate::ToneFade`]): los colores de tono se mezclan desde el anterior.
+    pub fade: Option<Fade>,
+}
+
+/// Transición de estado de un botón animado ([`crate::animate::Animated`]): el estado del que viene
+/// y cuánto lleva (0 a 1, ya con su curva). El catálogo mezcla el estilo de los dos.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Blend {
+    /// Estado anterior.
+    pub from: button::Status,
+    /// Avance hacia el actual.
+    pub progress: f32,
+}
+
+/// Cambio de tono de lo que se dibuja ([`Theme::tone`]): el tono del que viene y cuánto lleva (0 a
+/// 1, ya con su curva).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Fade {
+    /// Tono anterior.
+    pub from: Tone,
+    /// Avance hacia el actual.
+    pub progress: f32,
 }
 
 impl Default for Theme {
@@ -36,6 +66,27 @@ impl Theme {
         Self {
             palette: Palette::new(mode, accent),
             fonts,
+            motion: Motion::FULL,
+            blend: None,
+            fade: None,
+        }
+    }
+
+    /// Los colores de `tone`, mezclados desde los del tono anterior si cambia ([`Theme::fade`]).
+    pub fn tone(&self, tone: Tone) -> crate::theme::ToneColors {
+        let to = self.palette.tone(tone);
+        match self.fade {
+            Some(fade) if fade.from != tone && fade.progress < 1.0 => {
+                let from = self.palette.tone(fade.from);
+                let t = fade.progress;
+                crate::theme::ToneColors {
+                    solid: from.solid.mix(to.solid, t),
+                    text: from.text.mix(to.text, t),
+                    soft: from.soft.mix(to.soft, t),
+                    on_soft: from.on_soft.mix(to.on_soft, t),
+                }
+            }
+            _ => to,
         }
     }
 
@@ -78,6 +129,70 @@ fn outline(color: Color, width: f32, radius: f32) -> Border {
     }
 }
 
+/// Mezcla lineal de dos colores (`t` de 0 a 1).
+pub fn mix(from: Color, to: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    Color {
+        r: from.r + (to.r - from.r) * t,
+        g: from.g + (to.g - from.g) * t,
+        b: from.b + (to.b - from.b) * t,
+        a: from.a + (to.a - from.a) * t,
+    }
+}
+
+fn background_color(background: Option<Background>, fallback: Color) -> Option<Color> {
+    match background {
+        Some(Background::Color(color)) => Some(color),
+        // Los degradados no se mezclan: se quedan como están.
+        Some(Background::Gradient(_)) => None,
+        None => Some(Color { a: 0.0, ..fallback }),
+    }
+}
+
+/// Estilo de botón a medio camino de `from` a `to`. Un fondo que aparece o desaparece se funde
+/// desde su mismo color transparente.
+fn mix_button(from: button::Style, to: button::Style, t: f32) -> button::Style {
+    let background = match (from.background, to.background) {
+        (None, None) => None,
+        (a, b) => {
+            let reference = background_color(b, Color::TRANSPARENT)
+                .or_else(|| background_color(a, Color::TRANSPARENT))
+                .unwrap_or(Color::TRANSPARENT);
+            match (
+                background_color(a, reference),
+                background_color(b, reference),
+            ) {
+                (Some(a), Some(b)) => Some(Background::Color(mix(a, b, t))),
+                _ => to.background,
+            }
+        }
+    };
+    let border_color = if from.border.width == 0.0 {
+        Color {
+            a: 0.0,
+            ..to.border.color
+        }
+    } else {
+        from.border.color
+    };
+    button::Style {
+        background,
+        text_color: mix(from.text_color, to.text_color, t),
+        border: Border {
+            color: mix(border_color, to.border.color, t),
+            width: from.border.width + (to.border.width - from.border.width) * t,
+            radius: to.border.radius,
+        },
+        shadow: Shadow {
+            color: mix(from.shadow.color, to.shadow.color, t),
+            offset: from.shadow.offset + (to.shadow.offset - from.shadow.offset) * t,
+            blur_radius: from.shadow.blur_radius
+                + (to.shadow.blur_radius - from.shadow.blur_radius) * t,
+        },
+        snap: to.snap,
+    }
+}
+
 // --- Botones ------------------------------------------------------------------------------------
 
 /// Clases de botón.
@@ -96,6 +211,9 @@ pub enum ButtonClass {
     Destructive,
     /// Plano destructivo (texto rojo).
     DestructiveFlat,
+    /// Destructivo suave: fondo rojo tenue y texto rojo (dejar de compartir, expulsar, olvidar
+    /// un servidor); el lleno ([`ButtonClass::Destructive`]) queda para cerrar la sala y salir.
+    DestructiveSoft,
     /// Entrada de la barra lateral.
     Nav {
         /// Si es la página actual.
@@ -115,16 +233,34 @@ pub enum ButtonClass {
         /// Si es el elegido.
         selected: bool,
     },
-    /// Segmento de un selector segmentado.
+    /// Segmento de un selector segmentado. El fondo del elegido no lo pinta el segmento sino el
+    /// selector ([`crate::animate::Segments`], con [`ButtonClass::SegmentThumb`]), que lo desliza
+    /// de uno a otro.
     Segment {
         /// Si es el elegido.
         selected: bool,
     },
+    /// El fondo del segmento elegido, que se desliza bajo los segmentos.
+    SegmentThumb,
     /// Tarjeta de una opción excluyente (qué compartir): borde de acento si es la elegida.
     Choice {
         /// Si es la elegida.
         selected: bool,
     },
+}
+
+impl ButtonClass {
+    /// Si al pasar el ratón sube 1 px con sombra: los botones con relleno. Los planos, los de la
+    /// barra sobre el vídeo, las pestañas y las tarjetas cambian solo de fondo.
+    pub fn lifts(self) -> bool {
+        matches!(
+            self,
+            ButtonClass::Normal
+                | ButtonClass::Primary
+                | ButtonClass::Destructive
+                | ButtonClass::DestructiveSoft
+        )
+    }
 }
 
 impl button::Catalog for Theme {
@@ -135,6 +271,38 @@ impl button::Catalog for Theme {
     }
 
     fn style(&self, class: &Self::Class<'_>, status: button::Status) -> button::Style {
+        let to = self.button_style(*class, status);
+        match self.blend {
+            Some(blend) if blend.from != status && blend.progress < 1.0 => {
+                mix_button(self.button_style(*class, blend.from), to, blend.progress)
+            }
+            _ => to,
+        }
+    }
+}
+
+impl Theme {
+    pub(crate) fn button_style(&self, class: ButtonClass, status: button::Status) -> button::Style {
+        let mut style = self.button_surface(class, status);
+        if class.lifts() && status == button::Status::Hovered {
+            // Al pasar, sube con su sombra (el desplazamiento lo dibuja [`crate::animate`]); el
+            // principal brilla con el acento.
+            style.shadow = match class {
+                ButtonClass::Primary => Shadow {
+                    color: self.palette.accent_bg.alpha(match self.palette.mode {
+                        Mode::Light => 0.35,
+                        Mode::Dark => 0.45,
+                    }),
+                    offset: Vector::new(0.0, 2.0),
+                    blur_radius: 10.0,
+                },
+                _ => self.shadow(6.0, 2.0, 0.14, 0.4),
+            };
+        }
+        style
+    }
+
+    fn button_surface(&self, class: ButtonClass, status: button::Status) -> button::Style {
         let p = &self.palette;
         let disabled = status == button::Status::Disabled;
         let hovered = status == button::Status::Hovered;
@@ -176,7 +344,7 @@ impl button::Catalog for Theme {
             },
             ..base
         };
-        match *class {
+        match class {
             ButtonClass::Normal => {
                 let bg = if pressed {
                     p.button_pressed
@@ -192,6 +360,26 @@ impl button::Catalog for Theme {
             ButtonClass::Flat => flat(p.text),
             ButtonClass::Link => flat(p.accent_text),
             ButtonClass::DestructiveFlat => flat(p.error.text),
+            ButtonClass::DestructiveSoft => {
+                let soft = p.error.soft.color();
+                button::Style {
+                    background: Some(Background::Color(if disabled {
+                        p.button.color()
+                    } else if pressed {
+                        mix(soft, p.error.solid.color(), 0.3)
+                    } else if hovered {
+                        mix(soft, p.error.solid.color(), 0.15)
+                    } else {
+                        soft
+                    })),
+                    text_color: if disabled {
+                        p.text_disabled.color()
+                    } else {
+                        p.error.on_soft.color()
+                    },
+                    ..base
+                }
+            }
             ButtonClass::Nav { selected } => button::Style {
                 background: if selected {
                     Some(Background::Color(p.selected.color()))
@@ -272,20 +460,21 @@ impl button::Catalog for Theme {
                 snap: true,
             },
             ButtonClass::Segment { selected } => button::Style {
-                background: Some(Background::Color(if selected {
-                    p.card.color()
-                } else if hovered {
+                background: Some(Background::Color(if hovered && !selected {
                     p.button_hover.color()
                 } else {
                     Color::TRANSPARENT
                 })),
                 text_color: p.text.color(),
                 border: outline(Color::TRANSPARENT, 0.0, radius::CONTROL - 2.0),
-                shadow: if selected {
-                    self.shadow(2.0, 1.0, 0.12, 0.3)
-                } else {
-                    Shadow::default()
-                },
+                shadow: Shadow::default(),
+                snap: true,
+            },
+            ButtonClass::SegmentThumb => button::Style {
+                background: Some(Background::Color(p.card.color())),
+                text_color: p.text.color(),
+                border: outline(Color::TRANSPARENT, 0.0, radius::CONTROL - 2.0),
+                shadow: self.shadow(2.0, 1.0, 0.12, 0.3),
                 snap: true,
             },
         }
@@ -319,8 +508,8 @@ pub enum ContainerClass {
     Badge(Tone),
     /// Toast.
     Toast,
-    /// Velo detrás de un diálogo.
-    Scrim,
+    /// Velo detrás de un diálogo, con lo que lleva de su fundido de entrada (0 a 1).
+    Scrim(f32),
     /// Barra o panel sobre el vídeo.
     Overlay,
     /// Fondo del vídeo.
@@ -416,7 +605,7 @@ impl container::Catalog for Theme {
                 snap: true,
             },
             ContainerClass::Banner(tone) => {
-                let tone = p.tone(tone);
+                let tone = self.tone(tone);
                 container::Style {
                     background: fill(tone.soft.color()),
                     text_color: Some(tone.on_soft.color()),
@@ -425,7 +614,7 @@ impl container::Catalog for Theme {
                 }
             }
             ContainerClass::Badge(tone) => {
-                let tone = p.tone(tone);
+                let tone = self.tone(tone);
                 container::Style {
                     background: fill(tone.soft.color()),
                     text_color: Some(tone.on_soft.color()),
@@ -440,8 +629,8 @@ impl container::Catalog for Theme {
                 shadow: self.shadow(16.0, 4.0, 0.25, 0.5),
                 snap: true,
             },
-            ContainerClass::Scrim => container::Style {
-                background: fill(p.scrim.alpha(p.scrim_alpha)),
+            ContainerClass::Scrim(shown) => container::Style {
+                background: fill(p.scrim.alpha(p.scrim_alpha * shown.clamp(0.0, 1.0))),
                 ..none
             },
             ContainerClass::Overlay => container::Style {
@@ -473,11 +662,11 @@ impl container::Catalog for Theme {
                 ..none
             },
             ContainerClass::AvatarRing(tone) => container::Style {
-                border: outline(p.tone(tone).solid.color(), 2.0, radius::PILL),
+                border: outline(self.tone(tone).solid.color(), 2.0, radius::PILL),
                 ..none
             },
             ContainerClass::Dot(tone) => container::Style {
-                background: fill(p.tone(tone).solid.color()),
+                background: fill(self.tone(tone).solid.color()),
                 border: outline(Color::TRANSPARENT, 0.0, radius::PILL),
                 ..none
             },
@@ -509,7 +698,7 @@ impl container::Catalog for Theme {
                 ..none
             },
             ContainerClass::OverlayBadge(tone) => container::Style {
-                background: fill(p.tone(tone).solid.alpha(0.22)),
+                background: fill(self.tone(tone).solid.alpha(0.22)),
                 text_color: Some(p.overlay_text.color()),
                 border: outline(Color::TRANSPARENT, 0.0, radius::PILL),
                 ..none
@@ -580,7 +769,7 @@ impl core_text::Catalog for Theme {
             TextClass::Secondary => Some(p.text_secondary),
             TextClass::Disabled => Some(p.text_disabled),
             TextClass::Accent => Some(p.accent_text),
-            TextClass::Tone(tone) => Some(p.tone(tone).text),
+            TextClass::Tone(tone) => Some(self.tone(tone).text),
             TextClass::Overlay => Some(p.overlay_text),
             TextClass::OverlaySecondary => Some(p.overlay_text_secondary),
             TextClass::Custom(color) => {
@@ -864,7 +1053,7 @@ impl svg::Catalog for Theme {
             SvgClass::Accent => p.accent_text,
             SvgClass::OnAccent => p.on_accent,
             SvgClass::OnDestructive => p.on_destructive,
-            SvgClass::Tone(tone) => p.tone(tone).text,
+            SvgClass::Tone(tone) => self.tone(tone).text,
             SvgClass::Overlay => p.overlay_text,
         };
         svg::Style {
@@ -987,7 +1176,7 @@ impl progress_bar::Catalog for Theme {
         let p = &self.palette;
         let bar = match *class {
             ProgressClass::Accent => p.accent_bg,
-            ProgressClass::Tone(tone) => p.tone(tone).solid,
+            ProgressClass::Tone(tone) => self.tone(tone).solid,
         };
         progress_bar::Style {
             background: Background::Color(p.button.color()),

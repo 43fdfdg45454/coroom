@@ -39,6 +39,24 @@ pub fn kbps(value: f64) -> String {
     }
 }
 
+/// Los valores más anchos de [`ms`], [`kbps`] y [`percent`], para medir las ranuras de ancho
+/// fijo (`coroom_ui::widget::figure`): un 8 (la cifra más ancha en casi todas las letras) en cada
+/// posición de cada forma que pueden tomar.
+pub const MS_WIDEST: [&str; 2] = ["88,8 ms", "888 ms"];
+/// Ver [`MS_WIDEST`].
+pub const KBPS_WIDEST: [&str; 3] = ["888 kbit/s", "88,8 Mbit/s", "888 Mbit/s"];
+/// Ver [`MS_WIDEST`].
+pub const PERCENT_WIDEST: [&str; 1] = ["88,8 %"];
+
+/// Cuenta atrás en minutos y segundos: `0:42`, `1:05`. Va en una ranura de ancho fijo medida con
+/// [`CLOCK_WIDEST`] (`coroom_ui::widget::figure`), porque cambia cada segundo.
+pub fn clock(seconds: u64) -> String {
+    format!("{}:{:02}", seconds / 60, seconds % 60)
+}
+
+/// La cuenta atrás más ancha de [`clock`] por debajo de diez minutos (las de la interfaz duran uno).
+pub const CLOCK_WIDEST: &str = "8:88";
+
 /// Porcentaje con un decimal.
 pub fn percent(value: f64) -> String {
     format!("{} %", number(value, 1))

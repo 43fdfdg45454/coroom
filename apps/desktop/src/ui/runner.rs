@@ -160,6 +160,8 @@ struct Ready {
     /// Si la interfaz quedó esperando al vídeo ([`Present::WithVideo`]) y el vídeo no llegó para
     /// entonces, se dibuja sola.
     video_fallback: Option<Instant>,
+    /// Algún componente pidió el siguiente cuadro para su animación en este dibujo.
+    ui_frame: bool,
 }
 
 /// Lo que devolvió una pasada de la interfaz ([`Ready::pass`]).
@@ -436,6 +438,7 @@ impl Runner {
             clock,
             last_frame: Instant::now(),
             video_fallback: None,
+            ui_frame: false,
         })
     }
 }
@@ -459,7 +462,13 @@ impl Ready {
     /// (lista para [`Compositor::draw_ui`]).
     fn pass(&mut self, events: &[UiEvent], draw: bool) -> Pass {
         let mut messages = Vec::new();
-        let theme = self.app.theme;
+        let mut theme = self.app.theme;
+        // Con el teclado y el ratón tomados no se anima nada (se leen en este hilo).
+        theme.motion = if self.input_taken() {
+            coroom_ui::motion::Motion::OFF
+        } else {
+            self.app.motion()
+        };
         let mut interface = UserInterface::build(
             self.app.view(),
             self.viewport.logical_size(),
@@ -1227,7 +1236,9 @@ impl Ready {
     /// este mismo hilo; con la ventana oculta, tampoco. Un dibujo que quedó esperando al vídeo
     /// (`video`) sale solo si el vídeo se detiene.
     fn schedule_frame(&mut self, now: Instant, video: Option<Duration>) {
-        let animating = self.app.animating() && !self.input_taken() && !self.app.window_hidden;
+        let animating = (self.app.animating() || std::mem::take(&mut self.ui_frame))
+            && !self.input_taken()
+            && !self.app.window_hidden;
         if !animating && video.is_none() {
             return;
         }
@@ -1307,7 +1318,8 @@ impl Ready {
             self.interaction = mouse_interaction;
         }
         match redraw_request {
-            window::RedrawRequest::NextFrame => self.window.request_redraw(),
+            // Un componente se está animando: el siguiente cuadro, al ritmo del compositor.
+            window::RedrawRequest::NextFrame => self.ui_frame = true,
             window::RedrawRequest::At(at) => self.redraw_at(at),
             window::RedrawRequest::Wait => {}
         }

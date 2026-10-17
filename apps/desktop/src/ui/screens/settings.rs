@@ -919,7 +919,7 @@ fn account(app: &App) -> Element<'_, Message> {
         )),
         vec![
             ui::button_with(
-                Kind::DestructiveFlat,
+                Kind::DestructiveSoft,
                 t!("settings-cerrar-sesion"),
                 Some(Icon::LogOut),
                 Some(Message::SignOut),
@@ -961,7 +961,12 @@ fn account(app: &App) -> Element<'_, Message> {
 
 /// "hace 5 min", "hace 3 h", "hace 2 días".
 pub fn ago(unix: i64, now: i64) -> String {
-    let seconds = (now - unix).max(0);
+    ago_secs((now - unix).max(0) as u64)
+}
+
+/// Cuánto hace, redondeado para que no cambie cada segundo (ni el ancho del texto con él):
+/// «ahora mismo» durante el primer minuto, después «hace 5 min», «hace 3 h», «ayer»…
+pub fn ago_secs(seconds: u64) -> String {
     match seconds {
         0..60 => t!("settings-ahora-mismo").to_owned(),
         60..3600 => t!("settings-hace-min", valor = seconds / 60),
@@ -1302,15 +1307,17 @@ pub(crate) fn device_choices(
     out
 }
 
-/// «En vivo: …» con la edad de la lista.
+/// «En vivo: …» con la edad de la lista, redondeada.
 fn audio_freshness(app: &App) -> String {
     let state = &app.settings_page;
     let lead = t!("settings-dispositivos-en-vivo");
     match state.audio_updated_at {
+        // Redondeado: con los segundos, la descripción cambiaba de ancho, repartía las líneas
+        // de otra forma y movía toda la página.
         Some(at) => t!(
             "settings-actualizado-hace",
             lead = lead,
-            seconds = app.now.saturating_duration_since(at).as_secs()
+            ago = ago_secs(app.now.saturating_duration_since(at).as_secs())
         ),
         None => t!("settings-buscando-dispositivos", lead = lead),
     }
@@ -1801,8 +1808,10 @@ fn share_permission_row(app: &App) -> Element<'_, Message> {
         ui::caption(t!("settings-permiso-de-pantalla-ayuda")).wrapping(Wrapping::WordOrGlyph),
     ]
     .spacing(2);
-    let forget = ui::flat(
+    let forget = ui::button_with(
+        Kind::DestructiveSoft,
         t!("settings-olvidar-el-permiso-de-pantalla"),
+        None,
         (!tokens.is_empty()).then(|| on(Msg::ForgetSharePermission)),
     );
     row![texts.width(Length::Fill), forget]

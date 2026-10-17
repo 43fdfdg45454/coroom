@@ -46,7 +46,7 @@ diagnostics-lobby-texto = Abre o entra en una sala para ver la ruta, las direcci
 ## Candidatos
 
 diagnostics-candidatos-titulo = Candidatos de conexión directa
-diagnostics-candidatos-detalle = hace { $secs } s · { $timeout } s por candidato
+diagnostics-candidatos-detalle = { $ago } · { $timeout } s por candidato
 diagnostics-candidatos-detalle-sin-intento = { $timeout } s por candidato
 diagnostics-candidatos-vacio = Aún no se ha probado ninguna dirección.
 diagnostics-clase-ipv6 = IPv6 global

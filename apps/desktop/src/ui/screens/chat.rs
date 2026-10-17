@@ -1291,7 +1291,8 @@ fn composer(app: &App, look: Look) -> Element<'_, Message> {
         .into()
 }
 
-/// Contador de no leídos encima de un botón de `side` px (sin mensajes, el botón tal cual).
+/// Contador de no leídos encima de un botón de `side` px (sin mensajes, la capa del contador
+/// vacía: el botón sigue en la misma pila y no pierde su estado al llegar el primero).
 pub fn with_unread<'a>(
     control: impl Into<Element<'a, Message>>,
     unread: usize,
@@ -1299,7 +1300,7 @@ pub fn with_unread<'a>(
 ) -> Element<'a, Message> {
     let control = control.into();
     if unread == 0 {
-        return control;
+        return stack![control, ui::slot(None)].into();
     }
     let label = if unread > 99 {
         "99+".to_owned()

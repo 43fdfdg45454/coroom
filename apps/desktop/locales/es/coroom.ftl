@@ -166,6 +166,8 @@ system-registro-de-windows = registro de Windows
 system-sin-datos-del-sistema = sin datos del sistema
 app-host-sin-conexion = { $host } · sin conexión
 app-host-rtt-ms = { $host } · { $rtt } ms
+app-host-separador = { $host } ·
+app-rtt-ms = { $rtt } ms
 
 ## Avatares
 

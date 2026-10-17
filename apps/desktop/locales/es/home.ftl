@@ -24,7 +24,7 @@ home-enter = Entrar
 ## Invitaciones
 
 home-invite-title = { $name } te invita a su sala
-home-invite-detail = Sala { $code } · hace { $ago } s · caduca en { $left } s
+home-invite-detail = Sala { $code } · caduca en
 home-ignore = Ignorar
 
 ## Amigos
@@ -33,10 +33,7 @@ home-friends = Amigos
 home-online-none = Nadie conectado
 home-online-one = 1 conectado
 home-online-many = { $count } conectados
-home-updated-now = actualizado ahora mismo
-home-updated-seconds = actualizado hace { $seconds } s
-home-updated-minutes = actualizado hace { $minutes } min
-home-updated-hours = actualizado hace { $hours } h
+home-updated = actualizado { $ago }
 home-add-friend = Agregar amigo
 home-add-friend-close = Cancelar
 home-username = Nombre de usuario

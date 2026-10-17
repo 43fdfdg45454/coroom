@@ -3,6 +3,10 @@
 //! apartarse y soltar fuera) ya ha hecho la acción. [`release_to_pick`] envuelve el desplegable y le
 //! pasa al menú la pulsación solo cuando el botón se suelta sobre una opción. La barra de
 //! desplazamiento de un menú largo recibe la pulsación al momento, para poder arrastrarla.
+//!
+//! Al abrirse, el menú sale del botón: crece del 96 al 100 % y se descubre de arriba abajo, así que
+//! sus opciones aparecen escalonadas ([`Token::Panel`]; sin movimiento con animaciones reducidas).
+//! Se puede elegir desde el primer cuadro: la animación solo cambia cómo se ve.
 
 use iced_core::layout::{self, Layout};
 use iced_core::widget::tree::{self, Tree};
@@ -10,7 +14,13 @@ use iced_core::{
     Clipboard, Event, Length, Rectangle, Shell, Size, Vector, Widget, mouse, overlay, renderer,
 };
 
+use std::cell::Cell;
+
+use crate::motion::{Instant, Motion, Token};
 use crate::{Element, Renderer, Theme};
+
+/// De dónde crece el menú: 96 % de su tamaño.
+const MENU_START_SCALE: f32 = 0.96;
 
 /// Envoltorio de [`release_to_pick`].
 pub struct ReleaseToPick<'a, Message> {
@@ -33,6 +43,32 @@ struct State {
     armed: bool,
     /// El menú estaba desplegado la última vez que se pidió (para saber cuándo se abre otro).
     open: bool,
+    /// Cuándo se abrió el menú desplegado.
+    opened_at: Option<Instant>,
+    /// La marca del último cuadro.
+    now: Option<Instant>,
+    /// El movimiento del último dibujo ([`Theme::motion`]).
+    motion: Cell<Motion>,
+}
+
+impl State {
+    /// Cuánto se abrió el menú, ya con su curva (1: del todo).
+    fn opening(&self) -> f32 {
+        let (Some(since), Some(now)) = (self.opened_at, self.now) else {
+            return 1.0;
+        };
+        let motion = self.motion.get();
+        let duration = motion.duration(Token::Panel);
+        if motion.is_reduced() || duration.is_zero() {
+            return 1.0;
+        }
+        let t = now.saturating_duration_since(since).as_secs_f32() / duration.as_secs_f32();
+        if t >= 1.0 {
+            1.0
+        } else {
+            Token::Panel.easing().value(t.max(0.0))
+        }
+    }
 }
 
 impl<Message> Widget<Message, Theme, Renderer> for ReleaseToPick<'_, Message> {
@@ -125,6 +161,19 @@ impl<Message> Widget<Message, Theme, Renderer> for ReleaseToPick<'_, Message> {
             shell,
             viewport,
         );
+        let state = tree.state.downcast_mut::<State>();
+        match event {
+            Event::Window(iced_core::window::Event::RedrawRequested(now)) => state.now = Some(*now),
+            // El desplegable se abre al pulsarlo: el cuadro siguiente empieza a desplegar el menú
+            // (y desde ahí el propio menú pide los demás).
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+            | Event::Touch(iced_core::touch::Event::FingerPressed { .. })
+                if !state.open && cursor.is_over(layout.bounds()) =>
+            {
+                shell.request_redraw();
+            }
+            _ => {}
+        }
     }
 
     fn mouse_interaction(
@@ -156,6 +205,7 @@ impl<Message> Widget<Message, Theme, Renderer> for ReleaseToPick<'_, Message> {
             state, children, ..
         } = tree;
         let state = state.downcast_mut::<State>();
+        let opened = state.open;
         let Some(inner) = self.content.as_widget_mut().overlay(
             &mut children[0],
             layout,
@@ -166,22 +216,21 @@ impl<Message> Widget<Message, Theme, Renderer> for ReleaseToPick<'_, Message> {
             state.open = false;
             return None;
         };
-        if !std::mem::replace(&mut state.open, true) {
+        state.open = true;
+        if !opened {
             // Un menú nuevo: una pulsación del anterior (cerrado con el botón aún pulsado) no
             // cuenta para este.
             state.armed = false;
+            state.opened_at = Some(state.now.unwrap_or_else(Instant::now));
         }
-        Some(overlay::Element::new(Box::new(Release {
-            inner,
-            armed: &mut state.armed,
-        })))
+        Some(overlay::Element::new(Box::new(Release { inner, state })))
     }
 }
 
 /// El menú desplegado, con la pulsación retenida hasta que se suelta el botón.
 struct Release<'a, Message> {
     inner: overlay::Element<'a, Message, Theme, Renderer>,
-    armed: &'a mut bool,
+    state: &'a mut State,
 }
 
 impl<Message> Release<'_, Message> {
@@ -211,9 +260,35 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for Release<'_, Message
         layout: Layout<'_>,
         cursor: mouse::Cursor,
     ) {
-        self.inner
-            .as_overlay()
-            .draw(renderer, theme, style, layout, cursor);
+        self.state.motion.set(theme.motion);
+        let opening = self.state.opening();
+        let draw = |renderer: &mut Renderer| {
+            self.inner
+                .as_overlay()
+                .draw(renderer, theme, style, layout, cursor);
+        };
+        if opening >= 1.0 {
+            draw(renderer);
+            return;
+        }
+        // Crece desde el borde de arriba (el del botón) y se descubre hacia abajo.
+        let bounds = layout.bounds();
+        let scale = MENU_START_SCALE + (1.0 - MENU_START_SCALE) * opening;
+        let origin = iced_core::Point::new(bounds.center_x(), bounds.y);
+        let transformation = iced_core::Transformation::translate(origin.x, origin.y)
+            * iced_core::Transformation::scale(scale)
+            * iced_core::Transformation::translate(-origin.x, -origin.y);
+        // La sombra del menú sobresale: el recorte deja margen a los lados y abajo.
+        let margin = 16.0;
+        let clip = Rectangle {
+            x: bounds.x - margin,
+            y: bounds.y - margin,
+            width: bounds.width + 2.0 * margin,
+            height: (bounds.height + margin) * opening + margin,
+        };
+        iced_core::Renderer::with_layer(renderer, clip, |renderer| {
+            iced_core::Renderer::with_transformation(renderer, transformation, draw);
+        });
     }
 
     fn operate(
@@ -238,10 +313,19 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for Release<'_, Message
     ) {
         let over = cursor.is_over(layout.bounds());
         match event {
+            Event::Window(iced_core::window::Event::RedrawRequested(now)) => {
+                self.state.now = Some(*now);
+                if self.state.opening() < 1.0 {
+                    shell.request_redraw();
+                }
+                self.inner
+                    .as_overlay_mut()
+                    .update(event, layout, cursor, renderer, clipboard, shell);
+            }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) if over => {
                 if self.over_option(layout, cursor, renderer) {
                     // Se retiene: el menú sigue abierto y la página de debajo no la recibe.
-                    *self.armed = true;
+                    self.state.armed = true;
                 } else {
                     // La barra de desplazamiento (o el borde): el menú la recibe ya.
                     self.inner
@@ -251,7 +335,9 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for Release<'_, Message
                 shell.capture_event();
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                if std::mem::take(self.armed) && self.over_option(layout, cursor, renderer) {
+                if std::mem::take(&mut self.state.armed)
+                    && self.over_option(layout, cursor, renderer)
+                {
                     // Soltar sobre una opción la elige: el menú recibe la pulsación que espera.
                     let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
                     self.inner

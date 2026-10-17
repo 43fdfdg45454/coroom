@@ -1126,7 +1126,7 @@ pub fn refresh(app: &mut App) -> Vec<Effect> {
     effects
 }
 
-/// Llegó la lista de amigos o un cambio de presencia (para «en vivo · hace N s»).
+/// Llegó la lista de amigos o un cambio de presencia (para «en vivo» y su «hace N s»).
 pub fn on_friends(app: &mut App) {
     app.host.friends_at = Some(app.now);
 }
@@ -2227,15 +2227,25 @@ fn source_card(app: &App, real: bool) -> Element<'_, Message> {
         .into()
 }
 
-/// «en vivo · hace N s»: desde la última lista de amigos o el último cambio de presencia.
-fn live_label(app: &App) -> Option<String> {
+/// «● en vivo», con cuándo llegó la última lista de amigos o el último cambio de presencia al
+/// pasar el ratón: «hace N s» cambiaba de ancho cada segundo.
+fn live_label<'a>(app: &App) -> Option<Element<'a, Message>> {
     let at = app.host.friends_at?;
     let secs = app.now.saturating_duration_since(at).as_secs();
-    Some(if secs < 60 {
-        t!("host-en-vivo-hace-segundos", n = secs)
+    let detail = if secs < 60 {
+        t!("host-actualizado-hace-segundos", n = secs)
     } else {
-        t!("host-en-vivo-hace-minutos", n = secs / 60)
-    })
+        t!("host-actualizado-hace-minutos", n = secs / 60)
+    };
+    Some(ui::with_tooltip(
+        row![
+            ui::dot(Tone::Success),
+            ui::caption(t!("host-en-vivo-corto"))
+        ]
+        .spacing(space::XS)
+        .align_y(Alignment::Center),
+        detail,
+    ))
 }
 
 /// `list` con una línea y `element` debajo.
@@ -2256,7 +2266,7 @@ fn invite_card(app: &App, real: bool) -> Element<'_, Message> {
     if let Some(label) = live_label(app)
         && app.friends.loaded().is_some()
     {
-        header = header.push(ui::caption(label));
+        header = header.push(label);
     }
     let mut list = Column::new().push(container(header).padding(Padding::from([12.0, 16.0])));
     let push = with_separator;
@@ -2764,20 +2774,27 @@ fn setup(app: &App) -> Element<'_, Message> {
     ]
     .spacing(space::XS)
     .align_y(Alignment::Center);
-    let mut page = column![
+    let page = column![
         top,
         column![quality_head, preset_cards(app)].spacing(space::XS),
         advanced(app),
         audio_box(app, true),
     ]
     .spacing(space::M);
-    if let Some(error) = &state.error {
-        page = page.push(ui::banner(
+    // El error va con los botones, en una ranura que está siempre (con el espacio de debajo
+    // dentro): los bloques de la página no cambian de posición cuando aparece.
+    let error = state.error.as_ref().map(|error| {
+        container(ui::banner(
             Tone::Error,
             t!("host-no-se-pudo-abrir-la-sala", error = error),
             Some((t!("host-reintentar"), on(Msg::Start))),
-        ));
-    }
+        ))
+        .padding(Padding {
+            bottom: space::M,
+            ..Padding::ZERO
+        })
+        .into()
+    });
     let actions: Element<'_, Message> = if state.starting {
         let since = state.starting_since.unwrap_or(app.now);
         // Sin el sondeo de códecs (primer arranque o drivers nuevos) la sala lo espera: se dice.
@@ -2817,7 +2834,10 @@ fn setup(app: &App) -> Element<'_, Message> {
         .align_y(Alignment::Center)
         .into()
     };
-    page = page.push(row![ui::fill(), actions].align_y(Alignment::Center));
+    let page = page.push(column![
+        ui::slot(error),
+        row![ui::fill(), actions].align_y(Alignment::Center)
+    ]);
     ui::page("share", page)
 }
 
@@ -2945,12 +2965,33 @@ fn room_source_card<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
         }
         None => facts.push(t!("host-eligiendo-el-codec-con-tus-invitados").to_owned()),
     }
-    if let Some(kbps) = room.guests.iter().filter_map(|g| g.target_kbps).min() {
-        facts.push(stats::kbps(f64::from(kbps)));
-    }
+    // El bitrate objetivo detrás, en una ranura del ancho del más ancho (a la izquierda: va al
+    // final de la línea): cambia con el control de tasa y no debe repartir las líneas del texto
+    // de al lado.
+    let rate = room
+        .guests
+        .iter()
+        .filter_map(|g| g.target_kbps)
+        .min()
+        .map(|kbps| {
+            let line = |rate: &str| -> Element<'_, Message> {
+                ui::secondary(format!(" · {rate}"))
+                    .wrapping(Wrapping::None)
+                    .into()
+            };
+            ui::reserve(
+                stats::KBPS_WIDEST.map(line),
+                Some(line(&stats::kbps(f64::from(kbps)))),
+            )
+            .into()
+        });
     let info = column![
         ui::strong(title).wrapping(Wrapping::WordOrGlyph),
-        ui::secondary(facts.join(" · ")).wrapping(Wrapping::WordOrGlyph),
+        row![
+            ui::secondary(facts.join(" · ")).wrapping(Wrapping::WordOrGlyph),
+            ui::slot(rate),
+        ]
+        .align_y(Alignment::Center),
     ]
     .spacing(2)
     .width(Length::Fill);
@@ -2961,7 +3002,7 @@ fn room_source_card<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
         (!state.changing_source && state.switching.is_none()).then(|| on(Msg::ChangeSource(true))),
     );
     let stop = ui::button_with(
-        Kind::Normal,
+        Kind::DestructiveSoft,
         t!("host-dejar-de-compartir"),
         Some(Icon::Pause),
         (!state.changing_source && state.switching.is_none()).then(|| on(Msg::StopSharing)),
@@ -3043,6 +3084,14 @@ fn relay_reason(status: &GuestStatus) -> Option<&'static str> {
     silent.then(|| t!("host-cgnat"))
 }
 
+/// Los niveles de calidad, para medir la ranura de su insignia.
+const LEVELS: [QualityLevel; 4] = [
+    QualityLevel::Excellent,
+    QualityLevel::Good,
+    QualityLevel::Acceptable,
+    QualityLevel::Poor,
+];
+
 fn quality_label(level: QualityLevel) -> &'static str {
     match level {
         QualityLevel::Excellent => t!("host-calidad-excelente"),
@@ -3052,15 +3101,16 @@ fn quality_label(level: QualityLevel) -> &'static str {
     }
 }
 
-/// Lo que va con el nombre en una fila de «Integrantes»: «Anfitrión» y, si habla, «Hablando».
+/// Lo que va con el nombre en una fila de «Integrantes»: «Anfitrión» y, si habla, «Hablando»,
+/// en una ranura que está siempre (vacía si no habla): la fila no crece ni se corre cada vez que
+/// alguien empieza o deja de hablar.
 fn member_tags<'a>(host: bool, talking: bool) -> Vec<Element<'a, Message>> {
     let mut tags = Vec::new();
     if host {
         tags.push(coroom_ui::tag::live(t!("host-anfitrion")));
     }
-    if talking {
-        tags.push(ui::status_badge(Tone::Success, t!("host-hablando")));
-    }
+    let speaking = || ui::status_badge(Tone::Success, t!("host-hablando"));
+    tags.push(ui::reserve([speaking()], talking.then(speaking)).into());
     tags
 }
 
@@ -3216,27 +3266,37 @@ fn guest_row<'a>(app: &'a App, room: &'a Room, status: &'a GuestStatus) -> Eleme
         }
         None => facts.push(t!("host-conectando").to_owned()),
     }
-    if let Some(rtt) = status.rtt_ms {
-        facts.push(t!("host-rtt", ms = rtt.round() as u64));
-    }
     facts.push(permissions_label(&permissions));
     let talking = room.voice.talkers.contains(&id.0);
+    // Los datos en una línea: si no caben, «…» y enteros al pasar el ratón.
+    let facts = facts.join(" · ");
     let mut line = row![
         avatars::ringed_view(app, &status.name, status.avatar, size::AVATAR, talking),
         column![
             member_name(status.name.clone(), member_tags(false, talking)),
-            ui::secondary(facts.join(" · ")).wrapping(Wrapping::WordOrGlyph)
+            ui::one_line(facts, ui::secondary).width(Length::Fill)
         ]
         .spacing(2)
         .width(Length::Fill),
     ]
     .spacing(space::S)
     .align_y(Alignment::Center);
-    // El nivel con lo medido (el RTT de su conexión); sin medida, nada.
-    if let Some(rtt) = status.rtt_ms {
-        let level = QualityLevel::from_overhead_ms(rtt);
-        line = line.push(ui::status_badge(quality_tone(level), quality_label(level)));
-    }
+    // El nivel con lo medido (el RTT de su conexión) en una ranura del ancho de la insignia más
+    // ancha («Aceptable · 888 ms»), vacía hasta la primera medida: el menú «Más» no se corre.
+    let badge = |level: QualityLevel, rtt: String| {
+        ui::status_badge(
+            quality_tone(level),
+            t!("host-calidad-rtt", level = quality_label(level), ms = rtt),
+        )
+    };
+    let samples = LEVELS.map(|level| badge(level, "888".to_owned()));
+    let measured = status.rtt_ms.map(|rtt| {
+        badge(
+            QualityLevel::from_overhead_ms(rtt),
+            (rtt.round() as u64).to_string(),
+        )
+    });
+    line = line.push(ui::reserve(samples, measured));
     line = line.push(guest_menu(id, permissions));
     let muted = hears_muted(room, id);
     let mut card = column![
@@ -3282,7 +3342,7 @@ fn pad_line<'a>(app: &'a App, status: &'a GuestStatus) -> Element<'a, Message> {
     let max = coroom_session::input::max_gamepads();
     let slots = pad_choices(app.settings.input.preferred_slot, max);
     let current = PadSlot(status.permissions.gamepad_slot);
-    let mut controls = row![
+    let controls = row![
         ui::caption(t!("host-mando")),
         ui::select(slots, Some(current), move |slot| on(Msg::Pad(id, slot))),
         ui::select(
@@ -3294,6 +3354,8 @@ fn pad_line<'a>(app: &'a App, status: &'a GuestStatus) -> Element<'a, Message> {
     .spacing(space::XS)
     .align_y(Alignment::Center);
     let mut notes = Column::new().spacing(2);
+    // El VID:PID del mando, en su ranura (vacía hasta que lo declara).
+    let mut badge = None;
     match &status.gamepad {
         None => {
             notes = notes.push(ui::caption(t!("host-todavia-no-ha-conectado-ningun-mando")));
@@ -3304,7 +3366,7 @@ fn pad_line<'a>(app: &'a App, status: &'a GuestStatus) -> Element<'a, Message> {
                 PadTransport::XInput => "XInput",
                 PadTransport::Converted => t!("host-solo-convertido"),
             };
-            controls = controls.push(ui::status_badge(
+            badge = Some(ui::status_badge(
                 Tone::Neutral,
                 format!("{:04x}:{:04x} · {transport}", pad.vendor, pad.product),
             ));
@@ -3320,6 +3382,7 @@ fn pad_line<'a>(app: &'a App, status: &'a GuestStatus) -> Element<'a, Message> {
             }
         }
     }
+    let controls = controls.push(ui::slot(badge));
     container(column![controls, notes].spacing(space::XXS))
         .padding(Padding {
             left: size::AVATAR + space::S,
@@ -3352,10 +3415,29 @@ fn guests_section<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
     ]
     .spacing(space::S)
     .align_y(Alignment::Center);
-    let mut section = column![head].spacing(space::XS);
-    for request in &app.host.join_requests {
-        section = section.push(join_request_card(app, room, request));
-    }
+    // Las peticiones de entrada van en un bloque que está siempre (vacío sin peticiones, con el
+    // espacio de encima dentro): la lista de después no cambia de posición entre los hijos y sus
+    // deslizadores y menús no pierden el estado cuando llega o se va una.
+    let below = |content: Element<'a, Message>| -> Element<'a, Message> {
+        container(content)
+            .padding(Padding {
+                top: space::XS,
+                ..Padding::ZERO
+            })
+            .into()
+    };
+    let requests = (!app.host.join_requests.is_empty()).then(|| {
+        below(
+            Column::with_children(
+                app.host
+                    .join_requests
+                    .iter()
+                    .map(|request| join_request_card(app, room, request)),
+            )
+            .spacing(space::XS)
+            .into(),
+        )
+    });
     // Primero tú, después los invitados por orden de llegada; sin invitados, cómo traerlos.
     let mut rows = vec![own_row(app, room)];
     rows.extend(
@@ -3371,7 +3453,7 @@ fn guests_section<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
             None,
         ));
     }
-    section.push(ui::boxed_list(rows)).into()
+    column![head, ui::slot(requests), below(ui::boxed_list(rows))].into()
 }
 
 /// Tarjeta de un amigo que pide entrar, con el borde del acento y su cuenta atrás: «Dejar
@@ -3397,8 +3479,13 @@ fn join_request_card<'a>(
             column![
                 ui::strong(t!("host-name-pide-entrar", name = request.name))
                     .wrapping(Wrapping::WordOrGlyph),
-                ui::secondary(t!("host-pidio-hace", ago = ago.as_secs(), left = left))
-                    .wrapping(Wrapping::WordOrGlyph)
+                // La cuenta atrás en m:ss en una ranura de ancho fijo: cambia cada segundo sin
+                // mover el texto ni cortar la línea.
+                row![
+                    ui::secondary(t!("host-caduca-en")).wrapping(Wrapping::None),
+                    ui::figure(ui::secondary, stats::clock(left), &[stats::CLOCK_WIDEST]),
+                ]
+                .spacing(space::XXS)
             ]
             .spacing(2)
             .width(Length::Fill),
@@ -3501,16 +3588,16 @@ fn chat_panel(app: &App) -> Element<'_, Message> {
 
 /// Con la sala abierta.
 fn room_view<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
-    let mut page = Column::new().spacing(space::M).push(room_header(app, room));
+    let mut notices = Vec::new();
     if room.paused {
-        page = page.push(ui::banner(
+        notices.push(ui::banner(
             Tone::Warning,
             t!("host-la-entrada-de-todos-los-invitados"),
             Some((t!("host-reanudar"), on(Msg::Pause(false)))),
         ));
     }
     if let Some(relay) = &room.relay {
-        page = page.push(ui::banner(
+        notices.push(ui::banner(
             Tone::Warning,
             t!("host-sin-relay-relay-solo-podran-entrar", relay = relay),
             None,
@@ -3518,7 +3605,7 @@ fn room_view<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
     }
     if let Some((_, name)) = &app.host.handoff {
         // Pasar la sala, a la vista mientras dura: retirable hasta que conteste.
-        page = page.push(if app.host.handing_over {
+        notices.push(if app.host.handing_over {
             ui::banner(
                 Tone::Neutral,
                 t!("host-pasando-la-sala-a", name = name.as_str()),
@@ -3532,7 +3619,20 @@ fn room_view<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
             )
         });
     }
-    page = page
+    // Los avisos van en el bloque de la cabecera, en una ranura que está siempre (con el espacio
+    // de encima dentro): pausar la entrada no cambia de posición entre los hijos los bloques de
+    // después, y sus desplegables y deslizadores no pierden el estado.
+    let notices = (!notices.is_empty()).then(|| {
+        container(Column::with_children(notices).spacing(space::M))
+            .padding(Padding {
+                top: space::M,
+                ..Padding::ZERO
+            })
+            .into()
+    });
+    let mut page = Column::new()
+        .spacing(space::M)
+        .push(column![room_header(app, room), ui::slot(notices)])
         .push(room_source_card(app, room))
         .push(guests_section(app, room))
         // Solo informa: en tono neutro, porque el tono de información lleva el color de acento

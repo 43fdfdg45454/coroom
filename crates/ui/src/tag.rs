@@ -14,6 +14,7 @@ use crate::font::SEMIBOLD;
 use crate::style::ContainerClass;
 use crate::theme::Tone;
 use crate::tokens::text as type_size;
+use crate::widget::one_line;
 
 /// Cuándo surte efecto lo que se cambia.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,14 +35,15 @@ impl When {
     }
 }
 
-/// Etiqueta de cuándo surte efecto un ajuste, con el texto `label`.
+/// Etiqueta de cuándo surte efecto un ajuste, con el texto `label`: en una línea y, si no cabe,
+/// acortada con «…» y entera al pasar el ratón.
 pub fn tag<'a, M: 'a>(when: When, label: impl text::IntoFragment<'a>) -> Element<'a, M> {
-    container(
+    container(one_line(label.into_fragment().into_owned(), |label| {
         text(label)
             .size(type_size::CAPTION - 1.0)
             .font(SEMIBOLD)
-            .wrapping(Wrapping::None),
-    )
+            .wrapping(Wrapping::None)
+    }))
     .padding(Padding::from([2.0, 8.0]))
     .class(ContainerClass::Badge(when.tone()))
     .into()

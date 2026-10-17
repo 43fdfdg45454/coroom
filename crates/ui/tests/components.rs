@@ -116,11 +116,12 @@ fn gallery(theme: &Theme) -> Vec<Element<'static, Msg>> {
         ui::page("galería", ui::body("página")),
         Some(dialog),
         Msg::Press,
+        1.0,
+        0.0,
     ));
     all.push(ui::with_toasts(
         ui::body("base"),
         vec![ui::toast(Tone::Success, "Hecho")],
-        0.0,
     ));
     all
 }
