@@ -1845,15 +1845,16 @@ impl App {
                     .as_ref()
                     .map(AccountInfo::host)
                     .unwrap_or_default();
-                // «host ·» en una línea y la cifra a la derecha en su ranura.
+                // «host ·» en una línea y la cifra en su ranura, contando hasta cada medida nueva.
                 let widest = t!("app-rtt-ms", rtt = 888);
                 ui::status_badge_with(
                     tone,
                     row![
                         ui::one_line(t!("app-host-separador", host = host), ui::badge_text),
-                        ui::figure_after(
+                        ui::count_after(
                             ui::badge_text,
-                            t!("app-rtt-ms", rtt = rtt.round() as u64),
+                            rtt,
+                            |rtt| t!("app-rtt-ms", rtt = rtt.round() as u64),
                             &[widest.as_str()],
                         ),
                     ]

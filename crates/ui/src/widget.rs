@@ -1255,6 +1255,42 @@ pub fn figure_after<'a, M: 'a>(
     figure_aligned(style, value, widest, Horizontal::Left)
 }
 
+/// [`figure`] de un número que cuenta hasta su valor nuevo ([`crate::animate::Count`]); `format`
+/// lo escribe («48 ms»).
+pub fn count<'a, M: 'a>(
+    style: impl Fn(String) -> Text<'a> + Copy + 'a,
+    value: f64,
+    format: impl Fn(f64) -> String + 'a,
+    widest: &[&str],
+) -> Element<'a, M> {
+    count_aligned(style, value, format, widest, Horizontal::Right)
+}
+
+/// [`count`] alineada a la izquierda, como [`figure_after`].
+pub fn count_after<'a, M: 'a>(
+    style: impl Fn(String) -> Text<'a> + Copy + 'a,
+    value: f64,
+    format: impl Fn(f64) -> String + 'a,
+    widest: &[&str],
+) -> Element<'a, M> {
+    count_aligned(style, value, format, widest, Horizontal::Left)
+}
+
+fn count_aligned<'a, M: 'a>(
+    style: impl Fn(String) -> Text<'a> + Copy + 'a,
+    value: f64,
+    format: impl Fn(f64) -> String + 'a,
+    widest: &[&str],
+    align: Horizontal,
+) -> Element<'a, M> {
+    let widest: Vec<String> = widest.iter().map(|sample| (*sample).to_owned()).collect();
+    crate::animate::Count::new(value, move |value| {
+        let samples: Vec<&str> = widest.iter().map(String::as_str).collect();
+        figure_aligned(style, format(value), &samples, align)
+    })
+    .into()
+}
+
 fn figure_aligned<'a, M: 'a>(
     style: impl Fn(String) -> Text<'a>,
     value: impl Into<String>,

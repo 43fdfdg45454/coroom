@@ -1931,6 +1931,8 @@ fn pill_view<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     // Las cifras («48 ms», «RTT 120 ms», «5 s») en ranuras de ancho fijo: la píldora no cambia de
     // ancho a cada medida. Un texto más largo que la muestra («Midiendo», un motivo del relay)
     // ensancha la ranura, pero esos cambian de tarde en tarde.
+    // Sin cuenta animada sobre el vídeo: cada cuadro de la cuenta volvería a medir la interfaz
+    // y competiría con la entrega de los fotogramas.
     lead = lead.push(ui::figure(strong, pill.lead.clone(), &["888 ms"]));
     let reason_samples = [
         t!("room-rtt-valor", value = "888"),

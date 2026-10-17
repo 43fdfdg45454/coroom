@@ -12,6 +12,7 @@
 //!   ([`Token::Press`]) y volver ([`Token::Quick`]); los que tienen relleno suben 1 px al pasar.
 //!   Los botones de icono, además, se encogen al 96 % al pulsarlos; el texto no se escala nunca
 //!   (cambiaría el rasterizado de la letra en cada cuadro).
+//! - [`Count`]: una cifra cuenta hasta su valor nuevo.
 //! - [`ToneFade`]: una insignia que cambia de tono lo hace con un fundido.
 //! - [`Shake`]: el campo se sacude cuando aparece un error.
 //! - [`Segments`]: el fondo del segmento elegido se desliza hasta el nuevo.
@@ -1407,6 +1408,219 @@ impl<'a, M: 'a> From<ToneFade<'a, M>> for Element<'a, M> {
     }
 }
 
+/// Lo que tarda una cifra en contar hasta su valor nuevo.
+const COUNT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Una cifra que cuenta hasta su valor nuevo en 300 ms en lugar de saltar (latencias, el
+/// indicador del servidor). `build` dibuja la cifra para un valor; se llama en cada cuadro de la
+/// cuenta con el valor intermedio y debe dar siempre la misma forma (una ranura de ancho fijo,
+/// como [`crate::widget::figure`]), así que la fila no se mueve mientras cuenta. Con animaciones
+/// reducidas o sin ellas, salta.
+pub struct Count<'a, M> {
+    value: f64,
+    build: Box<dyn Fn(f64) -> Element<'a, M> + 'a>,
+    content: Element<'a, M>,
+    /// El valor que dibuja `content`.
+    built: f64,
+}
+
+impl<'a, M> Count<'a, M> {
+    /// La cifra `value`, dibujada con `build`.
+    pub fn new(value: f64, build: impl Fn(f64) -> Element<'a, M> + 'a) -> Self {
+        let content = build(value);
+        Self {
+            value,
+            build: Box::new(build),
+            content,
+            built: value,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CountState {
+    from: f64,
+    to: f64,
+    since: Option<Instant>,
+    now: Option<Instant>,
+    motion: Cell<Motion>,
+}
+
+impl CountState {
+    /// Avance de la cuenta, ya con su curva (1 si no hay).
+    fn progress(&self) -> f32 {
+        let (Some(since), Some(now)) = (self.since, self.now) else {
+            return 1.0;
+        };
+        let motion = self.motion.get();
+        let duration = motion.scale(COUNT);
+        if motion.is_reduced() || motion.is_off() || duration.is_zero() {
+            return 1.0;
+        }
+        let t = now.saturating_duration_since(since).as_secs_f32() / duration.as_secs_f32();
+        if t >= 1.0 {
+            1.0
+        } else {
+            Token::Panel.easing().value(t.max(0.0))
+        }
+    }
+
+    fn shown(&self) -> f64 {
+        self.from + (self.to - self.from) * f64::from(self.progress())
+    }
+}
+
+impl<M> iced_core::Widget<M, Theme, Renderer> for Count<'_, M> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<CountState>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(CountState {
+            from: self.value,
+            to: self.value,
+            since: None,
+            now: None,
+            motion: Cell::new(Motion::FULL),
+        })
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn size_hint(&self) -> Size<Length> {
+        self.content.as_widget().size_hint()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        let state = tree.state.downcast_mut::<CountState>();
+        if state.to != self.value {
+            // Un valor nuevo: cuenta desde el que se ve ahora.
+            state.from = state.shown();
+            state.to = self.value;
+            state.since = state.now;
+        }
+        let shown = state.shown();
+        if shown != self.built {
+            self.content = (self.build)(shown);
+            self.built = shown;
+            tree.children[0].diff(&self.content);
+        }
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, M>,
+        viewport: &Rectangle,
+    ) {
+        let state = tree.state.downcast_mut::<CountState>();
+        if let Event::Window(window::Event::RedrawRequested(now)) = event {
+            state.now = Some(*now);
+            if state.to != self.value || state.since.is_some() && state.progress() < 1.0 {
+                shell.invalidate_layout();
+                shell.request_redraw();
+            } else if state.since.is_some() {
+                // Terminó: el último *layout* deja el valor exacto.
+                state.since = None;
+                shell.invalidate_layout();
+            }
+        }
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        tree.state
+            .downcast_ref::<CountState>()
+            .motion
+            .set(theme.motion);
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+}
+
+impl<'a, M: 'a> From<Count<'a, M>> for Element<'a, M> {
+    fn from(count: Count<'a, M>) -> Self {
+        Element::new(count)
+    }
+}
+
 /// Lo que dura el sacudón de un campo con error.
 const SHAKE: std::time::Duration = std::time::Duration::from_millis(240);
 /// Oscilaciones del sacudón.
@@ -1654,6 +1868,24 @@ mod tests {
         assert_eq!(thumb_bounds(&segments, 7.0), Some(segments[2]));
         assert_eq!(thumb_bounds(&segments, -1.0), Some(segments[0]));
         assert_eq!(thumb_bounds(&[], 0.0), None);
+    }
+
+    #[test]
+    fn a_count_goes_from_the_old_value_to_the_new_one_and_stops_there() {
+        let start = Instant::now();
+        let state = |motion: Motion, after_ms: u64| CountState {
+            from: 10.0,
+            to: 50.0,
+            since: Some(start),
+            now: Some(start + std::time::Duration::from_millis(after_ms)),
+            motion: Cell::new(motion),
+        };
+        assert_eq!(state(Motion::FULL, 0).shown(), 10.0);
+        let halfway = state(Motion::FULL, 150).shown();
+        assert!(halfway > 10.0 && halfway < 50.0, "{halfway}");
+        assert_eq!(state(Motion::FULL, 300).shown(), 50.0);
+        // Sin animaciones (o con la entrada tomada) salta.
+        assert_eq!(state(Motion::OFF, 0).shown(), 50.0);
     }
 
     #[test]
