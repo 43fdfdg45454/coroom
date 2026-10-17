@@ -106,6 +106,7 @@ fn hold(reason: &str, stopped: mpsc::Receiver<()>) {
 }
 
 #[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
 fn hold(reason: &str, stopped: mpsc::Receiver<()>) {
     use windows::Win32::System::Power::{
         ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,

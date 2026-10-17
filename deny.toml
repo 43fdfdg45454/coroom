@@ -27,6 +27,14 @@ ignore = [
     # decoraciones Adwaita de `winit` 0.30 en Wayland. Las versiones nuevas (`fontdb` 0.24,
     # `skrifa`) llegan con `iced` 0.15; los SVG de los iconos ya no lo usan (`resvg` 0.48 sin texto).
     { id = "RUSTSEC-2026-0192", reason = "fontdb 0.23 de cosmic-text 0.15 (iced 0.14) y ab_glyph de winit 0.30; se retira con iced 0.15" },
+    # `zbus_names`, `zvariant` y `zvariant_derive` dejan de publicarse por separado: desde `zbus`
+    # 6.0.0 (2026-10-16) son módulos de `zbus`. Llegan con `zbus` 5, que usan `ashpd` 0.13 (todos
+    # los portales), `keyring` 4 (por `secret-service`) y `coroom-audio`; ni `ashpd` ni `keyring`
+    # tienen aún versión con `zbus` 6. No es una vulnerabilidad. Retirar al pasar a `zbus` 6 cuando
+    # salgan esas versiones (y `coroom-audio` con ellas).
+    { id = "RUSTSEC-2026-0370", reason = "zvariant de zbus 5 (ashpd 0.13, keyring 4); sin versiones con zbus 6 todavía" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names de zbus 5 (ashpd 0.13, keyring 4); sin versiones con zbus 6 todavía" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive de zbus 5 (ashpd 0.13, keyring 4); sin versiones con zbus 6 todavía" },
 ]
 
 [licenses]
