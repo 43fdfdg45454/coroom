@@ -461,7 +461,7 @@ fn d_kicked_guest_stops_presenting_and_cannot_decrypt() {
     let server = TestServer::start();
     let mut host = host(server.config());
     let code = room_code(&host);
-    let mut guest = guest(server.config(), &code, None);
+    let guest = guest(server.config(), &code, None);
     wait_until("30 fotogramas", Duration::from_secs(20), || {
         assert!(!guest.is_finished(), "{:?}", guest.end_reason());
         guest.summary().frames_presented >= 30
@@ -501,7 +501,15 @@ fn d_kicked_guest_stops_presenting_and_cannot_decrypt() {
         matches!(result, Err(MediaError::UnknownKey(_))),
         "{result:?}"
     );
-    guest.close();
+    // `coroom join` termina con el motivo y también con su resumen.
+    let ended = coroom_desktop::remote::finish_session(guest);
+    assert_eq!(ended.error, Some(SessionError::Removed.to_string()));
+    assert!(
+        ended
+            .summary
+            .is_some_and(|summary| summary.frames_presented >= 30),
+        "el resumen de lo que vio antes de la expulsión"
+    );
     host.close();
     drop(server);
 }

@@ -38,7 +38,7 @@ use super::video::{FeedSink, VideoFeed, Wake};
 use crate::account::{self, AccountOptions, AccountStore};
 use crate::probe::{ProbeOptions, Source, start_pipeline_with, to_present_frame};
 use crate::remote::{
-    AutoAllow, HostAudioOptions, HostOptions, JoinAudioOptions, JoinOptions, NetOptions,
+    AutoAllow, Ended, HostAudioOptions, HostOptions, JoinAudioOptions, JoinOptions, NetOptions,
     host_encoders, load_identity, prepare_host, share_source, start_guest, start_prepared_host,
 };
 
@@ -110,7 +110,7 @@ pub struct Backend {
     guest: Arc<Mutex<Option<GuestRun>>>,
     /// Cómo terminó la última sesión de invitado que se cerró sola (su resumen, o el motivo si
     /// fue por un error): `coroom join` con ventana lo da al salir.
-    guest_result: Arc<Mutex<Option<Result<LatencySummary, String>>>>,
+    guest_result: Arc<Mutex<Option<Ended>>>,
     /// Cancelación de la entrada en curso (antes de que haya sesión que cerrar).
     join_cancel: Option<Arc<AtomicBool>>,
     /// Sala de espera en marcha.
@@ -1146,9 +1146,9 @@ impl Backend {
             drop(take_if(&slot, |run| Arc::ptr_eq(&run.session, &session)));
             // El resumen antes de cerrar: si la aplicación sale ahora, la ranura ya está vacía.
             let summary = lock(&session).summary();
-            *lock(&result) = Some(match &reason {
-                Some(err) => Err(err.to_string()),
-                None => Ok(summary),
+            *lock(&result) = Some(Ended {
+                summary: Some(summary),
+                error: reason.as_ref().map(SessionError::to_string),
             });
             close_detached(session);
             feed.close();
@@ -1217,21 +1217,21 @@ impl Backend {
     }
 
     /// Detiene la prueba local y da su resumen.
-    pub fn finish_probe(&mut self) -> Option<Result<LatencySummary, String>> {
+    pub fn finish_probe(&mut self) -> Option<Ended> {
         let mut run = lock(&self.local).take()?;
         let pipeline = run.pipeline.take()?;
         let failure = pipeline.failure();
         let summary = pipeline.stop();
         drop(run.ledger);
-        Some(match failure {
-            Some(err) => Err(t!("backend-la-prueba-se-detuvo-err", err = err)),
-            None => Ok(summary),
+        Some(Ended {
+            summary: Some(summary),
+            error: failure.map(|err| t!("backend-la-prueba-se-detuvo-err", err = err)),
         })
     }
 
     /// Cierra todo al salir (espera a que las sesiones terminen). Devuelve el resumen del
     /// invitado, si había sesión, y el motivo si terminó por un error.
-    pub fn shutdown(&mut self) -> Option<Result<LatencySummary, String>> {
+    pub fn shutdown(&mut self) -> Option<Ended> {
         self.join_settings_save();
         self.stop_lobby();
         let host = lock(&self.host).take();
@@ -1244,9 +1244,9 @@ impl Backend {
                 let mut session = lock(&run.session);
                 let reason = session.end_reason();
                 session.close();
-                match reason {
-                    Some(err) => Err(err.to_string()),
-                    None => Ok(session.summary()),
+                Ended {
+                    summary: Some(session.summary()),
+                    error: reason.as_ref().map(SessionError::to_string),
                 }
             })
         });

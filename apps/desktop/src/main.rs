@@ -15,7 +15,7 @@ use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use coroom_desktop::account::{self, AccountOptions, FriendsAction, LoginOptions};
 use coroom_desktop::probe::{ProbeOptions, Source, run_headless};
 use coroom_desktop::remote::{
-    AutoAllow, CONSOLE_HELP, HostAudioOptions, HostOptions, JoinAudioOptions, JoinOptions,
+    AutoAllow, CONSOLE_HELP, Ended, HostAudioOptions, HostOptions, JoinAudioOptions, JoinOptions,
     NetOptions, load_identity, parse_game_capture, print_events_forwarding, run_host_console,
     run_join_console, run_join_headless, start_host, stdin_lines, wait_for_invitation,
 };
@@ -1024,23 +1024,37 @@ fn probe(args: &ProbeArgs) -> ExitCode {
         "con ventana"
     };
     eprintln!("Prueba de latencia local ({mode}): {options}");
-    let result = if args.headless {
-        run_headless(&options, wait_for_enter)
+    let ended = if args.headless {
+        Ended::from(run_headless(&options, wait_for_enter))
     } else {
         windowed(Launch::Probe(options))
     };
-    match result {
-        Ok(summary) => print_summary(&summary, args.json),
-        Err(err) => {
-            eprintln!("error: {err}");
-            ExitCode::FAILURE
-        }
-    }
+    report_end(ended, args.json)
 }
 
 /// `probe` y `join` con ventana: la pantalla de sala de la aplicación; al cerrarla, el resumen.
-fn windowed(launch: Launch) -> Result<LatencySummary, String> {
-    ui::run(launch)?.ok_or_else(|| "la ventana se cerró sin resumen".to_owned())
+fn windowed(launch: Launch) -> Ended {
+    match ui::run(launch) {
+        Ok(Some(ended)) => ended,
+        Ok(None) => Ended::failed("la ventana se cerró sin resumen".to_owned()),
+        Err(err) => Ended::failed(err),
+    }
+}
+
+/// El resumen de la sesión, si la hubo, y después el motivo si terminó por un error (el
+/// anfitrión que cierra la sala): entonces sale con error, pero con su tabla de latencia.
+fn report_end(ended: Ended, json: bool) -> ExitCode {
+    let printed = ended
+        .summary
+        .as_ref()
+        .map_or(ExitCode::SUCCESS, |summary| print_summary(summary, json));
+    match ended.error {
+        Some(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+        None => printed,
+    }
 }
 
 fn end_code(reason: Option<SessionError>) -> ExitCode {
@@ -1171,7 +1185,7 @@ fn join(args: &JoinArgs) -> ExitCode {
         "Invitado ({mode}): sala {}; identidad en {place}.",
         options.code
     );
-    let result = if args.headless {
+    let ended = if args.headless {
         run_join_headless(identity, &options, args.json, |session| {
             run_join_console(session, &stdin_lines())
         })
@@ -1181,13 +1195,7 @@ fn join(args: &JoinArgs) -> ExitCode {
             options: Box::new(options),
         })
     };
-    match result {
-        Ok(summary) => print_summary(&summary, args.json),
-        Err(err) => {
-            eprintln!("error: {err}");
-            ExitCode::FAILURE
-        }
-    }
+    report_end(ended, args.json)
 }
 
 #[cfg(test)]

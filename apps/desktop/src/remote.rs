@@ -1366,12 +1366,45 @@ pub fn start_guest(
 }
 
 /// Cierra la sesión y devuelve su resumen, o por qué terminó si fue con error.
-pub fn finish_session(mut session: RemoteSession) -> Result<LatencySummary, String> {
+pub fn finish_session(mut session: RemoteSession) -> Ended {
     let reason = session.end_reason();
     session.close();
-    match reason {
-        Some(err) => Err(err.to_string()),
-        None => Ok(session.summary()),
+    Ended {
+        summary: Some(session.summary()),
+        error: reason.as_ref().map(ToString::to_string),
+    }
+}
+
+/// Cómo terminó una sesión de `probe` o `join`: su resumen de latencia y, si terminó por un error
+/// (el anfitrión cerró la sala, se cortó), el motivo. Con los dos se imprime el resumen y luego el
+/// motivo.
+#[derive(Debug, Clone)]
+pub struct Ended {
+    /// Resumen (`None` si no llegó a haber sesión).
+    pub summary: Option<LatencySummary>,
+    /// Motivo, si terminó por un error.
+    pub error: Option<String>,
+}
+
+impl Ended {
+    /// Terminó sin sesión, por `error`.
+    pub fn failed(error: String) -> Self {
+        Self {
+            summary: None,
+            error: Some(error),
+        }
+    }
+}
+
+impl From<Result<LatencySummary, String>> for Ended {
+    fn from(result: Result<LatencySummary, String>) -> Self {
+        match result {
+            Ok(summary) => Self {
+                summary: Some(summary),
+                error: None,
+            },
+            Err(error) => Self::failed(error),
+        }
     }
 }
 
@@ -1400,16 +1433,22 @@ pub fn run_join_headless(
     options: &JoinOptions,
     json: bool,
     until_stopped: impl FnOnce(&RemoteSession),
-) -> Result<LatencySummary, String> {
-    let script = options
+) -> Ended {
+    let script = match options
         .input_script
         .as_deref()
         .map(InputScript::from_file)
         .transpose()
-        .map_err(|err| err.to_string())?;
+    {
+        Ok(script) => script,
+        Err(err) => return Ended::failed(err.to_string()),
+    };
     let sink = Box::new(PresenterSink::new(NullPresenter::new()));
     // Sin ventana, la imagen de los decodificadores de GPU se queda en la GPU.
-    let session = start_guest(identity, options, sink, DecodeOutput::Gpu { vulkan: None })?;
+    let session = match start_guest(identity, options, sink, DecodeOutput::Gpu { vulkan: None }) {
+        Ok(session) => session,
+        Err(err) => return Ended::failed(err),
+    };
     let printer = print_events(&session, json);
     let player = script.map(|script| {
         let input = session.input();
@@ -1435,7 +1474,7 @@ pub fn run_join_headless(
         if let Ok(Err(err)) = played {
             let _ = finish_session(session);
             let _ = printer.join();
-            return Err(format!("guion de entrada: {err}"));
+            return Ended::failed(format!("guion de entrada: {err}"));
         }
     } else {
         until_stopped(&session);

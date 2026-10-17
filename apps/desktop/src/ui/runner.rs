@@ -46,7 +46,6 @@ use coroom_render::wgpu::{GpuContext, HdrSurface, create_instance};
 use coroom_session::input::capture::{Action, CaptureMode, InputCapture, ShortcutKeys};
 use coroom_session::input::gamepad::{ConnectedPad, GamepadCapture, PadLink};
 use coroom_session::input::keymap::keycode_from_name;
-use coroom_session::latency::LatencySummary;
 use coroom_transport::crypto::Identity;
 use coroom_ui::font::Fonts;
 use iced_core::clipboard::Kind;
@@ -76,7 +75,7 @@ use super::screens::settings as settings_screen;
 use super::settings::{self, Settings, Shortcuts};
 use super::system;
 use crate::probe::{ProbeOptions, decode_output_for};
-use crate::remote::JoinOptions;
+use crate::remote::{Ended, JoinOptions};
 
 /// Título de la ventana.
 pub const TITLE: &str = "coroom";
@@ -180,12 +179,12 @@ struct Runner {
     proxy: EventLoopProxy<UserEvent>,
     ready: Option<Ready>,
     error: Option<String>,
-    result: Option<Result<LatencySummary, String>>,
+    result: Option<Ended>,
 }
 
 /// Abre la ventana y la ejecuta hasta que se cierre. Con [`Launch::Probe`] y [`Launch::Join`]
-/// devuelve el resumen de latencia final.
-pub fn run(launch: Launch) -> Result<Option<LatencySummary>, String> {
+/// devuelve cómo terminó la sesión, con su resumen de latencia.
+pub fn run(launch: Launch) -> Result<Option<Ended>, String> {
     super::ui_sound::install();
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
@@ -216,7 +215,7 @@ pub fn run(launch: Launch) -> Result<Option<LatencySummary>, String> {
     if let Some(err) = runner.error {
         return Err(err);
     }
-    runner.result.transpose()
+    Ok(runner.result)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
