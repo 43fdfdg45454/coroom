@@ -76,7 +76,7 @@ pub struct GuestControls {
 }
 
 struct GuestRun {
-    session: Arc<Mutex<RemoteSession>>,
+    session: Shared,
     controls: GuestControls,
 }
 
@@ -106,8 +106,11 @@ pub struct Backend {
     importer: Option<VideoImporter>,
     output: DecodeOutput,
     settings_path: PathBuf,
-    host: Arc<Mutex<Option<Arc<Mutex<RemoteSession>>>>>,
+    host: Arc<Mutex<Option<Shared>>>,
     guest: Arc<Mutex<Option<GuestRun>>>,
+    /// Cómo terminó la última sesión de invitado que se cerró sola (su resumen, o el motivo si
+    /// fue por un error): `coroom join` con ventana lo da al salir.
+    guest_result: Arc<Mutex<Option<Result<LatencySummary, String>>>>,
     /// Cancelación de la entrada en curso (antes de que haya sesión que cerrar).
     join_cancel: Option<Arc<AtomicBool>>,
     /// Sala de espera en marcha.
@@ -236,6 +239,7 @@ impl Backend {
             settings_path,
             host: Arc::new(Mutex::new(None)),
             guest: Arc::new(Mutex::new(None)),
+            guest_result: Arc::new(Mutex::new(None)),
             join_cancel: None,
             lobby: None,
             local: Arc::new(Mutex::new(None)),
@@ -894,7 +898,7 @@ impl Backend {
     }
 
     /// La sesión con chat: la sala propia o aquella en la que se está como invitado.
-    fn chat_session(&self) -> Option<Arc<Mutex<RemoteSession>>> {
+    fn chat_session(&self) -> Option<Shared> {
         lock(&self.host).clone().or_else(|| {
             lock(&self.guest)
                 .as_ref()
@@ -993,7 +997,7 @@ impl Backend {
                 load_identity(crate::ui::settings::explicit_data_dir().as_deref(), false)
                     .and_then(|(identity, _)| prepare_host(identity, &host, on_token));
             let mut session = match prepared {
-                Ok(session) => session,
+                Ok(session) => Live::new(session),
                 Err(err) => {
                     tracing::warn!(error = %err, "no se pudo preparar la sala");
                     notify(Message::Event(Event::HostStarted(Err(err))));
@@ -1061,6 +1065,7 @@ impl Backend {
         let feed = self.feed(self.importer.clone());
         let output = self.output.clone();
         let slot = Arc::clone(&self.guest);
+        let result = Arc::clone(&self.guest_result);
         let cancel = Arc::new(AtomicBool::new(false));
         self.join_cancel = Some(Arc::clone(&cancel));
         tracing::info!(
@@ -1078,8 +1083,9 @@ impl Backend {
                     .map(|(identity, _)| identity),
             };
             let sink = Box::new(FeedSink::new(Arc::clone(&feed)));
-            let started =
-                identity.and_then(|identity| start_guest(identity, &options, sink, output));
+            let started = identity
+                .and_then(|identity| start_guest(identity, &options, sink, output))
+                .map(Live::new);
             let session = match started {
                 Ok(_) | Err(_) if cancel.load(Ordering::Relaxed) => {
                     if let Ok(mut session) = started {
@@ -1138,6 +1144,12 @@ impl Backend {
             drop(poller);
             let reason = forward_events(events, &notify, Event::Guest, &session, "guest");
             drop(take_if(&slot, |run| Arc::ptr_eq(&run.session, &session)));
+            // El resumen antes de cerrar: si la aplicación sale ahora, la ranura ya está vacía.
+            let summary = lock(&session).summary();
+            *lock(&result) = Some(match &reason {
+                Some(err) => Err(err.to_string()),
+                None => Ok(summary),
+            });
             close_detached(session);
             feed.close();
             tracing::info!(
@@ -1238,7 +1250,16 @@ impl Backend {
                 }
             })
         });
-        guest.or_else(|| self.finish_probe())
+        let guest = guest.or_else(|| lock(&self.guest_result).take());
+        let result = guest.or_else(|| self.finish_probe());
+        // Las sesiones que se cierran aparte (`close_detached`) sueltan al final su decodificador
+        // y con él el dispositivo Vulkan de la ventana: salir antes de que terminen deja ese
+        // `vkDestroyDevice` en carrera con los destructores del driver (SIGSEGV al salir).
+        if !wait_live_released(SHUTDOWN_WAIT) {
+            let segundos = SHUTDOWN_WAIT.as_secs();
+            tracing::warn!(segundos, "una sesión no terminó de soltarse a tiempo");
+        }
+        result
     }
 }
 
@@ -1264,7 +1285,7 @@ fn forward_events(
     events: crossbeam_channel::Receiver<SessionEvent>,
     notify: &Notify,
     each: fn(SessionEvent) -> Event,
-    session: &Mutex<RemoteSession>,
+    session: &Mutex<Live<RemoteSession>>,
     role: &'static str,
 ) -> Option<SessionError> {
     let mut reason = None;
@@ -1439,9 +1460,65 @@ fn take_if<T>(slot: &Mutex<Option<T>>, is_mine: impl FnOnce(&T) -> bool) -> Opti
     }
 }
 
+/// Una sesión compartida entre la ventana y sus hilos.
+type Shared = Arc<Mutex<Live<RemoteSession>>>;
+
+/// Un valor que cuenta mientras no termine de soltarse, para que la salida de la aplicación lo
+/// espere ([`wait_live_released`]): una sesión se suelta en el hilo que tenga su última
+/// referencia (el de `close_detached`, el de las estadísticas…), y con ella su decodificador y el
+/// dispositivo Vulkan que comparte con la ventana.
+struct Live<T> {
+    inner: Option<T>,
+}
+
+/// Cuántos [`Live`] quedan sin soltar, y el aviso de cuando baja.
+static LIVE: (Mutex<usize>, Condvar) = (Mutex::new(0), Condvar::new());
+
+impl<T> Live<T> {
+    fn new(inner: T) -> Self {
+        *lock(&LIVE.0) += 1;
+        Self { inner: Some(inner) }
+    }
+}
+
+/// Espera como mucho `wait` a que no quede ningún [`Live`] sin soltar; `false` si no llegó.
+fn wait_live_released(wait: Duration) -> bool {
+    let (count, released) = &LIVE;
+    let guard = lock(count);
+    let (guard, _) = released
+        .wait_timeout_while(guard, wait, |live| *live > 0)
+        .unwrap_or_else(PoisonError::into_inner);
+    *guard == 0
+}
+
+impl<T> std::ops::Deref for Live<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.inner.as_ref().expect("Live vaciado antes de su drop")
+    }
+}
+
+impl<T> std::ops::DerefMut for Live<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.inner.as_mut().expect("Live vaciado antes de su drop")
+    }
+}
+
+impl<T> Drop for Live<T> {
+    fn drop(&mut self) {
+        // Primero se suelta el valor entero; solo entonces deja de contar.
+        drop(self.inner.take());
+        let (count, released) = &LIVE;
+        let mut live = lock(count);
+        *live = live.saturating_sub(1);
+        released.notify_all();
+    }
+}
+
 /// Cierra la sesión en un hilo aparte: `close` espera a sus hilos y puede tardar (o no volver si
 /// alguno se quedó colgado), y nunca debe hacerlo bajo un cerrojo ni en el hilo de la ventana.
-fn close_detached(session: Arc<Mutex<RemoteSession>>) {
+fn close_detached(session: Shared) {
     let spawned = thread::Builder::new()
         .name("coroom-cerrar".into())
         .spawn(move || lock(&session).close());
@@ -1564,7 +1641,7 @@ fn run_mic_test(request: &MicTest, running: &RunningMicTest, notify: &Notify) {
 }
 
 /// Estado de los invitados del anfitrión cada [`HOST_STATUS_PERIOD`] mientras la sala siga.
-fn poll_host_guests(session: std::sync::Weak<Mutex<RemoteSession>>, notify: Notify) {
+fn poll_host_guests(session: std::sync::Weak<Mutex<Live<RemoteSession>>>, notify: Notify) {
     let spawned = thread::Builder::new()
         .name("coroom-invitados".into())
         .spawn(move || {
@@ -1983,6 +2060,32 @@ fn codec_preference(choice: CodecChoice) -> Option<coroom_session::codec::Codec>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Una sesión que se suelta en otro hilo (el de `close_detached`) retiene la salida hasta
+    /// soltarse del todo: si no, su `vkDestroyDevice` corre a la vez que los destructores del
+    /// driver (SIGSEGV al salir).
+    #[test]
+    fn leaving_waits_for_sessions_that_are_still_being_released() {
+        struct SlowToRelease(Arc<AtomicBool>);
+        impl Drop for SlowToRelease {
+            fn drop(&mut self) {
+                // Lo que tarda en soltarse un decodificador con su dispositivo.
+                thread::sleep(Duration::from_millis(200));
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let released = Arc::new(AtomicBool::new(false));
+        let live = Live::new(SlowToRelease(Arc::clone(&released)));
+        let releasing = thread::spawn(move || drop(live));
+        assert!(wait_live_released(Duration::from_secs(30)));
+        assert!(released.load(Ordering::SeqCst), "volvió antes de soltarse");
+        releasing.join().expect("hilo");
+
+        // Con una sesión que no se suelta, la espera vuelve en su plazo y lo dice.
+        let held = Live::new(());
+        assert!(!wait_live_released(Duration::from_millis(50)));
+        drop(held);
+    }
     use coroom_testkit::timing_assert;
 
     /// Un `notify` que guarda los mensajes en un canal.
