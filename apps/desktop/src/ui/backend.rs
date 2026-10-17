@@ -1146,10 +1146,10 @@ impl Backend {
             drop(take_if(&slot, |run| Arc::ptr_eq(&run.session, &session)));
             // El resumen antes de cerrar: si la aplicación sale ahora, la ranura ya está vacía.
             let summary = lock(&session).summary();
-            *lock(&result) = Some(Ended {
-                summary: Some(summary),
-                error: reason.as_ref().map(SessionError::to_string),
-            });
+            *lock(&result) = Some(Ended::new(
+                summary,
+                reason.as_ref().map(SessionError::to_string),
+            ));
             close_detached(session);
             feed.close();
             tracing::info!(
@@ -1244,10 +1244,10 @@ impl Backend {
                 let mut session = lock(&run.session);
                 let reason = session.end_reason();
                 session.close();
-                Ended {
-                    summary: Some(session.summary()),
-                    error: reason.as_ref().map(SessionError::to_string),
-                }
+                Ended::new(
+                    session.summary(),
+                    reason.as_ref().map(SessionError::to_string),
+                )
             })
         });
         let guest = guest.or_else(|| lock(&self.guest_result).take());

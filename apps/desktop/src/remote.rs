@@ -1369,10 +1369,7 @@ pub fn start_guest(
 pub fn finish_session(mut session: RemoteSession) -> Ended {
     let reason = session.end_reason();
     session.close();
-    Ended {
-        summary: Some(session.summary()),
-        error: reason.as_ref().map(ToString::to_string),
-    }
+    Ended::new(session.summary(), reason.as_ref().map(ToString::to_string))
 }
 
 /// Cómo terminó una sesión de `probe` o `join`: su resumen de latencia y, si terminó por un error
@@ -1387,6 +1384,19 @@ pub struct Ended {
 }
 
 impl Ended {
+    /// La sesión terminó con `summary` y, si fue por un error, `error`. Si nunca llegó a la sala
+    /// (el código no existe, el anfitrión no estaba) no hay resumen: sería una tabla en cero.
+    pub fn new(summary: LatencySummary, error: Option<String>) -> Self {
+        let reached = summary.link.is_some()
+            || summary.frames_presented > 0
+            || summary.drops_total > 0
+            || error.is_none();
+        Self {
+            summary: reached.then_some(summary),
+            error,
+        }
+    }
+
     /// Terminó sin sesión, por `error`.
     pub fn failed(error: String) -> Self {
         Self {
@@ -1487,6 +1497,17 @@ pub fn run_join_headless(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Una sala que no existe termina con el error y sin una tabla en cero; una sesión que termina
+    /// bien conserva su resumen aunque esté vacío.
+    #[test]
+    fn a_session_that_never_reached_the_room_has_no_summary() {
+        let empty = LatencyLedger::new().summary();
+        let failed = Ended::new(empty.clone(), Some("la sala no existe".to_owned()));
+        assert!(failed.summary.is_none());
+        assert_eq!(failed.error.as_deref(), Some("la sala no existe"));
+        assert!(Ended::new(empty, None).summary.is_some());
+    }
 
     #[test]
     fn identities_persist_in_the_data_directory() {
