@@ -203,6 +203,18 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **La pantalla ya no se bloquea mientras miras una transmisión**: como invitado, con el vídeo
+  delante y el anfitrión compartiendo, coroom impide que el escritorio se bloquee o apague la
+  pantalla por inactividad (aunque solo uses un mando, que el sistema no cuenta). En Linux con el
+  portal `Inhibit`, también en Flatpak; en Windows con `SetThreadExecutionState`. Se suelta al
+  salir de la sala o cuando el anfitrión deja de compartir.
+- **Cambiar de servidor con la sala abierta pregunta antes**: la sala se cierra para todos, como al
+  salir de la aplicación.
+- **Cerrar la ventana (o `Ctrl+Q`) dentro de una sala como invitado pregunta antes**, igual que
+  `Esc`.
+- **Con tu sala abierta no se puede entrar en otra**: «Entrar» con un código o desde una invitación
+  queda desactivado y explica que hay que cerrar la sala propia.
+
 - **El ratón del invitado coincide con el del anfitrión Windows con varios monitores o escalado**:
   el movimiento absoluto lleva el cursor a su píxel exacto con `SetCursorPos` después de
   `SendInput` (con dos monitores quedaba desplazado, más hacia las esquinas), y la inyección y la

@@ -7,6 +7,7 @@ home-update-see = Ver la versión
 home-relay-disabled = Este servidor no tiene relay: solo funcionará la conexión directa entre equipos.
 home-relay-usage = Has usado el { $percent } % del relay este mes ({ $used } de { $quota }). Al llegar al 100 % solo funcionará la conexión directa.
 home-offline-reason = Sin conexión con el servidor: coroom vuelve a intentarlo solo.
+home-hosting-reason = Tienes tu sala abierta: ciérrala para entrar en otra.
 
 ## Compartir y unirse
 

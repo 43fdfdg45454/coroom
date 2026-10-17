@@ -717,6 +717,10 @@ pub enum Dialog {
     SignOut,
     /// Salir de la aplicación con la sala abierta.
     QuitWhileHosting,
+    /// Salir de la aplicación (cerrar la ventana o `Ctrl+Q`) dentro de una sala como invitado.
+    QuitWhileGuest,
+    /// Cambiar de servidor con la sala abierta.
+    SwitchServerWhileHosting,
     /// Desvincular un dispositivo.
     RevokeDevice {
         /// Dispositivo.
@@ -957,6 +961,17 @@ impl App {
                 .is_some_and(|guest| guest.phase == guest::Phase::Video)
     }
 
+    /// Si hay que impedir que el escritorio se bloquee: con el vídeo del invitado delante y el
+    /// anfitrión compartiendo algo. Quien mira (o juega con un mando, que el sistema no cuenta como
+    /// actividad) no toca el teclado ni el ratón.
+    pub fn wants_idle_inhibit(&self) -> bool {
+        self.video_in_front()
+            && self
+                .guest
+                .as_ref()
+                .is_some_and(|guest| !guest.nothing_shared())
+    }
+
     /// Fondo bajo la interfaz y el vídeo para el compositor de la ventana: el del vídeo con el
     /// vídeo delante, el de la ventana si no.
     pub fn backdrop(&self) -> iced_core::Color {
@@ -1138,16 +1153,12 @@ impl App {
             }
             Message::SwitchServer => {
                 self.account_menu = false;
-                let mut effects = vec![Effect::StopLobby];
                 if self.host.is_open() {
-                    effects.push(Effect::StopHost);
+                    // Cambiar de servidor cierra la sala para todos: se pregunta, como al salir.
+                    self.dialog = Some(Dialog::SwitchServerWhileHosting);
+                    return Vec::new();
                 }
-                // La cuenta sigue abierta: «Volver» lleva de nuevo a ella y elegir un servidor con
-                // la sesión guardada entra sin pedir la contraseña.
-                self.screen = Screen::Login;
-                self.login.step = login::Step::Servers;
-                self.login.error = None;
-                effects
+                self.switch_server()
             }
             Message::ToggleAccountMenu => {
                 self.account_menu = !self.account_menu;
@@ -1269,11 +1280,33 @@ impl App {
             .then(|| Effect::PreviewVisible(self.preview_visible()))
     }
 
+    /// Vuelve a la lista de servidores (cerrando la sala si está abierta). La cuenta sigue
+    /// abierta: «Volver» lleva de nuevo a ella y elegir un servidor con la sesión guardada entra
+    /// sin pedir la contraseña.
+    fn switch_server(&mut self) -> Vec<Effect> {
+        let mut effects = vec![Effect::StopLobby];
+        if self.host.is_open() {
+            effects.push(Effect::StopHost);
+        }
+        self.screen = Screen::Login;
+        self.login.step = login::Step::Servers;
+        self.login.error = None;
+        effects
+    }
+
+    /// Si se está dentro de una sala como invitado (no la prueba local).
+    pub fn in_room_as_guest(&self) -> bool {
+        self.screen == Screen::Guest && self.guest.is_some() && !self.probe
+    }
+
     fn shortcut(&mut self, shortcut: Shortcut) -> Vec<Effect> {
         match shortcut {
             Shortcut::Quit => {
                 if self.host.is_open() {
                     self.dialog = Some(Dialog::QuitWhileHosting);
+                    Vec::new()
+                } else if self.in_room_as_guest() {
+                    self.dialog = Some(Dialog::QuitWhileGuest);
                     Vec::new()
                 } else {
                     let mut effects = Vec::new();
@@ -1345,6 +1378,13 @@ impl App {
                 effects.push(Effect::Quit);
                 effects
             }
+            Dialog::QuitWhileGuest => {
+                let mut effects = guest::leave(self);
+                effects.extend(self.flush_settings());
+                effects.push(Effect::Quit);
+                effects
+            }
+            Dialog::SwitchServerWhileHosting => self.switch_server(),
             Dialog::RevokeDevice { device, .. } => vec![Effect::RevokeDevice(device)],
             Dialog::OfferHandoff { guest, name } => host::offer_handoff(self, guest, name),
             Dialog::HandoffOffered { .. } => host::accept_handoff(self),
@@ -1865,6 +1905,16 @@ impl App {
                 t!("app-cerrar-la-sala-y-salir").to_owned(),
                 t!("app-estas-compartiendo-la-pantalla-al-salir").to_owned(),
                 vec![fill(), cancel(), confirm(t!("app-cerrar-y-salir"), true)],
+            ),
+            Dialog::QuitWhileGuest => (
+                t!("app-salir-de-la-sala-y-cerrar").to_owned(),
+                t!("app-dejaras-de-ver-y-controlar-la").to_owned(),
+                vec![fill(), cancel(), confirm(t!("app-salir-y-cerrar"), true)],
+            ),
+            Dialog::SwitchServerWhileHosting => (
+                t!("app-cerrar-la-sala-y-cambiar-de-servidor").to_owned(),
+                t!("app-cambiar-de-servidor-cierra-la-sala").to_owned(),
+                vec![fill(), cancel(), confirm(t!("app-cerrar-y-cambiar"), true)],
             ),
             Dialog::RevokeDevice { name, .. } => (
                 t!("app-cerrar-la-sesion-de-name", name = name),

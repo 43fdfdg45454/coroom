@@ -3913,6 +3913,40 @@ mod tests {
         )));
     }
 
+    /// Con la sala abierta, cambiar de servidor pregunta antes (la cierra para todos) y no se
+    /// puede entrar en otra sala con un código ni con una invitación.
+    #[test]
+    fn an_open_room_is_not_left_by_accident() {
+        let mut app = app();
+        app.account = Some(crate::ui::app::tests::account());
+        open_room(&mut app);
+        let effects = app.update(Message::SwitchServer);
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(matches!(
+            app.dialog,
+            Some(crate::ui::app::Dialog::SwitchServerWhileHosting)
+        ));
+        app.update(Message::CloseDialog);
+        assert!(app.host.is_open(), "cancelar deja la sala abierta");
+
+        use crate::ui::screens::home::Msg as HomeMsg;
+        app.update(Message::Home(HomeMsg::Code("K7Q2MZ".into())));
+        assert!(app.update(Message::Home(HomeMsg::Join)).is_empty());
+        assert!(
+            app.update(Message::Home(HomeMsg::Accept("K7Q2MZ".into())))
+                .is_empty()
+        );
+        assert!(app.guest.is_none());
+
+        let effects = app.update(Message::SwitchServer);
+        assert!(effects.is_empty());
+        let effects = app.update(Message::ConfirmDialog);
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::StopHost)),
+            "{effects:?}"
+        );
+    }
+
     /// Pasar la sala: se confirma, se ofrece, Bea contesta con su código, se manda a los demás y,
     /// al cerrar esta, se entra en la suya.
     #[test]

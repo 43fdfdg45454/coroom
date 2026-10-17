@@ -16,6 +16,11 @@ app-cerrar-la-sesion-de-name = ¿Cerrar la sesión de «{ $name }»?
 app-cerrar-sesion = Cerrar sesión
 app-cerrar-sesion-2 = ¿Cerrar sesión?
 app-cerrar-y-salir = Cerrar y salir
+app-salir-de-la-sala-y-cerrar = ¿Salir de la sala y cerrar coroom?
+app-salir-y-cerrar = Salir y cerrar
+app-cerrar-la-sala-y-cambiar-de-servidor = ¿Cerrar la sala y cambiar de servidor?
+app-cambiar-de-servidor-cierra-la-sala = Estás compartiendo la pantalla: al cambiar de servidor, la sala se cierra para todos.
+app-cerrar-y-cambiar = Cerrar y cambiar
 app-compara-estos-numeros-con-name-por = Compara estos números con { $name } por otro medio (en persona o por una llamada). Si coinciden, nadie se ha puesto en medio.
 app-compartir = Compartir
 app-copiado-al-portapapeles = Copiado al portapapeles
@@ -138,6 +143,7 @@ portal-no-se-pudo-olvidar-el-permiso = no se pudo olvidar el permiso de pantalla
 ## runner
 
 runner-error-del-bucle-de-la-ventana = error del bucle de la ventana: { $err }
+runner-mirando-una-transmision = Mirando una transmisión de coroom
 runner-este-equipo = este equipo
 runner-no-hay-pantalla-disponible-cause-prueba = no hay pantalla disponible ({ $cause }); prueba las órdenes sin ventana (`coroom --help`)
 runner-no-se-pudo-abrir-la-ventana = no se pudo abrir la ventana: { $err }

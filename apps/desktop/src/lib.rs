@@ -9,6 +9,7 @@ pub mod l10n;
 pub mod account;
 pub mod avatar;
 pub mod doctor;
+pub mod inhibit;
 pub mod localtime;
 pub mod logging;
 pub mod portal;

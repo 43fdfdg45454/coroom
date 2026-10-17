@@ -113,7 +113,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             Vec::new()
         }
         Msg::Join => {
-            if server_down(app) {
+            if server_down(app) || app.host.is_open() {
                 return Vec::new();
             }
             let code = app.home.code.clone();
@@ -129,7 +129,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             guest::start(app, code)
         }
         Msg::Accept(code) => {
-            if server_down(app) {
+            if server_down(app) || app.host.is_open() {
                 return Vec::new();
             }
             app.invitations.retain(|invitation| invitation.code != code);
@@ -418,6 +418,18 @@ fn big_card_header<'a>(icon: Icon, title: &'a str, explanation: &'a str) -> Elem
     .into()
 }
 
+/// El motivo de «Entrar» desactivado con la sala propia abierta: entrar en otra la dejaría
+/// abierta sin nadie que la vea.
+fn hosting_reason<'a>() -> Element<'a, Message> {
+    row![
+        icon_with(Icon::Info, 14.0, SvgClass::Tone(Tone::Info)),
+        ui::caption(t!("home-hosting-reason")).wrapping(Wrapping::WordOrGlyph)
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center)
+    .into()
+}
+
 /// El motivo de un botón desactivado por el servidor caído.
 fn offline_reason<'a>() -> Element<'a, Message> {
     row![
@@ -500,7 +512,8 @@ fn code_input(app: &App, real: bool, enabled: bool) -> Element<'_, Message> {
 /// Tarjeta de unirse (`real`: ver [`ui::equal_height_row`]; la copia no lleva el `id` del campo
 /// ni mensajes).
 fn join_card(app: &App, real: bool) -> Element<'_, Message> {
-    let blocked = server_down(app);
+    let hosting = app.host.is_open();
+    let blocked = server_down(app) || hosting;
     let mut content = column![
         big_card_header(Icon::LogIn, t!("home-join-title"), t!("home-join-text")),
         row![
@@ -528,10 +541,28 @@ fn join_card(app: &App, real: bool) -> Element<'_, Message> {
             .align_y(Alignment::Center),
         );
     }
-    if blocked {
+    if hosting {
+        content = content.push(hosting_reason());
+    } else if blocked {
         content = content.push(offline_reason());
     }
     big_card(content, real)
+}
+
+/// «Entrar» de una invitación; con la sala propia abierta, desactivado y con el motivo al pasar
+/// el ratón.
+fn enter_invitation(invitation: &Invitation, blocked: bool, hosting: bool) -> Element<'_, Message> {
+    let button = ui::button_with(
+        Kind::Primary,
+        t!("home-enter"),
+        Some(Icon::LogIn),
+        (!blocked).then(|| on(Msg::Accept(invitation.code.clone()))),
+    );
+    if hosting {
+        ui::with_tooltip(button, t!("home-hosting-reason"))
+    } else {
+        button.into()
+    }
 }
 
 /// Tarjeta de una invitación que llega, con el borde del acento y su cuenta atrás.
@@ -541,7 +572,8 @@ fn invitation_card<'a>(app: &'a App, invitation: &'a Invitation) -> Element<'a, 
         .saturating_duration_since(received_at(app, invitation))
         .min(INVITATION_TTL);
     let left = INVITATION_TTL.saturating_sub(ago).as_secs().max(1);
-    let blocked = server_down(app);
+    let hosting = app.host.is_open();
+    let blocked = server_down(app) || hosting;
     container(
         row![
             avatars::view(
@@ -567,12 +599,7 @@ fn invitation_card<'a>(app: &'a App, invitation: &'a Invitation) -> Element<'a, 
                 t!("home-ignore"),
                 Some(on(Msg::Ignore(invitation.from_user)))
             ),
-            ui::button_with(
-                Kind::Primary,
-                t!("home-enter"),
-                Some(Icon::LogIn),
-                (!blocked).then(|| on(Msg::Accept(invitation.code.clone())))
-            )
+            enter_invitation(invitation, blocked, hosting)
         ]
         .spacing(space::S)
         .align_y(Alignment::Center),

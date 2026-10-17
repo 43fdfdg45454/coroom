@@ -3298,6 +3298,44 @@ pub(crate) mod shots {
 
 #[cfg(test)]
 mod tests {
+    /// Con la transmisión delante el escritorio no se bloquea; en una sala solo de voz, sí.
+    #[test]
+    fn the_screen_does_not_lock_while_watching_a_stream() {
+        let mut app = app();
+        shots::joined(&mut app, false, true);
+        app.update(Message::Event(Event::Guest(SessionEvent::Sharing(true))));
+        app.now += ESTIMATE_DWELL;
+        app.update(Message::Tick);
+        assert!(app.video_in_front());
+        assert!(app.wants_idle_inhibit());
+        app.update(Message::Event(Event::Guest(SessionEvent::Sharing(false))));
+        assert!(
+            !app.wants_idle_inhibit(),
+            "sin nada compartido no hay qué mirar"
+        );
+    }
+
+    /// Cerrar la ventana (o `Ctrl+Q`) dentro de una sala pregunta antes, como `Esc`; al
+    /// confirmar, sale de la sala y cierra.
+    #[test]
+    fn quitting_inside_a_room_asks_first() {
+        let mut app = app();
+        shots::joined(&mut app, false, true);
+        assert!(app.in_room_as_guest());
+        let effects = app.update(Message::Shortcut(crate::ui::app::Shortcut::Quit));
+        assert!(effects.is_empty(), "{effects:?}");
+        assert!(matches!(
+            app.dialog,
+            Some(crate::ui::app::Dialog::QuitWhileGuest)
+        ));
+        let effects = app.update(Message::ConfirmDialog);
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::Leave)),
+            "{effects:?}"
+        );
+        assert!(matches!(effects.last(), Some(Effect::Quit)), "{effects:?}");
+    }
+
     #[test]
     fn corrupt_video_is_noticed_once_per_period() {
         let start = Instant::now();

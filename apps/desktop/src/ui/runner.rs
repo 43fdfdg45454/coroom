@@ -149,6 +149,9 @@ struct Ready {
     quit: bool,
     /// Eventos ya convertidos que la interfaz recibe de golpe en el próximo dibujo.
     pending: Vec<UiEvent>,
+    /// Mientras se mira una transmisión, el escritorio no se bloquea
+    /// ([`App::wants_idle_inhibit`]).
+    idle_inhibit: Option<crate::inhibit::IdleInhibitor>,
 }
 
 /// Lo que devolvió una pasada de la interfaz ([`Ready::pass`]).
@@ -420,6 +423,7 @@ impl Runner {
             interaction: mouse::Interaction::None,
             quit: false,
             pending: Vec::new(),
+            idle_inhibit: None,
         })
     }
 }
@@ -559,6 +563,19 @@ impl Ready {
         self.run_effects(effects);
         if self.app.guest.is_none() && self.input.is_some() {
             self.detach_input();
+        }
+        self.sync_idle_inhibit();
+    }
+
+    /// Impide o vuelve a permitir el bloqueo del escritorio según [`App::wants_idle_inhibit`].
+    fn sync_idle_inhibit(&mut self) {
+        let wanted = self.app.wants_idle_inhibit();
+        if wanted && self.idle_inhibit.is_none() {
+            self.idle_inhibit = Some(crate::inhibit::IdleInhibitor::start(t!(
+                "runner-mirando-una-transmision"
+            )));
+        } else if !wanted {
+            self.idle_inhibit = None;
         }
     }
 
@@ -874,7 +891,8 @@ impl Ready {
                 return;
             }
             WindowEvent::CloseRequested => {
-                if self.app.host.is_open() && !self.app.probe {
+                // Con la sala abierta (anfitrión o invitado) se pregunta, como con `Ctrl+Q`.
+                if (self.app.host.is_open() && !self.app.probe) || self.app.in_room_as_guest() {
                     self.dispatch(Message::Shortcut(Shortcut::Quit));
                 } else {
                     self.save_settings_now();
