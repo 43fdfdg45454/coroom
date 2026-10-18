@@ -9,6 +9,8 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Añadido
 
+- **Imagen del servidor para arm/v7**: además de amd64 y arm64, `ghcr.io/…/coroom-server` se publica
+  para Raspberry Pi con un sistema de 32 bits. La CI la compila de forma cruzada desde amd64.
 - **Avatares** (protocolo 16; hay que actualizar también el servidor): cada uno elige una imagen en
   Ajustes → Cuenta y servidor (PNG, JPEG o WebP; se recorta al centro y se reduce a 256 px). El
   servidor la valida y guarda su propio PNG, y avisa del cambio a los amigos y a quien comparte sala.

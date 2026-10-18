@@ -52,7 +52,9 @@ gestiona certificados: usa el tuyo o uno autofirmado.
 ## Imagen
 
 Cada push a `main` que pasa la CI publica una versión (`.github/workflows/ci.yml`, job
-«Publicación») y sube la imagen a GitHub Container Registry para **amd64** y **arm64**:
+«Publicación») y sube la imagen a GitHub Container Registry para **amd64**, **arm64** y
+**arm/v7** (Raspberry Pi con un sistema de 32 bits, como Raspberry Pi OS de 32 bits en una Pi 2,
+3 o 4):
 
 ```
 ghcr.io/43fdfdg45454/coroom-server:X.Y.Z    # una versión concreta (recomendado)
@@ -63,7 +65,8 @@ ghcr.io/43fdfdg45454/coroom-server:latest   # la última versión estable
 en vez de `latest`: los clientes y el servidor tienen que hablar la misma versión del protocolo.
 Para compilar la imagen tú mismo: `docker buildx build -f deploy/Dockerfile -t
 ghcr.io/43fdfdg45454/coroom-server:X.Y.Z .` desde la raíz del repositorio (la compilación es
-cruzada: `--platform linux/arm64` sirve también desde un equipo amd64).
+cruzada: `--platform linux/arm64` o `--platform linux/arm/v7` sirven también desde un equipo
+amd64).
 
 ## Primer arranque
 

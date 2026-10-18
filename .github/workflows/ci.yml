@@ -321,15 +321,17 @@ jobs:
           IMAGE: ${{ steps.image.outputs.name }}
         run: |
           refs=()
-          for arch in amd64 arm64; do
+          for arch in amd64 arm64 arm; do
             refs+=("$IMAGE@$(cat "artifacts/digest-$arch/$arch")")
           done
           docker buildx imagetools create -t "$IMAGE:$VERSION" -t "$IMAGE:latest" "${refs[@]}"
           docker buildx imagetools inspect "$IMAGE:$VERSION"
           platforms="$(docker buildx imagetools inspect --raw "$IMAGE:$VERSION" \
-            | jq -r '[.manifests[].platform | select(.os != "unknown") | "\(.os)/\(.architecture)"] | sort | join(" ")')"
-          if [ "$platforms" != "linux/amd64 linux/arm64" ]; then
-            echo "::error::la imagen $IMAGE:$VERSION tiene «$platforms» en vez de linux/amd64 y linux/arm64"
+            | jq -r '[.manifests[].platform | select(.os != "unknown")
+                | "\(.os)/\(.architecture)\(if .architecture == "arm" then "/\(.variant // "")" else "" end)"]
+                | sort | join(" ")')"
+          if [ "$platforms" != "linux/amd64 linux/arm/v7 linux/arm64" ]; then
+            echo "::error::la imagen $IMAGE:$VERSION tiene «$platforms» en vez de linux/amd64, linux/arm/v7 y linux/arm64"
             exit 1
           fi
 

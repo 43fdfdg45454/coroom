@@ -27,13 +27,21 @@ getrandom.workspace = true
 if-addrs.workspace = true
 quinn.workspace = true
 quinn-proto.workspace = true
-raptorq.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 socket2.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "time", "sync", "macros", "io-util"] }
 tracing.workspace = true
 wtransport-proto.workspace = true
+
+# RaptorQ 2.0.1 con `std` compila en ARM de 32 bits un camino NEON con intrínsecos que en Rust
+# estable solo existen en aarch64 (`std::arch::arm` es inestable); sin `std` usa el camino genérico
+# en todas las arquitecturas. La imagen arm/v7 del servidor (Raspberry Pi de 32 bits) va sin él.
+[target.'cfg(not(target_arch = "arm"))'.dependencies]
+raptorq = { workspace = true, features = ["std"] }
+
+[target.'cfg(target_arch = "arm")'.dependencies]
+raptorq.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # `timeBeginPeriod` y `SetProcessInformation`: resolución de 1 ms para el pacer de QUIC y los

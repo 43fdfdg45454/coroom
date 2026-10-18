@@ -78,7 +78,8 @@ serde_json = { version = "=1.0.154", default-features = false, features = ["std"
 tracing = { version = "=0.1.44", default-features = false, features = ["std", "attributes"] }
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["std", "fmt", "ansi", "env-filter"] }
 postcard = { version = "=1.1.3", default-features = false, features = ["use-std"] }
-raptorq = { version = "=2.0.1", default-features = false, features = ["std"] }
+# Sin `std` aquí: `coroom-transport` la activa salvo en ARM de 32 bits (ver su Cargo.toml).
+raptorq = { version = "=2.0.1", default-features = false }
 if-addrs = { version = "=0.15.0", default-features = false }
 socket2 = { version = "=0.6.5", default-features = false }
 # WebTransport (borrador IETF, docs/ARQUITECTURA.md §3): servidor con la extensión de `h3`; el cliente

@@ -91,9 +91,11 @@ jobs:
             dist/coroom-dev.cer
           if-no-files-found: error
 
-  # Una arquitectura por runner, las dos nativas: cada una tiene el runner entero y arm64 no se
-  # compila de forma cruzada. Cada imagen se sube a GHCR solo por digest, sin etiqueta (nadie la
-  # ve como versión ni la baja con `:latest`); «Publicación» las une en una imagen
+  # Una arquitectura por runner: amd64 y arm64 nativas (cada una tiene el runner entero y arm64 no
+  # se compila de forma cruzada) y arm/v7 (Raspberry Pi con sistema de 32 bits), que no tiene
+  # runner, de forma cruzada desde amd64 (el Dockerfile compila en la plataforma del runner y la
+  # etapa final solo copia, sin QEMU). Cada imagen se sube a GHCR solo por digest, sin etiqueta
+  # (nadie la ve como versión ni la baja con `:latest`); «Publicación» las une en una imagen
   # multiarquitectura y le pone las etiquetas cuando las comprobaciones han pasado, sin volver a
   # compilar.
   docker:
@@ -106,9 +108,15 @@ jobs:
       matrix:
         include:
           - arch: amd64
+            platform: linux/amd64
             runner: ubuntu-latest
           - arch: arm64
+            platform: linux/arm64
             runner: ubuntu-24.04-arm
+          # `arch` es el TARGETARCH de BuildKit (el de las cachés del Dockerfile).
+          - arch: arm
+            platform: linux/arm/v7
+            runner: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
@@ -165,7 +173,7 @@ jobs:
         with:
           context: .
           file: deploy/Dockerfile
-          platforms: linux/${{ matrix.arch }}
+          platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
           tags: ${{ steps.image.outputs.name }}
           outputs: type=image,push-by-digest=true,name-canonical=true,push=true

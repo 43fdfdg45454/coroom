@@ -122,7 +122,7 @@ firma con sello de tiempo, así el paquete sigue siendo válido cuando caduque e
 ### Servidor: Docker
 
 ```bash
-docker pull ghcr.io/43fdfdg45454/coroom-server:X.Y.Z   # amd64 y arm64
+docker pull ghcr.io/43fdfdg45454/coroom-server:X.Y.Z   # amd64, arm64 y arm/v7
 ```
 
 `deploy/docker-compose.yml` usa esa imagen con la versión de `COROOM_VERSION`; la guía completa

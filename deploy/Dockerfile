@@ -3,26 +3,30 @@
 #   docker build -f deploy/Dockerfile -t coroom-server .
 #
 # Multi-arquitectura: la etapa de compilación corre siempre en la plataforma de quien construye y
-# compila de forma cruzada para la de destino (amd64 o arm64), así arm64 no pasa por QEMU:
-#   docker buildx build --platform linux/amd64,linux/arm64 -f deploy/Dockerfile .
-# La CI construye cada arquitectura en un runner nativo (amd64 y arm64) y las une en una imagen.
+# compila de forma cruzada para la de destino (amd64, arm64 o arm/v7), así nada pasa por QEMU:
+#   docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 -f deploy/Dockerfile .
+# La CI construye amd64 y arm64 en runners nativos y arm/v7 (Raspberry Pi con sistema de 32 bits)
+# de forma cruzada desde amd64, y las une en una imagen.
 
 FROM --platform=$BUILDPLATFORM rust:1-bookworm AS build
 ARG TARGETARCH
+ARG TARGETVARIANT
 WORKDIR /src
 # La versión de Rust fijada en rust-toolchain.toml (la misma que la CI), con el triple de la
 # plataforma de destino y, si es otra arquitectura, su compilador de C (aws-lc-sys y la SQLite de
 # sqlx compilan C).
 COPY rust-toolchain.toml ./
 RUN case "$TARGETARCH" in \
-      amd64) triple=x86_64-unknown-linux-gnu; packages=x86-64-linux-gnu ;; \
-      arm64) triple=aarch64-unknown-linux-gnu; packages=aarch64-linux-gnu ;; \
+      amd64) triple=x86_64-unknown-linux-gnu; packages=x86-64-linux-gnu; libc=amd64 ;; \
+      arm64) triple=aarch64-unknown-linux-gnu; packages=aarch64-linux-gnu; libc=arm64 ;; \
+      arm) [ "${TARGETVARIANT:-v7}" = v7 ] || { echo "arm admitido solo en v7: $TARGETVARIANT" >&2; exit 1; }; \
+           triple=armv7-unknown-linux-gnueabihf; packages=arm-linux-gnueabihf; libc=armhf ;; \
       *) echo "arquitectura no admitida: $TARGETARCH" >&2; exit 1 ;; \
     esac \
     && echo "$triple" > /triple \
     && if [ "$(uname -m)" != "${triple%%-*}" ]; then \
          apt-get update \
-         && apt-get install -y --no-install-recommends "gcc-$packages" "g++-$packages" "libc6-dev-${TARGETARCH}-cross" \
+         && apt-get install -y --no-install-recommends "gcc-$packages" "g++-$packages" "libc6-dev-$libc-cross" \
          && rm -rf /var/lib/apt/lists/*; \
        fi \
     && channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" \
@@ -32,6 +36,10 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
     CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
     AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar \
+    CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc \
+    CC_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-gcc \
+    CXX_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-g++ \
+    AR_armv7_unknown_linux_gnueabihf=arm-linux-gnueabihf-ar \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
     CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \
     CXX_x86_64_unknown_linux_gnu=x86_64-linux-gnu-g++ \
