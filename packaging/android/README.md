@@ -56,7 +56,7 @@ packaging/android/
 Primero la biblioteca de Rust, desde la raíz del repositorio:
 
 ```bash
-cargo ndk -t arm64-v8a -t x86_64 -P 28 \
+cargo ndk -t arm64-v8a -t x86_64 -P 28 --link-cxx-shared \
   -o packaging/android/app/src/main/jniLibs build --release -p coroom-android
 ```
 

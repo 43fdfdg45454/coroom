@@ -65,13 +65,31 @@ jobs:
           echo "NDK: $ANDROID_NDK_LATEST_HOME"
           cmake --version | head -1
 
-      # API 28 (Android 9): la que piden las capas de MediaCodec y AAudio.
+      # API 28 (Android 9): la que piden las capas de MediaCodec y AAudio. El procesado de voz es
+      # C++: --link-cxx-shared copia libc++_shared.so del NDK junto a la nuestra.
       - name: libcoroom_android.so
         run: |
-          cargo ndk -t arm64-v8a -t x86_64 -P 28 \
+          cargo ndk -t arm64-v8a -t x86_64 -P 28 --link-cxx-shared \
             -o packaging/android/app/src/main/jniLibs \
             build --release --locked -p coroom-android
           find packaging/android/app/src/main/jniLibs -name '*.so' -exec ls -l {} +
+
+      # Cada biblioteca que pide la nuestra tiene que estar en el teléfono (las del sistema que da
+      # el NDK) o en el APK; si no, la app no arranca (UnsatisfiedLinkError al cargarla).
+      - name: Dependencias de libcoroom_android.so
+        run: |
+          system="libc.so libm.so libdl.so liblog.so libandroid.so libmediandk.so libaaudio.so"
+          failed=0
+          for dir in packaging/android/app/src/main/jniLibs/*/; do
+            for needed in $(readelf -d "${dir}libcoroom_android.so" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do
+              case " $system " in *" $needed "*) continue ;; esac
+              if [ ! -f "$dir$needed" ]; then
+                echo "::error::${dir}libcoroom_android.so pide $needed y no va en el APK"
+                failed=1
+              fi
+            done
+          done
+          exit $failed
 
       - uses: actions/setup-java@v6
         with:

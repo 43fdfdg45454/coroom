@@ -93,6 +93,8 @@ val cargoBuild by tasks.registering(Exec::class) {
         "-t", "arm64-v8a",
         "-t", "x86_64",
         "-P", "28",
+        // El procesado de voz es C++: libc++_shared.so tiene que ir en el APK junto a la nuestra.
+        "--link-cxx-shared",
         "-o", "packaging/android/app/src/main/jniLibs",
         "build", "--release", "-p", "coroom-android",
     )
