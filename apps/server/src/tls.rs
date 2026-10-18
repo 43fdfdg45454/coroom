@@ -17,6 +17,7 @@ use rustls::sign::CertifiedKey;
 
 use coroom_transport::crypto::sha256_fingerprint;
 use coroom_transport::proto::Alpn;
+use coroom_transport::tls as coroom_tls;
 
 use crate::ServerError;
 use crate::config::{Config, TlsMode};
@@ -118,12 +119,14 @@ impl ResolvesServerCert for CertResolver {
 pub fn quic_server_config(
     resolver: Arc<CertResolver>,
 ) -> Result<rustls::ServerConfig, ServerError> {
-    let provider = Arc::new(aws_lc_rs::default_provider());
-    let mut config = rustls::ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|err| ServerError::Tls(err.to_string()))?
-        .with_no_client_auth()
-        .with_cert_resolver(resolver);
+    quic_server_config_for(resolver, coroom_tls::aes_gcm_accelerated())
+}
+
+fn quic_server_config_for(
+    resolver: Arc<CertResolver>,
+    aes_gcm_accelerated: bool,
+) -> Result<rustls::ServerConfig, ServerError> {
+    let mut config = server_config(resolver, &[&rustls::version::TLS13], aes_gcm_accelerated)?;
     config.alpn_protocols = vec![
         Alpn::H3.as_bytes().to_vec(),
         Alpn::Relay.as_bytes().to_vec(),
@@ -133,13 +136,34 @@ pub fn quic_server_config(
 
 /// Configuración `rustls` para TCP: TLS 1.3 y 1.2, ALPN `h2` y `http/1.1`.
 pub fn tcp_server_config(resolver: Arc<CertResolver>) -> Result<rustls::ServerConfig, ServerError> {
-    let provider = Arc::new(aws_lc_rs::default_provider());
-    let mut config = rustls::ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-        .map_err(|err| ServerError::Tls(err.to_string()))?
-        .with_no_client_auth()
-        .with_cert_resolver(resolver);
+    tcp_server_config_for(resolver, coroom_tls::aes_gcm_accelerated())
+}
+
+fn tcp_server_config_for(
+    resolver: Arc<CertResolver>,
+    aes_gcm_accelerated: bool,
+) -> Result<rustls::ServerConfig, ServerError> {
+    let versions = [&rustls::version::TLS13, &rustls::version::TLS12];
+    let mut config = server_config(resolver, &versions, aes_gcm_accelerated)?;
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(config)
+}
+
+/// Configuración común de QUIC y TCP. Sin AES por hardware el servidor impone ChaCha20-Poly1305
+/// aunque el cliente prefiera AES-GCM: el relay descifra y vuelve a cifrar cada datagrama de la
+/// sala, así que su CPU es la que más paquetes cifra.
+fn server_config(
+    resolver: Arc<CertResolver>,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+    aes_gcm_accelerated: bool,
+) -> Result<rustls::ServerConfig, ServerError> {
+    let mut config =
+        rustls::ServerConfig::builder_with_provider(coroom_tls::provider_for(aes_gcm_accelerated))
+            .with_protocol_versions(versions)
+            .map_err(|err| ServerError::Tls(err.to_string()))?
+            .with_no_client_auth()
+            .with_cert_resolver(resolver);
+    config.ignore_client_order = !aes_gcm_accelerated;
     Ok(config)
 }
 
@@ -418,8 +442,13 @@ mod tests {
         }
     }
 
-    /// Handshake en memoria con `server`; el certificado presentado si se completa.
-    fn handshake(server: &Arc<rustls::ServerConfig>, name: &str, alpn: &[u8]) -> Option<Vec<u8>> {
+    /// Handshake en memoria con `server` desde un cliente con el orden de suites de `rustls`
+    /// (AES-GCM primero); el certificado presentado y la suite negociada si se completa.
+    fn handshake(
+        server: &Arc<rustls::ServerConfig>,
+        name: &str,
+        alpn: &[u8],
+    ) -> Option<(Vec<u8>, rustls::CipherSuite)> {
         let capture = Arc::new(Capture::default());
         let mut config =
             rustls::ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
@@ -443,7 +472,8 @@ mod tests {
             client.process_new_packets().ok()?;
             if !client.is_handshaking() && !server.is_handshaking() {
                 assert_eq!(client.alpn_protocol(), Some(alpn));
-                return capture.0.lock().ok()?.clone();
+                let suite = client.negotiated_cipher_suite()?.suite();
+                return Some((capture.0.lock().ok()?.clone()?, suite));
             }
         }
         None
@@ -455,8 +485,26 @@ mod tests {
         let resolver = Arc::new(CertResolver::new(&material).expect("resolutor"));
         let config = Arc::new(tcp_server_config(resolver).expect("TCP"));
         for alpn in [&b"h2"[..], b"http/1.1"] {
-            let cert = handshake(&config, "coroom.example.com", alpn).expect("handshake");
+            let (cert, _) = handshake(&config, "coroom.example.com", alpn).expect("handshake");
             assert_eq!(sha256_fingerprint(&cert), material.fingerprint);
+        }
+    }
+
+    #[test]
+    fn a_server_without_aes_hardware_imposes_chacha20() {
+        let (material, _, _) = generate_self_signed_pem("coroom.example.com").expect("certificado");
+        let resolver = Arc::new(CertResolver::new(&material).expect("resolutor"));
+        for (aes_gcm_accelerated, expected) in [
+            (true, rustls::CipherSuite::TLS13_AES_256_GCM_SHA384),
+            (false, rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256),
+        ] {
+            let quic = quic_server_config_for(Arc::clone(&resolver), aes_gcm_accelerated);
+            let tcp = tcp_server_config_for(Arc::clone(&resolver), aes_gcm_accelerated);
+            for (config, alpn) in [(quic, &b"coroom-relay/1"[..]), (tcp, b"h2")] {
+                let config = Arc::new(config.expect("configuración"));
+                let (_, suite) = handshake(&config, "coroom.example.com", alpn).expect("handshake");
+                assert_eq!(suite, expected, "AES por hardware: {aes_gcm_accelerated}");
+            }
         }
     }
 

@@ -1407,6 +1407,7 @@ dependencies = [
  "quinn",
  "quinn-proto",
  "raptorq",
+ "rustix 1.1.5",
  "rustls",
  "rustls-native-certs",
  "serde",

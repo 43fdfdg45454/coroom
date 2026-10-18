@@ -52,9 +52,65 @@ const ED25519_SPKI_PREFIX: [u8; 12] = [
     0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
 ];
 
-/// Proveedor criptográfico de todas las conexiones: `aws-lc-rs` con X25519MLKEM768 preferido.
-pub(crate) fn provider() -> Arc<CryptoProvider> {
-    Arc::new(aws_lc_rs::default_provider())
+/// Proveedor criptográfico de todas las conexiones: `aws-lc-rs` con X25519MLKEM768 preferido y las
+/// suites en el orden que mejor cifra esta CPU ([`provider_for`]).
+pub fn provider() -> Arc<CryptoProvider> {
+    provider_for(aes_gcm_accelerated())
+}
+
+/// Proveedor para una CPU que acelera AES-GCM o no. Sin aceleración, ChaCha20-Poly1305 (RFC 8439)
+/// va primero: en software cifra varias veces más rápido que AES-GCM y no depende de tablas, así
+/// que tampoco filtra tiempos. Con aceleración se queda el orden de `rustls` (AES-GCM primero).
+pub fn provider_for(aes_gcm_accelerated: bool) -> Arc<CryptoProvider> {
+    let mut provider = aws_lc_rs::default_provider();
+    if !aes_gcm_accelerated {
+        provider
+            .cipher_suites
+            .sort_by_key(|suite| !is_chacha20(suite.suite()));
+    }
+    Arc::new(provider)
+}
+
+/// Si la suite cifra con ChaCha20-Poly1305 (TLS 1.3 o 1.2).
+fn is_chacha20(suite: rustls::CipherSuite) -> bool {
+    matches!(
+        suite,
+        rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+            | rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+            | rustls::CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+    )
+}
+
+/// Si la CPU cifra AES-GCM por hardware: instrucciones AES y multiplicación sin acarreo (GHASH).
+/// Las placas ARM sin extensiones criptográficas no las tienen.
+pub fn aes_gcm_accelerated() -> bool {
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    {
+        std::arch::is_x86_feature_detected!("aes")
+            && std::arch::is_x86_feature_detected!("pclmulqdq")
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("aes")
+            && std::arch::is_aarch64_feature_detected!("pmull")
+    }
+    #[cfg(all(target_arch = "arm", target_os = "linux"))]
+    {
+        // `std::arch::is_arm_feature_detected!` es inestable: se leen los bits de `AT_HWCAP2`.
+        const HWCAP2_AES: usize = 1 << 0;
+        const HWCAP2_PMULL: usize = 1 << 1;
+        let (_, hwcap2) = rustix::param::linux_hwcap();
+        hwcap2 & (HWCAP2_AES | HWCAP2_PMULL) == HWCAP2_AES | HWCAP2_PMULL
+    }
+    #[cfg(not(any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        all(target_arch = "arm", target_os = "linux")
+    )))]
+    {
+        false
+    }
 }
 
 /// Clave pública Ed25519 contenida en una SPKI DER, si lo es.
@@ -544,6 +600,9 @@ pub(crate) fn peer_server_config(
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(Arc::new(AdmittedClientVerifier::new(admitted)))
         .with_cert_resolver(Arc::new(RawKeyResolver(Arc::clone(&identity.certified))));
+    // Sin AES por hardware el servidor impone ChaCha20 aunque el cliente prefiera AES-GCM: basta
+    // con que una punta sea lenta con AES para elegir la suite que las dos cifran bien.
+    config.ignore_client_order = !aes_gcm_accelerated();
     config.alpn_protocols = vec![coroom_proto::Alpn::P2p.as_bytes().to_vec()];
     Ok(config)
 }
@@ -609,6 +668,21 @@ pub(crate) fn peer_key_of(connection: &quinn::Connection) -> Option<PublicKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chacha20_leads_only_without_aes_hardware() {
+        let first = |aes| provider_for(aes).cipher_suites[0].suite();
+        assert_eq!(first(true), rustls::CipherSuite::TLS13_AES_256_GCM_SHA384);
+        assert_eq!(
+            first(false),
+            rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256
+        );
+        let mut accelerated = provider_for(true).cipher_suites.clone();
+        let mut software = provider_for(false).cipher_suites.clone();
+        accelerated.sort_by_key(|suite| u16::from(suite.suite()));
+        software.sort_by_key(|suite| u16::from(suite.suite()));
+        assert_eq!(accelerated, software, "mismas suites, otro orden");
+    }
 
     #[test]
     fn spki_round_trips_the_public_key() {

@@ -215,6 +215,13 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **Relay en placas ARM sin cifrado por hardware: hasta varias veces menos CPU por paquete.** El
+  relay descifra y vuelve a cifrar la capa QUIC de cada datagrama (el contenido sigue cifrado de
+  punta a punta con SFrame), y lo hacía con AES-GCM porque es lo que piden los clientes. En una CPU
+  sin instrucciones AES eso es software lento y llenaba el procesador antes que la red. Ahora el
+  servidor mira si su CPU acelera AES-GCM y, si no, impone ChaCha20-Poly1305 (RFC 8439), que en
+  software es varias veces más rápido; con AES por hardware todo sigue igual. Lo mismo hace el
+  anfitrión en las conexiones directas cuando su CPU es la que no acelera AES.
 - **Calidad por el relay: el bitrate ya no se queda clavado abajo**, con anfitrión Linux o
   Windows. El invitado pasaba sus marcas de llegada al reloj del anfitrión con la mediana de los
   últimos ocho `Ping`; por el relay, el jitter del RTT la movía de 3 a 5 ms cada pocos segundos y

@@ -43,6 +43,10 @@ raptorq = { workspace = true, features = ["std"] }
 [target.'cfg(target_arch = "arm")'.dependencies]
 raptorq.workspace = true
 
+# `AT_HWCAP2`: si la CPU acelera AES-GCM, para elegir la suite TLS (tls.rs).
+[target.'cfg(all(target_arch = "arm", target_os = "linux"))'.dependencies]
+rustix = { workspace = true, features = ["param"] }
+
 [target.'cfg(windows)'.dependencies]
 # `timeBeginPeriod` y `SetProcessInformation`: resolución de 1 ms para el pacer de QUIC y los
 # temporizadores, también con la ventana oculta o minimizada (ver quic.rs).
