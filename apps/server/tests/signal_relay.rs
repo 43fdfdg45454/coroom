@@ -732,3 +732,92 @@ async fn the_host_can_kick_a_guest() {
     );
     server.stop().await;
 }
+
+/// Vídeo del anfitrión con `payload` bytes de carga: objeto `index` de un grupo de `count`.
+fn video_object(group: u32, index: u16, count: u16, payload: usize) -> Bytes {
+    let header = ObjectHeader {
+        track: Track::Video,
+        flags: if index + 1 == count {
+            ObjectHeader::LAST_OBJECT
+        } else {
+            0
+        },
+        group,
+        object: index,
+        object_count: count,
+        payload_len: payload as u16,
+        epoch_hint: 1,
+    };
+    let mut bytes = header.to_bytes().to_vec();
+    bytes.resize(bytes.len() + payload, 0x5A);
+    Bytes::from(bytes)
+}
+
+/// MEDICIÓN: cuánto vídeo reenvía el relay de un anfitrión a un invitado en localhost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "medición"]
+async fn relay_forwarding_rate() {
+    const RATE_KBPS: u64 = 300_000;
+    const PAYLOAD: usize = 1100;
+    const SECONDS: u64 = 3;
+    let server = start_server().await;
+    let mut host = client(&server).await;
+    let mut guest = client(&server).await;
+    let (_code, host_token, guest_token, _peer) = room(&mut host, &mut guest).await;
+    let host_relay =
+        connect::connect_relay(&host.endpoint, &relay_info(host_token, &server, Role::Host))
+            .await
+            .expect("anfitrión en el relay");
+    let guest_relay = connect::connect_relay(
+        &guest.endpoint,
+        &relay_info(guest_token, &server, Role::Guest),
+    )
+    .await
+    .expect("invitado en el relay");
+    host_relay.set_target_kbps(RATE_KBPS as u32);
+    guest_relay.set_target_kbps(RATE_KBPS as u32);
+    let datagram_len = video_object(0, 0, 1, PAYLOAD).len() as u64;
+    let per_ms = (RATE_KBPS * 1000 / 8 / 1000 / datagram_len).max(1);
+    let reader = {
+        let guest_relay = guest_relay.clone();
+        tokio::spawn(async move {
+            let mut bytes = 0u64;
+            let mut first = None;
+            let mut last = std::time::Instant::now();
+            while let Ok(Ok(datagram)) =
+                tokio::time::timeout(Duration::from_millis(500), guest_relay.read_datagram()).await
+            {
+                first.get_or_insert_with(std::time::Instant::now);
+                last = std::time::Instant::now();
+                bytes += datagram.len() as u64;
+            }
+            (bytes, first.map(|first| last - first))
+        })
+    };
+    let start = std::time::Instant::now();
+    let mut sent = 0u64;
+    let mut dropped = 0u64;
+    let mut tick = tokio::time::interval(Duration::from_millis(1));
+    let mut group = 0u32;
+    while start.elapsed() < Duration::from_secs(SECONDS) {
+        tick.tick().await;
+        for index in 0..per_ms {
+            let datagram = video_object(group, index as u16, per_ms as u16, PAYLOAD);
+            match host_relay.send_datagram(datagram) {
+                Ok(()) => sent += datagram_len,
+                Err(_) => dropped += 1,
+            }
+        }
+        group += 1;
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    let (received, span) = reader.await.expect("lector");
+    let span = span.map_or(elapsed, |span| span.as_secs_f64());
+    println!(
+        "enviado {:.1} Mbit/s ({dropped} sin enviar), recibido {:.1} Mbit/s ({:.1} % de lo enviado)",
+        sent as f64 * 8.0 / elapsed / 1e6,
+        received as f64 * 8.0 / span / 1e6,
+        received as f64 * 100.0 / sent.max(1) as f64
+    );
+    server.stop().await;
+}
