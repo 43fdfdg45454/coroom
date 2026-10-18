@@ -10,11 +10,16 @@
 //! - qué **informes de característica** tiene y su tamaño ([`HidSummary::features`]): el invitado
 //!   los lee del mando al conectarlo y el anfitrión los devuelve cuando el driver los pide (los de
 //!   calibración del DualSense, por ejemplo);
-//! - el tamaño del mayor **informe de entrada** ([`HidSummary::max_input`]).
+//! - el tamaño del mayor **informe de entrada** ([`HidSummary::max_input`]);
+//! - qué **informes de salida** tiene y su tamaño ([`HidSummary::outputs`]): la vibración y las
+//!   luces que el driver del anfitrión manda vuelven al invitado y se escriben en su mando con el
+//!   tamaño exacto que declara el descriptor ([`HidSummary::fit_output`]).
 //!
 //! No interpreta botones ni ejes: el dispositivo del anfitrión recibe los informes tal cual. Es
 //! un analizador de datos de la red, sin `unsafe` y con límites: [`MAX_DESCRIPTOR`] bytes, pila de
-//! globales de [`MAX_PUSH`] niveles, [`MAX_REPORT_BYTES`] por informe.
+//! globales de [`MAX_PUSH`] niveles y [`MAX_DECLARED_REPORT_BYTES`] por informe declarado. Lo que
+//! viaja por la red (cada informe de entrada o de salida) tiene además su propio límite,
+//! [`MAX_REPORT_BYTES`].
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -22,8 +27,15 @@ use std::fmt;
 /// Tamaño máximo de un descriptor (`HID_MAX_DESCRIPTOR_SIZE` de Linux).
 pub const MAX_DESCRIPTOR: usize = 4096;
 
-/// Tamaño máximo de un informe, con su identificador.
+/// Tamaño máximo de un informe que viaja por la red, con su identificador.
 pub const MAX_REPORT_BYTES: usize = 512;
+
+/// Tamaño máximo de un informe declarado en el descriptor, con su identificador (`UHID_DATA_MAX`
+/// de Linux). Es mayor que [`MAX_REPORT_BYTES`]: el DualShock 4 y el DualSense por Bluetooth
+/// declaran informes de salida de hasta 547 bytes (`0x19` y `0x39`, para audio) aunque los que se
+/// usan (`0x11` y `0x31`, de 78) caben de sobra; con el límite de la red no se podían mandar tal
+/// cual.
+pub const MAX_DECLARED_REPORT_BYTES: usize = 4096;
 
 /// Niveles de `Push` como mucho.
 pub const MAX_PUSH: usize = 8;
@@ -69,6 +81,9 @@ pub struct HidSummary {
     pub max_input: usize,
     /// Bytes del mayor informe de salida, con su identificador si lo hay.
     pub max_output: usize,
+    /// Informes de salida: identificador (0 si el descriptor no usa identificadores) y bytes,
+    /// contando el del identificador.
+    pub outputs: Vec<(u8, usize)>,
     /// Si el descriptor usa identificadores de informe.
     pub report_ids: bool,
 }
@@ -85,6 +100,28 @@ impl HidSummary {
             .iter()
             .any(|app| app.is_keyboard_or_mouse())
     }
+
+    /// Bytes del informe de salida `id` como se escribe en `hidraw` o con `hidapi`: siempre con
+    /// el identificador delante, 0 si el descriptor no los usa. `None` si no lo declara.
+    pub fn output_len(&self, id: u8) -> Option<usize> {
+        self.outputs
+            .iter()
+            .find(|(output, _)| *output == id)
+            .map(|(_, len)| len + usize::from(id == 0))
+    }
+
+    /// Un informe de salida (`data[0]` es su identificador, 0 si el descriptor no los usa) con el
+    /// tamaño que declara el descriptor: recortado si viene rellenado hasta el mayor de la
+    /// colección (Windows lo pasa así) o completado con ceros si viene corto. Si el descriptor no
+    /// declara ese informe, tal cual.
+    pub fn fit_output(&self, data: &[u8]) -> Vec<u8> {
+        let Some(len) = data.first().and_then(|id| self.output_len(*id)) else {
+            return data.to_vec();
+        };
+        let mut out = data[..data.len().min(len)].to_vec();
+        out.resize(len, 0);
+        out
+    }
 }
 
 /// Descriptor que no se puede leer.
@@ -98,7 +135,7 @@ pub enum HidError {
     Stack,
     /// `End Collection` sin `Collection`.
     Collection,
-    /// Un informe de más de [`MAX_REPORT_BYTES`] bytes (o un tamaño absurdo).
+    /// Un informe de más de [`MAX_DECLARED_REPORT_BYTES`] bytes (o un tamaño absurdo).
     ReportTooLarge,
 }
 
@@ -114,7 +151,7 @@ impl fmt::Display for HidError {
             HidError::Collection => f.write_str("descriptor HID con colecciones desparejadas"),
             HidError::ReportTooLarge => write!(
                 f,
-                "descriptor HID con un informe de más de {MAX_REPORT_BYTES} bytes"
+                "descriptor HID con un informe de más de {MAX_DECLARED_REPORT_BYTES} bytes"
             ),
         }
     }
@@ -190,7 +227,7 @@ pub fn parse(descriptor: &[u8]) -> Result<HidSummary, HidError> {
                 let add = u64::from(globals.report_size) * u64::from(globals.report_count);
                 let total = bits.entry((report, globals.report_id)).or_default();
                 *total = total.saturating_add(add);
-                if *total > (MAX_REPORT_BYTES as u64) * 8 {
+                if *total > (MAX_DECLARED_REPORT_BYTES as u64) * 8 {
                     return Err(HidError::ReportTooLarge);
                 }
                 usage = None;
@@ -243,7 +280,10 @@ pub fn parse(descriptor: &[u8]) -> Result<HidSummary, HidError> {
         let len = bytes(*total, *id);
         match report {
             Kind::Input => summary.max_input = summary.max_input.max(len),
-            Kind::Output => summary.max_output = summary.max_output.max(len),
+            Kind::Output => {
+                summary.max_output = summary.max_output.max(len);
+                summary.outputs.push((*id, len));
+            }
             Kind::Feature => summary.features.push((*id, len)),
         }
     }
@@ -314,6 +354,66 @@ mod tests {
         assert_eq!(summary.features, vec![(0x05, 41), (0x20, 64)]);
         assert_eq!(summary.max_input, 10);
         assert_eq!(summary.max_output, 48);
+        assert_eq!(summary.outputs, vec![(0x02, 48)]);
+        assert_eq!(summary.output_len(0x02), Some(48));
+        assert_eq!(summary.output_len(0x05), None, "0x05 es de característica");
+    }
+
+    /// Lo esencial del descriptor de un DualShock 4 por Bluetooth: entrada `0x11`, salida `0x11`
+    /// de 78 bytes (vibración y luz, la que se usa) y salida `0x19` de 547 (audio).
+    fn bluetooth_pad() -> Vec<u8> {
+        let mut descriptor = vec![0x05, 0x01, 0x09, 0x05, 0xA1, 0x01];
+        descriptor.extend([0x85, 0x11, 0x75, 0x08, 0x95, 0x4D, 0x81, 0x02]);
+        descriptor.extend([0x06, 0x00, 0xFF, 0x09, 0x22]);
+        descriptor.extend([0x85, 0x11, 0x95, 0x4D, 0x91, 0x02]);
+        descriptor.extend([0x85, 0x19, 0x96, 0x22, 0x02, 0x91, 0x02]);
+        descriptor.push(0xC0);
+        descriptor
+    }
+
+    #[test]
+    fn bluetooth_pads_with_big_audio_reports_are_read() {
+        // Antes se rechazaba (un informe de más de 512 bytes) y el mando iba convertido.
+        let summary = parse(&bluetooth_pad()).expect("descriptor");
+        assert!(summary.has_controller());
+        assert_eq!(summary.outputs, vec![(0x11, 78), (0x19, 547)]);
+        assert_eq!(summary.max_output, 547);
+        assert_eq!(summary.max_input, 78);
+    }
+
+    #[test]
+    fn outputs_are_fitted_to_their_declared_size() {
+        let summary = parse(&bluetooth_pad()).expect("descriptor");
+        // Windows rellena hasta el mayor informe de salida de la colección (547 bytes): se
+        // recorta al del informe.
+        let mut padded = vec![0x11, 0xC0, 0x20, 0xF3];
+        padded.resize(547, 0);
+        let fitted = summary.fit_output(&padded);
+        assert_eq!(fitted.len(), 78);
+        assert_eq!(&fitted[..4], &[0x11, 0xC0, 0x20, 0xF3]);
+        // Corto: se completa con ceros.
+        assert_eq!(summary.fit_output(&[0x11, 1, 2]).len(), 78);
+        assert_eq!(summary.fit_output(&[0x11, 1, 2])[..3], [0x11, 1, 2]);
+        // Un informe que el descriptor no declara pasa tal cual.
+        assert_eq!(summary.fit_output(&[0x07, 1, 2]), vec![0x07, 1, 2]);
+        assert!(summary.fit_output(&[]).is_empty());
+
+        // Sin identificadores: el 0 delante cuenta.
+        let plain = parse(&[
+            0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02, 0x95, 0x04,
+            0x91, 0x02, 0xC0,
+        ])
+        .expect("descriptor");
+        assert_eq!(plain.outputs, vec![(0, 4)]);
+        assert_eq!(plain.output_len(0), Some(5));
+        assert_eq!(
+            plain.fit_output(&[0, 0xFF, 0x80]),
+            vec![0, 0xFF, 0x80, 0, 0]
+        );
+        assert_eq!(
+            plain.fit_output(&[0, 1, 2, 3, 4, 5, 6]),
+            vec![0, 1, 2, 3, 4]
+        );
     }
 
     #[test]
@@ -346,10 +446,10 @@ mod tests {
         assert_eq!(parse(&[0xC0]), Err(HidError::Collection));
         assert_eq!(parse(&[0xB4]), Err(HidError::Stack));
         assert_eq!(parse(&[0xA4; MAX_PUSH + 1]), Err(HidError::Stack));
-        // 4096 bits = 512 bytes de informe: el máximo justo; uno más, fuera.
-        assert!(parse(&[0x75, 0x08, 0x96, 0x00, 0x02, 0x81, 0x02]).is_ok());
+        // 4096 bytes de informe: el máximo justo; uno más, fuera.
+        assert!(parse(&[0x75, 0x08, 0x96, 0x00, 0x10, 0x81, 0x02]).is_ok());
         assert_eq!(
-            parse(&[0x75, 0x08, 0x96, 0x01, 0x02, 0x81, 0x02]),
+            parse(&[0x75, 0x08, 0x96, 0x01, 0x10, 0x81, 0x02]),
             Err(HidError::ReportTooLarge)
         );
         // Un elemento largo que se sale.

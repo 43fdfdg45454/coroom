@@ -524,22 +524,29 @@ pub fn parse_output(bytes: &[u8]) -> Result<Option<DriverOutput>, InputError> {
 }
 
 /// Un informe de salida en el formato del protocolo de coroom (el de `hidraw` y `hidapi` al
-/// escribir): el identificador delante, 0 si el descriptor no los numera. Windows lo pasa con él o
-/// sin él según el caso.
+/// escribir): el identificador delante, 0 si el descriptor no los numera, y el tamaño que declara
+/// el descriptor para ese informe ([`HidSummary::fit_output`]).
+///
+/// Windows lo pasa con el identificador o sin él según el caso, y con `WriteFile` rellenado hasta
+/// el mayor informe de salida de la colección (`OutputReportByteLength`): el DualSense por
+/// Bluetooth declara uno de 547 bytes, así que su vibración (`0x31`, 78) llegaba con 547 y no
+/// cabía en el protocolo. Con el tamaño exacto del informe se sabe si trae el identificador; si
+/// no coincide con ninguno de los dos, se mira el primer byte.
 pub fn normalize_output(summary: &HidSummary, report_id: u8, data: &[u8]) -> Vec<u8> {
-    let has_prefix = if summary.report_ids {
-        report_id != 0 && data.first() == Some(&report_id)
-    } else {
-        data.len() == summary.max_output + 1 && data.first() == Some(&0)
+    let id = if summary.report_ids { report_id } else { 0 };
+    let has_prefix = match summary.output_len(id) {
+        Some(len) if data.len() == len => data.first() == Some(&id),
+        Some(len) if data.len() + 1 == len => false,
+        _ if summary.report_ids => report_id != 0 && data.first() == Some(&report_id),
+        _ => data.len() == summary.max_output + 1 && data.first() == Some(&0),
     };
     if has_prefix {
-        data.to_vec()
+        summary.fit_output(data)
     } else {
-        let id = if summary.report_ids { report_id } else { 0 };
         let mut out = Vec::with_capacity(data.len() + 1);
         out.push(id);
         out.extend_from_slice(data);
-        out
+        summary.fit_output(&out)
     }
 }
 
@@ -860,6 +867,9 @@ struct State<D> {
     /// Cada cuánto se repite el estado ([`KEEPALIVE_INTERVAL`]; los tests lo alargan).
     keepalive: Duration,
     stop: bool,
+    /// Si ya se avisó de que no se pueden recoger las salidas del driver (una vez hasta que
+    /// vuelva a funcionar, no cada 5 ms).
+    outputs_failing: bool,
 }
 
 struct Shared<D> {
@@ -1013,6 +1023,7 @@ impl<D: VhidDevice> VhidGamepads<D> {
                 pads: BTreeMap::new(),
                 keepalive,
                 stop: false,
+                outputs_failing: false,
             }),
             wake: Condvar::new(),
         });
@@ -1169,10 +1180,21 @@ impl<D: VhidDevice> VhidGamepads<D> {
         // Una tanda acotada por llamada: el driver guarda como mucho 64.
         for _ in 0..64 {
             let output = match state.device.take_output() {
-                Ok(Some(output)) => output,
-                Ok(None) => break,
+                Ok(Some(output)) => {
+                    state.outputs_failing = false;
+                    output
+                }
+                Ok(None) => {
+                    state.outputs_failing = false;
+                    break;
+                }
                 Err(err) => {
-                    tracing::debug!("mando virtual: {err}");
+                    if !std::mem::replace(&mut state.outputs_failing, true) {
+                        tracing::warn!(
+                            "{err}: la vibración y las luces de los mandos tal cual no llegan \
+                             al invitado"
+                        );
+                    }
                     break;
                 }
             };
@@ -2423,6 +2445,54 @@ mod tests {
         };
         assert_eq!(normalize_output(&plain, 0, &[7, 8, 9]), vec![0, 7, 8, 9]);
         assert_eq!(normalize_output(&plain, 0, &[0, 7, 8, 9]), vec![0, 7, 8, 9]);
+    }
+
+    /// Lo esencial de un DualSense por Bluetooth: entrada `0x31`, salida `0x31` de 78 bytes
+    /// (vibración y luces) y `0x39` de 547 (audio), así que `OutputReportByteLength` es 547.
+    fn bluetooth_summary() -> HidSummary {
+        let mut descriptor = vec![0x05, 0x01, 0x09, 0x05, 0xA1, 0x01];
+        descriptor.extend([0x85, 0x31, 0x75, 0x08, 0x95, 0x4D, 0x81, 0x02]);
+        descriptor.extend([0x06, 0x00, 0xFF, 0x09, 0x22]);
+        descriptor.extend([0x85, 0x31, 0x95, 0x4D, 0x91, 0x02]);
+        descriptor.extend([0x85, 0x39, 0x96, 0x22, 0x02, 0x91, 0x02]);
+        descriptor.push(0xC0);
+        hid::parse(&descriptor).expect("descriptor")
+    }
+
+    #[test]
+    fn outputs_padded_by_windows_are_cut_to_their_report() {
+        let summary = bluetooth_summary();
+        let payload = |first: u8| {
+            let mut data = vec![0u8; 77];
+            data[0] = first;
+            data[1] = 0x10;
+            data
+        };
+        let with_id = |first: u8| {
+            let mut data = vec![0x31];
+            data.extend(payload(first));
+            data
+        };
+        // Con `WriteFile`, rellenado hasta 547 bytes y con el identificador: 78 bytes.
+        let mut padded = with_id(0x02);
+        padded.resize(547, 0);
+        assert_eq!(normalize_output(&summary, 0x31, &padded), with_id(0x02));
+        // Exacto, con el identificador o sin él; aunque el primer byte de datos sea igual que el
+        // identificador, el tamaño dice cuál es.
+        assert_eq!(
+            normalize_output(&summary, 0x31, &with_id(0x31)),
+            with_id(0x31)
+        );
+        assert_eq!(
+            normalize_output(&summary, 0x31, &payload(0x31)),
+            with_id(0x31)
+        );
+        assert_eq!(
+            normalize_output(&summary, 0x31, &payload(0x02)),
+            with_id(0x02)
+        );
+        // Cabe en el protocolo.
+        assert!(normalize_output(&summary, 0x31, &padded).len() <= hid::MAX_REPORT_BYTES);
     }
 
     fn hat_of(wire: Wire) -> [u8; REPORT_LEN] {

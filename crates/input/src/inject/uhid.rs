@@ -8,10 +8,19 @@
 //! Lo que el driver le pide al mando vuelve por el hilo `uhid` de cada dispositivo:
 //!
 //! - `UHID_OUTPUT` (vibración, luces): a la cola de [`UhidPad::take_outputs`], que la sesión manda
-//!   al invitado para que lo escriba en su mando;
+//!   al invitado para que lo escriba en su mando. Es lo que llega cuando el driver escribe el
+//!   informe por el canal de interrupción (`hid_hw_output_report`: `hid-playstation`,
+//!   `hid-nintendo`, `hid-microsoft`, `hidraw` de SDL o Steam);
+//! - `UHID_SET_REPORT` de un informe de **salida**: también a esa cola. Es la vibración de los
+//!   drivers que la mandan como petición `SET_REPORT` (`hid_hw_request` o `hid_hw_raw_request`:
+//!   `hid-sony` con el DualShock 3, `hid-dr`, `hid-lg*`, `hid-pl`, `hid-zpff`…), y las luces de
+//!   `hid-input` en algunos casos. Se contesta que sí al momento;
+//! - `UHID_SET_REPORT` de un informe de característica: se acepta (no se manda al invitado);
 //! - `UHID_GET_REPORT` de un informe de característica (calibración, firmware): se contesta con el
-//!   que leyó el invitado al conectar su mando, o con `EIO` si no lo tiene;
-//! - `UHID_SET_REPORT`: se acepta.
+//!   que leyó el invitado al conectar su mando, o con `EIO` si no lo tiene.
+//!
+//! Los dos llevan los bytes como los dejó el driver, con el número de informe delante (0 si el
+//! descriptor no los usa): el formato del protocolo, el mismo que escribe `hidraw` en el invitado.
 //!
 //! Los eventos son `struct uhid_event` de `linux/uhid.h` (empaquetada: el tipo `u32` y la unión
 //! de las peticiones, en orden nativo); aquí se escriben y leen como bytes, sin `unsafe`, con los
@@ -26,7 +35,7 @@ use std::thread::{self, JoinHandle};
 
 use coroom_proto::input::{GamepadDevice, GamepadTransport};
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::InputError;
 
@@ -39,6 +48,10 @@ pub const UHID_HELP: &str = "no se puede abrir /dev/uhid para los mandos tal cua
      OPTIONS+=\"static_node=uhid\"` (por ejemplo en \
      /etc/udev/rules.d/60-coroom-uhid.rules), recarga con `sudo udevadm control --reload && sudo \
      udevadm trigger` y vuelve a entrar en la sesión; mientras, el mando va convertido";
+
+/// Cuando el hilo `uhid` ya no puede leer lo que pide el driver.
+const GONE: &str = "UHID: el mando tal cual dejó de atender al driver del anfitrión; su \
+     vibración y sus luces ya no llegan al invitado";
 
 /// Bytes de `struct uhid_event`: el tipo y la mayor petición (`uhid_create2_req`).
 pub const EVENT_SIZE: usize = 4 + CREATE2_SIZE;
@@ -145,7 +158,7 @@ pub fn set_report_reply(id: u32, errno: u16) -> Vec<u8> {
 /// Lo que pide el driver al dispositivo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    /// `UHID_OUTPUT` de un informe de salida: los bytes, con el identificador si lo hay.
+    /// `UHID_OUTPUT` de un informe de salida: los bytes, con el número de informe delante.
     Output(Vec<u8>),
     /// `UHID_GET_REPORT`: petición, número de informe y tipo.
     GetReport {
@@ -156,10 +169,14 @@ pub enum Request {
         /// Tipo (0: característica).
         kind: u8,
     },
-    /// `UHID_SET_REPORT`: petición.
+    /// `UHID_SET_REPORT`: petición, tipo y bytes (con el número de informe delante).
     SetReport {
         /// Identificador de la petición.
         id: u32,
+        /// Tipo (0: característica, 1: salida).
+        kind: u8,
+        /// Bytes del informe.
+        data: Vec<u8>,
     },
     /// Otros (`START`, `OPEN`, `CLOSE`…): nada que hacer.
     Other,
@@ -185,9 +202,17 @@ pub fn parse_request(event: &[u8]) -> Option<Request> {
             number: event[8],
             kind: event[9],
         },
-        UHID_SET_REPORT if event.len() >= 8 => Request::SetReport {
-            id: get_u32(event, 4),
-        },
+        // `uhid_set_report_req`: `id` u32, `rnum` u8, `rtype` u8, `size` u16, `data[4096]`.
+        UHID_SET_REPORT if event.len() >= 12 => {
+            let len = usize::from(get_u16(event, 10))
+                .min(DATA_MAX)
+                .min(event.len() - 12);
+            Request::SetReport {
+                id: get_u32(event, 4),
+                kind: event[9],
+                data: event[12..12 + len].to_vec(),
+            }
+        }
         _ => Request::Other,
     })
 }
@@ -311,7 +336,7 @@ fn serve(
             Ok(0) | Err(rustix::io::Errno::INTR) => continue,
             Ok(_) => {}
             Err(err) => {
-                debug!(error = %err, "UHID: poll");
+                warn!(error = %err, "{GONE}");
                 return;
             }
         }
@@ -319,7 +344,7 @@ fn serve(
             Ok(read) => read,
             Err(err) if err.kind() == ErrorKind::WouldBlock => continue,
             Err(err) => {
-                debug!(error = %err, "UHID: lectura");
+                warn!(error = %err, "{GONE}");
                 return;
             }
         };
@@ -335,7 +360,13 @@ fn serve(
                     _ => Err(EIO),
                 },
             )),
-            Some(Request::SetReport { id }) => Some(set_report_reply(id, 0)),
+            Some(Request::SetReport { id, kind, data }) => {
+                // La vibración que va por `SET_REPORT` sale como la de `UHID_OUTPUT`.
+                if kind == OUTPUT_REPORT && !data.is_empty() {
+                    let _ = tx.send(data);
+                }
+                Some(set_report_reply(id, 0))
+            }
             Some(Request::Other) | None => None,
         };
         if let Some(reply) = reply
@@ -446,8 +477,100 @@ mod tests {
         );
         let mut set = event(UHID_SET_REPORT);
         put_u32(&mut set, 4, 11);
-        assert_eq!(parse_request(&set), Some(Request::SetReport { id: 11 }));
+        set[8] = 0x01;
+        set[9] = OUTPUT_REPORT;
+        put_u16(&mut set, 10, 4);
+        set[12..16].copy_from_slice(&[0x01, 0x00, 0xFF, 0x40]);
+        assert_eq!(
+            parse_request(&set),
+            Some(Request::SetReport {
+                id: 11,
+                kind: OUTPUT_REPORT,
+                data: vec![0x01, 0x00, 0xFF, 0x40]
+            })
+        );
+        // Un tamaño que se sale del evento se corta, sin leer fuera.
+        let mut short = set[..14].to_vec();
+        put_u16(&mut short, 10, 4000);
+        assert_eq!(
+            parse_request(&short),
+            Some(Request::SetReport {
+                id: 11,
+                kind: OUTPUT_REPORT,
+                data: vec![0x01, 0x00]
+            })
+        );
         assert_eq!(parse_request(&[1, 0]), None);
         assert_eq!(parse_request(&event(2)), Some(Request::Other));
+    }
+
+    /// El hilo `uhid` sobre un par de sockets de datagramas (un evento por datagrama, como
+    /// `/dev/uhid`): lo que manda el "kernel" por un lado y lo que contesta el hilo por el otro.
+    #[test]
+    fn output_reports_reach_the_queue_by_either_path() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixDatagram;
+        use std::time::{Duration, Instant};
+
+        let (kernel, ours) = UnixDatagram::pair().expect("par de sockets");
+        let file = File::from(OwnedFd::from(ours));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = unbounded();
+        let features = BTreeMap::from([(0x05u8, vec![0x05, 1, 2])]);
+        let server = {
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || serve(file, &features, &stop, &tx))
+        };
+        let deadline = Duration::from_secs(10);
+        kernel.set_read_timeout(Some(deadline)).unwrap();
+        let mut reply = vec![0u8; EVENT_SIZE];
+
+        // `UHID_OUTPUT` (hid-playstation, hidraw).
+        let mut output = event(UHID_OUTPUT);
+        output[4..7].copy_from_slice(&[0x02, 0xFF, 0x80]);
+        put_u16(&mut output, 4 + DATA_MAX, 3);
+        output[4 + DATA_MAX + 2] = OUTPUT_REPORT;
+        kernel.send(&output).unwrap();
+        assert_eq!(rx.recv_timeout(deadline), Ok(vec![0x02, 0xFF, 0x80]));
+
+        // `UHID_SET_REPORT` de salida (hid-sony, hid-dr…): a la cola y contestado que sí.
+        let mut set = event(UHID_SET_REPORT);
+        put_u32(&mut set, 4, 42);
+        set[8] = 0x01;
+        set[9] = OUTPUT_REPORT;
+        put_u16(&mut set, 10, 4);
+        set[12..16].copy_from_slice(&[0x01, 0x00, 0xFF, 0x40]);
+        kernel.send(&set).unwrap();
+        assert_eq!(rx.recv_timeout(deadline), Ok(vec![0x01, 0x00, 0xFF, 0x40]));
+        let read = kernel.recv(&mut reply).expect("respuesta");
+        assert_eq!(get_u32(&reply[..read], 0), UHID_SET_REPORT_REPLY);
+        assert_eq!(get_u32(&reply[..read], 4), 42);
+        assert_eq!(get_u16(&reply[..read], 8), 0, "sin error");
+
+        // `UHID_SET_REPORT` de característica: contestado, pero no es vibración.
+        set[9] = FEATURE_REPORT;
+        put_u32(&mut set, 4, 43);
+        kernel.send(&set).unwrap();
+        let read = kernel.recv(&mut reply).expect("respuesta");
+        assert_eq!(get_u32(&reply[..read], 4), 43);
+        assert!(
+            rx.try_recv().is_err(),
+            "una característica no va al invitado"
+        );
+
+        // `UHID_GET_REPORT` de la característica que leyó el invitado.
+        let mut get = event(UHID_GET_REPORT);
+        put_u32(&mut get, 4, 44);
+        get[8] = 0x05;
+        get[9] = FEATURE_REPORT;
+        kernel.send(&get).unwrap();
+        let read = kernel.recv(&mut reply).expect("respuesta");
+        assert_eq!(get_u32(&reply[..read], 0), UHID_GET_REPORT_REPLY);
+        assert_eq!(&reply[12..15], &[0x05, 1, 2]);
+
+        stop.store(true, Ordering::Release);
+        let started = Instant::now();
+        server.join().expect("hilo uhid");
+        assert!(started.elapsed() < deadline);
     }
 }

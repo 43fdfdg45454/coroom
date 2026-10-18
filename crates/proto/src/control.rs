@@ -483,8 +483,10 @@ pub enum ControlMessage {
         raw: bool,
     },
     /// Anfitrión → invitado: informe de salida para su mando tal cual (vibración, luces), como lo
-    /// pidió el driver del anfitrión, con su identificador si lo hay. Como mucho
-    /// `hid::MAX_REPORT_BYTES` bytes.
+    /// pidió el driver del anfitrión: siempre con el número de informe delante (0 si el
+    /// descriptor no los usa), como se escribe en `hidraw` o con `hidapi`. Como mucho
+    /// `hid::MAX_REPORT_BYTES` bytes; el invitado lo ajusta al tamaño que declara su descriptor
+    /// para ese informe (`HidSummary::fit_output`).
     GamepadOutput {
         /// Ranura.
         slot: u8,

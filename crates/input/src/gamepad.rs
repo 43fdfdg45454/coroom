@@ -27,7 +27,8 @@
 //! Si el anfitrión lo acepta (`GamepadMode`, [`PadLink::raw`]), el hilo `mando-crudo` manda cada
 //! informe tal cual (y el último otra vez cada [`RESEND`] si no hay nuevos, por si se perdió el
 //! datagrama que soltaba un botón) y deja de salir lo convertido; los informes de salida del
-//! anfitrión (vibración, luces) se escriben en el mando. Sin ranura no se envía nada.
+//! anfitrión (vibración, luces) se escriben en el mando ([`PadOutputs`]) con el tamaño que declara
+//! su descriptor, y si el mando no los acepta se avisa una vez. Sin ranura no se envía nada.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -35,6 +36,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
+use coroom_proto::hid::HidSummary;
 use coroom_proto::input::{GamepadDevice, GamepadTransport, PadData};
 use gilrs::{Axis, Button, EventType, GamepadId, Gilrs, GilrsBuilder};
 use serde::{Deserialize, Serialize};
@@ -370,6 +372,16 @@ mod platform {
     /// Por qué no se puede abrir, para la lista de mandos.
     pub const NO_ACCESS: &str = "sin permiso para leerlo en crudo (reglas udev)";
 
+    /// Qué mirar si el mando no acepta los informes de salida.
+    pub const WRITE_HELP: &str = "comprueba que tu usuario puede escribir en su /dev/hidraw* \
+         (reglas udev) y que ningún otro programa (Steam, por ejemplo) le esté mandando los suyos";
+
+    impl super::OutputWriter for Device {
+        fn write_output(&mut self, data: &[u8]) -> Result<(), InputError> {
+            Device::write_output(self, data)
+        }
+    }
+
     pub fn find(vendor: u16, product: u16) -> Option<Info> {
         hidraw::find(
             Path::new(hidraw::SYS_HIDRAW),
@@ -402,6 +414,16 @@ mod platform {
     /// Por qué no se puede abrir, para la lista de mandos.
     pub const NO_ACCESS: &str = "no se puede abrir en crudo (¿Steam lo tiene en exclusiva?)";
 
+    /// Qué mirar si el mando no acepta los informes de salida.
+    pub const WRITE_HELP: &str = "si Steam está abierto en este equipo, ciérralo (puede tener el \
+         mando en uso o mandarle los suyos) y vuelve a conectarlo";
+
+    impl super::OutputWriter for Device {
+        fn write_output(&mut self, data: &[u8]) -> Result<(), InputError> {
+            Device::write_output(self, data)
+        }
+    }
+
     /// La colección HID abierta.
     pub type Device = hidwin::HidwinDevice;
 
@@ -410,15 +432,109 @@ mod platform {
     }
 }
 
+/// Dónde escribe el invitado los informes de salida del anfitrión: el mando en crudo (y en los
+/// tests, uno de mentira).
+pub trait OutputWriter: Send {
+    /// Escribe un informe de salida (`data[0]` es su identificador, 0 si no los hay).
+    fn write_output(&mut self, data: &[u8]) -> Result<(), InputError>;
+}
+
+/// Los informes de salida (vibración, luces) que el anfitrión manda al mando tal cual de una
+/// ranura, hasta el mando físico.
+pub struct PadOutputs {
+    writer: Box<dyn OutputWriter>,
+    summary: HidSummary,
+    /// Nombre del mando, para el aviso.
+    name: String,
+    /// Qué mirar si no los acepta.
+    help: &'static str,
+    /// Escritos bien y fallidos.
+    written: u64,
+    failed: u64,
+    /// Si ya se avisó de que no los acepta (una vez por mando).
+    warned: bool,
+}
+
+impl std::fmt::Debug for PadOutputs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PadOutputs")
+            .field("name", &self.name)
+            .field("written", &self.written)
+            .field("failed", &self.failed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PadOutputs {
+    /// Para el mando `name` con su descriptor (`summary`): `help` dice qué mirar si falla.
+    pub fn new(
+        writer: Box<dyn OutputWriter>,
+        summary: HidSummary,
+        name: &str,
+        help: &'static str,
+    ) -> Self {
+        Self {
+            writer,
+            summary,
+            name: name.to_owned(),
+            help,
+            written: 0,
+            failed: 0,
+            warned: false,
+        }
+    }
+
+    /// Escribe los de `outputs` que son de `slot` (los de otra ranura se descartan: el mando
+    /// cambió de ranura entre medias), cada uno con el tamaño que declara el descriptor.
+    pub fn deliver(&mut self, slot: u8, outputs: impl IntoIterator<Item = (u8, Vec<u8>)>) {
+        for (out_slot, data) in outputs {
+            if out_slot != slot || data.is_empty() {
+                continue;
+            }
+            let data = self.summary.fit_output(&data);
+            match self.writer.write_output(&data) {
+                Ok(()) => {
+                    if self.written == 0 {
+                        debug!(name = %self.name, report = data[0], "primera salida del anfitrión escrita en el mando");
+                    }
+                    self.written += 1;
+                }
+                Err(err) => {
+                    self.failed += 1;
+                    if !std::mem::replace(&mut self.warned, true) {
+                        warn!(
+                            error = %err,
+                            report = data[0],
+                            "el mando «{}» no acepta los informes de salida del anfitrión: su \
+                             vibración y sus luces no llegan; {}",
+                            self.name,
+                            self.help
+                        );
+                    } else {
+                        debug!(error = %err, "informe de salida al mando");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Informes escritos bien y fallidos.
+    pub fn counts(&self) -> (u64, u64) {
+        (self.written, self.failed)
+    }
+
+    /// Si ya se avisó de que el mando no los acepta.
+    pub fn warned(&self) -> bool {
+        self.warned
+    }
+}
+
 /// El mando de la ranura mandado tal cual en crudo (hilo `mando-crudo`).
 struct RawPad {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    #[cfg(any(
-        all(target_os = "linux", feature = "linux-portal"),
-        target_os = "windows"
-    ))]
-    writer: Option<platform::Device>,
+    /// Sus informes de salida (solo si es HID y se pudo abrir).
+    outputs: Option<PadOutputs>,
     /// Si es HID (lo convertido se calla cuando el anfitrión lo tiene tal cual).
     hid: bool,
 }
@@ -429,25 +545,6 @@ impl Drop for RawPad {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-    }
-}
-
-impl RawPad {
-    fn write(&mut self, data: &[u8]) {
-        #[cfg(any(
-            all(target_os = "linux", feature = "linux-portal"),
-            target_os = "windows"
-        ))]
-        if let Some(writer) = &mut self.writer
-            && let Err(err) = writer.write_output(data)
-        {
-            debug!(error = %err, "informe de salida al mando");
-        }
-        #[cfg(not(any(
-            all(target_os = "linux", feature = "linux-portal"),
-            target_os = "windows"
-        )))]
-        let _ = data;
     }
 }
 
@@ -467,11 +564,7 @@ fn declare(link: &Arc<dyn PadLink>, slot: u8, key: &PadKey) -> RawPad {
     let idle = |hid| RawPad {
         stop: Arc::new(AtomicBool::new(false)),
         thread: None,
-        #[cfg(any(
-            all(target_os = "linux", feature = "linux-portal"),
-            target_os = "windows"
-        ))]
-        writer: None,
+        outputs: None,
         hid,
     };
     #[cfg(any(
@@ -505,6 +598,12 @@ fn declare(link: &Arc<dyn PadLink>, slot: u8, key: &PadKey) -> RawPad {
                 return idle(false);
             }
         };
+        let outputs = PadOutputs::new(
+            Box::new(writer),
+            info.summary.clone(),
+            &info.name,
+            platform::WRITE_HELP,
+        );
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
             let (stop, link) = (Arc::clone(&stop), Arc::clone(link));
@@ -516,7 +615,7 @@ fn declare(link: &Arc<dyn PadLink>, slot: u8, key: &PadKey) -> RawPad {
         RawPad {
             stop,
             thread,
-            writer: Some(writer),
+            outputs: Some(outputs),
             hid: true,
         }
     }
@@ -773,16 +872,12 @@ fn run(shared: &Shared) {
 
         let now = Instant::now();
         // Vibración y luces del anfitrión: solo con un mando tal cual, y no en cada vuelta.
-        if let (Some((slot, _)), Some(raw)) = (announced, raw.as_mut())
-            && raw.hid
+        if let (Some((slot, _)), Some(outputs)) =
+            (announced, raw.as_mut().and_then(|raw| raw.outputs.as_mut()))
             && now.saturating_duration_since(last_outputs) >= IDLE_POLL
         {
             last_outputs = now;
-            for (out_slot, data) in link.outputs() {
-                if out_slot == slot {
-                    raw.write(&data);
-                }
-            }
+            outputs.deliver(slot, link.outputs());
         }
 
         // Los ejes, como mucho a 1000 Hz, con la hora en que llegó cada uno.
@@ -909,6 +1004,90 @@ mod tests {
             "gatillos en BRAKE/GAS"
         );
         assert!(mapping.ends_with("platform:Linux,"));
+    }
+
+    /// Un mando de mentira que apunta lo que se le escribe (o falla siempre).
+    struct FakeWriter {
+        written: Arc<Mutex<Vec<Vec<u8>>>>,
+        fail: bool,
+    }
+
+    impl OutputWriter for FakeWriter {
+        fn write_output(&mut self, data: &[u8]) -> Result<(), InputError> {
+            if self.fail {
+                return Err(InputError::Backend("hidraw: Broken pipe".into()));
+            }
+            self.written.lock().unwrap().push(data.to_vec());
+            Ok(())
+        }
+    }
+
+    /// Descriptor de un mando con entrada `0x01` y salida `0x05` de 32 bytes (vibración y luz,
+    /// como la de un DualShock 4 por USB).
+    fn numbered_pad() -> HidSummary {
+        let mut descriptor = vec![0x05, 0x01, 0x09, 0x05, 0xA1, 0x01];
+        descriptor.extend([0x85, 0x01, 0x75, 0x08, 0x95, 0x3F, 0x81, 0x02]);
+        descriptor.extend([0x06, 0x00, 0xFF, 0x09, 0x02]);
+        descriptor.extend([0x85, 0x05, 0x95, 0x1F, 0x91, 0x02]);
+        descriptor.push(0xC0);
+        coroom_proto::hid::parse(&descriptor).unwrap()
+    }
+
+    fn outputs_with(fail: bool) -> (PadOutputs, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let writer = FakeWriter {
+            written: Arc::clone(&written),
+            fail,
+        };
+        (
+            PadOutputs::new(
+                Box::new(writer),
+                numbered_pad(),
+                "Mando de ejemplo",
+                "ayuda",
+            ),
+            written,
+        )
+    }
+
+    #[test]
+    fn host_outputs_reach_the_pad_of_their_slot_with_their_size() {
+        let (mut outputs, written) = outputs_with(false);
+        outputs.deliver(
+            2,
+            vec![
+                // De la ranura 2, corto (como lo manda un driver que no rellena): a 32 bytes.
+                (2, vec![0x05, 0xFF, 0x04, 0x00, 0x80, 0x40]),
+                // De otra ranura (el mando cambió de ranura entre medias): no.
+                (3, vec![0x05, 0xFF, 0x04]),
+                // Vacío: no.
+                (2, vec![]),
+                // Rellenado hasta 64 bytes (Windows): recortado a 32.
+                (2, {
+                    let mut data = vec![0x05, 0xFF, 0x04, 0x00, 0x00, 0x00];
+                    data.resize(64, 0);
+                    data
+                }),
+            ],
+        );
+        let written = written.lock().unwrap();
+        assert_eq!(written.len(), 2);
+        assert!(written.iter().all(|data| data.len() == 32));
+        assert_eq!(&written[0][..6], &[0x05, 0xFF, 0x04, 0x00, 0x80, 0x40]);
+        assert!(written[0][6..].iter().all(|b| *b == 0));
+        assert_eq!(&written[1][..6], &[0x05, 0xFF, 0x04, 0x00, 0x00, 0x00]);
+        assert_eq!(outputs.counts(), (2, 0));
+        assert!(!outputs.warned());
+    }
+
+    #[test]
+    fn a_pad_that_refuses_outputs_is_warned_about_once() {
+        let (mut outputs, written) = outputs_with(true);
+        outputs.deliver(1, vec![(1, vec![0x05, 0xFF]), (1, vec![0x05, 0x00])]);
+        outputs.deliver(1, vec![(1, vec![0x05, 0x10])]);
+        assert!(written.lock().unwrap().is_empty());
+        assert_eq!(outputs.counts(), (0, 3));
+        assert!(outputs.warned(), "se avisa (una vez) de que no llegan");
     }
 
     #[test]

@@ -229,7 +229,8 @@ impl HidrawDevice {
         }
     }
 
-    /// Escribe un informe de salida (con su identificador si el descriptor los usa).
+    /// Escribe un informe de salida: `data[0]` es su número (0 si el descriptor no los usa; el
+    /// kernel no lo manda al mando en ese caso), como pide `hidraw`.
     pub fn write_output(&mut self, data: &[u8]) -> Result<(), InputError> {
         self.file
             .write_all(data)

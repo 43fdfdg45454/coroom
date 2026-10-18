@@ -8,7 +8,9 @@
 //! - (c) ranura de mando 2: botones y ejes llegan con `slot = 2` y otro invitado no puede usarla;
 //! - (d) pausa: el sumidero recibe `ReleaseAll` y nada más hasta reanudar;
 //! - (e) expulsión: `ReleaseAll` y la ranura queda libre;
-//! - (f) latencia de entrada (`recibido − enviado` con el reloj de la sesión) p95 < 5 ms.
+//! - (f) latencia de entrada (`recibido − enviado` con el reloj de la sesión) p95 < 5 ms;
+//! - (h) un mando tal cual sigue lo que elige el anfitrión;
+//! - (i) la vibración de un mando tal cual llega solo al invitado de su ranura.
 //!
 //! El emisor suma los `MouseMove` relativos cuando el paquete pendiente se llena (64 eventos: un
 //! parón de más de 64 ms del hilo a 1000 Hz) y funde siempre los `GamepadAxis` del mismo eje: el
@@ -928,6 +930,97 @@ fn h_a_raw_gamepad_follows_the_host_choice() {
     assert!(sink.raw_slots().is_empty());
     assert!(!input.raw(2));
     guest.close();
+    host.close();
+    drop(server);
+}
+
+/// Espera en `input` los informes de salida de `slot` hasta tener `count` (los de otras ranuras
+/// se apuntan aparte): `PadLink::outputs` los vacía en cada lectura.
+fn collect_outputs(
+    input: &impl PadLink,
+    seen: &mut Vec<(u8, Vec<u8>)>,
+    what: &str,
+    until: impl Fn(&[(u8, Vec<u8>)]) -> bool,
+) {
+    wait_until(what, LIMIT, || {
+        seen.extend(input.outputs());
+        until(seen)
+    });
+}
+
+#[test]
+fn i_vibration_reaches_only_the_guest_of_its_slot() {
+    let _serial = serial();
+    let server = TestServer::start();
+    let sink = RecordingSink::new();
+    let mut host = host(&server, &sink);
+    let code = room_code(&host);
+    let mut first = guest(&server, &code);
+    let first_id = connected(&host, &first, 0);
+    let mut second = guest(&server, &code);
+    let second_id = connected(&host, &second, 1);
+    let slot = |slot| Permissions {
+        gamepad_slot: Some(slot),
+        ..Permissions::VIEW_ONLY
+    };
+    allow(&mut host, &first, first_id, slot(2));
+    allow(&mut host, &second, second_id, slot(3));
+    wait_until("las ranuras 2 y 3", LIMIT, || {
+        sink.assigned_slots() == vec![2, 3]
+    });
+    let (one, two) = (first.input(), second.input());
+    one.send_pad(hid_pad(2, PAD_DESCRIPTOR.to_vec()));
+    two.send_pad(hid_pad(3, PAD_DESCRIPTOR.to_vec()));
+    wait_until("los dos mandos tal cual", LIMIT, || {
+        sink.raw_slots() == vec![2, 3] && one.raw(2) && two.raw(3)
+    });
+
+    // El driver del anfitrión escribe en los dos mandos (y en una ranura sin dueño): a cada
+    // invitado le llega lo suyo, tal cual y en orden, con el número de informe delante.
+    sink.push_output(3, vec![0x05, 0x10, 0x20]);
+    sink.push_output(2, vec![0x05, 0xFF, 0x00]);
+    sink.push_output(4, vec![0x05, 0x01, 0x01]);
+    sink.push_output(2, vec![0x05, 0x00, 0x00]);
+    let (mut got_one, mut got_two) = (Vec::new(), Vec::new());
+    collect_outputs(&one, &mut got_one, "la vibración del primero", |seen| {
+        seen.len() >= 2
+    });
+    collect_outputs(&two, &mut got_two, "la vibración del segundo", |seen| {
+        !seen.is_empty()
+    });
+    assert_eq!(
+        got_one,
+        vec![(2, vec![0x05, 0xFF, 0x00]), (2, vec![0x05, 0x00, 0x00])]
+    );
+    assert_eq!(got_two, vec![(3, vec![0x05, 0x10, 0x20])]);
+
+    // Convertido el primero, lo de su ranura ya no sale; lo del segundo, sí.
+    allow(
+        &mut host,
+        &first,
+        first_id,
+        Permissions {
+            gamepad_raw: false,
+            ..slot(2)
+        },
+    );
+    wait_until("el primero convertido", LIMIT, || {
+        sink.raw_slots() == vec![3] && !one.raw(2)
+    });
+    sink.push_output(2, vec![0x05, 0x80, 0x80]);
+    sink.push_output(3, vec![0x05, 0x00, 0x00]);
+    collect_outputs(&two, &mut got_two, "la parada del segundo", |seen| {
+        seen.len() >= 2
+    });
+    assert_eq!(got_two[1], (3, vec![0x05, 0x00, 0x00]));
+    // Comprobación en negativo, sin espera fija: los dos se recogen del sumidero en la misma
+    // tanda o en tandas seguidas, así que lo de la ranura 2, si saliera, iría por delante.
+    got_one.clear();
+    got_one.extend(one.outputs());
+    assert!(got_one.is_empty(), "{got_one:?}");
+
+    first.close();
+    second.close();
     host.close();
     drop(server);
 }
