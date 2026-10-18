@@ -80,7 +80,7 @@ jobs:
 
       - name: Versión de Gradle (gradle-wrapper.properties)
         id: gradle
-        run: echo "version=$(sed -n 's|.*gradle-\([0-9.]*\)-bin.zip.*|\1|p' packaging/android/gradle/wrapper/gradle-wrapper.properties)" >> "$GITHUB_OUTPUT"
+        run: echo "version=$(sed -n 's|^distributionUrl=.*gradle-\([0-9.]*\)-bin.zip$|\1|p' packaging/android/gradle/wrapper/gradle-wrapper.properties)" >> "$GITHUB_OUTPUT"
 
       - uses: gradle/actions/setup-gradle@v6
         with:
