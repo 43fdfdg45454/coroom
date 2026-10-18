@@ -1,6 +1,7 @@
 package coroom.android.ui.room
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -175,6 +176,9 @@ class RoomActivity : ComponentActivity() {
     /** Con el chat abierto el teclado escribe en el chat; los mandos siguen yendo al juego. */
     private val keyboardToGame: Boolean get() = room.state.value.panel != Panel.Chat
 
+    // Es Activity.dispatchKeyEvent, público; lint lo marca porque androidx.core.app.ComponentActivity
+    // lo vuelve a declarar con @RestrictTo para su propio uso.
+    @SuppressLint("RestrictedApi")
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (inRoom && event.keyCode !in SYSTEM_KEYS) {
             val fromPad = event.isFromSource(InputDevice.SOURCE_GAMEPAD) || event.isFromSource(InputDevice.SOURCE_JOYSTICK)

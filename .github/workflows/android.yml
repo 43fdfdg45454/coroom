@@ -115,6 +115,10 @@ jobs:
           path: packaging/android/out/*.apk
           if-no-files-found: error
 
+      - name: Lint completo
+        if: failure()
+        run: cat packaging/android/app/build/intermediates/lint_intermediate_text_report/release/lintReportRelease/lint-results-release.txt || true
+
       - name: Informe de lint
         if: failure()
         uses: actions/upload-artifact@v7
