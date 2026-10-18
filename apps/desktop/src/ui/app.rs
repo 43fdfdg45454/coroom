@@ -1954,7 +1954,7 @@ impl App {
                 Some(state) => {
                     let shown = guest::rail_shown(self);
                     row![
-                        ui::slot(shown.then(|| self.rail())),
+                        ui::slot(shown.then(|| self.guest_rail())),
                         ui::slot(shown.then(|| iced_widget::rule::vertical(1).into())),
                         guest::view(self, state),
                     ]
@@ -2169,6 +2169,19 @@ impl App {
         .padding(Padding::from([0.0, coroom_ui::tokens::space::M]))
         .center_y(Length::Fixed(HEADERBAR_HEIGHT))
         .class(ContainerClass::Headerbar)
+        .into()
+    }
+
+    /// El riel junto al vídeo del invitado, bajo una franja del alto de la cabecera de las demás
+    /// páginas y sus dos líneas ([`SHELL_TOP`]): sin ella el riel empezaba arriba del todo y, al
+    /// ir del vídeo a Inicio o volver, sus iconos y nombres saltaban el alto de la cabecera.
+    fn guest_rail(&self) -> Element<'_, Message> {
+        container(column![
+            iced_widget::Space::new().height(Length::Fixed(SHELL_TOP)),
+            self.rail(),
+        ])
+        .height(Length::Fill)
+        .class(coroom_ui::style::ContainerClass::Sidebar)
         .into()
     }
 
@@ -2569,6 +2582,10 @@ pub const RAIL_ACCOUNT_ID: &str = "rail-account";
 /// borde de arriba (la barra de título del sistema) y de abajo que del borde izquierdo de la
 /// ventana (`space::S`), como en la barra de cabecera de GNOME.
 pub const HEADERBAR_HEIGHT: f32 = BRAND_ICON + 2.0 * coroom_ui::tokens::space::S;
+
+/// Dónde empiezan el riel y la página bajo la cabecera ([`App::shell`]): la cabecera y una línea
+/// de 1 px por encima y otra por debajo. El riel del invitado empieza a la misma altura.
+const SHELL_TOP: f32 = HEADERBAR_HEIGHT + 2.0;
 
 /// Cuánto se espera tras el último cambio de ajustes para guardarlos.
 pub const SETTINGS_SAVE_DELAY: Duration = Duration::from_millis(600);

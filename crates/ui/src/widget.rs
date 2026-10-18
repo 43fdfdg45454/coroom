@@ -1037,8 +1037,15 @@ pub fn rail_count<'a, M: 'a>(count: impl Into<String>) -> Element<'a, M> {
         .into()
 }
 
+/// Identificador de la caja del icono del destino `index` del riel (`top` y luego `bottom`): las
+/// pruebas miden que no se mueva.
+pub fn rail_glyph_id(index: usize) -> iced_widget::Id {
+    iced_widget::Id::from(format!("rail-glyph-{index}"))
+}
+
 fn rail_entry<'a, M: Clone + 'a>(
     item: RailItem<'a, M>,
+    index: usize,
     selected: bool,
     wide: bool,
 ) -> Element<'a, M> {
@@ -1054,6 +1061,7 @@ fn rail_entry<'a, M: Clone + 'a>(
     // cifra no cambia el árbol ni mueve el icono.
     let glyph = stack![
         container(glyph)
+            .id(rail_glyph_id(index))
             .center_x(Length::Fixed(RAIL_GLYPH))
             .center_y(Length::Fixed(RAIL_GLYPH)),
         container(slot(mark))
@@ -1064,6 +1072,8 @@ fn rail_entry<'a, M: Clone + 'a>(
     ];
     let count = count.map(rail_count);
     let content: Element<'a, M> = if wide {
+        // La cifra, en una ranura del ancho de la insignia más ancha aunque no haya: que aparezca
+        // (llega un invitado) no estrecha el nombre.
         row![
             glyph,
             text(label)
@@ -1071,7 +1081,7 @@ fn rail_entry<'a, M: Clone + 'a>(
                 .font(if selected { SEMIBOLD } else { UI })
                 .wrapping(Wrapping::None)
                 .width(Length::Fill),
-            slot(count)
+            reserve([rail_count("88")], count).align_x(Horizontal::Right)
         ]
         .spacing(gap::S)
         .align_y(Alignment::Center)
@@ -1142,7 +1152,7 @@ pub fn rail<'a, M: Clone + 'a>(
     let first = top.len();
     let mut entries: Vec<Element<'a, M>> = Vec::new();
     for (index, item) in top.into_iter().enumerate() {
-        entries.push(rail_entry(item, selected == Some(index), wide));
+        entries.push(rail_entry(item, index, selected == Some(index), wide));
     }
     entries.push(space::vertical().into());
     entries.push(
@@ -1155,7 +1165,12 @@ pub fn rail<'a, M: Clone + 'a>(
         .chain((0..bottom.len()).map(|index| first + 2 + index))
         .collect();
     for (index, item) in bottom.into_iter().enumerate() {
-        entries.push(rail_entry(item, selected == Some(first + index), wide));
+        entries.push(rail_entry(
+            item,
+            first + index,
+            selected == Some(first + index),
+            wide,
+        ));
     }
     let entries = Column::with_children(entries)
         .spacing(2)

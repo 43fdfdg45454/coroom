@@ -225,10 +225,23 @@ impl Operation for FocusRecorder {
 
 /// Todas las escenas, en claro y en oscuro.
 pub fn scenes() -> Vec<Scene> {
+    scenes_where(|_| true)
+}
+
+/// Solo la escena `name` (`09-sala-abierta-claro`), sin montar las demás.
+pub fn scene(name: &str) -> Option<Scene> {
+    scenes_where(|full| full == name).pop()
+}
+
+/// Las escenas cuyo nombre completo cumple `wanted`.
+fn scenes_where(wanted: impl Fn(&str) -> bool) -> Vec<Scene> {
     let fonts = Fonts::detect(Some("Inter 11"));
     let mut scenes = Vec::new();
     for (mode, suffix) in [(Mode::Light, "claro"), (Mode::Dark, "oscuro")] {
         for (name, build) in builders() {
+            if !wanted(&format!("{name}-{suffix}")) {
+                continue;
+            }
             let mut app = base(mode, fonts);
             build(&mut app);
             // Las capturas muestran la página ya entrada (sin el desliz del cambio de destino).

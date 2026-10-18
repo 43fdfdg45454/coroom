@@ -205,6 +205,23 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **El audio del juego suena igual con anfitrión Linux o Windows**: la mezcla ya no comprime todo
+  lo que pasa de −3 dBFS (lo hacía hasta con una sola aplicación, en el anfitrión y otra vez en cada
+  invitado): una sola fuente sale intacta y el limitador solo actúa si la suma pasa del fondo de
+  escala, sin recortes duros. La mezcla por aplicación sigue el reloj de la captura en lugar de uno
+  propio (ya no mete silencios de 10 ms), el loopback de WASAPI rellena con silencio medido los
+  huecos que marca el dispositivo, y en Linux «Todo el sistema» ya no captura las voces de la sala
+  que reproduce el propio coroom.
+- **La vibración llega con el mando compartido tal cual**: un anfitrión Linux reenvía también las
+  vibraciones que el driver manda como `SET_REPORT` (DualShock 3 por USB, mandos DragonRise,
+  Logitech y otros), los DualShock 4 y DualSense por Bluetooth ya se comparten tal cual (sus
+  descriptores declaran informes de audio de más de 512 bytes que hacían caer al modo convertido), y
+  cada informe se ajusta al tamaño que declara el mando antes de escribirlo (Windows los rellenaba
+  hasta el más grande). Si el mando del invitado no acepta la escritura, un aviso dice por qué
+  (permisos de udev, Steam con el mando abierto) en lugar de perderlo en silencio.
+- **Los iconos y textos del riel lateral ya no saltan**: como invitado, al pasar del vídeo a Inicio,
+  Amigos o Ajustes sin salir de la sala (o al volver), el riel empezaba 48 px más arriba que en las
+  demás páginas.
 - **El relay ya no ahoga el vídeo** (protocolo 17; hay que actualizar también el servidor): el
   servidor anuncia su límite por sala (`COROOM_RELAY_MAX_KBPS`) en el `RelayToken` y el anfitrión no
   apunta por encima (deja sitio a la FEC más alta), en lugar de descubrirlo a base de pérdidas que
