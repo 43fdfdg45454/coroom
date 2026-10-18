@@ -96,6 +96,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use quinn::congestion::{BbrConfig, Controller, ControllerFactory, CubicConfig};
+
+use crate::media::PROBE_MAX_PACE_KBPS;
 // `quinn` no reexporta el estimador de RTT que recibe `Controller::on_ack`.
 use quinn_proto::RttEstimator;
 
@@ -207,6 +209,20 @@ pub const PROBE_INTERVAL: Duration = Duration::from_secs(4);
 
 /// Espera máxima entre sondas periódicas del techo.
 pub const PROBE_MAX_INTERVAL: Duration = Duration::from_secs(64);
+
+/// Espera entre las sondas de subida sin techo ([`RateController::probe_due`]): mientras lo que
+/// frena el objetivo es lo medido y el camino está limpio, un tren cada medio segundo. La
+/// transmisión tiene que estabilizarse en cinco segundos como mucho; a [`PROBE_INTERVAL`] tardaba
+/// de 30 a 40.
+pub const RAMP_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Cuánto por encima de lo medido sale cada tren de subida.
+pub const RAMP_STEP: f64 = 2.0;
+
+/// Lo que tiene que subir lo medido con un tren de subida limpio para seguir subiendo: si sube
+/// menos, el tren ya no midió más que antes (el enlace, o el ritmo máximo del tren) y la subida
+/// termina.
+pub const RAMP_MIN_GAIN: f64 = 1.1;
 
 /// Sondas de tren del techo que fallan seguidas antes de probar la subida con el propio vídeo: un
 /// tren va encima del vídeo que ya sale, y contra un limitador de cubo pequeño la suma no pasa
@@ -357,6 +373,9 @@ pub struct RateController {
     /// Lo que había medido la sonda antes de que la congestión lo acotara
     /// ([`RateController::distrust_probe`]): hasta dónde se vuelve a sondear sin techo.
     distrusted: Option<f64>,
+    /// Si aún se sube lo medido con trenes cada [`RAMP_INTERVAL`] (ver
+    /// [`RateController::probe_due`]); termina cuando un tren ya no mide más o pierde.
+    ramp: bool,
     /// Sondas de tren del techo que fallaron seguidas: con [`TRAIN_FAILS`], la siguiente subida se
     /// prueba con el propio vídeo.
     train_fails: u32,
@@ -414,6 +433,7 @@ impl RateController {
             raised: None,
             probed: None,
             distrusted: None,
+            ramp: true,
             train_fails: 0,
             train_at: None,
             train_room: None,
@@ -454,17 +474,17 @@ impl RateController {
     /// pendiente.
     pub fn probe_due(&mut self, now: Instant) -> Option<u32> {
         let since = |at: Option<Instant>| at.map(|at| now.saturating_duration_since(at));
-        if self.probe_pending.is_some()
-            || since(self.probe_at).is_some_and(|elapsed| elapsed < self.probe_interval)
-        {
+        if self.probe_pending.is_some() {
             return None;
         }
-        // Sin techo no hace falta mientras valga lo medido al arrancar (un tren en un enlace lento
-        // ocupa cientos de milisegundos que el vídeo pasaría esperando); si la congestión lo
-        // acotó, se vuelve a medir ([`RateController::reprobe_due`]).
+        // Sin techo, se sondea solo si lo medido frena el objetivo: para subirlo al arrancar o
+        // tras una congestión que lo acotó ([`RateController::reprobe_due`]).
         let Some(cap) = self.burst_cap else {
             return self.reprobe_due(now);
         };
+        if since(self.probe_at).is_some_and(|elapsed| elapsed < self.probe_interval) {
+            return None;
+        }
         let pace = {
             // Sin un recorte pendiente ni pérdida. Si el techo frena (el objetivo está en
             // él), un paso por encima; si no frena (el objetivo está por debajo por otra
@@ -509,7 +529,7 @@ impl RateController {
                 return None;
             }
         };
-        self.probe_pending = Some(pace.max(1));
+        self.probe_pending = Some(pace.clamp(1, PROBE_MAX_PACE_KBPS));
         self.probe_at = Some(now);
         self.train_at = Some(now);
         self.probe_pending
@@ -525,9 +545,30 @@ impl RateController {
     /// [`DELIVERED_HEADROOM`] veces lo recibido, y con un codificador que gasta lo que pide la
     /// imagen (por debajo del objetivo) se quedaba clavado abajo durante minutos (lo midió la
     /// prueba por el relay: 8 Mbit/s de objetivo con una sonda limpia de 40).
+    ///
+    /// Al arrancar (sin congestión aún), la sonda de la escalera puede medir de menos: por el
+    /// relay medía 46 Mbit/s en un camino que pasaba más de 60, y el objetivo se quedaba en
+    /// [`PROBE_START_SHARE`] de eso. Mientras lo medido frene el objetivo, un tren a [`RAMP_STEP`]
+    /// veces lo medido cada [`RAMP_INTERVAL`] lo sube; la subida termina cuando un tren ya no
+    /// mide [`RAMP_MIN_GAIN`] más o pierde datagramas.
     fn reprobe_due(&mut self, now: Instant) -> Option<u32> {
-        let before = self.distrusted?;
         let (probed, _) = self.probed?;
+        let (pace, interval) = match self.distrusted {
+            Some(before) => (before.max(probed * PROBE_STEP), self.probe_interval),
+            // Un tren no sale por encima de [`PROBE_MAX_PACE_KBPS`]: si eso no deja medir
+            // [`RAMP_MIN_GAIN`] más de lo medido, no hay nada que subir (en una red local, la
+            // escalera ya midió eso al arrancar).
+            None if self.ramp && f64::from(PROBE_MAX_PACE_KBPS) >= probed * RAMP_MIN_GAIN => {
+                (probed * RAMP_STEP, RAMP_INTERVAL)
+            }
+            None => return None,
+        };
+        if self
+            .probe_at
+            .is_some_and(|at| now.saturating_duration_since(at) < interval)
+        {
+            return None;
+        }
         let threshold = QUEUE_THRESHOLD.as_secs_f64() * 1000.0;
         let quiet = self.hold_until.is_none_or(|until| now >= until)
             && self.queue_ms < threshold / 2.0
@@ -537,7 +578,7 @@ impl RateController {
         if !quiet || !limited {
             return None;
         }
-        let pace = before.max(probed * PROBE_STEP).max(1.0).round() as u32;
+        let pace = (pace.max(1.0).round() as u32).min(PROBE_MAX_PACE_KBPS);
         self.probe_pending = Some(pace);
         self.probe_at = Some(now);
         self.train_at = Some(now);
@@ -577,6 +618,7 @@ impl RateController {
         let clean = u32::from(lost) * 50 <= u32::from(sent).max(1)
             && delivered.is_some_and(|kbps| kbps >= 0.9 * pace_f);
         let periodic = self.probe_pending.take() == Some(pace);
+        let previous = self.probed_kbps();
         if !periodic {
             // Los de la escalera al arrancar cuentan como la última sonda.
             self.probe_at = Some(now);
@@ -612,18 +654,30 @@ impl RateController {
                 self.train_fails += 1;
             }
             (None, true) if periodic => {
-                // La sonda tras la congestión pasó: lo medido vuelve a subir y, si llega a lo de
-                // antes, ya no hace falta sondear.
+                // La sonda pasó: lo medido sube y, si llega a lo de antes de la congestión, ya no
+                // hace falta sondear. En la subida al arrancar, si ya no midió bastante más que
+                // antes, el tren no da para más (el enlace o su ritmo máximo) y se termina.
                 self.probe_interval = PROBE_INTERVAL;
-                if self
-                    .distrusted
-                    .is_some_and(|before| self.probed_kbps().unwrap_or(0.0) >= before)
-                {
+                let now_probed = self.probed_kbps().unwrap_or(0.0);
+                if self.distrusted.is_some_and(|before| now_probed >= before) {
                     self.distrusted = None;
+                } else if self.distrusted.is_none()
+                    && now_probed < previous.unwrap_or(0.0) * RAMP_MIN_GAIN
+                {
+                    self.ramp = false;
                 }
             }
             (None, false) if periodic => {
                 self.probe_interval = (self.probe_interval * 2).min(PROBE_MAX_INTERVAL);
+                if self.distrusted.is_none() {
+                    // Un tren de subida que pierde llegó al enlace: lo que entregó es lo que pasa,
+                    // pero un tren corto no baja lo medido (eso lo hace la congestión del vídeo).
+                    self.ramp = false;
+                    let delivered = self.probed_kbps().unwrap_or(0.0);
+                    if let Some(previous) = previous.filter(|previous| *previous > delivered) {
+                        self.probed = Some((previous, now));
+                    }
+                }
             }
             (cap, false) if !periodic && (cap.is_none() || self.burst_cut_at.is_none()) => {
                 // Una sonda de la escalera al arrancar que pierde datagramas (un limitador) dice
@@ -1547,7 +1601,9 @@ mod tests {
         for tick in 0..40 {
             step(&mut controller, &mut probes, tick, 20);
         }
-        assert_eq!(probes, 0, "sin congestión no sondea");
+        // Sin congestión, solo la subida al arrancar: un tren por encima del enlace, que pierde y
+        // la termina.
+        assert_eq!(probes, 1, "sin congestión, solo la sonda de subida");
         let before = controller.target_kbps();
         assert!(before >= 27_000, "arranca en lo medido: {before}");
         // Un segundo con 60 ms de cola: recorta y acota lo medido.
@@ -1571,6 +1627,80 @@ mod tests {
             step(&mut controller, &mut probes, tick, 20);
         }
         assert_eq!(probes, settled, "recuperado lo medido, deja de sondear");
+    }
+
+    /// La escalera al arrancar mide de menos (46 Mbit/s en un camino de 90, como por el relay):
+    /// las sondas de subida llevan el objetivo a lo que pasa el camino en menos de cinco
+    /// segundos, con el codificador gastando el 42 % del objetivo (lo recibido no empuja). Antes
+    /// se quedaba en el 70 % de lo medido hasta que algo creara un techo: de 30 a 40 s.
+    #[test]
+    fn an_underestimated_start_settles_within_five_seconds() {
+        let start = Instant::now();
+        let mut controller = RateController::new(RateConfig {
+            min_kbps: 1_000,
+            max_kbps: 100_000,
+            start_kbps: 8_000,
+        });
+        let link = 90_000u32;
+        // El tren a 100 Mbit/s llega a 46 sin perder (la dispersión del primer tramo).
+        controller.on_probe(start, 100_000, Some(46_000), 0, 64);
+        controller.restart(32_200);
+        let settle = (link as f64 * PROBE_START_SHARE * 0.9) as u32;
+        let mut settled_at = None;
+        let mut probes = 0;
+        for tick in 0..200u32 {
+            let now = start + TICK * tick;
+            if let Some(pace) = controller.probe_due(now) {
+                probes += 1;
+                let (delivered, lost) = if pace <= link { (pace, 0) } else { (link, 2) };
+                controller.on_probe(now, pace, Some(delivered), lost, 16);
+            }
+            run_with_usage(&mut controller, start, tick..tick + 1, |_| 20, 0.0, 0.42);
+            if settled_at.is_none() && controller.target_kbps() >= settle {
+                settled_at = Some(TICK * tick);
+            }
+        }
+        let settled_at = settled_at.expect("llega a lo que pasa el camino");
+        assert!(
+            settled_at <= Duration::from_secs(5),
+            "se estabiliza en {settled_at:?} (objetivo {})",
+            controller.target_kbps()
+        );
+        assert!(
+            controller.target_kbps() <= link,
+            "no pasa del enlace: {}",
+            controller.target_kbps()
+        );
+        assert!(probes <= 3, "unas pocas sondas y termina: {probes}");
+    }
+
+    /// En una red local la escalera ya mide el ritmo máximo de un tren: no hay sondas de subida
+    /// y el objetivo no cambia (la conexión directa sigue igual).
+    #[test]
+    fn a_start_measured_at_the_train_maximum_is_not_probed_again() {
+        let start = Instant::now();
+        let mut controller = RateController::new(RateConfig {
+            min_kbps: 1_000,
+            max_kbps: 150_000,
+            start_kbps: 8_000,
+        });
+        controller.on_probe(start, PROBE_MAX_PACE_KBPS, Some(103_000), 0, 64);
+        controller.restart(72_100);
+        for tick in 0..200u32 {
+            assert_eq!(
+                controller.probe_due(start + TICK * tick),
+                None,
+                "tick {tick}"
+            );
+            run_with_usage(&mut controller, start, tick..tick + 1, |_| 1, 0.0, 0.42);
+        }
+        // Los dos primeros ajustes, antes de tener ventana, crecen a ciegas; después, nada.
+        let blind = (72_100.0 * 1.05 * 1.05) as u32 + 1;
+        assert!(
+            controller.target_kbps() <= blind,
+            "{}",
+            controller.target_kbps()
+        );
     }
 
     /// Un enlace simulado tick a tick (50 ms): `link` kbit/s con limitador (tira lo que pasa del

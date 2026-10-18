@@ -215,6 +215,14 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **La calidad por el relay se estabiliza en unos 4 segundos, no en 30 o 40.** La sonda del
+  enlace al arrancar podía medir de menos por el relay (46 Mbit/s en un camino que pasaba más de
+  60), el objetivo se quedaba en el 70 % de eso y, sin pérdida ni techo de ráfaga, nadie volvía a
+  sondear: con el codificador gastando una parte del objetivo, lo recibido tampoco lo subía. Ahora,
+  mientras lo medido frena el objetivo y el camino está limpio, sale un tren a doble ritmo cada
+  medio segundo hasta que ya no mide más o pierde. En directo no cambia nada (la sonda ya mide el
+  ritmo máximo de un tren al arrancar). Además, un tren pedido por encima de 100 Mbit/s salía
+  recortado y su resultado no se reconocía como sonda periódica.
 - **El relay ya no descifra nada: solo reenvía paquetes** (protocolo 19; hay que actualizar el
   servidor y todos los clientes a la vez). Antes, el relay terminaba la conexión QUIC de cada par:
   descifraba cada paquete, lo volvía a cifrar para cada invitado y además repartía el vídeo y
