@@ -66,10 +66,10 @@ jobs:
           cmake --version | head -1
 
       # API 28 (Android 9): la que piden las capas de MediaCodec y AAudio. El procesado de voz es
-      # C++: --link-cxx-shared copia libc++_shared.so del NDK junto a la nuestra.
+      # C++: --link-libcxx-shared copia libc++_shared.so del NDK junto a la nuestra.
       - name: libcoroom_android.so
         run: |
-          cargo ndk -t arm64-v8a -t x86_64 -P 28 --link-cxx-shared \
+          cargo ndk -t arm64-v8a -t x86_64 -P 28 --link-libcxx-shared \
             -o packaging/android/app/src/main/jniLibs \
             build --release --locked -p coroom-android
           find packaging/android/app/src/main/jniLibs -name '*.so' -exec ls -l {} +
