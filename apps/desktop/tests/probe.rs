@@ -157,7 +157,13 @@ fn synthetic_av1_pipeline_presents_with_the_cursor_shape() {
     .expect("arranque con AV1");
     let deadline = Instant::now() + Duration::from_secs(120);
     while !pipeline.wait(Duration::from_millis(250)) {
-        assert!(Instant::now() < deadline, "la prueba AV1 no terminó");
+        // Con el resumen por tramos: en qué etapa se quedó (capturados, codificados, decodificados
+        // o presentados) si alguna vez se cuelga.
+        assert!(
+            Instant::now() < deadline,
+            "la prueba AV1 no terminó:\n{}",
+            ledger.summary()
+        );
     }
     assert_eq!(pipeline.failure(), None);
     let summary = pipeline.stop();
