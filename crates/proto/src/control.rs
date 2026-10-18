@@ -82,6 +82,8 @@ pub enum DecoderBackend {
     Vaapi,
     /// Software.
     Software,
+    /// MediaCodec de Android. Al final: `postcard` codifica el índice de la variante.
+    MediaCodec,
 }
 
 /// Lo que decodifica un invitado, en su orden de preferencia, y sus límites de vídeo.
@@ -751,6 +753,7 @@ mod tests {
             DecoderBackend::D3D11va,
             DecoderBackend::Vaapi,
             DecoderBackend::Software,
+            DecoderBackend::MediaCodec,
         ])
     }
 

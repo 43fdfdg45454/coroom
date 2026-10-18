@@ -10,6 +10,11 @@ publish.workspace = true
 # FFmpeg (SVT-AV1, dav1d, Vulkan Video, NVENC/NVDEC, AMF, QSV, VAAPI). Sin ella solo queda OpenH264.
 default = ["ffmpeg"]
 ffmpeg = ["dep:rsmpeg", "dep:ash"]
+# MediaCodec de Android: decodificación por hardware directa a la `Surface` de la vista del vídeo
+# (`mediacodec`). En el equipo de desarrollo solo compila la parte independiente de la plataforma
+# (elección de decodificadores, parámetros, contabilidad de búferes y esperas), con sus pruebas;
+# la capa sobre el NDK solo existe con `target_os = "android"`.
+mediacodec = ["dep:ndk"]
 
 [dependencies]
 ash = { workspace = true, optional = true }
@@ -26,6 +31,20 @@ yuv.workspace = true
 # antes de abrir VA-API, en vez de abortar en su *implib*.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
+
+# MediaCodec del NDK (`mediacodec`). Nivel de API 28 (Android 9), el mínimo con lo que usa la capa:
+# `AMediaCodec_setAsyncNotifyCallback` (28), la única vía de la API segura de `ndk` 0.9 que da
+# los índices de los búferes (sin ellos no se puede soltar un búfer de salida desde el hilo de la
+# presentación), y `AImageReader_newWithUsage` (26) para la superficie de reserva sin pantalla.
+# `low-latency` (`KEY_LOW_LATENCY`, Android 11) no exige subir el nivel: es una clave de texto
+# del `MediaFormat` que solo se pone cuando el códec anuncia `FEATURE_LowLatency` (que tampoco
+# existe antes de Android 11); en versiones anteriores la aplicación nunca lo anuncia.
+[target.'cfg(target_os = "android")'.dependencies]
+ndk = { workspace = true, optional = true, features = [
+    "media",
+    "nativewindow",
+    "api-level-28",
+] }
 
 # Texturas D3D11 de la captura y su importación en los *hw frames* de FFmpeg; la huella del
 # sondeo (`ffmpeg::fingerprint`) enumera los adaptadores por DXGI y lee el registro.

@@ -15,6 +15,10 @@ pipewire = ["dep:pipewire"]
 wasapi = ["dep:wasapi", "dep:windows"]
 # Procesado de voz de WebRTC (solo Linux: su compilación usa meson, ninja, `nm` y `objcopy`).
 webrtc-apm = ["dep:webrtc-audio-processing"]
+# AAudio en Android (el invitado), fuera de las de por defecto: la app de Android compila con
+# `--no-default-features --features bundled-opus,aaudio` (libopus con CMake y el toolchain del NDK
+# de `ANDROID_NDK_HOME`).
+aaudio = ["dep:ndk", "dep:rustix"]
 
 [dependencies]
 tracing = { workspace = true }
@@ -46,6 +50,12 @@ windows = { workspace = true, optional = true, features = [
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
 ] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# AAudio de la API 28 (Android 9): uso, tipo de contenido y preset de entrada del flujo.
+ndk = { workspace = true, optional = true, features = ["audio", "api-level-28"] }
+# `CLOCK_MONOTONIC` para comparar con las marcas de AAudio y el *nice* de los hilos de audio.
+rustix = { workspace = true, optional = true, features = ["process", "thread"] }
 
 [lints]
 workspace = true

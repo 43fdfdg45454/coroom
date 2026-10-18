@@ -1,0 +1,36 @@
+[package]
+name = "coroom-android"
+description = "Invitado Android de coroom: la lógica en Rust bajo la interfaz en Kotlin (JNI)."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "coroom_android"
+# `cdylib`: `libcoroom_android.so`, que carga la aplicación (`System.loadLibrary`); `rlib`: las
+# pruebas en el equipo de desarrollo.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+coroom-session = { workspace = true, features = ["mediacodec", "aaudio"] }
+coroom-transport.workspace = true
+crossbeam-channel.workspace = true
+jni.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# El registro va a logcat (`__android_log_write`); la `Surface` de la vista como `ANativeWindow`
+# para MediaCodec; `CLOCK_MONOTONIC`, el reloj de `SystemClock.uptimeMillis()` de los eventos.
+[target.'cfg(target_os = "android")'.dependencies]
+libc.workspace = true
+ndk = { workspace = true, features = ["nativewindow", "api-level-28"] }
+ndk-sys.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

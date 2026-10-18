@@ -32,7 +32,7 @@ const LIBRARY_CRATES: [&str; 11] = [
 ];
 
 /// Aplicaciones de `apps/` que deben existir.
-const APPS: [&str; 2] = ["desktop", "server"];
+const APPS: [&str; 3] = ["android", "desktop", "server"];
 
 struct Member {
     package: String,
@@ -175,6 +175,7 @@ fn every_planned_crate_exists_with_its_package_name() {
     }
     assert_eq!(members["apps/desktop"].package, "coroom");
     assert_eq!(members["apps/server"].package, "coroom-server");
+    assert_eq!(members["apps/android"].package, "coroom-android");
     assert_eq!(members.len(), LIBRARY_CRATES.len() + APPS.len());
 }
 

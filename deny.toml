@@ -9,6 +9,9 @@ targets = [
     "aarch64-unknown-linux-gnu",
     "x86_64-pc-windows-msvc",
     "aarch64-pc-windows-msvc",
+    # El invitado Android (`apps/android`).
+    "aarch64-linux-android",
+    "x86_64-linux-android",
 ]
 all-features = false
 

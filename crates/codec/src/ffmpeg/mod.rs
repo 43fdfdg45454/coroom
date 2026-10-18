@@ -197,6 +197,8 @@ pub(crate) fn decoder_device(backend: DecoderBackend) -> Option<ffi::AVHWDeviceT
         DecoderBackend::D3D11va => Some(ffi::AV_HWDEVICE_TYPE_D3D11VA),
         DecoderBackend::Vaapi => Some(ffi::AV_HWDEVICE_TYPE_VAAPI),
         DecoderBackend::Software => None,
+        // No es de FFmpeg: `FfmpegDecoder` lo rechaza antes de llegar aquí.
+        DecoderBackend::MediaCodec => None,
     }
 }
 

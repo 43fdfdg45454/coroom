@@ -523,11 +523,17 @@ impl ServerTrust {
 
     /// Las raíces de confianza del sistema operativo (almacén de certificados de Windows, paquete
     /// de CA de la distribución en Linux, con `SSL_CERT_FILE` y `SSL_CERT_DIR` si están definidas),
-    /// cargadas con `rustls-native-certs`. Falla si no hay ninguna utilizable.
+    /// cargadas con `rustls-native-certs`, más las que dio quien embebe la biblioteca con
+    /// [`set_platform_roots`]. Falla si no hay ninguna utilizable.
     pub fn system_roots() -> Result<ServerTrust, TransportError> {
         let loaded = rustls_native_certs::load_native_certs();
         let mut roots = RootCertStore::empty();
-        let (added, _ignored) = roots.add_parsable_certificates(loaded.certs);
+        let (mut added, _ignored) = roots.add_parsable_certificates(loaded.certs);
+        let platform = PLATFORM_ROOTS
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        added += roots.add_parsable_certificates(platform).0;
         if added == 0 {
             let detail = loaded
                 .errors
@@ -541,6 +547,35 @@ impl ServerTrust {
         }
         Ok(ServerTrust::Roots(Arc::new(roots)))
     }
+}
+
+/// Raíces que el sistema da por otra vía que `rustls-native-certs`: en Android el almacén de
+/// autoridades (`AndroidCAStore`, con las que instaló el usuario) solo se lee desde Java, y la
+/// aplicación las pasa con [`set_platform_roots`].
+static PLATFORM_ROOTS: RwLock<Vec<CertificateDer<'static>>> = RwLock::new(Vec::new());
+
+/// Reemplaza las raíces de confianza de la plataforma (DER de cada certificado) que suma
+/// [`ServerTrust::system_roots`]. Se puede volver a llamar si el usuario añade una autoridad con la
+/// aplicación abierta; las conexiones ya hechas no cambian.
+pub fn set_platform_roots(certs: Vec<Vec<u8>>) {
+    let certs = certs.into_iter().map(CertificateDer::from).collect();
+    *PLATFORM_ROOTS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = certs;
+}
+
+/// [`set_platform_roots`] con los certificados en PEM, uno tras otro. Devuelve cuántos sirven como
+/// raíz; los bloques que no se pueden leer o no son un certificado válido se saltan.
+pub fn set_platform_roots_pem(pem: &str) -> usize {
+    use rustls::pki_types::pem::PemObject;
+    let certs: Vec<Vec<u8>> = CertificateDer::pem_slice_iter(pem.as_bytes())
+        .filter_map(Result::ok)
+        .filter(|cert| RootCertStore::empty().add(cert.clone()).is_ok())
+        .map(|cert| cert.as_ref().to_vec())
+        .collect();
+    let count = certs.len();
+    set_platform_roots(certs);
+    count
 }
 
 /// Verificador por huella del certificado del servidor.

@@ -287,9 +287,10 @@ fn spawn(order: &str) -> Result<(Child, Receiver<Option<String>>), String> {
     Ok((child, rx))
 }
 
-/// `status` legible: la señal en Unix (`SIGSEGV`), el código si no.
+/// `status` legible: la señal en Linux (`SIGSEGV`), el código si no. Con `target_os = "linux"` y
+/// no `unix`: `libc` solo es dependencia en Linux (Android y otros Unix se quedan con el código).
 fn describe_status(status: &std::process::ExitStatus) -> String {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         use std::os::unix::process::ExitStatusExt;
         if let Some(signal) = status.signal() {

@@ -5,9 +5,11 @@
 //! - **Captura** ([`AudioSource`]): en Linux, **PipeWire** nativo ([`pipewire`]: el nodo de cada
 //!   aplicación o el micrófono); en Windows, **WASAPI** ([`wasapi`]: *loopback* de todo salvo
 //!   coroom, *loopback* por proceso y micrófono). «Todo lo que suena» es en los dos sistemas todo
-//!   salvo coroom (las voces de la sala no vuelven como audio del juego). Para los tests,
+//!   salvo coroom (las voces de la sala no vuelven como audio del juego). En Android (el
+//!   invitado), **AAudio** ([`aaudio`]: el micrófono con el procesado de voz del sistema). Para
+//!   los tests,
 //!   [`synthetic::ToneSource`], una senoidal con marcas de tiempo exactas.
-//! - **Reproducción** ([`AudioSink`]): PipeWire o WASAPI, y [`synthetic::CaptureSink`], que guarda
+//! - **Reproducción** ([`AudioSink`]): PipeWire, WASAPI o AAudio, y [`synthetic::CaptureSink`], que guarda
 //!   lo que se reproduce. Cada escritura devuelve cuándo se oirá ([`Played`]) para la sincronía.
 //! - **Códec** ([`codec`]): Opus de libopus 1.6.1 (crate `opusic-c`) con perfiles
 //!   [`codec::Profile::Game`] (estéreo, `restricted low-delay`) y [`codec::Profile::Voice`] (mono,
@@ -17,7 +19,8 @@
 //!   Linux) y **sincronía A/V** ([`sync::AvSync`]).
 //!
 //! Los backends de plataforma van detrás de los traits y de una `feature` (`pipewire`, `wasapi`,
-//! `webrtc-apm`); [`game_source`], [`mic_source`] y [`playback_sink`] eligen el de la plataforma.
+//! `aaudio`, `webrtc-apm`); [`game_source`], [`mic_source`] y [`playback_sink`] eligen el de la
+//! plataforma.
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -32,7 +35,8 @@ pub mod realtime;
 pub mod sync;
 pub mod synthetic;
 
-// La mezcla por aplicación (`apps`) lo usa siempre; sin backend nativo, solo ella.
+// La mezcla por aplicación (`apps`) lo usa siempre; sin backend nativo, solo ella. AAudio solo
+// usa la mitad de reproducción (el micrófono lee del flujo sin anillo).
 #[cfg_attr(
     not(any(
         all(target_os = "linux", feature = "pipewire"),
@@ -42,16 +46,24 @@ pub mod synthetic;
 )]
 mod ring;
 
-// La conversión al formato de mezcla del dispositivo la usa WASAPI (modo compartido de baja
-// latencia); en los demás sistemas solo la ejercitan sus tests.
+// La conversión al formato del dispositivo la usan WASAPI (modo compartido de baja latencia) y,
+// en parte, AAudio (si concede coma flotante u otros canales); en los demás sistemas solo la
+// ejercitan sus tests.
 #[cfg_attr(not(all(target_os = "windows", feature = "wasapi")), allow(dead_code))]
 mod convert;
+
+// Las cuentas de AAudio que no dependen de la plataforma; fuera de Android, solo sus tests.
+#[cfg_attr(not(all(target_os = "android", feature = "aaudio")), allow(dead_code))]
+mod tuning;
 
 #[cfg(all(target_os = "linux", feature = "pipewire"))]
 pub mod pipewire;
 
 #[cfg(all(target_os = "windows", feature = "wasapi"))]
 pub mod wasapi;
+
+#[cfg(all(target_os = "android", feature = "aaudio"))]
+pub mod aaudio;
 
 /// Frecuencia de muestreo de todo el pipeline de audio, en Hz.
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
@@ -206,6 +218,31 @@ pub struct Played {
     pub played_at_estimate: Instant,
 }
 
+/// Procesado de voz que el propio sistema ya aplica a lo que entrega una fuente
+/// ([`AudioSource::platform_processing`]): en Android, el preset de captura `VOICE_COMMUNICATION`
+/// de AAudio. El procesado de coroom quita lo que ya viene hecho
+/// ([`processing::ProcessingOptions::without_platform`]) para no aplicarlo dos veces: dos
+/// controles de ganancia se pelean y una puerta de ruido detrás de la supresión del sistema corta
+/// sílabas.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlatformProcessing {
+    /// Cancelación de eco del sistema.
+    pub echo_cancellation: bool,
+    /// Supresión de ruido del sistema.
+    pub noise_suppression: bool,
+    /// Control automático de ganancia del sistema.
+    pub gain_control: bool,
+}
+
+impl PlatformProcessing {
+    /// El sistema no procesa nada (PipeWire, WASAPI, las fuentes sintéticas).
+    pub const NONE: PlatformProcessing = PlatformProcessing {
+        echo_cancellation: false,
+        noise_suppression: false,
+        gain_control: false,
+    };
+}
+
 /// Fuente de tramas de audio PCM.
 ///
 /// Es `Send` porque cada fuente vive en su hilo de audio (`audio-cap`, `voice-cap`).
@@ -232,6 +269,12 @@ pub trait AudioSource: Send {
     /// aplicación (todo el sistema, un dispositivo): entonces no cambia nada.
     fn set_app_filter(&mut self, _filter: &apps::AppFilter) -> bool {
         false
+    }
+
+    /// Qué procesado de voz aplica ya el sistema a lo que entrega (antes de [`AudioSource::start`],
+    /// lo que se va a pedir; después, lo que concedió el dispositivo). Por defecto, nada.
+    fn platform_processing(&self) -> PlatformProcessing {
+        PlatformProcessing::NONE
     }
 
     /// Como [`AudioSource::read`], en coma flotante (`[-1, 1]`). Devuelve las muestras escritas.
@@ -478,9 +521,14 @@ pub fn mic_source(device: Option<&str>) -> Result<Box<dyn AudioSource>, AudioErr
     {
         Ok(Box::new(wasapi::MicSource::new(device.map(str::to_owned))))
     }
+    #[cfg(all(target_os = "android", feature = "aaudio"))]
+    {
+        Ok(Box::new(aaudio::MicSource::new(device.map(str::to_owned))))
+    }
     #[cfg(not(any(
         all(target_os = "linux", feature = "pipewire"),
-        all(target_os = "windows", feature = "wasapi")
+        all(target_os = "windows", feature = "wasapi"),
+        all(target_os = "android", feature = "aaudio")
     )))]
     {
         let _ = device;
@@ -509,9 +557,17 @@ pub fn playback_sink(
             format,
         )))
     }
+    #[cfg(all(target_os = "android", feature = "aaudio"))]
+    {
+        Ok(Box::new(aaudio::PlaybackSink::new(
+            device.map(str::to_owned),
+            format,
+        )))
+    }
     #[cfg(not(any(
         all(target_os = "linux", feature = "pipewire"),
-        all(target_os = "windows", feature = "wasapi")
+        all(target_os = "windows", feature = "wasapi"),
+        all(target_os = "android", feature = "aaudio")
     )))]
     {
         let _ = (device, format);
@@ -531,9 +587,18 @@ pub fn list_devices() -> Result<Vec<DeviceInfo>, AudioError> {
     {
         wasapi::list_devices()
     }
+    #[cfg(all(target_os = "android", feature = "aaudio"))]
+    {
+        Err(AudioError::Unsupported(
+            "AAudio no enumera dispositivos: en Android la lista la da la aplicación \
+             (AudioManager.getDevices) y se elige por su id"
+                .to_owned(),
+        ))
+    }
     #[cfg(not(any(
         all(target_os = "linux", feature = "pipewire"),
-        all(target_os = "windows", feature = "wasapi")
+        all(target_os = "windows", feature = "wasapi"),
+        all(target_os = "android", feature = "aaudio")
     )))]
     {
         Err(AudioError::Unsupported(
@@ -558,6 +623,12 @@ pub fn status() -> Vec<String> {
         );
         lines.push(wasapi::process_loopback_status());
     }
+    #[cfg(all(target_os = "android", feature = "aaudio"))]
+    lines.push(
+        "backend: AAudio (salida en baja latencia a demanda; micrófono con el preset \
+         VOICE_COMMUNICATION)"
+            .to_owned(),
+    );
     #[cfg(target_os = "linux")]
     lines.push(
         "audio de una sola aplicación: por su nodo de PipeWire (--audio app NOMBRE); el loopback \

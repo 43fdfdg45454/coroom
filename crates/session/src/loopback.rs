@@ -1834,10 +1834,11 @@ pub(crate) fn decode_loop(
             }
             Ok(Some(mut image)) => {
                 health = DecodeHealth::default();
-                ledger.mark(frame.frame_id, Stage::Decoded, Instant::now());
+                // El id lo pone el decodificador: el de la entrada de la que sale la imagen, que
+                // no es la actual si el decodificador retiene un fotograma (MediaCodec).
+                ledger.mark(image.frame_id, Stage::Decoded, Instant::now());
                 ledger.record_cpu_copies(Stage::Decoded, current.cpu_copies());
                 bump(&shared.counters.decoded);
-                image.frame_id = frame.frame_id;
                 // El espacio de color negociado manda (`CodecSelected`).
                 if let Some(format) = opened_format {
                     image.color = format.color;

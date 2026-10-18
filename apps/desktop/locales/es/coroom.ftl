@@ -112,7 +112,6 @@ account-copiar = Copiar
 
 ## backend
 
-backend-el-servidor-cerro-la-senalizacion = el servidor cerró la señalización
 backend-la-prueba-se-detuvo-err = la prueba se detuvo: { $err }
 backend-no-se-pudo-abrir-url-err = No se pudo abrir { $url }: { $err }
 backend-no-se-pudo-arrancar-una-tarea = no se pudo arrancar una tarea: { $err }

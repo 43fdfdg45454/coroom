@@ -27,7 +27,8 @@ coroom-proto = { path = "crates/proto", version = "1.0.0" }
 coroom-crypto = { path = "crates/crypto", version = "1.0.0" }
 coroom-transport = { path = "crates/transport", version = "1.0.0" }
 coroom-capture = { path = "crates/capture", version = "1.0.0" }
-coroom-codec = { path = "crates/codec", version = "1.0.0" }
+# Sin FFmpeg por defecto: `coroom-session` lo pide fuera de Android (allí decodifica MediaCodec).
+coroom-codec = { path = "crates/codec", version = "1.0.0", default-features = false }
 coroom-audio = { path = "crates/audio", version = "1.0.0" }
 coroom-input = { path = "crates/input", version = "1.0.0" }
 coroom-render = { path = "crates/render", version = "1.0.0" }
@@ -138,6 +139,13 @@ ashpd = { version = "=0.13.13", default-features = false, features = ["async-io"
 # `sched_setscheduler`, `gettid` y `RLIMIT_RTTIME`.
 zbus = { version = "=5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
 libc = "=0.2.190"
+
+# Invitado Android (`apps/android`): enlaces seguros al NDK (MediaCodec, AAudio, ANativeWindow) de
+# rust-mobile y JNI para el puente con la interfaz en Kotlin. Cada crate activa solo los módulos
+# del NDK que usa.
+ndk = { version = "=0.9.0", default-features = false }
+jni = { version = "=0.22.4", default-features = false }
+ndk-sys = { version = "=0.6.0", default-features = false }
 windows = { version = "=0.62.2", default-features = false }
 # Invitado en Windows: el mando HID en crudo (informes, características y el descriptor, que
 # Windows no da y hidapi reconstruye de los datos preparsed). Backend en Rust puro, sin C.

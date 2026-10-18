@@ -444,17 +444,19 @@ fn start_audio(
         core: Arc::clone(core),
         links: Arc::clone(links),
     });
-    let processor =
-        host_audio
-            .voice
-            .as_ref()
-            .and_then(|voice| match VoiceProcessor::new(voice.processing) {
-                Ok(processor) => Some(processor),
-                Err(err) => {
-                    core.warn(format!("sin procesado de voz: {err}"));
-                    None
-                }
-            });
+    let processor = host_audio.voice.as_ref().and_then(|voice| {
+        // Lo que ya hace el sistema (Android con el preset de voz) no se repite.
+        let options = voice
+            .processing
+            .without_platform(voice.mic.platform_processing());
+        match VoiceProcessor::new(options) {
+            Ok(processor) => Some(processor),
+            Err(err) => {
+                core.warn(format!("sin procesado de voz: {err}"));
+                None
+            }
+        }
+    });
     let render = processor
         .as_ref()
         .filter(|processor| processor.echo_cancellation())

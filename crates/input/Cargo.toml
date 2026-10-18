@@ -22,10 +22,15 @@ windows-vhid = ["windows-sendinput"]
 coroom-crypto.workspace = true
 coroom-proto.workspace = true
 crossbeam-channel.workspace = true
-gilrs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+
+# La ventana y los mandos del invitado de escritorio. En Android no: `winit` arrastra
+# `android-activity` (que exige elegir actividad) y `gilrs` no tiene backend; allí la aplicación
+# pasa el tacto, las teclas y los mandos por JNI (`src/touch.rs` y `src/android.rs`).
+[target.'cfg(not(target_os = "android"))'.dependencies]
+gilrs.workspace = true
 winit.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]

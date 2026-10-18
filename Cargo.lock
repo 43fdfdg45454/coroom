@@ -1220,15 +1220,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "coroom-android"
+version = "1.0.0"
+dependencies = [
+ "coroom-session",
+ "coroom-transport",
+ "crossbeam-channel",
+ "jni",
+ "libc",
+ "ndk",
+ "ndk-sys",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "coroom-audio"
 version = "1.0.0"
 dependencies = [
  "bytemuck",
  "coroom-testkit",
  "libc",
+ "ndk",
  "opusic-c",
  "opusic-sys",
  "pipewire",
+ "rustix 1.1.5",
  "tracing",
  "wasapi",
  "webrtc-audio-processing",
@@ -1258,6 +1278,7 @@ dependencies = [
  "coroom-proto",
  "coroom-testkit",
  "libc",
+ "ndk",
  "openh264",
  "rsmpeg",
  "serde",
@@ -1381,6 +1402,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -1408,6 +1430,7 @@ dependencies = [
  "quinn",
  "quinn-proto",
  "raptorq",
+ "rcgen",
  "rustix 1.1.5",
  "rustls",
  "rustls-native-certs",

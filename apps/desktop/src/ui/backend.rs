@@ -18,13 +18,13 @@ use coroom_render::wgpu::VideoImporter;
 use coroom_session::capture::{RestoreTokenSink, ShareKind};
 use coroom_session::codec::DecodeOutput;
 use coroom_session::latency::{LatencyLedger, LatencySummary};
+use coroom_session::lobby::{self, LobbyEvent};
 use coroom_session::loopback::LoopbackPipeline;
 use coroom_session::preview::PreviewTap;
 use coroom_session::remote::{AudioControl, GuestInput, RemoteSession, SessionEvent};
 use coroom_session::{Session as _, SessionError};
 use coroom_transport::crypto::Identity;
 use coroom_transport::proto::signal::SignalMessage;
-use coroom_transport::{Endpoint, EndpointOptions, SignalClient};
 
 use super::app::{
     AccountInfo, App, AudioDevice, Effect, Event, GuestEnd, HostRequest, HostVoice, Invitation,
@@ -35,7 +35,7 @@ use super::screens::guest::Stats;
 use super::screens::host::{ShareOptions, SourceChoice};
 use super::settings::{CodecChoice, DecoderChoice, ServerEntry, Settings, VoiceMode};
 use super::video::{FeedSink, VideoFeed, Wake};
-use crate::account::{self, AccountOptions, AccountStore};
+use crate::account::{self, AccountOptions, AccountStorage, AccountStore};
 use crate::probe::{ProbeOptions, Source, start_pipeline_with, to_present_frame};
 use crate::remote::{
     AutoAllow, Ended, HostAudioOptions, HostOptions, JoinAudioOptions, JoinOptions, NetOptions,
@@ -50,12 +50,6 @@ pub const GUEST_STATS_PERIOD: Duration = Duration::from_millis(250);
 
 /// Cada cuánto se pide el estado de los invitados del anfitrión.
 pub const HOST_STATUS_PERIOD: Duration = Duration::from_millis(500);
-
-/// Espera antes de reabrir la sala de espera si se cae.
-const LOBBY_RETRY: Duration = Duration::from_secs(5);
-
-/// Cada cuánto la sala de espera informa del RTT con el servidor (insignia de la cabecera).
-const SERVER_STATUS_EVERY: Duration = Duration::from_secs(5);
 
 /// Lo más que se espera a que la sala conecte con el servidor al abrirla; después se avisa y se
 /// vuelve a la sala de espera (si arranca tarde, se cierra sola).
@@ -1878,126 +1872,75 @@ fn lobby(
     inbox: &mpsc::Receiver<SignalMessage>,
     notify: &Notify,
 ) {
-    while !stop.load(Ordering::Acquire) {
-        if let Err(err) = lobby_once(options, stop, inbox, notify) {
-            tracing::debug!(error = %err, "sala de espera");
-            if !stop.load(Ordering::Acquire) {
-                notify(Message::Event(Event::ServerStatus {
-                    rtt_ms: None,
-                    online: false,
-                }));
-            }
+    let session = || -> Result<_, String> {
+        let session = account::session(options)?;
+        let (identity, _) = load_identity(options.data_dir.as_deref(), options.headless)?;
+        Ok((session, identity))
+    };
+    lobby::run(&session, stop, inbox, &mut |event| {
+        if let Some(event) = lobby_ui_event(event) {
+            notify(Message::Event(event));
         }
-        let deadline = std::time::Instant::now() + LOBBY_RETRY;
-        while std::time::Instant::now() < deadline {
-            if stop.load(Ordering::Acquire) {
-                return;
-            }
-            discard_lobby_commands(inbox, notify);
-            thread::sleep(Duration::from_millis(200));
-        }
-    }
+    });
 }
 
-/// Sin señalización no se puede enviar nada: lo encolado se descarta avisando.
-fn discard_lobby_commands(inbox: &mpsc::Receiver<SignalMessage>, notify: &Notify) {
-    while inbox.try_recv().is_ok() {
-        notify(Message::Event(Event::JoinRequestFailed {
+/// Lo que la pantalla muestra de cada evento de la sala de espera.
+fn lobby_ui_event(event: LobbyEvent) -> Option<Event> {
+    Some(match event {
+        LobbyEvent::Online { rtt_ms } => Event::ServerStatus {
+            rtt_ms: Some(rtt_ms),
+            online: true,
+        },
+        LobbyEvent::Offline(_) => Event::ServerStatus {
+            rtt_ms: None,
+            online: false,
+        },
+        LobbyEvent::SendFailed(None) => Event::JoinRequestFailed {
             message: t!("backend-sin-conexion-para-pedir-entrar").to_owned(),
-        }));
-    }
-}
-
-fn lobby_once(
-    options: &AccountOptions,
-    stop: &AtomicBool,
-    inbox: &mpsc::Receiver<SignalMessage>,
-    notify: &Notify,
-) -> Result<(), String> {
-    let session = account::session(options)?;
-    let (identity, _) = load_identity(options.data_dir.as_deref(), options.headless)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| err.to_string())?;
-    runtime.block_on(async {
-        let endpoint = Endpoint::bind(&identity, None, EndpointOptions::default())
-            .map_err(|err| err.to_string())?;
-        let mut signal = SignalClient::connect(
-            &session.credentials.server,
-            &session.credentials.token,
-            &endpoint,
-            &session.trust,
-        )
-        .await
-        .map_err(|err| err.to_string())?;
-        let mut tick = tokio::time::interval(Duration::from_millis(200));
-        let mut status_tick = tokio::time::interval(SERVER_STATUS_EVERY);
-        let result = loop {
-            tokio::select! {
-                _ = status_tick.tick() => {
-                    notify(Message::Event(Event::ServerStatus {
-                        rtt_ms: Some(signal.rtt().as_secs_f64() * 1000.0),
-                        online: true,
-                    }));
-                }
-                event = signal.next_event() => match event {
-                    Ok(Some(SignalMessage::Invited { from_user, from_name, code })) => {
-                        notify(Message::Event(Event::Invited(Invitation {
-                            from_user,
-                            from_name,
-                            code,
-                        })));
-                    }
-                    Ok(Some(SignalMessage::Presence { user, online })) => {
-                        notify(Message::Event(Event::Presence { user, online }));
-                    }
-                    Ok(Some(SignalMessage::Activity { user, activity })) => {
-                        notify(Message::Event(Event::Activity { user, activity }));
-                    }
-                    Ok(Some(SignalMessage::Avatar { user, avatar })) => {
-                        notify(Message::Event(Event::Avatar { user, avatar }));
-                    }
-                    // Solo si la sala está abierta en otro dispositivo de la cuenta: se avisa.
-                    Ok(Some(SignalMessage::JoinRequested { from_user, from_name })) => {
-                        notify(Message::Event(Event::JoinRequested { from_user, from_name }));
-                    }
-                    Ok(Some(SignalMessage::JoinDeclined { from_user, from_name })) => {
-                        notify(Message::Event(Event::JoinDeclined { from_user, from_name }));
-                    }
-                    Ok(Some(SignalMessage::FriendRequested { from_user, from_name })) => {
-                        notify(Message::Event(Event::FriendRequested { from_user, from_name }));
-                    }
-                    // La sala de espera solo envía peticiones de entrar: un error es su respuesta
-                    // (el texto del servidor ya viene en español).
-                    Ok(Some(SignalMessage::Error { message, .. })) => {
-                        notify(Message::Event(Event::JoinRequestFailed { message }));
-                    }
-                    Ok(Some(_)) => {}
-                    Ok(None) => break Err(t!("backend-el-servidor-cerro-la-senalizacion").to_owned()),
-                    Err(err) => break Err(err.to_string()),
-                },
-                _ = tick.tick() => {
-                    // La parada se mira antes de vaciar la cola: lo que se encoló antes de pedirla
-                    // (una petición de entrar justo antes de cerrar la sala de espera) sale
-                    // todavía, en vez de perderse en silencio.
-                    let stopping = stop.load(Ordering::Acquire);
-                    while let Ok(message) = inbox.try_recv() {
-                        if let Err(err) = signal.send(&message).await {
-                            notify(Message::Event(Event::JoinRequestFailed {
-                                message: t!("backend-no-se-pudo-pedir-entrar", err = err),
-                            }));
-                        }
-                    }
-                    if stopping {
-                        break Ok(());
-                    }
-                }
-            }
-        };
-        signal.close();
-        endpoint.close();
-        result
+        },
+        LobbyEvent::SendFailed(Some(err)) => Event::JoinRequestFailed {
+            message: t!("backend-no-se-pudo-pedir-entrar", err = err),
+        },
+        LobbyEvent::Signal(message) => match message {
+            SignalMessage::Invited {
+                from_user,
+                from_name,
+                code,
+            } => Event::Invited(Invitation {
+                from_user,
+                from_name,
+                code,
+            }),
+            SignalMessage::Presence { user, online } => Event::Presence { user, online },
+            SignalMessage::Activity { user, activity } => Event::Activity { user, activity },
+            SignalMessage::Avatar { user, avatar } => Event::Avatar { user, avatar },
+            // Solo si la sala está abierta en otro dispositivo de la cuenta: se avisa.
+            SignalMessage::JoinRequested {
+                from_user,
+                from_name,
+            } => Event::JoinRequested {
+                from_user,
+                from_name,
+            },
+            SignalMessage::JoinDeclined {
+                from_user,
+                from_name,
+            } => Event::JoinDeclined {
+                from_user,
+                from_name,
+            },
+            SignalMessage::FriendRequested {
+                from_user,
+                from_name,
+            } => Event::FriendRequested {
+                from_user,
+                from_name,
+            },
+            // La sala de espera solo envía peticiones de entrar: un error es su respuesta (el
+            // texto del servidor ya viene en español).
+            SignalMessage::Error { message, .. } => Event::JoinRequestFailed { message },
+            _ => return None,
+        },
     })
 }
 

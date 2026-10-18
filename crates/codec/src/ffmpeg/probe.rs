@@ -104,6 +104,8 @@ fn platform_decoders() -> Vec<DecoderBackend> {
         .filter(|backend| match backend {
             DecoderBackend::D3D11va | DecoderBackend::D3D12va => cfg!(target_os = "windows"),
             DecoderBackend::Vaapi => cfg!(target_os = "linux"),
+            // No es de FFmpeg: lo describe la aplicación de Android (`DecoderSet::android`).
+            DecoderBackend::MediaCodec => false,
             _ => true,
         })
         .collect()

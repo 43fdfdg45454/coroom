@@ -7,7 +7,9 @@
 //! - **Salida del decodificador**: una imagen Vulkan de FFmpeg ([`VulkanImage`]) creada en el
 //!   mismo `VkDevice` que el presentador (el que describe [`SharedVulkanDevice`]), que
 //!   `coroom-render` importa en `wgpu` sin copia, o una imagen de GPU que no se puede presentar sin
-//!   copia ([`OpaqueImage`]: sin ventana no hace falta).
+//!   copia ([`OpaqueImage`]: sin ventana no hace falta). En Android (feature `mediacodec`), un
+//!   búfer de salida de MediaCodec que ya está en la `Surface` de la vista y solo falta soltar a la
+//!   pantalla (`crate::mediacodec::SurfaceFrame`).
 //!
 //! [`GpuInput`] dice qué entrada de GPU acepta un codificador (y, por tanto, qué debe pedir la
 //! captura) y [`DecodeOutput`] dónde deja el decodificador sus imágenes.
@@ -237,6 +239,11 @@ pub enum GpuImage {
     Vulkan(Arc<VulkanImage>),
     /// Imagen de GPU que solo se puede descartar.
     Opaque(Arc<OpaqueImage>),
+    /// Búfer de salida de MediaCodec decodificado en la `Surface` de la vista (Android): la
+    /// presentación lo suelta a la pantalla con [`crate::mediacodec::SurfaceFrame::present`]; si
+    /// se suelta sin presentar (el último `Arc`), vuelve al decodificador sin dibujarse.
+    #[cfg(feature = "mediacodec")]
+    MediaCodec(Arc<crate::mediacodec::SurfaceFrame>),
 }
 
 impl GpuImage {
@@ -249,6 +256,8 @@ impl GpuImage {
             GpuImage::D3D11(_) => "D3D11",
             GpuImage::Vulkan(_) => "Vulkan",
             GpuImage::Opaque(image) => &image.kind,
+            #[cfg(feature = "mediacodec")]
+            GpuImage::MediaCodec(_) => "MediaCodec",
         }
     }
 
@@ -260,6 +269,8 @@ impl GpuImage {
             GpuImage::D3D11(image) => Arc::as_ptr(image).cast(),
             GpuImage::Vulkan(image) => Arc::as_ptr(image).cast(),
             GpuImage::Opaque(image) => Arc::as_ptr(image).cast(),
+            #[cfg(feature = "mediacodec")]
+            GpuImage::MediaCodec(image) => Arc::as_ptr(image).cast(),
         }
     }
 }
@@ -273,6 +284,8 @@ impl fmt::Debug for GpuImage {
             GpuImage::D3D11(image) => image.fmt(f),
             GpuImage::Vulkan(image) => image.fmt(f),
             GpuImage::Opaque(image) => image.fmt(f),
+            #[cfg(feature = "mediacodec")]
+            GpuImage::MediaCodec(image) => image.fmt(f),
         }
     }
 }

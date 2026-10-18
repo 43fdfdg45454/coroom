@@ -6,21 +6,36 @@ license.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[features]
+# El invitado Android (`apps/android`): MediaCodec y AAudio. La parte independiente de la
+# plataforma compila (y se prueba) también en el escritorio.
+mediacodec = ["coroom-codec/mediacodec"]
+aaudio = ["coroom-audio/aaudio"]
+
 [dependencies]
 bytes.workspace = true
 coroom-audio.workspace = true
 coroom-capture.workspace = true
-coroom-codec.workspace = true
 coroom-input.workspace = true
 coroom-transport.workspace = true
 crossbeam-channel.workspace = true
 serde.workspace = true
+# Las credenciales de cada servidor (`account`), en JSON.
+serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "sync", "macros"] }
 tracing.workspace = true
+# El texto de las credenciales que entrega el almacén de la aplicación (`account::AccountStorage`).
+zeroize.workspace = true
+
+# FFmpeg en el escritorio; en Android no hay FFmpeg y decodifica MediaCodec (`mediacodec`).
+[target.'cfg(not(target_os = "android"))'.dependencies]
+coroom-codec = { workspace = true, features = ["ffmpeg"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+coroom-codec.workspace = true
 
 [dev-dependencies]
 coroom-testkit.workspace = true
-serde_json.workspace = true
 
 [lints]
 workspace = true

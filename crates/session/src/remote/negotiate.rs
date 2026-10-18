@@ -99,6 +99,7 @@ fn decoder_to_wire(backend: DecoderBackend) -> control::DecoderBackend {
         DecoderBackend::D3D11va => control::DecoderBackend::D3D11va,
         DecoderBackend::Vaapi => control::DecoderBackend::Vaapi,
         DecoderBackend::Software => control::DecoderBackend::Software,
+        DecoderBackend::MediaCodec => control::DecoderBackend::MediaCodec,
     }
 }
 
@@ -110,6 +111,7 @@ fn decoder_from_wire(backend: control::DecoderBackend) -> DecoderBackend {
         control::DecoderBackend::D3D11va => DecoderBackend::D3D11va,
         control::DecoderBackend::Vaapi => DecoderBackend::Vaapi,
         control::DecoderBackend::Software => DecoderBackend::Software,
+        control::DecoderBackend::MediaCodec => DecoderBackend::MediaCodec,
     }
 }
 

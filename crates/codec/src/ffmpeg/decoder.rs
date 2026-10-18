@@ -134,6 +134,9 @@ impl FfmpegDecoder {
         backend: DecoderBackend,
         output: DecodeOutput,
     ) -> Result<Self, CodecError> {
+        if backend == DecoderBackend::MediaCodec {
+            return Err(CodecError::DecoderUnavailable(backend));
+        }
         super::init_logging();
         let av_codec = AVCodec::find_decoder_by_name(decoder_name(codec, backend))
             .ok_or(CodecError::DecoderUnavailable(backend))?;

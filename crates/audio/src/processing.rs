@@ -10,6 +10,10 @@
 //! - **Windows** (y sin la feature): un respaldo propio sencillo: puerta de ruido por RMS sobre el
 //!   suelo de ruido estimado y control de ganancia lento hacia −20 dBFS. **Sin AEC**: en Windows se
 //!   asumen auriculares (pendiente de una crate de AEC que compile con MSVC).
+//! - **Android** (feature `aaudio`): el micrófono se abre con el preset `VOICE_COMMUNICATION` y es
+//!   el sistema quien cancela el eco, suprime el ruido y ajusta la ganancia
+//!   ([`crate::AudioSource::platform_processing`]); el respaldo solo hace lo que el sistema no
+//!   ([`ProcessingOptions::without_platform`]), para no procesar dos veces.
 //! - **VAD**: el procesado de WebRTC 2.x ya no tiene detector de voz (se quitó del módulo), así que
 //!   [`Vad`] es propio en las dos plataformas: nivel de la trama procesada contra el suelo de ruido
 //!   (el mínimo de los últimos 1,5 s), con histéresis: entra con dos tramas por encima de
@@ -61,12 +65,27 @@ impl ProcessingOptions {
         gain_control: false,
         echo_cancellation: false,
     };
+
+    /// Lo mismo sin lo que el sistema ya aplica a la captura (`platform`, de
+    /// [`crate::AudioSource::platform_processing`]): se crea el [`VoiceProcessor`] con esto para no
+    /// procesar dos veces. Así, con la cancelación de eco del sistema, [`VoiceProcessor::echo_cancellation`]
+    /// es `false` y la reproducción no le pasa referencia.
+    pub fn without_platform(self, platform: crate::PlatformProcessing) -> ProcessingOptions {
+        ProcessingOptions {
+            noise_suppression: self.noise_suppression && !platform.noise_suppression,
+            gain_control: self.gain_control && !platform.gain_control,
+            echo_cancellation: self.echo_cancellation && !platform.echo_cancellation,
+        }
+    }
 }
 
 /// Implementación del procesado de este binario.
 pub fn backend_label() -> &'static str {
     if cfg!(all(target_os = "linux", feature = "webrtc-apm")) {
         "módulo de procesado de WebRTC 2.1 (NS, AGC2, AEC3) y VAD propio"
+    } else if cfg!(all(target_os = "android", feature = "aaudio")) {
+        "procesado de voz de Android (AEC, NS y AGC del preset VOICE_COMMUNICATION, si el equipo \
+         los tiene), respaldo propio para lo que no haga y VAD propio"
     } else {
         "respaldo propio (puerta de ruido y ganancia, sin AEC) y VAD propio"
     }
@@ -538,6 +557,40 @@ mod tests {
             assert!(speaking_frames >= 80, "{options:?}: {speaking_frames}");
             assert_eq!(silent_speaking, 0, "{options:?}");
         }
+    }
+
+    #[test]
+    fn what_the_platform_already_does_is_not_done_twice() {
+        let all = ProcessingOptions::default();
+        assert_eq!(all.without_platform(crate::PlatformProcessing::NONE), all);
+        // El preset de voz de Android: eco, ruido y ganancia del sistema; solo queda el VAD.
+        let voice = crate::PlatformProcessing {
+            echo_cancellation: true,
+            noise_suppression: true,
+            gain_control: true,
+        };
+        assert_eq!(all.without_platform(voice), ProcessingOptions::NONE);
+        let processor =
+            VoiceProcessor::new(all.without_platform(voice)).expect("procesador sin nada");
+        assert!(!processor.echo_cancellation());
+        assert_eq!(processor.backend(), "ninguno");
+        // Solo la cancelación de eco del sistema: la supresión y la ganancia siguen aquí.
+        let echo_only = crate::PlatformProcessing {
+            echo_cancellation: true,
+            ..crate::PlatformProcessing::NONE
+        };
+        assert_eq!(
+            all.without_platform(echo_only),
+            ProcessingOptions {
+                echo_cancellation: false,
+                ..all
+            }
+        );
+        // Lo que no se pidió no se activa porque el sistema no lo haga.
+        assert_eq!(
+            ProcessingOptions::NONE.without_platform(crate::PlatformProcessing::NONE),
+            ProcessingOptions::NONE
+        );
     }
 
     #[test]

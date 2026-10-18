@@ -49,7 +49,7 @@ use coroom_transport::crypto::{FileStore, Identity, IdentityStore, KeyringStore}
 use coroom_transport::proto::signal::{Activity, SignalMessage};
 use coroom_transport::{Endpoint, EndpointOptions, SignalClient};
 
-use crate::account::{self, AccountOptions, AccountStore};
+use crate::account::{self, AccountOptions, AccountStorage, AccountStore};
 use crate::probe::{PresenterSink, ProbeOptions, Source, make_capturer};
 
 /// Opciones de red comunes a `host` y `join`.

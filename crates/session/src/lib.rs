@@ -10,6 +10,10 @@
 //! remota ([`remote::RemoteSession`]) implementan este trait. Las marcas de tiempo por
 //! etapa y su resumen viven en [`latency`].
 //!
+//! [`account`] tiene la lógica de cuentas que comparten las aplicaciones (sesión de cada
+//! servidor y llamadas a su API), con el almacén de credenciales tras
+//! [`account::AccountStorage`], que implementa cada plataforma.
+//!
 //! Reexporta [`coroom_audio`], [`coroom_capture`], [`coroom_codec`], [`coroom_input`] y
 //! [`coroom_transport`] como [`audio`], [`capture`], [`codec`], [`input`] y [`transport`] para que
 //! las aplicaciones de `apps/` no dependan directamente de ellas.
@@ -23,7 +27,9 @@ pub use coroom_codec as codec;
 pub use coroom_input as input;
 pub use coroom_transport as transport;
 
+pub mod account;
 pub mod latency;
+pub mod lobby;
 pub mod loopback;
 pub mod preview;
 pub mod remote;

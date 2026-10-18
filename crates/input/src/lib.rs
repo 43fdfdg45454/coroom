@@ -14,9 +14,17 @@
 //!   propio de UMDF2 (`windows-vhid`); y [`RecordingSink`] para los
 //!   tests. La sesión aplica permisos y pausa **antes** de llamar al sumidero.
 //! - [`keymap`]: tecla física de `winit` → evdev → *scancode* set 1 de Windows.
+//! - **Invitado de Android** (la aplicación en Kotlin pasa los eventos por JNI como números):
+//!   [`touch`] convierte el tacto en ratón (panel o directo) y [`android`] las teclas a evdev y los
+//!   mandos (convertidos) a sus ranuras, con la vibración hacia la aplicación. Los dos son
+//!   independientes de la plataforma y se prueban en el escritorio. En Android no se compila lo
+//!   que depende de `winit` y `gilrs` ([`capture::InputCapture`], la tabla de [`keymap`],
+//!   [`gamepad::GamepadCapture`]); lo demás que usa la sesión (permisos, [`gamepad::PadLink`],
+//!   [`send`], [`inject`], que allí es [`NullSink`]) vale igual.
 
 use std::fmt;
 
+pub mod android;
 pub mod capture;
 pub mod gamepad;
 #[cfg(all(target_os = "linux", feature = "linux-portal"))]
@@ -27,6 +35,7 @@ pub mod inject;
 pub mod keymap;
 pub mod script;
 pub mod send;
+pub mod touch;
 
 pub use coroom_proto::input::{
     EventClass, GamepadAxis, GamepadButton, GamepadKind, InputEvent, MouseButton,

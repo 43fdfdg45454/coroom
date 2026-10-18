@@ -7,6 +7,10 @@
 //! [`DecoderSet::with_output`] dice dónde dejan los decodificadores sus imágenes
 //! ([`DecodeOutput`]) y [`EncoderSet::gpu_input`] qué imágenes de GPU acepta sin copia el
 //! codificador preferido (lo que la sesión le pide a la captura).
+//!
+//! En Android (feature `mediacodec`), [`DecoderSet::android`] parte de lo que la aplicación lee
+//! de `MediaCodecList` en vez del sondeo: anuncia solo lo que el teléfono decodifica por hardware
+//! y [`DecoderSet::limits`] dice hasta qué tamaño y ritmo.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -49,6 +53,10 @@ pub fn create_decoder_with(
     let _ = output;
     match (codec, backend) {
         (Codec::H264, DecoderBackend::Software) => Ok(Box::new(OpenH264Decoder::new()?)),
+        // Necesita la lista de componentes y la superficie: se abre con [`DecoderSet::android`].
+        (_, DecoderBackend::MediaCodec) => {
+            Err(CodecError::DecoderUnavailable(DecoderBackend::MediaCodec))
+        }
         #[cfg(feature = "ffmpeg")]
         (codec, backend) => Ok(Box::new(crate::ffmpeg::FfmpegDecoder::with_output(
             codec,
@@ -411,11 +419,39 @@ impl EncoderSet {
     }
 }
 
+/// Lo que se sabe del flujo antes de abrir el decodificador (de `CodecSelected`): con él,
+/// MediaCodec se configura al tamaño real y con `operating-rate`, y la espera de la salida parte
+/// del intervalo del flujo. Los demás backends no lo necesitan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamHint {
+    /// Ancho del flujo.
+    pub width: u32,
+    /// Alto del flujo.
+    pub height: u32,
+    /// Fotogramas por segundo.
+    pub fps: u32,
+}
+
+/// Hasta qué tamaño y ritmo decodifica un conjunto (lo que el invitado anuncia en
+/// `Capabilities`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DecodeLimits {
+    /// Ancho máximo.
+    pub max_width: u32,
+    /// Alto máximo.
+    pub max_height: u32,
+    /// Fotogramas por segundo a ese tamaño.
+    pub max_fps: u32,
+}
+
 /// Decodificadores utilizables, en orden de preferencia, y dónde dejan las imágenes.
 #[derive(Debug, Clone)]
 pub struct DecoderSet {
     available: Vec<(Codec, DecoderBackend)>,
     output: DecodeOutput,
+    /// Componentes de MediaCodec y superficie, con [`DecoderSet::android`].
+    #[cfg(feature = "mediacodec")]
+    android: Option<std::sync::Arc<crate::mediacodec::AndroidSetup>>,
 }
 
 /// Dos conjuntos son iguales si ofrecen lo mismo y dejan las imágenes en el mismo sitio (CPU o
@@ -440,7 +476,88 @@ impl DecoderSet {
         Self {
             available: caps.decoders,
             output: DecodeOutput::Cpu,
+            #[cfg(feature = "mediacodec")]
+            android: None,
         }
+    }
+
+    /// Los decodificadores de MediaCodec del teléfono: lo que la aplicación leyó de
+    /// `MediaCodecList` (`decoders`), elegido con [`crate::mediacodec::info::choose`] (solo
+    /// hardware; por códec, primero los de `FEATURE_LowLatency`), con la salida en la superficie
+    /// de `surface`. Lo que se anuncia al anfitrión es [`DecoderSet::available`] y
+    /// [`DecoderSet::limits`], como con cualquier otro conjunto; la sesión los abre con
+    /// [`DecoderSet::open_format`] o [`DecoderSet::open_stream`].
+    #[cfg(feature = "mediacodec")]
+    pub fn android(
+        decoders: Vec<crate::mediacodec::AndroidDecoderInfo>,
+        surface: crate::mediacodec::SurfaceSlot,
+    ) -> Self {
+        let setup = crate::mediacodec::AndroidSetup::new(decoders, surface);
+        let mut set = Self::new(
+            setup
+                .codecs()
+                .into_iter()
+                .map(|codec| (codec, DecoderBackend::MediaCodec)),
+        );
+        // La imagen se queda en la GPU (en la superficie de la vista), sin copia a CPU.
+        set.output = DecodeOutput::Gpu { vulkan: None };
+        set.android = Some(std::sync::Arc::new(setup));
+        set
+    }
+
+    /// Los componentes de MediaCodec, si el conjunto es de [`DecoderSet::android`].
+    #[cfg(feature = "mediacodec")]
+    pub fn android_setup(&self) -> Option<&crate::mediacodec::AndroidSetup> {
+        self.android.as_deref()
+    }
+
+    /// Hasta qué tamaño y ritmo decodifica `codec` con lo que queda en el conjunto, si se sabe
+    /// (en Android, lo que dice `MediaCodecList` del componente preferido; en el escritorio no se
+    /// sabe y la sesión anuncia sus límites de siempre).
+    pub fn limits_for(&self, codec: Codec) -> Option<DecodeLimits> {
+        #[cfg(feature = "mediacodec")]
+        if let Some(setup) = &self.android
+            && self.backend_available(codec, DecoderBackend::MediaCodec)
+        {
+            return setup.limits_for(codec);
+        }
+        let _ = codec;
+        None
+    }
+
+    /// Lo que se puede anunciar sea cual sea el códec que elija el anfitrión entre los que quedan:
+    /// el mínimo de cada límite de [`DecoderSet::limits_for`] (el mensaje `Capabilities` lleva un
+    /// solo tamaño y ritmo). `None` si no se sabe.
+    pub fn limits(&self) -> Option<DecodeLimits> {
+        #[cfg(feature = "mediacodec")]
+        if let Some(setup) = &self.android {
+            let codecs: Vec<Codec> = self
+                .available
+                .iter()
+                .filter(|(_, backend)| *backend == DecoderBackend::MediaCodec)
+                .map(|(codec, _)| *codec)
+                .collect();
+            return setup.limits_among(&codecs);
+        }
+        None
+    }
+
+    #[cfg(feature = "mediacodec")]
+    fn backend_available(&self, codec: Codec, backend: DecoderBackend) -> bool {
+        self.available.contains(&(codec, backend))
+    }
+
+    /// Si `backend` de `codec` admite `format`: la tabla de [`decoder_supports`] y, con
+    /// MediaCodec, los perfiles que anuncia el componente.
+    fn backend_supports(&self, codec: Codec, backend: DecoderBackend, format: VideoFormat) -> bool {
+        #[cfg(feature = "mediacodec")]
+        if backend == DecoderBackend::MediaCodec {
+            return self
+                .android
+                .as_ref()
+                .is_some_and(|setup| setup.supports(codec, format));
+        }
+        decoder_supports(codec, backend, format)
     }
 
     /// Cambia dónde dejan los decodificadores las imágenes (por defecto, en CPU).
@@ -502,7 +619,7 @@ impl DecoderSet {
     pub fn supports(&self, codec: Codec, format: VideoFormat) -> bool {
         self.available
             .iter()
-            .any(|&(c, backend)| c == codec && decoder_supports(c, backend, format))
+            .any(|&(c, backend)| c == codec && self.backend_supports(c, backend, format))
     }
 
     /// Abre el mejor decodificador de `codec` (4:2:0 SDR); si un backend falla, prueba el
@@ -519,6 +636,17 @@ impl DecoderSet {
         codec: Codec,
         format: VideoFormat,
     ) -> Result<Box<dyn Decoder>, CodecError> {
+        self.open_stream(codec, format, None)
+    }
+
+    /// Como [`DecoderSet::open_format`], con lo que se sabe del flujo (`CodecSelected`): MediaCodec
+    /// se configura a ese tamaño y ritmo ([`StreamHint`]); los demás lo ignoran.
+    pub fn open_stream(
+        &self,
+        codec: Codec,
+        format: VideoFormat,
+        hint: Option<StreamHint>,
+    ) -> Result<Box<dyn Decoder>, CodecError> {
         let output = match &self.output {
             DecodeOutput::Gpu { vulkan: Some(_) } if !format.is_default() => DecodeOutput::Cpu,
             other => other.clone(),
@@ -527,9 +655,9 @@ impl DecoderSet {
         for (_, backend) in self
             .available
             .iter()
-            .filter(|&&(c, backend)| c == codec && decoder_supports(c, backend, format))
+            .filter(|&&(c, backend)| c == codec && self.backend_supports(c, backend, format))
         {
-            match create_decoder_with(codec, *backend, &output) {
+            match self.create(codec, *backend, (format, &output), hint) {
                 Ok(decoder) => return Ok(decoder),
                 Err(err) => {
                     // Como en los codificadores: el próximo arranque vuelve a sondear.
@@ -545,6 +673,26 @@ impl DecoderSet {
                 "no hay decodificador de {codec} en {format} disponible"
             ))
         }))
+    }
+
+    /// Crea el decodificador de `backend` en `format` (MediaCodec con los componentes del
+    /// conjunto que admiten `format`).
+    fn create(
+        &self,
+        codec: Codec,
+        backend: DecoderBackend,
+        (format, output): (VideoFormat, &DecodeOutput),
+        hint: Option<StreamHint>,
+    ) -> Result<Box<dyn Decoder>, CodecError> {
+        #[cfg(feature = "mediacodec")]
+        if backend == DecoderBackend::MediaCodec {
+            return match &self.android {
+                Some(setup) => setup.open(codec, format, hint),
+                None => Err(CodecError::DecoderUnavailable(backend)),
+            };
+        }
+        let _ = (format, hint);
+        create_decoder_with(codec, backend, output)
     }
 }
 
@@ -609,5 +757,73 @@ mod tests {
         let without = decoders.without(&[(Codec::H264, DecoderBackend::Software)]);
         assert!(without.is_empty());
         assert!(without.open(Codec::H264).is_err());
+    }
+
+    /// Con la lista del teléfono se anuncia solo lo de hardware, con los límites del componente
+    /// preferido de cada códec y sus perfiles; apartar un códec cambia lo que se anuncia.
+    #[cfg(all(feature = "mediacodec", not(target_os = "android")))]
+    #[test]
+    fn the_android_set_announces_only_hardware_decoders() {
+        use crate::mediacodec::info::{MIME_AV1, MIME_H264, MIME_HEVC};
+        use crate::mediacodec::{AndroidDecoderInfo, SurfaceSlot};
+        let info = |name: &str, mime: &str, max: (u32, u32, u32)| AndroidDecoderInfo {
+            name: name.to_owned(),
+            mime: mime.to_owned(),
+            hardware: true,
+            secure_required: false,
+            low_latency: false,
+            adaptive_playback: false,
+            max_width: max.0,
+            max_height: max.1,
+            max_fps: max.2,
+            achievable_fps: None,
+            main10: false,
+            yuv444: false,
+        };
+        let mut av1 = info("c2.example.av1.decoder", MIME_AV1, (1920, 1080, 120));
+        av1.main10 = true;
+        let mut software = info("c2.android.hevc.decoder", MIME_HEVC, (3840, 2160, 60));
+        software.hardware = false;
+        let avc = info("c2.example.avc.decoder", MIME_H264, (3840, 2160, 60));
+        let slot = SurfaceSlot::new();
+        let set = DecoderSet::android(vec![software, avc, av1], slot.clone());
+        assert_eq!(
+            set.available(),
+            &[
+                (Codec::Av1, DecoderBackend::MediaCodec),
+                (Codec::H264, DecoderBackend::MediaCodec)
+            ]
+        );
+        assert!(set.output().is_gpu());
+        assert!(
+            set.android_setup()
+                .is_some_and(|setup| setup.slot().same(&slot))
+        );
+        assert!(set.supports(Codec::Av1, VideoFormat::HDR10_420));
+        assert!(!set.supports(Codec::H264, VideoFormat::HDR10_420));
+        assert!(!set.supports(Codec::Hevc, VideoFormat::SDR_420));
+        let limits = |w, h, fps| DecodeLimits {
+            max_width: w,
+            max_height: h,
+            max_fps: fps,
+        };
+        assert_eq!(set.limits_for(Codec::H264), Some(limits(3840, 2160, 60)));
+        assert_eq!(set.limits(), Some(limits(1920, 1080, 60)));
+        // Sin AV1 (falló en la sesión), se anuncian los límites de H.264.
+        let without = set.without(&[(Codec::Av1, DecoderBackend::MediaCodec)]);
+        assert_eq!(without.limits(), Some(limits(3840, 2160, 60)));
+        assert_eq!(without.limits_for(Codec::Av1), None);
+        // Fuera de Android no hay MediaCodec que abrir.
+        assert!(matches!(
+            set.open(Codec::Av1),
+            Err(CodecError::DecoderUnavailable(DecoderBackend::MediaCodec))
+        ));
+        assert!(matches!(
+            create_decoder(Codec::H264, DecoderBackend::MediaCodec),
+            Err(CodecError::DecoderUnavailable(DecoderBackend::MediaCodec))
+        ));
+        // Un conjunto del escritorio no sabe sus límites.
+        assert_eq!(DecoderSet::openh264().limits(), None);
+        assert_eq!(DecoderSet::openh264().limits_for(Codec::H264), None);
     }
 }

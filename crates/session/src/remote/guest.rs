@@ -149,17 +149,19 @@ fn start_audio(
     let control = core.audio.clone();
     control.set_game_muted(guest_audio.mute_game);
     let frame_ms = if guest_audio.frame_ms >= 20 { 20 } else { 10 };
-    let processor =
-        guest_audio
-            .voice
-            .as_ref()
-            .and_then(|voice| match VoiceProcessor::new(voice.processing) {
-                Ok(processor) => Some(processor),
-                Err(err) => {
-                    core.warn(format!("sin procesado de voz: {err}"));
-                    None
-                }
-            });
+    let processor = guest_audio.voice.as_ref().and_then(|voice| {
+        // Lo que ya hace el sistema (Android con el preset de voz) no se repite.
+        let options = voice
+            .processing
+            .without_platform(voice.mic.platform_processing());
+        match VoiceProcessor::new(options) {
+            Ok(processor) => Some(processor),
+            Err(err) => {
+                core.warn(format!("sin procesado de voz: {err}"));
+                None
+            }
+        }
+    });
     let render = processor
         .as_ref()
         .filter(|processor| processor.echo_cancellation())

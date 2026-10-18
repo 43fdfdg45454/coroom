@@ -2,6 +2,7 @@
 //! enlace, la MTU del adaptador por el que sale y la dirección local con la que se le habla.
 
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+use std::sync::RwLock;
 
 /// La ruta IPv4 por defecto.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,9 +13,29 @@ pub struct DefaultRoute {
     pub mtu: Option<u32>,
 }
 
+/// Ruta que da quien embebe la biblioteca cuando el sistema no deja leer su tabla de rutas: en
+/// Android `/proc/net/route` está vedado a las aplicaciones y la ruta sale de `ConnectivityManager`
+/// (la aplicación la actualiza con [`set_default_route`] cada vez que cambia la red).
+static INJECTED: RwLock<Option<DefaultRoute>> = RwLock::new(None);
+
+/// Fija (o quita, con `None`) la ruta por defecto que da la plataforma. Si hay una, manda sobre la
+/// tabla de rutas del sistema.
+pub fn set_default_route(route: Option<DefaultRoute>) {
+    *INJECTED
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = route;
+}
+
 /// La ruta IPv4 por defecto.
 pub fn default_route() -> Result<DefaultRoute, String> {
-    platform::default_route()
+    let injected = INJECTED
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    match injected {
+        Some(route) => Ok(route),
+        None => platform::default_route(),
+    }
 }
 
 /// La puerta de enlace de la ruta IPv4 por defecto.
@@ -211,6 +232,9 @@ mod platform {
     use super::DefaultRoute;
 
     pub fn default_route() -> Result<DefaultRoute, String> {
-        Err("la tabla de rutas no se lee en este sistema".to_owned())
+        Err(
+            "la tabla de rutas no se lee en este sistema y la aplicación aún no dio la ruta"
+                .to_owned(),
+        )
     }
 }

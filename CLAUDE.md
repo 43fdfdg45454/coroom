@@ -59,10 +59,11 @@ crates/testkit    ayudas de prueba (solo dev-dependencies): timing_assert! para 
 apps/desktop      binario `coroom` (anfitrión + invitado), aplicación iced en src/ui
 apps/desktop/locales/  catálogos Fluent de los textos de la aplicación
 vendor/           iced_wgpu y cryoglyph parcheados a wgpu 30 (ver vendor/README.md)
+apps/android      invitado Android: lógica en Rust (`libcoroom_android.so`, puente JNI) bajo packaging/android
 apps/server       binario `coroom-server` (h3 + hyper/TLS + relay + sqlite + /admin)
 drivers/windows-vhid  driver de mandos virtuales de UMDF2 (modo usuario): mandos VHF tal cual y Xbox 360
 deploy/           Dockerfile, docker-compose.yml, .env.sample, README
-packaging/        flatpak/, msix/
+packaging/        flatpak/, msix/, android/ (Gradle + Kotlin/Jetpack Compose, la interfaz del invitado Android)
 docs/             ARQUITECTURA.md, seguridad.md, guia.md, screenshots/
 fuzz/             objetivos de cargo-fuzz (workspace aparte) y sus semillas
 tools/            scripts netem (la prueba de latencia es `coroom probe`)
@@ -92,6 +93,7 @@ cargo run --release -p coroom -- host --source synthetic [--invite NOMBRE]      
 cargo run --release -p coroom -- join [CÓDIGO]                                     # sin código, espera invitaciones
 COROOM_DEV_TOKEN=change-me cargo run -p coroom-server            # modo desarrollo: host/join aceptan --dev-token change-me sin cuenta
 cd deploy && cp .env.sample .env && docker compose up -d
+cargo ndk -t arm64-v8a -P 28 -o packaging/android/app/src/main/jniLibs build --release -p coroom-android  # invitado Android (NDK)
 ```
 
 ## Convenciones

@@ -23,6 +23,8 @@
 //! - [`slices`]: reparto de cada paquete en sus slices reales (NAL u OBU).
 //! - [`pool`]: búferes de imagen reutilizados entre fotogramas ([`BufferPool`]), para que la salida
 //!   en CPU del decodificador no reserve memoria con cada fotograma.
+//! - `mediacodec` (feature `mediacodec`, para el invitado de Android): decodificación por hardware
+//!   con MediaCodec directa a la `Surface` de la vista del vídeo, sin copias a CPU.
 
 use std::fmt;
 use std::sync::Arc;
@@ -34,6 +36,8 @@ pub mod convert;
 #[cfg(feature = "ffmpeg")]
 pub mod ffmpeg;
 pub mod gpu;
+#[cfg(feature = "mediacodec")]
+pub mod mediacodec;
 pub mod openh264;
 pub mod pool;
 pub mod select;
@@ -44,7 +48,7 @@ pub use caps::{Capabilities, decoder_supports, encoder_supports};
 pub use color::{Chroma, ColorSpace, VideoFormat};
 pub use gpu::{DecodeOutput, GpuImage, GpuInput};
 pub use pool::BufferPool;
-pub use select::{DecoderSet, EncoderSet};
+pub use select::{DecodeLimits, DecoderSet, EncoderSet, StreamHint};
 
 /// Slices por fotograma que pide la sesión a los codificadores.
 pub const DEFAULT_SLICES: u8 = 4;
@@ -179,6 +183,11 @@ impl fmt::Display for Backend {
 /// Backend de un decodificador, del preferido al de respaldo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum DecoderBackend {
+    /// MediaCodec de Android (por hardware, directo a la `Surface` de la vista). Va el primero:
+    /// en Android es el único de hardware y debe ganar a OpenH264. Existe en todas las
+    /// plataformas porque el anfitrión lo recibe en las capacidades del invitado; solo se abre
+    /// con la característica `mediacodec`.
+    MediaCodec,
     /// Vulkan Video.
     Vulkan,
     /// NVIDIA NVDEC (por CUDA).
@@ -195,7 +204,20 @@ pub enum DecoderBackend {
 
 impl DecoderBackend {
     /// Todos, en orden de preferencia.
+    #[cfg(not(feature = "mediacodec"))]
     pub const ALL: [DecoderBackend; 6] = [
+        DecoderBackend::Vulkan,
+        DecoderBackend::Nvdec,
+        DecoderBackend::D3D12va,
+        DecoderBackend::D3D11va,
+        DecoderBackend::Vaapi,
+        DecoderBackend::Software,
+    ];
+
+    /// Todos, en orden de preferencia.
+    #[cfg(feature = "mediacodec")]
+    pub const ALL: [DecoderBackend; 7] = [
+        DecoderBackend::MediaCodec,
         DecoderBackend::Vulkan,
         DecoderBackend::Nvdec,
         DecoderBackend::D3D12va,
@@ -207,6 +229,7 @@ impl DecoderBackend {
     /// Nombre corto para la línea de órdenes.
     pub const fn id(self) -> &'static str {
         match self {
+            DecoderBackend::MediaCodec => "mediacodec",
             DecoderBackend::Vulkan => "vulkan",
             DecoderBackend::Nvdec => "nvdec",
             DecoderBackend::D3D12va => "d3d12va",
@@ -232,6 +255,7 @@ impl DecoderBackend {
 impl fmt::Display for DecoderBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            DecoderBackend::MediaCodec => "MediaCodec",
             DecoderBackend::Vulkan => "Vulkan Video",
             DecoderBackend::Nvdec => "NVDEC",
             DecoderBackend::D3D12va => "D3D12 Video",

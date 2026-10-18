@@ -1,70 +1,42 @@
 //! Cuentas: `coroom login`, `logout`, `whoami`, `friends` e `invite`, y las credenciales
 //! de cada servidor.
 //!
-//! - **Credenciales**: el token de sesión de cada servidor (con el usuario, la huella del
-//!   certificado si se fijó y el puerto TCP del respaldo) en el llavero del sistema (`coroom` /
-//!   `server:<host>`) o, sin llavero, sin ventana (`--headless`) o con `--data-dir`, en
-//!   `servers/<host>.json` (`0600`) dentro del directorio de datos. El último servidor usado queda
-//!   en `servers/last` (sin secretos) para no repetir `--server`.
+//! La lógica de cuentas que no depende de la plataforma (sesión de cada servidor, llamadas a la
+//! API) está en [`coroom_session::account`] y se reexporta aquí; este módulo pone lo del
+//! escritorio:
+//!
+//! - **Credenciales**: [`AccountStore`] implementa [`AccountStorage`]. El token de sesión de cada
+//!   servidor (con el usuario, la huella del certificado si se fijó y el puerto TCP del respaldo)
+//!   va en el llavero del sistema (`coroom` / `server:<host>`) o, sin llavero, sin ventana
+//!   (`--headless`) o con `--data-dir`, en `servers/<host>.json` (`0600`) dentro del directorio de
+//!   datos. El último servidor usado queda en `servers/last` (sin secretos) para no repetir
+//!   `--server`. La identidad, donde la pone [`load_identity`].
 //! - **Login**: pide usuario y contraseña por consola sin eco (o `--user` y `--password-stdin`),
 //!   presenta la clave pública de la identidad del equipo y firma el desafío del servidor
 //!   ([`ApiClient::login`]); con `--invitation CÓDIGO`, antes crea la cuenta con el código.
-//! - Las llamadas a la API se hacen en un runtime de `tokio` del proceso y con un cliente por
-//!   sesión ([`Session::api`]) que reutiliza su conexión HTTP/3 de una petición a la siguiente:
-//!   abrir Amigos o Cuenta no paga otra vez el handshake. El llavero se lee y escribe fuera del
-//!   runtime (en Linux es bloqueante).
+//! - Las órdenes de la línea de órdenes y su salida, y el nombre del equipo ([`device_name`]).
+//!
+//! [`ApiClient::login`]: coroom_transport::api::ApiClient::login
 
-use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
-use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
-
-use coroom_transport::api::ApiClient;
-use coroom_transport::crypto::{CredentialStore, KeyringStore};
-use coroom_transport::proto::signal::{ErrorCode, SignalMessage};
-use coroom_transport::signal::ServerUrl;
-use coroom_transport::{Endpoint, EndpointOptions, ServerTrust, SignalClient, TransportError};
+use coroom_session::account as shared;
+pub use coroom_session::account::{
+    AccountStorage, AvatarChangeError, Credentials, ServerOptions, Session, SignedIn, Zeroizing,
+    accept_request, api_error, decline_request, devices, download_avatars, friend_id, list_friends,
+    normalize_fingerprint, probe_server, remove_friend, request_friend, revoke_device, runtime,
+    server_host, trust_for, usage,
+};
+use coroom_transport::crypto::{CredentialStore, Identity, KeyringStore};
 
 use crate::remote::{default_data_dir, load_identity};
-
-/// Lo que se guarda de la sesión en cada servidor.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Credentials {
-    /// URL del servidor (`https://host[:puerto]`).
-    pub server: String,
-    /// Usuario.
-    pub username: String,
-    /// Nombre visible.
-    pub display_name: String,
-    /// Identificador del usuario.
-    pub user_id: u64,
-    /// Token de sesión.
-    pub token: String,
-    /// Caducidad (segundos Unix).
-    pub expires_at: i64,
-    /// Huella del certificado autofirmado del servidor, si se fijó al iniciar sesión.
-    #[serde(default)]
-    pub trust_fingerprint: Option<String>,
-    /// Puerto TCP del respaldo HTTP/2, si no es el de la URL.
-    #[serde(default)]
-    pub tcp_port: Option<u16>,
-}
 
 /// Dónde están las credenciales de este usuario del equipo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountStore {
     data_dir: Option<PathBuf>,
     headless: bool,
-}
-
-/// Host de una URL de servidor (para nombrar su credencial).
-pub fn server_host(url: &str) -> Result<String, String> {
-    ServerUrl::parse(url)
-        .map(|url| url.host.to_ascii_lowercase())
-        .map_err(|err| err.to_string())
 }
 
 impl AccountStore {
@@ -98,56 +70,34 @@ impl AccountStore {
         }
     }
 
-    /// Credenciales guardadas para el servidor `url`.
-    pub fn load(&self, url: &str) -> Result<Option<Credentials>, String> {
-        let host = server_host(url)?;
-        let store = self.store(&host);
-        let Some(text) = store
-            .load()
-            .map_err(|err| format!("no se pudieron leer las credenciales: {err}"))?
-        else {
-            return Ok(None);
-        };
-        serde_json::from_str(&text).map(Some).map_err(|err| {
-            format!("las credenciales de {host} están dañadas ({err}); vuelve a iniciar sesión")
-        })
-    }
-
-    /// Guarda las credenciales y apunta el servidor como el último; devuelve dónde.
-    pub fn save(&self, credentials: &Credentials) -> Result<String, String> {
-        let host = server_host(&credentials.server)?;
-        let store = self.store(&host);
-        let text = serde_json::to_string(credentials)
-            .map_err(|err| format!("no se pudieron guardar las credenciales: {err}"))?;
-        store
-            .save(&text)
-            .map_err(|err| format!("no se pudieron guardar las credenciales: {err}"))?;
-        self.set_last_server(&credentials.server);
-        Ok(store.describe())
-    }
-
-    /// Borra las credenciales del servidor `url`.
-    pub fn delete(&self, url: &str) -> Result<(), String> {
-        let host = server_host(url)?;
-        self.store(&host)
-            .delete()
-            .map_err(|err| format!("no se pudieron borrar las credenciales: {err}"))
-    }
-
     fn last_path(&self) -> PathBuf {
         self.base_dir().join("servers").join("last")
     }
+}
 
-    /// Último servidor en el que se inició sesión.
-    pub fn last_server(&self) -> Option<String> {
+impl AccountStorage for AccountStore {
+    fn load_secret(&self, host: &str) -> Result<Option<Zeroizing<String>>, String> {
+        self.store(host).load().map_err(|err| err.to_string())
+    }
+
+    fn save_secret(&self, host: &str, secret: &str) -> Result<String, String> {
+        let store = self.store(host);
+        store.save(secret).map_err(|err| err.to_string())?;
+        Ok(store.describe())
+    }
+
+    fn delete_secret(&self, host: &str) -> Result<(), String> {
+        self.store(host).delete().map_err(|err| err.to_string())
+    }
+
+    fn last_server(&self) -> Option<String> {
         std::fs::read_to_string(self.last_path())
             .ok()
             .map(|text| text.trim().to_owned())
             .filter(|text| !text.is_empty())
     }
 
-    /// Apunta `url` como el último servidor (el que se recupera al abrir la aplicación).
-    pub fn set_last_server(&self, url: &str) {
+    fn set_last_server(&self, url: &str) {
         let path = self.last_path();
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -155,35 +105,8 @@ impl AccountStore {
         let _ = std::fs::write(path, format!("{url}\n"));
     }
 
-    /// El servidor de `--server` o, si falta, el último usado.
-    pub fn server(&self, server: Option<&str>) -> Result<String, String> {
-        match server {
-            Some(server) => Ok(server.trim().trim_end_matches('/').to_owned()),
-            None => self.last_server().ok_or_else(|| {
-                "falta --server URL (todavía no has iniciado sesión en ningún servidor)".to_owned()
-            }),
-        }
-    }
-}
-
-/// Huella SHA-256 en hexadecimal (admite `:` entre bytes y mayúsculas).
-pub fn normalize_fingerprint(fingerprint: &str) -> Result<String, String> {
-    let fingerprint = fingerprint.trim().replace(':', "").to_ascii_lowercase();
-    if fingerprint.len() != 64 || !fingerprint.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(
-            "la huella del certificado debe ser SHA-256 en hexadecimal (64 caracteres)".to_owned(),
-        );
-    }
-    Ok(fingerprint)
-}
-
-/// Confianza en el servidor: la huella dada o las raíces del sistema.
-pub fn trust_for(fingerprint: Option<&str>) -> Result<ServerTrust, String> {
-    match fingerprint {
-        Some(fingerprint) => Ok(ServerTrust::Fingerprint(normalize_fingerprint(
-            fingerprint,
-        )?)),
-        None => ServerTrust::system_roots().map_err(|err| err.to_string()),
+    fn load_identity(&self) -> Result<(Identity, String), String> {
+        load_identity(self.data_dir.as_deref(), self.headless)
     }
 }
 
@@ -201,66 +124,6 @@ pub fn device_name() -> String {
             .filter(|name| !name.is_empty())
     });
     name.unwrap_or_else(|| "equipo".to_owned())
-}
-
-/// Runtime de las llamadas a la API, el mismo durante todo el proceso: la conexión HTTP/3 de un
-/// cliente vive en el runtime donde se abrió, y así sigue abierta entre peticiones.
-fn runtime() -> Result<&'static tokio::runtime::Runtime, String> {
-    static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
-    RUNTIME
-        .get_or_init(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .thread_name("coroom-api")
-                .enable_all()
-                .build()
-                .map_err(|err| format!("no se pudo arrancar la red: {err}"))
-        })
-        .as_ref()
-        .map_err(Clone::clone)
-}
-
-/// Lo que distingue un cliente de la API de otro: servidor, token, huella fijada y puerto TCP.
-type ClientKey = (String, String, Option<String>, Option<u16>);
-
-/// El cliente de la API de cada servidor, con su conexión abierta ([`Session::api`]).
-static CLIENTS: LazyLock<Mutex<HashMap<ClientKey, Arc<ApiClient>>>> = LazyLock::new(Mutex::default);
-
-fn client_key(credentials: &Credentials, trust: &ServerTrust) -> ClientKey {
-    let fingerprint = match trust {
-        ServerTrust::Fingerprint(fingerprint) => Some(fingerprint.clone()),
-        _ => None,
-    };
-    (
-        credentials.server.clone(),
-        credentials.token.clone(),
-        fingerprint,
-        credentials.tcp_port,
-    )
-}
-
-/// Guarda `client` como el de `key` (el de su servidor deja de valer).
-fn keep_client(key: ClientKey, client: ApiClient) -> Arc<ApiClient> {
-    let client = Arc::new(client);
-    if let Ok(mut clients) = CLIENTS.lock() {
-        clients.retain(|cached, _| cached.0 != key.0);
-        clients.insert(key, Arc::clone(&client));
-    }
-    client
-}
-
-/// Olvida el cliente de `server` (sesión cerrada: su token ya no vale).
-fn forget_client(server: &str) {
-    if let Ok(mut clients) = CLIENTS.lock() {
-        clients.retain(|cached, _| cached.0 != server);
-    }
-}
-
-fn api_error(err: TransportError) -> String {
-    match err {
-        TransportError::Api { message, .. } => message,
-        other => format!("no se pudo hablar con el servidor: {other}"),
-    }
 }
 
 /// Opciones comunes de las órdenes de cuenta.
@@ -282,52 +145,20 @@ impl AccountOptions {
     fn store(&self) -> AccountStore {
         AccountStore::new(self.data_dir.as_deref(), self.headless)
     }
-}
 
-/// Sesión iniciada en un servidor, lista para la API y la señalización.
-#[derive(Debug, Clone)]
-pub struct Session {
-    /// Credenciales.
-    pub credentials: Credentials,
-    /// Confianza en el servidor.
-    pub trust: ServerTrust,
-}
-
-impl Session {
-    /// Cliente de la API con el token, el mismo para todas las peticiones de esta sesión (con su
-    /// conexión ya abierta); se usa con el runtime de [`runtime`].
-    pub fn api(&self) -> Result<Arc<ApiClient>, String> {
-        let key = client_key(&self.credentials, &self.trust);
-        if let Some(client) = CLIENTS.lock().ok().and_then(|c| c.get(&key).cloned()) {
-            return Ok(client);
+    /// El servidor, la huella y el puerto TCP, sin lo del almacén.
+    pub fn server_options(&self) -> ServerOptions {
+        ServerOptions {
+            server: self.server.clone(),
+            trust_fingerprint: self.trust_fingerprint.clone(),
+            tcp_port: self.tcp_port,
         }
-        let mut client = ApiClient::new(&self.credentials.server, self.trust.clone())
-            .map_err(|err| err.to_string())?
-            .with_token(&self.credentials.token);
-        if let Some(port) = self.credentials.tcp_port {
-            client = client.with_tcp_port(port);
-        }
-        Ok(keep_client(key, client))
     }
 }
 
 /// Carga la sesión guardada del servidor de `options`.
 pub fn session(options: &AccountOptions) -> Result<Session, String> {
-    let store = options.store();
-    let server = store.server(options.server.as_deref())?;
-    let credentials = store.load(&server)?.ok_or_else(|| {
-        format!("no has iniciado sesión en {server}: usa `coroom login --server {server}`")
-    })?;
-    let fingerprint = options
-        .trust_fingerprint
-        .clone()
-        .or_else(|| credentials.trust_fingerprint.clone());
-    let trust = trust_for(fingerprint.as_deref())?;
-    let mut credentials = credentials;
-    if let Some(port) = options.tcp_port {
-        credentials.tcp_port = Some(port);
-    }
-    Ok(Session { credentials, trust })
+    shared::session(&options.store(), &options.server_options())
 }
 
 /// Lee una línea de la entrada estándar tras `prompt` (en la salida de error).
@@ -433,22 +264,7 @@ pub fn login(options: &LoginOptions) -> Result<String, String> {
 
 /// `coroom logout`: revoca el token en el servidor y borra las credenciales.
 pub fn logout(options: &AccountOptions) -> Result<String, String> {
-    let store = options.store();
-    let server = store.server(options.server.as_deref())?;
-    let revoked = match session(options) {
-        Ok(session) => {
-            let api = session.api()?;
-            runtime()?.block_on(api.logout()).is_ok()
-        }
-        Err(_) => false,
-    };
-    forget_client(&server);
-    store.delete(&server)?;
-    Ok(if revoked {
-        format!("Sesión cerrada en {server}.")
-    } else {
-        format!("Credenciales de {server} borradas (el servidor no confirmó el cierre).")
-    })
+    shared::logout(&options.store(), &options.server_options())
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -609,23 +425,6 @@ pub fn friends(options: &AccountOptions, action: &FriendsAction) -> Result<Strin
 
 // --- Interfaz: las mismas operaciones sin consola y con datos estructurados ---------
 
-/// Lo que devuelve [`sign_in`].
-#[derive(Debug, Clone)]
-pub struct SignedIn {
-    /// Credenciales guardadas.
-    pub credentials: Credentials,
-    /// Nombre del dispositivo.
-    pub device: String,
-    /// Huella de la identidad del equipo.
-    pub fingerprint: String,
-    /// Dónde está la identidad.
-    pub place: String,
-    /// Dónde se guardaron las credenciales.
-    pub saved: String,
-    /// Versión del avatar de la cuenta (`None`: no tiene).
-    pub avatar: Option<u64>,
-}
-
 /// Inicia sesión sin preguntar nada (la interfaz ya pidió los datos): crea antes la cuenta si se
 /// da `invitation` (`(código, nombre visible)`), vincula este equipo y guarda las credenciales.
 pub fn sign_in(
@@ -635,270 +434,58 @@ pub fn sign_in(
     device: &str,
     invitation: Option<(&str, Option<&str>)>,
 ) -> Result<SignedIn, String> {
-    let store = account.store();
-    let server = store.server(account.server.as_deref())?;
-    let trust = trust_for(account.trust_fingerprint.as_deref())?;
-    let (identity, place) = load_identity(account.data_dir.as_deref(), account.headless)?;
-    // El cliente reutiliza su conexión HTTP/3 en todas las llamadas, y luego en las de la sesión.
-    let runtime = runtime()?;
-    let mut api = ApiClient::new(&server, trust.clone()).map_err(|err| err.to_string())?;
-    if let Some(port) = account.tcp_port {
-        api = api.with_tcp_port(port);
-    }
-    if let Some((code, display_name)) = invitation {
-        runtime
-            .block_on(api.redeem_invitation(code.trim(), username.trim(), password, display_name))
-            .map_err(api_error)?;
-    }
-    let token = runtime
-        .block_on(api.login(username.trim(), password, &identity, device))
-        .map_err(api_error)?;
-    let avatar = token.user.avatar;
-    let credentials = Credentials {
-        server: server.clone(),
-        username: token.user.username.clone(),
-        display_name: token.user.display_name.clone(),
-        user_id: token.user.id,
-        token: token.token,
-        expires_at: token.expires_at,
-        trust_fingerprint: account
-            .trust_fingerprint
-            .as_deref()
-            .map(normalize_fingerprint)
-            .transpose()?,
-        tcp_port: account.tcp_port,
-    };
-    keep_client(
-        client_key(&credentials, &trust),
-        api.with_token(&credentials.token),
-    );
-    let saved = store.save(&credentials)?;
-    Ok(SignedIn {
-        credentials,
-        device: device.to_owned(),
-        fingerprint: identity.fingerprint(),
-        place,
-        saved,
-        avatar,
-    })
+    shared::sign_in(
+        &account.store(),
+        &account.server_options(),
+        username,
+        password,
+        device,
+        invitation,
+    )
 }
 
 /// La sesión guardada del servidor de `options`, comprobada con el servidor (`GET /me`): el nombre
 /// del dispositivo y la huella de la identidad del equipo.
 pub fn resume(options: &AccountOptions) -> Result<(Session, SignedIn), String> {
-    let session = session(options)?;
-    let (identity, place) = load_identity(options.data_dir.as_deref(), options.headless)?;
-    let api = session.api()?;
-    let me = runtime()?.block_on(api.me()).map_err(api_error)?;
-    let signed = SignedIn {
-        credentials: Credentials {
-            username: me.user.username.clone(),
-            display_name: me.user.display_name.clone(),
-            ..session.credentials.clone()
-        },
-        device: me.device.map(|device| device.name).unwrap_or_default(),
-        fingerprint: identity.fingerprint(),
-        place,
-        saved: String::new(),
-        avatar: me.user.avatar,
-    };
-    Ok((session, signed))
-}
-
-/// Lista de amigos.
-pub fn list_friends(session: &Session) -> Result<coroom_transport::proto::api::Friends, String> {
-    let api = session.api()?;
-    runtime()?.block_on(api.friends()).map_err(api_error)
-}
-
-/// Pide amistad a `name`; devuelve el texto para el usuario.
-pub fn request_friend(session: &Session, name: &str) -> Result<String, String> {
-    let api = session.api()?;
-    let result = runtime()?
-        .block_on(api.add_friend(name.trim()))
-        .map_err(api_error)?;
-    Ok(if result.accepted {
-        format!("Ahora {} y tú sois amigos", result.user.display_name)
-    } else {
-        format!("Solicitud enviada a {}", result.user.display_name)
-    })
-}
-
-/// Acepta la solicitud `request`.
-pub fn accept_request(session: &Session, request: u64) -> Result<String, String> {
-    let api = session.api()?;
-    let result = runtime()?
-        .block_on(api.accept_friend(request))
-        .map_err(api_error)?;
-    Ok(format!(
-        "Ahora {} y tú sois amigos",
-        result.user.display_name
-    ))
-}
-
-/// Rechaza o retira la solicitud `request`.
-pub fn decline_request(session: &Session, request: u64) -> Result<String, String> {
-    let api = session.api()?;
-    runtime()?
-        .block_on(api.decline_friend(request))
-        .map_err(api_error)?;
-    Ok("Solicitud retirada".to_owned())
-}
-
-/// Quita al amigo `user`.
-pub fn remove_friend(session: &Session, user: u64) -> Result<String, String> {
-    let api = session.api()?;
-    runtime()?
-        .block_on(api.remove_friend(user))
-        .map_err(api_error)?;
-    Ok("Ya no sois amigos".to_owned())
-}
-
-/// Dispositivos de la cuenta.
-pub fn devices(session: &Session) -> Result<coroom_transport::proto::api::Devices, String> {
-    let api = session.api()?;
-    runtime()?.block_on(api.devices()).map_err(api_error)
-}
-
-/// Desvincula el dispositivo `device`.
-pub fn revoke_device(session: &Session, device: u64) -> Result<String, String> {
-    let api = session.api()?;
-    runtime()?
-        .block_on(api.delete_device(device))
-        .map_err(api_error)?;
-    Ok("Sesión del dispositivo cerrada".to_owned())
-}
-
-/// Uso del relay este mes.
-pub fn usage(session: &Session) -> Result<coroom_transport::proto::api::Usage, String> {
-    let api = session.api()?;
-    runtime()?.block_on(api.usage()).map_err(api_error)
+    shared::resume(&options.store(), &options.server_options())
 }
 
 /// Sube el avatar propio (el PNG ya preparado, `crate::avatar::prepare`); devuelve la versión que
 /// le dio el servidor.
 pub fn upload_avatar(session: &Session, png: Vec<u8>) -> Result<Option<u64>, String> {
-    let api = session.api()?;
-    let user = runtime()?
-        .block_on(api.set_avatar(png))
-        .map_err(avatar_change_error)?;
-    Ok(user.avatar)
+    shared::upload_avatar(session, png).map_err(avatar_change_text)
 }
 
 /// Quita el avatar propio.
 pub fn remove_avatar(session: &Session) -> Result<(), String> {
-    let api = session.api()?;
-    runtime()?
-        .block_on(api.delete_avatar())
-        .map_err(avatar_change_error)?;
-    Ok(())
+    shared::remove_avatar(session).map_err(avatar_change_text)
 }
 
-/// Como [`api_error`], con el tope de cambios de avatar por minuto del servidor
+/// El texto de un cambio de avatar fallido, con el tope de cambios por minuto del servidor
 /// (`too_many_requests`) explicado en la aplicación.
-fn avatar_change_error(err: TransportError) -> String {
+fn avatar_change_text(err: AvatarChangeError) -> String {
     match err {
-        TransportError::Api { code, .. } if code == "too_many_requests" => {
-            t!("avatar-demasiados-cambios").to_owned()
-        }
-        other => api_error(other),
+        AvatarChangeError::TooManyChanges => t!("avatar-demasiados-cambios").to_owned(),
+        AvatarChangeError::Other(text) => text,
     }
-}
-
-/// Descarga el avatar de cada usuario de `users` por la misma conexión y se lo da a `each`
-/// (`Ok(None)`: no tiene).
-pub fn download_avatars(
-    session: &Session,
-    users: &[u64],
-    mut each: impl FnMut(u64, Result<Option<Vec<u8>>, String>),
-) -> Result<(), String> {
-    let api = session.api()?;
-    let runtime = runtime()?;
-    for user in users {
-        each(
-            *user,
-            runtime.block_on(api.avatar(*user)).map_err(api_error),
-        );
-    }
-    Ok(())
-}
-
-/// Comprueba un servidor sin credenciales (ver [`ApiClient::probe`]).
-pub fn probe_server(
-    url: &str,
-    tcp_port: Option<u16>,
-) -> Result<coroom_transport::api::ServerProbe, String> {
-    runtime()?
-        .block_on(ApiClient::probe(url, tcp_port))
-        .map_err(api_error)
-}
-
-/// Busca el id de un amigo por su nombre de usuario.
-pub fn friend_id(session: &Session, name: &str) -> Result<u64, String> {
-    let api = session.api()?;
-    let list = runtime()?.block_on(api.friends()).map_err(api_error)?;
-    list.friends
-        .iter()
-        .find(|friend| friend.username.eq_ignore_ascii_case(name.trim()))
-        .map(|friend| friend.id)
-        .ok_or_else(|| format!("«{name}» no es tu amigo (`coroom friends add {name}`)"))
 }
 
 /// `coroom invite NOMBRE --code CÓDIGO`: invita a un amigo conectado a tu sala desde otra
 /// sesión de señalización (la sala debe ser tuya).
 pub fn invite(options: &AccountOptions, name: &str, code: &str) -> Result<String, String> {
-    let session = session(options)?;
-    let user = friend_id(&session, name)?;
-    let (identity, _) = load_identity(options.data_dir.as_deref(), options.headless)?;
-    let code = code.trim().to_ascii_uppercase();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .map_err(|err| format!("no se pudo arrancar la red: {err}"))?;
-    runtime.block_on(async {
-        let endpoint = Endpoint::bind(&identity, None, EndpointOptions::default())
-            .map_err(|err| err.to_string())?;
-        let mut signal = SignalClient::connect(
-            &session.credentials.server,
-            &session.credentials.token,
-            &endpoint,
-            &session.trust,
-        )
-        .await
-        .map_err(|err| err.to_string())?;
-        signal
-            .send(&SignalMessage::Invite {
-                to_user: user,
-                code: code.clone(),
-            })
-            .await
-            .map_err(|err| err.to_string())?;
-        // El servidor solo responde si algo falla.
-        let reply = loop {
-            match tokio::time::timeout(Duration::from_secs(2), signal.next_event()).await {
-                Ok(Ok(Some(SignalMessage::Error { code, message }))) => {
-                    break Some((code, message));
-                }
-                Ok(Ok(Some(_))) => continue,
-                _ => break None,
-            }
-        };
-        signal.close();
-        endpoint.close();
-        match reply {
-            Some((ErrorCode::UserOffline, message) | (ErrorCode::NotFriend, message)) => {
-                Err(message)
-            }
-            Some((_, message)) => Err(message),
-            None => Ok(format!("Invitación a la sala {code} enviada a {name}.")),
-        }
-    })
+    shared::invite(&options.store(), &options.server_options(), name, code)
 }
 
 #[cfg(test)]
 mod tests {
+    use coroom_transport::{ServerTrust, TransportError};
+
     use super::*;
+
+    /// Como lo explica la aplicación tras clasificarlo [`coroom_session::account`].
+    fn avatar_change_error(err: TransportError) -> String {
+        avatar_change_text(AvatarChangeError::from(err))
+    }
 
     fn credentials(server: &str) -> Credentials {
         Credentials {

@@ -14,6 +14,10 @@
 //!   `RLIMIT_RTTIME` al máximo que admiten: un hilo que acapara la CPU pierde la prioridad en vez
 //!   de colgar el equipo. Siempre con `SCHED_RESET_ON_FORK`.
 //! - **Windows**: MMCSS, tarea «Pro Audio» (`AvSetMmThreadCharacteristicsW`) con prioridad alta.
+//! - **Android** (feature `aaudio`): el hilo del dispositivo es el del callback de AAudio, que el
+//!   sistema ya pone en `SCHED_FIFO`; los nuestros pasan al *nice* de los hilos de audio de una
+//!   aplicación, `THREAD_PRIORITY_AUDIO` (−16, lo mismo que `Process.setThreadPriority`), que
+//!   Android permite sin privilegios. Ni RealtimeKit ni el portal: no existen allí.
 //!
 //! Si no se concede, el hilo sigue con prioridad normal: el audio funciona igual, con más jitter
 //! cuando la máquina va cargada.
@@ -153,7 +157,24 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "linux", all(target_os = "windows", feature = "wasapi"))))]
+#[cfg(all(target_os = "android", feature = "aaudio"))]
+mod imp {
+    /// `android.os.Process.THREAD_PRIORITY_AUDIO`: el *nice* de los hilos de audio.
+    const THREAD_PRIORITY_AUDIO: i32 = -16;
+
+    pub(super) fn promote(_priority: u32) -> Result<&'static str, String> {
+        let tid = rustix::thread::gettid();
+        rustix::process::setpriority_process(Some(tid), THREAD_PRIORITY_AUDIO)
+            .map(|()| "nice −16 (THREAD_PRIORITY_AUDIO)")
+            .map_err(|err| format!("setpriority: {err}"))
+    }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    all(target_os = "windows", feature = "wasapi"),
+    all(target_os = "android", feature = "aaudio")
+)))]
 mod imp {
     pub(super) fn promote(_priority: u32) -> Result<&'static str, String> {
         Err("sin prioridad de tiempo real en esta plataforma".to_owned())
