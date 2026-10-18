@@ -8,6 +8,12 @@
 //! - Un **cambio de estado** (tecla, botón, rueda, mando que se conecta, [`InputEvent::ReleaseAll`])
 //!   sale al momento, con el movimiento que tuviera delante en el mismo paquete (un clic nunca
 //!   adelanta al movimiento que lo precede).
+//! - El **texto** sin tecla física ([`InputEvent::Text`]) no está en el estado: también sale al
+//!   momento, como un cambio, y además va **repetido** en los datagramas siguientes (delante de
+//!   lo nuevo, con su número de orden en `text_seq`) hasta que salió en tantos como el estado
+//!   tras un cambio (el suyo y los de [`REPEATS`]) y pasó el último plazo de [`REPEATS`]. El
+//!   anfitrión teclea cada número una vez y en orden. Si un datagrama lleno no deja sitio, los
+//!   textos más antiguos dejan de repetirse antes (como mucho [`MAX_TEXT_REPEATS`] se reservan).
 //! - El **movimiento** (ratón y ejes) se agrupa como mucho [`BATCH_INTERVAL`] (≤ 1000 datagramas/s);
 //!   el primero tras una pausa sale al momento. Dentro del paquete los `MouseMove` se conservan uno
 //!   a uno (el anfitrión los inyecta todos, en orden); las posiciones absolutas y los ejes se
@@ -30,6 +36,7 @@
 //! anfitrión mide así cada etapa. Se cifra con [`InputCipher`] (canal y secuencia propios de cada
 //! canal) y sale por el [`InputLink`] que da la sesión (la conexión QUIC).
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -56,6 +63,10 @@ pub const REPEATS: [Duration; 3] = [
     Duration::from_millis(8),
     Duration::from_millis(20),
 ];
+
+/// Textos repetidos para los que un datagrama reserva sitio, como mucho (la mitad de
+/// [`MAX_EVENTS`]: los eventos nuevos siempre caben).
+pub const MAX_TEXT_REPEATS: usize = MAX_EVENTS / 2;
 
 /// Bytes de informes de mando por datagrama, como mucho (con el estado y lo demás, por debajo del
 /// MTU).
@@ -134,6 +145,8 @@ struct Batch {
     first: Option<Instant>,
     /// Hay un cambio de estado: sale ya.
     urgent: bool,
+    /// Sitios que se guardan para los textos que se repiten.
+    reserved: usize,
 }
 
 impl Batch {
@@ -157,7 +170,7 @@ impl Batch {
 
     /// Si un evento más que no se funde con otro ya no cabe.
     fn events_full(&self) -> bool {
-        self.events.len() >= MAX_EVENTS
+        self.events.len() + self.reserved >= MAX_EVENTS
     }
 
     fn push_pad(&mut self, pad: PadData, at: Instant) {
@@ -236,6 +249,33 @@ struct Worker {
     carrying_change: bool,
     /// Cuándo salió el último datagrama (para el *keepalive*).
     last_sent: Option<Instant>,
+    /// Textos que aún se repiten, el más antiguo delante: carácter, en cuántos datagramas salió
+    /// y cuándo salió el primero. Los que aún no salieron son los del lote, en su orden.
+    texts: VecDeque<PendingText>,
+    /// Número de orden del primero de `texts`.
+    text_first: u16,
+    /// Los eventos del datagrama: los textos repetidos y los del lote (reutilizado).
+    outgoing: Vec<InputEvent>,
+}
+
+/// Un texto que se repite ([`Worker::texts`]).
+#[derive(Debug, Clone, Copy)]
+struct PendingText {
+    ch: char,
+    sent: usize,
+    first_sent: Option<Instant>,
+}
+
+impl PendingText {
+    /// Ya salió en tantos datagramas como el estado tras un cambio y pasó el último plazo de
+    /// [`REPEATS`].
+    fn done(&self, now: Instant) -> bool {
+        let last = REPEATS[REPEATS.len() - 1];
+        self.sent > REPEATS.len()
+            && self
+                .first_sent
+                .is_some_and(|first| now.saturating_duration_since(first) >= last)
+    }
 }
 
 impl Worker {
@@ -255,6 +295,22 @@ impl Worker {
         });
         let repeat = batch.is_empty();
         let count = (batch.events.len() + batch.pads.len()) as u64;
+        // Los textos que ya salieron van delante, repetidos; si no caben todos, se dejan de
+        // repetir los más antiguos.
+        let resent = self.texts.iter().take_while(|text| text.sent > 0).count();
+        let dropped = resent.saturating_sub(MAX_EVENTS - batch.events.len());
+        for _ in 0..dropped {
+            self.texts.pop_front();
+            self.text_first = self.text_first.wrapping_add(1);
+        }
+        self.outgoing.clear();
+        self.outgoing.extend(
+            self.texts
+                .iter()
+                .take(resent - dropped)
+                .map(|text| InputEvent::Text { ch: text.ch }),
+        );
+        self.outgoing.extend_from_slice(&batch.events);
         let mut cipher = self.cipher.lock().unwrap_or_else(PoisonError::into_inner);
         let seq = cipher.next_seq(Channel::Datagram);
         let Ok(seq32) = u32::try_from(seq) else {
@@ -266,7 +322,8 @@ impl Worker {
             seq: seq32,
             sent_us,
             queued_us,
-            events: &batch.events,
+            events: &self.outgoing,
+            text_seq: self.text_first,
             state: &self.state,
             pads: &batch.pads,
         };
@@ -284,6 +341,16 @@ impl Worker {
         };
         drop(cipher);
         batch.clear();
+        // Un datagrama más para cada texto (también si no se pudo enviar: cuenta como perdido).
+        for text in &mut self.texts {
+            text.sent += 1;
+            text.first_sent.get_or_insert(now);
+        }
+        while self.texts.front().is_some_and(|text| text.done(now)) {
+            self.texts.pop_front();
+            self.text_first = self.text_first.wrapping_add(1);
+        }
+        batch.reserved = self.texts.len().min(MAX_TEXT_REPEATS);
         let result = sealed.and_then(|()| {
             let bytes = self.sealed.len() as u64;
             // El enlace se queda con el vector (quinn lo envuelve en `Bytes` sin copiar); aquí
@@ -371,6 +438,13 @@ impl Worker {
                 if !batch.push(event, at, &self.stats) {
                     self.send_batch(batch, Instant::now());
                     batch.push(event, at, &self.stats);
+                }
+                if let InputEvent::Text { ch } = event {
+                    self.texts.push_back(PendingText {
+                        ch,
+                        sent: 0,
+                        first_sent: None,
+                    });
                 }
             }
             Item::Pad(pad @ PadData::Report { .. }) => {
@@ -549,6 +623,9 @@ impl InputSender {
             repeated: 0,
             carrying_change: false,
             last_sent: None,
+            texts: VecDeque::new(),
+            text_first: 0,
+            outgoing: Vec::with_capacity(MAX_EVENTS),
         };
         let thread = thread::Builder::new()
             .name("entrada".into())
@@ -608,6 +685,7 @@ mod tests {
     use coroom_crypto::input::Role;
     use coroom_proto::input::{InputPacket, parse_datagram};
     use coroom_testkit::timing_assert;
+    use std::collections::BTreeMap;
 
     #[derive(Default)]
     struct Captured {
@@ -870,6 +948,82 @@ mod tests {
             "{repeats} repeticiones, se esperaban {}",
             REPEATS.len()
         );
+    }
+
+    /// Un texto sale al momento y se repite en los datagramas siguientes con su número de orden,
+    /// como mínimo en tantos como el estado tras un cambio; el siguiente texto lleva el número
+    /// siguiente. Así el anfitrión lo teclea aunque se pierda el datagrama original.
+    #[test]
+    fn texts_are_repeated_with_their_numbers() {
+        let (link, mut sender, mut host) = pair();
+        sender.send(InputEvent::Text { ch: 'ñ' });
+        // Hasta que salgan las repeticiones del estado tras el texto.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while sender.stats().repeats < REPEATS.len() as u64 {
+            assert!(Instant::now() < deadline, "el texto no se repite");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        sender.send(InputEvent::Text { ch: 'a' });
+        sender.send(InputEvent::Key {
+            code: 30,
+            pressed: true,
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while sender.stats().repeats < 2 * REPEATS.len() as u64 {
+            assert!(Instant::now() < deadline, "el segundo texto no se repite");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        sender.stop();
+        let packets = open_all(&link, &mut host);
+        // Cada número de orden es siempre el mismo carácter, y los textos de un paquete son
+        // consecutivos.
+        let mut by_seq = BTreeMap::new();
+        let mut copies = BTreeMap::new();
+        for (_, packet) in &packets {
+            let texts = packet.events.iter().filter_map(|event| match event {
+                InputEvent::Text { ch } => Some(*ch),
+                _ => None,
+            });
+            for (index, ch) in texts.enumerate() {
+                let seq = packet.text_seq.wrapping_add(index as u16);
+                assert_eq!(*by_seq.entry(seq).or_insert(ch), ch, "{packets:?}");
+                *copies.entry(seq).or_insert(0usize) += 1;
+            }
+        }
+        assert_eq!(
+            by_seq.into_iter().collect::<Vec<_>>(),
+            vec![(0, 'ñ'), (1, 'a')]
+        );
+        for (seq, count) in copies {
+            assert!(
+                count > REPEATS.len(),
+                "el texto {seq} salió en {count} datagramas: {packets:?}"
+            );
+        }
+        // El primero sale solo; la «a», delante de la tecla que se pulsó después.
+        assert_eq!(packets[0].1.events, vec![InputEvent::Text { ch: 'ñ' }]);
+        let with_key = packets
+            .iter()
+            .find(|(_, packet)| {
+                packet
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, InputEvent::Key { .. }))
+            })
+            .expect("sale la tecla");
+        let a = with_key
+            .1
+            .events
+            .iter()
+            .position(|e| *e == InputEvent::Text { ch: 'a' })
+            .expect("la «a» con la tecla");
+        let key = with_key
+            .1
+            .events
+            .iter()
+            .position(|e| matches!(e, InputEvent::Key { .. }))
+            .expect("tecla");
+        assert!(a < key, "{with_key:?}");
     }
 
     /// Con una tecla pulsada, pasadas las repeticiones cortas el estado sigue saliendo cada

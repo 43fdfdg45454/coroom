@@ -153,6 +153,7 @@ fn events() -> Vec<InputEvent> {
         InputEvent::MouseMoveAbsolute { x: 100, y: 200 },
         InputEvent::Wheel { dx: 0, dy: -1 },
         InputEvent::ReleaseAll,
+        InputEvent::Text { ch: 'ñ' },
     ]
 }
 
@@ -303,6 +304,7 @@ fn fuzz_seeds() {
         sent_us: 1_000,
         queued_us: 250,
         events,
+        text_seq: 7,
         state,
         pads: vec![PadData::Report {
             slot: 1,

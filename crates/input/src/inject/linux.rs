@@ -24,6 +24,16 @@
 //! ([`PointerArea::Window`]). La rueda va por `scroll_discrete` (1/120 de muesca, positivo hacia
 //! abajo en EI).
 //!
+//! **Texto sin tecla física** ([`InputEvent::Text`]): el teclado de EI anuncia su mapa XKB
+//! (`ei_keyboard.keymap`), que se lee al llegar el dispositivo ([`super::xkb::TextKeymap`]; un
+//! mapa nuevo llega con un dispositivo nuevo) y la distribución activa llega en
+//! `ei_keyboard.modifiers`, con los modificadores bloqueados y enganchados. Cada carácter se
+//! teclea con la tecla y los modificadores que lo dan en esa distribución con ese estado y con lo
+//! que tienen pulsado los invitados (que no se suelta), o con una tecla muerta y otra según la
+//! tabla de composición del anfitrión (la á de la distribución española): se pulsan los
+//! modificadores que falten y la tecla, en una trama, y se sueltan en la siguiente. Lo que no se
+//! puede dar así se descarta (con una línea de `debug` en el registro).
+//!
 //! **uinput** (`evdev` 0.13): un dispositivo por ranura, "coroom Gamepad N", con el
 //! vendor/product del mando de Xbox 360 (`045e:028e`) y la disposición del driver `xpad` (A, B,
 //! X = `BTN_NORTH`, Y = `BTN_WEST`, LB, RB, Back, Start, Guide, LS, RS; sticks `ABS_X/Y/RX/RY` en
@@ -55,6 +65,7 @@ use reis::event::{DeviceCapability, EiEvent};
 use tracing::{debug, warn};
 
 use super::uhid::UhidPad;
+use super::xkb::{KeyboardState, TextKeymap, Typing};
 use super::{EisConnection, EisProvider, InputSink, PadTracker, PointerArea, PressedKeys};
 use crate::keymap::evdev as codes;
 use crate::{
@@ -111,9 +122,54 @@ fn all_or_nothing<D: PartialEq + Copy>(
 
 // --- libei ------------------------------------------------------------------------------------
 
+/// Un dispositivo de EI del compositor.
+struct EiDevice {
+    device: reis::event::Device,
+    /// Si está activo (`resumed`).
+    resumed: bool,
+    /// Del mapa XKB que anuncia el teclado, qué tecla da cada carácter ([`InputEvent::Text`]).
+    text: Option<TextKeymap>,
+    /// Distribución activa y modificadores bloqueados y enganchados del teclado
+    /// (`ei_keyboard.modifiers`).
+    keyboard: KeyboardState,
+}
+
+impl EiDevice {
+    fn new(device: reis::event::Device) -> Self {
+        let text = device.keymap().and_then(|keymap| {
+            if keymap.type_ != ei::keyboard::KeymapType::Xkb {
+                return None;
+            }
+            TextKeymap::from_fd(&keymap.fd, keymap.size)
+                .inspect_err(|err| warn!("EI: el mapa de teclado no sirve para el texto: {err}"))
+                .ok()
+        });
+        if device.has_capability(DeviceCapability::Keyboard) {
+            debug!(
+                name = ?device.name(),
+                groups = text.as_ref().map(TextKeymap::groups),
+                "EI: teclado (distribuciones de su mapa XKB)"
+            );
+        }
+        Self {
+            device,
+            resumed: false,
+            text,
+            keyboard: KeyboardState::default(),
+        }
+    }
+}
+
+/// Mismo dispositivo de EI (para no repetir su `frame`).
+impl PartialEq for EiDevice {
+    fn eq(&self, other: &Self) -> bool {
+        self.device == other.device
+    }
+}
+
 #[derive(Default)]
 struct EiState {
-    devices: Vec<(reis::event::Device, bool)>,
+    devices: Vec<EiDevice>,
     connection: Option<reis::event::Connection>,
     sequence: u32,
     disconnected: Option<String>,
@@ -168,7 +224,9 @@ impl EiInput {
     /// ninguno: el dispositivo de cada evento se resuelve antes de encolar el primero, así un
     /// dispositivo que no está listo devuelve el error sin dejar nada a medias (quien llama
     /// deshace sus anotaciones de todo el grupo, y una tecla ya escrita quedaría pulsada).
-    fn inject_many(&self, events: &[InputEvent]) -> Result<(), InputError> {
+    ///
+    /// Cada [`InputEvent::Text`] de `events` se teclea con su `strokes`, en orden.
+    fn inject_many(&self, events: &[InputEvent], strokes: &[Typing]) -> Result<(), InputError> {
         let state = lock(&self.state);
         if let Some(reason) = &state.disconnected {
             return Err(InputError::Backend(format!(
@@ -179,17 +237,25 @@ impl EiInput {
             .connection
             .as_ref()
             .map_or(0, reis::event::Connection::serial);
+        let time = monotonic_us();
+        let mut strokes = strokes.iter();
         let touched = all_or_nothing(
             events,
             |event| Self::target(&state, &self.area, event),
-            |device, event| self.queue(device, event),
+            |device, event| match event {
+                InputEvent::Text { .. } => {
+                    if let Some(stroke) = strokes.next() {
+                        Self::type_text(&device.device, stroke, serial, time);
+                    }
+                }
+                _ => self.queue(&device.device, event),
+            },
         )?;
         if touched.is_empty() {
             return Ok(());
         }
-        let time = monotonic_us();
         for device in touched {
-            device.device().frame(serial, time);
+            device.device.device().frame(serial, time);
         }
         self.context
             .flush()
@@ -202,9 +268,9 @@ impl EiInput {
         state: &'s EiState,
         area: &PointerArea,
         event: &InputEvent,
-    ) -> Result<Option<&'s reis::event::Device>, InputError> {
+    ) -> Result<Option<&'s EiDevice>, InputError> {
         let capability = match *event {
-            InputEvent::Key { .. } => DeviceCapability::Keyboard,
+            InputEvent::Key { .. } | InputEvent::Text { .. } => DeviceCapability::Keyboard,
             InputEvent::MouseButton { .. } => DeviceCapability::Button,
             InputEvent::MouseMove { .. } => DeviceCapability::Pointer,
             InputEvent::MouseMoveAbsolute { .. } => match area {
@@ -219,16 +285,73 @@ impl EiInput {
             | InputEvent::GamepadAxis { .. }
             | InputEvent::ReleaseAll => return Ok(None),
         };
+        Self::device(state, capability).map(Some).ok_or_else(|| {
+            InputError::NotReady(format!(
+                "el compositor no ofrece un dispositivo de EI con {capability:?} activo"
+            ))
+        })
+    }
+
+    /// El primer dispositivo activo con `capability`.
+    fn device(state: &EiState, capability: DeviceCapability) -> Option<&EiDevice> {
         state
             .devices
             .iter()
-            .find(|(device, resumed)| *resumed && device.has_capability(capability))
-            .map(|(device, _)| Some(device))
-            .ok_or_else(|| {
-                InputError::NotReady(format!(
-                    "el compositor no ofrece un dispositivo de EI con {capability:?} activo"
-                ))
-            })
+            .find(|device| device.resumed && device.device.has_capability(capability))
+    }
+
+    /// Cómo teclear `ch` con el mapa del teclado de EI (el mismo al que irá:
+    /// [`EiInput::target`]) contra su estado (distribución activa y modificadores bloqueados y
+    /// enganchados, de `ei_keyboard.modifiers`) y lo que `held` dice que tienen pulsado los
+    /// invitados, sin soltar nada de eso. `None` (con una línea en el registro) si no se puede:
+    /// sin teclado, sin mapa o sin forma de dar el carácter.
+    fn text_typing(&self, ch: char, held: impl Fn(u16) -> bool) -> Option<Typing> {
+        let state = lock(&self.state);
+        let Some(keyboard) = Self::device(&state, DeviceCapability::Keyboard) else {
+            debug!(?ch, "EI: sin teclado activo; el texto se descarta");
+            return None;
+        };
+        let Some(keymap) = &keyboard.text else {
+            debug!(
+                ?ch,
+                "EI: el teclado no anuncia mapa XKB; el texto se descarta"
+            );
+            return None;
+        };
+        let typing = keymap.lookup(ch, keyboard.keyboard, held);
+        if typing.is_none() {
+            debug!(
+                ?ch,
+                state = ?keyboard.keyboard,
+                "EI: el carácter no se puede teclear en la distribución activa con lo pulsado; \
+                 se descarta"
+            );
+        }
+        typing
+    }
+
+    /// Teclea `typing` en `device`: por cada pulsación, sus modificadores y la tecla en una trama
+    /// y la tecla y los modificadores sueltos en orden inverso en la siguiente (la última la
+    /// cierra quien llama), como si se pulsara y soltara en un teclado; con tecla muerta, la
+    /// muerta y luego la otra.
+    fn type_text(device: &reis::event::Device, typing: &Typing, serial: u32, time: u64) {
+        let Some(keyboard) = device.interface::<ei::Keyboard>() else {
+            return;
+        };
+        for (index, stroke) in typing.strokes().iter().enumerate() {
+            if index > 0 {
+                device.device().frame(serial, time);
+            }
+            for modifier in stroke.modifiers() {
+                keyboard.key(u32::from(modifier), ei::keyboard::KeyState::Press);
+            }
+            keyboard.key(u32::from(stroke.key), ei::keyboard::KeyState::Press);
+            device.device().frame(serial, time);
+            keyboard.key(u32::from(stroke.key), ei::keyboard::KeyState::Released);
+            for modifier in stroke.modifiers().rev() {
+                keyboard.key(u32::from(modifier), ei::keyboard::KeyState::Released);
+            }
+        }
     }
 
     /// Pone `event` en la cola de `device`, el que le dio [`EiInput::target`] (sin `frame`).
@@ -279,7 +402,9 @@ impl EiInput {
                     scroll.scroll_discrete(dx, dy.saturating_neg());
                 }
             }
-            InputEvent::GamepadConnected { .. }
+            // El texto lo teclea `type_text`, con lo que resolvió `text_typing`.
+            InputEvent::Text { .. }
+            | InputEvent::GamepadConnected { .. }
             | InputEvent::GamepadDisconnected { .. }
             | InputEvent::GamepadButton { .. }
             | InputEvent::GamepadAxis { .. }
@@ -404,7 +529,7 @@ fn ei_loop(
             }
             EiEvent::DeviceAdded(added) => {
                 debug!(name = ?added.device.name(), "EI: dispositivo");
-                lock(state).devices.push((added.device, false));
+                lock(state).devices.push(EiDevice::new(added.device));
             }
             EiEvent::DeviceResumed(resumed) => {
                 let mut state = lock(state);
@@ -414,9 +539,9 @@ fn ei_loop(
                     .device
                     .device()
                     .start_emulating(resumed.serial, sequence);
-                for (device, active) in &mut state.devices {
-                    if *device == resumed.device {
-                        *active = true;
+                for device in &mut state.devices {
+                    if device.device == resumed.device {
+                        device.resumed = true;
                     }
                 }
                 drop(state);
@@ -427,16 +552,27 @@ fn ei_loop(
                 }
             }
             EiEvent::DevicePaused(paused) => {
-                for (device, active) in &mut lock(state).devices {
-                    if *device == paused.device {
-                        *active = false;
+                for device in &mut lock(state).devices {
+                    if device.device == paused.device {
+                        device.resumed = false;
+                    }
+                }
+            }
+            EiEvent::KeyboardModifiers(modifiers) => {
+                for device in &mut lock(state).devices {
+                    if device.device == modifiers.device {
+                        device.keyboard = KeyboardState {
+                            group: modifiers.group,
+                            latched: modifiers.latched,
+                            locked: modifiers.locked,
+                        };
                     }
                 }
             }
             EiEvent::DeviceRemoved(removed) => {
                 lock(state)
                     .devices
-                    .retain(|(device, _)| *device != removed.device);
+                    .retain(|device| device.device != removed.device);
             }
             EiEvent::Disconnected(disconnected) => {
                 lock(state).disconnected = Some(
@@ -1120,6 +1256,8 @@ pub struct LinuxSink {
     pad_state: PadTracker,
     /// Eventos de teclado y ratón que hay que escribir de un grupo (reutilizado).
     kbm_scratch: Vec<InputEvent>,
+    /// Cómo teclear cada [`InputEvent::Text`] de `kbm_scratch`, en orden (reutilizado).
+    text_scratch: Vec<Typing>,
     /// Eventos evdev de un grupo para una ranura (reutilizado).
     evdev_scratch: Vec<evdev::InputEvent>,
 }
@@ -1136,6 +1274,7 @@ impl LinuxSink {
             pressed: PressedKeys::default(),
             pad_state: PadTracker::default(),
             kbm_scratch: Vec::with_capacity(64),
+            text_scratch: Vec::new(),
             evdev_scratch: Vec::with_capacity(32),
         }
     }
@@ -1150,11 +1289,40 @@ impl LinuxSink {
         errors: &mut Vec<InputError>,
     ) -> usize {
         self.kbm_scratch.clear();
+        self.text_scratch.clear();
+        // El texto se resuelve con el mapa del teclado de EI, que tiene que estar listo.
+        let ei = if run
+            .iter()
+            .any(|event| matches!(event, InputEvent::Text { .. }))
+        {
+            match self.ei.ready() {
+                Ok(ei) => Some(ei),
+                Err(err) => {
+                    errors.push(err);
+                    return 0;
+                }
+            }
+        } else {
+            None
+        };
         for event in run {
             let write = match *event {
                 InputEvent::Key { code, pressed } => self.pressed.key(guest, code, pressed),
                 InputEvent::MouseButton { button, pressed } => {
                     self.pressed.button(guest, button, pressed)
+                }
+                // Con lo pulsado hasta aquí: una Mayúscula que el invitado pulsó antes en el
+                // paquete ya cuenta. Lo que no se puede teclear no se escribe (y cuenta como
+                // aplicado: no hay nada que reintentar).
+                InputEvent::Text { ch } => {
+                    let pressed = &self.pressed;
+                    match ei.and_then(|ei| ei.text_typing(ch, |code| pressed.is_held(code))) {
+                        Some(stroke) => {
+                            self.text_scratch.push(stroke);
+                            true
+                        }
+                        None => false,
+                    }
                 }
                 _ => true,
             };
@@ -1163,11 +1331,16 @@ impl LinuxSink {
             }
         }
         if self.kbm_scratch.is_empty() {
-            // Otro invitado ya tenía pulsado lo mismo: nada que escribir.
+            // Nada que escribir: otro invitado ya tenía pulsado lo mismo, o el texto no se puede
+            // teclear.
             return run.len();
         }
-        let scratch = &self.kbm_scratch;
-        match self.ei.ready().and_then(|ei| ei.inject_many(scratch)) {
+        let (scratch, strokes) = (&self.kbm_scratch, &self.text_scratch);
+        match self
+            .ei
+            .ready()
+            .and_then(|ei| ei.inject_many(scratch, strokes))
+        {
             Ok(()) => run.len(),
             Err(err) => {
                 // No llegó al sistema: se deshacen las anotaciones, en orden inverso (una tecla
@@ -1315,7 +1488,7 @@ impl InputSink for LinuxSink {
                     button,
                     pressed: false,
                 }));
-            result = ei.inject_many(&self.kbm_scratch);
+            result = ei.inject_many(&self.kbm_scratch, &[]);
         }
         // Y cada mando suyo al reposo en una trama por ranura.
         let neutral = self.pad_state.neutral_events(Some(guest), None);

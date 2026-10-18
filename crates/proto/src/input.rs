@@ -299,6 +299,15 @@ pub enum InputEvent {
     },
     /// Soltar todo lo pulsado (al perder el foco, al pausar o al expulsar).
     ReleaseAll,
+    /// Un carácter Unicode escrito sin tecla física (el teclado en pantalla de Android: ñ, á,
+    /// emoji…): el anfitrión lo teclea entero (pulsar y soltar) sin tocar lo que haya pulsado.
+    /// Uno por evento. No cuenta en [`InputState`]: para que no se pierda con un datagrama, cada
+    /// texto lleva un número de orden ([`InputPacket::text_seq`]) y el invitado lo repite en los
+    /// paquetes siguientes; el anfitrión teclea cada número una sola vez y en orden.
+    Text {
+        /// El carácter.
+        ch: char,
+    },
 }
 
 /// Cómo llega el mando físico de un invitado.
@@ -442,6 +451,7 @@ impl InputEvent {
     pub const fn class(&self) -> EventClass {
         match self {
             InputEvent::Key { .. }
+            | InputEvent::Text { .. }
             | InputEvent::MouseButton { .. }
             | InputEvent::MouseMove { .. }
             | InputEvent::MouseMoveAbsolute { .. }
@@ -588,6 +598,8 @@ impl InputState {
                 }
             }
             InputEvent::ReleaseAll => self.release_all(),
+            // Se teclea entero en el anfitrión: no deja nada pulsado.
+            InputEvent::Text { .. } => {}
         }
     }
 
@@ -820,6 +832,11 @@ pub struct InputPacket {
     pub queued_us: u16,
     /// Eventos, en orden.
     pub events: Vec<InputEvent>,
+    /// Número de orden del primer [`InputEvent::Text`] de `events`; los siguientes llevan los
+    /// consecutivos (con vuelta en `u16`). Los textos de un paquete son siempre los últimos que el
+    /// invitado tiene por repetir (los más antiguos, delante) seguidos de los nuevos, así que el
+    /// anfitrión sabe cuáles ya tecleó. Sin textos, cualquiera (`0`).
+    pub text_seq: u16,
     /// Estado completo tras `events`.
     pub state: InputState,
     /// Informes de mandos tal cual ([`PadData::Report`]).
@@ -882,6 +899,8 @@ pub struct InputPacketRef<'a> {
     pub queued_us: u16,
     /// Como [`InputPacket::events`].
     pub events: &'a [InputEvent],
+    /// Como [`InputPacket::text_seq`].
+    pub text_seq: u16,
     /// Como [`InputPacket::state`].
     pub state: &'a InputState,
     /// Como [`InputPacket::pads`].
@@ -1077,6 +1096,7 @@ mod tests {
                     value
                 }),
             Just(InputEvent::ReleaseAll),
+            any::<char>().prop_map(|ch| InputEvent::Text { ch }),
         ]
     }
 
@@ -1135,8 +1155,8 @@ mod tests {
 
     proptest! {
         #[test]
-        fn packets_round_trip(seq in any::<u32>(), sent_us in any::<u32>(), queued_us in any::<u16>(), events in events(), state in state(), pads in pads()) {
-            let packet = InputPacket { seq, sent_us, queued_us, events, state, pads };
+        fn packets_round_trip(seq in any::<u32>(), sent_us in any::<u32>(), queued_us in any::<u16>(), events in events(), text_seq in any::<u16>(), state in state(), pads in pads()) {
+            let packet = InputPacket { seq, sent_us, queued_us, events, text_seq, state, pads };
             let bytes = packet.to_bytes().expect("serializar");
             prop_assert_eq!(InputPacket::from_bytes(&bytes), Ok(packet));
         }
@@ -1228,6 +1248,7 @@ mod tests {
             sent_us: 0,
             queued_us: 0,
             events: vec![InputEvent::ReleaseAll; MAX_EVENTS + 1],
+            text_seq: 0,
             state: InputState::default(),
             pads: Vec::new(),
         };
@@ -1270,6 +1291,7 @@ mod tests {
                 };
                 MAX_EVENTS
             ],
+            text_seq: u16::MAX,
             state,
             // 800 bytes de informes (lo que admite `coroom_input::send` por datagrama).
             pads: vec![
@@ -1285,6 +1307,7 @@ mod tests {
             sent_us: packet.sent_us,
             queued_us: packet.queued_us,
             events: &packet.events,
+            text_seq: packet.text_seq,
             state: &packet.state,
             pads: &packet.pads,
         };
@@ -1398,6 +1421,7 @@ mod tests {
             sent_us: 0,
             queued_us: 0,
             events: Vec::new(),
+            text_seq: 0,
             state: InputState::default(),
             pads: vec![report(8); MAX_PADS + 1],
         };
@@ -1464,6 +1488,11 @@ mod tests {
             EventClass::Gamepad(2)
         );
         assert_eq!(InputEvent::ReleaseAll.class(), EventClass::Control);
+        assert_eq!(
+            InputEvent::Text { ch: 'ñ' }.class(),
+            EventClass::KeyboardMouse
+        );
+        assert!(!InputEvent::Text { ch: 'ñ' }.is_continuous());
         assert!(InputEvent::MouseMove { dx: 1, dy: 1 }.is_continuous());
         assert!(!InputEvent::Wheel { dx: 0, dy: 120 }.is_continuous());
     }

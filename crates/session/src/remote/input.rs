@@ -131,6 +131,8 @@ pub(crate) enum Job {
         /// Captura → recibido, en µs (con el reloj sincronizado), si se conoce.
         network_us: Option<u64>,
         events: Vec<InputEvent>,
+        /// [`InputPacket::text_seq`](coroom_transport::proto::input::InputPacket::text_seq).
+        text_seq: u16,
         state: InputState,
         pads: Vec<PadData>,
     },
@@ -295,6 +297,7 @@ async fn datagram_reader(
             queued_us: packet.queued_us,
             network_us: latency_us(&clock, received, packet.sent_us),
             events: packet.events,
+            text_seq: packet.text_seq,
             state: packet.state,
             pads: packet.pads,
         });
@@ -476,6 +479,8 @@ struct GuestState {
     pad: Option<PadState>,
     /// Última secuencia aplicada.
     last_seq: Option<u32>,
+    /// Los textos ya tecleados.
+    texts: TextOrder,
     /// Lo que el invitado tiene pulsado y acumulado, según lo aplicado hasta ahora.
     view: InputState,
     applied: u64,
@@ -495,6 +500,57 @@ struct GuestState {
     last_packet: Option<Instant>,
     /// Se soltó lo suyo por silencio: el siguiente paquete se reconcilia con la vista.
     stale: bool,
+}
+
+/// Cuándo y cómo llegó un paquete de entrada.
+#[derive(Debug, Clone, Copy)]
+struct PacketTiming {
+    seq: u32,
+    /// Cuándo llegó el datagrama.
+    received: Instant,
+    /// Captura → envío en el invitado, en µs.
+    queued_us: u16,
+    /// Captura → recibido, en µs, si se conoce.
+    network_us: Option<u64>,
+}
+
+/// Qué textos ([`InputEvent::Text`]) de un invitado ya se teclearon: el número de orden del
+/// siguiente. Cada paquete trae los textos que el invitado aún repite (los más antiguos delante,
+/// con números consecutivos desde [`InputPacket::text_seq`]) y los nuevos detrás; los paquetes se
+/// aplican en orden (los atrasados se descartan enteros), así que un texto no puede llegar antes
+/// que uno anterior que aún se repita: no hay que guardar ninguno a la espera.
+///
+/// [`InputPacket::text_seq`]: coroom_transport::proto::input::InputPacket::text_seq
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TextOrder {
+    next: Option<u16>,
+}
+
+impl TextOrder {
+    /// De los `count` textos de un paquete (el primero con el número `first`), cuántos del
+    /// principio ya se teclearon (los demás son nuevos y van en orden) y cuántos se perdieron
+    /// sin remedio entre el último tecleado y `first` (dejaron de repetirse antes de que llegara
+    /// ninguna copia).
+    fn accept(&mut self, first: u16, count: usize) -> (usize, u16) {
+        if count == 0 {
+            return (0, 0);
+        }
+        let after = first.wrapping_add(count as u16);
+        let Some(next) = self.next else {
+            self.next = Some(after);
+            return (0, 0);
+        };
+        let ahead = first.wrapping_sub(next) as i16;
+        if ahead > 0 {
+            self.next = Some(after);
+            return (0, ahead as u16);
+        }
+        let done = usize::from(ahead.unsigned_abs()).min(count);
+        if done < count {
+            self.next = Some(after);
+        }
+        (done, 0)
+    }
 }
 
 /// El hilo `inject`: único dueño del sumidero.
@@ -655,10 +711,17 @@ impl Worker {
                 queued_us,
                 network_us,
                 events,
+                text_seq,
                 state,
                 pads,
             } => {
-                if self.packet(guest, seq, received, queued_us, network_us, events, state) {
+                let timing = PacketTiming {
+                    seq,
+                    received,
+                    queued_us,
+                    network_us,
+                };
+                if self.packet(guest, timing, events, text_seq, state) {
                     self.pads(guest, pads);
                 }
             }
@@ -709,17 +772,20 @@ impl Worker {
     }
 
     /// Aplica un paquete; devuelve `false` si se descartó entero (antiguo o en pausa).
-    #[allow(clippy::too_many_arguments)]
     fn packet(
         &mut self,
         guest: GuestId,
-        seq: u32,
-        received: Instant,
-        queued_us: u16,
-        network_us: Option<u64>,
-        events: Vec<InputEvent>,
+        timing: PacketTiming,
+        mut events: Vec<InputEvent>,
+        text_seq: u16,
         state: InputState,
     ) -> bool {
+        let PacketTiming {
+            seq,
+            received,
+            queued_us,
+            network_us,
+        } = timing;
         let paused = self.paused;
         let entry = self.guests.entry(guest).or_default();
         entry.stats_changed = true;
@@ -738,6 +804,26 @@ impl Worker {
                 .is_some_and(|last| last.wrapping_add(1) != seq);
         entry.stale = false;
         entry.last_seq = Some(seq);
+        // Los textos que el invitado repite y ya se teclearon fuera (también en pausa: al
+        // reanudar no se teclea lo que escribió entretanto).
+        let texts = events
+            .iter()
+            .filter(|event| matches!(event, InputEvent::Text { .. }))
+            .count();
+        let (mut repeated, lost) = entry.texts.accept(text_seq, texts);
+        if lost > 0 {
+            debug!(
+                ?guest,
+                lost, "textos del invitado perdidos: ya no se repetían cuando volvió a llegar uno"
+            );
+        }
+        if repeated > 0 {
+            events.retain(|event| {
+                let skip = repeated > 0 && matches!(event, InputEvent::Text { .. });
+                repeated -= usize::from(skip);
+                !skip
+            });
+        }
         if paused {
             entry.dropped += events.len() as u64;
             self.totals.1 += events.len() as u64;
@@ -747,10 +833,17 @@ impl Worker {
             return false;
         }
         // Con hueco, los eventos de este paquete presuponen los perdidos: se aplica la diferencia
-        // entre la vista y el estado que llega, que los incluye.
+        // entre la vista y el estado que llega, que los incluye. El texto no está en el estado: el
+        // de este paquete va detrás de la diferencia (el de los perdidos, perdido queda).
         let events = if gap {
             entry.repaired += 1;
-            entry.view.diff(&state)
+            let mut repaired = entry.view.diff(&state);
+            repaired.extend(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, InputEvent::Text { .. })),
+            );
+            repaired
         } else {
             events
         };
@@ -1396,6 +1489,18 @@ mod tests {
         before: &InputState,
         events: Vec<InputEvent>,
     ) -> InputState {
+        texts(worker, guest, seq, before, events, 0)
+    }
+
+    /// Como [`packet`], con los textos numerados desde `text_seq`.
+    fn texts(
+        worker: &mut Worker,
+        guest: GuestId,
+        seq: u32,
+        before: &InputState,
+        events: Vec<InputEvent>,
+        text_seq: u16,
+    ) -> InputState {
         let mut state = before.clone();
         for event in &events {
             state.apply(event);
@@ -1407,6 +1512,7 @@ mod tests {
             queued_us: 120,
             network_us: Some(3_000),
             events,
+            text_seq,
             state: state.clone(),
             pads: Vec::new(),
         });
@@ -1486,6 +1592,7 @@ mod tests {
             queued_us: 0,
             network_us: None,
             events: vec![key(30, false)],
+            text_seq: 0,
             state: late,
             pads: Vec::new(),
         });
@@ -1560,6 +1667,133 @@ mod tests {
         let state = &worker.guests[&guest];
         assert_eq!(state.applied, 6);
         assert_eq!(state.dropped, 1);
+    }
+
+    /// El texto sin tecla física es entrada de teclado: sin el permiso de teclado y ratón se
+    /// descarta como una tecla, y con él llega al sumidero en el grupo del teclado.
+    #[test]
+    fn text_needs_the_keyboard_permission_like_a_key() {
+        let sink = RecordingSink::new();
+        let mut worker = worker(&sink);
+        let guest = GuestId(1);
+        let text = |ch| InputEvent::Text { ch };
+        worker.handle(Job::Permissions {
+            guest,
+            permissions: Permissions {
+                gamepad_slot: Some(1),
+                ..Permissions::VIEW_ONLY
+            },
+        });
+        let s0 = texts(
+            &mut worker,
+            guest,
+            0,
+            &InputState::default(),
+            vec![text('ñ'), key(30, true)],
+            0,
+        );
+        assert!(
+            sink.events_of(guest).is_empty(),
+            "sin permiso no llega nada"
+        );
+        assert_eq!(worker.guests[&guest].dropped, 2);
+
+        worker.handle(Job::Permissions {
+            guest,
+            permissions: Permissions {
+                keyboard_mouse: true,
+                ..Permissions::VIEW_ONLY
+            },
+        });
+        texts(
+            &mut worker,
+            guest,
+            1,
+            &s0,
+            vec![key(30, true), text('a')],
+            1,
+        );
+        assert_eq!(sink.events_of(guest), vec![key(30, true), text('a')]);
+        assert_eq!(
+            sink.batch_sizes().last(),
+            Some(&2),
+            "en el grupo del teclado"
+        );
+    }
+
+    /// Un texto se teclea una sola vez y en orden aunque se pierda su paquete o llegue repetido:
+    /// el invitado lo repite en los paquetes siguientes (con su número) y el anfitrión salta los
+    /// que ya tecleó, también tras un hueco reconciliado con el estado.
+    #[test]
+    fn texts_are_typed_once_and_in_order_despite_losses_and_repeats() {
+        let sink = RecordingSink::new();
+        let mut worker = worker(&sink);
+        let guest = GuestId(1);
+        let text = |ch| InputEvent::Text { ch };
+        worker.handle(Job::Permissions {
+            guest,
+            permissions: Permissions {
+                keyboard_mouse: true,
+                ..Permissions::VIEW_ONLY
+            },
+        });
+        // seq 0: «h» (texto 0).
+        let s0 = texts(
+            &mut worker,
+            guest,
+            0,
+            &InputState::default(),
+            vec![text('h')],
+            0,
+        );
+        // seq 1 se pierde: «o» (texto 1), con la «h» repetida delante, y la A pulsada.
+        let mut s1 = s0.clone();
+        s1.apply(&key(30, true));
+        // seq 2 llega con hueco: repite «h» y «o» y trae «l» (texto 2).
+        let s2 = texts(
+            &mut worker,
+            guest,
+            2,
+            &s1,
+            vec![text('h'), text('o'), text('l')],
+            0,
+        );
+        // seq 3, la repetición de seq 2 (solo el estado y los textos que siguen en la ventana).
+        let s3 = texts(&mut worker, guest, 3, &s2, vec![text('o'), text('l')], 1);
+        // seq 4: «a» nueva detrás de la «l» repetida.
+        texts(&mut worker, guest, 4, &s3, vec![text('l'), text('a')], 2);
+        assert_eq!(
+            sink.events_of(guest),
+            vec![
+                text('h'),
+                // La reconciliación del hueco (la A) y, detrás, los textos que faltaban.
+                key(30, true),
+                text('o'),
+                text('l'),
+                text('a'),
+            ]
+        );
+        assert_eq!(worker.guests[&guest].texts.next, Some(4));
+    }
+
+    #[test]
+    fn text_order_counts_repeats_and_gives_up_on_texts_no_longer_repeated() {
+        let mut order = TextOrder::default();
+        assert_eq!(order.accept(10, 0), (0, 0), "sin textos no cambia nada");
+        assert_eq!(order.next, None);
+        assert_eq!(order.accept(10, 2), (0, 0));
+        assert_eq!(order.accept(10, 3), (2, 0), "10 y 11 ya, 12 nuevo");
+        assert_eq!(order.accept(11, 2), (2, 0), "todo repetido");
+        assert_eq!(order.next, Some(13));
+        // El 13 y el 14 dejaron de repetirse sin llegar: se pierden y se sigue por el 15.
+        assert_eq!(order.accept(15, 1), (0, 2));
+        assert_eq!(order.next, Some(16));
+        // Con vuelta en `u16`.
+        let mut order = TextOrder {
+            next: Some(u16::MAX),
+        };
+        assert_eq!(order.accept(u16::MAX - 1, 3), (1, 0));
+        assert_eq!(order.next, Some(1));
     }
 
     /// Sin nada compartido («Dejar de compartir» o una sala solo de voz) no se inyecta nada de

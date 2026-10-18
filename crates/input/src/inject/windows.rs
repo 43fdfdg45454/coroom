@@ -2,6 +2,10 @@
 //!
 //! - **Teclado** por *scancode* (`KEYEVENTF_SCANCODE`, con `KEYEVENTF_EXTENDEDKEY` en las
 //!   extendidas) con la tabla evdev → set 1 de [`crate::keymap`]: la tecla física, sea cual sea la
+//!   distribución del anfitrión. El **texto** sin tecla física ([`InputEvent::Text`]: la ñ o un
+//!   emoji del teclado en pantalla de Android) va con `KEYEVENTF_UNICODE` (`VK_PACKET`, el
+//!   carácter en UTF-16 en `wScan`): pulsar y soltar, con las dos mitades de un par sustituto
+//!   seguidas fuera del plano básico. No toca las teclas físicas pulsadas ni depende de la
 //!   distribución del anfitrión.
 //! - **Ratón**: relativo con `MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE` (que Windows no junte
 //!   los movimientos); absoluto con `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK` sobre la
@@ -47,11 +51,11 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE,
-    MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_MOVE_NOCOALESCE, MOUSEEVENTF_RIGHTDOWN,
-    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
-    MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VIRTUAL_KEY,
+    KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MOUSE_EVENT_FLAGS,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_MOVE_NOCOALESCE,
+    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, SendInput, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetSystemMetrics, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN,
@@ -250,6 +254,18 @@ impl SendInputSink {
                     MOUSEEVENTF_MOVE | MOUSEEVENTF_MOVE_NOCOALESCE,
                 )),
                 InputEvent::MouseMoveAbsolute { x, y } => self.inputs.push(Self::absolute(x, y)),
+                InputEvent::Text { ch } => {
+                    // Fuera del plano básico, las dos mitades del par sustituto: pulsar las dos y
+                    // soltarlas después, como pide `KEYEVENTF_UNICODE`.
+                    let mut units = [0u16; 2];
+                    let units = ch.encode_utf16(&mut units);
+                    for unit in units.iter() {
+                        self.inputs.push(Self::unicode(*unit, true));
+                    }
+                    for unit in units.iter() {
+                        self.inputs.push(Self::unicode(*unit, false));
+                    }
+                }
                 InputEvent::Wheel { dx, dy } => {
                     if dy != 0 {
                         self.inputs
@@ -344,6 +360,26 @@ impl SendInputSink {
                 },
             },
         })
+    }
+
+    /// Una unidad UTF-16 de texto con `KEYEVENTF_UNICODE` (`wVk` a cero).
+    fn unicode(unit: u16, pressed: bool) -> INPUT {
+        let mut flags = KEYEVENTF_UNICODE;
+        if !pressed {
+            flags |= KEYEVENTF_KEYUP;
+        }
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(0),
+                    wScan: unit,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }
     }
 
     fn mouse(dx: i32, dy: i32, data: u32, flags: MOUSE_EVENT_FLAGS) -> INPUT {

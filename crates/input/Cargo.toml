@@ -9,9 +9,10 @@ publish.workspace = true
 [features]
 # Cada backend solo se compila en su sistema; activar los dos por defecto es inocuo en el otro.
 default = ["linux-portal", "windows-sendinput", "windows-vhid"]
-# Linux: teclado y ratón por libei (portal `RemoteDesktop`) y mandos por uinput (`evdev`, que va
-# siempre en Linux: también mueve los motores de los mandos del invitado).
-linux-portal = ["dep:reis", "dep:ashpd", "dep:tokio", "dep:rustix"]
+# Linux: teclado y ratón por libei (portal `RemoteDesktop`, con el mapa XKB del teclado de EI
+# leído con `xkbcommon` para el texto) y mandos por uinput (`evdev`, que va siempre en Linux:
+# también mueve los motores de los mandos del invitado).
+linux-portal = ["dep:reis", "dep:ashpd", "dep:tokio", "dep:rustix", "dep:xkbcommon"]
 # Windows: teclado y ratón por `SendInput`.
 windows-sendinput = []
 # Windows: mandos virtuales por el driver propio `coroomvhid` (UMDF2, drivers/windows-vhid). El
@@ -39,6 +40,7 @@ evdev.workspace = true
 reis = { workspace = true, optional = true }
 rustix = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["rt", "sync", "time"] }
+xkbcommon = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 hidapi.workspace = true

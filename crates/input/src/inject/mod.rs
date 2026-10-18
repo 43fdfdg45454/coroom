@@ -31,6 +31,8 @@ pub mod linux;
 pub mod uhid;
 #[cfg(all(target_os = "windows", feature = "windows-sendinput"))]
 pub mod windows;
+#[cfg(all(target_os = "linux", feature = "linux-portal"))]
+pub mod xkb;
 // El formato del driver es independiente de la plataforma (y se prueba en todas); solo el acceso
 // al driver es de Windows.
 #[cfg(feature = "windows-vhid")]
@@ -273,6 +275,11 @@ impl PressedKeys {
     /// liberación).
     pub fn key(&mut self, guest: GuestId, code: u16, pressed: bool) -> bool {
         edge(&mut self.keys, code, guest, pressed)
+    }
+
+    /// Si algún invitado tiene pulsada la tecla `code`.
+    pub fn is_held(&self, code: u16) -> bool {
+        self.keys.contains_key(&code)
     }
 
     /// Como [`PressedKeys::key`] para un botón del ratón.

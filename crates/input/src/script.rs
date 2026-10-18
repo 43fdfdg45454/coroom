@@ -16,7 +16,8 @@
 //! ```
 //!
 //! Los eventos son los de [`InputEvent`] tal como los escribe `serde` (`"ReleaseAll"`,
-//! `{"MouseMove": {"dx": 1, "dy": 0}}`…). `mouse_moves` con `numbered` pone en `dx` el número de
+//! `{"MouseMove": {"dx": 1, "dy": 0}}`, el texto sin tecla física como `{"Text": {"ch": "ñ"}}`…).
+//! `mouse_moves` con `numbered` pone en `dx` el número de
 //! orden (1, 2, 3…) para que el anfitrión pueda comprobar que llegan todos y en orden. Los ritmos
 //! se cumplen contra reloj (cada evento a su hora desde el principio del paso, sin acumular el
 //! retraso de `sleep`). El guion **no** respeta los permisos por sí mismo: es una herramienta de
@@ -316,6 +317,23 @@ mod tests {
         let err = script.play(&target).expect_err("sin permisos");
         assert!(err.to_string().contains("solo mirar"), "{err}");
         assert!(target.events.borrow().is_empty());
+    }
+
+    #[test]
+    fn text_without_a_key_is_an_event_too() {
+        let script =
+            InputScript::from_json(r#"{"steps": [{"event": {"Text": {"ch": "ñ"}}}, {"events": {"hz": 1000, "list": [{"Text": {"ch": "😀"}}]}}]}"#)
+                .expect("guion");
+        let target = Collect {
+            events: RefCell::new(Vec::new()),
+            allowed: Allowed::default(),
+        };
+        script.play(&target).expect("reproducir");
+        let events: Vec<InputEvent> = target.events.borrow().iter().map(|(_, e)| *e).collect();
+        assert_eq!(
+            events,
+            vec![InputEvent::Text { ch: 'ñ' }, InputEvent::Text { ch: '😀' }]
+        );
     }
 
     #[test]

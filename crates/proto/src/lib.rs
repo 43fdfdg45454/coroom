@@ -49,8 +49,9 @@ pub mod video;
 /// límite por sala del relay en `RelayToken` (`max_kbps`), que el anfitrión respeta; la 18, la
 /// vibración de los mandos convertidos y de Xbox por cable (`GamepadRumble`, detrás de
 /// `HandoffCancel`); la 19, el relay de reenvío ([`relay`]): ya no termina QUIC, la conexión de
-/// pares va de punta a punta a través de él (sin `Alpn::Relay` ni el token en `Hello`).
-pub const PROTOCOL_VERSION: u16 = 19;
+/// pares va de punta a punta a través de él (sin `Alpn::Relay` ni el token en `Hello`); la 20, el
+/// texto sin tecla física en la entrada ([`input::InputEvent::Text`], detrás de `ReleaseAll`).
+pub const PROTOCOL_VERSION: u16 = 20;
 
 /// Identificadores ALPN (RFC 7301) que el socket QUIC usa para demultiplexar conexiones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
