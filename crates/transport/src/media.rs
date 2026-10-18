@@ -545,6 +545,14 @@ const MAX_NACKS: u8 = 2;
 /// Muestras del reloj para las medianas.
 const CLOCK_SAMPLES: usize = 8;
 
+/// Muestras de `Pong` (una por [`PING_INTERVAL`]) entre las que se elige la de menor RTT para el
+/// desfase del reloj ([`Clock::offset_us`]).
+const OFFSET_WINDOW: usize = 32;
+
+/// Lo más que se mueve el desfase del reloj por segundo, en µs (100 ppm, más que la deriva de
+/// cualquier oscilador de cuarzo): ver [`Clock`].
+const MAX_OFFSET_SLEW_US_PER_S: f64 = 100.0;
+
 /// Grupos por delante del esperado a partir de los que se reinicia la pista.
 const RESET_DISTANCE: u32 = 1024;
 
@@ -570,10 +578,22 @@ pub fn repair_ratio_for_loss(loss: f64) -> f64 {
 }
 
 /// Reloj local en µs y estimación del reloj del otro extremo por `Ping`/`Pong`.
+///
+/// El desfase sale de la muestra de menor RTT de las últimas [`OFFSET_WINDOW`] (la de menos cola,
+/// cuya asimetría entre ida y vuelta es la menor) y, una vez estable, no salta: se acerca a esa
+/// estimación a [`MAX_OFFSET_SLEW_US_PER_S`] como mucho. Las marcas de llegada del `Feedback` van
+/// en el reloj remoto con este desfase, y el control de tasa del emisor toma cualquier subida de
+/// su retardo de ida por cola: con la mediana de las últimas ocho muestras, el jitter del camino
+/// por el relay (RTT de 15 a 60 ms) la movía de 3 a 5 ms cada pocos segundos, y esos saltos eran
+/// una cola de 5 a 10 ms que no existía (justo en el umbral de recorte): el objetivo se recortaba
+/// sin pérdida ni cola de verdad y se quedaba abajo. En una conexión directa (RTT de décimas de
+/// milisegundo) la mediana apenas se movía.
 #[derive(Debug)]
 pub struct Clock {
     origin: Instant,
     samples: VecDeque<(Duration, i64)>,
+    /// Desfase en uso (µs) y cuándo se movió por última vez, desde que hay [`CLOCK_SAMPLES`].
+    offset: Option<(f64, Instant)>,
 }
 
 impl Default for Clock {
@@ -592,7 +612,8 @@ impl Clock {
     pub fn with_origin(origin: Instant) -> Self {
         Self {
             origin,
-            samples: VecDeque::with_capacity(CLOCK_SAMPLES),
+            samples: VecDeque::with_capacity(OFFSET_WINDOW),
+            offset: None,
         }
     }
 
@@ -632,24 +653,55 @@ impl Clock {
         }
         let rtt = now_us - t;
         let offset = t_recv as i64 - (t + rtt / 2) as i64;
-        if self.samples.len() == CLOCK_SAMPLES {
+        if self.samples.len() == OFFSET_WINDOW {
             self.samples.pop_front();
         }
         self.samples.push_back((Duration::from_micros(rtt), offset));
+        if self.samples.len() < CLOCK_SAMPLES {
+            return;
+        }
+        let Some(estimate) = self.min_rtt_offset() else {
+            return;
+        };
+        let estimate = estimate as f64;
+        self.offset = Some(match self.offset {
+            None => (estimate, now),
+            Some((current, at)) => {
+                let step =
+                    MAX_OFFSET_SLEW_US_PER_S * now.saturating_duration_since(at).as_secs_f64();
+                (current + (estimate - current).clamp(-step, step), now)
+            }
+        });
     }
 
-    /// RTT medido por `Ping`/`Pong` (mediana de las últimas 8 muestras).
+    /// Desfase de la muestra de menor RTT de la ventana.
+    fn min_rtt_offset(&self) -> Option<i64> {
+        self.samples
+            .iter()
+            .min_by_key(|(rtt, _)| *rtt)
+            .map(|(_, offset)| *offset)
+    }
+
+    /// RTT medido por `Ping`/`Pong` (mediana de las últimas [`CLOCK_SAMPLES`] muestras).
     pub fn rtt(&self) -> Option<Duration> {
-        let mut rtts: Vec<Duration> = self.samples.iter().map(|(rtt, _)| *rtt).collect();
+        let mut rtts: Vec<Duration> = self
+            .samples
+            .iter()
+            .rev()
+            .take(CLOCK_SAMPLES)
+            .map(|(rtt, _)| *rtt)
+            .collect();
         rtts.sort_unstable();
         rtts.get(rtts.len() / 2).copied()
     }
 
-    /// Desfase `reloj remoto − reloj local` en µs (mediana de las últimas 8 muestras).
+    /// Desfase `reloj remoto − reloj local` en µs: el estable (ver [`Clock`]) o, mientras no hay
+    /// [`CLOCK_SAMPLES`] muestras, el de la de menor RTT.
     pub fn offset_us(&self) -> Option<i64> {
-        let mut offsets: Vec<i64> = self.samples.iter().map(|(_, offset)| *offset).collect();
-        offsets.sort_unstable();
-        offsets.get(offsets.len() / 2).copied()
+        match self.offset {
+            Some((offset, _)) => Some(offset.round() as i64),
+            None => self.min_rtt_offset(),
+        }
     }
 
     /// `at` expresado en el reloj remoto y truncado a 32 bits, si el desfase ya es estable: con
@@ -3669,6 +3721,74 @@ mod tests {
         }
         let remote = clock.remote_us_i32(base + Duration::from_micros(100_000));
         assert_eq!(remote, Some(150_000));
+    }
+
+    /// Un `Pong` por segundo con el RTT de un camino por el relay (20 ms de base y hasta 40 ms
+    /// más de cola en un sentido u otro): el desfase no se mueve más de lo que permite
+    /// [`MAX_OFFSET_SLEW_US_PER_S`] entre dos muestras y queda cerca del de verdad. Con la mediana
+    /// de ocho muestras saltaba milisegundos, y el control de tasa lo tomaba por cola.
+    #[test]
+    fn clock_offset_does_not_follow_the_jitter() {
+        let mut clock = Clock::new();
+        let base = clock.origin;
+        let truth: i64 = 50_000;
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut previous: Option<i64> = None;
+        let mut worst_step = 0i64;
+        for i in 0..300u64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Cola de ida y de vuelta, independientes, de 0 a 20 ms cada una.
+            let up = state % 20_000;
+            let down = (state >> 20) % 20_000;
+            let t = 1_000 + i * 1_000_000;
+            let t_recv = (t + 10_000 + up) as i64 + truth;
+            clock.on_pong(
+                base + Duration::from_micros(t + 20_000 + up + down),
+                t,
+                t_recv as u64,
+            );
+            let Some(offset) = clock.remote_us_i32(base).map(i64::from) else {
+                continue;
+            };
+            if let Some(previous) = previous {
+                worst_step = worst_step.max((offset - previous).abs());
+            }
+            previous = Some(offset);
+        }
+        // Entre dos `Pong` pasa un segundo más lo que varía el RTT (hasta 40 ms).
+        assert!(
+            worst_step <= (MAX_OFFSET_SLEW_US_PER_S * 1.04).ceil() as i64 + 1,
+            "el desfase saltó {worst_step} µs en un segundo"
+        );
+        let offset = clock.offset_us().unwrap();
+        assert!(
+            (offset - truth).abs() < 5_000,
+            "desfase {offset} lejos de {truth}"
+        );
+    }
+
+    /// Con relojes que derivan 50 ppm, el desfase la sigue (la deriva cabe en el paso máximo).
+    #[test]
+    fn clock_offset_follows_a_real_drift() {
+        let mut clock = Clock::new();
+        let base = clock.origin;
+        for i in 0..600u64 {
+            let t = 1_000 + i * 1_000_000;
+            // El remoto adelanta 50 µs por segundo.
+            let truth = 50_000 + (i * 50) as i64;
+            let t_recv = (t + 10_000) as i64 + truth;
+            clock.on_pong(base + Duration::from_micros(t + 20_000), t, t_recv as u64);
+        }
+        let truth = 50_000 + 599 * 50;
+        let offset = clock.offset_us().unwrap();
+        // La muestra de menor RTT es cualquiera de la ventana (todas iguales): como mucho
+        // [`OFFSET_WINDOW`] segundos de deriva por detrás.
+        assert!(
+            (truth - offset).abs() <= (OFFSET_WINDOW as i64) * 50 + 100,
+            "desfase {offset}, de verdad {truth}"
+        );
     }
 
     /// El pacing reparte cada fotograma al ritmo que se le da (el medido), sin pasar de la parte

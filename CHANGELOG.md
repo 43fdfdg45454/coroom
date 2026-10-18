@@ -205,6 +205,15 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **Calidad por el relay: el bitrate ya no se queda clavado abajo**, con anfitrión Linux o
+  Windows. El invitado pasaba sus marcas de llegada al reloj del anfitrión con la mediana de los
+  últimos ocho `Ping`; por el relay, el jitter del RTT la movía de 3 a 5 ms cada pocos segundos y
+  el anfitrión lo tomaba por cola: recortaba sin pérdida ni cola de verdad, olvidaba lo que había
+  medido la sonda y, sin techo de ráfaga, no volvía a sondear. Ahora el desfase sale de la muestra
+  de menor RTT y se mueve como mucho 100 µs por segundo, y tras una congestión el enlace se vuelve
+  a sondear al ritmo medido antes. Por el relay real con la fuente pesada: objetivo de 8 a
+  19 Mbit/s y de 51 a 3 informes de cola en AV1; en directo, igual que antes (72 Mbit/s, sin
+  recortes).
 - **El audio del juego suena igual con anfitrión Linux o Windows**: la mezcla ya no comprime todo
   lo que pasa de −3 dBFS (lo hacía hasta con una sola aplicación, en el anfitrión y otra vez en cada
   invitado): una sola fuente sale intacta y el limitador solo actúa si la suma pasa del fondo de
