@@ -218,10 +218,26 @@ impl Fallback {
         let gain = self.gate_gain * 10f32.powf(self.agc_gain_db / 20.0);
         if (gain - 1.0).abs() > 1e-4 {
             for sample in frame.iter_mut() {
-                *sample = crate::mix::soft_limit(*sample * gain);
+                *sample = soft_limit(*sample * gain);
             }
         }
     }
+}
+
+/// Codo del limitador suave de la ganancia del respaldo, en proporción del fondo de escala.
+const SOFT_KNEE: f32 = 0.7;
+
+/// Limitador suave de la voz cuando el respaldo le sube la ganancia: identidad hasta
+/// [`SOFT_KNEE`], después `tanh` hacia ±1 (nunca lo alcanza). Solo la voz del respaldo: la mezcla
+/// ([`crate::mix::Mixer`]) es transparente y limita solo lo que se pasa del fondo de escala.
+fn soft_limit(x: f32) -> f32 {
+    let magnitude = x.abs();
+    if magnitude <= SOFT_KNEE {
+        return x;
+    }
+    let headroom = 1.0 - SOFT_KNEE;
+    let limited = SOFT_KNEE + headroom * ((magnitude - SOFT_KNEE) / headroom).tanh();
+    limited.copysign(x)
 }
 
 #[cfg(all(target_os = "linux", feature = "webrtc-apm"))]
@@ -414,6 +430,21 @@ impl VoiceProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fallback_soft_limit_is_linear_below_the_knee_and_bounded_above() {
+        assert_eq!(soft_limit(0.5), 0.5);
+        assert_eq!(soft_limit(-SOFT_KNEE), -SOFT_KNEE);
+        assert!(soft_limit(5.0) <= 1.0 && soft_limit(5.0) > 0.99);
+        assert!(soft_limit(-1.2) > -1.0);
+        // Monótono.
+        let mut last = -2.0;
+        for i in -300..=300 {
+            let y = soft_limit(i as f32 / 100.0);
+            assert!(y >= last);
+            last = y;
+        }
+    }
 
     fn tone_frame(freq: f64, amplitude: f64, index: usize) -> Vec<i16> {
         (index * SAMPLES_PER_CHANNEL..(index + 1) * SAMPLES_PER_CHANNEL)

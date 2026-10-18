@@ -2645,11 +2645,10 @@ mod tests {
             (0.45..=0.55).contains(&ratio),
             "a la mitad: {normal} → {half}"
         );
-        // Una voz fuerte al doble pasaría del fondo de escala: el limitador la deja por encima
-        // del codo y por debajo del tope, sin recorte duro.
-        let knee = (coroom_audio::mix::KNEE * 32_767.0) as i16;
+        // Una voz fuerte al doble pasaría del fondo de escala: el limitador la baja justo hasta
+        // el tope (sin aplastarla por debajo), sin recorte duro.
         let loud = mixed_peak(2.0, 20_000.0);
-        assert!(loud > knee && loud < i16::MAX, "{loud}");
+        assert!(loud > 30_000, "{loud}");
         assert_eq!(mixed_peak(0.0, 20_000.0), 0, "a cero no suena");
     }
 

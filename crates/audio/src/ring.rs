@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::{AudioError, AudioFormat, Captured, DeviceCounters, Played, Render, SAMPLE_RATE_HZ};
@@ -45,6 +45,57 @@ pub(crate) struct Shared {
     pub(crate) cond: Condvar,
     /// Retardo del dispositivo hasta el altavoz, en µs (reproducción; 0 si no se conoce).
     pub(crate) delay_us: AtomicU64,
+    /// Captura: a quién más avisar de cada llegada (la mezcla por aplicación espera a la primera
+    /// de varias capturas).
+    arrivals: OnceLock<Arc<Arrivals>>,
+}
+
+/// Aviso de llegada compartido por varias capturas: quien espera a cualquiera de ellas (la mezcla
+/// por aplicación, [`crate::apps::AppMixSource`]) duerme en él en vez de en un reloj propio.
+#[derive(Debug, Default)]
+pub(crate) struct Arrivals {
+    generation: Mutex<u64>,
+    cond: Condvar,
+}
+
+impl Arrivals {
+    /// Llegadas hasta ahora: se lee antes de mirar los anillos y se pasa a [`Arrivals::wait`], así
+    /// no se pierde una que llegue entre medias.
+    pub(crate) fn generation(&self) -> u64 {
+        *self
+            .generation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn notify(&self) {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *generation = generation.wrapping_add(1);
+        drop(generation);
+        self.cond.notify_all();
+    }
+
+    /// Espera a que llegue algo después de `seen` o, como mucho, hasta `deadline`.
+    pub(crate) fn wait(&self, seen: u64, deadline: Instant) {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while *generation == seen {
+            let now = Instant::now();
+            if now >= deadline {
+                return;
+            }
+            generation = self
+                .cond
+                .wait_timeout(generation, deadline - now)
+                .map(|(guard, _)| guard)
+                .unwrap_or_else(|poisoned| poisoned.into_inner().0);
+        }
+    }
 }
 
 impl Shared {
@@ -62,7 +113,20 @@ impl Shared {
             }),
             cond: Condvar::new(),
             delay_us: AtomicU64::new(0),
+            arrivals: OnceLock::new(),
         })
+    }
+
+    /// Captura: avisa también a `arrivals` de cada llegada (una vez; las siguientes no cambian
+    /// nada).
+    pub(crate) fn notify_arrivals_to(&self, arrivals: Arc<Arrivals>) {
+        let _ = self.arrivals.set(arrivals);
+    }
+
+    /// Captura: si hay una trama entera de `format` esperando.
+    pub(crate) fn has_frame(&self, format: AudioFormat) -> bool {
+        let ring = self.lock();
+        ring.failure.is_none() && ring.samples.len() >= format.samples_per_frame()
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, Ring> {
@@ -125,6 +189,31 @@ impl Shared {
         ring.last_chunk = len;
         drop(ring);
         self.cond.notify_all();
+        if let Some(arrivals) = self.arrivals.get() {
+            arrivals.notify();
+        }
+    }
+
+    /// Captura: el dispositivo dice que se perdieron `frames` tramas (por canal) justo antes de lo
+    /// siguiente que llegue (WASAPI: `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`, con el hueco medido
+    /// por la posición del dispositivo de cada paquete). Se rellena con silencio, como mucho la
+    /// capacidad del anillo, para que lo que hay en cola siga siendo seguido: sin él, la hora de
+    /// captura de lo anterior al hueco ([`Shared::head_captured_at`]) saldría corrida lo que dura
+    /// el hueco. No cambia la hora de la última llegada: la pone el paquete que viene detrás.
+    #[cfg_attr(not(all(target_os = "windows", feature = "wasapi")), allow(dead_code))]
+    pub(crate) fn push_gap(&self, format: AudioFormat, frames: u64) {
+        let mut ring = self.lock();
+        let samples = usize::try_from(frames)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(usize::from(format.channels.max(1)))
+            .min(ring.capacity);
+        for _ in 0..samples {
+            if ring.samples.len() >= ring.capacity {
+                ring.samples.pop_front();
+                ring.overruns += 1;
+            }
+            ring.samples.push_back(0);
+        }
     }
 
     /// Cuándo se capturó la muestra más antigua de la cola: el final de lo último que llegó
@@ -341,6 +430,68 @@ impl Pull {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_device_gap_keeps_the_capture_times_in_line() {
+        let format = AudioFormat::VOICE;
+        let shared = Shared::new(format);
+        let t0 = Instant::now();
+        shared.push(format, std::iter::repeat_n(5, 480), Some(t0));
+        // Se perdieron 10 ms en el dispositivo: el siguiente paquete es de t0 + 20 ms.
+        shared.push_gap(format, 480);
+        shared.push(
+            format,
+            std::iter::repeat_n(9, 480),
+            Some(t0 + Duration::from_millis(20)),
+        );
+        let mut out = Vec::new();
+        let first = shared.read_frame(format, &mut out).expect("trama");
+        assert_eq!(
+            first.captured_at, t0,
+            "lo de antes del hueco conserva su hora"
+        );
+        assert!(out.iter().all(|s| *s == 5));
+        let gap = shared.read_frame(format, &mut out).expect("hueco");
+        assert_eq!(gap.captured_at, t0 + Duration::from_millis(10));
+        assert!(out.iter().all(|s| *s == 0), "el hueco es silencio");
+        let after = shared.read_frame(format, &mut out).expect("trama");
+        assert_eq!(after.captured_at, t0 + Duration::from_millis(20));
+        assert!(out.iter().all(|s| *s == 9));
+        // Un hueco enorme no pasa de la capacidad del anillo.
+        shared.push_gap(format, u64::MAX);
+        let ring = shared.lock();
+        assert_eq!(ring.samples.len(), ring.capacity);
+    }
+
+    #[test]
+    fn arrivals_wake_whoever_waits_for_any_capture() {
+        let format = AudioFormat::GAME;
+        let arrivals = Arc::new(Arrivals::default());
+        let shared = Shared::new(format);
+        shared.notify_arrivals_to(Arc::clone(&arrivals));
+        let seen = arrivals.generation();
+        assert!(!shared.has_frame(format));
+        let pusher = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                shared.push(
+                    format,
+                    std::iter::repeat_n(1, format.samples_per_frame()),
+                    None,
+                );
+            })
+        };
+        // Funcional: despierta por la llegada (el plazo es holgado), no por el plazo.
+        arrivals.wait(seen, Instant::now() + Duration::from_secs(10));
+        pusher.join().expect("hilo");
+        assert_ne!(arrivals.generation(), seen);
+        assert!(shared.has_frame(format));
+        // Sin llegadas, vuelve en el plazo.
+        let seen = arrivals.generation();
+        let deadline = Instant::now() + Duration::from_millis(5);
+        arrivals.wait(seen, deadline);
+        assert!(Instant::now() >= deadline);
+    }
 
     #[test]
     fn frames_flow_through_the_ring() {

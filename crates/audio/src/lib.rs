@@ -2,9 +2,10 @@
 //!
 //! Todo el pipeline trabaja a **48 kHz** con tramas de **10 ms** en PCM `i16` intercalado:
 //!
-//! - **Captura** ([`AudioSource`]): en Linux, **PipeWire** nativo ([`pipewire`]: monitor del *sink*
-//!   por defecto, el nodo de una aplicación o el micrófono); en Windows, **WASAPI** ([`wasapi`]:
-//!   *loopback* del dispositivo de salida, *loopback* por proceso y micrófono). Para los tests,
+//! - **Captura** ([`AudioSource`]): en Linux, **PipeWire** nativo ([`pipewire`]: el nodo de cada
+//!   aplicación o el micrófono); en Windows, **WASAPI** ([`wasapi`]: *loopback* de todo salvo
+//!   coroom, *loopback* por proceso y micrófono). «Todo lo que suena» es en los dos sistemas todo
+//!   salvo coroom (las voces de la sala no vuelven como audio del juego). Para los tests,
 //!   [`synthetic::ToneSource`], una senoidal con marcas de tiempo exactas.
 //! - **Reproducción** ([`AudioSink`]): PipeWire o WASAPI, y [`synthetic::CaptureSink`], que guarda
 //!   lo que se reproduce. Cada escritura devuelve cuándo se oirá ([`Played`]) para la sincronía.
@@ -328,7 +329,9 @@ pub type Render = Box<dyn FnMut(&mut [i16], Instant) + Send>;
 pub enum GameCapture {
     /// Sin audio del juego.
     None,
-    /// Lo que suena en la salida por defecto (monitor en PipeWire, loopback en WASAPI).
+    /// Todo lo que suena salvo coroom: en PipeWire, la mezcla de todas las aplicaciones
+    /// ([`apps::AppMixSource`]); en WASAPI, el loopback de todo menos el árbol de este proceso
+    /// (antes de Windows 10 20348, toda la salida por defecto).
     System,
     /// Solo una aplicación, por su nombre (PipeWire: `application.name` o `node.name`).
     App(String),
@@ -402,7 +405,15 @@ pub fn game_source(spec: &GameCapture) -> Result<Option<Box<dyn AudioSource>>, A
                  --audio app NOMBRE"
             ))),
             GameCapture::App(name) => Ok(Some(Box::new(pipewire::MonitorSource::app(name)))),
-            _ => Ok(Some(Box::new(pipewire::MonitorSource::system()))),
+            // Todo lo que suena salvo coroom, como el loopback de Windows (que excluye el árbol
+            // de este proceso): el monitor de la salida lleva también las voces de la sala que
+            // reproduce coroom, que volverían a los invitados como audio del juego (su propia voz
+            // con retardo y las demás dos veces). El monitor no deja quitar un flujo de la
+            // mezcla; la mezcla de cada aplicación sí.
+            _ => Ok(Some(Box::new(apps::AppMixSource::new(
+                app_backend()?,
+                apps::AppFilter::AllExcept(Vec::new()),
+            )))),
         }
     }
     #[cfg(all(target_os = "windows", feature = "wasapi"))]
@@ -536,9 +547,7 @@ pub fn status() -> Vec<String> {
     let mut lines = Vec::new();
     #[cfg(all(target_os = "linux", feature = "pipewire"))]
     lines.push(
-        "backend: PipeWire nativo (monitor de la salida o nodo de la aplicación, micrófono y \
-         reproducción)"
-            .to_owned(),
+        "backend: PipeWire nativo (nodo de cada aplicación, micrófono y reproducción)".to_owned(),
     );
     #[cfg(all(target_os = "windows", feature = "wasapi"))]
     {

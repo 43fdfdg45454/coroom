@@ -859,7 +859,8 @@ pub fn parse_game_capture(values: &[String]) -> Result<GameCapture, String> {
 /// hasta que se comparta algo, para que «Compartir pantalla o ventana» traiga el audio al momento
 /// (con el filtro de aplicaciones de lo elegido). Todas las aplicaciones menos `excluded` si este
 /// equipo separa el audio por aplicación (PipeWire, o WASAPI con loopback por proceso); si no, lo
-/// que suena en la salida del sistema (loopback de WASAPI o monitor de PipeWire).
+/// que suena en la salida del sistema (el loopback de WASAPI; en Linux, `System` es la misma mezcla
+/// por aplicación y falla en el mismo caso).
 pub fn idle_room_game_capture(excluded: Vec<String>) -> GameCapture {
     match coroom_session::audio::playing_apps() {
         Ok(_) => GameCapture::Apps(AppFilter::AllExcept(excluded)),

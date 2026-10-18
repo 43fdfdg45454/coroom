@@ -68,8 +68,11 @@ use crate::{
 /// Espera máxima a que el hilo abra el dispositivo.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Duración del búfer compartido que se pide para capturar (10 ms, en unidades de 100 ns).
-const BUFFER_HNS: i64 = 100_000;
+/// Duración del búfer compartido que se pide para capturar (50 ms, en unidades de 100 ns). No
+/// añade latencia: en cada evento se leen todos los paquetes que haya, así que solo es el margen
+/// para un despertar tardío del hilo. Con 10 ms (el periodo del motor), cualquier retraso del
+/// hilo perdía audio (`AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`).
+const CAPTURE_BUFFER_HNS: i64 = 500_000;
 
 /// Duración del búfer que se pide para reproducir (50 ms): tiene que caber el nivel objetivo con
 /// periodos de 20 ms. No añade latencia: se rellena solo hasta el objetivo.
@@ -148,6 +151,15 @@ fn qpc_to_instant(qpc: u64, reference: (u64, Instant)) -> Option<Instant> {
     }
 }
 
+/// Tramas que se perdieron antes de un paquete de captura: con
+/// `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY`, lo que salta su posición del dispositivo (`index`, en
+/// tramas desde que arrancó el flujo) respecto a donde acabó el anterior (`expected`). Sin la
+/// bandera, sin paquete anterior o sin salto hacia delante, ninguna.
+fn capture_gap(expected: Option<u64>, index: u64, discontinuity: bool) -> Option<u64> {
+    let expected = expected.filter(|_| discontinuity)?;
+    index.checked_sub(expected).filter(|gap| *gap > 0)
+}
+
 /// Tramas a 48 kHz que dura `duration`.
 fn duration_frames(duration: Duration) -> usize {
     (duration.as_micros() * u128::from(SAMPLE_RATE_HZ) / 1_000_000) as usize
@@ -212,7 +224,7 @@ fn open(endpoint: &Endpoint, format: AudioFormat) -> Result<Opened, AudioError> 
             autoconvert: true,
             buffer_duration_hns: match direction {
                 Direction::Render => RENDER_BUFFER_HNS,
-                Direction::Capture => BUFFER_HNS,
+                Direction::Capture => CAPTURE_BUFFER_HNS,
             },
         };
         client
@@ -536,6 +548,8 @@ fn run(
     let mut last_event = Instant::now();
     // El primer evento llega tras consumir el relleno inicial: vacío entonces no es una falta.
     let mut rendered = false;
+    // Captura: posición del dispositivo (en tramas) que sigue al último paquete leído.
+    let mut next_position: Option<u64> = None;
     while !stop.load(Ordering::Acquire) {
         let event = handle.wait_for_event(100);
         match &mut io {
@@ -562,6 +576,17 @@ fn run(
                         Ok((frames, info)) => {
                             let len = frames as usize * bytes_per_frame;
                             let silent = info.flags.silent;
+                            // Se perdió audio antes de este paquete (el hilo no leyó a tiempo):
+                            // el hueco, medido por la posición del dispositivo, va en silencio.
+                            if let Some(gap) = capture_gap(
+                                next_position,
+                                info.index,
+                                info.flags.data_discontinuity,
+                            ) {
+                                tracing::debug!(gap_frames = gap, "captura WASAPI con un hueco");
+                                shared.push_gap(format, gap);
+                            }
+                            next_position = Some(info.index.saturating_add(u64::from(frames)));
                             let captured_at = reference
                                 .filter(|_| !info.flags.timestamp_error && info.timestamp > 0)
                                 .and_then(|reference| qpc_to_instant(info.timestamp, reference));
@@ -1216,6 +1241,15 @@ fn has_ancestor_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_discontinuity_is_measured_by_the_device_position() {
+        assert_eq!(capture_gap(Some(960), 1_440, true), Some(480));
+        assert_eq!(capture_gap(Some(960), 1_440, false), None, "sin la bandera");
+        assert_eq!(capture_gap(None, 1_440, true), None, "primer paquete");
+        assert_eq!(capture_gap(Some(960), 960, true), None, "sin salto");
+        assert_eq!(capture_gap(Some(960), 0, true), None, "hacia atrás");
+    }
 
     #[test]
     fn keys_and_names_come_from_the_executable() {

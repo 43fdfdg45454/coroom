@@ -332,6 +332,13 @@ fn run_stream(
         if let Some(target) = &target {
             props.insert("target.object", valid_name(target)?);
         }
+        if let Kind::Capture { role: "Game", .. } = kind {
+            // Que el gestor de sesión (WirePlumber, `restore-stream`) no le ponga a la captura del
+            // juego un volumen guardado de otra vez (todas las capturas de coroom con el papel
+            // «Game» comparten la entrada): el audio del juego sale de aquí a la ganancia del
+            // propio flujo, 1, como en Windows; el volumen lo decide cada invitado.
+            props.insert("state.restore-props", "false");
+        }
         let stream = pw::stream::StreamBox::new(&core, name, props).map_err(backend)?;
         let data = StreamData {
             shared: Arc::clone(&shared),
