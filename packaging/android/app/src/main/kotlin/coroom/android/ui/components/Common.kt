@@ -102,7 +102,10 @@ fun RowDivider() {
     HorizontalDivider(thickness = 1.dp, color = MaterialTheme.colorScheme.surfaceContainerHigh)
 }
 
-/** Una fila de persona: avatar, nombre, segunda línea y la acción a la derecha. */
+/**
+ * Una fila de persona: avatar, nombre, segunda línea y la acción a la derecha. `user` y `avatar`
+ * (su versión) ponen la imagen del avatar en lugar de la inicial.
+ */
 @Composable
 fun PersonRow(
     name: String,
@@ -111,6 +114,8 @@ fun PersonRow(
     modifier: Modifier = Modifier,
     supportingColor: Color = MaterialTheme.colorScheme.onSurfaceVariant,
     offline: Boolean = false,
+    user: Long? = null,
+    avatar: Long? = null,
     trailing: @Composable RowScope.() -> Unit = {},
 ) {
     Row(
@@ -121,7 +126,7 @@ fun PersonRow(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Avatar(name = name, seed = seed, offline = offline)
+        Avatar(name = name, seed = seed, offline = offline, user = user, avatar = avatar)
         Column(modifier = Modifier.weight(1f)) {
             Text(text = name, style = CoroomText.itemTitle, color = MaterialTheme.colorScheme.onSurface, maxLines = 1)
             Text(text = supporting, style = CoroomText.supporting, color = supportingColor, maxLines = 2)

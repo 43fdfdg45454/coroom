@@ -11,12 +11,16 @@
 //! - [`events`]: los eventos que ve la interfaz.
 //! - [`app`]: el estado del proceso y las operaciones.
 //! - [`guest`]: la sesión dentro de una sala (vídeo, audio, tacto, teclado, mandos y cursor).
+//! - [`mouse`]: el ratón o el touchpad conectado al teléfono y el texto del teclado en pantalla.
+//! - [`avatars`]: la caché de disco de los avatares.
 
 pub mod app;
+pub mod avatars;
 pub mod events;
 pub mod guest;
 pub mod jni;
 mod log;
+pub mod mouse;
 pub mod store;
 mod surface;
 

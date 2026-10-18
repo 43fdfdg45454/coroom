@@ -5,7 +5,8 @@ import android.view.Surface
 /**
  * Puente JNI con `libcoroom_android.so` (crate `apps/android`). Toda la lógica, la red, el vídeo y
  * el audio están en Rust; Kotlin pone la interfaz y le pasa lo que solo Android sabe (la superficie
- * del vídeo, los toques, las teclas, los mandos, la red y las raíces de confianza).
+ * del vídeo, los toques, el ratón, las teclas y el texto, los mandos, la red y las raíces de
+ * confianza).
  *
  * Los nombres y las firmas son el contrato con `apps/android/src/jni.rs`: no se cambian sin cambiar
  * los dos lados (R8 tampoco los toca, ver `proguard-rules.pro`).
@@ -58,6 +59,24 @@ object Native {
         fromPad: Boolean,
         eventTimeMs: Long,
     ): Boolean
+
+    /**
+     * Texto del teclado en pantalla que no es ninguna tecla (ñ, á, emoji): un carácter cada vez
+     * hacia el anfitrión, sin los de control. `true` si se mandó algo.
+     */
+    @JvmStatic external fun text(text: String): Boolean
+
+    /** Movimiento relativo del ratón capturado (`SOURCE_MOUSE_RELATIVE`), en unidades del ratón. */
+    @JvmStatic external fun mouseMove(dx: Float, dy: Float)
+
+    /** Un botón del ratón capturado (`MotionEvent.BUTTON_*`). `true` si es un botón de ratón. */
+    @JvmStatic external fun mouseButton(button: Int, down: Boolean): Boolean
+
+    /** La rueda en muescas de Android: `AXIS_HSCROLL` (+ = derecha) y `AXIS_VSCROLL` (+ = arriba). */
+    @JvmStatic external fun mouseWheel(h: Float, v: Float)
+
+    /** Suelta los botones del ratón: se perdió la captura, se abrió un panel o se sale de la sala. */
+    @JvmStatic external fun mouseRelease()
 
     /** Ejes de un mando: `axes[i]` = `getAxisValue(i)` para los 48 `AXIS_*`. `true` si los usó. */
     @JvmStatic external fun padMotion(deviceId: Int, axes: FloatArray, eventTimeMs: Long): Boolean

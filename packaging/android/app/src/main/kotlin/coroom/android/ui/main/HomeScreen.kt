@@ -101,7 +101,7 @@ fun HomeScreen(
                     .semantics { contentDescription = accountLabel },
                 contentAlignment = Alignment.Center,
             ) {
-                Avatar(name = account.shownName, seed = account.userId)
+                Avatar(name = account.shownName, seed = account.userId, user = account.userId, avatar = account.avatar)
             }
         }
 
@@ -117,7 +117,7 @@ fun HomeScreen(
                 onCode = { code = RoomCode.clean(it) },
                 onJoin = { onJoin(code, null) },
             )
-            Invitations(state.invitations, state.nowMs, onJoin)
+            Invitations(state.invitations, state.friends.list?.friends.orEmpty(), state.nowMs, onJoin)
             OnlineFriends(state, onAskToJoin, onOpenFriends)
             state.pads.firstOrNull()?.let { PadHint(it) }
         }
@@ -200,6 +200,7 @@ private fun JoinCard(code: String, onCode: (String) -> Unit, onJoin: () -> Unit)
 @Composable
 private fun Invitations(
     invitations: List<Invitation>,
+    friends: List<Friend>,
     nowMs: Long,
     onJoin: (code: String, hostName: String?) -> Unit,
 ) {
@@ -224,7 +225,9 @@ private fun Invitations(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                Avatar(name = invitation.fromName, seed = invitation.fromUser)
+                // La invitación no lleva el avatar: el del amigo que invita, si está en la lista.
+                val avatar = friends.firstOrNull { it.id == invitation.fromUser }?.avatar
+                Avatar(name = invitation.fromName, seed = invitation.fromUser, user = invitation.fromUser, avatar = avatar)
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = stringResource(R.string.home_invitation_title, invitation.fromName),
@@ -314,6 +317,8 @@ fun FriendRow(
         supporting = friendStatus(friend),
         supportingColor = if (friend.online) CoroomTheme.colors.success else MaterialTheme.colorScheme.onSurfaceVariant,
         offline = !friend.online,
+        user = friend.id,
+        avatar = friend.avatar,
     ) {
         if (friend.activityKind == FriendActivity.Hosting) {
             PillOutlinedButton(

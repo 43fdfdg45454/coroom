@@ -11,6 +11,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.text.InputType
 import android.view.Choreographer
+import android.view.InputDevice
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -29,6 +30,12 @@ import coroom.android.Native
  * El vídeo de la sala: la [SurfaceView] en la que Rust decodifica con MediaCodec, el cursor del
  * anfitrión dibujado encima ([CursorView]) y una vista invisible que recibe el teclado en pantalla
  * ([KeyCaptureView]). Los toques sobre el vídeo van tal cual a `Native.touch`.
+ *
+ * Un ratón o un touchpad conectado al teléfono captura el puntero con un clic en el vídeo (como el
+ * modo inmersivo del escritorio; ese clic no llega al juego): desde entonces su movimiento
+ * relativo, sus botones y su rueda van a `Native.mouse*` y no pasan por el tacto. La captura se
+ * suelta al abrir un panel, al salir o al perder el foco la ventana, y los botones pulsados se
+ * sueltan con ella (`Native.mouseRelease`).
  */
 @SuppressLint("ViewConstructor")
 class VideoView(context: Context) : FrameLayout(context) {
@@ -38,6 +45,25 @@ class VideoView(context: Context) : FrameLayout(context) {
 
     /** Solo con la sala abierta (no durante «Entrando» ni con el error). */
     var inputEnabled = false
+
+    /**
+     * Si el ratón puede capturar el puntero ahora: dentro de la sala, sin panel ni diálogo abierto
+     * y con permiso de teclado y ratón. Al pasar a `false` se suelta la captura.
+     */
+    var mouseAllowed = false
+        set(value) {
+            val was = field
+            field = value
+            if (was && !value) releaseMouse()
+        }
+
+    /** Los botones del ratón (`MotionEvent.BUTTON_*`) tal como los vio la última vez la captura. */
+    private var mouseButtons = 0
+
+    /** El dedo que mueve el puntero en un touchpad capturado (`SOURCE_TOUCHPAD`, absoluto). */
+    private var padPointer = -1
+    private var padX = 0f
+    private var padY = 0f
 
     private val handler = Handler(Looper.getMainLooper())
     private val tickToken = Any()
@@ -61,10 +87,23 @@ class VideoView(context: Context) : FrameLayout(context) {
             }
         })
         setOnTouchListener { view, event -> onVideoTouch(view, event) }
+
+        // Los eventos capturados van a la vista con el foco: esta o, con el teclado en pantalla
+        // abierto, la que lo recibe.
+        isFocusable = true
+        isFocusableInTouchMode = true
+        setDefaultFocusHighlightEnabled(false)
+        setOnCapturedPointerListener { _, event -> onCapturedPointer(event) }
+        keyCapture.setOnCapturedPointerListener { _, event -> onCapturedPointer(event) }
     }
 
     private fun onVideoTouch(view: View, event: MotionEvent): Boolean {
-        if (!inputEnabled || !event.isFromSource(android.view.InputDevice.SOURCE_TOUCHSCREEN)) return false
+        if (inputEnabled && event.isFromSource(InputDevice.SOURCE_MOUSE)) {
+            // El ratón sin capturar no mueve nada: el primer clic captura el puntero.
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) requestMouseCapture(event)
+            return true
+        }
+        if (!inputEnabled || !event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN)) return false
         val count = event.pointerCount
         val ids = IntArray(count) { event.getPointerId(it) }
         val xs = FloatArray(count) { event.getX(it) }
@@ -89,6 +128,138 @@ class VideoView(context: Context) : FrameLayout(context) {
 
     override fun performClick(): Boolean = super.performClick()
 
+    // --- Ratón y touchpad capturados --------------------------------------------------------
+
+    private fun requestMouseCapture(event: MotionEvent) {
+        if (!mouseAllowed || hasPointerCapture()) return
+        // Sin el foco los eventos capturados no llegarían a nadie y el puntero se quedaría oculto.
+        if (!hasFocus() && !requestFocus()) return
+        // Los botones de este clic no son del juego: soltarlos luego no manda nada.
+        mouseButtons = event.buttonState and MOUSE_BUTTONS
+        padPointer = -1
+        requestPointerCapture()
+    }
+
+    private fun onCapturedPointer(event: MotionEvent): Boolean {
+        if (!mouseAllowed) {
+            releaseMouse()
+            return true
+        }
+        when {
+            event.isFromSource(InputDevice.SOURCE_MOUSE_RELATIVE) -> relativeMotion(event)
+            event.isFromSource(InputDevice.SOURCE_TOUCHPAD) -> touchpadMotion(event)
+        }
+        syncButtons(event)
+        if (event.actionMasked == MotionEvent.ACTION_SCROLL) {
+            val h = event.getAxisValue(MotionEvent.AXIS_HSCROLL)
+            val v = event.getAxisValue(MotionEvent.AXIS_VSCROLL)
+            if (h != 0f || v != 0f) runCatching { Native.mouseWheel(h, v) }
+        }
+        return true
+    }
+
+    /** Un ratón capturado da desplazamientos; los movimientos agrupados van en el historial. */
+    private fun relativeMotion(event: MotionEvent) {
+        val masked = event.actionMasked
+        if (masked != MotionEvent.ACTION_MOVE && masked != MotionEvent.ACTION_HOVER_MOVE) return
+        var dx = event.x
+        var dy = event.y
+        for (i in 0 until event.historySize) {
+            dx += event.getHistoricalX(i)
+            dy += event.getHistoricalY(i)
+        }
+        if (dx != 0f || dy != 0f) runCatching { Native.mouseMove(dx, dy) }
+    }
+
+    /**
+     * Un touchpad capturado da la posición absoluta de cada dedo en su superficie: el primero que
+     * se apoya mueve el puntero con su desplazamiento, pasado a milímetros con la resolución del
+     * touchpad y a unidades de ratón con [TOUCHPAD_COUNTS_PER_MM].
+     */
+    private fun touchpadMotion(event: MotionEvent) {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> trackPadPointer(event, 0)
+            MotionEvent.ACTION_POINTER_UP -> if (event.getPointerId(event.actionIndex) == padPointer) {
+                trackPadPointer(event, if (event.actionIndex == 0) 1 else 0)
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> padPointer = -1
+            MotionEvent.ACTION_MOVE -> {
+                val index = event.findPointerIndex(padPointer)
+                if (index < 0) {
+                    trackPadPointer(event, 0)
+                    return
+                }
+                var dx = 0f
+                var dy = 0f
+                var lastX = padX
+                var lastY = padY
+                for (i in 0 until event.historySize) {
+                    val x = event.getHistoricalX(index, i)
+                    val y = event.getHistoricalY(index, i)
+                    dx += x - lastX
+                    dy += y - lastY
+                    lastX = x
+                    lastY = y
+                }
+                padX = event.getX(index)
+                padY = event.getY(index)
+                dx += padX - lastX
+                dy += padY - lastY
+                val scaleX = touchpadScale(event, MotionEvent.AXIS_X)
+                val scaleY = touchpadScale(event, MotionEvent.AXIS_Y)
+                if (dx != 0f || dy != 0f) runCatching { Native.mouseMove(dx * scaleX, dy * scaleY) }
+            }
+        }
+    }
+
+    private fun trackPadPointer(event: MotionEvent, index: Int) {
+        if (index >= event.pointerCount) {
+            padPointer = -1
+            return
+        }
+        padPointer = event.getPointerId(index)
+        padX = event.getX(index)
+        padY = event.getY(index)
+    }
+
+    /** Unidades de ratón por unidad del touchpad (1 si el touchpad no dice su resolución). */
+    private fun touchpadScale(event: MotionEvent, axis: Int): Float {
+        val resolution = event.device?.getMotionRange(axis, InputDevice.SOURCE_TOUCHPAD)?.resolution ?: 0f
+        return if (resolution > 0f) TOUCHPAD_COUNTS_PER_MM / resolution else 1f
+    }
+
+    /** Los botones que cambiaron desde el último evento, uno a uno (Rust no repite los que ya están). */
+    private fun syncButtons(event: MotionEvent) {
+        val now = when (event.actionMasked) {
+            MotionEvent.ACTION_BUTTON_PRESS -> mouseButtons or event.actionButton
+            MotionEvent.ACTION_BUTTON_RELEASE -> mouseButtons and event.actionButton.inv()
+            else -> event.buttonState
+        } and MOUSE_BUTTONS
+        val changed = now xor mouseButtons
+        mouseButtons = now
+        if (changed == 0) return
+        for (button in MOUSE_BUTTON_LIST) {
+            if (changed and button != 0) runCatching { Native.mouseButton(button, now and button != 0) }
+        }
+    }
+
+    override fun onPointerCaptureChange(hasCapture: Boolean) {
+        super.onPointerCaptureChange(hasCapture)
+        if (!hasCapture) forgetMouse()
+    }
+
+    /** Suelta la captura del puntero y los botones del ratón (al abrir un panel, al salir…). */
+    fun releaseMouse() {
+        if (hasPointerCapture()) releasePointerCapture()
+        forgetMouse()
+    }
+
+    private fun forgetMouse() {
+        mouseButtons = 0
+        padPointer = -1
+        runCatching { Native.mouseRelease() }
+    }
+
     /** Empieza a seguir el cursor del anfitrión, un sondeo por fotograma. */
     fun startCursor() = cursor.start()
 
@@ -97,6 +268,7 @@ class VideoView(context: Context) : FrameLayout(context) {
     fun release() {
         handler.removeCallbacksAndMessages(tickToken)
         cursor.stop()
+        releaseMouse()
     }
 
     /** Enseña u oculta el teclado en pantalla. */
@@ -108,7 +280,24 @@ class VideoView(context: Context) : FrameLayout(context) {
         } else {
             imm.hideSoftInputFromWindow(keyCapture.windowToken, 0)
             keyCapture.clearFocus()
+            // Con el puntero capturado, sus eventos siguen necesitando una vista con el foco.
+            if (hasPointerCapture()) requestFocus()
         }
+    }
+
+    private companion object {
+        /** Los botones de ratón que entiende el anfitrión. */
+        val MOUSE_BUTTON_LIST = intArrayOf(
+            MotionEvent.BUTTON_PRIMARY,
+            MotionEvent.BUTTON_SECONDARY,
+            MotionEvent.BUTTON_TERTIARY,
+            MotionEvent.BUTTON_BACK,
+            MotionEvent.BUTTON_FORWARD,
+        )
+        val MOUSE_BUTTONS = MOUSE_BUTTON_LIST.fold(0) { all, button -> all or button }
+
+        /** Unidades de ratón por milímetro del touchpad (un ratón de unos 400 ppp). */
+        const val TOUCHPAD_COUNTS_PER_MM = 16f
     }
 }
 
@@ -199,8 +388,10 @@ class CursorView(context: Context) : View(context) {
 
 /**
  * Recibe el teclado en pantalla sin enseñar ningún campo: con `TYPE_NULL` el teclado manda teclas
- * (que la actividad pasa a Rust en `dispatchKeyEvent`); lo que llegue como texto se convierte en
- * teclas con el mapa del teclado virtual.
+ * (que la actividad pasa a Rust en `dispatchKeyEvent`). Lo que llegue como texto (`commitText`):
+ * las letras sin acento, las cifras, el espacio, Intro y el tabulador como sus teclas, con el mapa
+ * del teclado virtual (así los juegos que leen teclas las ven); el resto (ñ, á, signos que dependen
+ * de la distribución del anfitrión, emoji) como texto con `Native.text`, en el mismo orden.
  */
 class KeyCaptureView(context: Context) : View(context) {
     init {
@@ -219,9 +410,36 @@ class KeyCaptureView(context: Context) : View(context) {
             private val keyMap = KeyCharacterMap.load(KeyCharacterMap.VIRTUAL_KEYBOARD)
 
             override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
-                val events = text?.toString()?.toCharArray()?.let(keyMap::getEvents) ?: return true
-                events.forEach(::sendKey)
+                sendText(text?.toString().orEmpty())
                 return true
+            }
+
+            private fun sendText(text: String) {
+                val pending = StringBuilder()
+                var i = 0
+                while (i < text.length) {
+                    val codePoint = text.codePointAt(i)
+                    val events = if (codePoint.asKey()) keyMap.getEvents(charArrayOf(text[i])) else null
+                    if (events != null) {
+                        flushText(pending)
+                        events.forEach(::sendKey)
+                    } else {
+                        pending.appendCodePoint(codePoint)
+                    }
+                    i += Character.charCount(codePoint)
+                }
+                flushText(pending)
+            }
+
+            private fun Int.asKey(): Boolean =
+                this in 'a'.code..'z'.code || this in 'A'.code..'Z'.code || this in '0'.code..'9'.code ||
+                    this == ' '.code || this == '\n'.code || this == '\t'.code
+
+            private fun flushText(pending: StringBuilder) {
+                if (pending.isEmpty()) return
+                val text = pending.toString()
+                pending.setLength(0)
+                runCatching { Native.text(text) }
             }
 
             override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {

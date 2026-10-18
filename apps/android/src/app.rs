@@ -22,6 +22,7 @@ use coroom_session::codec::mediacodec::AndroidDecoderInfo;
 use coroom_session::input::gamepad::PadKey;
 use coroom_session::input::touch::{TouchConfig, TouchMode};
 
+use crate::avatars::AvatarCache;
 use crate::events::{self, UiEvent};
 use crate::guest::{self, Devices, Guest, JoinRequest};
 use crate::store::SealedStore;
@@ -117,6 +118,14 @@ struct Id {
 #[derive(Debug, Deserialize)]
 struct User {
     user: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct Avatar {
+    user: u64,
+    version: u64,
+    #[serde(default)]
+    server: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -314,6 +323,13 @@ impl App {
                 let id: Id = args(text)?;
                 account::remove_friend(&self.session("")?, id.id).map(Value::from)
             }
+            "avatar" => {
+                let request: Avatar = args(text)?;
+                let path = self.avatar(&request)?;
+                Ok(path.map_or(Value::Null, |path| {
+                    Value::from(path.to_string_lossy().into_owned())
+                }))
+            }
             "lobby_start" => {
                 let server: Server = args(text)?;
                 self.start_lobby(server.options());
@@ -486,6 +502,24 @@ impl App {
         }
     }
 
+    /// La ruta del PNG del avatar de la petición, de la caché o descargado; `None` si no tiene.
+    fn avatar(&self, request: &Avatar) -> Result<Option<std::path::PathBuf>, String> {
+        let cache = AvatarCache::in_data_dir(self.store.dir());
+        cache.get_or_fetch(request.user, request.version, || {
+            let options = ServerOptions {
+                server: request.server.clone(),
+                trust_fingerprint: None,
+                tcp_port: None,
+            };
+            let session = account::session(&self.store, &options)?;
+            let mut downloaded = Err("el servidor no contestó por el avatar".to_owned());
+            account::download_avatars(&session, &[request.user], |_, result| {
+                downloaded = result;
+            })?;
+            downloaded
+        })
+    }
+
     fn session(&self, text: &str) -> Result<account::Session, String> {
         let server: Server = args(text)?;
         account::session(&self.store, &server.options())
@@ -592,6 +626,37 @@ mod tests {
             call(&app, "ask_to_join", "{\"user\": 4}")["error"]
                 .as_str()
                 .is_some_and(|e| e.contains("sala de espera"))
+        );
+    }
+
+    #[test]
+    fn avatars_come_from_the_cache_and_need_an_account_otherwise() {
+        let (dir, app) = app();
+        assert!(
+            call(&app, "avatar", r#"{"user": 7}"#)["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("argumentos"))
+        );
+        // Sin cuenta no hay de dónde descargarlo.
+        assert!(
+            call(&app, "avatar", r#"{"user": 7, "version": 1}"#)
+                .get("error")
+                .is_some()
+        );
+        // Con el fichero ya en la caché se contesta sin ir a la red.
+        let png = b"\x89PNG de ejemplo".to_vec();
+        let version =
+            coroom_transport::proto::api::avatar_version(&coroom_transport::crypto::sha256(&png));
+        let path = AvatarCache::in_data_dir(dir.path()).path(7, version);
+        std::fs::create_dir_all(path.parent().expect("padre")).expect("directorio");
+        std::fs::write(&path, &png).expect("escribir");
+        assert_eq!(
+            call(
+                &app,
+                "avatar",
+                &format!(r#"{{"user": 7, "version": {version}}}"#)
+            ),
+            json!({ "ok": path.to_string_lossy() })
         );
     }
 

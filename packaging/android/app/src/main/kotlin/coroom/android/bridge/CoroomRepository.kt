@@ -108,6 +108,10 @@ class CoroomRepository(
     private fun remember(event: CoroomEvent) {
         when (event) {
             is CoroomEvent.ServerStatus -> _serverStatus.value = event
+            // El avatar propio cambiado desde otro dispositivo.
+            is CoroomEvent.AvatarChanged -> _account.update { account ->
+                if (account != null && account.userId == event.user) account.copy(avatar = event.avatar) else account
+            }
             is CoroomEvent.Invited -> _invitations.update { list ->
                 val now = System.currentTimeMillis()
                 val fresh = list.filter { it.code != event.code && now - it.receivedAtMs < INVITATION_TTL_MS }
@@ -184,6 +188,19 @@ class CoroomRepository(
     suspend fun declineRequest(id: Long): String = callText("decline_request") { put("id", id) }
 
     suspend fun removeFriend(id: Long): String = callText("remove_friend") { put("id", id) }
+
+    /**
+     * La ruta del PNG de la versión `version` del avatar de `user` (de la caché de disco de Rust o
+     * descargado del servidor), o `null` si no tiene avatar.
+     */
+    suspend fun avatarPath(user: Long, version: Long): String? {
+        val ok = call("avatar") {
+            put("user", user)
+            put("version", version)
+            put("server", _account.value?.server)
+        }
+        return (ok as? JsonPrimitive)?.contentOrNull
+    }
 
     // --- Sala de espera (señalización) ----------------------------------------------------
 

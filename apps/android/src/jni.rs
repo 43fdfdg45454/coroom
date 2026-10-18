@@ -13,7 +13,7 @@ use std::time::Duration;
 use jni::EnvUnowned;
 use jni::errors::ThrowRuntimeExAndDefault;
 use jni::objects::{JByteArray, JClass, JFloatArray, JIntArray, JObject, JString};
-use jni::sys::{jboolean, jint, jlong};
+use jni::sys::{jboolean, jfloat, jint, jlong};
 
 use coroom_session::input::gamepad::PadKey;
 use coroom_session::input::touch::TouchPointer;
@@ -221,6 +221,97 @@ pub extern "system" fn Java_coroom_android_Native_key<'caller>(
             return Ok(true);
         }
         Ok(guest.key(key_code, scan_code, down))
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `Native.text(text): Boolean`: texto del teclado en pantalla que no es ninguna tecla (ñ, á,
+/// emoji); `true` si se mandó algo a la sala.
+// SAFETY: como en `init`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_coroom_android_Native_text<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    text: JString<'caller>,
+) -> jboolean {
+    env.with_env(|env| -> Result<jboolean, BridgeError> {
+        let Some(guest) = crate::app()?.guest() else {
+            return Ok(false);
+        };
+        Ok(guest.text(&text.try_to_string(env)?))
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `Native.mouseMove(dx, dy)`: movimiento relativo del ratón capturado (`SOURCE_MOUSE_RELATIVE`),
+/// con los restos de menos de una unidad guardados para el siguiente.
+// SAFETY: como en `init`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_coroom_android_Native_mouseMove<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    dx: jfloat,
+    dy: jfloat,
+) {
+    env.with_env(|_env| -> Result<(), BridgeError> {
+        if let Some(guest) = crate::app()?.guest() {
+            guest.mouse_move(dx, dy);
+        }
+        Ok(())
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `Native.mouseButton(button, down): Boolean`: un botón del ratón capturado
+/// (`MotionEvent.BUTTON_*`); `false` si no es de ratón o no se está en una sala.
+// SAFETY: como en `init`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_coroom_android_Native_mouseButton<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    button: jint,
+    down: jboolean,
+) -> jboolean {
+    env.with_env(|_env| -> Result<jboolean, BridgeError> {
+        let Some(guest) = crate::app()?.guest() else {
+            return Ok(false);
+        };
+        Ok(guest.mouse_button(button, down))
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `Native.mouseWheel(h, v)`: la rueda en muescas de Android (`AXIS_HSCROLL`, `AXIS_VSCROLL`).
+// SAFETY: como en `init`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_coroom_android_Native_mouseWheel<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    horizontal: jfloat,
+    vertical: jfloat,
+) {
+    env.with_env(|_env| -> Result<(), BridgeError> {
+        if let Some(guest) = crate::app()?.guest() {
+            guest.mouse_wheel(horizontal, vertical);
+        }
+        Ok(())
+    })
+    .resolve::<ThrowRuntimeExAndDefault>()
+}
+
+/// `Native.mouseRelease()`: suelta los botones del ratón (se perdió la captura del puntero, la
+/// sala dejó de tener el foco, se abrió un panel o se sale).
+// SAFETY: como en `init`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_coroom_android_Native_mouseRelease<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+) {
+    env.with_env(|_env| -> Result<(), BridgeError> {
+        if let Some(guest) = crate::app()?.guest() {
+            guest.mouse_release();
+        }
+        Ok(())
     })
     .resolve::<ThrowRuntimeExAndDefault>()
 }

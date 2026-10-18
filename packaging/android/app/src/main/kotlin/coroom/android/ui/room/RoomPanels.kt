@@ -42,6 +42,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.clickable
 import coroom.android.R
 import coroom.android.bridge.ChatMessage
+import coroom.android.bridge.Member
 import coroom.android.platform.NetworkKind
 import coroom.android.ui.components.Avatar
 import coroom.android.ui.components.CoroomIcon
@@ -226,7 +227,9 @@ fun ChatPanel(state: RoomUiState, onClose: () -> Unit, onSend: (String) -> Unit)
                         reverseLayout = true,
                         verticalArrangement = Arrangement.spacedBy(10.dp, Alignment.Bottom),
                     ) {
-                        items(state.chat.asReversed()) { message -> ChatBubble(message) }
+                        items(state.chat.asReversed()) { message ->
+                            ChatBubble(message, state.members.firstOrNull { it.guest == message.guest })
+                        }
                     }
                 }
                 state.chatError?.let {
@@ -260,7 +263,7 @@ fun ChatPanel(state: RoomUiState, onClose: () -> Unit, onSend: (String) -> Unit)
 }
 
 @Composable
-private fun ChatBubble(message: ChatMessage) {
+private fun ChatBubble(message: ChatMessage, author: Member?) {
     val colors = MaterialTheme.colorScheme
     if (message.own) {
         Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
@@ -277,7 +280,14 @@ private fun ChatBubble(message: ChatMessage) {
         }
     } else {
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.Top) {
-            Avatar(name = message.name, seed = message.name.hashCode().toLong(), size = 28.dp)
+            // El mensaje dice quién lo escribió por su id en la sala; la cuenta y el avatar, los miembros.
+            Avatar(
+                name = message.name,
+                seed = author?.user ?: message.name.hashCode().toLong(),
+                size = 28.dp,
+                user = author?.user,
+                avatar = author?.avatar,
+            )
             Column {
                 Text(
                     text = if (message.guest == 0) stringResource(R.string.chat_host_name, message.name) else message.name,

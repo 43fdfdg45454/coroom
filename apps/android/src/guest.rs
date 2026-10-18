@@ -1,5 +1,6 @@
 //! Dentro de una sala: la sesión del invitado con MediaCodec en la `Surface` de la vista, AAudio,
-//! y la entrada del teléfono (tacto como ratón, teclado y mandos) hacia el anfitrión.
+//! y la entrada del teléfono (tacto como ratón, ratón o touchpad conectado, teclado, texto del
+//! teclado en pantalla y mandos) hacia el anfitrión.
 //!
 //! Hilos: el de los eventos de la sesión (hasta que termina) y el de los mandos, que cada
 //! [`IDLE_POLL`] sigue la ranura que da el anfitrión, le pasa su vibración a la aplicación y
@@ -34,6 +35,7 @@ use coroom_session::remote::{
 use coroom_transport::quic::Path;
 
 use crate::events::{self, UiEvent};
+use crate::mouse::{self, Mouse};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -186,6 +188,7 @@ pub struct Guest {
     input: GuestInput,
     audio: AudioControl,
     touch: Mutex<TouchMapper>,
+    mouse: Mutex<Mouse>,
     pads: Arc<Mutex<AndroidPads>>,
     cursor: Arc<CursorSlot>,
     relayed: AtomicBool,
@@ -309,6 +312,7 @@ impl Guest {
             input,
             audio,
             touch: Mutex::new(touch),
+            mouse: Mutex::new(Mouse::default()),
             pads: Arc::new(Mutex::new(pads)),
             cursor,
             relayed: AtomicBool::new(false),
@@ -388,6 +392,7 @@ impl Guest {
                             for event in lock(&guest.touch).reset() {
                                 guest.input.send(event);
                             }
+                            guest.mouse_release();
                         }
                         emit(UiEvent::Permissions {
                             keyboard_mouse: now.keyboard_mouse,
@@ -415,6 +420,7 @@ impl Guest {
         for event in lock(&self.touch).reset() {
             self.input.send(event);
         }
+        self.mouse_release();
         if let Some(mut session) = lock(&self.session).take() {
             session.close();
         }
@@ -473,6 +479,48 @@ impl Guest {
         };
         self.input.send(InputEvent::Key { code, pressed });
         true
+    }
+
+    /// Texto del teclado en pantalla que no es ninguna tecla (ñ, á, emoji): un evento por
+    /// carácter, sin los de control. `false` si no había nada que mandar.
+    pub fn text(&self, text: &str) -> bool {
+        let mut sent = false;
+        for event in mouse::text_events(text) {
+            self.input.send(event);
+            sent = true;
+        }
+        sent
+    }
+
+    /// Movimiento relativo del ratón capturado.
+    pub fn mouse_move(&self, dx: f32, dy: f32) {
+        if let Some(event) = lock(&self.mouse).motion(dx, dy) {
+            self.input.send(event);
+        }
+    }
+
+    /// Un botón del ratón capturado (`MotionEvent.getActionButton()`). `false` si no es de ratón.
+    pub fn mouse_button(&self, button: i32, pressed: bool) -> bool {
+        let (known, event) = lock(&self.mouse).button(button, pressed);
+        if let Some(event) = event {
+            self.input.send(event);
+        }
+        known
+    }
+
+    /// La rueda del ratón capturado, en muescas de Android.
+    pub fn mouse_wheel(&self, horizontal: f32, vertical: f32) {
+        if let Some(event) = lock(&self.mouse).wheel(horizontal, vertical) {
+            self.input.send(event);
+        }
+    }
+
+    /// Suelta los botones del ratón (se perdió la captura, se abrió un panel, se sale).
+    pub fn mouse_release(&self) {
+        let released = lock(&self.mouse).release();
+        for event in released {
+            self.input.send(event);
+        }
     }
 
     /// Un botón de un mando.

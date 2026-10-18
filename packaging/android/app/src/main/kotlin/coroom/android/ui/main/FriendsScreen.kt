@@ -276,7 +276,12 @@ private fun Requests(
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Avatar(name = request.shownName, seed = request.user?.id ?: request.id)
+                    Avatar(
+                        name = request.shownName,
+                        seed = request.user?.id ?: request.id,
+                        user = request.user?.id,
+                        avatar = request.user?.avatar,
+                    )
                     Column(modifier = Modifier.weight(1f)) {
                         Text(request.shownName, style = CoroomText.itemTitle, color = colors.onSurface)
                         Text(
@@ -304,6 +309,8 @@ private fun Outgoing(requests: List<FriendRequest>, busy: Boolean, onCancel: (Lo
                 name = request.shownName,
                 seed = request.user?.id ?: request.id,
                 supporting = stringResource(R.string.friends_request_outgoing, request.username),
+                user = request.user?.id,
+                avatar = request.user?.avatar,
             ) {
                 PillOutlinedButton(stringResource(R.string.action_cancel), { onCancel(request.id) }, enabled = !busy)
             }

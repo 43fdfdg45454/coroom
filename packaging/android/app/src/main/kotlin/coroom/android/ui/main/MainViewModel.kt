@@ -10,6 +10,7 @@ import coroom.android.bridge.BridgeException
 import coroom.android.bridge.BridgePad
 import coroom.android.bridge.CoroomEvent
 import coroom.android.bridge.Friend
+import coroom.android.bridge.FriendRequest
 import coroom.android.bridge.FriendsList
 import coroom.android.bridge.Invitation
 import coroom.android.bridge.RoomCode
@@ -183,7 +184,7 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
                 it.copy(online = event.online, activity = if (event.online) it.activity else null)
             }
             is CoroomEvent.ActivityChanged -> updateFriend(event.user) { it.copy(activity = event.activity) }
-            is CoroomEvent.AvatarChanged -> updateFriend(event.user) { it.copy(avatar = event.avatar) }
+            is CoroomEvent.AvatarChanged -> updateFriend(event.user, inRequests = true) { it.copy(avatar = event.avatar) }
             is CoroomEvent.FriendRequested -> {
                 refreshFriends()
                 _messages.send(UiText.res(R.string.message_friend_requested, event.fromName))
@@ -206,12 +207,25 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
         }
     }
 
-    private fun updateFriend(id: Long, change: (Friend) -> Friend) {
+    /** Cambia al amigo `id` en la lista y, con `inRequests`, también en las solicitudes. */
+    private fun updateFriend(id: Long, inRequests: Boolean = false, change: (Friend) -> Friend) {
         _state.update { state ->
             val list = state.friends.list ?: return@update state
+            fun requests(requests: List<FriendRequest>) = if (inRequests) {
+                requests.map { request ->
+                    val user = request.user
+                    if (user != null && user.id == id) request.copy(user = change(user)) else request
+                }
+            } else {
+                requests
+            }
             state.copy(
                 friends = state.friends.copy(
-                    list = list.copy(friends = list.friends.map { if (it.id == id) change(it) else it }),
+                    list = list.copy(
+                        friends = list.friends.map { if (it.id == id) change(it) else it },
+                        incoming = requests(list.incoming),
+                        outgoing = requests(list.outgoing),
+                    ),
                 ),
             )
         }

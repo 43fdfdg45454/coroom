@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.view.InputDevice
+import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.WindowManager
@@ -36,7 +37,8 @@ import kotlinx.coroutines.launch
 
 /**
  * La sala: en horizontal, a pantalla completa y con la pantalla encendida. Pasa a Rust los
- * toques del vídeo, las teclas y los mandos mientras se está dentro.
+ * toques del vídeo, el ratón, las teclas, el texto del teclado en pantalla y los mandos mientras
+ * se está dentro.
  */
 class RoomActivity : ComponentActivity() {
     private val room: RoomViewModel by viewModels {
@@ -81,7 +83,12 @@ class RoomActivity : ComponentActivity() {
         setContent {
             CoroomTheme(darkTheme = true) {
                 val state by room.state.collectAsStateWithLifecycle()
-                SideEffect { video.inputEnabled = state.phase == RoomPhase.InRoom }
+                SideEffect {
+                    video.inputEnabled = state.phase == RoomPhase.InRoom
+                    // Un panel, el diálogo de salir o perder el permiso sueltan el ratón capturado.
+                    video.mouseAllowed = state.phase == RoomPhase.InRoom && state.panel == Panel.None &&
+                        !state.confirmLeave && state.permissions?.keyboardMouse != false
+                }
                 RoomScreen(
                     state = state,
                     video = video,
@@ -151,7 +158,7 @@ class RoomActivity : ComponentActivity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) hideSystemBars()
+        if (hasFocus) hideSystemBars() else video.releaseMouse()
     }
 
     override fun onResume() {
@@ -161,6 +168,7 @@ class RoomActivity : ComponentActivity() {
 
     override fun onPause() {
         video.stopCursor()
+        video.releaseMouse()
         super.onPause()
     }
 
@@ -181,6 +189,10 @@ class RoomActivity : ComponentActivity() {
     @SuppressLint("RestrictedApi")
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         if (inRoom && event.keyCode !in SYSTEM_KEYS) {
+            // Los botones laterales de un ratón también llegan como Atrás y Adelante: no abren
+            // «¿Salir de la sala?» ni van como teclas (con el puntero capturado ya van al juego
+            // como botones). Con un panel abierto, Atrás lo cierra como siempre.
+            if (fromMouse(event) && mouseKeyIsButton(event.keyCode)) return true
             val fromPad = event.isFromSource(InputDevice.SOURCE_GAMEPAD) || event.isFromSource(InputDevice.SOURCE_JOYSTICK)
             // Atrás del sistema (gesto o tecla del teléfono) abre «¿Salir de la sala?»; el de un mando va al juego.
             val systemBack = event.keyCode == KeyEvent.KEYCODE_BACK && !fromPad
@@ -193,11 +205,35 @@ class RoomActivity : ComponentActivity() {
                         Native.key(event.deviceId, event.keyCode, event.scanCode, down, fromPad, event.eventTime)
                     }.getOrDefault(false)
                     if (used) return true
+                    // Una tecla sin equivalente que escribe un carácter (ñ, ç…): va como texto.
+                    if (down && !fromPad && sendChar(event.unicodeChar)) return true
+                } else if (event.action == KeyEvent.ACTION_MULTIPLE && event.keyCode == KeyEvent.KEYCODE_UNKNOWN) {
+                    // El texto que el teclado en pantalla confirma de una vez (vista con TYPE_NULL).
+                    val text = multipleCharacters(event)
+                    if (!text.isNullOrEmpty() && runCatching { Native.text(text) }.getOrDefault(false)) return true
                 }
             }
         }
         return super.dispatchKeyEvent(event)
     }
+
+    private fun mouseKeyIsButton(keyCode: Int): Boolean =
+        keyCode == KeyEvent.KEYCODE_FORWARD || keyCode == KeyEvent.KEYCODE_BACK && room.state.value.panel == Panel.None
+
+    private fun fromMouse(event: KeyEvent): Boolean =
+        event.isFromSource(InputDevice.SOURCE_MOUSE) || event.isFromSource(InputDevice.SOURCE_MOUSE_RELATIVE)
+
+    /** Un carácter de `KeyEvent.getUnicodeChar()` como texto; no los de control ni los acentos muertos. */
+    private fun sendChar(unicodeChar: Int): Boolean {
+        if (unicodeChar == 0 || unicodeChar and KeyCharacterMap.COMBINING_ACCENT != 0) return false
+        if (!Character.isValidCodePoint(unicodeChar) || Character.isISOControl(unicodeChar)) return false
+        return runCatching { Native.text(String(Character.toChars(unicodeChar))) }.getOrDefault(false)
+    }
+
+    // `getCharacters()` está en desuso desde la API 29 porque el sistema ya no lo usa, pero es lo que
+    // manda BaseInputConnection cuando la vista de TYPE_NULL recibe texto que no son teclas.
+    @Suppress("DEPRECATION")
+    private fun multipleCharacters(event: KeyEvent): String? = event.characters
 
     override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
         if (inRoom && event.isFromSource(InputDevice.SOURCE_JOYSTICK) && event.actionMasked == MotionEvent.ACTION_MOVE) {

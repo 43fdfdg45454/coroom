@@ -21,6 +21,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.filterIsInstance
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
@@ -132,6 +133,16 @@ class RoomViewModel(
         repository.setInRoom(true)
         viewModelScope.launch {
             repository.events.filter { it.isRoomEvent }.collect(::onEvent)
+        }
+        // Alguien de la sala cambió su avatar: el chat enseña el nuevo.
+        viewModelScope.launch {
+            repository.events.filterIsInstance<CoroomEvent.AvatarChanged>().collect { event ->
+                _state.update { state ->
+                    state.copy(
+                        members = state.members.map { if (it.user == event.user) it.copy(avatar = event.avatar) else it },
+                    )
+                }
+            }
         }
         viewModelScope.launch {
             container.settings.settings.collect { settings ->

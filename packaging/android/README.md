@@ -56,7 +56,7 @@ packaging/android/
 Primero la biblioteca de Rust, desde la raíz del repositorio:
 
 ```bash
-cargo ndk -t arm64-v8a -t x86_64 -P 28 --link-cxx-shared \
+cargo ndk -t arm64-v8a -t x86_64 -P 28 --link-libcxx-shared \
   -o packaging/android/app/src/main/jniLibs build --release -p coroom-android
 ```
 
@@ -128,8 +128,12 @@ reverse` solo reenvía TCP y la sala va por QUIC (UDP).
   pasa las CA del sistema y del usuario (`set_roots`). No hay servicios de notificaciones push:
   los avisos de invitación llegan mientras la aplicación sigue abierta en segundo plano.
 - **Sala**: en horizontal, a pantalla completa y con la pantalla encendida. Pasa los toques del
-  vídeo, el teclado (físico o en pantalla) y los mandos; dibuja el cursor del anfitrión y hace
-  vibrar el mando cuando lo pide el juego.
+  vídeo, el teclado (físico o en pantalla, con el texto que no es ninguna tecla, como ñ, á o
+  emoji, como texto) y los mandos; un ratón o un touchpad conectado captura el puntero con un clic
+  en el vídeo y manda movimiento relativo, botones y rueda (lo suelta al abrir un panel o salir).
+  Dibuja el cursor del anfitrión y hace vibrar el mando cuando lo pide el juego.
+- **Avatares**: los de la cuenta, los amigos y la gente de la sala, de la caché de disco que
+  mantiene Rust (`avatar`); mientras llegan, la inicial.
 - **Decodificadores**: manda a Rust la lista de MediaCodec (H.264, HEVC, AV1) antes de entrar.
 
 ## Licencias

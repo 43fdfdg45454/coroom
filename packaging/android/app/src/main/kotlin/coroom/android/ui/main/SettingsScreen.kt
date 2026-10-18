@@ -164,7 +164,7 @@ fun SettingsScreen(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
-                        Avatar(name = account.shownName, seed = account.userId)
+                        Avatar(name = account.shownName, seed = account.userId, user = account.userId, avatar = account.avatar)
                         Column(modifier = Modifier.weight(1f)) {
                             Text(account.shownName, style = CoroomText.itemBody, color = colors.onSurface)
                             Text(

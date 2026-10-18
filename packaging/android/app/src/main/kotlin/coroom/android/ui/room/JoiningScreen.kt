@@ -69,7 +69,15 @@ fun JoiningScreen(state: RoomUiState, onCancel: () -> Unit) {
         ) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 val host = state.hostName
-                Avatar(name = host ?: state.code, seed = (host ?: state.code).hashCode().toLong(), size = 44.dp)
+                // El anfitrión es el miembro 0, si ya llegó la lista (al cambiar de sala, por ejemplo).
+                val hostMember = state.members.firstOrNull { it.guest == 0 }
+                Avatar(
+                    name = host ?: state.code,
+                    seed = hostMember?.user ?: (host ?: state.code).hashCode().toLong(),
+                    size = 44.dp,
+                    user = hostMember?.user,
+                    avatar = hostMember?.avatar,
+                )
                 Column {
                     Text(
                         text = if (host != null) stringResource(R.string.joining_title_host, host) else stringResource(R.string.joining_title),
