@@ -37,6 +37,31 @@ pub use inject::{InputSink, NullSink, Recorded, RecordingSink};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GuestId(pub u32);
 
+/// Estado de los dos motores de vibración de un mando (el de `FF_RUMBLE` de Linux y el de
+/// `XINPUT_VIBRATION`): vale hasta el siguiente, y [`Rumble::OFF`] los para.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Rumble {
+    /// Motor grande (baja frecuencia), de 0 a 65 535.
+    pub strong: u16,
+    /// Motor pequeño (alta frecuencia), de 0 a 65 535.
+    pub weak: u16,
+}
+
+impl Rumble {
+    /// Los dos motores parados.
+    pub const OFF: Rumble = Rumble { strong: 0, weak: 0 };
+
+    /// Con esas intensidades.
+    pub const fn new(strong: u16, weak: u16) -> Self {
+        Self { strong, weak }
+    }
+
+    /// Si algún motor gira.
+    pub const fn is_on(self) -> bool {
+        self.strong != 0 || self.weak != 0
+    }
+}
+
 /// Error de la entrada.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputError {

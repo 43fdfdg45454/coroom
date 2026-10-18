@@ -111,7 +111,8 @@ El anfitrión da y quita, a cada invitado y en cualquier momento:
   dos cosas toca (a pantalla completa, solo con la barra). Los mandos no dependen de esto.
 - **Mando**: una **ranura** (1 a 8) para un mando; cada ranura es de un solo invitado. Tu mando
   llega **tal cual** (el juego y Steam lo ven como ese mando, con sus botones) o **convertido a
-  Xbox 360**, como decida el anfitrión. Si tienes varios mandos, eliges cuál envías en el panel de
+  Xbox 360**, como decida el anfitrión. La vibración del juego llega a tu mando de las dos formas
+  (convertido, si tu mando vibra). Si tienes varios mandos, eliges cuál envías en el panel de
   mandos de la barra (`Ctrl+Alt+J`).
 - **Voz**: el invitado habla a la sala. Lo trae al entrar, salvo que la sala se abriera con **Los
   invitados entran callados**; entonces se lo da el anfitrión. Oír al anfitrión y a los demás no

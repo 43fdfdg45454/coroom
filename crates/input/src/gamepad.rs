@@ -29,6 +29,16 @@
 //! datagrama que soltaba un botón) y deja de salir lo convertido; los informes de salida del
 //! anfitrión (vibración, luces) se escriben en el mando ([`PadOutputs`]) con el tamaño que declara
 //! su descriptor, y si el mando no los acepta se avisa una vez. Sin ranura no se envía nada.
+//!
+//! **Vibración** de los que no van tal cual por HID (convertidos y Xbox por cable): el anfitrión
+//! manda el estado de los dos motores (`GamepadRumble`, [`PadLink::rumble`]) y [`PadRumble`] lo
+//! aplica al mando de la ranura: en Linux, con un efecto `FF_RUMBLE` en el propio nodo `evdev`
+//! del mando ([`EvdevMotors`], al momento), y `gilrs` sin *force feedback* (el suyo manda cada
+//! 50 ms el estado, ceros incluidos, a todos los mandos que vibran, y pisaría la vibración de los
+//! que van tal cual); en Windows, con el de `gilrs` ([`GilrsMotors`], Windows.Gaming.Input), que
+//! lo refresca cada 50 ms. A un mando tal cual no se le escribe nada: su vibración llega en sus
+//! informes de salida. Un mando sin vibración se avisa una vez. Al cambiar de mando o de ranura,
+//! al pasar a tal cual o al terminar, los motores se paran.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -38,11 +48,12 @@ use std::time::{Duration, Instant, SystemTime};
 
 use coroom_proto::hid::HidSummary;
 use coroom_proto::input::{GamepadDevice, GamepadTransport, PadData};
+use gilrs::ff::{BaseEffect, BaseEffectType, Effect, EffectBuilder};
 use gilrs::{Axis, Button, EventType, GamepadId, Gilrs, GilrsBuilder};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::{GamepadAxis, GamepadButton, GamepadKind, InputError, InputEvent};
+use crate::{GamepadAxis, GamepadButton, GamepadKind, InputError, InputEvent, Rumble};
 
 /// Correspondencias de SDL que la base de `gilrs` no trae para Linux.
 ///
@@ -72,6 +83,9 @@ pub trait PadLink: Send + Sync {
     fn raw(&self, slot: u8) -> bool;
     /// Informes de salida del anfitrión desde la última llamada: ranura y bytes.
     fn outputs(&self) -> Vec<(u8, Vec<u8>)>;
+    /// Lo que el anfitrión pide ahora a los motores del mando de `slot` (el último
+    /// `GamepadRumble`; sin ninguno, o con otra conexión, [`Rumble::OFF`]).
+    fn rumble(&self, slot: u8) -> Rumble;
 }
 
 /// Un mando físico por lo que se le reconoce: VID, PID y nombre.
@@ -418,6 +432,10 @@ mod platform {
     pub const WRITE_HELP: &str = "si Steam está abierto en este equipo, ciérralo (puede tener el \
          mando en uso o mandarle los suyos) y vuelve a conectarlo";
 
+    /// Qué mirar si el mando no vibra.
+    pub const RUMBLE_HELP: &str = "en Windows solo vibran así los mandos de Xbox y los \
+         compatibles; con otro, prueba «Tal cual» si se puede";
+
     impl super::OutputWriter for Device {
         fn write_output(&mut self, data: &[u8]) -> Result<(), InputError> {
             Device::write_output(self, data)
@@ -526,6 +544,371 @@ impl PadOutputs {
     /// Si ya se avisó de que el mando no los acepta.
     pub fn warned(&self) -> bool {
         self.warned
+    }
+}
+
+/// Los motores de vibración de un mando del invitado: su nodo `evdev` en Linux
+/// ([`EvdevMotors`]), el de `gilrs` en el resto ([`GilrsMotors`]) y, en los tests, uno de mentira.
+pub trait Motors {
+    /// Pone los motores en `rumble` (vale hasta la siguiente; [`Rumble::OFF`] los para).
+    fn set(&mut self, rumble: Rumble) -> Result<(), String>;
+}
+
+/// La vibración que el anfitrión pide al mando de una ranura (`GamepadRumble`), hasta el mando
+/// físico: el estado se aplica solo si cambia (si en medio hubo varios, vale el último), y si el
+/// mando no vibra se avisa una vez.
+#[derive(Debug)]
+pub struct PadRumble {
+    /// Nombre del mando, para el aviso.
+    name: String,
+    /// Qué mirar si no vibra.
+    help: &'static str,
+    /// Lo que tiene puesto el mando.
+    current: Rumble,
+    /// Aplicados bien y fallidos.
+    applied: u64,
+    failed: u64,
+    /// Si ya se avisó de que no vibra (una vez por mando).
+    warned: bool,
+}
+
+impl PadRumble {
+    /// Para el mando `name`: `help` dice qué mirar si no vibra.
+    pub fn new(name: &str, help: &'static str) -> Self {
+        Self {
+            name: name.to_owned(),
+            help,
+            current: Rumble::OFF,
+            applied: 0,
+            failed: 0,
+            warned: false,
+        }
+    }
+
+    /// Pone en `motors` lo que pide el anfitrión, si cambió desde la última vez.
+    pub fn deliver(&mut self, motors: &mut dyn Motors, rumble: Rumble) {
+        if rumble == self.current {
+            return;
+        }
+        match motors.set(rumble) {
+            Ok(()) => {
+                if self.applied == 0 {
+                    debug!(name = %self.name, ?rumble, "primera vibración del anfitrión en el mando");
+                }
+                self.applied += 1;
+                self.current = rumble;
+            }
+            Err(err) => {
+                self.failed += 1;
+                // No vibra: no tiene nada puesto (y el siguiente cambio se vuelve a intentar).
+                self.current = Rumble::OFF;
+                if !std::mem::replace(&mut self.warned, true) {
+                    warn!(
+                        "el mando «{}» no vibra con lo que pide el anfitrión ({err}); {}",
+                        self.name, self.help
+                    );
+                } else {
+                    debug!(error = %err, "vibración del mando");
+                }
+            }
+        }
+    }
+
+    /// Para los motores si giraban (el mando deja la ranura o se acaba la sesión).
+    pub fn stop(&mut self, motors: &mut dyn Motors) {
+        self.deliver(motors, Rumble::OFF);
+    }
+
+    /// Olvida lo puesto, sin tocar los motores (el mando volvió con otros: no tiene nada).
+    pub fn forget(&mut self) {
+        self.current = Rumble::OFF;
+    }
+
+    /// Lo que tiene puesto el mando.
+    pub fn current(&self) -> Rumble {
+        self.current
+    }
+
+    /// Aplicados bien y fallidos.
+    pub fn counts(&self) -> (u64, u64) {
+        (self.applied, self.failed)
+    }
+
+    /// Si ya se avisó de que el mando no vibra.
+    pub fn warned(&self) -> bool {
+        self.warned
+    }
+}
+
+/// Los motores de un mando de `gilrs`: un efecto con los dos motores que se sustituye en cada
+/// cambio (`gilrs` lo mezcla y lo manda al mando cada 50 ms; el nuevo empieza a sonar en la misma
+/// vuelta en que se suelta el viejo). Sin efecto, los motores se paran.
+pub struct GilrsMotors<'a> {
+    /// Los mandos.
+    pub gilrs: &'a mut Gilrs,
+    /// El mando.
+    pub id: GamepadId,
+    /// El efecto que suena (lo guarda quien llama entre una vez y otra).
+    pub effect: &'a mut Option<Effect>,
+}
+
+impl Motors for GilrsMotors<'_> {
+    fn set(&mut self, rumble: Rumble) -> Result<(), String> {
+        if !rumble.is_on() {
+            // Al soltarlo, `gilrs` deja de mezclarlo y los motores se paran.
+            *self.effect = None;
+            return Ok(());
+        }
+        let motor = |kind| BaseEffect {
+            kind,
+            ..BaseEffect::default()
+        };
+        let effect = EffectBuilder::new()
+            .add_effect(motor(BaseEffectType::Strong {
+                magnitude: rumble.strong,
+            }))
+            .add_effect(motor(BaseEffectType::Weak {
+                magnitude: rumble.weak,
+            }))
+            .gamepads(&[self.id])
+            .finish(self.gilrs)
+            .map_err(|err| match err {
+                gilrs::ff::Error::FfNotSupported(_) => {
+                    "no tiene vibración (force feedback) o no se puede escribir en él".to_owned()
+                }
+                gilrs::ff::Error::Disconnected(_) => "se desconectó".to_owned(),
+                other => other.to_string(),
+            })?;
+        effect.play().map_err(|err| err.to_string())?;
+        *self.effect = Some(effect);
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use evdev_motors::EvdevMotors;
+
+/// Los motores de un mando de Linux, por su propio nodo `evdev`.
+#[cfg(target_os = "linux")]
+mod evdev_motors {
+    use std::fs::OpenOptions;
+    use std::path::{Path, PathBuf};
+
+    use evdev::{Device, FFEffect, FFEffectCode, FFEffectData, FFEffectKind, FFReplay, FFTrigger};
+
+    use super::Motors;
+    use crate::Rumble;
+
+    /// Qué mirar si el mando no vibra.
+    pub const RUMBLE_HELP: &str = "si vibra en otros programas, comprueba que tu usuario puede \
+         escribir en su /dev/input/event* (reglas udev)";
+
+    /// Los motores de un mando por su nodo `/dev/input/event*` (el que da `gilrs` del mando, sin
+    /// buscarlo): un efecto `FF_RUMBLE` sin fin (`length` 0, como el infinito de SDL) que se
+    /// actualiza en cada cambio y se para con [`Rumble::OFF`]. El nodo se abre, para escribir, con
+    /// la primera vibración (a un mando que nunca vibra no se le abre); al soltarlo se borra el
+    /// efecto, y si el programa termina de golpe, el núcleo borra los del nodo al cerrarlo.
+    #[derive(Debug)]
+    pub struct EvdevMotors {
+        /// El nodo del mando.
+        node: PathBuf,
+        /// El efecto subido (con su propio descriptor del nodo).
+        effect: Option<FFEffect>,
+        /// Si el efecto suena.
+        playing: bool,
+    }
+
+    impl EvdevMotors {
+        /// Para el mando del nodo `node` (no lo abre todavía).
+        pub fn new(node: &Path) -> Self {
+            Self {
+                node: node.to_owned(),
+                effect: None,
+                playing: false,
+            }
+        }
+
+        /// El nodo del mando.
+        pub fn node(&self) -> &Path {
+            &self.node
+        }
+
+        /// Si el mando de la ranura cambió de nodo (se desconectó y volvió), suelta el efecto
+        /// del viejo: el siguiente cambio abre el nuevo.
+        pub fn follow(&mut self, node: &Path) {
+            if node != self.node {
+                *self = Self::new(node);
+            }
+        }
+
+        /// Sube el efecto: abre el nodo para escribir y comprueba que el mando vibra.
+        fn upload(&self, data: FFEffectData) -> Result<FFEffect, String> {
+            let node = self.node.display();
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.node)
+                .map_err(|err| format!("no se puede abrir {node} para escribir: {err}"))?;
+            let mut device =
+                Device::from_fd(file.into()).map_err(|err| format!("{node}: {err}"))?;
+            if !device
+                .supported_ff()
+                .is_some_and(|ff| ff.contains(FFEffectCode::FF_RUMBLE))
+            {
+                return Err("no tiene vibración (force feedback)".to_owned());
+            }
+            // El efecto se queda con su copia del descriptor; el del dispositivo se cierra aquí.
+            device
+                .upload_ff_effect(data)
+                .map_err(|err| format!("no acepta el efecto de vibración: {err}"))
+        }
+
+        fn apply(&mut self, rumble: Rumble) -> Result<(), String> {
+            if !rumble.is_on() {
+                if self.playing
+                    && let Some(effect) = self.effect.as_mut()
+                {
+                    effect.stop().map_err(|err| format!("no se paró: {err}"))?;
+                }
+                self.playing = false;
+                return Ok(());
+            }
+            let data = effect_data(rumble);
+            let effect = match self.effect.take() {
+                // Cambiar un efecto que suena lo aplica al momento (`ff-memless` lo vuelve a
+                // empezar con lo nuevo).
+                Some(mut effect) => {
+                    effect
+                        .update(data)
+                        .map_err(|err| format!("no acepta el efecto de vibración: {err}"))?;
+                    effect
+                }
+                None => self.upload(data)?,
+            };
+            let effect = self.effect.insert(effect);
+            if !self.playing {
+                effect.play(1).map_err(|err| format!("no vibra: {err}"))?;
+                self.playing = true;
+            }
+            Ok(())
+        }
+    }
+
+    impl Motors for EvdevMotors {
+        fn set(&mut self, rumble: Rumble) -> Result<(), String> {
+            let applied = self.apply(rumble);
+            if applied.is_err() {
+                // Con el nodo en mal estado (desconectado, sin permiso), el siguiente cambio
+                // vuelve a empezar.
+                self.effect = None;
+                self.playing = false;
+            }
+            applied
+        }
+    }
+
+    /// El efecto de los dos motores en `rumble`, sin fin.
+    fn effect_data(rumble: Rumble) -> FFEffectData {
+        FFEffectData {
+            direction: 0,
+            trigger: FFTrigger::default(),
+            replay: FFReplay {
+                length: 0,
+                delay: 0,
+            },
+            kind: FFEffectKind::Rumble {
+                strong_magnitude: rumble.strong,
+                weak_magnitude: rumble.weak,
+            },
+        }
+    }
+}
+
+/// Si `gilrs` mueve los motores con su *force feedback*. En Linux no: su servidor manda cada
+/// 50 ms el estado, ceros incluidos, a todos los mandos que vibran, y pisaría la vibración que
+/// llega por los informes de salida a un mando tal cual; ahí los mueve [`EvdevMotors`].
+pub const GILRS_FORCE_FEEDBACK: bool = !cfg!(target_os = "linux");
+
+/// Cómo se abren los mandos del invitado.
+fn gilrs_builder() -> GilrsBuilder {
+    GilrsBuilder::new()
+        .add_mappings(MAPPINGS)
+        .with_force_feedback(GILRS_FORCE_FEEDBACK)
+}
+
+/// Los motores del mando de la ranura, con lo que los mueve en cada sistema.
+struct SlotMotors {
+    #[cfg(target_os = "linux")]
+    evdev: Option<EvdevMotors>,
+    #[cfg(not(target_os = "linux"))]
+    effect: Option<Effect>,
+}
+
+impl SlotMotors {
+    fn new() -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            evdev: None,
+            #[cfg(not(target_os = "linux"))]
+            effect: None,
+        }
+    }
+
+    /// Pone en el mando `id` lo que pide el anfitrión (si cambió).
+    fn deliver(&mut self, state: &mut PadRumble, gilrs: &mut Gilrs, id: GamepadId, rumble: Rumble) {
+        #[cfg(target_os = "linux")]
+        {
+            use gilrs::LinuxGamepadExt;
+            let Some(node) = gilrs
+                .connected_gamepad(id)
+                .map(|pad| pad.devpath().to_owned())
+            else {
+                // Desconectado: no hay motores que mover (el núcleo ya soltó los efectos).
+                return;
+            };
+            let motors = self.evdev.get_or_insert_with(|| EvdevMotors::new(&node));
+            if motors.node() != node {
+                // Volvió en otro nodo: el viejo no tiene nada puesto.
+                motors.follow(&node);
+                state.forget();
+            }
+            state.deliver(motors, rumble);
+        }
+        #[cfg(not(target_os = "linux"))]
+        state.deliver(
+            &mut GilrsMotors {
+                gilrs,
+                id,
+                effect: &mut self.effect,
+            },
+            rumble,
+        );
+    }
+}
+
+/// Qué mirar si el mando no vibra.
+fn rumble_help() -> &'static str {
+    #[cfg(target_os = "linux")]
+    {
+        evdev_motors::RUMBLE_HELP
+    }
+    #[cfg(target_os = "windows")]
+    {
+        platform::RUMBLE_HELP
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        "este sistema no hace vibrar ese mando"
+    }
+}
+
+/// Lo que deben tener los motores del mando de la ranura `slot`: lo que pide el anfitrión, salvo
+/// si va tal cual por HID (su vibración llega en sus informes de salida y no se le escribe nada).
+fn slot_rumble(link: &dyn PadLink, slot: u8, raw: Option<&RawPad>) -> Rumble {
+    if raw.is_some_and(|raw| raw.hid && link.raw(slot)) {
+        Rumble::OFF
+    } else {
+        link.rumble(slot)
     }
 }
 
@@ -721,7 +1104,7 @@ fn kind_of(key: &PadKey) -> PadKind {
 
 fn run(shared: &Shared) {
     let link = &shared.link;
-    let mut gilrs = match GilrsBuilder::new().add_mappings(MAPPINGS).build() {
+    let mut gilrs = match gilrs_builder().build() {
         Ok(gilrs) => gilrs,
         Err(gilrs::Error::NotImplemented(dummy)) => {
             warn!("los mandos no están disponibles en esta plataforma");
@@ -749,6 +1132,10 @@ fn run(shared: &Shared) {
     let mut seen_generation = shared.generation.load(Ordering::Acquire);
     let mut last_axes: Option<Instant> = None;
     let mut last_outputs = Instant::now();
+    // La vibración del mando de la ranura: su estado y lo que mueve sus motores.
+    let mut rumble: Option<PadRumble> = None;
+    let mut motors = SlotMotors::new();
+    let mut last_rumble = Instant::now();
     while !shared.stop.load(Ordering::Acquire) {
         // Espera en los mandos: un botón despierta al momento; con ejes pendientes, hasta que
         // toque enviarlos; si no, hasta la siguiente mirada a la ranura y las salidas.
@@ -836,8 +1223,13 @@ fn run(shared: &Shared) {
         let slot = shared.slot.load(Ordering::Acquire);
         let wanted = active.filter(|_| slot != 0).map(|id| (slot, id));
         if wanted != announced {
-            if let Some((old, _)) = announced {
+            if let Some((old, old_id)) = announced {
                 link.event(InputEvent::GamepadDisconnected { slot: old });
+                // El mando deja la ranura: sin motores en marcha.
+                if let Some(mut state) = rumble.take() {
+                    motors.deliver(&mut state, &mut gilrs, old_id, Rumble::OFF);
+                }
+                motors = SlotMotors::new();
             }
             raw = None;
             axes.reset();
@@ -848,6 +1240,7 @@ fn run(shared: &Shared) {
                 });
                 let key = key_of(&gilrs, id);
                 raw = Some(declare(link, slot, &key));
+                rumble = Some(PadRumble::new(&key.name, rumble_help()));
             }
             announced = wanted;
             publish = true;
@@ -879,6 +1272,17 @@ fn run(shared: &Shared) {
             last_outputs = now;
             outputs.deliver(slot, link.outputs());
         }
+        // Y la de los que no van tal cual por HID, al mismo ritmo: llega como estado, así que un
+        // mando que entra en la ranura con el juego vibrando también vibra. A uno tal cual no se
+        // le escribe nada (su vibración va en sus informes de salida): si pasa a tal cual
+        // vibrando, se para y ya.
+        if let (Some((slot, id)), Some(state)) = (announced, rumble.as_mut())
+            && now.saturating_duration_since(last_rumble) >= IDLE_POLL
+        {
+            last_rumble = now;
+            let wanted = slot_rumble(link.as_ref(), slot, raw.as_ref());
+            motors.deliver(state, &mut gilrs, id, wanted);
+        }
 
         // Los ejes, como mucho a 1000 Hz, con la hora en que llegó cada uno.
         if axes.has_pending() && now >= axes_due {
@@ -891,6 +1295,8 @@ fn run(shared: &Shared) {
             }
         }
     }
+    // Al terminar, los motores parados: el efecto se suelta (y se borra) antes que `gilrs`.
+    drop(motors);
 }
 
 #[cfg(test)]
@@ -1088,6 +1494,156 @@ mod tests {
         assert!(written.lock().unwrap().is_empty());
         assert_eq!(outputs.counts(), (0, 3));
         assert!(outputs.warned(), "se avisa (una vez) de que no llegan");
+    }
+
+    /// Motores de mentira: anotan lo que se les pone, o fallan como un mando sin vibración.
+    #[derive(Default)]
+    struct FakeMotors {
+        set: Vec<Rumble>,
+        unsupported: bool,
+    }
+
+    impl Motors for FakeMotors {
+        fn set(&mut self, rumble: Rumble) -> Result<(), String> {
+            if self.unsupported {
+                return Err("no tiene vibración".to_owned());
+            }
+            self.set.push(rumble);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn host_rumble_reaches_the_motors_once_per_change_and_stops() {
+        let mut motors = FakeMotors::default();
+        let mut rumble = PadRumble::new("Mando de prueba", "nada que mirar");
+        // Sin nada que pedir, no se toca el mando.
+        rumble.deliver(&mut motors, Rumble::OFF);
+        assert!(motors.set.is_empty());
+        // Cada estado nuevo, una vez (el hilo lo mira cada 5 ms aunque no cambie).
+        let strong = Rumble::new(0xFFFF, 0);
+        rumble.deliver(&mut motors, strong);
+        rumble.deliver(&mut motors, strong);
+        rumble.deliver(&mut motors, Rumble::new(0x8000, 0x4000));
+        assert_eq!(rumble.current(), Rumble::new(0x8000, 0x4000));
+        // Parar al dejar la ranura, y parar otra vez no hace nada.
+        rumble.stop(&mut motors);
+        rumble.stop(&mut motors);
+        assert_eq!(
+            motors.set,
+            vec![strong, Rumble::new(0x8000, 0x4000), Rumble::OFF]
+        );
+        assert_eq!(rumble.counts(), (3, 0));
+        assert!(!rumble.warned());
+    }
+
+    /// Un `PadLink` que solo responde a si el mando va tal cual y qué vibración pide el anfitrión.
+    struct FakeLink {
+        raw: AtomicBool,
+        rumble: Rumble,
+    }
+
+    impl PadLink for FakeLink {
+        fn event(&self, _: InputEvent) {}
+        fn pad(&self, _: PadData) {}
+        fn raw(&self, _: u8) -> bool {
+            self.raw.load(Ordering::Acquire)
+        }
+        fn outputs(&self) -> Vec<(u8, Vec<u8>)> {
+            Vec::new()
+        }
+        fn rumble(&self, _: u8) -> Rumble {
+            self.rumble
+        }
+    }
+
+    fn raw_pad(hid: bool) -> RawPad {
+        RawPad {
+            stop: Arc::new(AtomicBool::new(false)),
+            thread: None,
+            outputs: None,
+            hid,
+        }
+    }
+
+    #[test]
+    fn a_tal_cual_pad_never_gets_the_converted_rumble() {
+        let link = FakeLink {
+            raw: AtomicBool::new(false),
+            rumble: Rumble::new(0xFFFF, 0x8000),
+        };
+        // Convertido (sin interfaz HID en crudo) o Xbox por cable: lo del anfitrión.
+        assert_eq!(slot_rumble(&link, 1, None), link.rumble);
+        assert_eq!(slot_rumble(&link, 1, Some(&raw_pad(false))), link.rumble);
+        // HID que el anfitrión no aceptó tal cual: va convertido.
+        let hid = raw_pad(true);
+        assert_eq!(slot_rumble(&link, 1, Some(&hid)), link.rumble);
+
+        let mut motors = FakeMotors::default();
+        let mut rumble = PadRumble::new("Mando de prueba", "nada que mirar");
+        rumble.deliver(&mut motors, slot_rumble(&link, 1, Some(&hid)));
+        // Pasa a tal cual vibrando: se para una vez y no se le vuelve a escribir.
+        link.raw.store(true, Ordering::Release);
+        for _ in 0..3 {
+            rumble.deliver(&mut motors, slot_rumble(&link, 1, Some(&hid)));
+        }
+        assert_eq!(motors.set, vec![link.rumble, Rumble::OFF]);
+        // Un mando que entra ya tal cual no recibe nada.
+        let mut fresh = FakeMotors::default();
+        let mut other = PadRumble::new("Otro mando", "nada que mirar");
+        for _ in 0..3 {
+            other.deliver(&mut fresh, slot_rumble(&link, 2, Some(&hid)));
+        }
+        assert!(fresh.set.is_empty(), "{:?}", fresh.set);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gilrs_never_drives_the_motors_on_linux() {
+        // Su servidor de *force feedback* mandaría ceros cada 50 ms a todos los mandos que
+        // vibran, también a los tal cual.
+        const { assert!(!GILRS_FORCE_FEEDBACK) };
+        let _builder = gilrs_builder();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_evdev_node_opens_only_with_the_first_rumble() {
+        let missing = std::env::temp_dir()
+            .join("coroom-no-existe")
+            .join("event99");
+        let mut motors = EvdevMotors::new(&missing);
+        // Parar sin haber vibrado no abre el nodo.
+        assert_eq!(motors.set(Rumble::OFF), Ok(()));
+        let err = motors.set(Rumble::new(1, 1)).expect_err("sin nodo");
+        assert!(err.contains("no se puede abrir"), "{err}");
+        // Y un fichero que no es un mando tampoco vale (ni se le escribe nada).
+        let dir = std::env::temp_dir().join(format!("coroom-motors-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("directorio");
+        let file = dir.join("event0");
+        std::fs::write(&file, b"").expect("fichero");
+        motors.follow(&file);
+        assert_eq!(motors.node(), file);
+        assert!(motors.set(Rumble::new(1, 1)).is_err());
+        assert_eq!(std::fs::read(&file).expect("leer"), b"");
+        std::fs::remove_dir_all(&dir).expect("limpiar");
+    }
+
+    #[test]
+    fn a_pad_without_rumble_is_warned_about_once() {
+        let mut motors = FakeMotors {
+            unsupported: true,
+            ..FakeMotors::default()
+        };
+        let mut rumble = PadRumble::new("Mando sin motores", "nada que mirar");
+        rumble.deliver(&mut motors, Rumble::new(0xFFFF, 0xFFFF));
+        rumble.deliver(&mut motors, Rumble::new(0x1000, 0));
+        assert!(rumble.warned(), "se avisa (una vez) de que no vibra");
+        assert_eq!(rumble.counts(), (0, 2));
+        // No tiene nada puesto: parar no intenta nada.
+        assert_eq!(rumble.current(), Rumble::OFF);
+        rumble.stop(&mut motors);
+        assert_eq!(rumble.counts(), (0, 2));
     }
 
     #[test]

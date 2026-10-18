@@ -1,5 +1,5 @@
 ;
-; coroomvhid.inf - coroom virtual gamepad driver (UMDF2, protocol 3).
+; coroomvhid.inf - coroom virtual gamepad driver (UMDF2, protocol 4).
 ;
 ; Installs coroomvhid.dll on the root devices that install.ps1 creates:
 ;   - Root\coroomvhid (one): the control device, a HID source driver of the Virtual HID Framework.

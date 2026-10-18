@@ -913,6 +913,7 @@ async fn run_guest(
                         | Command::DeclineJoin(_)
                         | Command::GamepadMode { .. }
                         | Command::GamepadOutput { .. }
+                        | Command::GamepadRumble { .. }
                         | Command::Video(_)
                         | Command::Chat(_)
                         | Command::ChatClear
@@ -1379,6 +1380,10 @@ async fn control_loop(
             }
             Some(ControlMessage::GamepadOutput { slot, data }) => {
                 core.guest_input.push_pad_output(slot, data);
+            }
+            Some(ControlMessage::GamepadRumble { slot, strong, weak }) => {
+                core.guest_input
+                    .set_pad_rumble(slot, coroom_input::Rumble::new(strong, weak));
             }
             Some(
                 message @ (ControlMessage::Chat(_)

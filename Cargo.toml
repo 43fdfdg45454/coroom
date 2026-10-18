@@ -144,8 +144,8 @@ windows = { version = "=0.62.2", default-features = false }
 hidapi = { version = "=2.6.7", default-features = false, features = ["windows-native"] }
 
 # Entrada. `reis` (libei en Rust, de ids1024) habla el protocolo EI con el socket que da
-# el portal `RemoteDesktop` (`connect_to_eis`); `evdev` crea los mandos virtuales por uinput;
-# `gilrs` lee los mandos del invitado.
+# el portal `RemoteDesktop` (`connect_to_eis`); `evdev` crea los mandos virtuales por uinput y
+# mueve los motores de los mandos del invitado en Linux; `gilrs` lee los mandos del invitado.
 reis = { version = "=0.7.1", default-features = false }
 evdev = { version = "=0.13.2", default-features = false }
 gilrs = { version = "=0.11.2", default-features = false, features = ["wgi"] }

@@ -1,5 +1,5 @@
 /*
- * driver.h - internal declarations of coroomvhid.dll (UMDF2, protocol 3).
+ * driver.h - internal declarations of coroomvhid.dll (UMDF2, protocol 4).
  *
  * Device stacks (see coroomvhid.inf):
  *
@@ -115,6 +115,8 @@ typedef struct _COROOM_XUSB_CONTEXT {
     ULONG PacketNumber;
     ULONGLONG LastStateTick;
     BOOLEAN Resting;
+    /* Vibration games asked for (IOCTL_XUSB_SET_STATE), for COROOM_VHID_IOCTL_XUSB_RUMBLE. */
+    COROOM_VHID_XUSB_RUMBLE Rumble;
 } COROOM_XUSB_CONTEXT, *PCOROOM_XUSB_CONTEXT;
 
 /* Both kinds share the device context type; Kind tells which half is in use. */

@@ -637,6 +637,14 @@ impl InputSink for SendInputSink {
             .map(VhidGamepads::take_outputs)
             .unwrap_or_default()
     }
+
+    #[cfg(feature = "windows-vhid")]
+    fn take_rumble(&mut self) -> Vec<(u8, crate::Rumble)> {
+        self.pads
+            .as_mut()
+            .map(VhidGamepads::take_rumble)
+            .unwrap_or_default()
+    }
 }
 
 impl SendInputSink {

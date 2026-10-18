@@ -9,19 +9,22 @@
 //! Comprueba lo que la CI no ve al compilar: que el dispositivo de control crea mandos HID con el
 //! VID/PID y el descriptor pedidos (VHF desde UMDF2), que llegan sus informes de entrada, que las
 //! salidas y las lecturas de características van y vuelven, que los Xbox 360 aparecen en XInput
-//! solo mientras se usan y con el estado que se manda, y que todo desaparece al cerrar.
+//! solo mientras se usan y con el estado que se manda, que la vibración que les pide un juego
+//! (`XInputSetState`) vuelve al cliente, y que todo desaparece al cerrar.
 
 #![cfg(all(target_os = "windows", feature = "windows-vhid"))]
-#![allow(unsafe_code)] // XInputGetState; cada llamada lleva su `SAFETY:`.
+#![allow(unsafe_code)] // XInputGetState y XInputSetState; cada llamada lleva su `SAFETY:`.
 
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use coroom_input::inject::windows_vhid::{self, DriverHandle, Target, XBOX360_PRODUCT};
-use coroom_input::{GamepadButton, GuestId, InputError, InputEvent};
+use coroom_input::{GamepadButton, GuestId, InputError, InputEvent, Rumble};
 use coroom_proto::input::{GamepadDevice, GamepadTransport};
 use hidapi::{HidApi, HidDevice};
-use windows::Win32::UI::Input::XboxController::{XINPUT_GAMEPAD_A, XINPUT_STATE, XInputGetState};
+use windows::Win32::UI::Input::XboxController::{
+    XINPUT_GAMEPAD_A, XINPUT_STATE, XINPUT_VIBRATION, XInputGetState, XInputSetState,
+};
 
 const GUEST: GuestId = GuestId(1);
 
@@ -137,6 +140,28 @@ fn the_installed_driver_creates_raw_xbox_and_generic_pads() {
             .into_iter()
             .find(|(i, state)| *i == index && state.Gamepad.wButtons.contains(XINPUT_GAMEPAD_A))
     });
+
+    // La vibración que le pide un juego por XInput vuelve, con los dos motores en su sitio (el
+    // driver guarda el byte alto de cada uno).
+    let vibrate = |left: u16, right: u16| {
+        let vibration = XINPUT_VIBRATION {
+            wLeftMotorSpeed: left,
+            wRightMotorSpeed: right,
+        };
+        // SAFETY: `vibration` es local y vive durante la llamada; XInput solo la lee.
+        let result = unsafe { XInputSetState(index, &vibration) };
+        assert_eq!(result, 0, "XInputSetState");
+    };
+    vibrate(0xC000, 0x4000);
+    let rumble = wait_for("la vibración", Duration::from_secs(10), || {
+        pads.take_rumble().into_iter().last()
+    });
+    assert_eq!(rumble, (1, Rumble::new(0xC0C0, 0x4040)));
+    vibrate(0, 0);
+    let rumble = wait_for("la parada", Duration::from_secs(10), || {
+        pads.take_rumble().into_iter().last()
+    });
+    assert_eq!(rumble, (1, Rumble::OFF));
 
     // Tal cual: un HID con el VID/PID y el descriptor del invitado.
     pads.assign(2).expect("ranura 2");

@@ -395,7 +395,12 @@ anfitrión decide por invitado si su mando llega **tal cual** (por defecto) o **
 crea un mando con el mismo VID/PID, nombre y descriptor HID que el físico, y le pasan sus informes
 sin traducir: Steam, SDL y el juego lo reconocen como ese mando, con sus botones extra, giroscopio
 o lo que declare, y la vibración y las luces vuelven al mando del invitado. Un mando de Xbox por
-cable (XInput, sin HID en crudo) llega con su identidad. Funciona con anfitrión e invitado en
+cable (XInput, sin HID en crudo) llega con su identidad. Con ese y con el convertido, el anfitrión
+es un mando de Xbox 360 y la vibración que le pide el juego vuelve como el estado de los dos
+motores, que el invitado aplica a su mando (el que sea, si vibra: en Linux con un efecto
+`FF_RUMBLE` en su propio `/dev/input/event*`, al momento, y en Windows con Windows.Gaming.Input
+de `gilrs`, con unos 50 ms de más; a un mando tal cual no se le escribe nada; si no vibra, se
+avisa una vez en el registro). Funciona con anfitrión e invitado en
 Linux o Windows. Si no se puede (sin acceso a `/dev/hidraw*` o `/dev/uhid` en Linux, sin el
 driver de coroom en un anfitrión Windows, o un descriptor que también declara teclado o ratón sin
 ese permiso), va convertido y la tarjeta del invitado dice por qué. En el invitado Linux, leer el
@@ -413,7 +418,7 @@ mandos: mejor cerrarlo).
   `--source synthetic` el diálogo de control remoto sale al conceder teclado y ratón por primera
   vez.
 - Mandos por **uinput**: un "coroom Gamepad N" por ranura, visto por SDL, Steam y los juegos como
-  un mando de Xbox 360. Hace falta acceso a `/dev/uinput`; la regla udev (una vez):
+  un mando de Xbox 360, con vibración (`FF_RUMBLE`, como `xpad`). Hace falta acceso a `/dev/uinput`; la regla udev (una vez):
 
   ```bash
   echo 'KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"' \

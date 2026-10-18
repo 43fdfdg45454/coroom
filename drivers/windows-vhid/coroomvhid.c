@@ -1,5 +1,5 @@
 /*
- * coroomvhid.c - coroom virtual gamepad driver (UMDF2, protocol 3).
+ * coroomvhid.c - coroom virtual gamepad driver (UMDF2, protocol 4).
  *
  * Two kinds of device, both root devices created by install.ps1 (see coroomvhid.inf):
  *
@@ -12,9 +12,11 @@
  *     creation, without a round trip. The device is exclusive: one client, and closing its handle
  *     removes its gamepads.
  *   - The Xbox 360 devices (Root\coroomxusb) answer the xusb22 IOCTLs of xinput1_4.dll and
- *     Windows.Gaming.Input with the state the client writes. The layouts of those IOCTLs are not
- *     documented by Microsoft; the values here follow HIDMaestro (MIT License, Copyright (c)
- *     hifihedgehog, driver/companion.c), which checked them against a wired Xbox 360 controller.
+ *     Windows.Gaming.Input with the state the client writes, and keep the last vibration games
+ *     set (IOCTL_XUSB_SET_STATE) until the client reads it (COROOM_VHID_IOCTL_XUSB_RUMBLE). The
+ *     layouts of those IOCTLs are not documented by Microsoft; the values here follow HIDMaestro
+ *     (MIT License, Copyright (c) hifihedgehog, driver/companion.c), which checked them against a
+ *     wired Xbox 360 controller.
  *
  * Rules kept throughout this file:
  *   - every buffer size is checked before the buffer is touched, and the client data is copied
@@ -1084,6 +1086,9 @@ CoroomXusbDeactivate(
     (VOID)WdfWaitLockAcquire(Xusb->Lock, NULL);
     Xusb->Owner = NULL;
     RtlZeroMemory(&Xusb->State, sizeof(Xusb->State));
+    Xusb->Rumble.LeftMotor = 0;
+    Xusb->Rumble.RightMotor = 0;
+    Xusb->Rumble.Sequence++;
     started = Xusb->Started;
     WdfWaitLockRelease(Xusb->Lock);
 
@@ -1132,6 +1137,9 @@ CoroomXusbActivate(
     Xusb->PacketNumber++;
     Xusb->LastStateTick = GetTickCount64();
     Xusb->Resting = FALSE;
+    Xusb->Rumble.LeftMotor = 0;
+    Xusb->Rumble.RightMotor = 0;
+    Xusb->Rumble.Sequence++;
     started = Xusb->Started;
     WdfWaitLockRelease(Xusb->Lock);
 
@@ -1182,6 +1190,63 @@ CoroomXusbSetState(
         CoroomXusbPumpOnce(Xusb);
     }
     return STATUS_SUCCESS;
+}
+
+/* xusb22 IOCTL_XUSB_SET_STATE input (5 bytes, from xinput1_4.dll XInputSetState): the controller
+   index on the device, the LED state, the left (strong) and right (weak) motor speeds as the high
+   byte of XINPUT_VIBRATION, and what to change (COROOM_XUSB_SET_LED, COROOM_XUSB_SET_VIBRATION). */
+#define COROOM_XUSB_SET_STATE_SIZE 5
+#define COROOM_XUSB_SET_LED 0x01
+#define COROOM_XUSB_SET_VIBRATION 0x02
+
+/* A game sets the vibration: kept for the client (COROOM_VHID_IOCTL_XUSB_RUMBLE). Requests that
+   do not carry vibration (LEDs only, or shorter than expected) are accepted and ignored, as a
+   wired controller without motors would. */
+static NTSTATUS
+CoroomXusbGameSetState(
+    _In_ PCOROOM_XUSB_CONTEXT Xusb,
+    _In_ WDFREQUEST Request)
+{
+    UCHAR request[COROOM_XUSB_SET_STATE_SIZE];
+    PVOID input;
+    size_t inputLength;
+    NTSTATUS status;
+
+    status = WdfRequestRetrieveInputBuffer(Request, COROOM_XUSB_SET_STATE_SIZE, &input,
+                                           &inputLength);
+    if (!NT_SUCCESS(status)) {
+        return STATUS_SUCCESS;
+    }
+    RtlCopyMemory(request, input, sizeof(request));
+    if ((request[4] & COROOM_XUSB_SET_VIBRATION) == 0) {
+        return STATUS_SUCCESS;
+    }
+
+    (VOID)WdfWaitLockAcquire(Xusb->Lock, NULL);
+    Xusb->Rumble.LeftMotor = (USHORT)((USHORT)request[2] * 257);
+    Xusb->Rumble.RightMotor = (USHORT)((USHORT)request[3] * 257);
+    Xusb->Rumble.Sequence++;
+    WdfWaitLockRelease(Xusb->Lock);
+    return STATUS_SUCCESS;
+}
+
+/* COROOM_VHID_IOCTL_XUSB_RUMBLE: the last vibration, for the client that activated the device. */
+static NTSTATUS
+CoroomXusbTakeRumble(
+    _In_ PCOROOM_XUSB_CONTEXT Xusb,
+    _In_ WDFREQUEST Request,
+    _In_opt_ WDFFILEOBJECT File)
+{
+    COROOM_VHID_XUSB_RUMBLE rumble;
+
+    (VOID)WdfWaitLockAcquire(Xusb->Lock, NULL);
+    if (File == NULL || Xusb->Owner != File) {
+        WdfWaitLockRelease(Xusb->Lock);
+        return STATUS_ACCESS_DENIED;
+    }
+    RtlCopyMemory(&rumble, &Xusb->Rumble, sizeof(rumble));
+    WdfWaitLockRelease(Xusb->Lock);
+    return CoroomCompleteWithBytes(Request, &rumble, sizeof(rumble));
 }
 
 /* The xusb22 requests of xinput1_4.dll and Windows.Gaming.Input. */
@@ -1274,8 +1339,12 @@ CoroomXusbStandard(
         length = 4;
         break;
     case IOCTL_XUSB_SET_STATE:
+        /* Vibration: kept until the client reads it and sends it to the guest's controller. */
+        status = CoroomXusbGameSetState(Xusb, Request);
+        length = 0;
+        break;
     case IOCTL_XUSB_POWER_INFO:
-        /* Vibration is not forwarded to the guest's controller yet: accepted and ignored. */
+        /* Accepted and ignored. */
         length = 0;
         break;
     case IOCTL_XUSB_WAIT_GUIDE:
@@ -1335,6 +1404,9 @@ CoroomEvtXusbIoctl(
         break;
     case COROOM_VHID_IOCTL_XUSB_STATE:
         status = CoroomXusbSetState(xusb, Request, file);
+        break;
+    case COROOM_VHID_IOCTL_XUSB_RUMBLE:
+        status = CoroomXusbTakeRumble(xusb, Request, file);
         break;
     default:
         (VOID)WdfWaitLockAcquire(xusb->Lock, NULL);

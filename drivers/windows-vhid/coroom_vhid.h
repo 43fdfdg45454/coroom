@@ -6,7 +6,7 @@
  * below and its tests parse this file to check that both sides agree, so keep the
  * "#define NAME VALUE" lines simple (one decimal or hexadecimal literal, or a L"..." string).
  *
- * Model (protocol 3): one DLL, two kinds of root device, both created once by install.ps1.
+ * Model (protocol 4): one DLL, two kinds of root device, both created once by install.ps1.
  *
  *   Root\coroomvhid   the control device (one). A HID source driver of the Virtual HID Framework
  *                     (vhf.sys is its lower filter): through its device interface the client asks
@@ -32,8 +32,9 @@
 #ifndef COROOM_VHID_H
 #define COROOM_VHID_H
 
-/* Version of this interface; COROOM_VHID_INFO returns it. Bump on any change below. */
-#define COROOM_VHID_PROTOCOL_VERSION 3
+/* Version of this interface; COROOM_VHID_INFO returns it. Bump on any change below (4 added
+   COROOM_VHID_IOCTL_XUSB_RUMBLE). */
+#define COROOM_VHID_PROTOCOL_VERSION 4
 
 /* HID gamepads of the control device: pad numbers 0 to COROOM_VHID_MAX_PADS - 1. */
 #define COROOM_VHID_MAX_PADS 8
@@ -82,6 +83,7 @@
 #define COROOM_VHID_IOCTL_XUSB_ACTIVATE 0x0022E440   /* Xbox 360; in: COROOM_VHID_XUSB_ID */
 #define COROOM_VHID_IOCTL_XUSB_DEACTIVATE 0x0022E444 /* Xbox 360; no buffers */
 #define COROOM_VHID_IOCTL_XUSB_STATE 0x0022E448      /* Xbox 360; in: COROOM_VHID_XUSB_STATE */
+#define COROOM_VHID_IOCTL_XUSB_RUMBLE 0x0022E44C     /* Xbox 360; out: COROOM_VHID_XUSB_RUMBLE */
 
 /* COROOM_VHID_INFO.Kind */
 #define COROOM_VHID_KIND_CONTROL 0
@@ -98,6 +100,7 @@
 #define COROOM_VHID_OUTPUT_HEADER_SIZE 8
 #define COROOM_VHID_XUSB_ID_SIZE 4
 #define COROOM_VHID_XUSB_STATE_SIZE 12
+#define COROOM_VHID_XUSB_RUMBLE_SIZE 8
 
 /* The Xbox 360 controller that converted gamepads present (wired, Microsoft). */
 #define COROOM_VHID_XBOX360_VENDOR_ID 0x045E
@@ -175,6 +178,19 @@ typedef struct _COROOM_VHID_XUSB_STATE {
     INT16 ThumbRY;       /* up is positive */
 } COROOM_VHID_XUSB_STATE, *PCOROOM_VHID_XUSB_STATE;
 
+/*
+ * COROOM_VHID_IOCTL_XUSB_RUMBLE (only the client that activated the device): the vibration that
+ * games last asked of it with XInputSetState (IOCTL_XUSB_SET_STATE), without waiting. The motor
+ * speeds go from 0 to 65535 (the XInput byte times 257); both are zero after activation and
+ * deactivation. Sequence grows with every vibration request and every reset, so the client can
+ * tell a new request from the one it already read.
+ */
+typedef struct _COROOM_VHID_XUSB_RUMBLE {
+    UINT16 LeftMotor;    /* low-frequency (strong) motor, XINPUT_VIBRATION.wLeftMotorSpeed */
+    UINT16 RightMotor;   /* high-frequency (weak) motor, XINPUT_VIBRATION.wRightMotorSpeed */
+    UINT32 Sequence;
+} COROOM_VHID_XUSB_RUMBLE, *PCOROOM_VHID_XUSB_RUMBLE;
+
 #pragma pack(pop)
 
 /* C_ASSERT comes from the WDK and the Windows SDK (winnt.h). */
@@ -184,6 +200,7 @@ C_ASSERT(sizeof(COROOM_VHID_INPUT) == COROOM_VHID_INPUT_SIZE);
 C_ASSERT(sizeof(COROOM_VHID_OUTPUT) == COROOM_VHID_OUTPUT_HEADER_SIZE);
 C_ASSERT(sizeof(COROOM_VHID_XUSB_ID) == COROOM_VHID_XUSB_ID_SIZE);
 C_ASSERT(sizeof(COROOM_VHID_XUSB_STATE) == COROOM_VHID_XUSB_STATE_SIZE);
+C_ASSERT(sizeof(COROOM_VHID_XUSB_RUMBLE) == COROOM_VHID_XUSB_RUMBLE_SIZE);
 
 #define COROOM_VHID_CTL(Function) \
     CTL_CODE(FILE_DEVICE_UNKNOWN, (Function), METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA)
@@ -195,5 +212,6 @@ C_ASSERT(COROOM_VHID_IOCTL_TAKE_OUTPUT == COROOM_VHID_CTL(0x904));
 C_ASSERT(COROOM_VHID_IOCTL_XUSB_ACTIVATE == COROOM_VHID_CTL(0x910));
 C_ASSERT(COROOM_VHID_IOCTL_XUSB_DEACTIVATE == COROOM_VHID_CTL(0x911));
 C_ASSERT(COROOM_VHID_IOCTL_XUSB_STATE == COROOM_VHID_CTL(0x912));
+C_ASSERT(COROOM_VHID_IOCTL_XUSB_RUMBLE == COROOM_VHID_CTL(0x913));
 
 #endif /* COROOM_VHID_H */

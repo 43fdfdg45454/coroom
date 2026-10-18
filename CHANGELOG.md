@@ -9,6 +9,16 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Añadido
 
+- **Vibración con todos los mandos compartidos** (protocolo 18; hay que actualizar también el
+  servidor y, en un anfitrión Windows, **reinstalar el driver de mandos** con el `install.ps1` de
+  esta versión: el anterior no sirve y los mandos no se crean hasta actualizarlo): además de los
+  mandos tal cual por HID, ahora vibran los **convertidos a Xbox 360** y los **mandos de Xbox por
+  cable**. En Linux el mando virtual acepta la vibración del juego como un mando de Xbox 360 real;
+  en Windows, el driver recoge la que el juego pide por XInput. El invitado la aplica a su mando,
+  sea cual sea, si vibra (si no, se avisa una vez en el registro); al soltar el mando, cambiar de
+  mando o salir de la sala, los motores se paran. En un invitado Linux la vibración llega al
+  momento y ya no puede cortar la de un mando tal cual (antes, la biblioteca de mandos podía
+  mandarle los motores a cero cada 50 ms).
 - **Imagen del servidor para arm/v7**: además de amd64 y arm64, `ghcr.io/…/coroom-server` se publica
   para Raspberry Pi con un sistema de 32 bits. La CI la compila de forma cruzada desde amd64.
 - **Avatares** (protocolo 16; hay que actualizar también el servidor): cada uno elige una imagen en

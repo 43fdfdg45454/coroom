@@ -936,6 +936,12 @@ pub(crate) enum Command {
         slot: u8,
         data: Vec<u8>,
     },
+    /// Los motores de vibración del mando del invitado (`GamepadRumble`).
+    GamepadRumble {
+        guest: GuestId,
+        slot: u8,
+        rumble: coroom_input::Rumble,
+    },
     /// Anfitrión: otros codificadores (otro códec o backend preferido), bitrate máximo,
     /// resolución máxima o fps.
     Video(VideoChange),

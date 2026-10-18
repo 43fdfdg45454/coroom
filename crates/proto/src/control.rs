@@ -40,6 +40,10 @@
 //! a todos a ella ([`ControlMessage::MoveToRoom`]; al nuevo también, como confirmación de que puede
 //! salir de esta). Hasta mandarlos, el anfitrión puede retirar la oferta
 //! ([`ControlMessage::HandoffCancel`]).
+//!
+//! Desde la versión 18 la vibración de los mandos que no van tal cual por HID viaja como el
+//! estado de sus dos motores ([`ControlMessage::GamepadRumble`]), al final de la lista para no
+//! mover los índices de `postcard` de los demás.
 
 use serde::{Deserialize, Serialize};
 
@@ -537,6 +541,18 @@ pub enum ControlMessage {
     /// Anfitrión → invitado: retira la oferta de [`ControlMessage::HandoffOffer`] (la canceló, o
     /// llegó una respuesta que ya no esperaba); si el invitado abrió su sala, la cierra.
     HandoffCancel,
+    /// Anfitrión → invitado: lo que el juego pide a los dos motores del mando de su ranura cuando
+    /// no va tal cual por HID (el convertido y el de Xbox por cable, que en el anfitrión son un
+    /// mando de Xbox 360 de uinput o del driver de Windows). Es el estado, no un efecto: vale
+    /// hasta el siguiente, y `0, 0` los para. El invitado lo aplica a su mando físico.
+    GamepadRumble {
+        /// Ranura.
+        slot: u8,
+        /// Motor grande (baja frecuencia), de 0 a 65 535.
+        strong: u16,
+        /// Motor pequeño (alta frecuencia), de 0 a 65 535.
+        weak: u16,
+    },
 }
 
 impl ControlMessage {
@@ -698,6 +714,27 @@ mod tests {
         assert_eq!(control_datagram(&cursor), None);
         let datagram = control_datagram_tagged(&cursor, 1234).expect("cabe");
         assert_eq!(parse_control_datagram_tagged(&datagram), Ok((1234, cursor)));
+    }
+
+    /// `GamepadRumble` va detrás de `HandoffCancel` (los índices de `postcard` de los demás no
+    /// cambian) y solo por el stream: es un estado que no se puede perder, el `0, 0` que para los
+    /// motores tampoco.
+    #[test]
+    fn rumble_goes_last_and_only_by_the_stream() {
+        let cancel = postcard::to_allocvec(&ControlMessage::HandoffCancel).expect("cancel");
+        let rumble = ControlMessage::GamepadRumble {
+            slot: 2,
+            strong: u16::MAX,
+            weak: 0x1234,
+        };
+        let body = postcard::to_allocvec(&rumble).expect("rumble");
+        assert_eq!(body[0], cancel[0] + 1);
+        assert!(!rumble.is_urgent() && !rumble.fits_datagram());
+        assert_eq!(control_datagram_tagged(&rumble, 0), None);
+        assert_eq!(
+            decode::<ControlMessage>(&body).expect("decodificar"),
+            rumble
+        );
     }
     use proptest::prelude::*;
 
@@ -910,6 +947,9 @@ mod tests {
                 .prop_map(|(slot, raw)| ControlMessage::GamepadMode { slot, raw }),
             (1u8..=8, prop::collection::vec(any::<u8>(), 1..64))
                 .prop_map(|(slot, data)| ControlMessage::GamepadOutput { slot, data }),
+            (1u8..=8, any::<u16>(), any::<u16>()).prop_map(|(slot, strong, weak)| {
+                ControlMessage::GamepadRumble { slot, strong, weak }
+            }),
             prop::collection::vec(
                 (
                     any::<u32>(),

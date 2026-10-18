@@ -1,5 +1,5 @@
 //! Mandos virtuales en Windows (feature `windows-vhid`): cliente del driver `coroomvhid.dll`
-//! (`drivers/windows-vhid/`, UMDF2, protocolo 3).
+//! (`drivers/windows-vhid/`, UMDF2, protocolo 4).
 //!
 //! Windows no tiene API de usuario para crear un mando. El driver tiene dos clases de dispositivo,
 //! y los dos los crea `install.ps1` una vez:
@@ -11,7 +11,9 @@
 //!   (vibración, luces) esperan en el driver hasta que [`VhidGamepads::take_outputs`] los recoge.
 //! - **Xbox 360** ([`XUSB_SLOTS`], `Root\coroomxusb`): mandos de XInput. Son los que reciben los
 //!   mandos **convertidos** ([`XusbState`]) mientras haya libres (los ven todos los juegos, también
-//!   los que solo usan XInput) y los de Xbox por cable tal cual, con su VID/PID.
+//!   los que solo usan XInput) y los de Xbox por cable tal cual, con su VID/PID. La vibración que
+//!   les piden los juegos (`XInputSetState`) la guarda el driver y [`VhidGamepads::take_rumble`] la
+//!   lee ([`XusbRumble`]).
 //!
 //! - **Formato** (independiente de la plataforma y probado en Linux): las estructuras y los IOCTL
 //!   de `coroom_vhid.h` ([`create_request`], [`input_request`], [`parse_output`],
@@ -38,10 +40,10 @@ use std::time::{Duration, Instant};
 use coroom_proto::hid::{self, HidSummary};
 use coroom_proto::input::{GamepadDevice, GamepadTransport};
 
-use crate::{GamepadAxis, GamepadButton, GuestId, InputError, InputEvent};
+use crate::{GamepadAxis, GamepadButton, GuestId, InputError, InputEvent, Rumble};
 
 /// Versión del protocolo del driver que habla este cliente (`COROOM_VHID_PROTOCOL_VERSION`).
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Mandos HID que puede tener el driver a la vez (`COROOM_VHID_MAX_PADS`), uno por ranura.
 pub const DRIVER_PADS: u8 = 8;
@@ -85,6 +87,8 @@ pub mod ioctl {
     pub const XUSB_DEACTIVATE: u32 = 0x0022_E444;
     /// Su estado (`XINPUT_GAMEPAD`).
     pub const XUSB_STATE: u32 = 0x0022_E448;
+    /// La última vibración que le pidió un juego.
+    pub const XUSB_RUMBLE: u32 = 0x0022_E44C;
 }
 
 /// `COROOM_VHID_INFO.Kind` del dispositivo de control.
@@ -113,6 +117,8 @@ pub mod size {
     pub const XUSB_ID: usize = 4;
     /// `COROOM_VHID_XUSB_STATE`.
     pub const XUSB_STATE: usize = 12;
+    /// `COROOM_VHID_XUSB_RUMBLE`.
+    pub const XUSB_RUMBLE: usize = 8;
 }
 
 /// El Xbox 360 de los mandos convertidos (`COROOM_VHID_XBOX360_*`).
@@ -550,6 +556,40 @@ pub fn normalize_output(summary: &HidSummary, report_id: u8, data: &[u8]) -> Vec
     }
 }
 
+/// Lo que responde `COROOM_VHID_IOCTL_XUSB_RUMBLE`: la última vibración que un juego pidió a un
+/// Xbox 360 (`XInputSetState`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct XusbRumble {
+    /// Motor izquierdo, el grande (`wLeftMotorSpeed`), de 0 a 65 535.
+    pub left: u16,
+    /// Motor derecho, el pequeño (`wRightMotorSpeed`).
+    pub right: u16,
+    /// Crece con cada petición (y al activarlo o desactivarlo).
+    pub sequence: u32,
+}
+
+impl XusbRumble {
+    /// Lee `COROOM_VHID_XUSB_RUMBLE` (little endian, sin relleno).
+    pub fn parse(bytes: &[u8]) -> Result<Self, InputError> {
+        let Ok(bytes) = <[u8; size::XUSB_RUMBLE]>::try_from(bytes) else {
+            return Err(InputError::Backend(format!(
+                "mando virtual: el driver devolvió una vibración de {} bytes",
+                bytes.len()
+            )));
+        };
+        Ok(Self {
+            left: u16::from_le_bytes([bytes[0], bytes[1]]),
+            right: u16::from_le_bytes([bytes[2], bytes[3]]),
+            sequence: u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+        })
+    }
+
+    /// Los motores.
+    pub fn rumble(&self) -> Rumble {
+        Rumble::new(self.left, self.right)
+    }
+}
+
 /// Lo que responde `COROOM_VHID_IOCTL_GET_INFO`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DriverInfo {
@@ -622,6 +662,8 @@ pub enum DriverOp {
     Destroy,
     /// Recoger las salidas.
     Output,
+    /// Leer la vibración de los Xbox 360.
+    Rumble,
 }
 
 /// Error en español de una operación fallida, a partir del código de Win32 en que Windows
@@ -639,6 +681,7 @@ pub fn driver_error(
         (DriverOp::Report, Some(slot)) => format!("mandar el estado del mando de la ranura {slot}"),
         (DriverOp::Destroy, Some(slot)) => format!("quitar el mando de la ranura {slot}"),
         (DriverOp::Output, _) => "recoger la vibración de los mandos".to_owned(),
+        (DriverOp::Rumble, _) => "leer la vibración de los mandos de Xbox 360".to_owned(),
         (_, None) => "hablar con el driver".to_owned(),
     };
     let why = match win32 {
@@ -700,6 +743,8 @@ pub trait VhidDevice: Send + 'static {
     fn xusb_deactivate(&mut self, slot: u8) -> Result<(), InputError>;
     /// Su estado.
     fn xusb_state(&mut self, slot: u8, state: &XusbState) -> Result<(), InputError>;
+    /// La última vibración que le pidió un juego.
+    fn xusb_rumble(&mut self, slot: u8) -> Result<XusbRumble, InputError>;
 }
 
 /// Qué dispositivo del driver lleva una ranura.
@@ -834,6 +879,9 @@ struct Pad {
     pacer: ReportPacer,
     owner: Option<GuestId>,
     raw: Option<Raw>,
+    /// La última vibración leída de su Xbox 360 (`sequence`) y la que se dio al invitado.
+    rumble_seen: Option<u32>,
+    rumble: Rumble,
 }
 
 impl Pad {
@@ -844,6 +892,8 @@ impl Pad {
             pacer: ReportPacer::default(),
             owner: None,
             raw: None,
+            rumble_seen: None,
+            rumble: Rumble::OFF,
         }
     }
 
@@ -870,6 +920,11 @@ struct State<D> {
     /// Si ya se avisó de que no se pueden recoger las salidas del driver (una vez hasta que
     /// vuelva a funcionar, no cada 5 ms).
     outputs_failing: bool,
+    /// Lo mismo con la vibración de los Xbox 360.
+    rumble_failing: bool,
+    /// Paradas de los motores de mandos que se quitaron o sustituyeron vibrando, para la próxima
+    /// [`VhidGamepads::take_rumble`].
+    rumble_stops: Vec<(u8, Rumble)>,
 }
 
 struct Shared<D> {
@@ -950,6 +1005,15 @@ impl<D: VhidDevice> State<D> {
             .min()
     }
 
+    /// Quita el mando de `slot` (sin cerrar su dispositivo); si vibraba, el invitado lo para.
+    fn take_pad(&mut self, slot: u8) -> Option<Pad> {
+        let pad = self.pads.remove(&slot)?;
+        if pad.rumble.is_on() {
+            self.rumble_stops.push((slot, Rumble::OFF));
+        }
+        Some(pad)
+    }
+
     /// El primer Xbox 360 instalado que no lleva ninguna ranura.
     fn free_xusb(&self) -> Option<u8> {
         self.device.xusb_slots().into_iter().find(|slot| {
@@ -1024,6 +1088,8 @@ impl<D: VhidDevice> VhidGamepads<D> {
                 keepalive,
                 stop: false,
                 outputs_failing: false,
+                rumble_failing: false,
+                rumble_stops: Vec::new(),
             }),
             wake: Condvar::new(),
         });
@@ -1066,7 +1132,7 @@ impl<D: VhidDevice> VhidGamepads<D> {
     /// Quita el mando de `slot`.
     pub fn release(&mut self, slot: u8) -> Result<(), InputError> {
         let mut state = lock(&self.shared);
-        let Some(pad) = state.pads.remove(&slot) else {
+        let Some(pad) = state.take_pad(slot) else {
             return Err(InputError::NoSuchSlot(slot));
         };
         state.close_target(pad.target)
@@ -1092,7 +1158,7 @@ impl<D: VhidDevice> VhidGamepads<D> {
         };
         // El convertido se suelta primero: su Xbox 360 queda libre y, con el genérico, el HID
         // ocupa el mismo número.
-        state.pads.remove(&slot);
+        state.take_pad(slot);
         state.close_target(current)?;
         match &device.transport {
             GamepadTransport::Hid {
@@ -1165,7 +1231,7 @@ impl<D: VhidDevice> VhidGamepads<D> {
             return Ok(());
         }
         let (target, owner) = (pad.target, pad.owner);
-        state.pads.remove(&slot);
+        state.take_pad(slot);
         state.close_target(target)?;
         let result = state.reopen_converted(slot, owner);
         self.shared.wake.notify_one();
@@ -1212,6 +1278,48 @@ impl<D: VhidDevice> VhidGamepads<D> {
                     slot,
                     normalize_output(&summary, output.report_id, &output.data),
                 ));
+            }
+        }
+        out
+    }
+
+    /// Los cambios de la vibración que los juegos pidieron a los Xbox 360 de las ranuras desde la
+    /// última llamada (y las paradas de los que se quitaron vibrando), por ranura.
+    pub fn take_rumble(&mut self) -> Vec<(u8, Rumble)> {
+        let mut state = lock(&self.shared);
+        let State {
+            device,
+            pads,
+            rumble_failing,
+            rumble_stops,
+            ..
+        } = &mut *state;
+        let mut out = std::mem::take(rumble_stops);
+        for (slot, pad) in pads.iter_mut() {
+            let Target::Xusb(xusb) = pad.target else {
+                continue;
+            };
+            let read = match device.xusb_rumble(xusb) {
+                Ok(read) => {
+                    *rumble_failing = false;
+                    read
+                }
+                Err(err) => {
+                    if !std::mem::replace(rumble_failing, true) {
+                        tracing::warn!(
+                            "{err}: la vibración de los mandos de Xbox 360 no llega al invitado"
+                        );
+                    }
+                    continue;
+                }
+            };
+            if pad.rumble_seen == Some(read.sequence) {
+                continue;
+            }
+            pad.rumble_seen = Some(read.sequence);
+            if read.rumble() != pad.rumble {
+                pad.rumble = read.rumble();
+                out.push((*slot, pad.rumble));
             }
         }
         out
@@ -1346,7 +1454,7 @@ mod driver {
 
     use super::{
         DriverInfo, DriverOp, DriverOutput, INTERFACE_GUID, KIND_CONTROL, KIND_XUSB, MAX_REPORT,
-        PROTOCOL_VERSION, PadSpec, VhidDevice, VhidGamepads, XusbState, create_request,
+        PROTOCOL_VERSION, PadSpec, VhidDevice, VhidGamepads, XusbRumble, XusbState, create_request,
         driver_error, input_request, ioctl, not_installed_error, parse_output, size,
     };
     use crate::InputError;
@@ -1606,6 +1714,15 @@ mod driver {
                 driver_error(DriverOp::Report, None, win32_code(&err), &err.message())
             })?;
             Ok(())
+        }
+
+        fn xusb_rumble(&mut self, slot: u8) -> Result<XusbRumble, InputError> {
+            let mut out = [0u8; size::XUSB_RUMBLE];
+            let len =
+                control(self.xusb(slot)?, ioctl::XUSB_RUMBLE, &[], &mut out).map_err(|err| {
+                    driver_error(DriverOp::Rumble, None, win32_code(&err), &err.message())
+                })?;
+            XusbRumble::parse(&out[..len])
         }
     }
 
@@ -2198,6 +2315,7 @@ mod tests {
             ("XUSB_ACTIVATE", ioctl::XUSB_ACTIVATE, 0x910),
             ("XUSB_DEACTIVATE", ioctl::XUSB_DEACTIVATE, 0x911),
             ("XUSB_STATE", ioctl::XUSB_STATE, 0x912),
+            ("XUSB_RUMBLE", ioctl::XUSB_RUMBLE, 0x913),
         ] {
             assert_eq!(number(&format!("COROOM_VHID_IOCTL_{name}")), code, "{name}");
             assert_eq!(code, ctl_code(function), "{name}");
@@ -2219,6 +2337,7 @@ mod tests {
             ("OUTPUT_HEADER", size::OUTPUT_HEADER),
             ("XUSB_ID", size::XUSB_ID),
             ("XUSB_STATE", size::XUSB_STATE),
+            ("XUSB_RUMBLE", size::XUSB_RUMBLE),
         ] {
             assert_eq!(
                 number(&format!("COROOM_VHID_{name}_SIZE")) as usize,
@@ -2353,23 +2472,24 @@ mod tests {
         assert!(parse_output(&[3, 1, 5, 0, 9, 0, 0, 0, 0xAA]).is_err());
         assert!(parse_output(&[8, 1, 5, 0, 0, 0, 0, 0]).is_err());
 
-        let info = DriverInfo::parse(&[3, 0, 0, 0, KIND_XUSB, 2, 1, 0]).unwrap();
+        let info = DriverInfo::parse(&[4, 0, 0, 0, KIND_XUSB, 2, 1, 0]).unwrap();
         assert_eq!(
             info,
             DriverInfo {
-                protocol: 3,
+                protocol: 4,
                 kind: KIND_XUSB,
                 slot: 2,
                 active: 1
             }
         );
         assert_eq!(info.check(), Ok(()));
-        let older = DriverInfo::parse(&[2, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+        // El driver de antes (sin la vibración de los Xbox 360) se rechaza explicando qué hacer.
+        let older = DriverInfo::parse(&[3, 0, 0, 0, 0, 0, 0, 0]).unwrap();
         assert!(
-            matches!(older.check(), Err(InputError::GamepadUnavailable(text)) if text.contains("versión 2"))
+            matches!(older.check(), Err(InputError::GamepadUnavailable(text)) if text.contains("versión 3"))
         );
         assert!(
-            DriverInfo::parse(&[3, 0, 0, 0, KIND_XUSB, 4, 0, 0])
+            DriverInfo::parse(&[4, 0, 0, 0, KIND_XUSB, 4, 0, 0])
                 .unwrap()
                 .check()
                 .is_err()
@@ -2617,6 +2737,8 @@ mod tests {
         outputs: Arc<Mutex<Vec<DriverOutput>>>,
         xusb: Vec<u8>,
         reject_create: Arc<Mutex<bool>>,
+        /// La vibración de cada Xbox 360, como la guarda el driver.
+        rumble: Arc<Mutex<BTreeMap<u8, XusbRumble>>>,
     }
 
     impl FakeDevice {
@@ -2626,7 +2748,27 @@ mod tests {
                 outputs: Arc::default(),
                 xusb: (0..slots).collect(),
                 reject_create: Arc::default(),
+                rumble: Arc::default(),
             }
+        }
+
+        /// Un juego llama a `XInputSetState` en el Xbox 360 `xusb` (con los bytes de XInput,
+        /// como los escala el driver).
+        fn set_rumble(&self, xusb: u8, left: u8, right: u8) {
+            let mut rumble = self.rumble.lock().unwrap();
+            let entry = rumble.entry(xusb).or_default();
+            entry.left = u16::from(left) * 257;
+            entry.right = u16::from(right) * 257;
+            entry.sequence += 1;
+        }
+
+        /// Lo que hace el driver al activar y desactivar: motores parados.
+        fn reset_rumble(&self, xusb: u8) {
+            let mut rumble = self.rumble.lock().unwrap();
+            let entry = rumble.entry(xusb).or_default();
+            entry.left = 0;
+            entry.right = 0;
+            entry.sequence += 1;
         }
 
         fn calls(&self) -> Vec<Call> {
@@ -2686,11 +2828,13 @@ mod tests {
 
         fn xusb_activate(&mut self, slot: u8, vendor: u16, product: u16) -> Result<(), InputError> {
             assert!(self.xusb.contains(&slot));
+            self.reset_rumble(slot);
             self.push(Call::Activate(slot, vendor, product));
             Ok(())
         }
 
         fn xusb_deactivate(&mut self, slot: u8) -> Result<(), InputError> {
+            self.reset_rumble(slot);
             self.push(Call::Deactivate(slot));
             Ok(())
         }
@@ -2698,6 +2842,17 @@ mod tests {
         fn xusb_state(&mut self, slot: u8, state: &XusbState) -> Result<(), InputError> {
             self.push(Call::State(slot, *state));
             Ok(())
+        }
+
+        fn xusb_rumble(&mut self, slot: u8) -> Result<XusbRumble, InputError> {
+            assert!(self.xusb.contains(&slot));
+            Ok(self
+                .rumble
+                .lock()
+                .unwrap()
+                .get(&slot)
+                .copied()
+                .unwrap_or_default())
         }
     }
 
@@ -3023,5 +3178,68 @@ mod tests {
             Err(InputError::Unsupported(text)) if text.contains("Xbox 360")
         ));
         assert_eq!(pads.targets()[&1], Target::Hid(0));
+    }
+
+    #[test]
+    fn xbox_360_vibration_reaches_its_slot_once_per_change() {
+        let device = FakeDevice::with_xusb(2);
+        let mut pads = VhidGamepads::with_keepalive(device.clone(), NO_KEEPALIVE).unwrap();
+        pads.assign(2).unwrap();
+        pads.assign(5).unwrap();
+        pads.assign(7).unwrap();
+        assert_eq!(
+            pads.targets(),
+            BTreeMap::from([
+                (2, Target::Xusb(0)),
+                (5, Target::Xusb(1)),
+                (7, Target::Hid(6))
+            ])
+        );
+        assert_eq!(pads.take_rumble(), vec![], "parados al activarlos");
+
+        // Un juego hace vibrar el de la ranura 5: sale una vez, con el byte de XInput escalado.
+        device.set_rumble(1, 0x80, 0x40);
+        assert_eq!(pads.take_rumble(), vec![(5, Rumble::new(0x8080, 0x4040))]);
+        assert_eq!(pads.take_rumble(), vec![]);
+        // Lo mismo otra vez no es un cambio.
+        device.set_rumble(1, 0x80, 0x40);
+        assert_eq!(pads.take_rumble(), vec![]);
+        device.set_rumble(0, 0xFF, 0);
+        device.set_rumble(1, 0, 0);
+        assert_eq!(
+            pads.take_rumble(),
+            vec![(2, Rumble::new(0xFFFF, 0)), (5, Rumble::OFF)]
+        );
+
+        // Pasar a tal cual (Xbox por cable) con los motores en marcha los para, y el Xbox 360
+        // nuevo empieza parado.
+        let mut xbox = raw_device(GamepadTransport::XInput);
+        xbox.vendor = 0x045E;
+        xbox.product = 0x0B12;
+        pads.connect_raw(2, &xbox).unwrap();
+        assert_eq!(pads.take_rumble(), vec![(2, Rumble::OFF)]);
+        device.set_rumble(0, 0x10, 0x20);
+        assert_eq!(pads.take_rumble(), vec![(2, Rumble::new(0x1010, 0x2020))]);
+        // Y quitar la ranura vibrando, también.
+        pads.release(2).unwrap();
+        assert_eq!(pads.take_rumble(), vec![(2, Rumble::OFF)]);
+        // El genérico (sin Xbox 360) no tiene de dónde leerla.
+        assert_eq!(pads.take_rumble(), vec![]);
+    }
+
+    #[test]
+    fn the_rumble_answer_follows_the_header_structure() {
+        let read = XusbRumble::parse(&[0x34, 0x12, 0xFF, 0xFF, 7, 0, 0, 1]).unwrap();
+        assert_eq!(
+            read,
+            XusbRumble {
+                left: 0x1234,
+                right: 0xFFFF,
+                sequence: 0x0100_0007,
+            }
+        );
+        assert_eq!(read.rumble(), Rumble::new(0x1234, 0xFFFF));
+        assert!(XusbRumble::parse(&[0; 7]).is_err());
+        assert!(XusbRumble::parse(&[0; 9]).is_err());
     }
 }

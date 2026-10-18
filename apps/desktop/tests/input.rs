@@ -32,7 +32,9 @@ use coroom_session::capture::synthetic::SyntheticCapturer;
 use coroom_session::codec::{DecoderSet, EncoderSet};
 use coroom_session::input::gamepad::PadLink;
 use coroom_session::input::script::{InputScript, Step};
-use coroom_session::input::{GamepadAxis, GamepadButton, InputEvent, Recorded, RecordingSink};
+use coroom_session::input::{
+    GamepadAxis, GamepadButton, InputEvent, Recorded, RecordingSink, Rumble,
+};
 use coroom_session::latency::{InputLatency, LatencyLedger};
 use coroom_session::loopback::{LoopbackConfig, NullSink};
 use coroom_session::remote::{GuestStatus, PadTransport, RemoteSession};
@@ -1018,6 +1020,62 @@ fn i_vibration_reaches_only_the_guest_of_its_slot() {
     got_one.clear();
     got_one.extend(one.outputs());
     assert!(got_one.is_empty(), "{got_one:?}");
+
+    first.close();
+    second.close();
+    host.close();
+    drop(server);
+}
+
+#[test]
+fn i_rumble_reaches_only_the_guest_of_its_slot() {
+    let _serial = serial();
+    let server = TestServer::start();
+    let sink = RecordingSink::new();
+    let mut host = host(&server, &sink);
+    let code = room_code(&host);
+    let mut first = guest(&server, &code);
+    let first_id = connected(&host, &first, 0);
+    let mut second = guest(&server, &code);
+    let second_id = connected(&host, &second, 1);
+    let slot = |slot| Permissions {
+        gamepad_slot: Some(slot),
+        ..Permissions::VIEW_ONLY
+    };
+    allow(&mut host, &first, first_id, slot(2));
+    allow(&mut host, &second, second_id, slot(3));
+    wait_until("las ranuras 2 y 3", LIMIT, || {
+        sink.assigned_slots() == vec![2, 3]
+    });
+    let (one, two) = (first.input(), second.input());
+
+    // Los juegos del anfitrión hacen vibrar los dos mandos convertidos (y uno sin dueño): a cada
+    // invitado le llega el estado de los motores de su ranura, y solo eso.
+    sink.push_rumble(3, Rumble::new(0x1000, 0x2000));
+    sink.push_rumble(2, Rumble::new(0xFFFF, 0));
+    sink.push_rumble(4, Rumble::new(0x0101, 0x0101));
+    wait_until("la vibración de los dos", LIMIT, || {
+        one.rumble(2) == Rumble::new(0xFFFF, 0) && two.rumble(3) == Rumble::new(0x1000, 0x2000)
+    });
+    // En negativo, sin espera fija: los tres salen del sumidero en la misma tanda y en orden por
+    // el stream de cada uno, así que lo de la ranura 3, si llegase al primero, ya estaría.
+    assert_eq!(one.rumble(3), Rumble::OFF);
+    assert_eq!(two.rumble(2), Rumble::OFF);
+    assert_eq!(one.rumble(4), Rumble::OFF);
+
+    // El último estado manda, y la parada también llega.
+    sink.push_rumble(2, Rumble::new(0x4000, 0x4000));
+    sink.push_rumble(2, Rumble::OFF);
+    wait_until("la parada del primero", LIMIT, || {
+        one.rumble(2) == Rumble::OFF
+    });
+    assert_eq!(two.rumble(3), Rumble::new(0x1000, 0x2000), "el otro sigue");
+
+    // Sin ranura, lo que vibraba deja de valer (y no vuelve si se le da otra vez).
+    allow(&mut host, &second, second_id, Permissions::VIEW_ONLY);
+    assert_eq!(two.rumble(3), Rumble::OFF);
+    allow(&mut host, &second, second_id, slot(3));
+    assert_eq!(two.rumble(3), Rumble::OFF);
 
     first.close();
     second.close();

@@ -52,7 +52,7 @@ use coroom_input::gamepad::PadLink;
 use coroom_input::inject::{EisConnection, EisProvider, PointerArea};
 use coroom_input::script::ScriptTarget;
 use coroom_input::send::{InputLink, InputSender, SenderSnapshot};
-use coroom_input::{EventClass, InputError, InputEvent, InputSink};
+use coroom_input::{EventClass, InputError, InputEvent, InputSink, Rumble};
 use coroom_transport::PeerConnection;
 use coroom_transport::crypto::hpke::PairwiseSecret;
 use coroom_transport::crypto::input::{Channel, InputCipher, Role};
@@ -85,8 +85,9 @@ const MAX_NEGATIVE_US: i64 = 2_000;
 /// permisos, modo del mando) se publica al momento.
 const PUBLISH_PERIOD: Duration = Duration::from_millis(100);
 
-/// Con un mando tal cual, cada cuánto se recogen del sumidero sus informes de salida (vibración,
-/// luces) para el invitado.
+/// Con mandos asignados, cada cuánto se recogen del sumidero sus informes de salida (vibración,
+/// luces) y el estado de sus motores para el invitado (en Linux, es también lo que espera como
+/// mucho un juego que sube un efecto de vibración al mando uinput).
 const OUTPUTS_PERIOD: Duration = Duration::from_millis(5);
 
 /// Socket de EI de la captura (`coroom_capture::RemoteDesktopShare`) como proveedor de la inyección:
@@ -551,8 +552,9 @@ impl Worker {
             // Trabajo periódico del sumidero (repetición de teclas en Windows): se hace y acota la
             // espera.
             let tick = self.sink.tick(now);
-            // Con un mando tal cual, su vibración sale enseguida aunque no llegue nada.
-            let mut wait = if self.any_raw() {
+            // Con mandos, su vibración sale enseguida aunque no llegue nada (y en Linux los juegos
+            // que suben efectos esperan respuesta).
+            let mut wait = if self.any_pad() {
                 OUTPUTS_PERIOD
             } else {
                 PUBLISH_PERIOD
@@ -591,15 +593,16 @@ impl Worker {
         self.publish(true);
     }
 
-    /// Lo que no es un trabajo: la vigilancia de invitados callados, las salidas de los mandos
-    /// tal cual (cada [`OUTPUTS_PERIOD`]) y la publicación de estadísticas (cada
+    /// Lo que no es un trabajo: la vigilancia de invitados callados, las salidas y la vibración
+    /// de los mandos (cada [`OUTPUTS_PERIOD`]) y la publicación de estadísticas (cada
     /// [`PUBLISH_PERIOD`]).
     fn housekeeping(&mut self, now: Instant) {
         self.follow_sharing();
         self.expire_stale(now);
-        if self.any_raw() && now.saturating_duration_since(self.last_outputs) >= OUTPUTS_PERIOD {
+        if self.any_pad() && now.saturating_duration_since(self.last_outputs) >= OUTPUTS_PERIOD {
             self.last_outputs = now;
             self.forward_outputs();
+            self.forward_rumble();
         }
         let periodic = now.saturating_duration_since(self.last_publish) >= PUBLISH_PERIOD;
         if periodic {
@@ -1001,10 +1004,11 @@ impl Worker {
         }
     }
 
-    fn any_raw(&self) -> bool {
+    /// Si algún invitado tiene ranura de mando (con su mando virtual en el anfitrión).
+    fn any_pad(&self) -> bool {
         self.guests
             .values()
-            .any(|state| state.pad.as_ref().is_some_and(|pad| pad.active))
+            .any(|state| state.permissions.gamepad_slot.is_some())
     }
 
     /// Vibración y luces que el sistema mandó a los mandos tal cual, a su invitado.
@@ -1019,6 +1023,24 @@ impl Worker {
             });
             if let Some(guest) = owner {
                 self.command(Command::GamepadOutput { guest, slot, data });
+            }
+        }
+    }
+
+    /// Lo que los juegos pidieron a los motores de los mandos convertidos y de Xbox por cable, al
+    /// invitado de su ranura (al de ninguna, nada). Va también en pausa: es el juego, no el
+    /// invitado, quien la pide, y parar los motores tiene que llegar siempre.
+    fn forward_rumble(&mut self) {
+        for (slot, rumble) in self.sink.take_rumble() {
+            let owner = self.guests.iter().find_map(|(guest, state)| {
+                (state.permissions.gamepad_slot == Some(slot)).then_some(*guest)
+            });
+            if let Some(guest) = owner {
+                self.command(Command::GamepadRumble {
+                    guest,
+                    slot,
+                    rumble,
+                });
             }
         }
     }
@@ -1102,6 +1124,8 @@ struct GuestInputInner {
     pad_modes: Mutex<BTreeMap<u8, bool>>,
     /// Informes de salida del anfitrión para el mando (`GamepadOutput`), los más recientes.
     pad_outputs: Mutex<VecDeque<(u8, Vec<u8>)>>,
+    /// Lo que el anfitrión pide a los motores de cada ranura (`GamepadRumble`), el último.
+    pad_rumble: Mutex<BTreeMap<u8, Rumble>>,
 }
 
 /// Informes de salida del anfitrión que se guardan como mucho hasta que el hilo de mandos los
@@ -1157,6 +1181,8 @@ impl GuestInput {
     }
 
     pub(crate) fn set_allowed(&self, allowed: Allowed) {
+        // La vibración de una ranura que ya no es suya no vale (el anfitrión quitó ese mando).
+        lock(&self.inner.pad_rumble).retain(|slot, _| allowed.gamepad_slot == Some(*slot));
         *lock(&self.inner.allowed) = allowed;
     }
 
@@ -1174,6 +1200,8 @@ impl GuestInput {
         // Conexión nueva: el anfitrión vuelve a decir el modo de cada mando.
         lock(&self.inner.pad_modes).clear();
         lock(&self.inner.pad_outputs).clear();
+        // Y los motores se paran hasta que diga otra cosa (también al terminar la sesión).
+        lock(&self.inner.pad_rumble).clear();
     }
 
     /// Envía datos del mando tal cual al anfitrión (si la entrada ya está lista).
@@ -1196,6 +1224,15 @@ impl GuestInput {
             outputs.pop_front();
         }
         outputs.push_back((slot, data));
+    }
+
+    pub(crate) fn set_pad_rumble(&self, slot: u8, rumble: Rumble) {
+        let mut motors = lock(&self.inner.pad_rumble);
+        if rumble.is_on() {
+            motors.insert(slot, rumble);
+        } else {
+            motors.remove(&slot);
+        }
     }
 
     pub(crate) fn stop(&self) {
@@ -1228,6 +1265,13 @@ impl PadLink for GuestInput {
 
     fn outputs(&self) -> Vec<(u8, Vec<u8>)> {
         lock(&self.inner.pad_outputs).drain(..).collect()
+    }
+
+    fn rumble(&self, slot: u8) -> Rumble {
+        lock(&self.inner.pad_rumble)
+            .get(&slot)
+            .copied()
+            .unwrap_or(Rumble::OFF)
     }
 }
 

@@ -282,8 +282,9 @@ equipo del anfitrión, así que:
   informes de entrada de 512 bytes como máximo y solo para la ranura del propio invitado (lo de
   otra ranura se descarta y se cuenta); en pausa se quita el dispositivo, y al expulsar, quitar la
   ranura o desconectar el mando, también.
-- **Hacia el invitado** solo vuelven los informes de salida (vibración, luces) de su propio mando,
-  cifrados como el resto del control. Las peticiones `GET_REPORT` del sistema se contestan con los
+- **Hacia el invitado** solo vuelven los informes de salida (vibración, luces) de su propio mando
+  y, con el convertido o un Xbox por cable, el estado de sus dos motores (`GamepadRumble`, dos
+  números), cifrados como el resto del control. Las peticiones `GET_REPORT` del sistema se contestan con los
   informes de característica que mandó el invitado al conectar, sin ida y vuelta por la red.
 - El objetivo de fuzzing `proto_hid` cubre el parser (§3).
 

@@ -30,18 +30,26 @@
 //! ±32767 con Y hacia abajo; gatillos `ABS_Z/RZ` en 0..255; cruceta `ABS_HAT0X/Y`), así que SDL,
 //! Steam Input y los juegos lo reconocen. Los eventos de mando de un paquete van en **una sola
 //! trama** `SYN_REPORT` por ranura: un stick con `X` e `Y` cambiados llega al juego como una
-//! muestra, no como dos a medias. Sin *force feedback*. Si `/dev/uinput` no es accesible, el error
-//! explica la regla udev ([`UINPUT_HELP`]).
+//! muestra, no como dos a medias. Con vibración como la de `xpad`: *force feedback* `FF_RUMBLE`
+//! (y `FF_GAIN`) por el protocolo de uinput. El juego sube efectos (`UI_FF_UPLOAD`, que se le
+//! contestan desde el hilo `inject` en la siguiente vuelta, cada pocos ms con mandos asignados), los
+//! borra (`UI_FF_ERASE`) y los reproduce o para (`EV_FF` con el id y las repeticiones);
+//! [`UinputRumble`] lo convierte en el estado de los dos motores, con la duración de cada efecto,
+//! y [`InputSink::take_rumble`] da los cambios para el invitado de la ranura. Si `/dev/uinput` no
+//! es accesible, el error explica la regla udev ([`UINPUT_HELP`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use evdev::uinput::VirtualDevice;
-use evdev::{AbsInfo, AbsoluteAxisCode, AttributeSet, BusType, EventType, InputId, KeyCode};
+use evdev::{
+    AbsInfo, AbsoluteAxisCode, AttributeSet, BusType, EventSummary, EventType, FFEffectCode,
+    FFEffectKind, InputId, KeyCode, UInputCode,
+};
 use reis::ei;
 use reis::event::{DeviceCapability, EiEvent};
 use tracing::{debug, warn};
@@ -49,7 +57,9 @@ use tracing::{debug, warn};
 use super::uhid::UhidPad;
 use super::{EisConnection, EisProvider, InputSink, PadTracker, PointerArea, PressedKeys};
 use crate::keymap::evdev as codes;
-use crate::{EventClass, GamepadAxis, GamepadButton, GuestId, InputError, InputEvent, MouseButton};
+use crate::{
+    EventClass, GamepadAxis, GamepadButton, GuestId, InputError, InputEvent, MouseButton, Rumble,
+};
 use coroom_proto::input::{GamepadDevice, GamepadTransport};
 
 /// Qué hacer si `/dev/uinput` no es accesible.
@@ -671,7 +681,19 @@ struct VirtualPad {
     device: VirtualDevice,
     /// Cruceta: arriba, abajo, izquierda, derecha.
     dpad: [bool; 4],
+    /// Los efectos de vibración que le subió el juego.
+    rumble: UinputRumble,
+    /// Si ya se avisó de que no se puede leer su vibración (una vez por mando).
+    ff_warned: bool,
 }
+
+/// Efectos de vibración que puede tener subidos a la vez cada mando (los de `ff-memless`, el de
+/// `xpad`).
+pub const FF_EFFECTS_MAX: u32 = 16;
+
+/// Vueltas de lectura del protocolo de *force feedback* por llamada, como mucho (cada una lee
+/// hasta 32 eventos): lo que quede se lee en la siguiente.
+const FF_READS: usize = 8;
 
 fn uinput_error(err: std::io::Error) -> InputError {
     match err.kind() {
@@ -759,7 +781,151 @@ pub fn create_gamepad_as(identity: &PadIdentity) -> Result<VirtualDevice, InputE
             .with_absolute_axis(&evdev::UinputAbsSetup::new(axis, info))
             .map_err(uinput_error)?;
     }
+    let mut ff = AttributeSet::<FFEffectCode>::new();
+    ff.insert(FFEffectCode::FF_RUMBLE);
+    ff.insert(FFEffectCode::FF_GAIN);
+    builder = builder
+        .with_ff(&ff)
+        .map_err(uinput_error)?
+        .with_ff_effects_max(FF_EFFECTS_MAX);
     builder.build().map_err(uinput_error)
+}
+
+// --- Vibración (force feedback de uinput) ------------------------------------------------------
+
+/// Un efecto `FF_RUMBLE` subido por el juego.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RumbleEffect {
+    rumble: Rumble,
+    /// `replay.length`: lo que dura cada reproducción (cero: hasta que se pare).
+    length: Duration,
+    /// `replay.delay`: la espera antes de cada reproducción.
+    delay: Duration,
+}
+
+/// Un efecto que se está reproduciendo: desde cuándo y cuántas veces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Playing {
+    since: Instant,
+    count: u32,
+}
+
+/// El estado de los motores de un mando uinput a partir del protocolo de *force feedback*, sin
+/// tocar el dispositivo (lo lee [`VirtualPad::service_ff`]). Como `ff-memless`, el módulo de los
+/// mandos reales: los efectos que suenan se suman (saturando) escalados por la ganancia
+/// (`FF_GAIN`); cada reproducción espera su `delay` y dura su `length` (cero: hasta que se pare), y
+/// se repite las veces que diga `EV_FF`. Parar, borrar o que se acabe la última reproducción deja
+/// los motores en lo que sumen los demás (sin ninguno, parados).
+#[derive(Debug, Clone)]
+pub struct UinputRumble {
+    effects: BTreeMap<i16, RumbleEffect>,
+    playing: BTreeMap<i16, Playing>,
+    gain: u16,
+    /// Lo último que se dio con [`UinputRumble::poll`].
+    reported: Rumble,
+}
+
+impl Default for UinputRumble {
+    fn default() -> Self {
+        Self {
+            effects: BTreeMap::new(),
+            playing: BTreeMap::new(),
+            gain: u16::MAX,
+            reported: Rumble::OFF,
+        }
+    }
+}
+
+impl UinputRumble {
+    /// `UI_FF_UPLOAD`: el efecto `id` (nuevo o sustituido) con esos motores y su programación en
+    /// ms. Sustituir uno que suena cambia lo que suena sin reiniciarlo.
+    pub fn upload(&mut self, id: i16, rumble: Rumble, length_ms: u16, delay_ms: u16) {
+        self.effects.insert(
+            id,
+            RumbleEffect {
+                rumble,
+                length: Duration::from_millis(u64::from(length_ms)),
+                delay: Duration::from_millis(u64::from(delay_ms)),
+            },
+        );
+    }
+
+    /// `UI_FF_ERASE`: el efecto `id` deja de existir (y de sonar).
+    pub fn erase(&mut self, id: i16) {
+        self.effects.remove(&id);
+        self.playing.remove(&id);
+    }
+
+    /// `EV_FF` con el id de un efecto: lo reproduce `count` veces desde `now` (cero lo para).
+    pub fn play(&mut self, id: i16, count: i32, now: Instant) {
+        match u32::try_from(count) {
+            Ok(count) if count > 0 && self.effects.contains_key(&id) => {
+                self.playing.insert(id, Playing { since: now, count });
+            }
+            _ => {
+                self.playing.remove(&id);
+            }
+        }
+    }
+
+    /// `EV_FF` con `FF_GAIN`: la ganancia de todos los efectos (`0xFFFF` es la de partida).
+    pub fn set_gain(&mut self, gain: i32) {
+        self.gain = u16::try_from(gain.clamp(0, i32::from(u16::MAX))).unwrap_or(u16::MAX);
+    }
+
+    /// Lo que suman los efectos que suenan en `now`; quita los que ya acabaron.
+    pub fn current(&mut self, now: Instant) -> Rumble {
+        let effects = &self.effects;
+        self.playing.retain(|id, playing| {
+            effects
+                .get(id)
+                .is_some_and(|effect| Self::phase(effect, playing, now).is_some())
+        });
+        let gain = u32::from(self.gain);
+        let scale = |value: u16| u32::from(value) * gain / u32::from(u16::MAX);
+        let (mut strong, mut weak) = (0u32, 0u32);
+        for (id, playing) in &self.playing {
+            let Some(effect) = self.effects.get(id) else {
+                continue;
+            };
+            if Self::phase(effect, playing, now) == Some(true) {
+                strong += scale(effect.rumble.strong);
+                weak += scale(effect.rumble.weak);
+            }
+        }
+        let saturate = |value: u32| u16::try_from(value).unwrap_or(u16::MAX);
+        Rumble::new(saturate(strong), saturate(weak))
+    }
+
+    /// `None` si la reproducción ya acabó; si no, si suena en `now` (`false`: en su `delay`).
+    fn phase(effect: &RumbleEffect, playing: &Playing, now: Instant) -> Option<bool> {
+        let elapsed = now.saturating_duration_since(playing.since);
+        if effect.length.is_zero() {
+            // Sin duración: suena desde su `delay` hasta que lo paren.
+            return Some(elapsed >= effect.delay);
+        }
+        let period = effect.length + effect.delay;
+        let round = elapsed.as_nanos() / period.as_nanos();
+        if round >= u128::from(playing.count) {
+            return None;
+        }
+        let into = elapsed.as_nanos() % period.as_nanos();
+        Some(into >= effect.delay.as_nanos())
+    }
+
+    /// El estado de los motores en `now` si cambió desde la última vez.
+    pub fn poll(&mut self, now: Instant) -> Option<Rumble> {
+        let current = self.current(now);
+        (current != self.reported).then(|| {
+            self.reported = current;
+            current
+        })
+    }
+
+    /// Lo último que se dio con [`UinputRumble::poll`].
+    pub fn reported(&self) -> Rumble {
+        self.reported
+    }
 }
 
 fn button_code(button: GamepadButton) -> Option<KeyCode> {
@@ -802,6 +968,77 @@ pub fn axis_value(axis: GamepadAxis, value: i16) -> (AbsoluteAxisCode, i32) {
 }
 
 impl VirtualPad {
+    fn new(device: VirtualDevice) -> Self {
+        Self {
+            device,
+            dpad: [false; 4],
+            rumble: UinputRumble::default(),
+            ff_warned: false,
+        }
+    }
+
+    /// Atiende sin bloquear lo que el juego mandó al mando (subidas y borrados de efectos, que lo
+    /// esperan, y reproducciones) y devuelve el estado de los motores si cambió.
+    fn service_ff(&mut self, now: Instant) -> Result<Option<Rumble>, InputError> {
+        let failed =
+            |err: std::io::Error| InputError::Backend(format!("uinput (vibración): {err}"));
+        for _ in 0..FF_READS {
+            let mut fds = [rustix::event::PollFd::new(
+                &self.device,
+                rustix::event::PollFlags::IN,
+            )];
+            let ready = rustix::event::poll(&mut fds, Some(&rustix::event::Timespec::default()))
+                .map_err(|err| failed(err.into()))?;
+            if ready == 0 {
+                break;
+            }
+            let events: Vec<evdev::InputEvent> =
+                self.device.fetch_events().map_err(failed)?.collect();
+            if events.is_empty() {
+                break;
+            }
+            for event in events {
+                match event.destructure() {
+                    EventSummary::UInput(request, UInputCode::UI_FF_UPLOAD, _) => {
+                        let mut upload = self.device.process_ff_upload(request).map_err(failed)?;
+                        let effect = upload.effect();
+                        match effect.kind {
+                            FFEffectKind::Rumble {
+                                strong_magnitude,
+                                weak_magnitude,
+                            } => {
+                                self.rumble.upload(
+                                    upload.effect_id(),
+                                    Rumble::new(strong_magnitude, weak_magnitude),
+                                    effect.replay.length,
+                                    effect.replay.delay,
+                                );
+                                upload.set_retval(0);
+                            }
+                            // El mando solo declara `FF_RUMBLE`: el kernel no deja subir otros.
+                            _ => upload.set_retval(-rustix::io::Errno::INVAL.raw_os_error()),
+                        }
+                        // Al soltar `upload` se contesta al juego (`UI_END_FF_UPLOAD`).
+                    }
+                    EventSummary::UInput(request, UInputCode::UI_FF_ERASE, _) => {
+                        let erase = self.device.process_ff_erase(request).map_err(failed)?;
+                        self.rumble
+                            .erase(i16::try_from(erase.effect_id()).unwrap_or(-1));
+                    }
+                    EventSummary::ForceFeedback(_, FFEffectCode::FF_GAIN, value) => {
+                        self.rumble.set_gain(value);
+                    }
+                    EventSummary::ForceFeedback(_, code, value) => {
+                        self.rumble
+                            .play(i16::try_from(code.0).unwrap_or(-1), value, now);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(self.rumble.poll(now))
+    }
+
     /// Añade a `out` los eventos evdev de `event` (sin `SYN_REPORT`).
     fn queue(&mut self, event: &InputEvent, out: &mut Vec<evdev::InputEvent>) {
         match *event {
@@ -876,6 +1113,9 @@ pub struct LinuxSink {
     raw: BTreeMap<u8, UhidPad>,
     /// Ranuras con un `VirtualPad` que lleva la identidad del mando XInput del invitado.
     xinput: BTreeSet<u8>,
+    /// Paradas de los motores de mandos que se quitaron o sustituyeron vibrando, para la próxima
+    /// [`InputSink::take_rumble`].
+    rumble_stops: Vec<(u8, Rumble)>,
     pressed: PressedKeys,
     pad_state: PadTracker,
     /// Eventos de teclado y ratón que hay que escribir de un grupo (reutilizado).
@@ -892,6 +1132,7 @@ impl LinuxSink {
             pads: BTreeMap::new(),
             raw: BTreeMap::new(),
             xinput: BTreeSet::new(),
+            rumble_stops: Vec::new(),
             pressed: PressedKeys::default(),
             pad_state: PadTracker::default(),
             kbm_scratch: Vec::with_capacity(64),
@@ -945,6 +1186,13 @@ impl LinuxSink {
                 errors.push(err);
                 0
             }
+        }
+    }
+
+    /// Un mando que se va (o se sustituye) con los motores en marcha: el invitado los para.
+    fn retire(&mut self, slot: u8, pad: Option<VirtualPad>) {
+        if pad.is_some_and(|pad| pad.rumble.reported().is_on()) {
+            self.rumble_stops.push((slot, Rumble::OFF));
         }
     }
 
@@ -1105,13 +1353,7 @@ impl InputSink for LinuxSink {
             return Ok(());
         }
         let device = create_gamepad(slot)?;
-        self.pads.insert(
-            slot,
-            VirtualPad {
-                device,
-                dpad: [false; 4],
-            },
-        );
+        self.pads.insert(slot, VirtualPad::new(device));
         Ok(())
     }
 
@@ -1120,7 +1362,10 @@ impl InputSink for LinuxSink {
         self.xinput.remove(&slot);
         let raw = self.raw.remove(&slot).is_some();
         match self.pads.remove(&slot) {
-            Some(_) => Ok(()),
+            Some(pad) => {
+                self.retire(slot, Some(pad));
+                Ok(())
+            }
             None if raw => Ok(()),
             None => Err(InputError::NoSuchSlot(slot)),
         }
@@ -1135,7 +1380,8 @@ impl InputSink for LinuxSink {
                 let pad = UhidPad::create(slot, device)?;
                 // El convertido se quita solo cuando el tal cual ya existe.
                 self.pad_state.forget(slot);
-                self.pads.remove(&slot);
+                let old = self.pads.remove(&slot);
+                self.retire(slot, old);
                 self.xinput.remove(&slot);
                 self.raw.insert(slot, pad);
                 Ok(())
@@ -1150,13 +1396,8 @@ impl InputSink for LinuxSink {
                 let created = create_gamepad_as(&identity)?;
                 self.pad_state.forget(slot);
                 self.raw.remove(&slot);
-                self.pads.insert(
-                    slot,
-                    VirtualPad {
-                        device: created,
-                        dpad: [false; 4],
-                    },
-                );
+                let old = self.pads.insert(slot, VirtualPad::new(created));
+                self.retire(slot, old);
                 self.xinput.insert(slot);
                 Ok(())
             }
@@ -1177,13 +1418,8 @@ impl InputSink for LinuxSink {
         if was_raw || was_xinput {
             self.pad_state.forget(slot);
             let device = create_gamepad(slot)?;
-            self.pads.insert(
-                slot,
-                VirtualPad {
-                    device,
-                    dpad: [false; 4],
-                },
-            );
+            let old = self.pads.insert(slot, VirtualPad::new(device));
+            self.retire(slot, old);
         }
         Ok(())
     }
@@ -1193,6 +1429,22 @@ impl InputSink for LinuxSink {
             .iter()
             .flat_map(|(slot, pad)| pad.take_outputs().into_iter().map(|data| (*slot, data)))
             .collect()
+    }
+
+    fn take_rumble(&mut self) -> Vec<(u8, Rumble)> {
+        let now = Instant::now();
+        let mut out = std::mem::take(&mut self.rumble_stops);
+        for (slot, pad) in &mut self.pads {
+            match pad.service_ff(now) {
+                Ok(Some(rumble)) => out.push((*slot, rumble)),
+                Ok(None) => {}
+                Err(err) if !std::mem::replace(&mut pad.ff_warned, true) => warn!(
+                    "mando virtual de la ranura {slot}: {err}; su vibración no llega al invitado"
+                ),
+                Err(err) => debug!(slot, error = %err, "vibración del mando virtual"),
+            }
+        }
+        out
     }
 
     fn prepare(&mut self) {
@@ -1403,6 +1655,158 @@ mod tests {
         }
     }
 
+    const MS: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn a_rumble_effect_plays_for_its_length_and_stops() {
+        let t0 = Instant::now();
+        let mut ff = UinputRumble::default();
+        assert_eq!(ff.poll(t0), None, "sin efectos, parados");
+        ff.upload(0, Rumble::new(0x8000, 0x4000), 100, 0);
+        assert_eq!(ff.poll(t0), None, "subido no suena hasta reproducirlo");
+        ff.play(0, 1, t0);
+        assert_eq!(ff.poll(t0), Some(Rumble::new(0x8000, 0x4000)));
+        assert_eq!(ff.poll(t0 + 50 * MS), None, "sigue igual");
+        // Se acaba su `replay.length`: el juego no manda nada más y los motores se paran.
+        assert_eq!(ff.poll(t0 + 100 * MS), Some(Rumble::OFF));
+        assert!(ff.playing.is_empty());
+        // Otra vez, y parado a mano antes de acabar.
+        ff.play(0, 1, t0 + 200 * MS);
+        assert_eq!(ff.poll(t0 + 200 * MS), Some(Rumble::new(0x8000, 0x4000)));
+        ff.play(0, 0, t0 + 210 * MS);
+        assert_eq!(ff.poll(t0 + 210 * MS), Some(Rumble::OFF));
+        assert_eq!(ff.reported(), Rumble::OFF);
+    }
+
+    #[test]
+    fn an_endless_effect_waits_its_delay_and_plays_until_stopped_or_erased() {
+        let t0 = Instant::now();
+        let mut ff = UinputRumble::default();
+        ff.upload(3, Rumble::new(0xFFFF, 0), 0, 20);
+        ff.play(3, 1, t0);
+        assert_eq!(ff.poll(t0 + 10 * MS), None, "en su delay, parados");
+        assert_eq!(ff.poll(t0 + 20 * MS), Some(Rumble::new(0xFFFF, 0)));
+        assert_eq!(
+            ff.poll(t0 + 60_000 * MS),
+            None,
+            "sin duración, hasta que lo paren"
+        );
+        // Sustituirlo mientras suena cambia lo que suena sin reiniciar la espera.
+        ff.upload(3, Rumble::new(0x1000, 0x2000), 0, 20);
+        assert_eq!(ff.poll(t0 + 60_001 * MS), Some(Rumble::new(0x1000, 0x2000)));
+        // Borrarlo (el juego cerró el mando) lo para.
+        ff.erase(3);
+        assert_eq!(ff.poll(t0 + 60_002 * MS), Some(Rumble::OFF));
+        // Reproducir un efecto que no existe no hace nada.
+        ff.play(3, 1, t0 + 60_003 * MS);
+        assert_eq!(ff.poll(t0 + 60_003 * MS), None);
+    }
+
+    #[test]
+    fn repeated_effects_pause_in_their_delay_and_end_after_the_count() {
+        let t0 = Instant::now();
+        let mut ff = UinputRumble::default();
+        ff.upload(1, Rumble::new(0x3000, 0x3000), 50, 10);
+        ff.play(1, 2, t0);
+        let on = Rumble::new(0x3000, 0x3000);
+        assert_eq!(ff.current(t0 + 5 * MS), Rumble::OFF);
+        assert_eq!(ff.current(t0 + 10 * MS), on);
+        assert_eq!(ff.current(t0 + 59 * MS), on);
+        assert_eq!(ff.current(t0 + 65 * MS), Rumble::OFF, "segundo delay");
+        assert_eq!(ff.current(t0 + 70 * MS), on, "segunda vez");
+        assert_eq!(ff.current(t0 + 119 * MS), on);
+        assert_eq!(ff.current(t0 + 120 * MS), Rumble::OFF, "acabaron las dos");
+        assert!(ff.playing.is_empty());
+    }
+
+    #[test]
+    fn effects_add_up_saturating_and_follow_the_gain() {
+        let t0 = Instant::now();
+        let mut ff = UinputRumble::default();
+        ff.upload(0, Rumble::new(0xC000, 0x1000), 0, 0);
+        ff.upload(1, Rumble::new(0x8000, 0x2000), 0, 0);
+        ff.play(0, 1, t0);
+        ff.play(1, 1, t0);
+        assert_eq!(ff.poll(t0), Some(Rumble::new(0xFFFF, 0x3000)));
+        // `FF_GAIN` a la mitad escala cada efecto antes de sumarlos.
+        ff.set_gain(0x8000);
+        let half = |value: u32| (value * 0x8000 / 0xFFFF) as u16;
+        assert_eq!(
+            ff.poll(t0),
+            Some(Rumble::new(
+                half(0xC000) + half(0x8000),
+                half(0x1000) + half(0x2000)
+            ))
+        );
+        ff.set_gain(-5);
+        assert_eq!(
+            ff.poll(t0),
+            Some(Rumble::OFF),
+            "ganancia cero (y fuera de rango)"
+        );
+        ff.set_gain(i32::MAX);
+        ff.play(0, 0, t0);
+        assert_eq!(
+            ff.poll(t0),
+            Some(Rumble::new(0x8000, 0x2000)),
+            "queda el otro"
+        );
+    }
+
+    /// Crea un mando uinput real, le mueve los motores como el invitado ([`EvdevMotors`], en otro
+    /// hilo: la subida espera a que el mando la conteste) y comprueba que el mando lo convierte en
+    /// los motores.
+    #[test]
+    #[ignore = "necesita acceso a /dev/uinput (regla udev de coroom)"]
+    fn a_real_uinput_gamepad_tells_the_rumble_a_game_plays() {
+        use crate::gamepad::{EvdevMotors, Motors};
+        let mut device = create_gamepad(4).expect("mando uinput");
+        let node = device
+            .enumerate_dev_nodes_blocking()
+            .expect("nodos")
+            .filter_map(Result::ok)
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("event"))
+            })
+            .expect("nodo /dev/input/event*");
+        let mut pad = VirtualPad::new(device);
+        let (step, next) = mpsc::channel::<()>();
+        // El «juego» es el invitado moviendo los motores de su mando: el mismo camino de ida y
+        // vuelta de un mando convertido.
+        let game = thread::spawn(move || {
+            let mut motors = EvdevMotors::new(&node);
+            motors.set(Rumble::new(0xC000, 0x2000)).expect("vibrar");
+            next.recv().expect("paso");
+            motors.set(Rumble::OFF).expect("parar");
+            next.recv().expect("paso");
+            // Soltarlo lo borra (`UI_FF_ERASE`, que también espera respuesta).
+            drop(motors);
+        });
+        let wait_for = |pad: &mut VirtualPad, wanted: Rumble| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if pad.service_ff(Instant::now()).expect("leer") == Some(wanted) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "no llegó {wanted:?}");
+                thread::sleep(MS);
+            }
+        };
+        wait_for(&mut pad, Rumble::new(0xC000, 0x2000));
+        step.send(()).expect("paso");
+        wait_for(&mut pad, Rumble::OFF);
+        step.send(()).expect("paso");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !game.is_finished() {
+            pad.service_ff(Instant::now()).expect("leer");
+            assert!(Instant::now() < deadline, "el borrado no terminó");
+            thread::sleep(MS);
+        }
+        game.join().expect("hilo del juego");
+        assert!(pad.rumble.effects.is_empty(), "borrado");
+    }
+
     /// Crea un mando uinput real y comprueba con `evdev` que se presenta como un mando de Xbox 360.
     #[test]
     #[ignore = "necesita acceso a /dev/uinput (regla udev de coroom)"]
@@ -1427,10 +1831,9 @@ mod tests {
         assert!(
             axes.contains(AbsoluteAxisCode::ABS_RZ) && axes.contains(AbsoluteAxisCode::ABS_HAT0Y)
         );
-        let mut pad = VirtualPad {
-            device,
-            dpad: [false; 4],
-        };
+        let ff = opened.supported_ff().expect("vibración");
+        assert!(ff.contains(FFEffectCode::FF_RUMBLE) && ff.contains(FFEffectCode::FF_GAIN));
+        let mut pad = VirtualPad::new(device);
         pad.emit(&InputEvent::GamepadButton {
             slot: 3,
             button: GamepadButton::A,

@@ -2985,6 +2985,20 @@ async fn run_host(
                 Some(Command::GamepadOutput { guest, slot, data }) => {
                     ctx.send_to_guest(guest, &ControlMessage::GamepadOutput { slot, data });
                 }
+                Some(Command::GamepadRumble {
+                    guest,
+                    slot,
+                    rumble,
+                }) => {
+                    ctx.send_to_guest(
+                        guest,
+                        &ControlMessage::GamepadRumble {
+                            slot,
+                            strong: rumble.strong,
+                            weak: rumble.weak,
+                        },
+                    );
+                }
                 Some(Command::Video(change)) => ctx.change_video(change),
                 Some(Command::Chat(text)) => ctx.chat_from_host(text),
                 Some(Command::ChatClear) => ctx.chat_clear(),

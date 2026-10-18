@@ -10,7 +10,8 @@ dispositivo:
   Pro, 8BitDo…), con sus botones extra, y la vibración y las luces vuelven al mando del invitado.
 - **Mandos de Xbox 360** (cuatro, para XInput): los mandos **convertidos** van a ellos, así que los
   ven también los juegos que solo usan XInput, y un mando de Xbox por cable del invitado llega con
-  su VID/PID. Responden a los IOCTL de `xusb22` como un mando por cable; las disposiciones, que
+  su VID/PID. Responden a los IOCTL de `xusb22` como un mando por cable, y la vibración que les
+  piden los juegos (`XInputSetState`) vuelve al mando del invitado; las disposiciones, que
   Microsoft no documenta, siguen a [HIDMaestro](https://hidmaestro.org/) (MIT).
 
 `coroom host` lo usa solo: al dar una ranura (`allow N pad RANURA`) el invitado tiene su mando, y
@@ -52,7 +53,10 @@ coroom.exe ──DeviceIoControl──▶ Root\coroomvhid  «Mandos virtuales de
   cerrar el handle (o morir `coroom`) el driver quita todos sus mandos.
 - **Mandos de Xbox 360** (`Root\coroomxusb`, cuatro, cada uno con su ranura en `CoroomSlot`): su
   interfaz XUSB solo está activa mientras `coroom` los usa, así que los juegos no ven mandos
-  fantasma. El que los activa es su dueño: otro programa no puede mandarles estados.
+  fantasma. El que los activa es su dueño: otro programa no puede mandarles estados ni leer su
+  vibración. Cada uno guarda la última vibración que le pidió un juego (`IOCTL_XUSB_SET_STATE`)
+  hasta que `coroom` la lee (`COROOM_VHID_IOCTL_XUSB_RUMBLE`, cada pocos ms) y la manda al
+  invitado de la ranura.
 - **Qué va a cada uno**: un mando convertido, al primer Xbox 360 libre y, si no queda ninguno, a un
   mando HID genérico ([`report_descriptor.inc`](report_descriptor.inc)); un mando HID tal cual, a
   un mando VHF con su identidad; un Xbox por cable tal cual, a un Xbox 360 con su VID/PID.
@@ -65,7 +69,8 @@ coroom.exe ──DeviceIoControl──▶ Root\coroomvhid  «Mandos virtuales de
 - **Permisos** (en el INF): el dispositivo de control, solo SYSTEM, administradores y el usuario
   con la sesión iniciada (`D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`); los Xbox 360, cualquiera
   (los abren los juegos), pero sus órdenes privadas solo valen para quien los activó.
-- La interfaz está en [`coroom_vhid.h`](coroom_vhid.h) (protocolo 3). Los tests de
+- La interfaz está en [`coroom_vhid.h`](coroom_vhid.h) (protocolo 4; el 4 añade la vibración de
+  los Xbox 360). Los tests de
   `coroom-input` (`crates/input/src/inject/windows_vhid.rs`) leen la cabecera, el descriptor, el INF
   y los scripts y comprueban que el cliente de Rust dice lo mismo campo a campo.
 
@@ -80,7 +85,8 @@ coroom.exe ──DeviceIoControl──▶ Root\coroomvhid  «Mandos virtuales de
 
 Los mandos tal cual se presentan siempre como **USB**, aunque el del invitado vaya por Bluetooth
 (SDL decide el modo USB o Bluetooth de un DualSense o un Switch Pro por el bus). La vibración de
-los Xbox 360 todavía no vuelve al invitado.
+los Xbox 360 vuelve al invitado como el estado de sus dos motores, y allí la aplica a su mando
+(sea cual sea): con su nodo `evdev` en Linux y con `gilrs` en Windows.
 
 ## Firma
 
@@ -158,8 +164,10 @@ descomprimido:
 3. Crea el dispositivo de control y los cuatro Xbox 360 y ejecuta
    `pnputil /add-driver coroomvhid.inf /install`.
 
-`coroom doctor` debe decir «mandos: driver coroomvhid (protocolo 3): mandos tal cual (HID) y 4
-mandos de Xbox 360». En el Administrador de dispositivos, «Dispositivos del sistema», aparecen
+`coroom doctor` debe decir «mandos: driver coroomvhid (protocolo 4): mandos tal cual (HID) y 4
+mandos de Xbox 360». Un `coroom` nuevo con el driver de antes (protocolo 3) lo dice y no usa los
+mandos: **al actualizar coroom, vuelve a ejecutar `install.ps1`** con el paquete del driver de
+esa versión. En el Administrador de dispositivos, «Dispositivos del sistema», aparecen
 «Mandos virtuales de coroom» y cuatro «Mando de Xbox 360 de coroom»; los mandos de los invitados
 aparecen y desaparecen mientras `coroom` comparte. **Al actualizar desde un driver del protocolo 2
 (un mando raíz por ranura), vuelve a ejecutar `install.ps1`**: quita los mandos antiguos.
@@ -185,7 +193,8 @@ x64 en un runner de Windows Server 2025 con `install.ps1`, comprueba que el disp
 y los cuatro Xbox 360 arrancan y ejecuta
 [`crates/input/tests/windows_driver.rs`](../../crates/input/tests/windows_driver.rs) con el
 cliente de coroom: un segundo cliente no puede abrir el driver; un convertido es un Xbox 360 que
-XInput ve con los botones que se mandan; un tal cual aparece como HID con su VID/PID, contesta sus
+XInput ve con los botones que se mandan y cuya vibración (`XInputSetState`) vuelve al cliente; un
+tal cual aparece como HID con su VID/PID, contesta sus
 características con las del invitado, entrega sus informes y devuelve las salidas que le escribe
 Windows; sin Xbox 360 libres sale el genérico; al cerrar no queda ningún mando. Después,
 `uninstall.ps1` y comprueba que no quedan dispositivos, paquete ni certificados.
@@ -196,7 +205,8 @@ Windows 11 y en Windows 10 22H2, con el arranque seguro y la integridad de memor
 1. `install.ps1` sin errores ni avisos y `coroom doctor`.
 2. **Convertido**: `coroom host --auto-allow pad` y un invitado con mando, con «Convertido a Xbox
    360»: en `joy.cpl` aparece un mando de Xbox 360 que mueve ejes, botones y cruceta; un juego que
-   solo use XInput lo usa sin Steam.
+   solo use XInput lo usa sin Steam, y su vibración llega al mando del invitado (también con un
+   juego de Windows.Gaming.Input).
 3. **Tal cual**: un invitado con un DualSense, un Switch Pro o un 8BitDo, en «Tal cual»: en
    `joy.cpl` aparece con su nombre; Steam lo reconoce como ese mando (*Ajustes → Mando*), con sus
    botones extra; la vibración de un juego llega al mando del invitado.
@@ -217,7 +227,8 @@ Anota los resultados (versión de Windows, arquitectura, mandos, juegos) en un i
 - **En un equipo de escritorio** (la lista de arriba): la CI lo prueba en Windows Server 2025 x64,
   sin juegos ni Steam; ARM64 solo se compila.
 - **Los IOCTL de `xusb22`**: no están documentados; se siguen los valores de HIDMaestro. XInput los
-  acepta en la CI (estado y botones); vibración y Windows.Gaming.Input, sin probar.
+  acepta en la CI (estado, botones y la vibración de `XInputSetState`); la vibración que manda
+  Windows.Gaming.Input, sin probar.
 - **Mandos que preguntan al PC**: un Switch Pro manda subcomandos y espera respuesta por informes
   de entrada; hoy esas preguntas llegan al mando del invitado como salidas y su respuesta vuelve
   como un informe más, con la latencia de la red. Si algún mando no lo tolera, irá convertido.

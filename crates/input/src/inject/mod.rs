@@ -8,7 +8,9 @@
 //! ranura ([`InputSink::assign_gamepad`] / [`InputSink::release_gamepad`]). Un mando **tal cual**
 //! ([`InputSink::connect_raw`]) sustituye al de la ranura por uno idéntico al del invitado (UHID o
 //! uinput con su identidad en Linux); el sumidero que no sepa, lo rechaza y la sesión sigue con el
-//! convertido.
+//! convertido. Lo que el sistema manda de vuelta a los mandos sale por [`InputSink::take_outputs`]
+//! (informes de salida de los HID tal cual) y [`InputSink::take_rumble`] (los motores de los de
+//! Xbox 360, convertidos o de Xbox por cable).
 //!
 //! Backends: [`linux`] (feature `linux-portal`: libei por el portal `RemoteDesktop` y uinput),
 //! [`windows`] (feature `windows-sendinput`: `SendInput`; los mandos por el driver propio de
@@ -20,7 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::keymap::evdev as codes;
-use crate::{GamepadAxis, GamepadButton, GuestId, InputError, InputEvent, MouseButton};
+use crate::{GamepadAxis, GamepadButton, GuestId, InputError, InputEvent, MouseButton, Rumble};
 use coroom_proto::input::{GamepadDevice, GamepadTransport};
 
 #[cfg(all(target_os = "linux", feature = "linux-portal"))]
@@ -118,6 +120,16 @@ pub trait InputSink: Send {
     /// Informes de salida (vibración, luces) que el driver del anfitrión mandó a los mandos tal
     /// cual desde la última llamada: ranura y bytes.
     fn take_outputs(&mut self) -> Vec<(u8, Vec<u8>)> {
+        Vec::new()
+    }
+
+    /// Cambios de los motores de vibración que los juegos pidieron a los mandos de Xbox 360 del
+    /// anfitrión (los convertidos y los de Xbox por cable tal cual; los HID tal cual mandan la
+    /// suya en [`InputSink::take_outputs`]) desde la última llamada, por ranura y en orden. Un
+    /// mando que se quita o se sustituye con los motores en marcha deja un [`Rumble::OFF`]. La
+    /// sesión la llama a menudo con mandos asignados (en Linux, también para contestar a tiempo
+    /// a los juegos que suben efectos).
+    fn take_rumble(&mut self) -> Vec<(u8, Rumble)> {
         Vec::new()
     }
 }
@@ -573,6 +585,7 @@ struct RecordingState {
     raw: BTreeSet<u8>,
     raw_unsupported: bool,
     outputs: Vec<(u8, Vec<u8>)>,
+    rumble: Vec<(u8, Rumble)>,
     /// Tamaño de cada grupo recibido por [`InputSink::inject_batch`].
     batches: Vec<usize>,
 }
@@ -646,6 +659,11 @@ impl RecordingSink {
     /// Simula un informe de salida del driver del anfitrión para el mando tal cual de `slot`.
     pub fn push_output(&self, slot: u8, data: Vec<u8>) {
         self.lock().outputs.push((slot, data));
+    }
+
+    /// Simula lo que un juego del anfitrión pide a los motores del mando de `slot`.
+    pub fn push_rumble(&self, slot: u8, rumble: Rumble) {
+        self.lock().rumble.push((slot, rumble));
     }
 
     /// Espera hasta que `condition` se cumpla sobre el registro o pase `timeout`; devuelve si se
@@ -764,6 +782,10 @@ impl InputSink for RecordingSink {
 
     fn take_outputs(&mut self) -> Vec<(u8, Vec<u8>)> {
         std::mem::take(&mut self.lock().outputs)
+    }
+
+    fn take_rumble(&mut self) -> Vec<(u8, Rumble)> {
+        std::mem::take(&mut self.lock().rumble)
     }
 }
 
