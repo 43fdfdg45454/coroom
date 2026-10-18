@@ -60,6 +60,8 @@ pub struct RelayInfo {
     pub trust: ServerTrust,
     /// Token del `RelayToken`.
     pub token: Vec<u8>,
+    /// Límite de vídeo por sala del `RelayToken` en kbit/s (`0` = sin límite).
+    pub max_kbps: u32,
     /// Papel con el que se entra.
     pub role: Role,
 }

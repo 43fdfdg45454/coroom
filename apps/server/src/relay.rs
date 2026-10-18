@@ -18,7 +18,10 @@
 //!   anfitrión** de la sala ([`Grant::host_user`]); los bytes de datagramas que reenvía la sala se
 //!   cargan a ese usuario ([`Quota`]) y, si agota su cuota mensual, el relay corta la sala y lo
 //!   avisa a la señalización ([`Relay::set_exceeded_sender`]). `COROOM_RELAY_MAX_KBPS` limita cada
-//!   sala con un cubo de fichas: lo que pasa del límite se descarta y se cuenta.
+//!   sala con un cubo de fichas: lo que pasa del límite se descarta y se cuenta. El vídeo del
+//!   anfitrión y lo que suben los invitados van en cubos separados (los `Feedback` y `Nack` de un
+//!   invitado no se pierden porque el vídeo vació el cubo), y el límite viaja en el `RelayToken`
+//!   para que el anfitrión no apunte por encima.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -174,7 +177,10 @@ struct RelayRoom {
     guests: HashMap<PeerId, quinn::Connection>,
     cache: GroupCache,
     bytes: u64,
+    /// Vídeo del anfitrión.
     bucket: Option<Bucket>,
+    /// Lo que suben los invitados (entrada, voz, `Feedback`, `Nack`), con el mismo límite.
+    uplink: Option<Bucket>,
     dropped: u64,
 }
 
@@ -186,18 +192,27 @@ impl RelayRoom {
             cache: GroupCache::default(),
             bytes: 0,
             bucket: (max_kbps > 0).then(|| Bucket::new(max_kbps)),
+            uplink: (max_kbps > 0).then(|| Bucket::new(max_kbps)),
             dropped: 0,
         }
     }
 
-    /// Pasa el límite de la sala; si no, cuenta el descarte.
+    /// El vídeo del anfitrión pasa el límite de la sala; si no, cuenta el descarte.
     fn admit(&mut self, bytes: usize) -> bool {
-        let allowed = self
-            .bucket
+        Self::pass(&mut self.bucket, &mut self.dropped, bytes)
+    }
+
+    /// Un datagrama de un invitado pasa el límite de la sala; si no, cuenta el descarte.
+    fn admit_uplink(&mut self, bytes: usize) -> bool {
+        Self::pass(&mut self.uplink, &mut self.dropped, bytes)
+    }
+
+    fn pass(bucket: &mut Option<Bucket>, dropped: &mut u64, bytes: usize) -> bool {
+        let allowed = bucket
             .as_mut()
             .is_none_or(|bucket| bucket.allow(bytes, Instant::now()));
         if !allowed {
-            self.dropped += 1;
+            *dropped += 1;
         }
         allowed
     }
@@ -248,6 +263,11 @@ impl Relay {
             max_kbps,
             ..Self::default()
         })
+    }
+
+    /// Límite de vídeo por sala en kbit/s (`0` = sin límite).
+    pub fn max_kbps(&self) -> u32 {
+        self.max_kbps
     }
 
     /// A dónde se avisa (con el id de la sala) cuando una sala se corta por la cuota.
@@ -493,7 +513,7 @@ impl Relay {
             let conn = conn.clone();
             tokio::spawn(async move {
                 while let Ok(datagram) = conn.read_datagram().await {
-                    if !relay.admit(grant.room, datagram.len()) {
+                    if !relay.admit_uplink(grant.room, datagram.len()) {
                         continue;
                     }
                     // Un datagrama de control lleva en `group` la etiqueta del invitado (su id de
@@ -551,14 +571,14 @@ impl Relay {
     }
 
     /// Un datagrama de un invitado pasa el límite de la sala (y suma a sus bytes).
-    fn admit(&self, room: u64, bytes: usize) -> bool {
+    fn admit_uplink(&self, room: u64, bytes: usize) -> bool {
         let Ok(mut inner) = self.inner.lock() else {
             return false;
         };
         let Some(room) = inner.rooms.get_mut(&room) else {
             return false;
         };
-        if !room.admit(bytes) {
+        if !room.admit_uplink(bytes) {
             return false;
         }
         room.bytes += bytes as u64;
@@ -801,6 +821,23 @@ mod tests {
         assert!(!room.admit(65_000));
         assert_eq!(room.dropped, 1);
         assert!(RelayRoom::new(0).admit(10_000_000), "sin límite");
+    }
+
+    #[test]
+    fn guest_uplink_survives_a_room_full_of_video() {
+        let mut room = RelayRoom::new(1_000);
+        assert!(room.admit(65_000));
+        assert!(!room.admit(1_000), "el vídeo agotó su cubo");
+        assert!(
+            room.admit_uplink(1_000),
+            "el Feedback de un invitado no paga el vídeo del anfitrión"
+        );
+        assert!(room.admit_uplink(60_000));
+        assert!(
+            !room.admit_uplink(10_000),
+            "la subida tiene su propio límite"
+        );
+        assert_eq!(room.dropped, 2);
     }
 
     #[test]

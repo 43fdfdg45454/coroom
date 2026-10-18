@@ -205,6 +205,12 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **El relay ya no ahoga el vídeo** (protocolo 17; hay que actualizar también el servidor): el
+  servidor anuncia su límite por sala (`COROOM_RELAY_MAX_KBPS`) en el `RelayToken` y el anfitrión no
+  apunta por encima (deja sitio a la FEC más alta), en lugar de descubrirlo a base de pérdidas que
+  el control de tasa tomaba por congestión. Lo que suben los invitados (entrada, voz, `Feedback`,
+  `Nack`) tiene su propio cubo: ya no se descarta porque el vídeo del anfitrión vació el de la sala.
+
 - **La pantalla ya no se bloquea mientras miras una transmisión**: como invitado, con el vídeo
   delante y el anfitrión compartiendo, coroom impide que el escritorio se bloquee o apague la
   pantalla por inactividad (aunque solo uses un mando, que el sistema no cuenta). En Linux con el

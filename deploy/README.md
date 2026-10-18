@@ -143,7 +143,7 @@ dispositivos vinculados abren la señalización y el relay.
 | `COROOM_MAX_GUESTS_PER_ROOM` | `8` | Invitados como mucho por sala |
 | `COROOM_RELAY_ENABLED` | `true` | Relay de medios; sin él, las salas solo funcionan en directo |
 | `COROOM_RELAY_QUOTA_GB_PER_MONTH` | `0` | Cuota mensual del relay por anfitrión en GB (10⁹ bytes, admite decimales); `0` = sin límite |
-| `COROOM_RELAY_MAX_KBPS` | `0` | Bitrate máximo por sala en el relay (lo que pase se descarta y se cuenta); `0` = sin límite |
+| `COROOM_RELAY_MAX_KBPS` | `0` | Bitrate máximo de vídeo por sala en el relay; se anuncia al anfitrión, que no apunta por encima (lo que pase igual se descarta y se cuenta). Lo que suben los invitados tiene el mismo límite aparte; `0` = sin límite |
 | `COROOM_SOURCE_URL` | el repositorio de coroom | Repositorio que enlazan `GET /version` y `/admin` (AGPL-3.0); con un servidor modificado, el de tu fork |
 | `RUST_LOG` | `info` | Nivel de logs (nunca incluyen tokens ni contraseñas) |
 

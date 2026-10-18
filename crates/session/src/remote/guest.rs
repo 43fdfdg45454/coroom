@@ -433,12 +433,17 @@ impl Room {
                 self.maybe_connect();
                 Ok(())
             }
-            SignalMessage::RelayToken { token, addr } => {
+            SignalMessage::RelayToken {
+                token,
+                addr,
+                max_kbps,
+            } => {
                 self.relay = Some(RelayInfo {
                     addr,
                     server_name: self.server_name.clone(),
                     trust: self.config.trust.clone(),
                     token,
+                    max_kbps,
                     role: WireRole::Guest,
                 });
                 self.relay_known = true;

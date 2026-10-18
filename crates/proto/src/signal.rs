@@ -206,6 +206,9 @@ pub enum SignalMessage {
         token: Vec<u8>,
         /// Dirección UDP del relay.
         addr: SocketAddr,
+        /// Límite de vídeo por sala del relay en kbit/s (`COROOM_RELAY_MAX_KBPS`; `0` = sin
+        /// límite). Lo que pase se descarta, así que el anfitrión no apunta por encima.
+        max_kbps: u32,
     },
     /// Anfitrión → servidor: expulsa a un invitado (cierra su señalización y su relay).
     Kick {
@@ -438,7 +441,13 @@ mod tests {
                     payload
                 }
             ),
-            (bytes(), addr()).prop_map(|(token, addr)| SignalMessage::RelayToken { token, addr }),
+            (bytes(), addr(), any::<u32>()).prop_map(|(token, addr, max_kbps)| {
+                SignalMessage::RelayToken {
+                    token,
+                    addr,
+                    max_kbps,
+                }
+            }),
             any::<u32>().prop_map(|peer_id| SignalMessage::Kick { peer_id }),
             ".{0,40}".prop_map(|message| SignalMessage::Error {
                 code: ErrorCode::RoomFull,

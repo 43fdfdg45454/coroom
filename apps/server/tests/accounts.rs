@@ -811,11 +811,16 @@ async fn the_monthly_quota_cuts_the_relay_and_new_rooms_go_direct() {
     })
     .await;
     let relay_info = |message: SignalMessage, role: Role| match message {
-        SignalMessage::RelayToken { token, addr } => Some(RelayInfo {
+        SignalMessage::RelayToken {
+            token,
+            addr,
+            max_kbps,
+        } => Some(RelayInfo {
             addr,
             server_name: "127.0.0.1".to_owned(),
             trust: server.trust.clone(),
             token,
+            max_kbps,
             role,
         }),
         _ => None,

@@ -44,8 +44,9 @@ pub mod video;
 /// sin mandar nada; la 14, las salas sin compartir (`Sharing`): solo voz y chat, o tras «Dejar de
 /// compartir»; la 16, los avatares (la versión del avatar en `Joined`, `PeerJoined` y
 /// `control::Member`, con el usuario, y el aviso `Avatar`) y la solicitud de amistad en vivo
-/// (`FriendRequested`), las dos detrás de `Error`, que vuelve a la posición que tenía.
-pub const PROTOCOL_VERSION: u16 = 16;
+/// (`FriendRequested`), las dos detrás de `Error`, que vuelve a la posición que tenía; la 17, el
+/// límite por sala del relay en `RelayToken` (`max_kbps`), que el anfitrión respeta.
+pub const PROTOCOL_VERSION: u16 = 17;
 
 /// Identificadores ALPN (RFC 7301) que el socket QUIC usa para demultiplexar conexiones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

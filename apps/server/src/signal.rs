@@ -704,6 +704,7 @@ impl Hub {
         Ok(SignalMessage::RelayToken {
             token: token.to_vec(),
             addr: relay_addr,
+            max_kbps: self.relay.max_kbps(),
         })
     }
 

@@ -22,8 +22,8 @@ use coroom_transport::crypto::hpke::{self, PairwiseOffer};
 use coroom_transport::crypto::sframe::MediaKey;
 use coroom_transport::crypto::{RoomGroup, SafetyNumber, sha256_fingerprint};
 use coroom_transport::media::{
-    CHECK_PROBE_PACKETS, DEFAULT_SOURCE, MediaSender, MediaSenderConfig, PROBE_POLL, PROBE_SPACING,
-    audio_datagram, startup_probe_paces,
+    CHECK_PROBE_PACKETS, DEFAULT_SOURCE, MAX_REPAIR_RATIO, MediaSender, MediaSenderConfig,
+    PROBE_POLL, PROBE_SPACING, audio_datagram, startup_probe_paces,
 };
 use coroom_transport::proto::PROTOCOL_VERSION;
 use coroom_transport::proto::control::{
@@ -1004,6 +1004,17 @@ impl HostCtx {
         }
     }
 
+    /// Máximo del emisor hacia el relay: `max`, o menos si la sala tiene límite en el relay
+    /// (`RelayToken::max_kbps`). El relay descarta el vídeo que pase de ese límite, FEC
+    /// incluida, así que el objetivo deja sitio a la reparación más alta ([`MAX_REPAIR_RATIO`]):
+    /// apuntar por encima solo produce pérdidas que el control de tasa toma por congestión.
+    fn relay_max_kbps(&self, max: u32) -> u32 {
+        let cap = lock(&self.relay_info)
+            .as_ref()
+            .map_or(0, |relay| relay.max_kbps);
+        relay_video_max_kbps(max, cap)
+    }
+
     /// Otros codificadores, bitrate máximo, resolución máxima o fps con la sala abierta. El
     /// bitrate va derecho al control de tasa; lo demás reabre el codificador (un intra) con
     /// [`renegotiate`], y los invitados siguen: el tamaño nuevo les llega en el flujo (su
@@ -1012,8 +1023,12 @@ impl HostCtx {
         if let Some(max) = change.max_kbps {
             let max = max.max(1);
             self.max_kbps.store(max, Ordering::Release);
-            for sender in lock(&self.links).senders() {
-                sender.set_max_kbps(max);
+            let links = lock(&self.links);
+            for link in links.direct.values() {
+                link.sender.set_max_kbps(max);
+            }
+            if let Some(relay) = &links.relay {
+                relay.sender.set_max_kbps(self.relay_max_kbps(max));
             }
             debug!(kbps = max, "bitrate máximo");
         }
@@ -1607,6 +1622,16 @@ fn drop_idle_relay(ctx: &Arc<HostCtx>) {
     }
 }
 
+/// Máximo de vídeo hacia un relay que limita la sala a `cap` kbit/s (`0` = sin límite) con el
+/// máximo `max` del anfitrión: lo que quepa con la FEC más alta ([`MAX_REPAIR_RATIO`]).
+fn relay_video_max_kbps(max: u32, cap: u32) -> u32 {
+    if cap == 0 {
+        return max;
+    }
+    let video = (f64::from(cap) / (1.0 + MAX_REPAIR_RATIO)).floor() as u32;
+    max.min(video.max(1))
+}
+
 /// Conecta con el relay si la sala lo tiene y aún no está. Con `quiet`, un fallo solo se anota
 /// en el log (es el intento en paralelo con la apertura directa).
 async fn ensure_relay_with(ctx: &Arc<HostCtx>, quiet: bool) {
@@ -1635,6 +1660,16 @@ async fn ensure_relay_with(ctx: &Arc<HostCtx>, quiet: bool) {
         ctx.sender_config(),
         ctx.core.clock_origin,
     ));
+    let max = ctx.max_kbps.load(Ordering::Acquire).max(1);
+    let relay_max = relay_video_max_kbps(max, relay_info.max_kbps);
+    if relay_max < max {
+        debug!(
+            kbps = relay_max,
+            relay_kbps = relay_info.max_kbps,
+            "el relay limita el vídeo de la sala"
+        );
+        sender.set_max_kbps(relay_max);
+    }
     sender.set_epoch_hint(ctx.core.epoch.load(Ordering::Acquire) as u16);
     // Por el relay llegan todos los invitados: los lectores separan por la clave de cada uno.
     ctx.input
@@ -2795,7 +2830,11 @@ async fn run_host(
             .map_err(network("señalización"))?;
         match message {
             Some(SignalMessage::RoomCreated { code: created }) => code = Some(created),
-            Some(SignalMessage::RelayToken { token, addr }) => relay = Some(Some((token, addr))),
+            Some(SignalMessage::RelayToken {
+                token,
+                addr,
+                max_kbps,
+            }) => relay = Some(Some((token, addr, max_kbps))),
             Some(SignalMessage::QuotaExceeded { message }) => {
                 core.emit(SessionEvent::RelayUnavailable(message));
                 relay = Some(None);
@@ -2846,11 +2885,12 @@ async fn run_host(
 
     let ctx = Arc::new(HostCtx {
         core: Arc::clone(&core),
-        relay_info: std::sync::Mutex::new(relay.map(|(token, addr)| RelayInfo {
+        relay_info: std::sync::Mutex::new(relay.map(|(token, addr, max_kbps)| RelayInfo {
             addr,
             server_name: server.host,
             trust: config.trust.clone(),
             token,
+            max_kbps,
             role: WireRole::Host,
         })),
         config,
@@ -3043,6 +3083,18 @@ mod tests {
     use super::*;
 
     const RTT: Duration = Duration::from_millis(20);
+
+    /// Con límite en el relay, el vídeo y su FEC más alta caben en él; sin límite, manda el
+    /// máximo del anfitrión.
+    #[test]
+    fn the_relay_cap_bounds_the_video_with_its_repair() {
+        assert_eq!(relay_video_max_kbps(80_000, 0), 80_000);
+        let max = relay_video_max_kbps(80_000, 30_000);
+        assert!(f64::from(max) * (1.0 + MAX_REPAIR_RATIO) <= 30_000.0);
+        assert!(max > 23_000, "no deja más margen que el de la FEC: {max}");
+        assert_eq!(relay_video_max_kbps(10_000, 30_000), 10_000);
+        assert_eq!(relay_video_max_kbps(10_000, 1), 1);
+    }
     const INTERVAL: Duration = Duration::from_micros(16_667);
 
     /// Las peticiones de una tormenta (cada grupo perdido pide un intra, de varios invitados) se

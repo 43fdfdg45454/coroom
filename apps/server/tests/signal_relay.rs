@@ -43,12 +43,17 @@ impl Running {
     }
 }
 
+/// Límite por sala del relay de estos tests.
+const RELAY_MAX_KBPS: u32 = 400_000;
+
 async fn start_server() -> Running {
     let dir = tempfile::tempdir().expect("directorio temporal");
     let any: SocketAddr = "127.0.0.1:0".parse().expect("dirección");
     let mut config = Config::self_signed(any, any, dir.path().to_owned());
     config.dev_token = Some(TOKEN.to_owned());
     config.max_guests_per_room = 2;
+    // Holgado: los tests de medios no lo rozan, y el `RelayToken` tiene que anunciarlo.
+    config.relay_max_kbps = RELAY_MAX_KBPS;
     // `/health` por HTTP/1.1 en claro (el TCP con TLS se prueba en `http3.rs`).
     config.tcp_plain = true;
     let server = Server::bind(&config).await.expect("arranque del servidor");
@@ -107,7 +112,12 @@ async fn next(client: &mut Client) -> SignalMessage {
 
 /// `RelayToken` → datos de conexión al relay.
 fn relay_info(message: SignalMessage, server: &Running, role: Role) -> RelayInfo {
-    let SignalMessage::RelayToken { token, addr } = message else {
+    let SignalMessage::RelayToken {
+        token,
+        addr,
+        max_kbps,
+    } = message
+    else {
         panic!("se esperaba RelayToken: {message:?}");
     };
     RelayInfo {
@@ -115,6 +125,7 @@ fn relay_info(message: SignalMessage, server: &Running, role: Role) -> RelayInfo
         server_name: "localhost".to_owned(),
         trust: server.trust.clone(),
         token,
+        max_kbps,
         role,
     }
 }
@@ -209,8 +220,18 @@ async fn signaling_creates_joins_and_relays_messages() {
     );
 
     let (code, host_token, guest_token, guest_id) = room(&mut host, &mut guest).await;
-    assert!(matches!(host_token, SignalMessage::RelayToken { .. }));
-    assert!(matches!(guest_token, SignalMessage::RelayToken { .. }));
+    for token in [&host_token, &guest_token] {
+        assert!(
+            matches!(
+                token,
+                SignalMessage::RelayToken {
+                    max_kbps: RELAY_MAX_KBPS,
+                    ..
+                }
+            ),
+            "el relay anuncia su límite: {token:?}"
+        );
+    }
     assert_eq!(health(&server).await["rooms"], 1);
 
     // MLS: anfitrión → invitado y del invitado a todos (el anfitrión).
@@ -637,6 +658,7 @@ async fn relay_fans_out_and_answers_nacks_from_its_cache() {
             SignalMessage::RelayToken {
                 token: Vec::new(),
                 addr: host_relay.remote_address(),
+                max_kbps: 0,
             },
             &server,
             Role::Guest,
