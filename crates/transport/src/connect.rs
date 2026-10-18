@@ -7,16 +7,18 @@
 //! verificada (TLS con la identidad esperada); si en los dos sentidos se establece una, las dos
 //! partes se quedan con la que inició el par de clave menor, con una gracia de
 //! [`PREFER_GRACE`] para que coincidan. Las demás se cierran. Si en [`PUNCH_TIMEOUT`] no hay
-//! ninguna, se usa el relay del servidor ([`connect_relay`]), cuya conexión se abre y autentica
-//! **a la vez** que la apertura simultánea (desde el primer instante, no al vencer el plazo): si
-//! la directa llega, la del relay se cierra; si no, el relay ya está listo y no se suman sus
-//! idas y vueltas a los 3 s de la apertura. Los candidatos que el otro extremo anuncie después
+//! ninguna, se usa la que va por el relay del servidor, que se abre **a la vez** que la apertura
+//! simultánea (desde el primer instante, no al vencer el plazo): si la directa llega, la del relay
+//! se cierra; si no, ya está lista y no se suman sus idas y vueltas a los 3 s de la apertura. Los candidatos que el otro extremo anuncie después
 //! (la dirección WAN que su router abre al cabo de un par de segundos) entran por
 //! [`Connector::connect_with`] mientras dura la apertura.
 //!
-//! Relay: conexión QUIC al servidor con ALPN `coroom-relay/1`; un primer stream de autenticación
-//! con `Hello` y el `RelayToken` de la señalización. Después los datagramas y el stream de control
-//! se usan igual que en directo.
+//! Relay: el `Endpoint` se liga al relay con el `RelayToken` de la señalización
+//! ([`Endpoint::bind_relay`]) y cada par de la sala pasa a tener una dirección virtual
+//! ([`virtual_addr`]). La conexión por el relay es la misma conexión de pares que la directa
+//! (`coroom-p2p/1`, TLS con las identidades de los dos), solo que por esa dirección: el relay
+//! reenvía sus paquetes sin descifrarlos. Los dos extremos la abren y se quedan con la del par de
+//! clave menor, como con las directas.
 
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
@@ -25,13 +27,12 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::debug;
 
-use coroom_proto::codec;
-use coroom_proto::control::{ControlMessage, Hello, Role};
-use coroom_proto::{Alpn, PROTOCOL_VERSION};
-
 use crate::TransportError;
-use crate::quic::{ControlReceiver, Endpoint, HELLO_TIMEOUT, Path, PeerConnection};
-use crate::tls::{PublicKey, ServerTrust};
+use crate::quic::{Endpoint, Path, PeerConnection};
+use crate::relay::RelayParams;
+use crate::tls::PublicKey;
+
+pub use crate::socket::virtual_addr;
 
 /// Tiempo de la apertura simultánea antes de recurrir al relay.
 pub const PUNCH_TIMEOUT: Duration = Duration::from_secs(3);
@@ -46,24 +47,29 @@ const ATTEMPT_STAGGER: Duration = Duration::from_millis(10);
 /// de la señalización con la dirección WAN del router).
 pub type ExtraCandidates = mpsc::UnboundedReceiver<Vec<SocketAddr>>;
 
-/// Tipo del stream de autenticación hacia el relay (primer byte).
-pub const STREAM_RELAY_AUTH: u8 = 0x03;
+/// Espera de más a la conexión por el relay cuando vence la apertura sin directa ni relay (el
+/// relay tarda en ligar o en contestar).
+pub const RELAY_GRACE: Duration = Duration::from_secs(5);
 
-/// Datos para conectar con el relay de la sala.
+/// Datos del relay de la sala (del `RelayToken`).
 #[derive(Debug, Clone)]
 pub struct RelayInfo {
-    /// Dirección UDP del relay (la del `RelayToken`).
+    /// Dirección UDP del relay.
     pub addr: SocketAddr,
-    /// Nombre del servidor para TLS (el de su certificado).
-    pub server_name: String,
-    /// Confianza en su certificado.
-    pub trust: ServerTrust,
-    /// Token del `RelayToken`.
+    /// Token.
     pub token: Vec<u8>,
-    /// Límite de vídeo por sala del `RelayToken` en kbit/s (`0` = sin límite).
+    /// Límite de vídeo de cada invitado por el relay en kbit/s (`0` = sin límite).
     pub max_kbps: u32,
-    /// Papel con el que se entra.
-    pub role: Role,
+}
+
+impl RelayInfo {
+    /// Lo que pide [`Endpoint::bind_relay`].
+    pub fn params(&self) -> RelayParams {
+        RelayParams {
+            addr: self.addr,
+            token: self.token.clone(),
+        }
+    }
 }
 
 /// Clase de un candidato, en el orden en que se prueban.
@@ -138,7 +144,7 @@ impl fmt::Display for CandidateReport {
 /// Intento de conexión directa: la conexión, si la hubo, y lo que pasó con cada candidato.
 #[derive(Debug)]
 pub struct DirectAttempt {
-    /// La conexión directa, si alguna se estableció.
+    /// La conexión: directa si alguna se estableció; si no, la del relay, si la hubo.
     pub connection: Option<PeerConnection>,
     /// Cada candidato con su resultado, en el orden en que se probaron.
     pub candidates: Vec<CandidateReport>,
@@ -293,20 +299,21 @@ impl Connector {
         self
     }
 
-    /// Conecta con el par `peer` probando `candidates` y, si fallan, `relay`
-    /// ([`Connector::connect_with`] sin candidatos tardíos).
+    /// Conecta con el par `peer` probando `candidates` y, si fallan, por el relay en `relay` (la
+    /// dirección virtual del par, [`virtual_addr`]) ([`Connector::connect_with`] sin candidatos
+    /// tardíos).
     pub async fn connect(
         &self,
         peer: PublicKey,
         candidates: &[SocketAddr],
-        relay: Option<&RelayInfo>,
+        relay: Option<SocketAddr>,
     ) -> Result<Established, TransportError> {
         self.connect_with(peer, candidates, relay, None).await
     }
 
     /// Conecta con el par `peer` probando `candidates` (y los que lleguen por `extra` mientras
-    /// dura la apertura) y, si fallan, `relay`. La conexión con el relay se abre y autentica desde
-    /// el principio, en paralelo con la apertura simultánea: si la directa gana, se cierra.
+    /// dura la apertura) y, si fallan, por el relay en `relay`, cuya conexión se abre desde el
+    /// principio, en paralelo con la apertura simultánea: si la directa gana, se cierra.
     ///
     /// Lo primero es admitir a `peer` en el `Endpoint` (`Endpoint::admit`), antes de lanzar ningún
     /// intento: si el otro extremo llama antes de que arranquen los nuestros, su handshake ya pasa
@@ -317,65 +324,58 @@ impl Connector {
         &self,
         peer: PublicKey,
         candidates: &[SocketAddr],
-        relay: Option<&RelayInfo>,
+        relay: Option<SocketAddr>,
         extra: Option<ExtraCandidates>,
     ) -> Result<Established, TransportError> {
         self.endpoint.admit(peer);
-        let relay_task = relay.map(|relay| {
-            let endpoint = self.endpoint.clone();
-            let relay = relay.clone();
-            tokio::spawn(async move { connect_relay(&endpoint, &relay).await })
-        });
-        let (candidates, relay_reason) = if self.force_relay {
-            (Vec::new(), Some("se pidió usar el relay".to_owned()))
+        let (candidates, extra, forced) = if self.force_relay {
+            (&[][..], None, true)
         } else {
-            let attempt = self.try_direct_with(peer, candidates, extra).await;
-            if let Some(connection) = attempt.connection {
-                if let Some(task) = relay_task {
-                    // La del relay ya no hace falta: se cierra en cuanto termine de abrirse.
-                    tokio::spawn(async move {
-                        if let Ok(Ok(connection)) = task.await {
-                            connection.close("hay conexión directa");
-                        }
-                    });
-                }
-                return Ok(Established {
-                    connection,
-                    path: Path::Direct,
-                    candidates: attempt.candidates,
-                    relay_reason: None,
-                });
-            }
-            let reason = attempt.relay_reason();
-            (attempt.candidates, Some(reason))
+            (candidates, extra, false)
         };
-        let Some(task) = relay_task else {
+        let attempt = self.try_direct_with(peer, candidates, relay, extra).await;
+        let Some(connection) = attempt.connection.clone() else {
             return Err(TransportError::Unreachable);
         };
-        let connection = task.await.map_err(|_| {
-            TransportError::Protocol("la conexión con el relay se canceló".into())
-        })??;
+        let path = connection.path();
+        let relay_reason = (path == Path::Relayed).then(|| {
+            if forced {
+                "se pidió usar el relay".to_owned()
+            } else {
+                attempt.relay_reason()
+            }
+        });
         Ok(Established {
             connection,
-            path: Path::Relayed,
-            candidates,
+            path,
+            candidates: attempt.candidates,
             relay_reason,
         })
     }
 
-    /// Solo la apertura simultánea, con el resultado de cada candidato (el anfitrión decide por
-    /// su cuenta qué hacer con el relay).
-    pub async fn try_direct(&self, peer: PublicKey, candidates: &[SocketAddr]) -> DirectAttempt {
-        self.try_direct_with(peer, candidates, None).await
+    /// La apertura simultánea con el resultado de cada candidato y, si no hay directa, la
+    /// conexión por el relay en `relay` (la dirección virtual del par).
+    pub async fn try_direct(
+        &self,
+        peer: PublicKey,
+        candidates: &[SocketAddr],
+        relay: Option<SocketAddr>,
+    ) -> DirectAttempt {
+        self.try_direct_with(peer, candidates, relay, None).await
     }
 
     /// Como [`Connector::try_direct`], probando también los candidatos que lleguen por `extra`
     /// antes de que venza el plazo (sin alargarlo: a un candidato que llega a los 2 s le queda
     /// un segundo, de sobra para el handshake de QUIC).
+    ///
+    /// La conexión por el relay se abre en los dos sentidos desde el principio y se aparta: solo
+    /// se usa si vence el plazo sin directa (o enseguida, si no hay ningún candidato directo que
+    /// esperar). Entre las dos del relay gana, como entre las directas, la del par de clave menor.
     pub async fn try_direct_with(
         &self,
         peer: PublicKey,
         candidates: &[SocketAddr],
+        relay: Option<SocketAddr>,
         mut extra: Option<ExtraCandidates>,
     ) -> DirectAttempt {
         let endpoint = &self.endpoint;
@@ -386,11 +386,10 @@ impl Connector {
         let mut ordered = order_candidates(candidates);
         let (tx, mut outgoing) = mpsc::unbounded_channel();
         let (result_tx, mut results) = mpsc::unbounded_channel::<(usize, CandidateOutcome)>();
-        let spawn_attempt = |i: usize, addr: SocketAddr, stagger: Duration| {
+        let spawn_attempt = |i: usize, addr: SocketAddr, stagger: Duration, timeout: Duration| {
             let endpoint = endpoint.clone();
             let tx = tx.clone();
             let result_tx = result_tx.clone();
-            let timeout = self.timeout;
             tokio::spawn(async move {
                 tokio::time::sleep(stagger).await;
                 match tokio::time::timeout(timeout, endpoint.connect_peer(addr, peer)).await {
@@ -413,11 +412,25 @@ impl Connector {
             .iter()
             .copied()
             .enumerate()
-            .map(|(i, addr)| spawn_attempt(i, addr, ATTEMPT_STAGGER * i as u32))
+            .map(|(i, addr)| spawn_attempt(i, addr, ATTEMPT_STAGGER * i as u32, self.timeout))
             .collect();
+        if let Some(relay) = relay {
+            // Su resultado no es el de un candidato directo: el índice queda fuera de la lista.
+            attempts.push(spawn_attempt(
+                usize::MAX,
+                relay,
+                Duration::ZERO,
+                self.timeout + RELAY_GRACE,
+            ));
+        }
+        // Sin candidatos directos que esperar, la del relay vale en cuanto llega.
+        let relay_only = ordered.is_empty() && extra.is_none();
 
         let mut deadline = tokio::time::Instant::now() + self.timeout;
+        let mut relay_grace = relay.is_some();
         let mut held: Option<PeerConnection> = None;
+        // Las del relay, apartadas: la preferida y la otra.
+        let mut relayed: [Option<PeerConnection>; 2] = [None, None];
         let mut duplicates = Vec::new();
         let chosen = loop {
             let (connection, ours) = tokio::select! {
@@ -437,6 +450,7 @@ impl Connector {
                                     ordered.len() - 1,
                                     addr,
                                     ATTEMPT_STAGGER * j as u32,
+                                    self.timeout,
                                 ));
                             }
                         }
@@ -444,9 +458,35 @@ impl Connector {
                     }
                     continue;
                 }
-                () = tokio::time::sleep_until(deadline) => break held.take(),
+                () = tokio::time::sleep_until(deadline) => {
+                    if held.is_some() {
+                        break held.take();
+                    }
+                    let [preferred, other] = &mut relayed;
+                    if let Some(connection) = preferred.take().or_else(|| other.take()) {
+                        break Some(connection);
+                    }
+                    if relay_grace {
+                        // El relay todavía no contestó: se le da un rato más, solo a él.
+                        relay_grace = false;
+                        deadline = tokio::time::Instant::now() + RELAY_GRACE;
+                        continue;
+                    }
+                    break None;
+                }
             };
             let preferred = ours == we_prefer_outgoing;
+            if connection.path() == Path::Relayed && !relay_only {
+                let slot = &mut relayed[usize::from(!preferred)];
+                if let Some(previous) = slot.replace(connection) {
+                    duplicates.push(previous);
+                }
+                if relayed[0].is_some() && !relay_grace && held.is_none() {
+                    // Ya en la espera de más del relay: la preferida no tiene por qué esperar.
+                    break relayed[0].take();
+                }
+                continue;
+            }
             if preferred {
                 if let Some(previous) = held.take() {
                     duplicates.push(previous);
@@ -479,7 +519,7 @@ impl Connector {
                 report.outcome = outcome;
             }
         }
-        if let Some(chosen) = &chosen {
+        if let Some(chosen) = chosen.as_ref().filter(|c| c.path() == Path::Direct) {
             let remote = crate::quic::canonical(chosen.remote_address());
             let class = candidate_class(remote);
             // Si entró por una dirección que no estaba en la lista (la NAT del par reescribió el
@@ -492,6 +532,7 @@ impl Connector {
                 report.outcome = CandidateOutcome::Connected;
             }
         }
+        duplicates.extend(relayed.into_iter().flatten());
         for connection in duplicates {
             connection.close("conexión duplicada");
         }
@@ -530,45 +571,6 @@ async fn recv_extra(extra: &mut Option<ExtraCandidates>) -> Option<Vec<SocketAdd
         Some(extra) => extra.recv().await,
         None => std::future::pending().await,
     }
-}
-
-/// Conecta con el relay y se autentica con el token.
-pub async fn connect_relay(
-    endpoint: &Endpoint,
-    relay: &RelayInfo,
-) -> Result<PeerConnection, TransportError> {
-    let (connection, shared) = endpoint
-        .connect_server(relay.addr, &relay.server_name, &relay.trust, Alpn::Relay)
-        .await?;
-    let hello = Hello {
-        protocol_version: PROTOCOL_VERSION,
-        identity_pk: endpoint.public_key(),
-        role: relay.role,
-        relay_token: Some(relay.token.clone()),
-    };
-    let (mut send, recv) = connection.open_bi().await?;
-    send.write_all(&[STREAM_RELAY_AUTH]).await?;
-    send.write_all(&codec::encode(&ControlMessage::Hello(hello))?)
-        .await?;
-    let mut receiver = ControlReceiver::new(recv);
-    let reply = tokio::time::timeout(HELLO_TIMEOUT, receiver.recv())
-        .await
-        .map_err(|_| TransportError::Timeout("respuesta del relay"))??;
-    match reply {
-        Some(ControlMessage::Hello(_)) => {}
-        _ => {
-            connection.close(quinn::VarInt::from_u32(1), b"relay");
-            return Err(TransportError::Protocol(
-                "el relay rechazó el token".to_owned(),
-            ));
-        }
-    }
-    // El stream de autenticación queda abierto mientras dure la conexión.
-    tokio::spawn(async move {
-        let _keep = send;
-        let _ = receiver.recv().await;
-    });
-    Ok(PeerConnection::new(connection, None, Path::Relayed, shared))
 }
 
 #[cfg(test)]

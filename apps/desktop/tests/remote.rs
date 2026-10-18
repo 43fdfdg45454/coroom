@@ -372,6 +372,31 @@ fn b_force_relay_session_presents_every_frame() {
     drop(server);
 }
 
+/// Una sala con un invitado directo y otro por el relay a la vez: cada uno por su camino (el
+/// relay solo lleva al suyo) y los dos presentan todo.
+#[test]
+fn b_a_room_mixes_direct_and_relayed_guests() {
+    let _serial = serial();
+    let server = TestServer::start();
+    let host = host(server.config());
+    let code = room_code(&host);
+    let direct = guest(server.config(), &code, Some(FRAMES));
+    let mut config = server.config();
+    config.force_relay = true;
+    let relayed = guest(config, &code, Some(FRAMES));
+    wait_until("los dos caminos", Duration::from_secs(20), || {
+        let paths: Vec<Option<Path>> = host.guests().iter().map(|status| status.path).collect();
+        paths.contains(&Some(Path::Direct)) && paths.contains(&Some(Path::Relayed))
+    });
+    let finished = relayed.wait(SESSION_LIMIT);
+    assert!(finished, "el invitado del relay no terminó a tiempo");
+    let relayed_summary = relayed.summary();
+    let (summary, direct, _host) = finish(direct, host);
+    check_delivery(&summary, &direct, Path::Direct);
+    check_delivery(&relayed_summary, &relayed, Path::Relayed);
+    drop(server);
+}
+
 /// Indica si `lo` tiene una disciplina netem activa.
 fn netem_active() -> bool {
     std::process::Command::new("tc")

@@ -172,3 +172,17 @@ path = "fuzz_targets/audio_jitter.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "proto_relay"
+path = "fuzz_targets/proto_relay.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_relay"
+path = "fuzz_targets/server_relay.rs"
+test = false
+doc = false
+bench = false

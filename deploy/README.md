@@ -2,9 +2,9 @@
 
 `coroom-server` es un único binario que termina TLS él mismo (`docs/ARQUITECTURA.md` §3 y §4):
 
-- por **UDP**, un solo socket QUIC que demultiplexa por ALPN entre HTTP/3 (`h3`: la API `/api/v1`,
-  la administración `/admin`, `/health`, `/version` y la señalización WebTransport en `/signal`) y
-  el relay de medios (`coroom-relay/1`);
+- por **UDP**, un solo socket con HTTP/3 (`h3`: la API `/api/v1`, la administración `/admin`,
+  `/health`, `/version` y la señalización WebTransport en `/signal`) y el relay de medios, que
+  reenvía los paquetes de las conexiones de pares sin descifrarlos (como un servidor TURN);
 - por **TCP**, HTTP/2 y HTTP/1.1 **con TLS** como respaldo (navegadores y redes sin UDP), que
   anuncia HTTP/3 con `Alt-Svc`.
 
@@ -143,7 +143,7 @@ dispositivos vinculados abren la señalización y el relay.
 | `COROOM_MAX_GUESTS_PER_ROOM` | `8` | Invitados como mucho por sala |
 | `COROOM_RELAY_ENABLED` | `true` | Relay de medios; sin él, las salas solo funcionan en directo |
 | `COROOM_RELAY_QUOTA_GB_PER_MONTH` | `0` | Cuota mensual del relay por anfitrión en GB (10⁹ bytes, admite decimales); `0` = sin límite |
-| `COROOM_RELAY_MAX_KBPS` | `0` | Bitrate máximo de vídeo por sala en el relay; se anuncia al anfitrión, que no apunta por encima (lo que pase igual se descarta y se cuenta). Lo que suben los invitados tiene el mismo límite aparte; `0` = sin límite |
+| `COROOM_RELAY_MAX_KBPS` | `0` | Bitrate máximo de vídeo por invitado en el relay; se anuncia al anfitrión, que no apunta por encima (lo que pase igual se descarta y se cuenta). Lo que sube cada invitado tiene el mismo límite aparte; `0` = sin límite. Con N invitados por el relay, el servidor recibe N copias del anfitrión y manda N |
 | `COROOM_SOURCE_URL` | el repositorio de coroom | Repositorio que enlazan `GET /version` y `/admin` (AGPL-3.0); con un servidor modificado, el de tu fork |
 | `RUST_LOG` | `info` | Nivel de logs (nunca incluyen tokens ni contraseñas) |
 
@@ -196,8 +196,8 @@ La revisión de la 1.0 está en [`docs/seguridad.md`](../docs/seguridad.md). Lo 
 como operador:
 
 - **Lo que ve el servidor**: cuentas, amigos, quién entra en qué sala y cuándo, direcciones IP y el
-  volumen y el ritmo del tráfico del relay. No ve vídeo, audio, voz ni entrada (cifrados de extremo
-  a extremo), ni claves privadas: los tokens se guardan como SHA-256 y las contraseñas con Argon2id.
+  volumen y el ritmo del tráfico del relay. No ve vídeo, audio, voz, entrada ni chat, ni siquiera
+  las cabeceras de los medios (el relay reenvía paquetes cifrados de punta a punta entre los pares), ni claves privadas: los tokens se guardan como SHA-256 y las contraseñas con Argon2id.
 - **Límites ya puestos** (no hay que configurarlos): 5 fallos de login por minuto por cuenta y por
   IP; 10 códigos de sala que no existen por minuto por cuenta; cuerpos de 64 KiB; mensajes de
   señalización de 256 KiB; cabeceras HTTP en 10 s y cuerpos en 20 s por TCP; 1 024 conexiones TCP a

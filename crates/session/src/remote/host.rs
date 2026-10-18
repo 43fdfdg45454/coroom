@@ -17,7 +17,7 @@ use coroom_codec::{
     Backend, Codec, DEFAULT_SLICES, EncoderConfig, EncoderSet, VideoFormat, encoder_label,
 };
 use coroom_input::InputSink;
-use coroom_transport::connect::{self, Connector, ExtraCandidates, RelayInfo};
+use coroom_transport::connect::{Connector, ExtraCandidates, RelayInfo, virtual_addr};
 use coroom_transport::crypto::hpke::{self, PairwiseOffer};
 use coroom_transport::crypto::sframe::MediaKey;
 use coroom_transport::crypto::{RoomGroup, SafetyNumber, sha256_fingerprint};
@@ -34,7 +34,8 @@ use coroom_transport::proto::media::{ObjectHeader, Track};
 use coroom_transport::proto::signal::{ErrorCode, SignalMessage};
 use coroom_transport::quic::{ControlReceiver, ControlSender, ControlStream};
 use coroom_transport::rate::{Congestion, RateConfig};
-use coroom_transport::signal::{ServerUrl, SignalClient, SignalSender};
+use coroom_transport::relay::{BindingState, RelayBinding};
+use coroom_transport::signal::{SignalClient, SignalSender};
 use coroom_transport::{Endpoint, EndpointOptions, Path, PeerConnection, PublicKey};
 use crossbeam_channel::{Receiver, bounded};
 use tokio::runtime::Handle;
@@ -187,153 +188,99 @@ impl KeyframeGate {
     }
 }
 
-/// Emisor de una conexión directa con un invitado.
-struct DirectLink {
+/// Emisor de la conexión con un invitado (directa o a través del relay).
+struct GuestLink {
     sender: Arc<MediaSender>,
     control: ControlSender,
 }
 
-/// Emisor único hacia el relay y el control de cada invitado que llega por él.
-struct RelayLink {
-    sender: Arc<MediaSender>,
-    guests: BTreeMap<GuestId, ControlSender>,
-}
-
-/// Un destino del fotograma cifrado: un emisor y los controles de los invitados a los que llega.
+/// Un destino del fotograma cifrado: un emisor y el control de su invitado.
 struct Target {
     sender: Arc<MediaSender>,
     controls: Vec<ControlSender>,
 }
 
-/// Conexiones de medios del anfitrión.
+/// Conexiones de medios del anfitrión: una por invitado, por el camino que haya (el relay solo
+/// reenvía los paquetes de esa misma conexión).
 #[derive(Default)]
 pub(crate) struct Links {
-    direct: BTreeMap<GuestId, DirectLink>,
-    relay: Option<RelayLink>,
+    guests: BTreeMap<GuestId, GuestLink>,
 }
 
 impl Links {
     fn targets(&self) -> Vec<Target> {
-        let mut out: Vec<Target> = self
-            .direct
+        self.guests
             .values()
             .map(|link| Target {
                 sender: Arc::clone(&link.sender),
                 controls: vec![link.control.clone()],
             })
-            .collect();
-        if let Some(relay) = &self.relay
-            && !relay.guests.is_empty()
-        {
-            out.push(Target {
-                sender: Arc::clone(&relay.sender),
-                controls: relay.guests.values().cloned().collect(),
-            });
-        }
-        out
+            .collect()
     }
 
     fn connected(&self) -> usize {
-        self.direct.len() + self.relay.as_ref().map_or(0, |relay| relay.guests.len())
+        self.guests.len()
     }
 
     fn contains(&self, guest: GuestId) -> bool {
-        self.direct.contains_key(&guest)
-            || self
-                .relay
-                .as_ref()
-                .is_some_and(|relay| relay.guests.contains_key(&guest))
+        self.guests.contains_key(&guest)
     }
 
     fn controls(&self) -> Vec<ControlSender> {
-        self.targets()
-            .into_iter()
-            .flat_map(|target| target.controls)
+        self.guests
+            .values()
+            .map(|link| link.control.clone())
             .collect()
     }
 
     /// Control de cada invitado conectado.
     fn guest_controls(&self) -> Vec<(GuestId, ControlSender)> {
-        let mut out: Vec<(GuestId, ControlSender)> = self
-            .direct
+        self.guests
             .iter()
             .map(|(guest, link)| (*guest, link.control.clone()))
-            .collect();
-        if let Some(relay) = &self.relay {
-            out.extend(
-                relay
-                    .guests
-                    .iter()
-                    .map(|(guest, control)| (*guest, control.clone())),
-            );
-        }
-        out
+            .collect()
     }
 
     fn senders(&self) -> Vec<Arc<MediaSender>> {
-        let mut out: Vec<Arc<MediaSender>> = self
-            .direct
+        self.guests
             .values()
             .map(|link| Arc::clone(&link.sender))
-            .collect();
-        if let Some(relay) = &self.relay {
-            out.push(Arc::clone(&relay.sender));
-        }
-        out
+            .collect()
     }
 
-    /// Conexiones con invitados conectados (la del relay una vez, si tiene alguno): por ellas van
-    /// los datagramas de control del anfitrión (el cursor numerado, que el relay abre en abanico).
+    /// Conexiones con invitados conectados: por ellas van los datagramas de control del
+    /// anfitrión (el cursor numerado).
     fn connections(&self) -> Vec<PeerConnection> {
-        let mut out: Vec<PeerConnection> = self
-            .direct
+        self.guests
             .values()
             .map(|link| link.sender.connection().clone())
-            .collect();
-        if let Some(relay) = &self.relay
-            && !relay.guests.is_empty()
-        {
-            out.push(relay.sender.connection().clone());
-        }
-        out
+            .collect()
     }
 
-    /// Bitrate para el codificador: el mínimo de los objetivos de todos los emisores con
-    /// invitados, descontada la FEC de cada uno ([`MediaSender::encoder_target_kbps`]).
+    /// Bitrate para el codificador: el mínimo de los objetivos de todos los emisores, descontada
+    /// la FEC de cada uno ([`MediaSender::encoder_target_kbps`]).
     fn min_target(&self) -> Option<u32> {
-        self.targets()
-            .iter()
-            .map(|target| target.sender.encoder_target_kbps())
+        self.guests
+            .values()
+            .map(|link| link.sender.encoder_target_kbps())
             .min()
     }
 
     /// Ruta, RTT y objetivo de cada invitado conectado.
     fn status(&self) -> Vec<LinkStatus> {
-        let mut out: Vec<_> = self
-            .direct
+        self.guests
             .iter()
-            .map(|(guest, link)| LinkStatus {
-                guest: *guest,
-                path: Path::Direct,
-                remote: link.sender.connection().remote_address(),
-                rtt_ms: link.sender.connection().rtt().as_secs_f64() * 1000.0,
-                target_kbps: Some(link.sender.target_kbps()),
-            })
-            .collect();
-        if let Some(relay) = &self.relay {
-            let conn = relay.sender.connection();
-            let rtt_ms = conn.rtt().as_secs_f64() * 1000.0;
-            for guest in relay.guests.keys() {
-                out.push(LinkStatus {
+            .map(|(guest, link)| {
+                let conn = link.sender.connection();
+                LinkStatus {
                     guest: *guest,
-                    path: Path::Relayed,
+                    path: conn.path(),
                     remote: conn.remote_address(),
-                    rtt_ms,
-                    target_kbps: relay.sender.source_target_kbps(u64::from(guest.0)),
-                });
-            }
-        }
-        out
+                    rtt_ms: conn.rtt().as_secs_f64() * 1000.0,
+                    target_kbps: Some(link.sender.target_kbps()),
+                }
+            })
+            .collect()
     }
 }
 
@@ -597,8 +544,8 @@ fn voice_permitted(core: &Core, out: &mut Vec<GuestId>) {
     );
 }
 
-/// Envía `datagram` a los invitados que cumplen `allowed` (menos `exclude`): por su enlace directo
-/// o, si alguno llega por el relay, una vez al relay (que abre en abanico). Devuelve si salió.
+/// Envía `datagram` a los invitados que cumplen `allowed` (menos `exclude`), cada uno por su
+/// conexión. Devuelve si salió.
 fn send_to(
     links: &Links,
     datagram: &Bytes,
@@ -606,7 +553,7 @@ fn send_to(
     exclude: Option<GuestId>,
 ) -> bool {
     let mut sent = false;
-    for (guest, link) in &links.direct {
+    for (guest, link) in &links.guests {
         if Some(*guest) != exclude
             && allowed(guest)
             && link
@@ -617,19 +564,6 @@ fn send_to(
         {
             sent = true;
         }
-    }
-    if let Some(relay) = &links.relay
-        && relay
-            .guests
-            .keys()
-            .any(|guest| Some(*guest) != exclude && allowed(guest))
-        && relay
-            .sender
-            .connection()
-            .send_datagram(datagram.clone())
-            .is_ok()
-    {
-        sent = true;
     }
     sent
 }
@@ -665,10 +599,9 @@ impl AudioOut for HostAudioOut {
     }
 }
 
-/// Lee la voz de los invitados que llega por `conn` (la directa de `only` o la del relay): la
-/// descifra para saber quién habla y oírla, comprueba su permiso y la reenvía tal cual a los
-/// demás invitados.
-fn voice_reader(ctx: &Arc<HostCtx>, conn: PeerConnection, only: Option<GuestId>) {
+/// Lee la voz que llega por la conexión de `only`: la descifra para comprobar que es suya y
+/// oírla, comprueba su permiso y la reenvía tal cual a los demás invitados.
+fn voice_reader(ctx: &Arc<HostCtx>, conn: PeerConnection, only: GuestId) {
     let core = Arc::clone(&ctx.core);
     let thread_ctx = Arc::clone(ctx);
     let mut decryptor = core.ring.decryptor();
@@ -683,25 +616,25 @@ fn voice_reader(ctx: &Arc<HostCtx>, conn: PeerConnection, only: Option<GuestId>)
         if header.track != Track::Voice {
             return;
         }
-        let guest = if core.sframe {
+        let own = if core.sframe {
             match decryptor.decrypt_into(payload, &mut plain) {
                 Ok((info, _)) if info.track == Track::Voice as u8 => {
                     let leaf = info.sender_leaf;
                     lock(&core.guests)
-                        .values()
-                        .find(|status| status.leaf == leaf)
-                        .map(|status| status.guest)
+                        .get(&only)
+                        .is_some_and(|status| status.leaf == leaf)
                 }
-                _ => None,
+                _ => false,
             }
         } else {
             plain.clear();
             plain.extend_from_slice(payload);
-            only
+            true
         };
-        let Some(guest) = guest.filter(|guest| only.is_none_or(|only| only == *guest)) else {
+        if !own {
             return;
-        };
+        }
+        let guest = only;
         voice_permitted(core, &mut permitted);
         if !permitted.contains(&guest) {
             // Sin permiso de voz: ni se oye ni se reenvía.
@@ -877,7 +810,9 @@ struct HostCtx {
     pending: std::sync::Mutex<Option<PendingEpoch>>,
     /// Datos del relay de la sala; `None` si el servidor no lo da (cuota agotada o sin relay).
     relay_info: std::sync::Mutex<Option<RelayInfo>>,
-    relay_lock: tokio::sync::Mutex<()>,
+    /// Ligadura del socket con el relay: mientras viva, cada invitado es alcanzable en su
+    /// dirección virtual.
+    relay_binding: std::sync::Mutex<Option<RelayBinding>>,
     hello: Hello,
     /// Codificadores del anfitrión (lo que puede elegir; cambian con [`Command::Video`]).
     encoders: std::sync::Mutex<EncoderSet>,
@@ -928,10 +863,19 @@ pub(crate) const RELAY_DISABLED: &str = "el servidor no tiene relay: la sala sol
                                          directo";
 
 impl HostCtx {
-    /// El servidor quitó el relay a la sala (cuota agotada; él mismo corta sus conexiones).
+    /// El servidor quitó el relay a la sala (cuota agotada; él mismo deja de reenviar).
     fn relay_unavailable(&self, message: String) {
         lock(&self.relay_info).take();
+        lock(&self.relay_binding).take();
         self.core.emit(SessionEvent::RelayUnavailable(message));
+    }
+
+    /// Dirección virtual de `guest` por el relay, si la sala está ligada.
+    fn relay_addr(&self, guest: GuestId) -> Option<std::net::SocketAddr> {
+        lock(&self.relay_binding)
+            .as_ref()
+            .filter(|binding| matches!(binding.state(), BindingState::Bound { .. }))
+            .map(|_| virtual_addr(guest.0))
     }
 
     /// El vídeo de ahora (resolución máxima y fps incluidos).
@@ -1004,8 +948,8 @@ impl HostCtx {
         }
     }
 
-    /// Máximo del emisor hacia el relay: `max`, o menos si la sala tiene límite en el relay
-    /// (`RelayToken::max_kbps`). El relay descarta el vídeo que pase de ese límite, FEC
+    /// Máximo del emisor hacia un invitado por el relay: `max`, o menos si la sala tiene límite
+    /// en el relay (`RelayToken::max_kbps`). El relay descarta lo que pase de ese límite, FEC
     /// incluida, así que el objetivo deja sitio a la reparación más alta ([`MAX_REPAIR_RATIO`]):
     /// apuntar por encima solo produce pérdidas que el control de tasa toma por congestión.
     fn relay_max_kbps(&self, max: u32) -> u32 {
@@ -1013,6 +957,14 @@ impl HostCtx {
             .as_ref()
             .map_or(0, |relay| relay.max_kbps);
         relay_video_max_kbps(max, cap)
+    }
+
+    /// Máximo del emisor de `sender`: `max` en directo; por el relay, con su límite.
+    fn link_max_kbps(&self, sender: &MediaSender, max: u32) -> u32 {
+        match sender.connection().path() {
+            Path::Direct => max,
+            Path::Relayed => self.relay_max_kbps(max),
+        }
     }
 
     /// Otros codificadores, bitrate máximo, resolución máxima o fps con la sala abierta. El
@@ -1024,11 +976,9 @@ impl HostCtx {
             let max = max.max(1);
             self.max_kbps.store(max, Ordering::Release);
             let links = lock(&self.links);
-            for link in links.direct.values() {
-                link.sender.set_max_kbps(max);
-            }
-            if let Some(relay) = &links.relay {
-                relay.sender.set_max_kbps(self.relay_max_kbps(max));
+            for link in links.guests.values() {
+                link.sender
+                    .set_max_kbps(self.link_max_kbps(&link.sender, max));
             }
             debug!(kbps = max, "bitrate máximo");
         }
@@ -1237,17 +1187,11 @@ impl HostCtx {
         {
             let mut links = lock(&self.links);
             if links
-                .direct
+                .guests
                 .get(&guest)
                 .is_some_and(|link| Arc::ptr_eq(&link.sender, sender))
             {
-                links.direct.remove(&guest);
-            }
-            if let Some(relay) = &mut links.relay
-                && Arc::ptr_eq(&relay.sender, sender)
-                && relay.guests.remove(&guest).is_some()
-            {
-                relay.sender.forget_source(u64::from(guest.0));
+                links.guests.remove(&guest);
             }
         }
         if let Some(status) = lock(&self.core.guests).get_mut(&guest) {
@@ -1433,20 +1377,12 @@ impl HostCtx {
     fn is_member(&self, guest: GuestId) -> bool {
         lock(&self.core.guests).contains_key(&guest)
     }
-
-    fn guest_by_key(&self, key: &PublicKey) -> Option<GuestId> {
-        lock(&self.core.guests)
-            .values()
-            .find(|status| status.public_key == *key)
-            .map(|status| status.guest)
-    }
 }
 
-/// Conecta con el invitado: directo o, si no se puede, deja que llegue por el relay. La conexión
-/// con el relay se abre a la vez que la apertura simultánea (si la sala tiene relay): cuando la
-/// apertura falla, el invitado ya está autenticado en el relay y su control llega sin sumar las
-/// idas y vueltas del handshake a los 3 s de la apertura. Los candidatos que el invitado anuncie
-/// después (la WAN que abre su router) entran por `extra`.
+/// Conecta con el invitado: directo o, si no se puede, por el relay. La conexión por el relay se
+/// abre a la vez que la apertura simultánea (si la sala está ligada al relay) y se aparta: cuando
+/// la apertura falla, ya está lista y no suma sus idas y vueltas a los 3 s de la apertura. Los
+/// candidatos que el invitado anuncie después (la WAN que abre su router) entran por `extra`.
 async fn connect_guest(
     ctx: Arc<HostCtx>,
     guest: GuestId,
@@ -1454,19 +1390,25 @@ async fn connect_guest(
     addrs: Vec<std::net::SocketAddr>,
     extra: ExtraCandidates,
 ) {
-    if ctx.config.force_relay {
-        ensure_relay(&ctx).await;
-        return;
-    }
-    if lock(&ctx.relay_info).is_some() {
-        // En paralelo y sin avisar si falla: si gana la directa no hacía falta; si no, el intento
-        // de abajo lo repite y avisa.
-        let relay_ctx = Arc::clone(&ctx);
-        tokio::spawn(async move { ensure_relay_with(&relay_ctx, true).await });
-    }
+    let relay = ctx.relay_addr(guest);
+    let (addrs, extra) = if ctx.config.force_relay {
+        (Vec::new(), None)
+    } else {
+        (addrs, Some(extra))
+    };
     let connector = Connector::new(ctx.endpoint.clone()).with_timeout(ctx.config.punch_timeout);
-    let attempt = connector.try_direct_with(key, &addrs, Some(extra)).await;
-    let relay_reason = attempt.connection.is_none().then(|| attempt.relay_reason());
+    let attempt = connector.try_direct_with(key, &addrs, relay, extra).await;
+    let relayed = attempt
+        .connection
+        .as_ref()
+        .is_none_or(|connection| connection.path() == Path::Relayed);
+    let relay_reason = relayed.then(|| {
+        if ctx.config.force_relay {
+            "se pidió usar el relay".to_owned()
+        } else {
+            attempt.relay_reason()
+        }
+    });
     if let Some(status) = lock(&ctx.core.guests).get_mut(&guest) {
         status.candidates = attempt.candidates.clone();
     }
@@ -1476,25 +1418,29 @@ async fn connect_guest(
         relay_reason: relay_reason.clone(),
     });
     let Some(connection) = attempt.connection else {
-        if lock(&ctx.relay_info).is_none() {
-            ctx.core.warn(format!(
+        ctx.core.warn(if lock(&ctx.relay_info).is_none() {
+            format!(
                 "el invitado {} no conecta en directo y la sala no tiene relay",
                 guest.0
-            ));
-            return;
-        }
-        debug!(guest = guest.0, reason = ?relay_reason, "sin conexión directa; se usa el relay");
-        ensure_relay(&ctx).await;
+            )
+        } else {
+            format!(
+                "el invitado {} no conecta ni en directo ni por el relay",
+                guest.0
+            )
+        });
         return;
     };
+    if relayed {
+        debug!(guest = guest.0, reason = ?relay_reason, "sin conexión directa; se usa el relay");
+    }
     if lock(&ctx.links).contains(guest) || !ctx.is_member(guest) {
         connection.close("conexión duplicada");
         return;
     }
-    drop_idle_relay(&ctx);
     match tokio::time::timeout(REPLY_TIMEOUT, connection.accept_control(ctx.hello.clone())).await {
         Ok(Ok(control)) if control.peer_hello().identity_pk == key => {
-            attach_direct(&ctx, guest, connection, control);
+            attach(&ctx, guest, connection, control);
         }
         other => {
             let reason = match other {
@@ -1516,21 +1462,29 @@ fn permissions_message(permissions: Permissions) -> ControlMessage {
     }
 }
 
-fn attach_direct(
-    ctx: &Arc<HostCtx>,
-    guest: GuestId,
-    connection: PeerConnection,
-    control: ControlStream,
-) {
+/// Atiende al invitado por su conexión (directa o a través del relay).
+fn attach(ctx: &Arc<HostCtx>, guest: GuestId, connection: PeerConnection, control: ControlStream) {
     let (reply, receiver, _hello) = control.split();
     let sender = Arc::new(MediaSender::with_clock_origin(
         connection.clone(),
         ctx.sender_config(),
         ctx.core.clock_origin,
     ));
+    if connection.path() == Path::Relayed {
+        let max = ctx.max_kbps.load(Ordering::Acquire);
+        let relay_max = ctx.relay_max_kbps(max);
+        if relay_max < max {
+            debug!(
+                guest = guest.0,
+                kbps = relay_max,
+                "el relay limita el vídeo de este invitado"
+            );
+            sender.set_max_kbps(relay_max);
+        }
+    }
     ctx.input
         .spawn_readers(&ctx.core, &connection, Some(guest), &sender);
-    voice_reader(ctx, connection.clone(), Some(guest));
+    voice_reader(ctx, connection.clone(), guest);
     tokio::spawn(control_datagrams(
         Arc::clone(ctx),
         connection.clone(),
@@ -1538,14 +1492,19 @@ fn attach_direct(
     ));
     ctx.install_pending();
     sender.set_epoch_hint(ctx.core.epoch.load(Ordering::Acquire) as u16);
-    lock(&ctx.links).direct.insert(
+    lock(&ctx.links).guests.insert(
         guest,
-        DirectLink {
+        GuestLink {
             sender: Arc::clone(&sender),
             control: reply.clone(),
         },
     );
-    ctx.after_attach(guest, Path::Direct, connection.remote_address(), &reply);
+    ctx.after_attach(
+        guest,
+        connection.path(),
+        connection.remote_address(),
+        &reply,
+    );
     tokio::spawn(probe_link(Arc::clone(ctx), Arc::clone(&sender)));
     tokio::spawn(control_reader(
         Arc::clone(ctx),
@@ -1553,7 +1512,6 @@ fn attach_direct(
         receiver,
         sender,
         reply,
-        None,
     ));
 }
 
@@ -1600,30 +1558,9 @@ async fn probe_link(ctx: Arc<HostCtx>, sender: Arc<MediaSender>) {
     }
 }
 
-/// Conecta con el relay una sola vez y atiende los controles que abre cada invitado por él.
-async fn ensure_relay(ctx: &Arc<HostCtx>) {
-    ensure_relay_with(ctx, false).await;
-}
-
-/// Cierra la conexión con el relay si no tiene ningún invitado: la que se abrió en paralelo con
-/// una apertura simultánea que acabó en directo. Una sesión solo en LAN no mantiene así una
-/// conexión ociosa con el relay; si otro invitado la necesita, [`ensure_relay`] la vuelve a abrir.
-fn drop_idle_relay(ctx: &Arc<HostCtx>) {
-    let idle = {
-        let mut links = lock(&ctx.links);
-        match &links.relay {
-            Some(relay) if relay.guests.is_empty() => links.relay.take(),
-            _ => None,
-        }
-    };
-    if let Some(relay) = idle {
-        debug!("relay sin invitados: se cierra (hay conexión directa)");
-        relay.sender.connection().close("hay conexión directa");
-    }
-}
-
-/// Máximo de vídeo hacia un relay que limita la sala a `cap` kbit/s (`0` = sin límite) con el
-/// máximo `max` del anfitrión: lo que quepa con la FEC más alta ([`MAX_REPAIR_RATIO`]).
+/// Máximo de vídeo hacia un invitado por un relay que lo limita a `cap` kbit/s (`0` = sin
+/// límite) con el máximo `max` del anfitrión: lo que quepa con la FEC más alta
+/// ([`MAX_REPAIR_RATIO`]).
 fn relay_video_max_kbps(max: u32, cap: u32) -> u32 {
     if cap == 0 {
         return max;
@@ -1632,162 +1569,45 @@ fn relay_video_max_kbps(max: u32, cap: u32) -> u32 {
     max.min(video.max(1))
 }
 
-/// Conecta con el relay si la sala lo tiene y aún no está. Con `quiet`, un fallo solo se anota
-/// en el log (es el intento en paralelo con la apertura directa).
-async fn ensure_relay_with(ctx: &Arc<HostCtx>, quiet: bool) {
-    let _guard = ctx.relay_lock.lock().await;
-    if lock(&ctx.links).relay.is_some() {
-        return;
-    }
-    let Some(relay_info) = lock(&ctx.relay_info).clone() else {
-        debug!("la sala no tiene relay; solo conexiones directas");
-        return;
-    };
-    let connection = match connect::connect_relay(&ctx.endpoint, &relay_info).await {
-        Ok(connection) => connection,
-        Err(err) if quiet => {
-            debug!(error = %err, "no se pudo abrir el relay en paralelo");
-            return;
-        }
-        Err(err) => {
-            ctx.core
-                .warn(format!("no se pudo conectar con el relay: {err}"));
-            return;
-        }
-    };
-    let sender = Arc::new(MediaSender::with_clock_origin(
-        connection.clone(),
-        ctx.sender_config(),
-        ctx.core.clock_origin,
-    ));
-    let max = ctx.max_kbps.load(Ordering::Acquire).max(1);
-    let relay_max = relay_video_max_kbps(max, relay_info.max_kbps);
-    if relay_max < max {
-        debug!(
-            kbps = relay_max,
-            relay_kbps = relay_info.max_kbps,
-            "el relay limita el vídeo de la sala"
-        );
-        sender.set_max_kbps(relay_max);
-    }
-    sender.set_epoch_hint(ctx.core.epoch.load(Ordering::Acquire) as u16);
-    // Por el relay llegan todos los invitados: los lectores separan por la clave de cada uno.
-    ctx.input
-        .spawn_readers(&ctx.core, &connection, None, &sender);
-    voice_reader(ctx, connection.clone(), None);
-    tokio::spawn(control_datagrams(
-        Arc::clone(ctx),
-        connection.clone(),
-        Arc::clone(&sender),
-    ));
-    lock(&ctx.links).relay = Some(RelayLink {
-        sender: Arc::clone(&sender),
-        guests: BTreeMap::new(),
-    });
-    tokio::spawn(relay_accept_loop(Arc::clone(ctx), connection, sender));
-}
-
-async fn relay_accept_loop(
-    ctx: Arc<HostCtx>,
-    connection: PeerConnection,
-    sender: Arc<MediaSender>,
+/// Avisa si el relay suelta la ligadura de la sala (cuota agotada, sala cerrada) y no se pudo
+/// rehacer: los invitados que estaban por él se reconectan en directo si pueden.
+async fn watch_relay(
+    ctx: std::sync::Weak<HostCtx>,
+    mut state: tokio::sync::watch::Receiver<BindingState>,
 ) {
-    loop {
-        if connection.quinn().close_reason().is_some() || ctx.core.ended() {
-            break;
-        }
-        let control = match connection.accept_control(ctx.hello.clone()).await {
-            Ok(control) => control,
-            Err(coroom_transport::TransportError::Closed) => break,
-            Err(err) => {
-                debug!(error = %err, "control del relay rechazado");
-                continue;
-            }
-        };
-        let key = control.peer_hello().identity_pk;
-        let Some(guest) = ctx.guest_by_key(&key) else {
-            debug!("control del relay de un invitado desconocido");
+    while state.changed().await.is_ok() {
+        let BindingState::Lost(code) = *state.borrow_and_update() else {
             continue;
         };
-        if lock(&ctx.links).contains(guest) {
-            continue;
+        if let Some(ctx) = ctx.upgrade() {
+            ctx.relay_unavailable(format!("el relay dejó de reenviar la sala ({code:?})"));
         }
-        let (reply, receiver, _hello) = control.split();
-        ctx.install_pending();
-        sender.set_epoch_hint(ctx.core.epoch.load(Ordering::Acquire) as u16);
-        if let Some(relay) = &mut lock(&ctx.links).relay {
-            relay.guests.insert(guest, reply.clone());
-        }
-        ctx.after_attach(
-            guest,
-            Path::Relayed,
-            sender.connection().remote_address(),
-            &reply,
-        );
-        // Por el relay el tren llega a todos los invitados; cada uno informa el suyo.
-        tokio::spawn(probe_link(Arc::clone(&ctx), Arc::clone(&sender)));
-        tokio::spawn(control_reader(
-            Arc::clone(&ctx),
-            guest,
-            receiver,
-            Arc::clone(&sender),
-            reply,
-            Some(u64::from(guest.0)),
-        ));
+        return;
     }
-    let mut links = lock(&ctx.links);
-    if links
-        .relay
-        .as_ref()
-        .is_some_and(|relay| Arc::ptr_eq(&relay.sender, &sender))
-    {
-        links.relay = None;
-    }
-    drop(links);
-    ctx.update_active();
-    debug!("conexión con el relay cerrada");
 }
 
-/// Atiende las copias en datagrama de los `Nack`, `KeyframeRequest` y `Feedback` de una conexión
-/// (directa o la del relay, que las trae de todos sus invitados): llegan antes que las del stream
-/// de control cuando este perdió un paquete. Las repetidas no reenvían ni aplican nada
-/// (`MediaSender::on_nack`, `KeyframeGate`, `MediaSender::on_feedback_from`). Por el relay, el
-/// `Feedback` se atribuye por la etiqueta del datagrama (el id de par del invitado), que tiene
-/// que ser el de un invitado conectado por el relay.
+/// Atiende las copias en datagrama de los `Nack`, `KeyframeRequest` y `Feedback` de una conexión:
+/// llegan antes que las del stream de control cuando este perdió un paquete. Las repetidas no
+/// reenvían ni aplican nada (`MediaSender::on_nack`, `KeyframeGate`, `MediaSender::on_feedback`).
 async fn control_datagrams(
     ctx: Arc<HostCtx>,
     connection: PeerConnection,
     sender: Arc<MediaSender>,
 ) {
-    let relayed = connection.path() == Path::Relayed;
     while let Ok(datagram) = connection.read_control_datagram().await {
-        match coroom_transport::proto::control::parse_control_datagram_tagged(&datagram) {
-            Ok((
-                _,
-                ControlMessage::Nack {
-                    track,
-                    group,
-                    missing,
-                },
-            )) => {
+        match coroom_transport::proto::control::parse_control_datagram(&datagram) {
+            Ok(ControlMessage::Nack {
+                track,
+                group,
+                missing,
+            }) => {
                 sender.on_nack(track, group, &missing);
             }
-            Ok((_, ControlMessage::KeyframeRequest { group })) => {
+            Ok(ControlMessage::KeyframeRequest { group }) => {
                 keyframe_request(&ctx, group, connection.rtt());
             }
-            Ok((tag, ControlMessage::Feedback(feedback))) => {
-                if !relayed {
-                    sender.on_feedback(&feedback);
-                    continue;
-                }
-                let guest = GuestId(tag);
-                let known = lock(&ctx.links)
-                    .relay
-                    .as_ref()
-                    .is_some_and(|relay| relay.guests.contains_key(&guest));
-                if known {
-                    sender.on_feedback_from(u64::from(tag), &feedback);
-                }
+            Ok(ControlMessage::Feedback(feedback)) => {
+                sender.on_feedback(&feedback);
             }
             Ok(_) => {}
             Err(err) => debug!(error = %err, "datagrama de control no válido"),
@@ -1803,17 +1623,13 @@ async fn control_reader(
     mut receiver: ControlReceiver,
     sender: Arc<MediaSender>,
     reply: ControlSender,
-    source: Option<u64>,
 ) {
     loop {
         let message = match receiver.recv().await {
             Ok(Some(message)) => message,
             Ok(None) | Err(_) => break,
         };
-        let rest = match source {
-            Some(source) => sender.handle_control_from(source, message, &reply),
-            None => sender.handle_control(message, &reply),
-        };
+        let rest = sender.handle_control(message, &reply);
         match rest {
             Some(ControlMessage::KeyframeRequest { group }) => {
                 let rtt = sender.connection().rtt();
@@ -1842,7 +1658,7 @@ async fn control_reader(
             }
             Some(ControlMessage::ProbeResult { .. }) => {
                 // Ya lo aplicó el emisor; se anota lo mejor medido hacia este invitado.
-                if let Some(outcome) = sender.probe(source.unwrap_or(DEFAULT_SOURCE))
+                if let Some(outcome) = sender.probe(DEFAULT_SOURCE)
                     && let Some(kbps) = outcome.kbps()
                 {
                     let changed = lock(&ctx.core.guests)
@@ -1876,9 +1692,7 @@ async fn control_reader(
         }
     }
     ctx.detach(guest, &sender);
-    if source.is_none() {
-        sender.connection().close("fin");
-    }
+    sender.connection().close("fin");
     debug!(guest = guest.0, "control del invitado cerrado");
 }
 
@@ -2594,10 +2408,6 @@ impl Room {
             safety_number,
             permissions,
         });
-        if self.ctx.config.force_relay {
-            let ctx = Arc::clone(&self.ctx);
-            tokio::spawn(async move { ensure_relay(&ctx).await });
-        }
         Ok(())
     }
 
@@ -2673,13 +2483,7 @@ impl Room {
         }
         let closed = {
             let mut links = lock(&self.ctx.links);
-            let direct = links.direct.remove(&guest);
-            if let Some(relay) = &mut links.relay
-                && relay.guests.remove(&guest).is_some()
-            {
-                relay.sender.forget_source(u64::from(guest.0));
-            }
-            direct
+            links.guests.remove(&guest)
         };
         if let Some(link) = closed {
             let _ = link.control.send(&ControlMessage::Bye);
@@ -2811,7 +2615,6 @@ async fn run_host(
     .await
     .map_err(|_| SessionError::Network("el servidor no responde".to_owned()))?
     .map_err(signal_error)?;
-    let server = ServerUrl::parse(&config.server_url).map_err(network("URL del servidor"))?;
     signal
         .send(&SignalMessage::CreateRoom {
             identity_pk: identity.public_key(),
@@ -2857,6 +2660,25 @@ async fn run_host(
     let (Some(code), Some(relay)) = (code, relay) else {
         return Err(SessionError::Network("sala incompleta".into()));
     };
+    let relay = relay.map(|(token, addr, max_kbps)| RelayInfo {
+        addr,
+        token,
+        max_kbps,
+    });
+    // Ligado desde ya: el invitado que no conecte en directo llega por el relay sin esperar.
+    let binding = match &relay {
+        Some(info) => match endpoint.bind_relay(info.params()).await {
+            Ok(binding) => Some(binding),
+            Err(err) => {
+                core.emit(SessionEvent::RelayUnavailable(format!(
+                    "no se pudo usar el relay: {err}"
+                )));
+                None
+            }
+        },
+        None => None,
+    };
+    let relay = relay.filter(|_| binding.is_some());
     if config.force_relay && relay.is_none() {
         return Err(SessionError::Rejected(
             "se pidió el relay (--force-relay) pero la sala no lo tiene".to_owned(),
@@ -2885,14 +2707,8 @@ async fn run_host(
 
     let ctx = Arc::new(HostCtx {
         core: Arc::clone(&core),
-        relay_info: std::sync::Mutex::new(relay.map(|(token, addr, max_kbps)| RelayInfo {
-            addr,
-            server_name: server.host,
-            trust: config.trust.clone(),
-            token,
-            max_kbps,
-            role: WireRole::Host,
-        })),
+        relay_info: std::sync::Mutex::new(relay),
+        relay_binding: std::sync::Mutex::new(binding),
         config,
         video: std::sync::Mutex::new(video),
         endpoint,
@@ -2901,12 +2717,10 @@ async fn run_host(
         encode,
         gate,
         pending: std::sync::Mutex::new(None),
-        relay_lock: tokio::sync::Mutex::new(()),
         hello: Hello {
             protocol_version: PROTOCOL_VERSION,
             identity_pk: identity.public_key(),
             role: WireRole::Host,
-            relay_token: None,
         },
         max_kbps: AtomicU32::new(video.bitrate_kbps),
         format_note: std::sync::Mutex::new(None),
@@ -2944,9 +2758,8 @@ async fn run_host(
     core.set_state(SessionState::Active);
     tokio::spawn(rate_loop(Arc::clone(&ctx)));
     tokio::spawn(cursor_loop(Arc::clone(&ctx)));
-    if ctx.config.force_relay {
-        let ctx = Arc::clone(&ctx);
-        tokio::spawn(async move { ensure_relay(&ctx).await });
+    if let Some(binding) = lock(&ctx.relay_binding).as_ref() {
+        tokio::spawn(watch_relay(Arc::downgrade(&ctx), binding.watch()));
     }
 
     let mut tick = tokio::time::interval(Duration::from_millis(200));

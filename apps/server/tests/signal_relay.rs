@@ -3,22 +3,25 @@
 //!
 //! - Dos clientes crean y se unen a una sala, reciben `Observed` (la dirección de su `Endpoint` de
 //!   medios), intercambian `Mls` y `Candidates`, y el anfitrión ve salir al invitado.
-//! - Relay: un anfitrión y dos invitados (uno por `Connector` con `--force-relay`); los datagramas
-//!   del anfitrión llegan a los dos y un `Nack` se responde desde la caché sin llegar al anfitrión.
+//! - Relay: un anfitrión y dos invitados (uno por `Connector` con `--force-relay`) se ligan al
+//!   relay y abren sus conexiones de pares a través de él, de punta a punta; entre invitados no
+//!   pasa nada, y al expulsar o cerrar la sala el relay suelta la ligadura.
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::Bytes;
 use coroom_server::{Config, Server};
+use coroom_transport::connect::{Established, virtual_addr};
 use coroom_transport::crypto::Identity;
 use coroom_transport::proto::PROTOCOL_VERSION;
-use coroom_transport::proto::control::{self, ControlMessage, Hello, Role};
+use coroom_transport::proto::control::{ControlMessage, Hello, Role};
 use coroom_transport::proto::media::{ObjectHeader, Track};
 use coroom_transport::proto::signal::{ErrorCode, HOST_PEER_ID, SignalMessage, is_valid_room_code};
+use coroom_transport::relay::{BindingState, RelayBinding};
 use coroom_transport::{
-    Connector, Endpoint, EndpointOptions, Path, RelayInfo, ServerTrust, SignalClient,
-    TransportError, connect,
+    Connector, Endpoint, EndpointOptions, Path, PeerConnection, RelayInfo, ServerTrust,
+    SignalClient, TransportError,
 };
 use tokio::sync::oneshot;
 
@@ -27,6 +30,7 @@ const TOKEN: &str = "change-me";
 
 struct Running {
     url: String,
+    udp: SocketAddr,
     trust: ServerTrust,
     tcp: SocketAddr,
     stop: Option<oneshot::Sender<()>>,
@@ -43,7 +47,7 @@ impl Running {
     }
 }
 
-/// Límite por sala del relay de estos tests.
+/// Límite por invitado del relay de estos tests.
 const RELAY_MAX_KBPS: u32 = 400_000;
 
 async fn start_server() -> Running {
@@ -57,7 +61,8 @@ async fn start_server() -> Running {
     // `/health` por HTTP/1.1 en claro (el TCP con TLS se prueba en `http3.rs`).
     config.tcp_plain = true;
     let server = Server::bind(&config).await.expect("arranque del servidor");
-    let url = format!("https://127.0.0.1:{}", server.udp_addr().port());
+    let udp = server.udp_addr();
+    let url = format!("https://127.0.0.1:{}", udp.port());
     let trust = ServerTrust::Fingerprint(server.fingerprint().to_owned());
     let tcp = server.tcp_addr();
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
@@ -66,6 +71,7 @@ async fn start_server() -> Running {
     }));
     Running {
         url,
+        udp,
         trust,
         tcp,
         stop: Some(stop_tx),
@@ -110,8 +116,8 @@ async fn next(client: &mut Client) -> SignalMessage {
         .expect("sesión abierta")
 }
 
-/// `RelayToken` → datos de conexión al relay.
-fn relay_info(message: SignalMessage, server: &Running, role: Role) -> RelayInfo {
+/// `RelayToken` → datos de la ligadura con el relay.
+fn relay_info(message: SignalMessage) -> RelayInfo {
     let SignalMessage::RelayToken {
         token,
         addr,
@@ -122,11 +128,8 @@ fn relay_info(message: SignalMessage, server: &Running, role: Role) -> RelayInfo
     };
     RelayInfo {
         addr,
-        server_name: "localhost".to_owned(),
-        trust: server.trust.clone(),
         token,
         max_kbps,
-        role,
     }
 }
 
@@ -433,12 +436,82 @@ fn hello(identity: &Identity, role: Role) -> Hello {
         protocol_version: PROTOCOL_VERSION,
         identity_pk: identity.public_key(),
         role,
-        relay_token: None,
+    }
+}
+
+/// Liga `client` al relay con su `RelayToken`.
+async fn bind(client: &Client, token: SignalMessage) -> RelayBinding {
+    tokio::time::timeout(
+        TIMEOUT,
+        client.endpoint.bind_relay(relay_info(token).params()),
+    )
+    .await
+    .expect("ligadura a tiempo")
+    .expect("ligadura")
+}
+
+/// Conecta `host` con el invitado `peer` por el relay, abriendo desde los dos lados a la vez
+/// como las sesiones; el invitado con `force_relay` y los candidatos directos del anfitrión.
+async fn relayed(
+    host: &Client,
+    guest: &Client,
+    peer: u32,
+    force_relay: bool,
+) -> (PeerConnection, Established) {
+    let host_candidates = vec![host.endpoint.local_addr().expect("dirección")];
+    let host_connector = Connector::new(host.endpoint.clone());
+    let from_host =
+        host_connector.connect(guest.identity.public_key(), &[], Some(virtual_addr(peer)));
+    let guest_connector = Connector::new(guest.endpoint.clone()).force_relay(force_relay);
+    let candidates: &[SocketAddr] = if force_relay { &host_candidates } else { &[] };
+    let from_guest = guest_connector.connect(
+        host.identity.public_key(),
+        candidates,
+        Some(virtual_addr(HOST_PEER_ID)),
+    );
+    let (host_side, guest_side) =
+        tokio::time::timeout(TIMEOUT, async { tokio::join!(from_host, from_guest) })
+            .await
+            .expect("conexiones a tiempo");
+    let host_side = host_side.expect("el anfitrión conecta por el relay");
+    let guest_side = guest_side.expect("el invitado conecta por el relay");
+    assert_eq!(host_side.path, Path::Relayed);
+    assert_eq!(guest_side.path, Path::Relayed);
+    (host_side.connection, guest_side)
+}
+
+async fn datagram(connection: &PeerConnection) -> Bytes {
+    tokio::time::timeout(TIMEOUT, connection.read_datagram())
+        .await
+        .expect("datagrama a tiempo")
+        .expect("datagrama")
+}
+
+/// Espera a que el relay suelte la ligadura de `binding`; `poke` manda algo por ella para que
+/// el relay conteste que no la conoce (sin tráfico se vería al refrescarla, a los 10 s).
+async fn lost(binding: &RelayBinding, poke: impl Fn()) -> BindingState {
+    let mut watch = binding.watch();
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        let state = *watch.borrow_and_update();
+        if matches!(state, BindingState::Lost(_)) {
+            return state;
+        }
+        poke();
+        let _ = tokio::time::timeout_at(
+            deadline.min(tokio::time::Instant::now() + Duration::from_millis(100)),
+            watch.changed(),
+        )
+        .await;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "el relay debería soltar la ligadura"
+        );
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn relay_fans_out_and_answers_nacks_from_its_cache() {
+async fn the_relay_forwards_end_to_end_connections_without_terminating_them() {
     let server = start_server().await;
     let mut host = client(&server).await;
     let mut guest_a = client(&server).await;
@@ -464,39 +537,44 @@ async fn relay_fans_out_and_answers_nacks_from_its_cache() {
     assert_ne!(peer_a, peer_b);
     let token_b = next(&mut guest_b).await;
 
-    let host_relay =
-        connect::connect_relay(&host.endpoint, &relay_info(host_token, &server, Role::Host))
-            .await
-            .expect("anfitrión en el relay");
-    assert_eq!(host_relay.path(), Path::Relayed);
-    let relay_a = connect::connect_relay(
-        &guest_a.endpoint,
-        &relay_info(token_a, &server, Role::Guest),
-    )
-    .await
-    .expect("invitado A en el relay");
-    // El invitado B pasa por el `Connector` con `--force-relay`.
-    let relay_b = Connector::new(guest_b.endpoint.clone())
-        .force_relay(true)
-        .connect(
-            host.identity.public_key(),
-            &[],
-            Some(&relay_info(token_b, &server, Role::Guest)),
-        )
-        .await
-        .expect("invitado B en el relay");
-    assert_eq!(relay_b.path, Path::Relayed);
-    let relay_b = relay_b.connection;
+    // Cada uno se liga con su token y el relay le dice qué par es.
+    let host_binding = bind(&host, host_token).await;
+    let binding_a = bind(&guest_a, token_a).await;
+    let binding_b = bind(&guest_b, token_b).await;
+    assert_eq!(
+        host_binding.state(),
+        BindingState::Bound { peer: HOST_PEER_ID }
+    );
+    assert_eq!(binding_a.state(), BindingState::Bound { peer: peer_a });
+    assert_eq!(binding_b.state(), BindingState::Bound { peer: peer_b });
+    let relay_addr = host_binding.relay().expect("dirección del relay");
+    assert_eq!(relay_addr.port(), server.udp.port());
 
-    // Controles: cada invitado abre el suyo y el anfitrión los acepta por su única conexión.
-    let accept = {
-        let host_relay = host_relay.clone();
-        let host_hello = hello(&host.identity, Role::Host);
-        tokio::spawn(async move {
-            let first = host_relay.accept_control(host_hello.clone()).await?;
-            let second = host_relay.accept_control(host_hello).await?;
-            Ok::<_, TransportError>((first, second))
-        })
+    // A por la carrera normal (sin candidatos directos) y B con `--force-relay`, aunque tenga
+    // los candidatos directos del anfitrión.
+    let (host_a, guest_a_side) = relayed(&host, &guest_a, peer_a, false).await;
+    let (host_b, guest_b_side) = relayed(&host, &guest_b, peer_b, true).await;
+    assert_eq!(
+        guest_b_side.relay_reason.as_deref(),
+        Some("se pidió usar el relay")
+    );
+    let (relay_a, relay_b) = (guest_a_side.connection, guest_b_side.connection);
+    // La conexión es de punta a punta: cada extremo autentica al otro con su identidad, y el
+    // relay, que no tiene sus claves, no puede hacerse pasar por ninguno.
+    assert_eq!(host_a.peer_key(), Some(guest_a.identity.public_key()));
+    assert_eq!(host_b.peer_key(), Some(guest_b.identity.public_key()));
+    assert_eq!(relay_a.peer_key(), Some(host.identity.public_key()));
+    assert_eq!(relay_a.remote_address(), relay_addr);
+    assert_eq!(host_a.remote_address(), relay_addr);
+
+    // Control: cada invitado abre el suyo y el anfitrión lo acepta por la conexión de ese invitado.
+    let accept_a = {
+        let (host_a, host_hello) = (host_a.clone(), hello(&host.identity, Role::Host));
+        tokio::spawn(async move { host_a.accept_control(host_hello).await })
+    };
+    let accept_b = {
+        let (host_b, host_hello) = (host_b.clone(), hello(&host.identity, Role::Host));
+        tokio::spawn(async move { host_b.accept_control(host_hello).await })
     };
     let mut control_a = relay_a
         .open_control(hello(&guest_a.identity, Role::Guest))
@@ -507,86 +585,42 @@ async fn relay_fans_out_and_answers_nacks_from_its_cache() {
         .await
         .expect("control B");
     assert_eq!(control_a.peer_hello().role, Role::Host);
-    let (first, second) = tokio::time::timeout(TIMEOUT, accept)
+    let host_control_a = tokio::time::timeout(TIMEOUT, accept_a)
         .await
         .expect("a tiempo")
         .expect("tarea")
-        .expect("controles del anfitrión");
-    let mut host_controls = [first, second];
-    let mut seen: Vec<[u8; 32]> = host_controls
-        .iter()
-        .map(|control| control.peer_hello().identity_pk)
-        .collect();
-    seen.sort();
-    let mut expected = vec![guest_a.identity.public_key(), guest_b.identity.public_key()];
-    expected.sort();
-    assert_eq!(
-        seen, expected,
-        "el relay fija la identidad de cada invitado"
-    );
-
-    // Abanico: un grupo de 3 objetos del anfitrión llega a los dos invitados.
-    for index in 0..3 {
-        host_relay
-            .send_datagram(object(7, index, 3))
-            .expect("datagrama");
-    }
-    for guest in [&relay_a, &relay_b] {
-        let mut got = Vec::new();
-        for _ in 0..3 {
-            let datagram = tokio::time::timeout(TIMEOUT, guest.read_datagram())
-                .await
-                .expect("datagrama a tiempo")
-                .expect("datagrama");
-            got.push(ObjectHeader::parse(&datagram).expect("cabecera").object);
-        }
-        got.sort();
-        assert_eq!(got, [0, 1, 2]);
-    }
-
-    // `Nack` de un grupo en caché: lo responde el relay y el anfitrión no lo ve.
-    control_a
-        .sender
-        .send(&ControlMessage::Nack {
-            track: Track::Video,
-            group: 7,
-            missing: vec![1],
-        })
-        .expect("Nack");
-    let resent = tokio::time::timeout(TIMEOUT, relay_a.read_datagram())
-        .await
-        .expect("reenvío a tiempo")
-        .expect("datagrama");
-    assert_eq!(resent, object(7, 1, 3));
-    // `Nack` de un grupo que no está: llega al anfitrión (por el control de A).
-    control_a
-        .sender
-        .send(&ControlMessage::Nack {
-            track: Track::Video,
-            group: 99,
-            missing: vec![0],
-        })
-        .expect("Nack");
-    let index_a = host_controls
-        .iter()
-        .position(|control| control.peer_hello().identity_pk == guest_a.identity.public_key())
-        .expect("control de A");
-    let forwarded = tokio::time::timeout(TIMEOUT, host_controls[index_a].receiver.recv())
+        .expect("control de A en el anfitrión");
+    let mut host_control_b = tokio::time::timeout(TIMEOUT, accept_b)
         .await
         .expect("a tiempo")
-        .expect("mensaje");
+        .expect("tarea")
+        .expect("control de B en el anfitrión");
     assert_eq!(
-        forwarded,
-        Some(ControlMessage::Nack {
-            track: Track::Video,
-            group: 99,
-            missing: vec![0]
-        }),
-        "el Nack del grupo 7 no debe llegar al anfitrión, el del 99 sí"
+        host_control_a.peer_hello().identity_pk,
+        guest_a.identity.public_key()
     );
 
-    // Control anfitrión → invitado y del invitado B al anfitrión.
-    host_controls[index_a]
+    // Datagramas: cada invitado recibe solo lo que el anfitrión le manda a él.
+    for index in 0..3 {
+        host_a
+            .send_datagram(object(7, index, 3))
+            .expect("datagrama a A");
+    }
+    host_b
+        .send_datagram(object(8, 0, 1))
+        .expect("datagrama a B");
+    let mut got = Vec::new();
+    for _ in 0..3 {
+        got.push(ObjectHeader::parse(&datagram(&relay_a).await).expect("cabecera"));
+    }
+    got.sort_by_key(|header| header.object);
+    assert!(got.iter().all(|header| header.group == 7), "{got:?}");
+    assert_eq!(datagram(&relay_b).await, object(8, 0, 1));
+    relay_b.send_datagram(object(1, 0, 1)).expect("datagrama");
+    assert_eq!(datagram(&host_b).await, object(1, 0, 1));
+
+    // Control en los dos sentidos, de punta a punta.
+    host_control_a
         .sender
         .send(&ControlMessage::TargetBitrate { kbps: 8000 })
         .expect("envío");
@@ -601,76 +635,81 @@ async fn relay_fans_out_and_answers_nacks_from_its_cache() {
         .sender
         .send(&ControlMessage::Ping { t: 5 })
         .expect("envío");
-    let index_b = 1 - index_a;
     assert_eq!(
-        tokio::time::timeout(TIMEOUT, host_controls[index_b].receiver.recv())
+        tokio::time::timeout(TIMEOUT, host_control_b.receiver.recv())
             .await
             .expect("a tiempo")
             .expect("mensaje"),
         Some(ControlMessage::Ping { t: 5 })
     );
-
-    // Datagramas de un invitado al anfitrión.
-    relay_b.send_datagram(object(1, 0, 1)).expect("datagrama");
-    let upstream = tokio::time::timeout(TIMEOUT, host_relay.read_datagram())
+    // Un stream grande pasa entero (el relay no corta los paquetes de tamaño completo).
+    let big: Vec<u8> = (0..400_000u32).map(|i| i as u8).collect();
+    let receiver = {
+        let relay_a = relay_a.clone();
+        tokio::spawn(async move {
+            let mut stream = relay_a.quinn().accept_uni().await.expect("stream");
+            stream.read_to_end(1 << 20).await.expect("lectura")
+        })
+    };
+    let mut stream = host_a.quinn().open_uni().await.expect("stream");
+    stream.write_all(&big).await.expect("escritura");
+    stream.finish().expect("fin");
+    let received = tokio::time::timeout(TIMEOUT, receiver)
         .await
         .expect("a tiempo")
-        .expect("datagrama");
-    assert_eq!(upstream, object(1, 0, 1));
+        .expect("tarea");
+    assert!(received == big, "el stream llega entero");
 
-    // Un datagrama de control lleva la etiqueta del invitado (su id de par) y la pone el relay:
-    // A manda un `Feedback` con los contadores al máximo firmado como B; al anfitrión llega como
-    // de A (si no, B se quedaría sin control de tasa: sus informes parecerían viejos).
-    let forged = control::control_datagram_tagged(
-        &ControlMessage::Feedback(control::Feedback {
-            highest_group: u32::MAX,
-            received_bytes: u64::MAX,
-            lost_objects: 0,
-            owd_samples: Vec::new(),
-            ecn_ce: 0,
-        }),
-        peer_b,
+    // Entre invitados no pasa nada: el relay solo une al anfitrión con los suyos.
+    guest_b.endpoint.admit(guest_a.identity.public_key());
+    let between = tokio::time::timeout(
+        Duration::from_secs(2),
+        guest_a
+            .endpoint
+            .connect_peer(virtual_addr(peer_b), guest_b.identity.public_key()),
     )
-    .expect("cabe");
-    relay_a
-        .send_datagram(Bytes::from(forged))
-        .expect("datagrama");
-    let (tag, message) = loop {
-        let datagram = tokio::time::timeout(TIMEOUT, host_relay.read_control_datagram())
-            .await
-            .expect("a tiempo")
-            .expect("datagrama");
-        if let Ok(parsed) = control::parse_control_datagram_tagged(&datagram) {
-            break parsed;
-        }
-    };
-    assert_eq!(tag, peer_a, "la etiqueta es la del grant, no la que puso A");
-    assert!(matches!(message, ControlMessage::Feedback(_)));
-
-    let health = health(&server).await;
-    assert!(health["relay_bytes"].as_u64().unwrap_or(0) > 0, "{health}");
-    assert_eq!(health["rooms"], 1);
-
-    // Un token inventado no entra.
-    let bogus = RelayInfo {
-        token: vec![0; 32],
-        ..relay_info(
-            SignalMessage::RelayToken {
-                token: Vec::new(),
-                addr: host_relay.remote_address(),
-                max_kbps: 0,
-            },
-            &server,
-            Role::Guest,
-        )
-    };
+    .await;
     assert!(
-        connect::connect_relay(&guest_b.endpoint, &bogus)
-            .await
-            .is_err()
+        !matches!(between, Ok(Ok(_))),
+        "un invitado no debe llegar a otro por el relay"
     );
 
-    // Al cerrar el anfitrión su señalización, la sala se cierra y los invitados lo saben.
+    let health = health(&server).await;
+    assert!(
+        health["relay_bytes"].as_u64().unwrap_or(0) > 400_000,
+        "{health}"
+    );
+    assert_eq!(health["rooms"], 1);
+
+    // Un token inventado no se liga.
+    let bogus = coroom_transport::relay::RelayParams {
+        addr: relay_addr,
+        token: vec![0; 32],
+    };
+    let other = client(&server).await;
+    assert!(other.endpoint.bind_relay(bogus).await.is_err());
+
+    // Al expulsar a B, el relay suelta su ligadura y deja de pasarle nada.
+    host.signal
+        .send(&SignalMessage::Kick { peer_id: peer_b })
+        .await
+        .expect("Kick");
+    let state = lost(&binding_b, || {
+        let _ = relay_b.send_datagram(object(2, 0, 1));
+    })
+    .await;
+    assert!(matches!(state, BindingState::Lost(_)), "{state:?}");
+    let _ = host_b.send_datagram(object(9, 0, 1));
+    let after = tokio::time::timeout(Duration::from_millis(500), relay_b.read_datagram()).await;
+    assert!(
+        after.is_err(),
+        "nada llega a B tras la expulsión: {after:?}"
+    );
+    // A sigue.
+    host_a.send_datagram(object(10, 0, 1)).expect("datagrama");
+    assert_eq!(datagram(&relay_a).await, object(10, 0, 1));
+
+    // Al cerrar el anfitrión su señalización, la sala se cierra y el relay suelta a A.
     host.signal.close();
     loop {
         match next(&mut guest_a).await {
@@ -681,8 +720,12 @@ async fn relay_fans_out_and_answers_nacks_from_its_cache() {
             _ => continue,
         }
     }
-    let closed = tokio::time::timeout(TIMEOUT, relay_a.closed()).await;
-    assert!(closed.is_ok(), "el relay cierra las conexiones de la sala");
+    let state = lost(&binding_a, || {
+        let _ = relay_a.send_datagram(object(3, 0, 1));
+    })
+    .await;
+    assert!(matches!(state, BindingState::Lost(_)), "{state:?}");
+    drop(host_binding);
     server.stop().await;
 }
 
@@ -763,17 +806,11 @@ async fn relay_forwarding_rate() {
     let server = start_server().await;
     let mut host = client(&server).await;
     let mut guest = client(&server).await;
-    let (_code, host_token, guest_token, _peer) = room(&mut host, &mut guest).await;
-    let host_relay =
-        connect::connect_relay(&host.endpoint, &relay_info(host_token, &server, Role::Host))
-            .await
-            .expect("anfitrión en el relay");
-    let guest_relay = connect::connect_relay(
-        &guest.endpoint,
-        &relay_info(guest_token, &server, Role::Guest),
-    )
-    .await
-    .expect("invitado en el relay");
+    let (_code, host_token, guest_token, peer) = room(&mut host, &mut guest).await;
+    let _host_binding = bind(&host, host_token).await;
+    let _guest_binding = bind(&guest, guest_token).await;
+    let (host_relay, guest_side) = relayed(&host, &guest, peer, false).await;
+    let guest_relay = guest_side.connection;
     host_relay.set_target_kbps(RATE_KBPS as u32);
     guest_relay.set_target_kbps(RATE_KBPS as u32);
     let datagram_len = video_object(0, 0, 1, PAYLOAD).len() as u64;

@@ -202,11 +202,12 @@ pub enum SignalMessage {
     },
     /// Servidor → cliente: credencial para el relay de la sala.
     RelayToken {
-        /// Token opaco que va en el `Hello` hacia el relay.
+        /// Secreto con el que se liga al relay (`relay::Frame::Allocate` y `Bind`); nunca viaja
+        /// tal cual, solo su id y firmas.
         token: Vec<u8>,
         /// Dirección UDP del relay.
         addr: SocketAddr,
-        /// Límite de vídeo por sala del relay en kbit/s (`COROOM_RELAY_MAX_KBPS`; `0` = sin
+        /// Límite del relay por invitado y sentido en kbit/s (`COROOM_RELAY_MAX_KBPS`; `0` = sin
         /// límite). Lo que pase se descarta, así que el anfitrión no apunta por encima.
         max_kbps: u32,
     },

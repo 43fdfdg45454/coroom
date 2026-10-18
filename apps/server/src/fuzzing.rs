@@ -1,6 +1,8 @@
-//! Arnés para el fuzzing (`fuzz/`, `feature` `fuzzing`): el despacho de rutas y la señalización
-//! con un estado de servidor completo (SQLite en un directorio temporal, certificado autofirmado,
-//! relay y cuotas) pero **sin sockets**, para que cada entrada del fuzzer se resuelva en memoria.
+//! Arnés para el fuzzing (`fuzz/`, `feature` `fuzzing`): el despacho de rutas, la señalización y
+//! las tramas del relay con un estado de servidor completo (SQLite en un directorio temporal,
+//! certificado autofirmado, relay y cuotas) pero **sin red**, para que cada entrada del fuzzer se
+//! resuelva en memoria. El único socket es uno UDP en localhost por el que el relay contesta y
+//! reenvía (a direcciones de loopback donde no escucha nadie).
 //!
 //! No forma parte del servidor normal: solo se compila con la `feature` `fuzzing`.
 
@@ -21,11 +23,16 @@ use crate::auth::AuthState;
 use crate::config::Config;
 use crate::probe::UdpStatus;
 use crate::quota::Quota;
-use crate::relay::Relay;
+use crate::relay::{Grant, Relay, Token};
 use crate::routes::{Request, dispatch};
 use crate::signal::{Hub, HubConfig};
 use crate::tls::{CertResolver, TlsMaterial};
 use crate::{ServerError, ServerState, open_database};
+use coroom_transport::proto::control::Role;
+use coroom_transport::proto::relay::Frame;
+use coroom_transport::proto::signal::{HOST_PEER_ID, PeerId};
+use coroom_transport::relay::{bind_mac, token_id};
+use coroom_transport::socket::{HookedSocket, Segment, SegmentHook};
 
 /// Token de desarrollo del arnés (ficticio).
 pub const DEV_TOKEN: &str = "change-me";
@@ -42,11 +49,25 @@ pub const METHODS: [Method; 5] = [
     Method::PUT,
 ];
 
-/// Servidor sin sockets para el fuzzer.
+/// Servidor sin red para el fuzzer.
 pub struct Harness {
     runtime: tokio::runtime::Runtime,
     state: Arc<ServerState>,
     admin_token: String,
+    relay_socket: Arc<HookedSocket<Relay>>,
+    /// Tokens del anfitrión y del invitado de la sala del relay.
+    relay_tokens: [Token; 2],
+}
+
+/// Sala del relay del arnés.
+const RELAY_ROOM: u64 = 1;
+/// Par del invitado de esa sala.
+const RELAY_GUEST: PeerId = 1;
+
+/// Dirección de origen `index` de las tramas del relay: cuatro en loopback, en el puerto de
+/// descarte (nadie escucha, así que lo que el relay mande ahí se pierde).
+pub fn relay_source(index: u8) -> SocketAddr {
+    (Ipv4Addr::new(127, 0, 0, 2 + index % 4), 9).into()
 }
 
 impl std::fmt::Debug for Harness {
@@ -112,10 +133,32 @@ impl Harness {
                 relay_addr: Some(any),
             }))
         })?;
+        let relay_socket = {
+            let _guard = runtime.enter();
+            let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .and_then(|socket| HookedSocket::new(socket, Arc::clone(&state.relay)))
+                .map_err(|err| ServerError::Config(err.to_string()))?;
+            socket
+        };
+        let grant = |peer, role| Grant {
+            room: RELAY_ROOM,
+            peer,
+            role,
+            identity_pk: [0; 32],
+            host_user: None,
+        };
+        let (Some(host), Some(guest)) = (
+            state.relay.grant(grant(HOST_PEER_ID, Role::Host)),
+            state.relay.grant(grant(RELAY_GUEST, Role::Guest)),
+        ) else {
+            return Err(ServerError::Config("sin aleatoriedad".to_owned()));
+        };
         let mut harness = Harness {
             runtime,
             state,
             admin_token: String::new(),
+            relay_socket,
+            relay_tokens: [host, guest],
         };
         let setup = format!(r#"{{"username":"admin","password":"{ADMIN_PASSWORD}"}}"#);
         harness.request(&Method::POST, "/api/v1/setup", None, setup.as_bytes());
@@ -195,6 +238,45 @@ impl Harness {
             messages
         })
     }
+
+    /// Una trama del relay que llega de [`relay_source`]`(from)`, como si viniese de la red;
+    /// `true` si era del relay (si no, iría a QUIC).
+    pub fn relay_frame(&self, from: u8, bytes: &[u8]) -> bool {
+        let _guard = self.runtime.enter();
+        let io = self.relay_socket.io();
+        let mut datagram = bytes.to_vec();
+        let consumed = !matches!(
+            self.state
+                .relay
+                .segment(io, relay_source(from), None, &mut datagram),
+            Segment::Quic
+        );
+        self.state.relay.flush(io);
+        consumed
+    }
+
+    /// Liga [`relay_source`]`(from)` como el anfitrión (`guest == false`) o el invitado de la
+    /// sala, con un `Bind` válido (la galleta de la época actual y la firma con su token).
+    pub fn relay_bind(&self, from: u8, guest: bool) {
+        let token = &self.relay_tokens[usize::from(guest)];
+        let token_id = token_id(token);
+        let cookie = self
+            .state
+            .relay
+            .current_cookie(relay_source(from), &token_id);
+        let bind = Frame::Bind {
+            version: PROTOCOL_VERSION,
+            token_id,
+            cookie,
+            mac: bind_mac(token, &token_id, &cookie),
+        };
+        self.relay_frame(from, &bind.encode());
+    }
+
+    /// Pares ligados al relay.
+    pub fn relay_bound(&self) -> usize {
+        self.state.relay.bound_peers()
+    }
 }
 
 #[cfg(test)]
@@ -232,5 +314,21 @@ mod tests {
             matches!(replies.first(), Some(SignalMessage::Error { .. })),
             "{replies:?}"
         );
+
+        // Relay: las tramas que no son suyas van a QUIC; un `Bind` válido liga, uno inventado no.
+        assert!(!harness.relay_frame(0, &[0x40, 1, 2, 3]));
+        assert!(harness.relay_frame(0, &[0x30, 0, 0, 0, 1, 0x40]));
+        harness.relay_bind(0, false);
+        harness.relay_bind(1, true);
+        assert_eq!(harness.relay_bound(), 2);
+        assert!(harness.relay_frame(0, &[0x30, 0, 0, 0, 1, 0x40, 0x41]));
+        let forged = Frame::Bind {
+            version: PROTOCOL_VERSION,
+            token_id: [7; 16],
+            cookie: [0; 16],
+            mac: [0; 16],
+        };
+        harness.relay_frame(2, &forged.encode());
+        assert_eq!(harness.relay_bound(), 2);
     }
 }

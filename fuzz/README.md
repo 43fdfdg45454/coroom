@@ -35,6 +35,7 @@ ejecuta cada objetivo 120 s con AddressSanitizer cada semana y a mano.
 | `proto_hid` | Descriptores de informes HID (`hid::parse`): límites de tamaño de los informes | Todo el descriptor |
 | `proto_control` | `FrameBuffer` + `ControlMessage`; ida y vuelta | Trozos del stream |
 | `proto_signal` | `FrameBuffer::with_max(MAX_SIGNAL_MESSAGE)` + `SignalMessage` | Trozos del stream |
+| `proto_relay` | `relay::Frame::parse`, `data_peer` y `set_data_peer`; ida y vuelta; nada con el bit fijo de QUIC es del relay | La trama |
 | `proto_api` | Tipos JSON de la API (24 tipos) y hexadecimal | Byte de tipo y el cuerpo |
 | `transport_media` | `ReceiverCore`: FEC, `Nack`, plazos; memoria acotada | Órdenes: `op % 4 == 0` avanza `u8` ms y vence plazos; `0xFF` fija el intervalo del vídeo (`u16` × 10 µs); si no, un datagrama (trozo) |
 | `transport_loopback` | `Reassembler` del bucle local | Datagramas (trozos) |
@@ -43,6 +44,7 @@ ejecuta cada objetivo 120 s con AddressSanitizer cada semana y a mano.
 | `crypto_mls` | `RoomGroup::process`, `join` y `add_member` | Byte de modo (`% 4`) y el mensaje |
 | `server_api` | `routes::dispatch` del servidor con SQLite temporal (arnés `coroom_server::fuzzing`) | Método, sesión (0 ninguna, 1 administrador, 2 falsa), ruta hasta `0x00`, cuerpo |
 | `server_signal` | `Hub::run`: una sesión de señalización entera | Byte (impar: `Auth` de desarrollo delante) y los bytes del stream |
+| `server_relay` | `Relay` como gancho del socket: ligaduras, reenvío, límites; como mucho los dos pares de la sala ligados | Órdenes: byte con el origen (`>> 4`, de 4) y la orden (`% 4`): 0 y 1 ligan al anfitrión o al invitado con un `Bind` válido; si no, una trama (trozo) |
 | `server_avatar` | `avatar::validate` del servidor: límites al decodificar, PNG propio y estable al volver a validarlo | El fichero subido |
 | `codec_slices` | `split_slices` de H.264, HEVC y AV1 | Byte de códec y el paquete |
 | `audio_jitter` | `JitterBuffer` con secuencias arbitrarias | Órdenes: `op % 3 == 0` avanza y saca; si no, mete un paquete (secuencia, captura, banderas, avance y trozo) |

@@ -17,6 +17,7 @@ pub mod hex;
 pub mod hid;
 pub mod input;
 pub mod media;
+pub mod relay;
 pub mod signal;
 pub mod video;
 
@@ -47,29 +48,27 @@ pub mod video;
 /// (`FriendRequested`), las dos detrás de `Error`, que vuelve a la posición que tenía; la 17, el
 /// límite por sala del relay en `RelayToken` (`max_kbps`), que el anfitrión respeta; la 18, la
 /// vibración de los mandos convertidos y de Xbox por cable (`GamepadRumble`, detrás de
-/// `HandoffCancel`).
-pub const PROTOCOL_VERSION: u16 = 18;
+/// `HandoffCancel`); la 19, el relay de reenvío ([`relay`]): ya no termina QUIC, la conexión de
+/// pares va de punta a punta a través de él (sin `Alpn::Relay` ni el token en `Hello`).
+pub const PROTOCOL_VERSION: u16 = 19;
 
 /// Identificadores ALPN (RFC 7301) que el socket QUIC usa para demultiplexar conexiones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Alpn {
     /// HTTP/3: API REST, administración y sesiones WebTransport de señalización.
     H3,
-    /// Relay de medios de coroom, versión 1.
-    Relay,
-    /// QUIC directo entre pares, versión 1.
+    /// QUIC entre pares, versión 1 (en directo o a través del relay de reenvío, [`relay`]).
     P2p,
 }
 
 impl Alpn {
     /// Todos los ALPN que conoce esta versión del protocolo.
-    pub const ALL: [Alpn; 3] = [Alpn::H3, Alpn::Relay, Alpn::P2p];
+    pub const ALL: [Alpn; 2] = [Alpn::H3, Alpn::P2p];
 
     /// Identificador ALPN como texto.
     pub const fn as_str(self) -> &'static str {
         match self {
             Alpn::H3 => "h3",
-            Alpn::Relay => "coroom-relay/1",
             Alpn::P2p => "coroom-p2p/1",
         }
     }
@@ -99,7 +98,6 @@ mod tests {
     #[test]
     fn alpn_values_match_the_specification() {
         assert_eq!(Alpn::H3.as_bytes(), b"h3");
-        assert_eq!(Alpn::Relay.as_bytes(), b"coroom-relay/1");
         assert_eq!(Alpn::P2p.as_bytes(), b"coroom-p2p/1");
     }
 

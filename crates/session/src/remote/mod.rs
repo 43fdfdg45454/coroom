@@ -10,8 +10,8 @@
 //!   de NAT falla o se fuerza, por el relay). Los invitados entran aprobados con permiso de mirar y
 //!   hablar, o solo de mirar si la sala los quiere callados ([`Permissions::on_entry`]). El
 //!   pipeline local se reutiliza: captura →
-//!   codificación → **SFrame** (una vez por fotograma) → `MediaSender` (uno por invitado directo y,
-//!   como mucho, uno hacia el relay, que abre en abanico). El bitrate del codificador es el
+//!   codificación → **SFrame** (una vez por fotograma) → `MediaSender` (uno por invitado, directo o a
+//!   través del relay, que solo reenvía). El bitrate del codificador es el
 //!   **mínimo** de los objetivos de todos los invitados (cada `RateController` ya aplica su
 //!   histéresis); un `KeyframeRequest` pide un intra.
 //! - **Invitado** ([`RemoteSession::guest`]): entra con su `KeyPackage`, construye el grupo con el

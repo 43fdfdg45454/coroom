@@ -328,7 +328,7 @@ pub struct Config {
     )]
     pub relay_quota_gb_per_month: f64,
 
-    /// Bitrate máximo por sala en el relay (kbit/s); `0` = sin límite.
+    /// Bitrate máximo por invitado y sentido en el relay (kbit/s); `0` = sin límite.
     #[arg(
         long,
         env = "COROOM_RELAY_MAX_KBPS",
@@ -336,7 +336,7 @@ pub struct Config {
         value_name = "KBIT/S",
         hide_env = true,
         hide_default_value = true,
-        help = "Bitrate máximo por sala en el relay (lo que pase se descarta); 0 = sin límite \
+        help = "Bitrate máximo por invitado y sentido en el relay (lo que pase se descarta); 0 = sin límite \
                 [COROOM_RELAY_MAX_KBPS; por defecto 0]"
     )]
     pub relay_max_kbps: u32,

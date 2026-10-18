@@ -3,11 +3,12 @@
 //! Un único binario (`docs/ARQUITECTURA.md` §3 y §4) con dos pilas que comparten la misma lógica de rutas
 //! ([`routes::dispatch`]):
 //!
-//! - **QUIC** en el puerto UDP (`COROOM_BIND_UDP`), demultiplexado por el ALPN negociado:
-//!   - `h3`: HTTP/3 con `quinn` + `h3` (`/health`, `/version`, la API `/api/v1` y `/admin`) y la
-//!     **señalización** por WebTransport en `/signal` (`h3-webtransport`, [`signal`]);
-//!   - `coroom-relay/1`: el **relay** de medios con abanico, caché de `Nack`, cuotas y límite por
-//!     sala ([`relay`], [`quota`]).
+//! - El puerto UDP (`COROOM_BIND_UDP`), separado por el primer byte de cada datagrama:
+//!   - **QUIC** `h3`: HTTP/3 con `quinn` + `h3` (`/health`, `/version`, la API `/api/v1` y
+//!     `/admin`) y la **señalización** por WebTransport en `/signal` (`h3-webtransport`,
+//!     [`signal`]);
+//!   - las tramas del **relay** de reenvío, que copia los paquetes de las conexiones de pares sin
+//!     terminarlas, con cuotas y límite por invitado ([`relay`], [`quota`]).
 //! - **HTTP/2 y HTTP/1.1 sobre TLS** en el puerto TCP (`COROOM_BIND_TCP`, [`tcp`]), con la cabecera
 //!   `Alt-Svc` que anuncia HTTP/3; sin TLS solo con `COROOM_TCP_PLAIN=true` (desarrollo).
 //!
@@ -148,9 +149,9 @@ fn ipv4_fallback(addr: SocketAddr) -> Option<SocketAddr> {
     }
 }
 
-/// Bitrate con el que se dimensiona la ventana de las conexiones del servidor (relay incluido):
-/// holgada para que QUIC no frene el abanico de datagramas.
-const SERVER_TARGET_KBPS: u32 = 100_000;
+/// Bitrate con el que se dimensiona la cola de datagramas de las conexiones del servidor (solo
+/// señalización: el relay no termina QUIC).
+const SIGNALING_TARGET_KBPS: u32 = 1_000;
 
 /// Estado compartido por las dos pilas.
 #[derive(Debug)]
@@ -282,12 +283,19 @@ impl Server {
         let quic_config = QuicServerConfig::try_from(tls::quic_server_config(Arc::clone(&certs))?)
             .map_err(|err| ServerError::Tls(err.to_string()))?;
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
-        // Mismo transporte que los clientes (MTU, keep-alive, búferes de datagramas) con una
-        // ventana amplia fija para el relay.
+        // Mismo transporte que los clientes (MTU, keep-alive, búferes de datagramas); las
+        // conexiones del servidor son solo de señalización: el controlador de `quinn`.
         server_config.transport_config(Arc::new(coroom_transport::quic::transport_config(
-            &CongestionShared::new(SERVER_TARGET_KBPS),
-            Congestion::Media,
+            &CongestionShared::new(SIGNALING_TARGET_KBPS),
+            Congestion::Standard,
         )));
+        // El relay es el gancho del socket UDP: atiende sus tramas antes de que lleguen a `quinn`.
+        let quota = Arc::new(Quota::new(db.clone(), config.quota_bytes()));
+        let relay = if config.relay_enabled {
+            Relay::with_limits(Some(Arc::clone(&quota)), config.relay_max_kbps)
+        } else {
+            Relay::disabled(Some(Arc::clone(&quota)))
+        };
 
         // El socket con los búferes ampliados de los clientes (`SO_RCVBUF`/`SO_SNDBUF` de 8 MB,
         // lo que el sistema conceda: en Linux, `net.core.rmem_max`/`wmem_max`, ver
@@ -297,9 +305,12 @@ impl Server {
             ServerError::Config("el servidor necesita un runtime de tokio".into())
         })?;
         let open = |addr: SocketAddr, server_config: quinn::ServerConfig| {
-            let socket = coroom_transport::quic::bind_udp_socket(addr)?;
-            quinn::Endpoint::new(
-                quinn::EndpointConfig::default(),
+            let socket = coroom_transport::socket::HookedSocket::new(
+                coroom_transport::quic::bind_udp_socket(addr)?,
+                Arc::clone(&relay),
+            )?;
+            quinn::Endpoint::new_with_abstract_socket(
+                coroom_transport::quic::endpoint_config(),
                 Some(server_config),
                 socket,
                 Arc::clone(&runtime),
@@ -340,8 +351,6 @@ impl Server {
                 "modo desarrollo: COROOM_DEV_TOKEN está definido y la señalización acepta ese                  token sin cuenta; no lo uses en un servidor público"
             );
         }
-        let quota = Arc::new(Quota::new(db.clone(), config.quota_bytes()));
-        let relay = Relay::with_limits(Some(Arc::clone(&quota)), config.relay_max_kbps);
         let (cuts_tx, quota_cuts) = tokio::sync::mpsc::unbounded_channel();
         relay.set_exceeded_sender(cuts_tx);
         let hub = Hub::with_accounts(

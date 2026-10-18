@@ -38,6 +38,7 @@ const PAD_DESCRIPTOR: &[u8] = &[
     0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x02, 0x81, 0x02, 0xc0,
 ];
 use coroom_session::transport::proto::media::{ObjectHeader, Track};
+use coroom_session::transport::proto::relay::{ErrorCode as RelayError, Frame as RelayFrame};
 use coroom_session::transport::proto::signal::SignalMessage;
 
 /// Datos con su longitud delante (`u16` BE), el formato de `coroom_fuzz::Bytes::chunk`.
@@ -509,6 +510,71 @@ fn fuzz_seeds() {
     seeds.write("server_signal", "sesion", &session);
     seeds.write("server_signal", "sin-auth", &prefixed(&[0], &frames[1]));
     seeds.write("server_signal", "auth-crudo", &prefixed(&[0], &frames[0]));
+
+    // --- proto_relay, server_relay -----------------------------------------------------------------
+    let relay = [
+        RelayFrame::Allocate {
+            version: PROTOCOL_VERSION,
+            token_id: [3; 16],
+        },
+        RelayFrame::Challenge {
+            token_id: [3; 16],
+            cookie: [4; 16],
+        },
+        RelayFrame::Bind {
+            version: PROTOCOL_VERSION,
+            token_id: [3; 16],
+            cookie: [4; 16],
+            mac: [5; 16],
+        },
+        RelayFrame::Bound {
+            cookie: [4; 16],
+            peer: 1,
+            lifetime_s: 40,
+            mac: [6; 16],
+        },
+        RelayFrame::Error(RelayError::NotBound),
+        RelayFrame::Data {
+            peer: 1,
+            packet: &[0x40, 0xAA, 0xBB, 0xCC],
+        },
+        RelayFrame::Refresh,
+        RelayFrame::Refreshed,
+    ];
+    let names = [
+        "allocate",
+        "challenge",
+        "bind",
+        "bound",
+        "error",
+        "data",
+        "refresh",
+        "refreshed",
+    ];
+    for (frame, name) in relay.iter().zip(names) {
+        seeds.write("proto_relay", name, &frame.encode());
+    }
+    // Anfitrión desde el origen 0 e invitado desde el 1, ligados; datos en los dos sentidos, un
+    // refresco y un paquete de QUIC.
+    let data_to = |peer: u32| {
+        RelayFrame::Data {
+            peer,
+            packet: &[0x40; 64],
+        }
+        .encode()
+    };
+    let mut session = vec![0x00, 0x11];
+    for (op, frame) in [
+        (0x02, data_to(1)),
+        (0x12, data_to(0)),
+        (0x12, RelayFrame::Refresh.encode()),
+        (0x22, data_to(0)),
+        (0x02, vec![0x40, 1, 2, 3]),
+    ] {
+        session.push(op);
+        session.extend_from_slice(&chunks([frame.as_slice()]));
+    }
+    seeds.write("server_relay", "sesion", &session);
 
     // --- proto_api, server_api ---------------------------------------------------------------------
     let json = |value: &dyn erased::Json| value.to_json();

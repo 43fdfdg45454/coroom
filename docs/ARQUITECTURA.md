@@ -109,7 +109,7 @@ y un respaldo declarado cuando dependa de drivers o de borradores.
 | Señalización y API | **HTTP/3** (`h3`) y **WebTransport** en el mismo puerto UDP; sin WebSocket | HTTP/2 con TLS por TCP con `Alt-Svc`; streams QUIC propios con los mismos mensajes si WebTransport no casa |
 | Protocolo de medios | Propio y mínimo con el esquema de **Media over QUIC** (pistas, grupos, objetos) y cabecera binaria fija; control con `postcard` | Es ya el respaldo: se adoptará `moq-transport` cuando el IETF lo cierre |
 | FEC, NACK y control de tasa | FEC **RaptorQ** (RFC 6330) adaptativa a la pérdida, NACK con caché, cargas de 1200 B; control tipo **SCReAM** (RFC 8298) con controlador de congestión propio en `quinn`, informe cada 50 ms, cola medida con el mínimo del OWD de 500 ms (y vía rápida con un informe para colas ≥ 50 ms), crecimiento acotado a 1,25 × lo que el receptor recibe, espera de 1 s tras cada recorte, umbrales de pérdida de GCC y **techo de ráfaga** para los enlaces con limitador (la pérdida que depende del ritmo, con al menos 600 objetos y por encima de la propia del enlace más el margen de una binomial, baja el techo a lo que pasó; si no baja con él, se da por aleatoria y se deshace; sin pérdida el techo no se mueve: lo suben **sondas periódicas** cortas de 16 datagramas a 1,25 × el techo cuando frena, cada 4 s y doblando hasta 64 s si fallan, recordando el de antes por si la subida pierde, y se quita si el enlace pasa el ritmo natural del pacing); sin tope de bitrate del usuario (lo limita el enlace; mínimo 0,5 Mbit/s); arranque en el 70 % de lo que mide la **sonda del enlace** (cuatro trenes de 64 datagramas por invitado al conectar, en escalera hasta 100 Mbit/s para medir también lo que sobra por encima de ese máximo; dispersión medida por el receptor; un tren que pierde fija el techo de ráfaga desde el principio; 8 Mbit/s si no llega); **pacing** de cada fotograma al 70 % de lo que midió la sonda (o 1,25 × el objetivo si es más), con techo de 100 Mbit/s, como mucho el 30 % del intervalo (un intra, 1 intervalo con holgura medida, 2 sin ella) y, con techo de ráfaga, a ese techo hasta el 85 % del intervalo (un intra, 8) con el objetivo en el 70 % del techo; FEC descontada del bitrate del codificador; VBV de un fotograma que sigue al bitrate | Sin ECN, la cola se estima por OWD; escalera de resolución/fps bajo el suelo del modo |
-| NAT y relay | Candidatos (IPv6 primero, reflejado, WAN del router abierta por PCP/NAT-PMP/UPnP, CGNAT, locales) y apertura simultánea QUIC desde un solo socket | Relay QUIC en el servidor, transparente para los medios |
+| NAT y relay | Candidatos (IPv6 primero, reflejado, WAN del router abierta por PCP/NAT-PMP/UPnP, CGNAT, locales) y apertura simultánea QUIC desde un solo socket | Relay de reenvío en el servidor (estilo TURN, RFC 8656): no termina QUIC, la conexión de pares va de punta a punta |
 | Criptografía | **MLS** (RFC 9420, `openmls`) para la sala, **SFrame** (RFC 9605, AES-256-GCM) por fotograma y trama, **HPKE** (RFC 9180) con **X-Wing** (X25519 + ML-KEM-768) para la entrada; identidad Ed25519; firma híbrida Ed25519 + **ML-DSA-65** tras la `feature` `pq-sign` (desactivada por defecto) | ChaCha20-Poly1305 si la CPU no acelera AES; X-Wing **sin** respaldo a X25519 (la oferta manipulada se rechaza) |
 | Captura Linux | **PipeWire** por el portal `ScreenCast` (`ashpd`), DMA-BUF con modificadores explícitos, *restore token*; sin XShm | Copia a CPU si la importación sin copias falla |
 | Captura Windows | **Windows.Graphics.Capture** con las mejoras de Windows 11 24H2 (regiones sucias, sin borde); sin DXGI Desktop Duplication | WGC básico en versiones anteriores |
@@ -119,7 +119,7 @@ y un respaldo declarado cuando dependa de drivers o de borradores.
 | Entrada | Protocolo 11: toda la entrada por datagramas con los eventos en orden y el **estado completo** del invitado en cada paquete (`InputState`); el anfitrión aplica los eventos con la secuencia seguida y, si se perdió un datagrama, reconcilia su vista con el estado; el invitado repite el estado a los 3, 8 y 20 ms de cada cambio; captura → inyectado medido por etapas (cola en el invitado, red, inyección). Linux: **libei** por el portal `RemoteDesktop` (`reis`), mandos convertidos por **uinput** y **tal cual** por **UHID** (el mando del invitado con su VID/PID y su descriptor HID, leído en el invitado por `hidraw` en Linux o `hidapi` en Windows; protocolo 8: `PadData`, `GamepadMode`, `GamepadOutput`); la vibración de los convertidos y de los Xbox por cable vuelve como el estado de los dos motores (protocolo 18: `GamepadRumble`, del *force feedback* `FF_RUMBLE` de uinput o de `XInputSetState` en el driver de Windows) y el invitado la aplica con un efecto `FF_RUMBLE` en el nodo `evdev` del propio mando en Linux (con el *force feedback* de `gilrs` apagado: su refresco de 50 ms mandaría ceros también a los mandos tal cual) o con el de `gilrs` en Windows. Windows: `SendInput` y driver propio de mandos en modo usuario, **UMDF2** (`drivers/windows-vhid/`): mandos tal cual como fuente de la **Virtual HID Framework** (`vhf.sys`) y convertidos a cuatro **Xbox 360** de XInput (la interfaz XUSB de `xusb22`); sin firma de prueba ni tocar el arranque seguro o HVCI | Aviso si falta libei (uinput no depende de él); mando a teclas (`--gamepad-to-keys`) sin driver |
 | Render | `wgpu` con backend Vulkan para importar las texturas decodificadas, `winit` con Wayland nativo; BT.709 y HDR10 (BT.2020 PQ) con superficie `Rgba16Float`; 4:4:4 y 120 fps cuando todos lo admiten | D3D12 en Windows si la importación lo exige; *tone mapping* a SDR sin superficie HDR |
 | UI | `iced` 0.14 a bajo nivel (`iced_winit`, `iced_wgpu`) sobre el mismo `wgpu::Device` que el vídeo; la interfaz se dibuja en una textura propia solo cuando cambia y el **compositor de la ventana** (`apps/desktop/src/ui/compose.rs`) entrega cada fotograma de vídeo en cuanto llega, desde el hilo `present`, con la interfaz encima (alfa premultiplicado): la presentación no espera a reconstruir la interfaz; sistema de diseño `coroom-ui` de estilo Adwaita con tema, acento y fuente del sistema; textos en Fluent | Fuente Inter embebida si no hay la del sistema |
-| Servidor | `coroom-server`: `h3` y relay en el mismo socket (ALPN), `hyper` + `tokio-rustls` para TCP, **SQLite** (`sqlx`), certificado del operador en PEM (o autofirmado), imagen distroless; sin gestión de certificados ni dependencia de internet | — |
+| Servidor | `coroom-server`: `h3` y relay en el mismo socket (el relay por el primer byte de cada datagrama), `hyper` + `tokio-rustls` para TCP, **SQLite** (`sqlx`), certificado del operador en PEM (o autofirmado), imagen distroless; sin gestión de certificados ni dependencia de internet | — |
 | Empaquetado | **Flatpak** (runtime freedesktop 26.08, portales declarados), **MSIX** firmado y `.zip` portátil, imagen multiarquitectura en GHCR; publicación automática en cada push a `main` con la versión que calcula GitVersion (etiqueta `vX.Y.Z` y release con los paquetes) | — |
 | Observabilidad | `tracing` y overlay de estadísticas con marcas por etapa; sin telemetría externa | — |
 
@@ -128,13 +128,14 @@ y un respaldo declarado cuando dependa de drivers o de borradores.
 ```
 Invitado ── HTTP/3 + WebTransport ──▶ Servidor (UDP) ◀── HTTP/3 + WebTransport ── Anfitrión
    │                                  API, /admin, señalización,                       │
-   │                                  relay (solo texto cifrado)                       │
-   └════════════════ QUIC directo, o QUIC ↔ relay ↔ QUIC si falla ═════════════════════┘
+   │                                  relay (reenvía UDP, no descifra)                 │
+   └═══════════ QUIC de pares directo, o el mismo QUIC a través del relay ═════════════┘
 ```
 
-- **Un solo puerto UDP**: el socket QUIC del servidor demultiplexa por ALPN entre `h3` (API REST,
-  interfaz de administración y sesiones WebTransport de señalización en `/signal`) y
-  `coroom-relay/1` (medios). TCP con HTTP/2 y TLS queda para clientes sin HTTP/3 y para anunciar
+- **Un solo puerto UDP**: el socket del servidor separa por el primer byte de cada datagrama los
+  paquetes de QUIC (todos con el bit fijo `0x40`: los extremos de coroom no lo engrasan, RFC 9287)
+  de las tramas del relay (`0b00xx_xxxx`, `proto::relay`); lo de QUIC va a `h3` (API REST, interfaz
+  de administración y sesiones WebTransport de señalización en `/signal`). TCP con HTTP/2 y TLS queda para clientes sin HTTP/3 y para anunciar
   `Alt-Svc`. Con Docker, los puertos del host son los de `COROOM_PUBLIC_UDP_PORT` y
   `COROOM_PUBLIC_TCP_PORT` (443 por defecto); en desarrollo, UDP 4433 y TCP 8443.
 - **Señalización**: sesión WebTransport autenticada que transporta candidatos de red, claves
@@ -150,10 +151,18 @@ Invitado ── HTTP/3 + WebTransport ──▶ Servidor (UDP) ◀── HTTP/3 
   conexiones a todos (IPv6 primero, luego reflejado, luego la WAN de operadora, luego locales)
   mientras acepta entrantes, con un tiempo de apertura de 3 s; gana la primera conexión con la
   identidad verificada.
-- **Relay de respaldo**: si ninguna llega, el par se conecta al relay con un `RelayToken`. El relay
-  termina QUIC salto a salto, reenvía los objetos leyendo solo la cabecera en claro (pista, grupo,
-  secuencia, marca de intra), abre en abanico el flujo del anfitrión a N invitados y responde NACK
-  desde una caché corta por sala. Tiene cuotas por cuenta y por sala y el operador decide si lo
+- **Relay de respaldo**: con el `RelayToken` de la sala, cada par se **liga** al relay desde su
+  socket de medios (`Allocate` → `Challenge` con una galleta sin estado atada a su dirección →
+  `Bind` firmado con el token → `Bound` firmado por el relay; el token nunca viaja) y lo refresca
+  cada 10 s. Los pares remotos pasan a tener una dirección virtual (240.0.0.0/4) en el socket: lo
+  que `quinn` manda ahí sale como `Data` hacia el relay, que lo reescribe con el par de origen y lo
+  reenvía tal cual. La conexión de pares (`coroom-p2p/1`, TLS con las identidades) va de **punta a
+  punta**: el relay no la termina ni la descifra, no ve las cabeceras de los medios y su coste por
+  paquete es recibir y mandar (con GSO y GRO). Solo une al anfitrión con los invitados de su sala;
+  el anfitrión sube una copia por invitado, como en directo, y los NACK, el control de tasa y el RTT
+  son de punta a punta. La conexión por el relay se abre en paralelo con la apertura simultánea y se
+  aparta: se usa si la directa no llega en el plazo, sin sumar sus idas y vueltas. Tiene cuotas por
+  cuenta, un límite por invitado y sentido (`COROOM_RELAY_MAX_KBPS`) y el operador decide si lo
   habilita. QUIC migra la ruta al cambiar de red y el invitado reconecta solo.
 - **Cuentas por servidor**: sin registro público. El primer administrador se crea en `/admin` en el
   primer arranque; después, según `COROOM_REGISTRATION`, el administrador emite códigos de
@@ -217,15 +226,15 @@ violación.
 
 ## 6. Seguridad
 
-Cada salto va por QUIC con TLS 1.3 e intercambio híbrido poscuántico, y por encima el contenido
+Cada conexión va por QUIC con TLS 1.3 e intercambio híbrido poscuántico (también a través del
+relay, que solo reenvía sus paquetes), y por encima el contenido
 viaja cifrado de extremo a extremo: la sala es un grupo MLS cuyas entradas y salidas rotan la clave
 con secreto hacia delante; las claves SFrame de cada emisor se derivan del exportador MLS y la época
 viaja en la cabecera, así que la rotación nunca bloquea el flujo; la entrada usa una clave pareja a
-pareja HPKE con X-Wing, de modo que ningún invitado puede leer ni falsificar la de otro. El relay ve
-y usa la cabecera de los medios, nunca su contenido, y la capa SFrame se mantiene también en directo
-para que las dos rutas se comporten igual. El chat se sella con AES-256-GCM y una clave de grupo
-por época (exportador MLS `coroom chat v1`): el relay, que reenvía los streams de control, no lo
-lee, y quien sale de la sala deja de leer lo que se escribe después; la autoría la pone el
+pareja HPKE con X-Wing, de modo que ningún invitado puede leer ni falsificar la de otro. El relay no
+ve ni la cabecera de los medios, y la capa SFrame queda por encima de QUIC en las dos rutas. El chat se sella con AES-256-GCM y una clave de grupo
+por época (exportador MLS `coroom chat v1`): ni el
+anfitrión que lo reenvía ni el relay lo leen, y quien sale de la sala deja de leer lo que se escribe después; la autoría la pone el
 anfitrión (§2.3 y §1 de `docs/seguridad.md`).
 
 El análisis de amenazas (servidor curioso o malicioso, invitado malicioso, red hostil), la revisión

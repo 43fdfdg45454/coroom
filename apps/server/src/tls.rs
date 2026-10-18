@@ -113,9 +113,9 @@ impl ResolvesServerCert for CertResolver {
     }
 }
 
-/// Configuración `rustls` para QUIC: solo TLS 1.3, ALPN `h3` y `coroom-relay/1` (el socket
-/// demultiplexa por el ALPN negociado) y el proveedor `aws-lc-rs` (con el intercambio híbrido
-/// poscuántico X25519MLKEM768 por delante).
+/// Configuración `rustls` para QUIC: solo TLS 1.3, ALPN `h3` (el relay no termina QUIC: sus
+/// tramas las atiende el gancho del socket antes de `quinn`) y el proveedor `aws-lc-rs` (con el
+/// intercambio híbrido poscuántico X25519MLKEM768 por delante).
 pub fn quic_server_config(
     resolver: Arc<CertResolver>,
 ) -> Result<rustls::ServerConfig, ServerError> {
@@ -127,10 +127,7 @@ fn quic_server_config_for(
     aes_gcm_accelerated: bool,
 ) -> Result<rustls::ServerConfig, ServerError> {
     let mut config = server_config(resolver, &[&rustls::version::TLS13], aes_gcm_accelerated)?;
-    config.alpn_protocols = vec![
-        Alpn::H3.as_bytes().to_vec(),
-        Alpn::Relay.as_bytes().to_vec(),
-    ];
+    config.alpn_protocols = vec![Alpn::H3.as_bytes().to_vec()];
     Ok(config)
 }
 
@@ -500,7 +497,7 @@ mod tests {
         ] {
             let quic = quic_server_config_for(Arc::clone(&resolver), aes_gcm_accelerated);
             let tcp = tcp_server_config_for(Arc::clone(&resolver), aes_gcm_accelerated);
-            for (config, alpn) in [(quic, &b"coroom-relay/1"[..]), (tcp, b"h2")] {
+            for (config, alpn) in [(quic, &b"h3"[..]), (tcp, b"h2")] {
                 let config = Arc::new(config.expect("configuración"));
                 let (_, suite) = handshake(&config, "coroom.example.com", alpn).expect("handshake");
                 assert_eq!(suite, expected, "AES por hardware: {aes_gcm_accelerated}");

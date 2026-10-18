@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use coroom_audio::processing::VoiceProcessor;
 use coroom_codec::{DecoderSet, decoder_label};
 use coroom_transport::PeerConnection;
-use coroom_transport::connect::{Connector, ExtraCandidates, RelayInfo};
+use coroom_transport::connect::{Connector, ExtraCandidates, RelayInfo, virtual_addr};
 use coroom_transport::crypto::hpke;
 use coroom_transport::crypto::{
     KeyPackageBundle, Processed, RoomGroup, SafetyNumber, sha256_fingerprint,
@@ -21,7 +21,8 @@ use coroom_transport::proto::control::{ControlMessage, Hello, Role as WireRole};
 use coroom_transport::proto::media::{ObjectHeader, Track};
 use coroom_transport::proto::signal::{ErrorCode, HOST_PEER_ID, SignalMessage};
 use coroom_transport::quic::{ControlReceiver, ControlSender};
-use coroom_transport::signal::{ServerUrl, SignalClient, SignalSender};
+use coroom_transport::relay::RelayBinding;
+use coroom_transport::signal::{SignalClient, SignalSender};
 use coroom_transport::{Endpoint, EndpointOptions, PublicKey};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use tokio::runtime::Handle;
@@ -273,8 +274,8 @@ fn audio_receiver(
         let own = core.own_leaf.load(Ordering::Acquire);
         let accept = match track {
             AudioTrack::Game => source == host,
-            // La propia vuelve por el abanico del relay. Oír a la sala no necesita permiso: el
-            // permiso de voz es para hablar.
+            // El anfitrión no le devuelve la propia; por si acaso, se descarta. Oír a la sala no
+            // necesita permiso: el permiso de voz es para hablar.
             AudioTrack::Voice => source != own || !core.sframe,
         };
         if !accept {
@@ -392,11 +393,12 @@ struct Room {
     code: String,
     endpoint: Endpoint,
     signal: SignalSender,
-    server_name: String,
     host_pk: PublicKey,
     bundle: Option<KeyPackageBundle>,
     group: Option<RoomGroup>,
-    relay: Option<RelayInfo>,
+    /// La ligadura con el relay; mientras viva, el anfitrión es alcanzable en
+    /// `virtual_addr(HOST_PEER_ID)`.
+    relay: Option<RelayBinding>,
     /// Si ya se sabe si hay relay (`RelayToken`, o `QuotaExceeded`/`RelayDisabled` si no).
     relay_known: bool,
     candidates: Option<Vec<SocketAddr>>,
@@ -438,16 +440,19 @@ impl Room {
                 addr,
                 max_kbps,
             } => {
-                self.relay = Some(RelayInfo {
+                let info = RelayInfo {
                     addr,
-                    server_name: self.server_name.clone(),
-                    trust: self.config.trust.clone(),
                     token,
                     max_kbps,
-                    role: WireRole::Guest,
-                });
-                self.relay_known = true;
-                self.maybe_connect();
+                };
+                match self.endpoint.bind_relay(info.params()).await {
+                    Ok(binding) => {
+                        self.relay = Some(binding);
+                        self.relay_known = true;
+                        self.maybe_connect();
+                    }
+                    Err(err) => self.no_relay(format!("no se pudo usar el relay: {err}")),
+                }
                 Ok(())
             }
             SignalMessage::QuotaExceeded { message } => {
@@ -676,9 +681,10 @@ impl Room {
         if self.connection.is_some() || !self.relay_known {
             return;
         }
-        let (Some(candidates), relay) = (&self.candidates, &self.relay) else {
+        let Some(candidates) = &self.candidates else {
             return;
         };
+        let relay = self.relay.as_ref().map(|_| virtual_addr(HOST_PEER_ID));
         // Sin candidatos del anfitrión (fuerza el relay) no se intenta la vía directa, salvo que
         // no haya relay.
         let force_relay = relay.is_some() && (self.config.force_relay || candidates.is_empty());
@@ -688,7 +694,7 @@ impl Room {
             self.endpoint.clone(),
             self.host_pk,
             candidates.clone(),
-            relay.clone(),
+            relay,
             force_relay,
             (self.config.punch_timeout, self.config.quality_probe),
             self.frames.clone(),
@@ -754,7 +760,6 @@ async fn run_guest(
     let mapping_task = super::start_port_mapping(&config, &endpoint);
     let mut mapping_rx = super::watch_port_mapping(&core, mapping_task);
     let mut signal = connect_signal(&config, &endpoint).await?;
-    let server = ServerUrl::parse(&config.server_url).map_err(network("URL del servidor"))?;
     let (key_package, bundle) = KeyPackageBundle::generate(&identity)
         .map_err(|err| SessionError::Crypto(err.to_string()))?;
     signal
@@ -863,7 +868,6 @@ async fn run_guest(
         code,
         endpoint: endpoint.clone(),
         signal: signal.sender(),
-        server_name: server.host,
         host_pk,
         bundle: Some(bundle),
         group: None,
@@ -974,7 +978,7 @@ async fn connect_and_receive(
     endpoint: Endpoint,
     host_pk: PublicKey,
     candidates: Vec<SocketAddr>,
-    relay: Option<RelayInfo>,
+    relay: Option<SocketAddr>,
     force_relay: bool,
     timeouts: (Duration, Duration),
     frames: FrameQueue,
@@ -987,7 +991,7 @@ async fn connect_and_receive(
         endpoint,
         host_pk,
         &candidates,
-        relay.as_ref(),
+        relay,
         force_relay,
         timeouts,
         &frames,
@@ -1004,7 +1008,7 @@ async fn receive(
     endpoint: Endpoint,
     host_pk: PublicKey,
     candidates: &[SocketAddr],
-    relay: Option<&RelayInfo>,
+    relay: Option<SocketAddr>,
     force_relay: bool,
     (punch_timeout, probe): (Duration, Duration),
     frames: &FrameQueue,
@@ -1025,7 +1029,6 @@ async fn receive(
             protocol_version: PROTOCOL_VERSION,
             identity_pk,
             role: WireRole::Guest,
-            relay_token: None,
         }),
     )
     .await
@@ -1045,8 +1048,6 @@ async fn receive(
             frame_interval: GUEST_FRAME_INTERVAL,
         },
     ));
-    // Detrás del relay, el anfitrión atribuye los `Feedback` en datagrama por esta etiqueta.
-    receiver.set_control_tag(core.own_peer_id.load(Ordering::Acquire));
     {
         let mut link = lock(&core.link);
         link.path = Some(established.path);

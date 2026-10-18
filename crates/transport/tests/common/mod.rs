@@ -40,7 +40,6 @@ pub fn hello(peer: &Peer, role: Role) -> Hello {
         protocol_version: PROTOCOL_VERSION,
         identity_pk: peer.identity.public_key(),
         role,
-        relay_token: None,
     }
 }
 

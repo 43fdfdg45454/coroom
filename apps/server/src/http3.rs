@@ -1,5 +1,5 @@
-//! Socket QUIC del servidor: demultiplexado por ALPN entre HTTP/3 (`h3`, con WebTransport para la
-//! señalización) y el relay de medios (`coroom-relay/1`).
+//! Conexiones QUIC del servidor: HTTP/3 (`h3`, con WebTransport para la señalización). Las tramas
+//! del relay no llegan aquí: las atiende el gancho del socket ([`crate::relay::Relay`]).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -67,9 +67,6 @@ async fn handle_incoming(incoming: quinn::Incoming, state: Arc<ServerState>) {
     debug!(%remote, ?alpn, "conexión QUIC aceptada");
     match alpn {
         Some(Alpn::H3) => serve_h3(connection, state).await,
-        Some(Alpn::Relay) if state.config.relay_enabled => {
-            Arc::clone(&state.relay).handle(connection).await
-        }
         _ => connection.close(quinn::VarInt::from_u32(0x0178), b"ALPN no admitido"),
     }
 }

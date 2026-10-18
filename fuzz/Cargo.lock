@@ -834,6 +834,7 @@ dependencies = [
 name = "coroom-transport"
 version = "1.0.0"
 dependencies = [
+ "aws-lc-rs",
  "bytes",
  "coroom-crypto",
  "coroom-proto",

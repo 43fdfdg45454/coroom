@@ -52,6 +52,8 @@ use coroom_proto::media::ObjectHeader;
 
 use crate::TransportError;
 use crate::rate::{Congestion, CongestionShared};
+use crate::relay::{self, RelayBinding, RelayHook, RelayParams, SendRaw};
+use crate::socket::{HookedSocket, virtual_peer};
 use crate::tls::{self, Admitted, IdentityKey, PublicKey, ServerTrust};
 
 /// Intervalo de `keep_alive` de todas las conexiones: tres caben en [`IDLE_TIMEOUT`], así una
@@ -321,6 +323,8 @@ struct Dispatch {
 
 struct EndpointInner {
     quinn: quinn::Endpoint,
+    socket: Arc<HookedSocket<RelayHook>>,
+    hook: Arc<RelayHook>,
     key: IdentityKey,
     admitted: Admitted,
     options: EndpointOptions,
@@ -426,13 +430,14 @@ impl Endpoint {
         let runtime = quinn::default_runtime().ok_or_else(|| {
             TransportError::Protocol("el Endpoint necesita un runtime de tokio".to_owned())
         })?;
-        let socket = bind_socket(addr)?;
+        let hook = Arc::new(RelayHook::default());
+        let socket = HookedSocket::new(bind_socket(addr)?, Arc::clone(&hook))?;
         let mtu_upper_bound = local_mtu_upper_bound();
-        let server_config = server_config(&crypto, options, mtu_upper_bound);
-        let quinn = quinn::Endpoint::new(
-            quinn::EndpointConfig::default(),
+        let server_config = server_config(&crypto, options, mtu_upper_bound, false);
+        let quinn = quinn::Endpoint::new_with_abstract_socket(
+            endpoint_config(),
             Some(server_config.0),
-            socket,
+            Arc::clone(&socket) as Arc<dyn quinn::AsyncUdpSocket>,
             runtime,
         )?;
 
@@ -443,12 +448,15 @@ impl Endpoint {
             crypto,
             options,
             mtu_upper_bound,
+            Arc::clone(&hook),
             Arc::clone(&dispatch),
             Arc::clone(&unclaimed),
         ));
         Ok(Self {
             inner: Arc::new(EndpointInner {
                 quinn,
+                socket,
+                hook,
                 key,
                 admitted,
                 options,
@@ -503,12 +511,13 @@ impl Endpoint {
             QuicClientConfig::try_from(tls::peer_client_config(&self.inner.key, expected)?)
                 .map_err(|err| TransportError::Tls(err.to_string()))?;
         let shared = CongestionShared::new(self.inner.options.initial_target_kbps);
+        let relayed = virtual_peer(addr).is_some();
         let mut config = quinn::ClientConfig::new(Arc::new(crypto));
         config.transport_config(Arc::new(endpoint_transport_config(
             &shared,
             self.inner.options.congestion,
             self.inner.options.max_kbps(),
-            self.inner.mtu_upper_bound,
+            path_mtu_upper_bound(self.inner.mtu_upper_bound, relayed),
         )));
         let connection = self
             .inner
@@ -523,12 +532,20 @@ impl Endpoint {
                 "identidad del par inesperada".to_owned(),
             ));
         }
-        Ok(PeerConnection::new(
-            connection,
-            Some(key),
-            Path::Direct,
-            shared,
-        ))
+        let relay = relayed.then(|| self.inner.hook.relay()).flatten();
+        Ok(PeerConnection::new(connection, Some(key), relay, shared))
+    }
+
+    /// Liga el socket al relay de la sala: desde entonces cada par de la sala es alcanzable en
+    /// su dirección virtual ([`crate::socket::virtual_addr`]) con [`Endpoint::connect_peer`], y
+    /// sus conexiones entrantes llegan por ella. Mientras viva la [`RelayBinding`].
+    pub async fn bind_relay(&self, params: RelayParams) -> Result<RelayBinding, TransportError> {
+        relay::bind(
+            Arc::clone(&self.inner.socket) as Arc<dyn SendRaw>,
+            Arc::clone(&self.inner.hook),
+            params,
+        )
+        .await
     }
 
     /// Conecta con el servidor de coroom en `addr` con el ALPN `alpn` (señalización `h3` o relay).
@@ -546,7 +563,7 @@ impl Endpoint {
         let shared = CongestionShared::new(self.inner.options.initial_target_kbps);
         let congestion = match alpn {
             Alpn::H3 => Congestion::Standard,
-            Alpn::Relay | Alpn::P2p => self.inner.options.congestion,
+            Alpn::P2p => self.inner.options.congestion,
         };
         let mut config = quinn::ClientConfig::new(Arc::new(crypto));
         config.transport_config(Arc::new(endpoint_transport_config(
@@ -626,10 +643,35 @@ impl Endpoint {
 
 struct ServerConfigWithShared(quinn::ServerConfig, Arc<CongestionShared>);
 
+/// Configuración del `quinn::Endpoint`: sin engrasar el bit fijo de QUIC (RFC 9287), del que
+/// depende distinguir las tramas del relay de los paquetes QUIC en el mismo socket
+/// ([`coroom_proto::relay::is_relay_frame`]). La comparten los clientes y el servidor.
+pub fn endpoint_config() -> quinn::EndpointConfig {
+    let mut config = quinn::EndpointConfig::default();
+    config.grease_quic_bit(false);
+    config
+}
+
+/// Techo del sondeo de MTU de una conexión: el del adaptador o, por el relay, el mismo menos la
+/// cabecera de las tramas [`coroom_proto::relay::Frame::Data`].
+fn path_mtu_upper_bound(adapter: Option<u16>, relayed: bool) -> Option<u16> {
+    if relayed {
+        let bound = adapter.unwrap_or(DEFAULT_MTU_UPPER_BOUND);
+        Some(
+            bound
+                .saturating_sub(coroom_proto::relay::DATA_HEADER as u16)
+                .max(INITIAL_MTU),
+        )
+    } else {
+        adapter
+    }
+}
+
 fn server_config(
     crypto: &Arc<QuicServerConfig>,
     options: EndpointOptions,
     mtu_upper_bound: Option<u16>,
+    relayed: bool,
 ) -> ServerConfigWithShared {
     let shared = CongestionShared::new(options.initial_target_kbps);
     let mut config = quinn::ServerConfig::with_crypto(Arc::clone(crypto) as _);
@@ -637,7 +679,7 @@ fn server_config(
         &shared,
         options.congestion,
         options.max_kbps(),
-        mtu_upper_bound,
+        path_mtu_upper_bound(mtu_upper_bound, relayed),
     )));
     config.migration(true);
     ServerConfigWithShared(config, shared)
@@ -648,18 +690,21 @@ async fn accept_loop(
     crypto: Arc<QuicServerConfig>,
     options: EndpointOptions,
     mtu_upper_bound: Option<u16>,
+    hook: Arc<RelayHook>,
     dispatch: Arc<Mutex<Dispatch>>,
     unclaimed: Arc<Notify>,
 ) {
     while let Some(incoming) = quinn.accept().await {
         let crypto = Arc::clone(&crypto);
+        let hook = Arc::clone(&hook);
         let dispatch = Arc::clone(&dispatch);
         let unclaimed = Arc::clone(&unclaimed);
         tokio::spawn(async move {
             let remote = incoming.remote_address();
+            let relayed = virtual_peer(remote).is_some();
             // Un controlador de congestión con estado propio por conexión.
             let ServerConfigWithShared(config, shared) =
-                server_config(&crypto, options, mtu_upper_bound);
+                server_config(&crypto, options, mtu_upper_bound, relayed);
             let connection = match incoming.accept_with(Arc::new(config)) {
                 Ok(connecting) => match connecting.await {
                     Ok(connection) => connection,
@@ -677,7 +722,8 @@ async fn accept_loop(
                 connection.close(quinn::VarInt::from_u32(1), b"identidad");
                 return;
             };
-            let peer = PeerConnection::new(connection, Some(key), Path::Direct, shared);
+            let relay = relayed.then(|| hook.relay()).flatten();
+            let peer = PeerConnection::new(connection, Some(key), relay, shared);
             let Ok(mut dispatch) = dispatch.lock() else {
                 return;
             };
@@ -784,7 +830,8 @@ impl DatagramQueue {
 struct PeerInner {
     conn: quinn::Connection,
     peer_key: Option<PublicKey>,
-    path: Path,
+    /// Relay por el que va, si va por él (la dirección remota de `quinn` es la virtual del par).
+    relay: Option<SocketAddr>,
     congestion: Arc<CongestionShared>,
     control: tokio::sync::Mutex<mpsc::Receiver<BiStream>>,
     input: tokio::sync::Mutex<mpsc::Receiver<BiStream>>,
@@ -846,7 +893,7 @@ impl fmt::Debug for PeerConnection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PeerConnection")
             .field("remote", &self.remote_address())
-            .field("path", &self.inner.path)
+            .field("path", &self.path())
             .finish_non_exhaustive()
     }
 }
@@ -855,7 +902,7 @@ impl PeerConnection {
     pub(crate) fn new(
         conn: quinn::Connection,
         peer_key: Option<PublicKey>,
-        path: Path,
+        relay: Option<SocketAddr>,
         congestion: Arc<CongestionShared>,
     ) -> Self {
         let (control_tx, control_rx) = mpsc::channel(8);
@@ -881,7 +928,7 @@ impl PeerConnection {
                 send_queue_capacity,
                 conn,
                 peer_key,
-                path,
+                relay,
                 congestion,
                 control: tokio::sync::Mutex::new(control_rx),
                 input: tokio::sync::Mutex::new(input_rx),
@@ -908,12 +955,18 @@ impl PeerConnection {
 
     /// Ruta de la conexión.
     pub fn path(&self) -> Path {
-        self.inner.path
+        if self.inner.relay.is_some() || virtual_peer(self.inner.conn.remote_address()).is_some() {
+            Path::Relayed
+        } else {
+            Path::Direct
+        }
     }
 
-    /// Dirección remota actual (normalizada a IPv4 si estaba mapeada).
+    /// Dirección remota actual (normalizada a IPv4 si estaba mapeada); por el relay, la del relay.
     pub fn remote_address(&self) -> SocketAddr {
-        canonical(self.inner.conn.remote_address())
+        self.inner
+            .relay
+            .unwrap_or_else(|| canonical(self.inner.conn.remote_address()))
     }
 
     /// RTT suavizado de QUIC.
@@ -1271,6 +1324,14 @@ impl ControlReceiver {
     }
 }
 
+impl SendRaw for HookedSocket<RelayHook> {
+    fn send_raw(&self, to: SocketAddr, frame: &[u8]) {
+        if let Err(err) = self.io().send(to, None, frame, None) {
+            debug!(%to, error = %err, "trama del relay sin enviar");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1288,6 +1349,23 @@ mod tests {
         assert_eq!(mtu_upper_bound(0), INITIAL_MTU);
         // Un MTU enorme (loopback) tampoco pasa del techo de quinn.
         assert_eq!(mtu_upper_bound(65_536), DEFAULT_MTU_UPPER_BOUND);
+    }
+
+    #[test]
+    fn a_relayed_connection_leaves_room_for_the_relay_header() {
+        assert_eq!(path_mtu_upper_bound(Some(1352), false), Some(1352));
+        assert_eq!(path_mtu_upper_bound(None, false), None);
+        let header = coroom_proto::relay::DATA_HEADER as u16;
+        assert_eq!(path_mtu_upper_bound(Some(1352), true), Some(1352 - header));
+        assert_eq!(
+            path_mtu_upper_bound(None, true),
+            Some(DEFAULT_MTU_UPPER_BOUND - header)
+        );
+        // Nunca por debajo del MTU inicial de QUIC.
+        assert_eq!(
+            path_mtu_upper_bound(Some(INITIAL_MTU), true),
+            Some(INITIAL_MTU)
+        );
     }
 
     #[test]

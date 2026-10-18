@@ -502,8 +502,8 @@ const FULL_REPAIR_LOSS: f64 = 0.05;
 /// ventana de pérdida esté limpia: con un RTT largo, una pérdida aislada sin FEC cuesta un `Nack`
 /// y su ida y vuelta, y como los grupos se entregan en orden, retiene a todos los que vienen
 /// detrás (con 55 ms de RTT a 60 fps, cuatro fotogramas). El símbolo se descuenta del presupuesto
-/// del codificador ([`MediaSender::encoder_target_kbps`]). El RTT es el medido con el invitado
-/// ([`MediaSender::guest_rtt`]), no el de la conexión QUIC (por el relay sería anfitrión↔relay).
+/// del codificador ([`MediaSender::encoder_target_kbps`]). El RTT es el de la conexión con el
+/// invitado ([`MediaSender::guest_rtt`]), de punta a punta también por el relay.
 pub const FEC_FLOOR_RTT_INTERVALS: f64 = 2.0;
 
 /// Objetos que tiene que tener un grupo para que el piso de FEC le añada un símbolo: con menos,
@@ -1013,19 +1013,10 @@ impl MediaSender {
             .is_some_and(|rtt| rtt > self.frame_interval().mul_f64(FEC_FLOOR_RTT_INTERVALS))
     }
 
-    /// RTT con el invitado que limita: en una conexión directa, el de QUIC; por el relay, el doble
-    /// del retardo de ida base que ve su control de tasa (las marcas de llegada del `Feedback`,
-    /// en el reloj del emisor estimado por `Ping`/`Pong`, dan ~RTT/2 sin cola), o `None` hasta
-    /// que haya muestras.
+    /// RTT con el invitado: el de QUIC, de punta a punta también por el relay (que solo reenvía
+    /// los paquetes de la conexión).
     pub fn guest_rtt(&self) -> Option<Duration> {
-        if self.conn.path() == crate::Path::Direct {
-            return Some(self.conn.rtt());
-        }
-        let state = self.state.lock().ok()?;
-        let base_us = state.limiting()?.rate.base_owd_us()?;
-        Some(Duration::from_micros(
-            u64::try_from(base_us.max(0)).unwrap_or(0) * 2,
-        ))
+        Some(self.conn.rtt())
     }
 
     /// Ritmo al que se reparte un fotograma, en kbit/s, y si el enlace midió holgura para los
@@ -2565,8 +2556,6 @@ pub struct MediaReceiver {
     offset_us: AtomicI64,
     /// Último `Pong` del emisor, en µs desde `origin` ([`MediaReceiver::last_pong`]).
     last_pong_us: AtomicI64,
-    /// Etiqueta de los datagramas de control que envía ([`MediaReceiver::set_control_tag`]).
-    control_tag: AtomicU32,
 }
 
 /// Valor de `MediaReceiver::offset_us` mientras no hay desfase.
@@ -2592,7 +2581,6 @@ impl MediaReceiver {
             origin: clock.origin(),
             offset_us: AtomicI64::new(NO_OFFSET),
             last_pong_us: AtomicI64::new(-1),
-            control_tag: AtomicU32::new(0),
             inner: Mutex::new(ReceiverInner {
                 core: ReceiverCore::new(config.frame_interval),
                 clock,
@@ -2615,13 +2603,6 @@ impl MediaReceiver {
         u64::try_from(us)
             .ok()
             .map(|us| self.origin + Duration::from_micros(us))
-    }
-
-    /// Etiqueta que llevan los datagramas de control de este receptor (el `group` de su
-    /// cabecera): detrás del relay, el anfitrión recibe los de todos los invitados por una misma
-    /// conexión y con ella atribuye cada `Feedback` a su invitado (su id de par).
-    pub fn set_control_tag(&self, tag: u32) {
-        self.control_tag.store(tag, Ordering::Release);
     }
 
     /// Fija el intervalo de fotograma de `track` con lo que anuncia el emisor (ver
@@ -2797,13 +2778,12 @@ impl MediaReceiver {
     /// Envía un mensaje por el stream de control y, si corre prisa (`Nack`, `KeyframeRequest`,
     /// `Feedback`), una copia en un datagrama de control: si el paquete del stream se pierde, QUIC
     /// no lo reenvía hasta su PTO (60-70 ms con un RTT de 20 ms) y lo que viene detrás espera con
-    /// él. El datagrama lleva la etiqueta de [`MediaReceiver::set_control_tag`].
+    /// él.
     pub fn send_control(&self, message: &ControlMessage) {
         if let Err(err) = self.control.send(message) {
             debug!(error = %err, "no se pudo enviar un mensaje de control");
         }
-        let tag = self.control_tag.load(Ordering::Acquire);
-        if let Some(datagram) = coroom_proto::control::control_datagram_tagged(message, tag)
+        if let Some(datagram) = coroom_proto::control::control_datagram(message)
             && let Err(err) = self.conn.send_datagram(Bytes::from(datagram))
         {
             debug!(error = %err, "no se pudo enviar un datagrama de control");

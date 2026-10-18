@@ -39,6 +39,7 @@ jobs:
           - proto_hid
           - proto_control
           - proto_signal
+          - proto_relay
           - proto_api
           - transport_media
           - transport_loopback
@@ -47,6 +48,7 @@ jobs:
           - crypto_mls
           - server_api
           - server_signal
+          - server_relay
           - server_avatar
           - codec_slices
           - audio_jitter

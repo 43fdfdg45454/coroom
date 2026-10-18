@@ -175,8 +175,6 @@ pub struct Hello {
     pub identity_pk: [u8; 32],
     /// Papel de quien saluda.
     pub role: Role,
-    /// Token del relay (`RelayToken` de la señalización). Solo hacia el relay; en directo, `None`.
-    pub relay_token: Option<Vec<u8>>,
 }
 
 /// Informe del receptor para el control de tasa y la FEC (cada 50 ms).
@@ -594,9 +592,8 @@ pub fn control_datagram(message: &ControlMessage) -> Option<Vec<u8>> {
 }
 
 /// Datagrama de control de cualquier mensaje que quepa en uno ([`ControlMessage::fits_datagram`])
-/// con `tag` en el `group` de su cabecera. La etiqueta la pone quien envía: el invitado detrás del
-/// relay marca sus `Feedback` con su id de par (el anfitrión recibe los de todos por una misma
-/// conexión) y el anfitrión numera sus `Cursor` (el invitado descarta los que llegan desordenados).
+/// con `tag` en el `group` de su cabecera. La etiqueta la pone quien envía: el anfitrión numera sus
+/// `Cursor` (el invitado descarta los que llegan desordenados).
 /// `None` si el mensaje no va en datagramas o no cabe.
 pub fn control_datagram_tagged(message: &ControlMessage, tag: u32) -> Option<Vec<u8>> {
     if !message.fits_datagram() {
@@ -759,20 +756,15 @@ mod tests {
 
     fn message() -> impl Strategy<Value = ControlMessage> {
         prop_oneof![
-            (
-                any::<u16>(),
-                any::<[u8; 32]>(),
-                any::<bool>(),
-                prop::option::of(prop::collection::vec(any::<u8>(), 0..64))
-            )
-                .prop_map(|(protocol_version, identity_pk, host, relay_token)| {
+            (any::<u16>(), any::<[u8; 32]>(), any::<bool>(),).prop_map(
+                |(protocol_version, identity_pk, host)| {
                     ControlMessage::Hello(Hello {
                         protocol_version,
                         identity_pk,
                         role: if host { Role::Host } else { Role::Guest },
-                        relay_token,
                     })
-                }),
+                }
+            ),
             (
                 any::<u32>(),
                 any::<u64>(),

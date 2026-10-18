@@ -215,13 +215,21 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
-- **Relay en placas ARM sin cifrado por hardware: hasta varias veces menos CPU por paquete.** El
-  relay descifra y vuelve a cifrar la capa QUIC de cada datagrama (el contenido sigue cifrado de
-  punta a punta con SFrame), y lo hacía con AES-GCM porque es lo que piden los clientes. En una CPU
-  sin instrucciones AES eso es software lento y llenaba el procesador antes que la red. Ahora el
-  servidor mira si su CPU acelera AES-GCM y, si no, impone ChaCha20-Poly1305 (RFC 8439), que en
-  software es varias veces más rápido; con AES por hardware todo sigue igual. Lo mismo hace el
-  anfitrión en las conexiones directas cuando su CPU es la que no acelera AES.
+- **El relay ya no descifra nada: solo reenvía paquetes** (protocolo 19; hay que actualizar el
+  servidor y todos los clientes a la vez). Antes, el relay terminaba la conexión QUIC de cada par:
+  descifraba cada paquete, lo volvía a cifrar para cada invitado y además repartía el vídeo y
+  contestaba los NACK. En un servidor pequeño (una placa ARM) eso llenaba el procesador mucho antes
+  que la red y el bitrate por el relay se quedaba en ~25 Mbit/s. Ahora funciona como un servidor
+  TURN (RFC 8656): el anfitrión y cada invitado hablan su propia conexión cifrada de punta a punta
+  a través del relay, que solo copia los paquetes UDP de uno a otro (en lotes, con GSO y GRO), sin
+  claves ni cabeceras que mirar. Por el relay el bitrate lo limita la red, igual que en directo, y
+  el operador ya no puede ver ni las cabeceras de los medios. El anfitrión sube una copia por
+  invitado que entra por el relay, como con los que entran en directo; los NACK, el control de tasa
+  y el RTT pasan a ser de punta a punta. La conexión por el relay se prepara a la vez que la
+  directa y se usa si esta no llega, sin sumar tiempo. `COROOM_RELAY_MAX_KBPS` pasa a ser el límite
+  **por invitado** y sentido (antes, por sala). Por el mismo motivo, en la conexión con el servidor
+  (la señalización) el servidor impone ChaCha20-Poly1305 (RFC 8439) si su CPU no acelera AES-GCM,
+  y el anfitrión hace lo mismo en las conexiones de pares cuando la suya es la que no lo acelera.
 - **Calidad por el relay: el bitrate ya no se queda clavado abajo**, con anfitrión Linux o
   Windows. El invitado pasaba sus marcas de llegada al reloj del anfitrión con la mediana de los
   últimos ocho `Ping`; por el relay, el jitter del RTT la movía de 3 a 5 ms cada pocos segundos y

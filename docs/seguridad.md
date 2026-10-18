@@ -25,19 +25,19 @@ Resumen de los hallazgos (detalle en §4):
 
 | Actor | Qué puede | Qué no puede |
 |---|---|---|
-| **Servidor honesto pero curioso** (el operador mira la base de datos, el registro y el tráfico que pasa por el relay) | Ver cuentas, amigos, salas abiertas, quién entra en qué sala y cuándo, direcciones IP, volumen y ritmo del tráfico, y las cabeceras en claro de los medios (pista, grupo, objeto, marca de intra, 16 bits bajos de la época SFrame) | Leer vídeo, audio, voz, entrada o chat (SFrame, HPKE y la clave de chat de la época, que nunca tiene); saber qué se escribe o se juega. Del chat solo ve el tamaño y el ritmo de los mensajes de control |
+| **Servidor honesto pero curioso** (el operador mira la base de datos, el registro y el tráfico que pasa por el relay) | Ver cuentas, amigos, salas abiertas, quién entra en qué sala y cuándo, direcciones IP, volumen, tamaño y ritmo de los paquetes que reenvía el relay | Leer nada de la conexión de pares, ni siquiera las cabeceras de los medios: el relay no termina QUIC (reenvía los paquetes cifrados de punta a punta entre las identidades de los pares); leer vídeo, audio, voz, entrada o chat (además, SFrame, HPKE y la clave de chat de la época, que nunca tiene); saber qué se escribe o se juega |
 | **Servidor malicioso** (o comprometido) | Todo lo anterior; negar el servicio; cortar o reordenar mensajes; presentar una clave de identidad falsa en el primer contacto (I-1); suplantar la oferta de clave pareja a pareja **no** (va firmada); degradar a X25519 **ya no** (C-1) | Descifrar ni falsificar medios, entrada o chat de una sala cuyos números de seguridad se comprobaron; hacer commits MLS (solo vale el del anfitrión, firmado) |
 | **Invitado malicioso** (miembro de la sala) | Ver y oír lo que el anfitrión comparte mientras esté dentro; enviar entrada si tiene permiso; leer el chat mientras esté dentro y los últimos 50 mensajes al entrar; escribir en él (10 cada 10 s); intentar agotar recursos del anfitrión o de otros invitados con paquetes hostiles (acotado: M-1) | Leer o falsificar la entrada de otro invitado (clave pareja a pareja); escribir en el chat con el nombre de otro (el autor lo pone el anfitrión según el stream por el que llega); seguir leyendo la entrada, los medios o el chat tras la expulsión (época MLS nueva); hacer commits MLS |
-| **Red hostil** (en el camino, sin el servidor) | Ver direcciones, tamaños y tiempos; tirar o retrasar paquetes | Leer o modificar nada: QUIC con TLS 1.3 (X25519MLKEM768) en cada salto, claves crudas fijadas entre pares y certificado del servidor fijado o validado |
+| **Red hostil** (en el camino, sin el servidor) | Ver direcciones, tamaños y tiempos; tirar o retrasar paquetes | Leer o modificar nada: QUIC con TLS 1.3 (X25519MLKEM768) de punta a punta entre pares (también a través del relay), claves crudas fijadas entre pares y certificado del servidor fijado o validado |
 | **Anfitrión** | Es de confianza para su sala: ve y decide todo, y la entrada se inyecta en su equipo; pone autor y hora a cada mensaje del chat y guarda el historial (en memoria, mientras dure la sala) | — |
 
 **Qué protege cada capa y qué no**:
 
 | Capa | Protege | No protege |
 |---|---|---|
-| QUIC/TLS 1.3 (cada salto) | Confidencialidad e integridad frente a la red; híbrido poscuántico X25519MLKEM768 | Nada frente al relay (termina TLS) |
+| QUIC/TLS 1.3 (de punta a punta entre pares; con el servidor para la señalización) | Confidencialidad e integridad frente a la red y frente al relay, que solo reenvía los paquetes; híbrido poscuántico X25519MLKEM768 | Tamaños y ritmo de los paquetes, y quién habla con quién (el relay lo sabe por la ligadura) |
 | MLS (RFC 9420, `openmls`) | Pertenencia a la sala, secreto hacia delante y recuperación tras compromiso al entrar o salir alguien | Los mensajes de control MLS van como `PublicMessage` (firmados, no cifrados): el servidor ve quién entra y sale (ya lo sabe por la señalización) |
-| SFrame (RFC 9605) | Contenido de vídeo, audio y voz frente al servidor y el relay; repeticiones | Metadatos: tamaños, ritmo, pista, marca de intra |
+| SFrame (RFC 9605) | Contenido de vídeo, audio y voz frente al servidor y frente a quien reenvíe sin ser el emisor; repeticiones | Metadatos frente a los miembros de la sala: tamaños, ritmo, pista, marca de intra |
 | HPKE (RFC 9180) con X-Wing | La entrada de cada invitado frente al resto de invitados y al servidor; poscuántica | — |
 | Chat (exportador MLS por época, AES-256-GCM) | Texto, autor y hora frente al servidor y el relay; quien sale deja de leer lo que se escribe después; repeticiones; que un historial o una orden de vaciar pasen por un mensaje | Autenticación de cada miembro: la clave es de grupo (ver más abajo); el tamaño y el ritmo de los mensajes; nada frente al anfitrión |
 | Cuentas | Que solo los dispositivos vinculados abran la señalización y el relay | Que el servidor no mienta sobre las claves (I-1) |
@@ -48,11 +48,11 @@ comprueba que lo selló la hoja MLS de **ese** invitado, le pone autor (id del i
 nombre de la señalización) y hora, lo guarda y lo vuelve a sellar para todos, el autor incluido.
 El invitado solo acepta lo que sella la hoja del anfitrión. Como la clave es de grupo, un
 sellado prueba que lo hizo un miembro de la época, no cuál: la autoría la garantiza el anfitrión,
-que sabe por qué stream llegó cada mensaje. El límite es la **connivencia**: un invitado de la
-sala junto con quien controle el relay (que termina TLS y reenvía los streams de control) puede
-sellar un mensaje como si fuera del anfitrión, con cualquier autor, y meterlo en el stream de otro
-invitado. Sin el relay (en directo) o sin un miembro de la sala, no. Firmar cada mensaje con la
-clave de la hoja lo cerraría; queda como propuesta.
+que sabe por qué stream llegó cada mensaje. Un invitado no puede meter un
+sellado en el stream de otro: cada stream va en la conexión de pares entre ese invitado y el
+anfitrión, con TLS de punta a punta también a través del relay (que solo reenvía sus paquetes y no
+tiene sus claves). Antes del protocolo 19, el relay terminaba TLS y un invitado en connivencia con
+quien lo controlase podía hacerse pasar por el anfitrión en el chat; eso ya no es posible.
 
 ## 2. Revisión por capas
 
@@ -197,7 +197,7 @@ suba el protocolo, el desafío pasará a `"coroom device challenge v1\0" ‖ len
 | Medios (receptor) | 64 grupos abiertos por pista y 131 072 objetos reservados en total; reparaciones por grupo ≤ objetos (**M-1**) |
 | Entrada | 64 eventos por mensaje; tramas de stream acotadas |
 | Chat | 2 000 caracteres y 8 000 bytes por mensaje, sin caracteres de control salvo salto de línea y tabulador; 10 mensajes cada 10 s por persona (el anfitrión descarta el resto; el cliente avisa antes con «Vas muy rápido»); 50 mensajes de historial, solo en la memoria del anfitrión; 64 mensajes en espera de una época nueva en el invitado |
-| Relay | Cuotas mensuales por cuenta, límite por sala, invitados por sala |
+| Relay | Cuotas mensuales por cuenta, límite por invitado y sentido (`COROOM_RELAY_MAX_KBPS`, cubo de fichas), invitados por sala; solo reenvía entre el anfitrión y los invitados de una sala; ninguna respuesta es más grande que la petición (el `Allocate` va relleno hasta el tamaño del `Challenge`) y la galleta de la ligadura, sin estado, prueba que el par recibe en su dirección antes de crear nada; el token no viaja (va su id y firmas HMAC-SHA-256) |
 
 ### 2.8 Administración (`/admin`) y cabeceras HTTP
 

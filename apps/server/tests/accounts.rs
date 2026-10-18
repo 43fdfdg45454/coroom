@@ -12,15 +12,16 @@ use bytes::Bytes;
 use common::{ADMIN, PASSWORD, TIMEOUT, next, next_matching, start};
 use coroom_server::config::Registration;
 use coroom_transport::api::ApiClient;
+use coroom_transport::connect::virtual_addr;
 use coroom_transport::crypto::Identity;
 use coroom_transport::proto::api::{
     CreateInvitation, LoginChallenge, LoginComplete, LoginRequest, UpdateUser, challenge_message,
 };
-use coroom_transport::proto::control::Role;
 use coroom_transport::proto::hex;
 use coroom_transport::proto::media::{ObjectHeader, Track};
-use coroom_transport::proto::signal::{Activity, ErrorCode, SignalMessage};
-use coroom_transport::{RelayInfo, SignalClient, TransportError, connect};
+use coroom_transport::proto::signal::{Activity, ErrorCode, HOST_PEER_ID, SignalMessage};
+use coroom_transport::relay::BindingState;
+use coroom_transport::{Connector, RelayInfo, SignalClient, TransportError};
 use http::Method;
 use serde_json::{Value, json};
 
@@ -790,8 +791,9 @@ fn object(group: u32, index: u16, count: u16, len: usize) -> Bytes {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_monthly_quota_cuts_the_relay_and_new_rooms_go_direct() {
-    // 20 kB al mes.
-    let server = start(|config| config.relay_quota_gb_per_month = 0.000_02).await;
+    // 100 kB al mes: el resto de los dos handshakes de QUIC (los dos lados abren por el relay)
+    // queda para los datagramas.
+    let server = start(|config| config.relay_quota_gb_per_month = 0.000_1).await;
     let admin = server.admin().await;
     let (ana_id, ana) = server.user(&admin, "ana").await;
     let (bea_id, bea) = server.user(&admin, "bea").await;
@@ -810,22 +812,23 @@ async fn the_monthly_quota_cuts_the_relay_and_new_rooms_go_direct() {
         _ => None,
     })
     .await;
-    let relay_info = |message: SignalMessage, role: Role| match message {
+    let relay_info = |message: SignalMessage| match message {
         SignalMessage::RelayToken {
             token,
             addr,
             max_kbps,
         } => Some(RelayInfo {
             addr,
-            server_name: "127.0.0.1".to_owned(),
-            trust: server.trust.clone(),
             token,
             max_kbps,
-            role,
         }),
         _ => None,
     };
-    let host_relay = next_matching(&mut ana_signal, |m| relay_info(m, Role::Host)).await;
+    let host_relay = next_matching(&mut ana_signal, relay_info).await;
+    let guest_peer = next_matching(&mut ana_signal, |message| match message {
+        SignalMessage::PeerJoined { peer_id, .. } => Some(peer_id),
+        _ => None,
+    });
     bea_signal
         .send(&SignalMessage::JoinRoom {
             code: code.clone(),
@@ -834,16 +837,29 @@ async fn the_monthly_quota_cuts_the_relay_and_new_rooms_go_direct() {
         })
         .await
         .expect("JoinRoom");
-    let guest_relay = next_matching(&mut bea_signal, |m| relay_info(m, Role::Guest)).await;
+    let guest_peer = guest_peer.await;
+    let guest_relay = next_matching(&mut bea_signal, relay_info).await;
 
-    let host = connect::connect_relay(&ana_endpoint, &host_relay)
+    let host_binding = ana_endpoint
+        .bind_relay(host_relay.params())
         .await
-        .expect("anfitrión en el relay");
-    let guest = connect::connect_relay(&bea_endpoint, &guest_relay)
+        .expect("anfitrión ligado al relay");
+    let _guest_binding = bea_endpoint
+        .bind_relay(guest_relay.params())
         .await
-        .expect("invitado en el relay");
+        .expect("invitado ligado al relay");
+    let (from_host, from_guest) = (
+        Connector::new(ana_endpoint.clone()),
+        Connector::new(bea_endpoint.clone()),
+    );
+    let (host, guest) = tokio::join!(
+        from_host.connect(bea_id.public_key(), &[], Some(virtual_addr(guest_peer))),
+        from_guest.connect(ana_id.public_key(), &[], Some(virtual_addr(HOST_PEER_ID))),
+    );
+    let host = host.expect("anfitrión por el relay").connection;
+    let guest = guest.expect("invitado por el relay").connection;
 
-    // El anfitrión envía hasta que el relay corta (a los ~20 kB reenviados). El invitado lee
+    // El anfitrión envía hasta que el relay corta (a los ~100 kB reenviados). El invitado lee
     // hasta que, cortado el anfitrión, pasa 1 s sin que llegue nada más.
     let cut = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let received = {
@@ -867,9 +883,11 @@ async fn the_monthly_quota_cuts_the_relay_and_new_rooms_go_direct() {
             bytes
         })
     };
+    // El relay no termina QUIC: no puede cerrar la conexión, la suelta (deja de reenviar y, al
+    // siguiente paquete, contesta que no la conoce; la ligadura no se puede rehacer).
     let deadline = Instant::now() + TIMEOUT;
     let mut group = 0u32;
-    while host.quinn().close_reason().is_none() && Instant::now() < deadline {
+    while matches!(host_binding.state(), BindingState::Bound { .. }) && Instant::now() < deadline {
         for index in 0..4 {
             let _ = host.send_datagram(object(group, index, 4, 900));
         }
@@ -878,8 +896,8 @@ async fn the_monthly_quota_cuts_the_relay_and_new_rooms_go_direct() {
     }
     cut.store(true, std::sync::atomic::Ordering::Release);
     assert!(
-        host.quinn().close_reason().is_some(),
-        "el relay debe cortar al agotar la cuota"
+        matches!(host_binding.state(), BindingState::Lost(_)),
+        "el relay debe soltar la sala al agotar la cuota"
     );
     let message = next_matching(&mut ana_signal, |message| match message {
         SignalMessage::QuotaExceeded { message } => Some(message),
@@ -894,14 +912,16 @@ async fn the_monthly_quota_cuts_the_relay_and_new_rooms_go_direct() {
     .await;
     let forwarded = received.await.expect("invitado");
     assert!(
-        (15_000..40_000).contains(&forwarded),
-        "reenviados {forwarded} bytes con una cuota de 20 kB"
+        // Lo que no llega es el handshake de QUIC y las cabeceras de los paquetes; lo que
+        // pasa de la cuota es lo que reenvió el último lote antes de cargarlo.
+        (50_000..110_000).contains(&forwarded),
+        "reenviados {forwarded} bytes con una cuota de 100 kB"
     );
 
     // El uso queda contado (propio y del administrador) y una sala nueva va sin relay.
     let usage = server.api_with(&ana.token).usage().await.expect("uso");
-    assert!(usage.bytes >= 20_000, "{usage:?}");
-    assert_eq!(usage.quota_bytes, Some(20_000));
+    assert!(usage.bytes >= 100_000, "{usage:?}");
+    assert_eq!(usage.quota_bytes, Some(100_000));
     let (_, admin_usage) = raw(&admin, Method::GET, "/admin/usage", Value::Null).await;
     assert_eq!(admin_usage["users"][0]["username"], "ana");
     drop(ana_signal);

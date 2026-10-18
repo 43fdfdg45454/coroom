@@ -32,7 +32,9 @@ pub mod media;
 pub mod nat;
 pub mod quic;
 pub mod rate;
+pub mod relay;
 pub mod signal;
+pub mod socket;
 pub mod tls;
 mod webtransport;
 
