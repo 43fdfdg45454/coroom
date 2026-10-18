@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      La interfaz es Compose (Material 3); el tema de la ventana solo pone el fondo mientras
+      arranca. Las barras del sistema las deja transparentes enableEdgeToEdge().
+    -->
+    <style name="Theme.Coroom" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/window_background</item>
+    </style>
+
+    <!-- La sala: siempre a oscuras, debajo del vídeo. -->
+    <style name="Theme.Coroom.Room" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/room_background</item>
+    </style>
+</resources>

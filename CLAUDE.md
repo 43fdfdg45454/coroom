@@ -93,7 +93,7 @@ cargo run --release -p coroom -- host --source synthetic [--invite NOMBRE]      
 cargo run --release -p coroom -- join [CÓDIGO]                                     # sin código, espera invitaciones
 COROOM_DEV_TOKEN=change-me cargo run -p coroom-server            # modo desarrollo: host/join aceptan --dev-token change-me sin cuenta
 cd deploy && cp .env.sample .env && docker compose up -d
-cargo ndk -t arm64-v8a -P 28 -o packaging/android/app/src/main/jniLibs build --release -p coroom-android  # invitado Android (NDK)
+cargo ndk -t arm64-v8a -t x86_64 -P 28 -o packaging/android/app/src/main/jniLibs build --release -p coroom-android  # invitado Android (NDK); luego gradle :app:assembleDebug en packaging/android
 ```
 
 ## Convenciones

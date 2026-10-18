@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Solo TLS. Además de las raíces del sistema se aceptan las que instala el usuario: el
+  certificado del servidor lo pone el operador, a menudo con una CA propia en una LAN o VPN.
+  (Las conexiones del puente en Rust reciben esas mismas raíces con set_roots.)
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

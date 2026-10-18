@@ -1,0 +1,124 @@
+name: Android
+
+# El invitado Android: `libcoroom_android.so` (apps/android) con el NDK del runner para arm64-v8a
+# y x86_64, y el APK de packaging/android con Gradle. Lo llama packages.yml; a mano, desde la
+# pestaña Actions.
+#
+# Firma: con los secretos COROOM_ANDROID_KEYSTORE (el .jks en base64),
+# COROOM_ANDROID_KEYSTORE_PASSWORD, COROOM_ANDROID_KEY_ALIAS y COROOM_ANDROID_KEY_PASSWORD, la clave
+# de la publicación; sin ellos, la de depuración del runner (el APK instala, pero no se actualiza
+# encima de uno firmado con otra clave).
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Versión X.Y.Z
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Versión X.Y.Z
+        required: true
+        type: string
+        default: 1.0.0
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  apk:
+    name: APK
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Versión de Rust (rust-toolchain.toml)
+        id: rust
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
+          targets: aarch64-linux-android, x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+
+      - uses: ./.github/actions/version
+        with:
+          version: ${{ env.VERSION }}
+
+      - name: cargo-ndk
+        run: cargo install cargo-ndk@4.1.2 --locked
+
+      # El runner trae el SDK y el NDK más reciente (ANDROID_NDK_LATEST_HOME); cmake para libopus.
+      - name: NDK
+        run: |
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+          echo "NDK: $ANDROID_NDK_LATEST_HOME"
+          cmake --version | head -1
+
+      # API 28 (Android 9): la que piden las capas de MediaCodec y AAudio.
+      - name: libcoroom_android.so
+        run: |
+          cargo ndk -t arm64-v8a -t x86_64 -P 28 \
+            -o packaging/android/app/src/main/jniLibs \
+            build --release --locked -p coroom-android
+          find packaging/android/app/src/main/jniLibs -name '*.so' -exec ls -l {} +
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Versión de Gradle (gradle-wrapper.properties)
+        id: gradle
+        run: echo "version=$(sed -n 's|.*gradle-\([0-9.]*\)-bin.zip.*|\1|p' packaging/android/gradle/wrapper/gradle-wrapper.properties)" >> "$GITHUB_OUTPUT"
+
+      - uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: ${{ steps.gradle.outputs.version }}
+
+      - name: Clave de firma
+        env:
+          KEYSTORE: ${{ secrets.COROOM_ANDROID_KEYSTORE }}
+        run: |
+          if [ -n "$KEYSTORE" ]; then
+            echo "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/coroom.jks"
+            echo "COROOM_ANDROID_KEYSTORE=$RUNNER_TEMP/coroom.jks" >> "$GITHUB_ENV"
+          else
+            echo "::warning::sin COROOM_ANDROID_KEYSTORE: el APK va firmado con la clave de depuración del runner"
+          fi
+
+      - name: APK
+        working-directory: packaging/android
+        env:
+          COROOM_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.COROOM_ANDROID_KEYSTORE_PASSWORD }}
+          COROOM_ANDROID_KEY_ALIAS: ${{ secrets.COROOM_ANDROID_KEY_ALIAS }}
+          COROOM_ANDROID_KEY_PASSWORD: ${{ secrets.COROOM_ANDROID_KEY_PASSWORD }}
+        run: |
+          gradle --no-daemon -Pcoroom.version="$VERSION" :app:lintRelease :app:assembleRelease
+          mkdir -p out
+          cp app/build/outputs/apk/release/app-release.apk "out/coroom-$VERSION-android.apk"
+          ls -l out
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: android
+          path: packaging/android/out/*.apk
+          if-no-files-found: error
+
+      - name: Informe de lint
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-lint
+          path: packaging/android/app/build/reports/
+          if-no-files-found: ignore

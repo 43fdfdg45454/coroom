@@ -5,7 +5,7 @@ name: CI
 # 1. «Versión»: GitVersion calcula X.Y.Z del historial (GitVersion.yml). En main, la última
 #    etiqueta vX.Y.Z más un parche (o menor/mayor con «+semver: minor|major» en un commit).
 # 2. «Comprobaciones» (Linux y Windows) y «Paquetes» (Flatpak, MSIX y zip, imagen del servidor,
-#    driver; packages.yml) en paralelo, con esa versión escrita en el workspace.
+#    driver, APK de Android; packages.yml) en paralelo, con esa versión escrita en el workspace.
 # 3. «Publicación», solo en main y solo si todo lo anterior pasó: etiqueta la imagen en GHCR, crea la
 #    etiqueta vX.Y.Z y la release de GitHub con los paquetes y las notas. Nadie crea etiquetas ni
 #    toca la versión a mano.
@@ -242,6 +242,7 @@ jobs:
     uses: ./.github/workflows/packages.yml
     with:
       version: ${{ needs.version.outputs.version }}
+    secrets: inherit # la clave de firma del APK (android.yml), si está
 
   publish:
     name: Publicación ${{ needs.version.outputs.version }}
@@ -298,6 +299,7 @@ jobs:
           mkdir -p upload
           cp artifacts/flatpak/*.flatpak upload/
           cp artifacts/windows/* upload/
+          cp artifacts/android/*.apk upload/
           for platform in x64 ARM64; do
             (cd "artifacts/coroomvhid-$platform" && zip -qr "../../upload/coroomvhid-$VERSION-$platform.zip" .)
           done
@@ -348,6 +350,7 @@ jobs:
             echo
             echo "- **Linux**: \`coroom-$VERSION-x86_64.flatpak\` (\`flatpak install --user coroom-$VERSION-x86_64.flatpak\`)."
             echo "- **Windows**: \`coroom-$VERSION-x64.msix\` (firmado con el certificado de prueba \`coroom-dev.cer\`, que hay que instalar antes) o el portátil \`coroom-$VERSION-windows-x64.zip\`."
+            echo "- **Android** (9 o posterior, invitado): \`coroom-$VERSION-android.apk\`, para instalar desde el archivo."
             echo "- **Servidor**: \`docker pull $image\`."
             echo "- **Driver de mando virtual** (Windows 10 22H2 u 11, x64 o ARM64): \`coroomvhid-$VERSION-x64.zip\` o \`coroomvhid-$VERSION-ARM64.zip\`. Driver UMDF2 en modo usuario, firmado en la CI con un certificado autofirmado de un solo uso (\`coroomvhid.cer\`, en el paquete; su clave privada se borró al terminar la compilación). Se instala con \`install.ps1\` en una consola de administrador, sin firma de prueba y con el arranque seguro y la integridad de memoria activados; \`uninstall.ps1\` lo quita todo, también el certificado. Los mandos convertidos llegan como Xbox 360 (XInput, hasta cuatro; después, HID genéricos) y los tal cual con el VID/PID y el descriptor del mando del invitado. Antes de publicarse se instala y se prueba en un Windows de la CI. Es opcional: sin él, coroom funciona y el mando puede ir como teclas."
             echo

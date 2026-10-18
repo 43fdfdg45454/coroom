@@ -1,0 +1,19 @@
+# Compilación de Gradle y de Android Studio
+build/
+.gradle/
+.kotlin/
+.idea/
+*.iml
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+# El wrapper se regenera con `gradle wrapper` (README.md); solo va gradle-wrapper.properties
+gradle/wrapper/gradle-wrapper.jar
+gradlew
+gradlew.bat
+# Bibliotecas de Rust que deja `cargo ndk` (las compila la CI)
+app/src/main/jniLibs/
+# Almacenes de firma: los pone el operador fuera del repositorio
+*.jks
+*.keystore

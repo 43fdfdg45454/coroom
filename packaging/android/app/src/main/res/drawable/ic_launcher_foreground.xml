@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Primer plano del icono adaptable: los dos anillos enlazados de packaging/icons/coroom.svg
+  (anfitrión e invitado), escalados a la zona segura de 66 dp del lienzo de 108 dp.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:pathData="M27.41,54a16.36,16.36 0,1 0,32.73 0a16.36,16.36 0,1 0,-32.73 0"
+        android:strokeWidth="6.82"
+        android:strokeColor="#FFFFFFFF" />
+    <path
+        android:pathData="M47.86,54a16.36,16.36 0,1 0,32.73 0a16.36,16.36 0,1 0,-32.73 0"
+        android:strokeWidth="6.82"
+        android:strokeColor="#FF99C1F1" />
+    <!-- El tramo del primer anillo que pasa por encima del segundo: así se ven enlazados. -->
+    <path
+        android:pathData="M46.61,37.88A16.36,16.36 0,0 1,58.26 43.5"
+        android:strokeWidth="6.82"
+        android:strokeColor="#FFFFFFFF" />
+</vector>
