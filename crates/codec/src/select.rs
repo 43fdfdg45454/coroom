@@ -622,6 +622,16 @@ impl DecoderSet {
             .any(|&(c, backend)| c == codec && self.backend_supports(c, backend, format))
     }
 
+    /// Si el decodificador que se usaría para `codec` (el primero que queda) admite `format`: lo
+    /// que el invitado puede aceptar sin cambiar de decodificador. Un HEVC por NVDEC que no hace
+    /// 4:4:4 no se cambia por el `hevc` de FFmpeg en la CPU por pedir 4:4:4.
+    pub fn preferred_supports(&self, codec: Codec, format: VideoFormat) -> bool {
+        self.available
+            .iter()
+            .find(|(c, _)| *c == codec)
+            .is_some_and(|&(c, backend)| self.backend_supports(c, backend, format))
+    }
+
     /// Abre el mejor decodificador de `codec` (4:2:0 SDR); si un backend falla, prueba el
     /// siguiente.
     pub fn open(&self, codec: Codec) -> Result<Box<dyn Decoder>, CodecError> {

@@ -153,7 +153,10 @@ impl GuestCapabilities {
     }
 
     /// Lo que decodifica `set` y, si se piden (Ajustes del invitado), los códecs con los que
-    /// acepta 4:4:4 y HDR10 ([`coroom_codec::decoder_supports`]).
+    /// acepta 4:4:4 y HDR10: los que su decodificador preferido decodifica en ese formato
+    /// ([`DecoderSet::preferred_supports`]). Aceptar un formato nunca pasa un códec de la GPU a la
+    /// CPU: con HEVC 4:4:4 en el `hevc` de FFmpeg, un invitado sin 4:4:4 en NVDEC decodificaba
+    /// 1440p a 120 fps a menos de la mitad del ritmo.
     pub fn from_decoders(set: &DecoderSet, yuv444: bool, hdr10: bool) -> Self {
         let mut caps = Self::new(set.available().to_vec());
         let codecs = set_codecs(set);
@@ -161,14 +164,14 @@ impl GuestCapabilities {
             caps.yuv444 = codecs
                 .iter()
                 .copied()
-                .filter(|&codec| set.supports(codec, VideoFormat::SDR_444))
+                .filter(|&codec| set.preferred_supports(codec, VideoFormat::SDR_444))
                 .collect();
         }
         if hdr10 {
             caps.hdr10 = codecs
                 .iter()
                 .copied()
-                .filter(|&codec| set.supports(codec, VideoFormat::HDR10_420))
+                .filter(|&codec| set.preferred_supports(codec, VideoFormat::HDR10_420))
                 .collect();
         }
         caps
@@ -486,6 +489,18 @@ mod tests {
         assert_eq!(caps.hdr10, vec![Codec::Av1]);
         let off = GuestCapabilities::from_decoders(&set, false, false);
         assert!(off.yuv444.is_empty() && off.hdr10.is_empty());
+        // HEVC por NVDEC sin 4:4:4 medido (sin sondeo, ninguno por hardware lo tiene): el `hevc`
+        // de FFmpeg haría 4:4:4, pero en la CPU; no se acepta por eso.
+        let nvdec = DecoderSet::new([(Codec::Hevc, DecoderBackend::Nvdec), (Codec::Hevc, SW)]);
+        let caps = GuestCapabilities::from_decoders(&nvdec, true, true);
+        assert!(caps.yuv444.is_empty(), "{:?}", caps.yuv444);
+        assert_eq!(caps.hdr10, vec![Codec::Hevc]);
+        let software_only = GuestCapabilities::from_decoders(
+            &nvdec.without(&[(Codec::Hevc, DecoderBackend::Nvdec)]),
+            true,
+            false,
+        );
+        assert_eq!(software_only.yuv444, vec![Codec::Hevc]);
         for format in wanted {
             let (chroma, color) = format_to_wire(format);
             assert_eq!(format_from_wire(chroma, color), format);

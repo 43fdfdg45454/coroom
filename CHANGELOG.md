@@ -215,6 +215,14 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **Invitados que decodificaban 4:4:4 en la CPU**: la app daba por hecho que toda NVIDIA
+  decodifica HEVC 4:4:4 por hardware; las anteriores a Turing no pueden, y FFmpeg seguía por
+  software sin avisar. Un invitado así recibía 1440p a 120 fps y decodificaba unos 50, con saltos,
+  intras pedidos sin parar y cortes de audio. Ahora el sondeo decodifica una muestra 4:4:4 de
+  HEVC y de AV1 con cada decodificador por hardware y solo cuenta los que la sacan de la GPU con
+  la imagen correcta (`coroom doctor` los lista en «Decodificar 4:4:4 por hardware»). Además, el
+  invitado solo acepta 4:4:4 en un códec si lo decodifica el mismo decodificador que usaría en
+  4:2:0: pedir 4:4:4 ya no pasa el vídeo de la GPU a la CPU.
 - **Cambiar de cuenta en el mismo servidor** (hay que actualizar también el servidor): cerrar
   sesión y entrar con otra cuenta fallaba con «esta identidad ya está vinculada a otra cuenta». La
   identidad del equipo era de la primera cuenta para siempre. Ahora pasa a la cuenta que entra; la

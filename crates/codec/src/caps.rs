@@ -55,15 +55,16 @@ pub fn encoder_supports(codec: Codec, backend: Backend, format: VideoFormat) -> 
     }
 }
 
-/// Si el decodificador `codec` con `backend` admite `format`. Tabla fija, como
+/// Si el decodificador `codec` con `backend` admite `format`. El 4:4:4 por hardware no sale de
+/// una tabla: lo dice el sondeo de esta máquina ([`Capabilities::decoders_444`], cada uno
+/// decodificó una muestra 4:4:4 en la GPU); sin sondeo, no. El resto es una tabla fija, como
 /// [`encoder_supports`]:
 ///
 /// | | 4:4:4 (8 bits) | HDR10 (10 bits 4:2:0) |
 /// |---|---|---|
 /// | OpenH264 (H.264 software) | no | no |
 /// | dav1d (AV1) y `hevc` de FFmpeg (software) | sí | sí |
-/// | NVDEC | HEVC (Turing y posteriores) | HEVC y AV1 |
-/// | Vulkan Video, VA-API, D3D11/D3D12 | no (Vulkan Video no tiene perfiles 4:4:4 de decodificación estándar) | HEVC y AV1 |
+/// | Por hardware | HEVC y AV1 si el sondeo lo midió (H.264 no) | HEVC y AV1 |
 pub fn decoder_supports(codec: Codec, backend: DecoderBackend, format: VideoFormat) -> bool {
     if format.is_hdr() && format.chroma == Chroma::Yuv444 {
         return false;
@@ -77,8 +78,9 @@ pub fn decoder_supports(codec: Codec, backend: DecoderBackend, format: VideoForm
     }
     match (format.chroma, backend) {
         (_, DecoderBackend::Software) => true,
-        (Chroma::Yuv444, DecoderBackend::Nvdec) => codec == Codec::Hevc,
-        (Chroma::Yuv444, _) => false,
+        (Chroma::Yuv444, _) => PROBED
+            .get()
+            .is_some_and(|caps| caps.decoders_444.contains(&(codec, backend))),
         (Chroma::Yuv420, _) => true,
     }
 }
@@ -101,6 +103,9 @@ pub struct Capabilities {
     /// Codificadores por hardware que FFmpeg trae pero que no abren en esta máquina, con el
     /// motivo (lo normal si falta esa GPU o su driver): `«codificar HEVC con NVENC: …»`.
     pub unavailable: Vec<String>,
+    /// Decodificadores por hardware de [`Self::decoders`] que decodifican 4:4:4: los que sacaron
+    /// en la GPU la muestra 4:4:4 de su códec ([`decoder_supports`]).
+    pub decoders_444: Vec<(Codec, DecoderBackend)>,
 }
 
 static PROBED: OnceLock<Capabilities> = OnceLock::new();
@@ -122,6 +127,8 @@ struct CachedProbe {
     ffmpeg_dir: Option<String>,
     rejected: Vec<String>,
     unavailable: Vec<String>,
+    #[serde(default)]
+    decoders_444: Vec<(String, String)>,
 }
 
 impl CachedProbe {
@@ -142,6 +149,11 @@ impl CachedProbe {
             ffmpeg_dir: caps.ffmpeg_dir.clone(),
             rejected: caps.rejected.clone(),
             unavailable: caps.unavailable.clone(),
+            decoders_444: caps
+                .decoders_444
+                .iter()
+                .map(|(codec, backend)| (codec.id().to_owned(), backend.id().to_owned()))
+                .collect(),
         }
     }
 
@@ -152,14 +164,17 @@ impl CachedProbe {
             .iter()
             .map(|(codec, backend)| Some((Codec::from_id(codec)?, Backend::from_id(backend)?)))
             .collect::<Option<Vec<_>>>()?;
-        let decoders = self
-            .decoders
-            .iter()
-            .map(|(codec, backend)| {
-                Some((Codec::from_id(codec)?, DecoderBackend::from_id(backend)?))
-            })
-            .collect::<Option<Vec<_>>>()?;
+        let decoders_of = |list: &[(String, String)]| {
+            list.iter()
+                .map(|(codec, backend)| {
+                    Some((Codec::from_id(codec)?, DecoderBackend::from_id(backend)?))
+                })
+                .collect::<Option<Vec<_>>>()
+        };
+        let decoders = decoders_of(&self.decoders)?;
+        let decoders_444 = decoders_of(&self.decoders_444)?;
         let mut caps = Capabilities::with(encoders, decoders);
+        caps.decoders_444 = decoders_444;
         caps.ffmpeg_version = self.ffmpeg_version.clone();
         caps.ffmpeg_dir = self.ffmpeg_dir.clone();
         caps.rejected = self.rejected.clone();
@@ -381,6 +396,7 @@ impl Capabilities {
             caps.decoders.extend(probed.decoders);
             caps.rejected = probed.rejected;
             caps.unavailable = probed.unavailable;
+            caps.decoders_444 = probed.decoders_444;
             caps.ffmpeg_version = Some(crate::ffmpeg::version());
             caps.ffmpeg_dir = Some(crate::ffmpeg::library_dir());
         }
@@ -398,6 +414,7 @@ impl Capabilities {
             ffmpeg_dir: None,
             rejected: Vec::new(),
             unavailable: Vec::new(),
+            decoders_444: Vec::new(),
         }
     }
 
@@ -415,6 +432,7 @@ impl Capabilities {
             ffmpeg_dir: None,
             rejected: Vec::new(),
             unavailable: Vec::new(),
+            decoders_444: Vec::new(),
         }
     }
 
@@ -498,6 +516,12 @@ impl fmt::Display for Capabilities {
                 pad(encoders, encoder_width)
             )?;
         }
+        let decoders_444: Vec<String> = self
+            .decoders_444
+            .iter()
+            .map(|&(codec, backend)| format!("{codec}/{}", decoder_label(codec, backend)))
+            .collect();
+        writeln!(f, "Decodificar 4:4:4 por hardware: {}", join(decoders_444))?;
         if !self.unavailable.is_empty() {
             writeln!(f, "Por hardware que no abren en este equipo:")?;
             for line in &self.unavailable {

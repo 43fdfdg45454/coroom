@@ -67,6 +67,23 @@ pub(crate) const CHECK_FRAMES: u64 = 300;
 /// Fotogramas de cada muestra de los decodificadores.
 const SAMPLE_FRAMES: u64 = 30;
 
+/// Lado de las muestras 4:4:4 (`samples/`): el de los codificadores, porque NVDEC no decodifica
+/// HEVC de menos de 144×144.
+#[cfg(test)]
+const SAMPLE_444_SIDE: u32 = ENCODE_SIDE;
+
+/// Fotogramas de cada muestra 4:4:4: un intra y predichos.
+#[cfg(test)]
+const SAMPLE_444_FRAMES: u64 = 10;
+
+/// Muestras 4:4:4 (8 bits) del patrón, generadas con `tools/probe-samples.sh`: aquí no hay
+/// codificador por software que haga 4:4:4, y un decodificador por hardware solo se da por bueno
+/// en 4:4:4 si decodifica una de verdad en la GPU.
+const SAMPLES_444: [(Codec, &[u8]); 2] = [
+    (Codec::Hevc, include_bytes!("samples/hevc-444.bin")),
+    (Codec::Av1, include_bytes!("samples/av1-444.bin")),
+];
+
 /// PSNR de luma mínimo de cada fotograma comprobado. El patrón a 1 Mbit/s sale por encima de
 /// 35 dB con cualquier codificador sano; un flujo corrupto da en torno a 10.
 pub(crate) const MIN_PSNR_DB: f64 = 25.0;
@@ -89,9 +106,11 @@ pub(crate) fn worst_case() -> Duration {
     let decoders = combinations(platform_decoders().len(), Codec::PREFERENCE.len());
     // Codificador: el hijo de Vulkan Video, abrir y la comprobación de imagen. Muestras: H.264 y
     // AV1. Decodificador: el hijo de Vulkan, decodificar la muestra o abrir con `hwaccel`.
+    // Y cada decodificador por hardware otra vez, con la muestra 4:4:4 de su códec.
+    let decoders_444 = combinations(platform_decoders().len(), SAMPLES_444.len());
     (child + PROBE_TIMEOUT + CHECK_TIMEOUT) * encoders
         + PROBE_TIMEOUT * 2
-        + (child + PROBE_TIMEOUT) * decoders
+        + (child + PROBE_TIMEOUT) * (decoders + decoders_444)
 }
 
 /// Backends de codificación que tienen sentido en este sistema.
@@ -371,18 +390,20 @@ fn check_image(image: &RawFrame) -> Result<(), String> {
 }
 
 /// PSNR de la luma de `image` frente al patrón de su `frame_id`, convertido igual que lo
-/// convierte el codificador (BT.709 en rango limitado). `None` si el formato no es YUV 4:2:0
-/// de 8 bits en CPU o el tamaño no es el del patrón.
+/// convierte el codificador (BT.709 en rango limitado). `None` si el formato no es YUV 4:2:0 o
+/// 4:4:4 de 8 bits en CPU o el tamaño no es el del patrón.
 pub(crate) fn luma_psnr(image: &RawFrame) -> Option<f64> {
-    if !matches!(image.format, PixelFormat::I420 | PixelFormat::Nv12)
-        || image.width != image.height
-        || image.width == 0
-    {
+    if image.width != image.height || image.width == 0 {
         return None;
     }
+    let pattern = test_pattern(image.width, image.frame_id);
+    let expected = match image.format {
+        PixelFormat::I420 | PixelFormat::Nv12 => crate::convert::bgra_to_i420(&pattern).ok()?,
+        PixelFormat::I444 => crate::convert::bgra_to_i444(&pattern).ok()?,
+        _ => return None,
+    };
     let side = image.width as usize;
     let stride = image.stride as usize;
-    let expected = crate::convert::bgra_to_i420(&test_pattern(image.width, image.frame_id)).ok()?;
     let mut squared = 0f64;
     for y in 0..side {
         let got = image.data.get(y * stride..y * stride + side)?;
@@ -510,6 +531,9 @@ pub(crate) struct Probed {
     pub(crate) rejected: Vec<String>,
     /// Codificadores por hardware de la build que no abren aquí, con el motivo.
     pub(crate) unavailable: Vec<String>,
+    /// Decodificadores por hardware que decodificaron la muestra 4:4:4 de su códec en la GPU
+    /// ([`probe_444`]).
+    pub(crate) decoders_444: Vec<(Codec, DecoderBackend)>,
 }
 
 /// Codificadores y decodificadores de FFmpeg que funcionan aquí, en orden de preferencia.
@@ -590,8 +614,62 @@ pub(crate) fn probe() -> Probed {
     }
     let rank = |codec: Codec| Codec::PREFERENCE.iter().position(|c| *c == codec);
     decoders.sort_by_key(|&(codec, backend)| (rank(codec), backend));
+    probe_444(&mut probed);
     super::set_log_level(super::default_log_level());
     probed
+}
+
+/// La muestra 4:4:4 de `bytes` ([`SAMPLES_444`]): un fotograma por paquete, cada uno con su
+/// longitud delante (u32 little-endian). Vacía si no se entiende.
+fn sample_444(bytes: &[u8]) -> Vec<Vec<EncodedSlice>> {
+    let mut frames = Vec::new();
+    let mut rest = bytes;
+    while let Some((len, tail)) = rest.split_first_chunk::<4>() {
+        let len = u32::from_le_bytes(*len) as usize;
+        let Some((data, tail)) = tail.split_at_checked(len) else {
+            return Vec::new();
+        };
+        let frame_id = frames.len() as u64;
+        frames.push(vec![EncodedSlice {
+            frame_id,
+            index: 0,
+            count: 1,
+            keyframe: frame_id == 0,
+            data: data.to_vec(),
+        }]);
+        rest = tail;
+    }
+    frames
+}
+
+/// Qué decodificadores por hardware de `probed` decodifican 4:4:4: el de cada códec con muestra
+/// ([`SAMPLES_444`]) tiene que sacarla de la GPU y con la imagen del patrón. Un `hwaccel` que no
+/// sabe 4:4:4 (NVDEC antes de Turing, por ejemplo) no da error: FFmpeg sigue por software, y el
+/// invitado decodificaría en la CPU sin que nadie lo supiera.
+fn probe_444(probed: &mut Probed) {
+    let hardware: Vec<(Codec, DecoderBackend)> = probed
+        .decoders
+        .iter()
+        .copied()
+        .filter(|(_, backend)| backend.is_hardware())
+        .collect();
+    for (codec, backend) in hardware {
+        let Some((_, bytes)) = SAMPLES_444.iter().find(|(c, _)| *c == codec) else {
+            continue;
+        };
+        let sample = sample_444(bytes);
+        if sample.is_empty() {
+            continue;
+        }
+        match probe_decoder(codec, backend, sample) {
+            DecoderProbe::Works => probed.decoders_444.push((codec, backend)),
+            DecoderProbe::Rejected(reason) => probed.rejected.push(format!(
+                "decodificar {codec} en 4:4:4 con {}: {reason}",
+                crate::decoder_label(codec, backend)
+            )),
+            DecoderProbe::Missing | DecoderProbe::Unavailable(_) => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -632,6 +710,45 @@ mod tests {
         let reason = check_encoder(&mut encoder, Codec::Av1, Instant::now())
             .expect_err("sin tiempo no comprueba nada");
         assert!(reason.contains("0 de 300 fotogramas"), "{reason}");
+    }
+
+    /// Las muestras 4:4:4 son el patrón: los decodificadores por software (que siempre hacen
+    /// 4:4:4) las sacan enteras, en 4:4:4 y con la imagen de cada fotograma.
+    #[test]
+    fn the_444_samples_decode_to_the_pattern() {
+        for (codec, bytes) in SAMPLES_444 {
+            let sample = sample_444(bytes);
+            assert_eq!(sample.len() as u64, SAMPLE_444_FRAMES, "{codec}");
+            let mut decoder =
+                FfmpegDecoder::new(codec, DecoderBackend::Software).expect("decodificador");
+            let mut decoded = 0;
+            for frame in &sample {
+                if let Some(image) = decoder.decode(frame).expect("decodifica") {
+                    assert_eq!(image.format, PixelFormat::I444, "{codec}");
+                    let psnr = luma_psnr(&image).expect("PSNR");
+                    assert!(psnr >= MIN_PSNR_DB, "{codec}: {psnr:.1} dB");
+                    decoded += 1;
+                }
+            }
+            assert!(decoded + 2 >= SAMPLE_444_FRAMES, "{codec}: {decoded}");
+        }
+        assert!(sample_444(&[9, 0, 0, 0, 1]).is_empty(), "truncada");
+    }
+
+    /// Escribe el patrón en `yuv444p` crudo ([`SAMPLE_444_SIDE`], [`SAMPLE_444_FRAMES`]
+    /// fotogramas) en `COROOM_PATTERN_OUT`: la entrada de `tools/probe-samples.sh`, que genera
+    /// las muestras 4:4:4 de `samples/`.
+    #[test]
+    #[ignore = "genera la entrada de tools/probe-samples.sh"]
+    fn write_the_444_pattern() {
+        let path = std::env::var("COROOM_PATTERN_OUT").expect("COROOM_PATTERN_OUT");
+        let mut raw = Vec::new();
+        for frame_id in 0..SAMPLE_444_FRAMES {
+            let image = crate::convert::bgra_to_i444(&test_pattern(SAMPLE_444_SIDE, frame_id))
+                .expect("I444");
+            raw.extend_from_slice(&image.data);
+        }
+        std::fs::write(path, raw).expect("escribir el patrón");
     }
 
     #[test]

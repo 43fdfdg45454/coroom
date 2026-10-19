@@ -202,7 +202,7 @@ pub fn video_support(hdr_display: Option<bool>) -> VideoSupport {
     let decodes = |format: VideoFormat| -> Vec<Codec> {
         Codec::PREFERENCE
             .into_iter()
-            .filter(|codec| decoders.supports(*codec, format))
+            .filter(|codec| decoders.preferred_supports(*codec, format))
             .collect()
     };
     VideoSupport {
