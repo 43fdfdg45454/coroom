@@ -93,6 +93,8 @@
     <string name="home_invitations_empty">Sin invitaciones por ahora. Cuando un amigo te invite a su sala, aparecerá aquí.</string>
     <string name="home_invitation_title">%1$s te invita</string>
     <string name="home_invitation_detail">Sala %1$s · %2$s</string>
+    <string name="home_own_room_title">Tu sala en %1$s</string>
+    <string name="home_own_room_detail">Sala %1$s · abierta con tu cuenta en otro dispositivo</string>
     <string name="home_friends_online">Amigos conectados</string>
     <string name="home_friends_online_empty">Ninguno de tus amigos está conectado ahora.</string>
     <string name="home_friends_none_body">Agrega a tus amigos por su nombre de usuario de coroom para ver aquí quién está conectado y entrar en sus salas.</string>
@@ -170,6 +172,13 @@
     <string name="settings_version">coroom %1$s</string>
     <string name="settings_licenses">Licencias</string>
     <string name="settings_system">Permisos</string>
+    <string name="settings_help">Ayuda</string>
+    <string name="settings_log">Compartir registro</string>
+    <string name="settings_log_body">Ayuda a diagnosticar problemas. No contiene contraseñas ni claves.</string>
+    <string name="log_share_title">Compartir el registro de coroom</string>
+    <string name="log_share_subject">Registro de coroom %1$s</string>
+    <string name="log_share_empty">Todavía no hay registro: se escribe mientras usas coroom.</string>
+    <string name="log_share_failed">No hay ninguna app con la que compartir el registro.</string>
     <string name="logout_title">¿Cerrar la sesión?</string>
     <string name="logout_body">Este teléfono dejará de recibir invitaciones. Para volver a entrar necesitarás tu contraseña.</string>
     <string name="licenses_title">Licencias</string>
@@ -211,6 +220,8 @@
     <string name="quality_unknown">sin medir</string>
     <string name="quality_reconnecting">Reconectando</string>
     <string name="pill_description">Conexión %1$s: %2$s, %3$s. Abrir conexión y calidad</string>
+    <string name="pill_description_collapsed">Conexión %1$s: %2$s. Mostrar los controles de la sala</string>
+    <string name="pill_description_collapsed_unread">Conexión %1$s: %2$s. Hay mensajes nuevos en el chat. Mostrar los controles de la sala</string>
     <string name="route_direct_short">directa</string>
     <string name="route_relay_short">por relay</string>
     <string name="route_unknown_short">conectando</string>

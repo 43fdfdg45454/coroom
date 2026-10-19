@@ -17,7 +17,7 @@ use coroom_session::remote::{GuestStatus, QualityLevel, SessionEvent};
 use coroom_session::{GuestId, Permissions, SessionError};
 use coroom_transport::api::ServerProbe;
 use coroom_transport::proto::api::{Devices, Friends, Usage};
-use coroom_transport::proto::signal::Activity;
+use coroom_transport::proto::signal::{Activity, OwnRoom};
 use coroom_ui::theme::{Accent, Mode, Palette, Tone};
 use coroom_ui::widget::{self as ui};
 use coroom_ui::{Element, Theme, font::Fonts};
@@ -293,6 +293,8 @@ pub enum Event {
         /// Lo que hace.
         activity: Activity,
     },
+    /// Las salas que la cuenta tiene abiertas en sus otros dispositivos (Inicio las ofrece).
+    OwnRooms(Vec<OwnRoom>),
     /// Un amigo pide entrar en la sala que compartes.
     JoinRequested {
         /// Quien lo pide.
@@ -884,6 +886,8 @@ pub struct App {
     pub usage: Option<Usage>,
     /// Invitaciones recibidas.
     pub invitations: Vec<Invitation>,
+    /// Salas de la propia cuenta abiertas en sus otros dispositivos.
+    pub own_rooms: Vec<OwnRoom>,
     /// Inicio de sesión.
     pub login: login::State,
     /// Inicio.
@@ -961,6 +965,7 @@ impl App {
             friends: Load::Idle,
             usage: None,
             invitations: Vec::new(),
+            own_rooms: Vec::new(),
             login,
             home: home::State::default(),
             friends_page: friends::State::default(),
@@ -1759,6 +1764,7 @@ impl App {
                 self.account = None;
                 self.friends = Load::Idle;
                 self.invitations.clear();
+                self.own_rooms.clear();
                 self.screen = Screen::Login;
                 self.login.step = login::Step::Servers;
                 self.login.password.clear();
@@ -1811,6 +1817,10 @@ impl App {
                     friend.activity = activity;
                 }
                 host::on_friends(self);
+                Vec::new()
+            }
+            Event::OwnRooms(rooms) => {
+                self.own_rooms = rooms;
                 Vec::new()
             }
             Event::JoinRequested {

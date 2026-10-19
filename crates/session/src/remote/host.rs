@@ -1648,6 +1648,9 @@ async fn control_reader(
                         guest.0, caps.max_width, caps.max_height, caps.max_fps
                     ));
                 }
+                if let Some(status) = lock(&ctx.core.guests).get_mut(&guest) {
+                    status.can_host = caps.can_host;
+                }
                 lock(&ctx.guest_caps).insert(guest, caps);
                 let ctx = Arc::clone(&ctx);
                 tokio::spawn(async move { renegotiate(&ctx, Some(guest)).await });
@@ -2154,12 +2157,13 @@ impl Room {
                 user,
                 name,
                 avatar,
+                device,
             } => {
                 self.on_peer_joined(
                     GuestId(peer_id),
                     identity_pk,
                     &key_package,
-                    (user, name, avatar),
+                    (user, name, avatar, device),
                 )
                 .await
             }
@@ -2209,6 +2213,10 @@ impl Room {
                 self.ctx
                     .core
                     .emit(SessionEvent::Activity { user, activity });
+                Ok(())
+            }
+            SignalMessage::OwnRooms { rooms } => {
+                self.ctx.core.emit(SessionEvent::OwnRooms(rooms));
                 Ok(())
             }
             SignalMessage::Presence { user, online } => {
@@ -2289,8 +2297,13 @@ impl Room {
         guest: GuestId,
         identity_pk: PublicKey,
         key_package: &[u8],
-        (user, name, avatar): (u64, String, Option<u64>),
+        (user, name, avatar, device): (u64, String, Option<u64>, Option<String>),
     ) -> Result<(), SessionError> {
+        // La misma cuenta desde otro dispositivo: «Bea (Teléfono)».
+        let name = match &device {
+            Some(device) => truncate_name(&format!("{name} ({device})")),
+            None => name,
+        };
         let own = self.ctx.core.identity.public_key();
         if identity_pk == own {
             self.ctx.core.warn(format!(
@@ -2400,6 +2413,8 @@ impl Room {
                 input_key: false,
                 input: Default::default(),
                 gamepad: None,
+                can_host: false,
+                device,
             },
         );
         self.ctx.core.emit(SessionEvent::GuestJoined {
@@ -2818,7 +2833,15 @@ async fn run_host(
                 Some(Command::Chat(text)) => ctx.chat_from_host(text),
                 Some(Command::ChatClear) => ctx.chat_clear(),
                 Some(Command::OfferHandoff(guest)) => {
-                    ctx.send_to_guest(guest, &ControlMessage::HandoffOffer);
+                    let can_host = lock(&ctx.core.guests)
+                        .get(&guest)
+                        .is_some_and(|status| status.can_host);
+                    if can_host {
+                        ctx.send_to_guest(guest, &ControlMessage::HandoffOffer);
+                    } else {
+                        // Su dispositivo no puede hospedar: es un «no» sin preguntarle.
+                        ctx.core.emit(SessionEvent::HandoffReply { guest, code: None });
+                    }
                 }
                 Some(Command::CancelHandoff(guest)) => {
                     ctx.send_to_guest(guest, &ControlMessage::HandoffCancel);

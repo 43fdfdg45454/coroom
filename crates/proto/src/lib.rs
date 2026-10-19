@@ -50,8 +50,11 @@ pub mod video;
 /// vibración de los mandos convertidos y de Xbox por cable (`GamepadRumble`, detrás de
 /// `HandoffCancel`); la 19, el relay de reenvío ([`relay`]): ya no termina QUIC, la conexión de
 /// pares va de punta a punta a través de él (sin `Alpn::Relay` ni el token en `Hello`); la 20, el
-/// texto sin tecla física en la entrada ([`input::InputEvent::Text`], detrás de `ReleaseAll`).
-pub const PROTOCOL_VERSION: u16 = 20;
+/// texto sin tecla física en la entrada ([`input::InputEvent::Text`], detrás de `ReleaseAll`); la
+/// 21, si el invitado puede hospedar (`control::Capabilities::can_host`), el dispositivo de quien
+/// entra con una cuenta que ya está en la sala (`signal::SignalMessage::PeerJoined`) y las salas
+/// propias abiertas en otros dispositivos (`signal::SignalMessage::OwnRooms`, al final).
+pub const PROTOCOL_VERSION: u16 = 21;
 
 /// Identificadores ALPN (RFC 7301) que el socket QUIC usa para demultiplexar conexiones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -13,6 +13,7 @@
 //! - [`guest`]: la sesión dentro de una sala (vídeo, audio, tacto, teclado, mandos y cursor).
 //! - [`mouse`]: el ratón o el touchpad conectado al teléfono y el texto del teclado en pantalla.
 //! - [`avatars`]: la caché de disco de los avatares.
+//! - `log`: el registro, a logcat y a `<filesDir>/logs/coroom.log` (lo que se comparte).
 
 pub mod app;
 pub mod avatars;
@@ -29,13 +30,14 @@ use std::sync::{Arc, OnceLock};
 /// La lógica del proceso, creada por [`init`] la primera vez.
 static APP: OnceLock<Arc<app::App>> = OnceLock::new();
 
-/// Arranca la lógica una vez por proceso: el registro, el almacén sellado en `files_dir` con la
-/// clave de `secret` y el nombre del dispositivo. Las llamadas siguientes no cambian nada.
+/// Arranca la lógica una vez por proceso: el registro (logcat y `files_dir/logs`), el almacén
+/// sellado en `files_dir` con la clave de `secret` y el nombre del dispositivo. Las llamadas
+/// siguientes no cambian nada.
 pub fn init(files_dir: &str, secret: &[u8], device: &str) -> Result<(), String> {
     if APP.get().is_some() {
         return Ok(());
     }
-    log::init();
+    log::init(std::path::Path::new(files_dir));
     let store = store::SealedStore::new(files_dir, secret)?;
     let _ = APP.set(Arc::new(app::App::new(store, device.to_owned())));
     Ok(())

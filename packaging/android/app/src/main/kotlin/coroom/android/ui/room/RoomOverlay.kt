@@ -73,16 +73,26 @@ class RoomActions(
     val onLeave: () -> Unit,
     val onSendChat: (String) -> Unit,
     val onClearNotice: (Int) -> Unit,
+    /** Enseñar la barra escondida (toque en la píldora reducida). */
+    val onRevealOverlay: () -> Unit,
+    /** «Compartir registro» desde el panel de conexión. */
+    val onShareLog: () -> Unit,
 )
 
 /**
  * Lo que va encima del vídeo con la sala abierta (bocetos «Sala», «Sala: conexión y calidad» y
  * «Sala: chat»): la píldora de conexión siempre visible, la barra lateral, el modo táctil, los
  * avisos y los paneles.
+ *
+ * La barra lateral y los chips se esconden solos a los [OVERLAY_HIDE_MS] sin tocarlos (con un
+ * panel, el diálogo de salir, el teclado o una reconexión no se esconden): queda solo la píldora
+ * reducida al punto de la calidad y la latencia, que siguen siempre a la vista, y tocarla vuelve
+ * a enseñarlo todo. Los toques en el vídeo siguen yendo al juego.
  */
 @Composable
 fun RoomOverlay(state: RoomUiState, actions: RoomActions) {
     val panelOpen = state.panel != Panel.None
+    val overlayVisible = state.overlayVisible
     Box(modifier = Modifier.fillMaxSize()) {
         // Con un panel abierto el vídeo se oscurece y tocarlo cierra el panel (no llega al juego).
         AnimatedVisibility(visible = panelOpen, enter = fadeIn(), exit = fadeOut()) {
@@ -104,13 +114,32 @@ fun RoomOverlay(state: RoomUiState, actions: RoomActions) {
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                ConnectionPill(state, onClick = { actions.onTogglePanel(Panel.Connection) })
-                state.permissions?.let { PermissionsChip(it) }
+                ConnectionPill(
+                    state,
+                    expanded = overlayVisible,
+                    onClick = { if (overlayVisible) actions.onTogglePanel(Panel.Connection) else actions.onRevealOverlay() },
+                )
+                val permissions = state.permissions
+                AnimatedVisibility(visible = overlayVisible && permissions != null, enter = fadeIn(), exit = fadeOut()) {
+                    permissions?.let { PermissionsChip(it) }
+                }
             }
 
-            if (!panelOpen) {
-                TouchModeChip(state.touchMode, Modifier.align(Alignment.BottomStart).padding(start = 14.dp, bottom = 12.dp))
-                RoomRail(state, actions, Modifier.align(Alignment.CenterEnd).padding(end = 12.dp, top = 12.dp, bottom = 12.dp))
+            AnimatedVisibility(
+                visible = overlayVisible && !panelOpen,
+                modifier = Modifier.align(Alignment.BottomStart).padding(start = 14.dp, bottom = 12.dp),
+                enter = slideInVertically { it } + fadeIn(),
+                exit = slideOutVertically { it } + fadeOut(),
+            ) {
+                TouchModeChip(state.touchMode)
+            }
+            AnimatedVisibility(
+                visible = overlayVisible && !panelOpen,
+                modifier = Modifier.align(Alignment.CenterEnd).padding(end = 12.dp, top = 12.dp, bottom = 12.dp),
+                enter = slideInHorizontally { it } + fadeIn(),
+                exit = slideOutHorizontally { it } + fadeOut(),
+            ) {
+                RoomRail(state, actions)
             }
 
             NoticeToast(state, actions.onClearNotice, Modifier.align(Alignment.TopCenter).padding(top = 12.dp))
@@ -122,7 +151,7 @@ fun RoomOverlay(state: RoomUiState, actions: RoomActions) {
             enter = slideInHorizontally { it } + fadeIn(),
             exit = slideOutHorizontally { it } + fadeOut(),
         ) {
-            ConnectionPanel(state, onClose = actions.onClosePanel)
+            ConnectionPanel(state, onClose = actions.onClosePanel, onShareLog = actions.onShareLog)
         }
         AnimatedVisibility(
             visible = state.panel == Panel.Chat,
@@ -171,9 +200,13 @@ private fun routeText(relayed: Boolean?): String = stringResource(
     },
 )
 
-/** «● 14 ms · directa · AV1»: la latencia siempre a la vista; abre el panel de conexión. */
+/**
+ * «● 14 ms · directa · AV1»: la latencia siempre a la vista; abre el panel de conexión. Con la
+ * barra escondida (`expanded` en falso) se queda en «● 14 ms» (y el aviso de chat sin leer), y
+ * tocarla enseña la barra.
+ */
 @Composable
-fun ConnectionPill(state: RoomUiState, onClick: () -> Unit, modifier: Modifier = Modifier) {
+fun ConnectionPill(state: RoomUiState, onClick: () -> Unit, modifier: Modifier = Modifier, expanded: Boolean = true) {
     val colors = MaterialTheme.colorScheme
     val rtt = state.shownRttMs?.let { stringResource(R.string.unit_ms, formatNumber(it, 0)) } ?: stringResource(R.string.no_value)
     val route = routeText(state.shownRelayed)
@@ -190,7 +223,11 @@ fun ConnectionPill(state: RoomUiState, onClick: () -> Unit, modifier: Modifier =
             }
         },
     )
-    val description = stringResource(R.string.pill_description, quality, rtt, route)
+    val description = when {
+        expanded -> stringResource(R.string.pill_description, quality, rtt, route)
+        state.unreadChat -> stringResource(R.string.pill_description_collapsed_unread, quality, rtt)
+        else -> stringResource(R.string.pill_description_collapsed, quality, rtt)
+    }
     Row(
         modifier = modifier
             .height(34.dp)
@@ -208,7 +245,13 @@ fun ConnectionPill(state: RoomUiState, onClick: () -> Unit, modifier: Modifier =
             style = CoroomText.supporting.copy(fontWeight = FontWeight.SemiBold),
             color = colors.onSurface,
         )
-        Text(text = detail, style = CoroomText.supporting, color = colors.onSurfaceVariant)
+        AnimatedVisibility(visible = expanded) {
+            Text(text = detail, style = CoroomText.supporting, color = colors.onSurfaceVariant)
+        }
+        // Con la barra escondida no se ve el aviso del chat de la barra lateral: va aquí.
+        AnimatedVisibility(visible = !expanded && state.unreadChat, enter = fadeIn(), exit = fadeOut()) {
+            Box(Modifier.size(8.dp).background(colors.error, CircleShape))
+        }
     }
 }
 
@@ -453,6 +496,16 @@ private fun RoomOverlayPreview() {
     }
 }
 
+@Preview(name = "Sala: barra escondida", widthDp = 844, heightDp = 390)
+@Composable
+private fun RoomOverlayHiddenPreview() {
+    CoroomTheme(darkTheme = true, dynamicColor = false) {
+        Box(Modifier.fillMaxSize().background(Color(0xFF3D8B4A))) {
+            RoomOverlay(PreviewRoom.state.copy(overlayShown = false), PreviewRoom.actions)
+        }
+    }
+}
+
 @Preview(name = "Sala: conexión y calidad", widthDp = 844, heightDp = 390)
 @Composable
 private fun RoomConnectionPreview() {
@@ -511,5 +564,5 @@ internal object PreviewRoom {
         permissions = InputPermissions(keyboardMouse = false, gamepadSlot = 1),
         noticeSeq = 1,
     )
-    val actions = RoomActions({}, {}, {}, {}, {}, {}, {}, {}, {})
+    val actions = RoomActions({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})
 }

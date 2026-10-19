@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Lo único que comparte «Compartir registro» (Ajustes): los registros de `filesDir/logs`
+  (coroom.log y coroom.1.log). Nada más del directorio privado de la aplicación.
+-->
+<paths>
+    <files-path name="logs" path="logs/" />
+</paths>

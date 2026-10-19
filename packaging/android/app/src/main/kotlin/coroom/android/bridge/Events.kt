@@ -32,6 +32,10 @@ sealed interface CoroomEvent {
     @Serializable
     data class AvatarChanged(val user: Long = 0, val avatar: Long? = null) : CoroomEvent
 
+    /** Las salas abiertas con la propia cuenta en otros dispositivos (vacía: ninguna). */
+    @Serializable
+    data class OwnRooms(val rooms: List<OwnRoom> = emptyList()) : CoroomEvent
+
     @Serializable
     data class JoinRequested(
         @SerialName("from_user") val fromUser: Long = 0,
@@ -161,6 +165,7 @@ fun parseEvent(text: String): CoroomEvent? = try {
         "presence" -> json.decode(CoroomEvent.Presence.serializer())
         "activity" -> json.decode(CoroomEvent.ActivityChanged.serializer())
         "avatar" -> json.decode(CoroomEvent.AvatarChanged.serializer())
+        "own_rooms" -> json.decode(CoroomEvent.OwnRooms.serializer())
         "join_requested" -> json.decode(CoroomEvent.JoinRequested.serializer())
         "join_declined" -> json.decode(CoroomEvent.JoinDeclined.serializer())
         "friend_requested" -> json.decode(CoroomEvent.FriendRequested.serializer())

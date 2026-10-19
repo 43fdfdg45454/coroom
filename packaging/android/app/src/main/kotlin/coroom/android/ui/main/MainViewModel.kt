@@ -13,6 +13,7 @@ import coroom.android.bridge.Friend
 import coroom.android.bridge.FriendRequest
 import coroom.android.bridge.FriendsList
 import coroom.android.bridge.Invitation
+import coroom.android.bridge.OwnRoom
 import coroom.android.bridge.RoomCode
 import coroom.android.bridge.TouchMode
 import coroom.android.platform.Gamepad
@@ -59,6 +60,8 @@ data class MainUiState(
     val account: Account? = null,
     val serverOnline: Boolean? = null,
     val invitations: List<Invitation> = emptyList(),
+    /** Las salas de la cuenta abiertas en sus otros dispositivos. */
+    val ownRooms: List<OwnRoom> = emptyList(),
     val friends: FriendsUi = FriendsUi(),
     val pads: List<Gamepad> = emptyList(),
     /** Los mandos tal como los ve Rust (`pads`); `null` si aún no contestó. */
@@ -88,6 +91,11 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
 
     /** Salas que abrir. */
     val rooms: Flow<RoomRequest> = _rooms.receiveAsFlow()
+
+    private val _logShares = Channel<List<String>>(Channel.BUFFERED)
+
+    /** Los ficheros del registro que compartir («Compartir registro» de Ajustes; lo abre la pantalla). */
+    val logShares: Flow<List<String>> = _logShares.receiveAsFlow()
 
     private var pendingJoin: RoomRequest? = null
     private val askedAt = mutableMapOf<Long, Long>()
@@ -137,6 +145,9 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
             repository.invitations.collect { list ->
                 _state.update { it.copy(invitations = list, nowMs = System.currentTimeMillis()) }
             }
+        }
+        viewModelScope.launch {
+            repository.ownRooms.collect { rooms -> _state.update { it.copy(ownRooms = rooms) } }
         }
         viewModelScope.launch {
             container.gamepads.pads.collect { pads ->
@@ -238,6 +249,8 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
             try {
                 val list = repository.friends()
                 _state.update { it.copy(friends = FriendsUi(loading = false, list = list)) }
+                // Hay servidor: los avatares que no llegaron antes (el propio también) se vuelven a pedir.
+                repository.retryAvatars()
             } catch (error: BridgeException) {
                 _state.update { it.copy(friends = it.friends.copy(loading = false, error = error.message)) }
             }
@@ -336,6 +349,18 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
         viewModelScope.launch {
             container.settings.setNotifyInvitations(false)
             _messages.send(UiText.res(R.string.message_notifications_denied))
+        }
+    }
+
+    /** Comparte el registro: los ficheros que haya o, si todavía no hay nada escrito, se dice. */
+    fun shareLog() {
+        viewModelScope.launch {
+            try {
+                val files = repository.logFiles()
+                if (files.isEmpty()) _messages.send(UiText.res(R.string.log_share_empty)) else _logShares.send(files)
+            } catch (error: BridgeException) {
+                _messages.send(UiText.Raw(error.message.orEmpty()))
+            }
         }
     }
 

@@ -85,6 +85,13 @@ data class FriendRequest(
     val username: String get() = user?.username.orEmpty()
 }
 
+/** Una sala abierta con la propia cuenta en otro dispositivo (`own_rooms`). */
+@Serializable
+data class OwnRoom(
+    val code: String = "",
+    val device: String = "",
+)
+
 @Serializable
 data class FriendsList(
     val friends: List<Friend> = emptyList(),

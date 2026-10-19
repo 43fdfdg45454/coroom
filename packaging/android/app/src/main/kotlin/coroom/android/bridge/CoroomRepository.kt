@@ -20,6 +20,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObjectBuilder
@@ -73,10 +74,24 @@ class CoroomRepository(
     /** Invitaciones recibidas, la más nueva primero. */
     val invitations: StateFlow<List<Invitation>> = _invitations.asStateFlow()
 
+    private val _ownRooms = MutableStateFlow<List<OwnRoom>>(emptyList())
+
+    /** Las salas abiertas con la cuenta en sus otros dispositivos (se entra con un toque). */
+    val ownRooms: StateFlow<List<OwnRoom>> = _ownRooms.asStateFlow()
+
     private val _inRoom = MutableStateFlow(false)
 
     /** Si hay una pantalla de sala abierta (la sala de espera se cierra mientras tanto). */
     val inRoom: StateFlow<Boolean> = _inRoom.asStateFlow()
+
+    private val _avatarRetry = MutableStateFlow(0)
+
+    /**
+     * Sube cuando conviene volver a pedir los avatares que no llegaron por la red (como en el
+     * escritorio): al volver el servidor, al llegar la lista de amigos o la de la sala. Lo que ya
+     * está en memoria o el servidor dijo que no existe no se vuelve a pedir.
+     */
+    val avatarRetry: StateFlow<Int> = _avatarRetry.asStateFlow()
 
     private val lobbyMutex = Mutex()
     private var lobbyServer: String? = null
@@ -107,7 +122,14 @@ class CoroomRepository(
 
     private fun remember(event: CoroomEvent) {
         when (event) {
-            is CoroomEvent.ServerStatus -> _serverStatus.value = event
+            is CoroomEvent.ServerStatus -> {
+                // Solo el paso a «responde», no cada aviso de que sigue respondiendo.
+                val cameBack = event.online && _serverStatus.value?.online != true
+                _serverStatus.value = event
+                if (cameBack) retryAvatars()
+            }
+            is CoroomEvent.Members -> retryAvatars()
+            is CoroomEvent.OwnRooms -> _ownRooms.value = event.rooms
             // El avatar propio cambiado desde otro dispositivo.
             is CoroomEvent.AvatarChanged -> _account.update { account ->
                 if (account != null && account.userId == event.user) account.copy(avatar = event.avatar) else account
@@ -120,6 +142,11 @@ class CoroomRepository(
             }
             else -> Unit
         }
+    }
+
+    /** Vuelve a pedir los avatares que no llegaron (ver [avatarRetry]). */
+    fun retryAvatars() {
+        _avatarRetry.update { it + 1 }
     }
 
     /** Quita una invitación (al entrar con ella o descartarla). */
@@ -172,6 +199,7 @@ class CoroomRepository(
         lobbyMutex.withLock { lobbyServer = null }
         _serverStatus.value = null
         _invitations.value = emptyList()
+        _ownRooms.value = emptyList()
         _account.value = null
         return text
     }
@@ -265,6 +293,12 @@ class CoroomRepository(
     suspend fun setJoinMuted(muted: Boolean) {
         call("set_join_muted") { put("muted", muted) }
     }
+
+    /**
+     * Los ficheros del registro de la parte en Rust (`<filesDir>/logs`), el de esta ejecución
+     * primero; vacío si todavía no hay nada escrito.
+     */
+    suspend fun logFiles(): List<String> = callAs("log_files", ListSerializer(String.serializer()))
 
     /** `null` fuera de una sala. */
     suspend fun stats(): RoomStats? {

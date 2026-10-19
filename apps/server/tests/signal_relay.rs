@@ -201,6 +201,7 @@ async fn room(
             user: 0,
             name: "desarrollo".to_owned(),
             avatar: None,
+            device: None,
         }
     );
     (code, host_token, guest_token, your_peer_id)

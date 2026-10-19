@@ -6,7 +6,7 @@
 
 use coroom_session::lobby::LobbyEvent;
 use coroom_session::remote::{QualityLevel, SessionEvent};
-use coroom_transport::proto::signal::{Activity, SignalMessage};
+use coroom_transport::proto::signal::{Activity, OwnRoom, SignalMessage};
 use coroom_transport::quic::Path;
 use serde::Serialize;
 
@@ -43,6 +43,12 @@ pub enum UiEvent {
         user: u64,
         /// `idle`, `hosting` o `playing`.
         activity: &'static str,
+    },
+    /// Las salas abiertas con la propia cuenta en otros dispositivos (Inicio las ofrece para
+    /// entrar con un toque); vacía cuando no queda ninguna.
+    OwnRooms {
+        /// Código y dispositivo de cada una, de la más antigua a la más nueva.
+        rooms: Vec<OwnRoom>,
     },
     /// Cambió el avatar de alguien.
     Avatar {
@@ -252,6 +258,7 @@ fn from_signal(message: SignalMessage) -> Option<UiEvent> {
             user,
             activity: activity(a),
         },
+        SignalMessage::OwnRooms { rooms } => UiEvent::OwnRooms { rooms },
         SignalMessage::Avatar { user, avatar } => UiEvent::Avatar { user, avatar },
         SignalMessage::JoinRequested {
             from_user,
@@ -394,6 +401,9 @@ pub fn from_session(event: &SessionEvent) -> Option<UiEvent> {
             user: *user,
             activity: activity(*a),
         },
+        SessionEvent::OwnRooms(rooms) => UiEvent::OwnRooms {
+            rooms: rooms.clone(),
+        },
         SessionEvent::Avatar { user, avatar } => UiEvent::Avatar {
             user: *user,
             avatar: *avatar,
@@ -451,6 +461,20 @@ mod tests {
                 from_user: 2,
                 from_name: "Bea".to_owned(),
                 code: "K7Q2MZ".to_owned(),
+            })
+        );
+        let own = from_lobby(LobbyEvent::Signal(SignalMessage::OwnRooms {
+            rooms: vec![OwnRoom {
+                code: "K7Q2MZ".to_owned(),
+                device: "Equipo de ejemplo".to_owned(),
+            }],
+        }))
+        .expect("salas propias");
+        assert_eq!(
+            serde_json::to_value(own).expect("json"),
+            serde_json::json!({
+                "type": "own_rooms",
+                "rooms": [{"code": "K7Q2MZ", "device": "Equipo de ejemplo"}],
             })
         );
         assert_eq!(

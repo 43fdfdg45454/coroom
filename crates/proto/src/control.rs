@@ -101,6 +101,9 @@ pub struct Capabilities {
     pub yuv444: Vec<Codec>,
     /// Códecs que decodifica en HDR10 (10 bits, BT.2020 PQ) y quiere recibir así.
     pub hdr10: Vec<Codec>,
+    /// Si puede abrir una sala y quedarse de anfitrión ([`ControlMessage::HandoffOffer`]): el
+    /// invitado de Android no comparte, así que no se le ofrece.
+    pub can_host: bool,
 }
 
 /// Matriz de color de un flujo (la de `coroom_codec::color::Matrix`).
@@ -825,9 +828,10 @@ mod tests {
                 any::<[u32; 3]>(),
                 prop::collection::vec(codec(), 0..3),
                 prop::collection::vec(codec(), 0..3),
+                any::<bool>(),
             )
                 .prop_map(
-                    |(decoders, [max_width, max_height, max_fps], yuv444, hdr10)| {
+                    |(decoders, [max_width, max_height, max_fps], yuv444, hdr10, can_host)| {
                         ControlMessage::Capabilities(Capabilities {
                             decoders,
                             max_width,
@@ -835,6 +839,7 @@ mod tests {
                             max_fps,
                             yuv444,
                             hdr10,
+                            can_host,
                         })
                     }
                 ),

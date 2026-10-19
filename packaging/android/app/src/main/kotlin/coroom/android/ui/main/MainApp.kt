@@ -47,6 +47,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import coroom.android.R
+import coroom.android.platform.LogShare
 import coroom.android.ui.components.CoroomIcon
 import coroom.android.ui.components.NoticeCard
 import coroom.android.ui.components.PillButton
@@ -156,6 +157,18 @@ private fun SignedInApp(main: MainViewModel, state: MainUiState, onEnableNotific
     LaunchedEffect(main) {
         main.messages.collect { snackbar.showSnackbar(it.resolve(context)) }
     }
+    // «Compartir registro» de Ajustes: la hoja de compartir del sistema con los ficheros.
+    LaunchedEffect(main) {
+        main.logShares.collect { paths ->
+            val chooser = LogShare.chooser(context, paths)
+            val shown = chooser != null && runCatching { context.startActivity(chooser) }.isSuccess
+            if (!shown) {
+                snackbar.showSnackbar(
+                    context.getString(if (chooser == null) R.string.log_share_empty else R.string.log_share_failed),
+                )
+            }
+        }
+    }
     // Al volver a la app, la lista de amigos al día.
     LifecycleResumeEffect(main) {
         main.refreshFriends()
@@ -205,6 +218,7 @@ private fun SignedInApp(main: MainViewModel, state: MainUiState, onEnableNotific
                     onNotify = main::setNotifyInvitations,
                     onEnableNotifications = onEnableNotifications,
                     onLogout = main::logout,
+                    onShareLog = main::shareLog,
                 )
             }
         }

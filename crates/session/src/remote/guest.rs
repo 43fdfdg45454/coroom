@@ -90,8 +90,11 @@ pub(crate) fn start(
             "no hay ningún decodificador disponible con las opciones dadas".into(),
         ));
     }
-    let decode =
-        Arc::new(DecodeControl::new(decoders).accepting(config.accept_yuv444, config.accept_hdr));
+    let decode = Arc::new(
+        DecodeControl::new(decoders)
+            .accepting(config.accept_yuv444, config.accept_hdr)
+            .hosting(config.can_host),
+    );
     if core.software_decoder.load(Ordering::Acquire) {
         decode.set_software_only(true);
         // Al arrancar no hay nada que volver a abrir ni que renegociar.
@@ -509,6 +512,10 @@ impl Room {
             }
             SignalMessage::Activity { user, activity } => {
                 self.core.emit(SessionEvent::Activity { user, activity });
+                Ok(())
+            }
+            SignalMessage::OwnRooms { rooms } => {
+                self.core.emit(SessionEvent::OwnRooms(rooms));
                 Ok(())
             }
             SignalMessage::Presence { user, online } => {
@@ -1085,9 +1092,7 @@ async fn receive(
         });
     }
 
-    let (yuv444, hdr) = decode.accept;
-    // Sin los decodificadores que ya fallaron en esta sesión (ver `DecodeControl`).
-    let caps = GuestCapabilities::from_decoders(&decode.usable(), yuv444, hdr);
+    let caps = capabilities(&decode);
     let control_task = tokio::spawn(control_loop(
         Arc::clone(core),
         control_rx,
@@ -1582,6 +1587,16 @@ impl VideoWatch {
 /// Recibe, descifra y entrega a la decodificación; con un temporizador propio pide intra si el
 /// vídeo no avanza ([`VideoWatch`]) y vuelve a anunciar las capacidades si el hilo `decode` se
 /// quedó sin decodificadores de un códec.
+/// Lo que el invitado anuncia: lo que decodifica, sin los decodificadores que ya fallaron en esta
+/// sesión (ver `DecodeControl`), y si puede quedarse de anfitrión.
+fn capabilities(decode: &DecodeControl) -> GuestCapabilities {
+    let (yuv444, hdr) = decode.accept;
+    GuestCapabilities {
+        can_host: decode.can_host,
+        ..GuestCapabilities::from_decoders(&decode.usable(), yuv444, hdr)
+    }
+}
+
 async fn media_loop(
     core: &Arc<Core>,
     connection: &PeerConnection,
@@ -1611,8 +1626,7 @@ async fn media_loop(
         };
         let Some(frame) = received else {
             if decode.take_renegotiation() {
-                let (yuv444, hdr) = decode.accept;
-                let caps = GuestCapabilities::from_decoders(&decode.usable(), yuv444, hdr);
+                let caps = capabilities(decode);
                 debug!(?caps, "se vuelven a anunciar las capacidades");
                 let _ = control.send(&caps.to_message());
             }

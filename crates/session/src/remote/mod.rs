@@ -284,6 +284,9 @@ pub struct RemoteConfig {
     pub accept_yuv444: bool,
     /// Invitado: anunciar los códecs con los que acepta HDR10 (Ajustes).
     pub accept_hdr: bool,
+    /// Invitado: si este equipo puede abrir una sala y quedarse de anfitrión (se anuncia: al que
+    /// no puede, como el invitado de Android, no se le ofrece pasarle la sala).
+    pub can_host: bool,
     /// Solo en builds de desarrollo: medios sin SFrame para la prueba A/B de `docs/ARQUITECTURA.md` §2.3.
     /// Los dos extremos deben ponerlo igual. No existe en release.
     #[cfg(debug_assertions)]
@@ -314,6 +317,7 @@ impl RemoteConfig {
             quality_probe: QUALITY_PROBE,
             accept_yuv444: false,
             accept_hdr: false,
+            can_host: true,
             #[cfg(debug_assertions)]
             insecure_no_sframe: false,
             pacing: coroom_transport::media::PacingConfig::default(),
@@ -498,6 +502,9 @@ pub enum SessionEvent {
         /// Su actividad.
         activity: coroom_transport::proto::signal::Activity,
     },
+    /// Las salas que la propia cuenta tiene abiertas en sus otros dispositivos (al conectarse y
+    /// cada vez que se abre o se cierra una; vacía cuando no queda ninguna).
+    OwnRooms(Vec<coroom_transport::proto::signal::OwnRoom>),
     /// Un amigo se conectó o desconectó de la señalización (llega también con la sala abierta o
     /// dentro de una, para que la lista de amigos no se congele).
     Presence {
@@ -722,6 +729,9 @@ impl fmt::Display for SessionEvent {
             SessionEvent::Activity { user, activity } => {
                 write!(f, "El usuario {user} está {activity:?}.")
             }
+            SessionEvent::OwnRooms(rooms) => {
+                write!(f, "Salas propias en otros dispositivos: {}.", rooms.len())
+            }
             SessionEvent::Presence { user, online: true } => {
                 write!(f, "El usuario {user} se ha conectado.")
             }
@@ -816,6 +826,11 @@ pub struct GuestStatus {
     pub input: InputLatency,
     /// El mando físico que declaró para su ranura, si lo hay.
     pub gamepad: Option<GuestPad>,
+    /// Si puede quedarse de anfitrión (lo anuncia con lo que decodifica; hasta entonces, no).
+    pub can_host: bool,
+    /// Nombre de su dispositivo, si su cuenta ya estaba en la sala (`PeerJoined::device`): va
+    /// también entre paréntesis en [`GuestStatus::name`].
+    pub device: Option<String>,
 }
 
 /// Cómo puede llegar el mando físico de un invitado.

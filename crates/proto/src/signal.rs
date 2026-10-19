@@ -12,6 +12,9 @@
 //! `PeerJoined` y `Joined`, reparte la presencia de los amigos (`Presence`, y `Avatar` cuando uno
 //! cambia de avatar) y las invitaciones a salas (`Invite` → `Invited`, solo
 //! entre amigos), y avisa con `QuotaExceeded` o `RelayDisabled` cuando la sala no tiene relay.
+//! A cada sesión de una cuenta le dice qué salas tiene abiertas esa cuenta (`OwnRooms`), para entrar
+//! en la propia desde otro dispositivo, y a quien hospeda, el dispositivo de quien entra con una
+//! cuenta que ya está en la sala (`PeerJoined::device`).
 //!
 //! El servidor enruta `Mls` y `Candidates` sin interpretarlos y rellena `from_peer` con el par que
 //! los envió (el valor que pone el cliente se ignora).
@@ -171,6 +174,9 @@ pub enum SignalMessage {
         name: String,
         /// Versión de su avatar (`None`: no tiene).
         avatar: Option<u64>,
+        /// Nombre del dispositivo con el que entra, solo si su cuenta ya está en la sala (es la
+        /// del anfitrión o la de otro invitado): con él se distinguen las dos filas.
+        device: Option<String>,
     },
     /// Servidor → miembros: un par ha salido de la sala.
     PeerLeft {
@@ -307,6 +313,23 @@ pub enum SignalMessage {
         /// Su nombre visible.
         from_name: String,
     },
+    /// Servidor → cada sesión de una cuenta: las salas que la cuenta tiene abiertas como
+    /// anfitrión desde sus otros dispositivos (al autenticarse, aunque no haya ninguna, y cada vez
+    /// que se abre o se cierra una; la que hospeda la propia sesión no va). Con ella se entra con
+    /// un toque en la propia sala desde otro dispositivo.
+    OwnRooms {
+        /// Las salas, de la más antigua a la más nueva.
+        rooms: Vec<OwnRoom>,
+    },
+}
+
+/// Una sala abierta por la propia cuenta ([`SignalMessage::OwnRooms`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnRoom {
+    /// Código de la sala.
+    pub code: String,
+    /// Nombre del dispositivo que la hospeda.
+    pub device: String,
 }
 
 #[cfg(test)]
@@ -374,18 +397,30 @@ mod tests {
                 bytes(),
                 any::<u64>(),
                 ".{0,40}",
-                prop::option::of(any::<u64>())
+                prop::option::of(any::<u64>()),
+                prop::option::of(".{0,40}")
             )
-                .prop_map(|(peer_id, identity_pk, key_package, user, name, avatar)| {
-                    SignalMessage::PeerJoined {
-                        peer_id,
-                        identity_pk,
-                        key_package,
-                        user,
-                        name,
-                        avatar,
+                .prop_map(
+                    |(peer_id, identity_pk, key_package, user, name, avatar, device)| {
+                        SignalMessage::PeerJoined {
+                            peer_id,
+                            identity_pk,
+                            key_package,
+                            user,
+                            name,
+                            avatar,
+                            device,
+                        }
                     }
-                }),
+                ),
+            prop::collection::vec(("[A-Z2-9]{6}", ".{0,40}"), 0..4).prop_map(|rooms| {
+                SignalMessage::OwnRooms {
+                    rooms: rooms
+                        .into_iter()
+                        .map(|(code, device)| OwnRoom { code, device })
+                        .collect(),
+                }
+            }),
             (any::<u64>(), "[A-Z2-9]{6}")
                 .prop_map(|(to_user, code)| SignalMessage::Invite { to_user, code }),
             (any::<u64>(), ".{0,40}", "[A-Z2-9]{6}").prop_map(|(from_user, from_name, code)| {

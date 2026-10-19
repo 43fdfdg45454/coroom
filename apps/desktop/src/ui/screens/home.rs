@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use coroom_transport::proto::api::{Friend, Friends};
-use coroom_transport::proto::signal::{Activity, ROOM_CODE_LEN, is_valid_room_code};
+use coroom_transport::proto::signal::{Activity, OwnRoom, ROOM_CODE_LEN, is_valid_room_code};
 use coroom_ui::Element;
 use coroom_ui::animate::{Collapse, Shift};
 use coroom_ui::font::MONO;
@@ -691,7 +691,8 @@ fn tray<'a>(app: &'a App) -> Element<'a, Message> {
         .map(|friends| friends.incoming.as_slice())
         .unwrap_or_default();
     let notices = notices(app);
-    let count = invitations.len() + requests.len() + notices.len();
+    let own = own_rooms(app);
+    let count = own.len() + invitations.len() + requests.len() + notices.len();
     let summary = match count {
         0 => t!("home-tray-empty").to_owned(),
         _ => t!("home-tray-detail").to_owned(),
@@ -704,6 +705,9 @@ fn tray<'a>(app: &'a App) -> Element<'a, Message> {
     .spacing(space::XS)
     .align_y(Alignment::Center);
     let mut entries: Vec<Element<'a, Message>> = Vec::new();
+    for room in own {
+        entries.push(tray_entry(app, own_room_card(app, room), 1.0, 0.0));
+    }
     for invitation in invitations {
         let since = received_at(app, invitation);
         entries.push(tray_entry(
@@ -844,6 +848,42 @@ fn invitation_card<'a>(
     .padding(Padding::from([12.0, 16.0]))
     .width(Length::Fill)
     .class(ContainerClass::CardAccent)
+    .into()
+}
+
+/// Las salas de la cuenta abiertas en sus otros dispositivos (sin la que comparte este).
+pub(crate) fn own_rooms(app: &App) -> Vec<&OwnRoom> {
+    let hosted = room_code(app);
+    app.own_rooms
+        .iter()
+        .filter(|room| Some(room.code.as_str()) != hosted)
+        .collect()
+}
+
+/// La sala que la cuenta tiene abierta en otro dispositivo: se entra con un toque, sin código ni
+/// invitación. Se queda mientras siga abierta.
+fn own_room_card<'a>(app: &'a App, room: &'a OwnRoom) -> Element<'a, Message> {
+    let hosting = app.host.is_open() || app.guest.is_some();
+    let blocked = server_down(app) || hosting;
+    let enter = ui::button_with(
+        Kind::Primary,
+        t!("home-enter"),
+        Some(Icon::LogIn),
+        (!blocked).then(|| on(Msg::Accept(room.code.clone()))),
+    );
+    let enter = if hosting {
+        ui::with_tooltip(enter, t!("home-hosting-reason"))
+    } else {
+        enter.into()
+    };
+    container(ui::list_row(
+        Some(icon_with(Icon::Monitor, size::AVATAR, SvgClass::Accent)),
+        t!("home-own-room-title", device = room.device.as_str()),
+        Some(t!("home-own-room-detail", code = room.code.as_str())),
+        vec![enter],
+    ))
+    .width(Length::Fill)
+    .class(ContainerClass::Card)
     .into()
 }
 
@@ -1068,6 +1108,36 @@ mod tests {
     use super::*;
     use crate::ui::app::tests::app;
     use crate::ui::screens::host::SourceChoice;
+
+    /// La sala abierta con la misma cuenta en otro dispositivo sale en la bandeja y se entra con
+    /// un toque; la que comparte este equipo no sale.
+    #[test]
+    fn the_own_room_on_another_device_is_one_tap_away() {
+        let mut app = app();
+        app.update(Message::Event(Event::OwnRooms(vec![
+            OwnRoom {
+                code: "K7Q2MZ".into(),
+                device: "Equipo de ejemplo".into(),
+            },
+            OwnRoom {
+                code: "ABCDEF".into(),
+                device: "Portátil".into(),
+            },
+        ])));
+        let codes: Vec<&str> = own_rooms(&app)
+            .iter()
+            .map(|room| room.code.as_str())
+            .collect();
+        assert_eq!(codes, ["K7Q2MZ", "ABCDEF"]);
+        let effects = app.update(Message::Home(Msg::Accept("K7Q2MZ".into())));
+        assert!(
+            effects.contains(&Effect::Join("K7Q2MZ".into())),
+            "{effects:?}"
+        );
+
+        app.update(Message::Event(Event::OwnRooms(Vec::new())));
+        assert!(own_rooms(&app).is_empty(), "cerrada en el otro, desaparece");
+    }
 
     fn friend(id: u64, name: &str, online: bool) -> Friend {
         Friend {

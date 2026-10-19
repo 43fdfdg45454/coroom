@@ -51,5 +51,16 @@
             android:windowSoftInputMode="adjustNothing|stateHidden"
             android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|screenLayout|smallestScreenSize|uiMode|density|touchscreen"
             tools:ignore="DiscouragedApi,LockedOrientationActivity" />
+
+        <!-- «Compartir registro» (Ajustes): solo los ficheros de files/logs, de lectura y para la app elegida. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.logs"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/log_paths" />
+        </provider>
     </application>
 </manifest>

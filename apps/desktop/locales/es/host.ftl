@@ -198,6 +198,7 @@ host-compartir-pantalla-o-ventana = Compartir pantalla o ventana
 host-solo-voz-y-chat = Solo voz y chat
 host-dejar-de-compartir = Dejar de compartir
 host-pasarle-la-sala = Pasarle la sala
+host-no-puede-hospedar = Su dispositivo no puede abrir salas (el de Android solo entra): pásasela a alguien que use la aplicación de escritorio.
 host-esperando-a-que-acepte = Esperando a que { $name } acepte la sala…
 host-pasando-la-sala-a = Pasando la sala a { $name }: todos entráis en la suya.
 host-name-no-acepto-la-sala = { $name } no aceptó la sala.

@@ -85,12 +85,15 @@ En **Transmisión**, debajo del código, cambias sin cerrar la sala (los invitad
 En el menú **Más** de un invitado, **Pasarle la sala**: si acepta, abre una sala nueva (solo voz;
 desde ella comparte lo suyo) y todos, tú incluido, entráis en ella solos, sin escribir el código
 (quien tenía el micrófono silenciado sigue así). Mientras no contesta, la sala lo dice y puedes
-**Retirar la oferta**.
+**Retirar la oferta**. A quien entra desde Android no se le puede pasar: el teléfono solo entra en
+salas, y el botón lo explica.
 
 ## Unirte a una sala
 
 1. En **Inicio**, escribe el código en **Unirme a una sala** y pulsa **Entrar**, o acepta una
-   invitación de un amigo.
+   invitación de un amigo. Si tienes una sala abierta con tu cuenta en otro dispositivo, Inicio la
+   ofrece como **Tu sala en …**: entras con **Entrar**, sin código. Puedes estar en una sala
+   desde varios dispositivos a la vez; el anfitrión ve el nombre del dispositivo junto al tuyo.
 2. coroom te enseña los pasos: señalización, claves de la sala, conexión con el anfitrión (directa
    entre los dos equipos o por el relay del servidor) y, antes del vídeo, la **calidad esperada**
    según el RTT medido. Pulsa **Ver ya** o espera.
@@ -216,4 +219,5 @@ La aplicación guarda un **registro** de cada ejecución en `logs/coroom.log`, d
 directorio de datos (`%APPDATA%\coroom\logs` en Windows, `~/.local/share/coroom/logs` en Linux, o
 el de `COROOM_DATA_DIR`); la ejecución anterior queda en `coroom.1.log`. `coroom doctor` dice la
 ruta exacta. Si algo falla (una sala que no abre, el vídeo que se corta), cierra coroom y manda
-esos dos ficheros junto con el diagnóstico.
+esos dos ficheros junto con el diagnóstico. En Android, **Ajustes → Compartir registro** (o el
+botón del panel de conexión de la sala) los manda con la aplicación que elijas.

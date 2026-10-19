@@ -42,6 +42,11 @@ home-invite-title = { $name } te invita a su sala
 home-invite-detail = Sala { $code } · caduca en
 home-ignore = Ignorar
 
+## Salas propias en otros dispositivos
+
+home-own-room-title = Tu sala en { $device }
+home-own-room-detail = Sala { $code } · abierta con tu cuenta en otro dispositivo
+
 ## Amigos
 
 home-online-none = Nadie conectado

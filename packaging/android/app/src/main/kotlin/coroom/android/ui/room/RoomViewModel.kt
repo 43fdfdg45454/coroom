@@ -97,17 +97,41 @@ data class RoomUiState(
     val network: NetworkKind = NetworkKind.Unknown,
     val permissions: InputPermissions? = null,
     val confirmLeave: Boolean = false,
+    /**
+     * Si la barra de la sala (la lateral, los chips y la píldora entera) está a la vista: se
+     * esconde sola a los [OVERLAY_HIDE_MS] sin tocarla, como la del escritorio a pantalla completa.
+     */
+    val overlayShown: Boolean = true,
 ) {
     /** La latencia de la píldora: la de `stats` si hay, si no la de `quality`. */
     val shownRttMs: Double? get() = stats?.rttMs ?: rttMs
 
     val shownRelayed: Boolean? get() = stats?.relayed ?: relayed
+
+    /**
+     * Lo que no deja esconder la barra: un panel (el chat) o el diálogo de salir abiertos, el
+     * teclado en pantalla en uso o una reconexión en curso.
+     */
+    val overlayPinned: Boolean
+        get() = panel != Panel.None || confirmLeave || keyboardVisible || reconnecting != null
+
+    /** La barra se dibuja entera (si no, solo la píldora reducida a punto y latencia). */
+    val overlayVisible: Boolean get() = overlayShown || overlayPinned
 }
+
+/**
+ * Lo que tarda en esconderse la barra de la sala sin tocarla: el mismo tiempo que la del vídeo en
+ * el escritorio (`coroom_ui::tokens::motion::BAR_HIDE`).
+ */
+const val OVERLAY_HIDE_MS = 2_500L
 
 /** Lo que la actividad tiene que hacer por la sala. */
 sealed interface RoomCommand {
     data object Finish : RoomCommand
     data object RequestMic : RoomCommand
+
+    /** Abrir la hoja de compartir con estos ficheros del registro. */
+    data class ShareLog(val paths: List<String>) : RoomCommand
 }
 
 class RoomViewModel(
@@ -128,6 +152,7 @@ class RoomViewModel(
     private var left = false
     private var micAllowed = false
     private var statsJob: Job? = null
+    private var overlayJob: Job? = null
 
     init {
         repository.setInRoom(true)
@@ -209,13 +234,19 @@ class RoomViewModel(
                     )
                 }
                 startStats()
+                // Al entrar se ve la barra (y luego se esconde sola), como al empezar el vídeo en el escritorio.
+                revealOverlay()
             }
             is CoroomEvent.Connected -> _state.update { it.copy(relayed = event.relayed) }
             is CoroomEvent.Quality -> _state.update {
                 it.copy(quality = LinkQuality.parse(event.level) ?: it.quality, rttMs = event.rttMs)
             }
             is CoroomEvent.Reconnecting -> _state.update { it.copy(reconnecting = event) }
-            is CoroomEvent.Reconnected -> _state.update { it.copy(reconnecting = null, relayed = event.relayed) }
+            is CoroomEvent.Reconnected -> {
+                _state.update { it.copy(reconnecting = null, relayed = event.relayed) }
+                // Que se vea un momento que volvió la conexión antes de esconderse.
+                revealOverlay()
+            }
             is CoroomEvent.VideoCodec -> _state.update { it.copy(codec = event.codec, codecDetail = event.detail) }
             is CoroomEvent.Members -> _state.update { state ->
                 val host = event.members.firstOrNull { it.guest == 0 }?.name
@@ -307,7 +338,23 @@ class RoomViewModel(
 
     // --- Barra de la sala ----------------------------------------------------------------
 
+    /**
+     * Enseña la barra de la sala y vuelve a contar [OVERLAY_HIDE_MS] para esconderla: al entrar,
+     * con cada acción de la barra y al tocar la píldora reducida. Lo que se manda al juego (tacto,
+     * ratón, teclado y mandos) no la enseña. Mientras [RoomUiState.overlayPinned] se sigue viendo
+     * aunque haya pasado el tiempo.
+     */
+    fun revealOverlay() {
+        _state.update { it.copy(overlayShown = true) }
+        overlayJob?.cancel()
+        overlayJob = viewModelScope.launch {
+            delay(OVERLAY_HIDE_MS)
+            _state.update { it.copy(overlayShown = false) }
+        }
+    }
+
     fun toggleMic() {
+        revealOverlay()
         val state = _state.value
         if (state.micMuted && !micAllowed) {
             _commands.trySend(RoomCommand.RequestMic)
@@ -340,6 +387,7 @@ class RoomViewModel(
     }
 
     fun cycleTouchMode() {
+        revealOverlay()
         val next = if (_state.value.touchMode == TouchMode.Trackpad) TouchMode.Direct else TouchMode.Trackpad
         _state.update { it.copy(touchMode = next) }
         viewModelScope.launch { container.settings.setTouchMode(next) }
@@ -347,16 +395,21 @@ class RoomViewModel(
 
     fun setKeyboardVisible(visible: Boolean) {
         _state.update { it.copy(keyboardVisible = visible) }
+        revealOverlay()
     }
 
     fun togglePanel(panel: Panel) {
+        revealOverlay()
         _state.update {
             val next = if (it.panel == panel) Panel.None else panel
             it.copy(panel = next, unreadChat = if (next == Panel.Chat) false else it.unreadChat)
         }
     }
 
-    fun closePanel() = _state.update { it.copy(panel = Panel.None) }
+    fun closePanel() {
+        _state.update { it.copy(panel = Panel.None) }
+        revealOverlay()
+    }
 
     fun sendChat(text: String) {
         val clean = text.trim()
@@ -371,7 +424,27 @@ class RoomViewModel(
         }
     }
 
-    fun askLeave(ask: Boolean) = _state.update { it.copy(confirmLeave = ask) }
+    /** «Compartir registro» del panel de conexión: la actividad abre la hoja de compartir. */
+    fun shareLog() {
+        viewModelScope.launch {
+            try {
+                val files = repository.logFiles()
+                if (files.isEmpty()) showNotice(UiText.res(R.string.log_share_empty)) else _commands.send(RoomCommand.ShareLog(files))
+            } catch (error: BridgeException) {
+                showNotice(UiText.Raw(error.message.orEmpty()))
+            }
+        }
+    }
+
+    /** No se pudo abrir la hoja de compartir: sin ficheros o sin ninguna app que los reciba. */
+    fun logShareFailed(empty: Boolean) {
+        showNotice(UiText.res(if (empty) R.string.log_share_empty else R.string.log_share_failed))
+    }
+
+    fun askLeave(ask: Boolean) {
+        _state.update { it.copy(confirmLeave = ask) }
+        revealOverlay()
+    }
 
     fun leave() {
         left = true

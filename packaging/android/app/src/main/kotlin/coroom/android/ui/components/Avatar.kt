@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.produceState
 import androidx.compose.ui.Alignment
@@ -62,7 +63,11 @@ fun Avatar(
     val image = if (user != null && avatar != null && !LocalInspectionMode.current) {
         val sidePx = with(LocalDensity.current) { size.roundToPx() }.coerceAtLeast(1)
         val repository = LocalContext.current.container.repository
-        val loaded by produceState(AvatarImages.cached(user, avatar, sidePx), user, avatar, sidePx) {
+        // Si no llegó por la red (sin servidor justo al arrancar, por ejemplo), se vuelve a pedir
+        // cuando el repositorio dice que hay servidor otra vez; el propio, que está siempre a la
+        // vista en Inicio, si no, se quedaba en la inicial.
+        val retry by repository.avatarRetry.collectAsState()
+        val loaded by produceState(AvatarImages.cached(user, avatar, sidePx), user, avatar, sidePx, retry) {
             if (value == null) value = AvatarImages.load(repository, user, avatar, sidePx)
         }
         loaded

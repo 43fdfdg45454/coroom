@@ -41,6 +41,7 @@ import coroom.android.bridge.Account
 import coroom.android.bridge.Friend
 import coroom.android.bridge.FriendActivity
 import coroom.android.bridge.Invitation
+import coroom.android.bridge.OwnRoom
 import coroom.android.bridge.RoomCode
 import coroom.android.platform.Gamepad
 import coroom.android.ui.components.Avatar
@@ -117,6 +118,7 @@ fun HomeScreen(
                 onCode = { code = RoomCode.clean(it) },
                 onJoin = { onJoin(code, null) },
             )
+            if (state.ownRooms.isNotEmpty()) OwnRooms(state.ownRooms, account, onJoin)
             Invitations(state.invitations, state.friends.list?.friends.orEmpty(), state.nowMs, onJoin)
             OnlineFriends(state, onAskToJoin, onOpenFriends)
             state.pads.firstOrNull()?.let { PadHint(it) }
@@ -193,6 +195,44 @@ private fun JoinCard(code: String, onCode: (String) -> Unit, onJoin: () -> Unit)
                 enabled = valid,
                 height = 56.dp,
             )
+        }
+    }
+}
+
+/** Las salas abiertas con la propia cuenta en otro dispositivo: se entra con un toque. */
+@Composable
+private fun OwnRooms(rooms: List<OwnRoom>, account: Account, onJoin: (code: String, hostName: String?) -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        rooms.forEach { room ->
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(colors.surfaceContainer)
+                    .padding(start = 14.dp, end = 12.dp, top = 12.dp, bottom = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                CoroomIcon(R.drawable.ic_monitor, contentDescription = null, tint = colors.primary, size = 28.dp)
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = stringResource(R.string.home_own_room_title, room.device),
+                        style = CoroomText.itemTitle,
+                        color = colors.onSurface,
+                    )
+                    Text(
+                        text = stringResource(R.string.home_own_room_detail, room.code),
+                        style = CoroomText.supporting,
+                        color = colors.onSurfaceVariant,
+                    )
+                }
+                PillButton(
+                    text = stringResource(R.string.action_join),
+                    onClick = { onJoin(room.code, account.shownName) },
+                    height = 44.dp,
+                )
+            }
         }
     }
 }

@@ -130,6 +130,8 @@ pub struct GuestCapabilities {
     pub yuv444: Vec<Codec>,
     /// Códecs que acepta en HDR10.
     pub hdr10: Vec<Codec>,
+    /// Si puede quedarse de anfitrión (pasarle la sala); el invitado de Android no.
+    pub can_host: bool,
 }
 
 impl GuestCapabilities {
@@ -146,6 +148,7 @@ impl GuestCapabilities {
             max_fps,
             yuv444: Vec::new(),
             hdr10: Vec::new(),
+            can_host: true,
         }
     }
 
@@ -184,9 +187,13 @@ impl GuestCapabilities {
     }
 
     /// Lo que se supone de un invitado que no anuncia nada en [`super::CAPABILITIES_TIMEOUT`]:
-    /// H.264 por software, que decodifica cualquiera.
+    /// H.264 por software, que decodifica cualquiera (y no se le pasa la sala: no se sabe si
+    /// puede).
     pub fn h264_fallback() -> Self {
-        Self::new(vec![(Codec::H264, DecoderBackend::Software)])
+        Self {
+            can_host: false,
+            ..Self::new(vec![(Codec::H264, DecoderBackend::Software)])
+        }
     }
 
     /// Mensaje de control.
@@ -202,6 +209,7 @@ impl GuestCapabilities {
             max_fps: self.max_fps,
             yuv444: self.yuv444.iter().copied().map(codec_to_wire).collect(),
             hdr10: self.hdr10.iter().copied().map(codec_to_wire).collect(),
+            can_host: self.can_host,
         })
     }
 
@@ -218,6 +226,7 @@ impl GuestCapabilities {
             max_fps: caps.max_fps,
             yuv444: caps.yuv444.iter().copied().map(codec_from_wire).collect(),
             hdr10: caps.hdr10.iter().copied().map(codec_from_wire).collect(),
+            can_host: caps.can_host,
         }
     }
 }
@@ -490,6 +499,7 @@ mod tests {
             (Codec::H264, SW),
         ]);
         caps.hdr10 = vec![Codec::Av1];
+        caps.can_host = false;
         let ControlMessage::Capabilities(wire) = caps.to_message() else {
             panic!("se esperaba Capabilities");
         };

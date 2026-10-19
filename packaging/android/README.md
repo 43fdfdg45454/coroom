@@ -111,6 +111,12 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 adb logcat -s coroom            # el registro de la parte en Rust
 ```
 
+El mismo registro, con la hora de cada línea y el nivel `info` de coroom (`warn,coroom=info`), se
+guarda en el directorio privado de la aplicación (`files/logs/coroom.log`; la ejecución anterior en
+`coroom.1.log`, y rota a los 10 MB). Sin cable: Ajustes → Ayuda → «Compartir registro» (o el botón
+del panel «Conexión y calidad» de la sala) manda los dos ficheros por la hoja de compartir del
+sistema.
+
 La primera vez se pone la dirección del servidor (por ejemplo `https://coroom.example.com:4433`).
 Si el certificado es de una CA propia, se puede instalar en el teléfono (Ajustes → Seguridad →
 Cifrado y credenciales → Instalar certificado → Certificado de CA) o aceptar la huella SHA-256 que

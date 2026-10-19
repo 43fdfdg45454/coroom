@@ -31,6 +31,7 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import coroom.android.Native
 import coroom.android.container
+import coroom.android.platform.LogShare
 import coroom.android.ui.theme.CoroomTheme
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -102,6 +103,8 @@ class RoomActivity : ComponentActivity() {
                         onLeave = room::leave,
                         onSendChat = room::sendChat,
                         onClearNotice = room::clearNotice,
+                        onRevealOverlay = room::revealOverlay,
+                        onShareLog = room::shareLog,
                     ),
                     onCancelJoin = room::leave,
                     onRetry = room::retry,
@@ -119,6 +122,7 @@ class RoomActivity : ComponentActivity() {
                             micForJoin = false
                             micPermission.launch(Manifest.permission.RECORD_AUDIO)
                         }
+                        is RoomCommand.ShareLog -> shareLog(command.paths)
                     }
                 }
             }
@@ -144,6 +148,13 @@ class RoomActivity : ComponentActivity() {
     private suspend fun startJoin(mic: Boolean) {
         val joinMuted = container.settings.settings.first().joinMuted
         room.start(mic = mic, joinMuted = joinMuted)
+    }
+
+    /** La hoja de compartir con el registro (la sala sigue abierta detrás). */
+    private fun shareLog(paths: List<String>) {
+        val chooser = LogShare.chooser(this, paths)
+        val shown = chooser != null && runCatching { startActivity(chooser) }.isSuccess
+        if (!shown) room.logShareFailed(empty = chooser == null)
     }
 
     private fun hasMicPermission(): Boolean =

@@ -325,7 +325,15 @@ impl App {
             }
             "avatar" => {
                 let request: Avatar = args(text)?;
-                let path = self.avatar(&request)?;
+                // Al registro: un avatar que no llega se vuelve a pedir, pero así se sabe por qué.
+                let path = self.avatar(&request).inspect_err(|error| {
+                    tracing::warn!(
+                        user = request.user,
+                        version = request.version,
+                        %error,
+                        "no se pudo traer el avatar"
+                    );
+                })?;
                 Ok(path.map_or(Value::Null, |path| {
                     Value::from(path.to_string_lossy().into_owned())
                 }))
@@ -431,6 +439,13 @@ impl App {
                 Ok(Value::Null)
             }
             "stats" => Ok(self.guest().map_or(Value::Null, |guest| guest.stats())),
+            // Los registros para «Compartir registro» de Ajustes, el de esta ejecución primero.
+            "log_files" => Ok(Value::from(
+                crate::log::files(self.store.dir())
+                    .into_iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+            )),
             _ => Err(format!("operación desconocida: {method}")),
         }
     }
@@ -657,6 +672,23 @@ mod tests {
                 &format!(r#"{{"user": 7, "version": {version}}}"#)
             ),
             json!({ "ok": path.to_string_lossy() })
+        );
+    }
+
+    #[test]
+    fn log_files_lists_the_written_logs_newest_first() {
+        let (dir, app) = app();
+        assert_eq!(call(&app, "log_files", ""), json!({ "ok": [] }));
+        let logs = dir.path().join("logs");
+        std::fs::create_dir_all(&logs).expect("directorio");
+        std::fs::write(logs.join("coroom.log"), "ahora\n").expect("escribir");
+        std::fs::write(logs.join("coroom.1.log"), "antes\n").expect("escribir");
+        assert_eq!(
+            call(&app, "log_files", ""),
+            json!({ "ok": [
+                logs.join("coroom.log").to_string_lossy(),
+                logs.join("coroom.1.log").to_string_lossy(),
+            ] })
         );
     }
 

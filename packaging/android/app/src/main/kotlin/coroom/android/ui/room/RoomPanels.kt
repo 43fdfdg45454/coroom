@@ -22,6 +22,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -55,9 +56,9 @@ private val Spanish: Locale = Locale.forLanguageTag("es")
 /** Números con coma decimal, como en los bocetos («21,4 Mbit/s»). */
 fun formatNumber(value: Double, decimals: Int): String = String.format(Spanish, "%.${decimals}f", value)
 
-/** Panel «Conexión y calidad». */
+/** Panel «Conexión y calidad». `onShareLog`: «Compartir registro», para mandar lo que pasó si algo va mal. */
 @Composable
-fun ConnectionPanel(state: RoomUiState, onClose: () -> Unit) {
+fun ConnectionPanel(state: RoomUiState, onClose: () -> Unit, onShareLog: () -> Unit) {
     val colors = MaterialTheme.colorScheme
     val stats = state.stats
     val none = stringResource(R.string.no_value)
@@ -128,11 +129,15 @@ fun ConnectionPanel(state: RoomUiState, onClose: () -> Unit) {
                     Text(it, style = CoroomText.mono, color = colors.onSurface)
                 }
             }
-            Text(
-                text = stringResource(R.string.connection_footer),
-                style = CoroomText.label,
-                color = colors.onSurfaceVariant,
-            )
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = stringResource(R.string.connection_footer),
+                    style = CoroomText.label,
+                    color = colors.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = onShareLog) { Text(stringResource(R.string.settings_log)) }
+            }
         }
     }
 }

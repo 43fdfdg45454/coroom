@@ -28,8 +28,8 @@ use coroom_transport::proto::PROTOCOL_VERSION;
 use coroom_transport::proto::codec::{self, FrameBuffer};
 use coroom_transport::proto::control::Role;
 use coroom_transport::proto::signal::{
-    Activity, ErrorCode, HOST_PEER_ID, PeerId, ROOM_CODE_ALPHABET, ROOM_CODE_LEN, SignalMessage,
-    UserId, is_valid_room_code,
+    Activity, ErrorCode, HOST_PEER_ID, OwnRoom, PeerId, ROOM_CODE_ALPHABET, ROOM_CODE_LEN,
+    SignalMessage, UserId, is_valid_room_code,
 };
 
 use crate::auth::{constant_time_eq, token_hash};
@@ -101,6 +101,8 @@ struct Account {
     avatar: Option<u64>,
     /// Clave del dispositivo autenticado (`None` en modo desarrollo: no se comprueba).
     device_pk: Option<[u8; 32]>,
+    /// Nombre del dispositivo (el de su alta; en modo desarrollo, [`DEV_NAME`]).
+    device: String,
 }
 
 impl Account {
@@ -195,11 +197,37 @@ impl HubInner {
         activity
     }
 
-    /// La sala que `user` tiene abierta como anfitrión.
+    /// La sala que `user` tiene abierta como anfitrión; si la abrió desde varios dispositivos, la
+    /// más nueva (la última que abrió), para que pedir entrar vaya siempre a la misma.
     fn hosted_room(&self, user: i64) -> Option<&Room> {
         self.rooms
-            .values()
-            .find(|room| room.host.account.user == Some(user))
+            .iter()
+            .filter(|(_, room)| room.host.account.user == Some(user))
+            .max_by_key(|(id, _)| **id)
+            .map(|(_, room)| room)
+    }
+
+    /// Las salas que `user` tiene abiertas, de la más antigua a la más nueva, sin la que hospeda
+    /// `session` ([`SignalMessage::OwnRooms`]).
+    fn own_rooms(&self, user: i64, session: SessionId) -> Vec<OwnRoom> {
+        let mut rooms: Vec<(u64, OwnRoom)> = self
+            .rooms
+            .iter()
+            .filter(|(_, room)| {
+                room.host.account.user == Some(user) && room.host.session != session
+            })
+            .map(|(id, room)| {
+                (
+                    *id,
+                    OwnRoom {
+                        code: room.code.clone(),
+                        device: room.host.account.device.clone(),
+                    },
+                )
+            })
+            .collect();
+        rooms.sort_unstable_by_key(|(id, _)| *id);
+        rooms.into_iter().map(|(_, room)| room).collect()
     }
 
     /// Fallos recientes de `key`, olvidando los de fuera de la ventana.
@@ -260,6 +288,11 @@ fn error(code: ErrorCode, message: impl Into<String>) -> SignalMessage {
         code,
         message: message.into(),
     }
+}
+
+/// Un rechazo con su código (lo que se envía es [`error`]).
+fn rejected(code: ErrorCode, message: impl Into<String>) -> (ErrorCode, String) {
+    (code, message.into())
 }
 
 fn poisoned() -> (ErrorCode, String) {
@@ -607,6 +640,20 @@ impl Hub {
         sessions.len()
     }
 
+    /// Dice a cada sesión de `user` qué salas tiene abiertas la cuenta en sus otros dispositivos
+    /// (al abrir o cerrar una).
+    fn deliver_own_rooms(inner: &mut HubInner, user: i64) {
+        let sessions: Vec<SessionId> = inner
+            .online
+            .get(&user)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default();
+        for session in sessions {
+            let rooms = inner.own_rooms(user, session);
+            Self::deliver(inner, session, SignalMessage::OwnRooms { rooms });
+        }
+    }
+
     /// Avisa a los amigos conectados de que `user` entra o sale.
     ///
     /// Quien llama decide `online` bajo el cerrojo, pero avisa después de esperar a la base de
@@ -818,6 +865,9 @@ impl Hub {
         if let Some(entry) = inner.sessions.get_mut(&session) {
             entry.member = Some((room_id, HOST_PEER_ID));
         }
+        if let Some(user) = host_user {
+            Self::deliver_own_rooms(&mut inner, user);
+        }
         drop(inner);
         info!(room = room_id, relay = ?relay, "sala creada");
         let relay_message = self.relay_message(
@@ -898,6 +948,14 @@ impl Hub {
         let user = account.user_id();
         let name = account.name.clone();
         let avatar = account.avatar;
+        // La misma cuenta desde otro dispositivo: el anfitrión distingue las filas por él.
+        let repeated = account.user.is_some()
+            && (room.host.account.user == account.user
+                || room
+                    .guests
+                    .values()
+                    .any(|member| member.account.user == account.user));
+        let device = repeated.then(|| account.device.clone());
         room.guests.insert(
             peer_id,
             Member {
@@ -926,6 +984,7 @@ impl Hub {
                 user,
                 name,
                 avatar,
+                device,
             },
         );
         drop(inner);
@@ -1161,6 +1220,9 @@ impl Hub {
                 return left;
             };
             inner.codes.remove(&room.code);
+            if let Some(user) = room.host.account.user {
+                Self::deliver_own_rooms(&mut inner, user);
+            }
             for member in room.guests.values() {
                 left.changed.extend(member.account.user);
                 Self::deliver(
@@ -1241,20 +1303,23 @@ impl Hub {
     }
 
     /// Comprueba el `Auth` y devuelve la cuenta, o el error que hay que enviar.
-    async fn authenticate(&self, message: Option<SignalMessage>) -> Result<Account, SignalMessage> {
+    async fn authenticate(
+        &self,
+        message: Option<SignalMessage>,
+    ) -> Result<Account, (ErrorCode, String)> {
         let Some(SignalMessage::Auth {
             protocol_version,
             token,
             device_pk,
         }) = message
         else {
-            return Err(error(
+            return Err(rejected(
                 ErrorCode::Unauthorized,
                 "el primer mensaje debe ser Auth con el token de sesión",
             ));
         };
         if protocol_version != PROTOCOL_VERSION {
-            return Err(error(
+            return Err(rejected(
                 ErrorCode::ProtocolVersion,
                 format!(
                     "el servidor habla la versión {PROTOCOL_VERSION} del protocolo y el cliente \
@@ -1270,10 +1335,11 @@ impl Hub {
                 name: DEV_NAME.to_owned(),
                 avatar: None,
                 device_pk: None,
+                device: DEV_NAME.to_owned(),
             });
         }
         let Some(db) = &self.db else {
-            return Err(error(
+            return Err(rejected(
                 ErrorCode::Unauthorized,
                 "token de desarrollo no válido (COROOM_DEV_TOKEN)",
             ));
@@ -1281,7 +1347,7 @@ impl Hub {
         let session = match db.session(&token_hash(&token)).await {
             Ok(Some(session)) => session,
             Ok(None) => {
-                return Err(error(
+                return Err(rejected(
                     ErrorCode::Unauthorized,
                     "la sesión no es válida o ha caducado: vuelve a iniciar sesión con \
                      `coroom login`",
@@ -1289,11 +1355,11 @@ impl Hub {
             }
             Err(err) => {
                 warn!(error = %err, "no se pudo leer la sesión");
-                return Err(error(ErrorCode::Internal, "error de la base de datos"));
+                return Err(rejected(ErrorCode::Internal, "error de la base de datos"));
             }
         };
         if session.user.disabled {
-            return Err(error(
+            return Err(rejected(
                 ErrorCode::Unauthorized,
                 "tu cuenta está deshabilitada; habla con el administrador del servidor",
             ));
@@ -1306,14 +1372,15 @@ impl Hub {
                     name: session.user.display_name,
                     avatar: session.user.avatar,
                     device_pk: Some(device_pk),
+                    device: device.name.clone(),
                 })
             }
-            Some(_) => Err(error(
+            Some(_) => Err(rejected(
                 ErrorCode::Unauthorized,
                 "este dispositivo no es el vinculado al token: inicia sesión desde él con \
                  `coroom login`",
             )),
-            None => Err(error(
+            None => Err(rejected(
                 ErrorCode::Unauthorized,
                 "el token de la interfaz web no abre la señalización: inicia sesión con \
                  `coroom login`",
@@ -1348,9 +1415,9 @@ impl Hub {
             .flatten();
         let account = match self.authenticate(auth).await {
             Ok(account) => account,
-            Err(rejection) => {
+            Err((code, message)) => {
                 debug!(%remote, "señalización rechazada");
-                let _ = tx.send(rejection).await;
+                let _ = tx.send(error(code, message)).await;
                 drop(tx);
                 let _ = writer_task.await;
                 return;
@@ -1380,6 +1447,13 @@ impl Hub {
                     }
                 }
             }
+            let rooms = self
+                .inner
+                .lock()
+                .map(|inner| inner.own_rooms(user, session))
+                .unwrap_or_default();
+            // También vacía: lo que el cliente recordase de antes de reconectar ya no vale.
+            let _ = tx.send(SignalMessage::OwnRooms { rooms }).await;
         }
         debug!(%remote, session, ?user, "sesión de señalización abierta");
 
@@ -1460,6 +1534,7 @@ mod tests {
             name: DEV_NAME.to_owned(),
             avatar: None,
             device_pk: None,
+            device: "Equipo de ejemplo".to_owned(),
         };
         assert_eq!(dev.user_id(), 0);
         assert!(Hub::check_identity(&dev, &[1; 32]).is_ok());
@@ -1468,6 +1543,7 @@ mod tests {
             name: "Ana".to_owned(),
             avatar: None,
             device_pk: Some([2; 32]),
+            device: "Equipo de ejemplo".to_owned(),
         };
         assert_eq!(real.user_id(), 7);
         assert!(Hub::check_identity(&real, &[2; 32]).is_ok());
@@ -1482,8 +1558,111 @@ mod tests {
             name: "Ana".to_owned(),
             avatar: None,
             device_pk: None,
+            device: "Equipo de ejemplo".to_owned(),
         };
         hub.register(tx, close, account).expect("sesión").0
+    }
+
+    /// Como [`session`], con el dispositivo y lo que le llega.
+    fn session_on(
+        hub: &Hub,
+        user: i64,
+        device: &str,
+    ) -> (SessionId, mpsc::Receiver<SignalMessage>) {
+        let (tx, rx) = mpsc::channel(SESSION_QUEUE);
+        let (close, _closed) = oneshot::channel();
+        let account = Account {
+            user: Some(user),
+            name: "Ana".to_owned(),
+            avatar: None,
+            device_pk: None,
+            device: device.to_owned(),
+        };
+        (hub.register(tx, close, account).expect("sesión").0, rx)
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<SignalMessage>) -> Vec<SignalMessage> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// La misma cuenta en dos dispositivos: el que no hospeda se entera de la sala del otro (y de
+    /// que se cerró), entra con la cuenta repetida y el anfitrión recibe su dispositivo; pedir
+    /// entrar va a la sala más nueva de la cuenta.
+    #[test]
+    fn the_same_account_sees_and_joins_its_rooms_on_other_devices() {
+        let hub = Hub::new(HubConfig::new(8), Relay::new());
+        let addr: SocketAddr = ([127, 0, 0, 1], 4433).into();
+        let (pc, mut pc_rx) = session_on(&hub, 1, "Equipo de ejemplo");
+        let (phone, mut phone_rx) = session_on(&hub, 1, "Teléfono de ejemplo");
+        let created = block_on(hub.create_room(pc, [1; 32], "sala", addr)).expect("sala creada");
+        let Some(SignalMessage::RoomCreated { code }) = created.first().cloned() else {
+            panic!("sin código: {created:?}");
+        };
+        let room = OwnRoom {
+            code: code.clone(),
+            device: "Equipo de ejemplo".to_owned(),
+        };
+        assert_eq!(
+            drain(&mut phone_rx),
+            [SignalMessage::OwnRooms {
+                rooms: vec![room.clone()]
+            }]
+        );
+        // La que hospeda no se la ofrece a sí misma.
+        assert_eq!(
+            drain(&mut pc_rx),
+            [SignalMessage::OwnRooms { rooms: Vec::new() }]
+        );
+
+        assert!(hub.join_room(phone, &code, [2; 32], vec![1], addr).is_ok());
+        let joined = drain(&mut pc_rx);
+        assert!(
+            matches!(
+                joined.as_slice(),
+                [SignalMessage::PeerJoined { device: Some(device), .. }]
+                    if device == "Teléfono de ejemplo"
+            ),
+            "{joined:?}"
+        );
+        // Otra cuenta entra sin dispositivo: no está repetida.
+        let (friend, _friend_rx) = session_on(&hub, 2, "Portátil de ejemplo");
+        assert!(hub.join_room(friend, &code, [3; 32], vec![1], addr).is_ok());
+        let joined = drain(&mut pc_rx);
+        assert!(
+            matches!(
+                joined.as_slice(),
+                [SignalMessage::PeerJoined { device: None, .. }]
+            ),
+            "{joined:?}"
+        );
+
+        // Una segunda sala de la cuenta: pedir entrar va a la más nueva.
+        let (laptop, _laptop_rx) = session_on(&hub, 1, "Portátil");
+        let newer = block_on(hub.create_room(laptop, [4; 32], "sala", addr)).expect("otra sala");
+        let Some(SignalMessage::RoomCreated { code: newer }) = newer.first().cloned() else {
+            panic!("sin código");
+        };
+        let hosted = hub
+            .inner
+            .lock()
+            .ok()
+            .and_then(|inner| inner.hosted_room(1).map(|room| room.code.clone()));
+        assert_eq!(hosted.as_deref(), Some(newer.as_str()));
+
+        // Se cierra la del equipo: a los demás dispositivos les queda solo la otra (el teléfono,
+        // que estaba dentro, se entera además del cierre).
+        drain(&mut phone_rx);
+        hub.leave(pc);
+        let after = drain(&mut phone_rx);
+        assert!(
+            after.contains(&SignalMessage::OwnRooms {
+                rooms: vec![OwnRoom {
+                    code: newer,
+                    device: "Portátil".to_owned(),
+                }]
+            }),
+            "{after:?}"
+        );
     }
 
     /// Hallazgo S-3: adivinar códigos de sala tiene un límite por cuenta que no se salta abriendo
@@ -1544,6 +1723,7 @@ mod tests {
             name: "Bea".to_owned(),
             avatar: None,
             device_pk: None,
+            device: "Equipo de ejemplo".to_owned(),
         };
         hub.register(tx, close, friend).expect("sesión del amigo");
         let lobby = session(&hub, Some(2));
@@ -1558,6 +1738,7 @@ mod tests {
                 name: "Ana".to_owned(),
                 avatar: None,
                 device_pk: None,
+                device: "Equipo de ejemplo".to_owned(),
             };
             hub.register(tx, close, account).expect("sesión de la sala")
         };

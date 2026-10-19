@@ -831,6 +831,8 @@ pub(crate) struct DecodeControl {
     wanted: Mutex<Option<(Codec, VideoFormat)>>,
     /// Lo que el invitado acepta además de 4:2:0 SDR: `(4:4:4, HDR10)`.
     pub(crate) accept: (bool, bool),
+    /// Si el invitado puede quedarse de anfitrión (se anuncia con lo que decodifica).
+    pub(crate) can_host: bool,
     /// Decodificadores que fallaron en esta sesión.
     excluded: Mutex<Vec<(Codec, DecoderBackend)>>,
     /// El invitado tiene que volver a anunciar sus capacidades ([`DecodeControl::usable`]).
@@ -860,6 +862,7 @@ impl DecodeControl {
             set,
             wanted: Mutex::new(None),
             accept: (false, false),
+            can_host: true,
             excluded: Mutex::new(Vec::new()),
             renegotiate: AtomicBool::new(false),
             opener: Box::new(|set, codec, format| set.open_format(codec, format)),
@@ -900,6 +903,12 @@ impl DecodeControl {
     /// Con lo que acepta el invitado: 4:4:4 y HDR10.
     pub(crate) fn accepting(mut self, yuv444: bool, hdr: bool) -> Self {
         self.accept = (yuv444, hdr);
+        self
+    }
+
+    /// Con si el invitado puede quedarse de anfitrión.
+    pub(crate) fn hosting(mut self, can_host: bool) -> Self {
+        self.can_host = can_host;
         self
     }
 

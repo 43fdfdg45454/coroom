@@ -17,8 +17,8 @@ use coroom_session::Session as _;
 use coroom_session::account::{self, AccountStorage, ServerOptions};
 use coroom_session::audio::AudioFormat;
 use coroom_session::capture::{CursorShape, CursorState};
-use coroom_session::codec::mediacodec::{AndroidDecoderInfo, SurfaceSlot};
-use coroom_session::codec::{DecoderSet, GpuImage};
+use coroom_session::codec::mediacodec::{AndroidChoice, AndroidDecoderInfo, SurfaceSlot};
+use coroom_session::codec::{Codec, DecoderSet, GpuImage};
 use coroom_session::input::android::{AndroidMotors, AndroidPads, PadAxes, evdev_from_android};
 use coroom_session::input::capture::Allowed;
 use coroom_session::input::gamepad::{IDLE_POLL, PadChoice, PadKey, PadLink};
@@ -26,7 +26,7 @@ use coroom_session::input::touch::{
     TouchAction, TouchConfig, TouchMapper, TouchMode, TouchPointer,
 };
 use coroom_session::input::{InputEvent, Rumble};
-use coroom_session::latency::LatencyLedger;
+use coroom_session::latency::{LatencyLedger, LatencySummary, LinkSummary};
 use coroom_session::loopback::{CursorSink, DecodedFrame, FrameSink, SinkError};
 use coroom_session::remote::{
     AudioControl, GuestAudio, GuestInput, RemoteConfig, RemoteSession, SessionEvent, TalkMode,
@@ -192,8 +192,69 @@ pub struct Guest {
     pads: Arc<Mutex<AndroidPads>>,
     cursor: Arc<CursorSlot>,
     relayed: AtomicBool,
+    /// Los componentes de MediaCodec por códec, para decir en el registro cuál decodifica.
+    decoders: Vec<AndroidChoice>,
     stop: Arc<AtomicBool>,
     poller: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+/// Los componentes de MediaCodec de cada códec que se anuncia, el preferido primero:
+/// `AV1: c2.ejemplo.av1.decoder · H.264: c2.ejemplo.avc.decoder, OMX.ejemplo.avc`.
+fn decoders_line(choices: &[AndroidChoice]) -> String {
+    if choices.is_empty() {
+        return "ninguno".to_owned();
+    }
+    choices
+        .iter()
+        .map(|choice| {
+            let names: Vec<&str> = choice
+                .components
+                .iter()
+                .map(|info| info.name.as_str())
+                .collect();
+            format!("{}: {}", choice.codec, names.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// El decodificador de `codec`: el componente preferido de MediaCodec y los de respaldo (la sesión
+/// abre el primero que admite el formato y arranca).
+fn decoder_line(choices: &[AndroidChoice], codec: Codec) -> String {
+    let Some(choice) = choices.iter().find(|choice| choice.codec == codec) else {
+        return format!("{codec}: ningún componente de MediaCodec");
+    };
+    let mut names = choice.components.iter().map(|info| info.name.as_str());
+    let first = names.next().unwrap_or("?");
+    let rest: Vec<&str> = names.collect();
+    if rest.is_empty() {
+        format!("{codec} con MediaCodec {first}")
+    } else {
+        format!(
+            "{codec} con MediaCodec {first} (respaldo: {})",
+            rest.join(", ")
+        )
+    }
+}
+
+/// Las cifras de `stats` para la píldora y el panel de conexión. Los fps y el bitrate son los del
+/// último momento (`*_recent`), como en el escritorio: los de la ventana larga del libro de
+/// latencias tardan decenas de segundos en reflejar un cambio.
+fn stats_json(
+    summary: &LatencySummary,
+    link: Option<&LinkSummary>,
+    relayed: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "rtt_ms": link.map(|link| link.rtt_ms),
+        "loss_percent": link.map(|link| link.loss_percent),
+        "target_kbps": link.map(|link| link.target_kbps),
+        "relayed": relayed,
+        "fps": summary.fps_recent,
+        "kbps": summary.bitrate_recent_kbps,
+        "latency_ms": summary.total.p50_us as f64 / 1000.0,
+        "latency_p95_ms": summary.total.p95_us as f64 / 1000.0,
+    })
 }
 
 /// Configuración de la sesión con la cuenta guardada.
@@ -207,11 +268,14 @@ fn remote_config(
         tcp_port: None,
     };
     let session = account::session(store, &options)?;
-    Ok(RemoteConfig::new(
+    let mut config = RemoteConfig::new(
         session.credentials.server.clone(),
         session.credentials.token.clone(),
         session.trust,
-    ))
+    );
+    // El teléfono solo entra: el anfitrión no le ofrece pasarle la sala.
+    config.can_host = false;
+    Ok(config)
 }
 
 /// Audio de la sala: el juego por AAudio y, si se pidió, el micrófono con el preset de voz.
@@ -259,8 +323,10 @@ impl Guest {
     ) -> Result<Arc<Guest>, String> {
         let config = remote_config(store, request.server.clone())?;
         let (identity, _) = store.load_identity()?;
-        let decoders =
-            DecoderSet::android(lock(&devices.decoders).clone(), devices.surface.clone());
+        let phone_decoders = lock(&devices.decoders).clone();
+        let choices = coroom_session::codec::mediacodec::info::choose(phone_decoders.clone());
+        tracing::info!("decodificadores por hardware: {}", decoders_line(&choices));
+        let decoders = DecoderSet::android(phone_decoders, devices.surface.clone());
         if decoders.is_empty() {
             return Err(
                 "este teléfono no decodifica por hardware ningún códec que use coroom".to_owned(),
@@ -316,6 +382,7 @@ impl Guest {
             pads: Arc::new(Mutex::new(pads)),
             cursor,
             relayed: AtomicBool::new(false),
+            decoders: choices,
             stop: Arc::new(AtomicBool::new(false)),
             poller: Mutex::new(None),
         });
@@ -338,6 +405,12 @@ impl Guest {
                 }
                 _ => tracing::info!(%event, "sesión"),
             }
+            if let SessionEvent::VideoCodec { codec, .. } = &event {
+                tracing::info!(
+                    "decodificador de vídeo: {}",
+                    decoder_line(&self.decoders, *codec)
+                );
+            }
             match &event {
                 SessionEvent::Connected { path, .. } | SessionEvent::Reconnected { path } => {
                     self.relayed
@@ -355,6 +428,15 @@ impl Guest {
                     step: "keys",
                     done: true,
                 }),
+                // No puede abrir una sala: un anfitrión que lo ofrezca igual recibe un «no» en
+                // vez de esperar una respuesta que nunca llegaría.
+                SessionEvent::HandoffOffered => {
+                    if let Some(session) = lock(&self.session).as_ref()
+                        && let Err(err) = session.reply_handoff(None)
+                    {
+                        tracing::warn!(error = %err, "no se pudo rechazar la oferta de la sala");
+                    }
+                }
                 _ => {}
             }
             ended |= matches!(event, SessionEvent::Ended(_));
@@ -563,18 +645,11 @@ impl Guest {
         let Some(session) = session.as_ref() else {
             return serde_json::Value::Null;
         };
-        let summary = session.summary();
-        let link = session.link();
-        serde_json::json!({
-            "rtt_ms": link.as_ref().map(|link| link.rtt_ms),
-            "loss_percent": link.as_ref().map(|link| link.loss_percent),
-            "target_kbps": link.as_ref().map(|link| link.target_kbps),
-            "relayed": self.relayed.load(Ordering::Acquire),
-            "fps": summary.fps,
-            "kbps": summary.bitrate_kbps,
-            "latency_ms": summary.total.p50_us as f64 / 1000.0,
-            "latency_p95_ms": summary.total.p95_us as f64 / 1000.0,
-        })
+        stats_json(
+            &session.summary(),
+            session.link().as_ref(),
+            self.relayed.load(Ordering::Acquire),
+        )
     }
 
     /// El cursor del anfitrión en píxeles de la vista: número de cambio, posición, si se ve y su
@@ -683,6 +758,60 @@ mod tests {
         }
         assert!(slot.shape(1).is_none(), "la más vieja se olvida");
         assert!(slot.shape(CURSOR_SHAPES as u64 + 1).is_some());
+    }
+
+    #[test]
+    fn stats_show_the_recent_rates_like_the_desktop() {
+        let mut summary = LatencyLedger::new().summary();
+        // La ventana larga aún recuerda lo de hace medio minuto; lo de ahora es lo que se enseña.
+        summary.fps = 30.0;
+        summary.bitrate_kbps = 6_000.0;
+        summary.fps_recent = 60.0;
+        summary.bitrate_recent_kbps = 18_400.0;
+        let stats = stats_json(&summary, None, true);
+        assert_eq!(stats["fps"], 60.0);
+        assert_eq!(stats["kbps"], 18_400.0);
+        assert_eq!(stats["relayed"], true);
+        assert!(stats["rtt_ms"].is_null(), "sin enlace todavía");
+    }
+
+    fn decoder(name: &str, mime: &str, low_latency: bool) -> AndroidDecoderInfo {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "mime": mime,
+            "hardware": true,
+            "low_latency": low_latency,
+            "max_width": 1920,
+            "max_height": 1080,
+            "max_fps": 60,
+        }))
+        .expect("decodificador")
+    }
+
+    #[test]
+    fn the_log_names_the_mediacodec_component_of_the_codec() {
+        let choices = coroom_session::codec::mediacodec::info::choose(vec![
+            decoder("OMX.ejemplo.avc", "video/avc", false),
+            decoder("c2.ejemplo.avc.decoder", "video/avc", true),
+            decoder("c2.ejemplo.hevc.decoder", "video/hevc", true),
+        ]);
+        assert_eq!(
+            decoder_line(&choices, Codec::H264),
+            "H.264 con MediaCodec c2.ejemplo.avc.decoder (respaldo: OMX.ejemplo.avc)"
+        );
+        assert_eq!(
+            decoder_line(&choices, Codec::Hevc),
+            "HEVC con MediaCodec c2.ejemplo.hevc.decoder"
+        );
+        assert_eq!(
+            decoder_line(&choices, Codec::Av1),
+            "AV1: ningún componente de MediaCodec"
+        );
+        assert_eq!(
+            decoders_line(&choices),
+            "HEVC: c2.ejemplo.hevc.decoder · H.264: c2.ejemplo.avc.decoder, OMX.ejemplo.avc"
+        );
+        assert_eq!(decoders_line(&[]), "ninguno");
     }
 
     #[test]

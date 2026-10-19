@@ -1326,6 +1326,7 @@ fn lobby_event(event: &SessionEvent) -> Option<Event> {
             user: *user,
             activity: *activity,
         },
+        SessionEvent::OwnRooms(rooms) => Event::OwnRooms(rooms.clone()),
         SessionEvent::Avatar { user, avatar } => Event::Avatar {
             user: *user,
             avatar: *avatar,
@@ -1913,6 +1914,7 @@ fn lobby_ui_event(event: LobbyEvent) -> Option<Event> {
             }),
             SignalMessage::Presence { user, online } => Event::Presence { user, online },
             SignalMessage::Activity { user, activity } => Event::Activity { user, activity },
+            SignalMessage::OwnRooms { rooms } => Event::OwnRooms(rooms),
             SignalMessage::Avatar { user, avatar } => Event::Avatar { user, avatar },
             // Solo si la sala está abierta en otro dispositivo de la cuenta: se avisa.
             SignalMessage::JoinRequested {

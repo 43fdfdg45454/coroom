@@ -3,6 +3,7 @@ package coroom.android.ui.main
 import android.content.Intent
 import android.provider.Settings as AndroidSettings
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -67,6 +68,8 @@ fun SettingsScreen(
     /** Activar los avisos: pide el permiso de notificaciones si hace falta (lo hace la actividad). */
     onEnableNotifications: () -> Unit,
     onLogout: () -> Unit,
+    /** «Compartir registro»: los ficheros del registro por la hoja de compartir del sistema. */
+    onShareLog: () -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
     val context = LocalContext.current
@@ -177,6 +180,29 @@ fun SettingsScreen(
                             text = stringResource(R.string.settings_logout),
                             onClick = { confirmLogout = true },
                             contentColor = colors.error,
+                        )
+                    }
+                }
+            }
+
+            SettingsHeader(stringResource(R.string.settings_help))
+            ListCard {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(role = Role.Button, onClick = onShareLog)
+                        .heightIn(min = 56.dp)
+                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(14.dp),
+                ) {
+                    CoroomIcon(R.drawable.ic_file_text, contentDescription = null)
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(stringResource(R.string.settings_log), style = CoroomText.itemBody, color = colors.onSurface)
+                        Text(
+                            stringResource(R.string.settings_log_body),
+                            style = CoroomText.supporting,
+                            color = colors.onSurfaceVariant,
                         )
                     }
                 }
@@ -341,7 +367,7 @@ private fun LicensesDialog(onDismiss: () -> Unit) {
 private fun SettingsPreview() {
     CoroomTheme(dynamicColor = false) {
         Box(Modifier.background(MaterialTheme.colorScheme.background)) {
-            SettingsScreen(FakeData.mainState, PaddingValues(), {}, {}, {}, {}, {}, {})
+            SettingsScreen(FakeData.mainState, PaddingValues(), {}, {}, {}, {}, {}, {}, {})
         }
     }
 }

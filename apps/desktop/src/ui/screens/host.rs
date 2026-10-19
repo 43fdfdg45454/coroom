@@ -1059,6 +1059,7 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::Handoff(id) => {
             if app.host.handoff.is_none()
                 && let Some(status) = guest(app, id)
+                && status.can_host
             {
                 app.dialog = Some(Dialog::OfferHandoff {
                     guest: id,
@@ -4332,6 +4333,23 @@ fn guest_row<'a>(app: &'a App, room: &'a Room, status: &'a GuestStatus) -> Eleme
     )
 }
 
+/// «Pasarle la sala»: desactivado mientras otra oferta espera respuesta y, con el motivo al pasar
+/// el ratón, si el dispositivo del invitado no puede abrir salas (el teléfono solo entra).
+fn handoff_button<'a>(status: &GuestStatus, free: bool) -> Element<'a, Message> {
+    let id = status.guest;
+    let button = ui::button_with(
+        Kind::Normal,
+        t!("host-pasarle-la-sala"),
+        Some(Icon::ArrowRight),
+        (free && status.can_host).then(|| on(Msg::Handoff(id))),
+    );
+    if status.can_host {
+        button.into()
+    } else {
+        ui::with_tooltip(button, t!("host-no-puede-hospedar"))
+    }
+}
+
 /// El desplegable de un invitado. Tiene siempre las mismas filas (el mando, su VID:PID y sus
 /// notas en ranuras): lo que llega no le cambia la altura.
 fn guest_details<'a>(
@@ -4405,12 +4423,7 @@ fn guest_details<'a>(
             Some(Icon::Fingerprint),
             Some(on(Msg::Safety(id))),
         ),
-        ui::button_with(
-            Kind::Normal,
-            t!("host-pasarle-la-sala"),
-            Some(Icon::ArrowRight),
-            handoff.then(|| on(Msg::Handoff(id))),
-        ),
+        handoff_button(status, handoff),
         kick,
     ]
     .spacing(space::S)
@@ -4923,6 +4936,8 @@ pub(crate) mod shots {
             input_key: true,
             input: InputLatency::default(),
             gamepad: None,
+            can_host: true,
+            device: None,
         }
     }
 
@@ -5136,6 +5151,8 @@ mod tests {
             input_key: true,
             input: Default::default(),
             gamepad: None,
+            can_host: true,
+            device: None,
         }
     }
 
@@ -5351,6 +5368,27 @@ mod tests {
     }
 
     /// Si el invitado no acepta, se queda todo como estaba.
+    #[test]
+    fn the_room_is_not_offered_to_a_guest_that_cannot_host() {
+        let mut app = app();
+        open_room(&mut app);
+        let phone = GuestStatus {
+            can_host: false,
+            ..status(2, "Carla")
+        };
+        app.update(Message::Event(Event::HostGuests(
+            vec![status(1, "Bea"), phone],
+            HostVoice::default(),
+        )));
+        assert!(
+            app.update(Message::Host(Msg::Handoff(GuestId(2))))
+                .is_empty()
+        );
+        assert!(app.dialog.is_none() && app.host.handoff.is_none());
+        app.update(Message::Host(Msg::Handoff(GuestId(1))));
+        assert!(matches!(&app.dialog, Some(Dialog::OfferHandoff { name, .. }) if name == "Bea"));
+    }
+
     #[test]
     fn a_declined_handoff_changes_nothing() {
         let mut app = app();
