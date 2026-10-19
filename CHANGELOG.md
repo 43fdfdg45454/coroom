@@ -669,6 +669,10 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Cambiado
 
+- **Un codificador por hardware que no acaba la comprobación de imagen dice por qué**: antes solo
+  se leía «la comprobación de imagen no terminó en 20 s». Ahora el diagnóstico y el registro dicen
+  cuántos de los 300 fotogramas llegó a codificar, cuánto tardó cada uno (mediana y máximo) y
+  cuántos no salieron a la primera.
 - **Pruebas en dos clases** (decisión del propietario): las funcionales (que el vídeo, el audio y la
   entrada lleguen y estén enteros) hacen fallar la CI; los umbrales que dependen de la velocidad de
   la máquina (latencias, p95, fps o Mbit/s logrados, huecos) van con `timing_assert!` de la crate

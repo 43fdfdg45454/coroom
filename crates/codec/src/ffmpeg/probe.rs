@@ -33,7 +33,7 @@
 
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rsmpeg::avcodec::AVCodec;
 use rsmpeg::ffi;
@@ -73,6 +73,11 @@ pub(crate) const MIN_PSNR_DB: f64 = 25.0;
 
 /// Tiempo límite de la comprobación de un codificador (abrirlo, 300 fotogramas y decodificarlos).
 const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Lo que puede durar el bucle de la comprobación ([`check_encoder`]): menos que
+/// [`CHECK_TIMEOUT`], para que un codificador lento (que no colgado) acabe con lo que se midió
+/// (cuántos fotogramas y cuánto tardó cada uno) en vez de con un «no terminó» sin datos.
+const CHECK_BUDGET: Duration = Duration::from_secs(17);
 
 /// Lo más que puede tardar [`probe`]: cada paso espera como mucho su tiempo límite (el hilo que
 /// no responde se abandona), así que la suma de todos acota el sondeo entero. Lo usa el padre del
@@ -259,7 +264,11 @@ fn probe_encoder(codec: Codec, backend: Backend) -> EncoderProbe {
         move || {
             let mut encoder = FfmpegEncoder::new(codec, backend).ok()?;
             encoder.configure(&probe_config(codec, ENCODE_SIDE)).ok()?;
-            Some(check_encoder(&mut encoder, codec))
+            Some(check_encoder(
+                &mut encoder,
+                codec,
+                Instant::now() + CHECK_BUDGET,
+            ))
         },
     );
     match checked {
@@ -274,19 +283,42 @@ fn probe_encoder(codec: Codec, backend: Backend) -> EncoderProbe {
 
 /// Comprobación de imagen de un codificador (ver el módulo): codifica [`CHECK_FRAMES`]
 /// fotogramas del patrón, los decodifica por software y compara cada uno con el original. Si
-/// pasa, devuelve los [`SAMPLE_FRAMES`] primeros codificados; si no, por qué.
+/// pasa, devuelve los [`SAMPLE_FRAMES`] primeros codificados; si no, por qué. Si llega `deadline`
+/// antes de acabar, el motivo dice hasta dónde llegó y cuánto tardó en codificar cada fotograma.
 fn check_encoder(
     encoder: &mut dyn Encoder,
     codec: Codec,
+    deadline: Instant,
 ) -> Result<Vec<Vec<EncodedSlice>>, String> {
     let mut decoder = crate::select::create_decoder(codec, DecoderBackend::Software)
         .map_err(|err| format!("sin decodificador por software para comprobarlo: {err}"))?;
     let mut sample = Vec::new();
     let (mut encoded, mut decoded) = (0u64, 0u64);
+    // Lo que tardó cada `encode` y cuántos no soltaron su fotograma a la primera.
+    let mut times = Vec::with_capacity(CHECK_FRAMES as usize);
+    let mut late = 0u64;
+    let started = Instant::now();
     for frame_id in 0..CHECK_FRAMES {
+        if Instant::now() >= deadline {
+            times.sort_unstable();
+            let ms = |d: Option<&Duration>| d.map_or(0.0, |d| d.as_secs_f64() * 1000.0);
+            return Err(format!(
+                "la comprobación de imagen no terminó: {frame_id} de {CHECK_FRAMES} fotogramas en \
+                 {:.0} s (codificar uno tardó {:.0} ms de mediana y {:.0} ms como mucho; {late} no \
+                 salieron a la primera)",
+                started.elapsed().as_secs_f64(),
+                ms(times.get(times.len() / 2)),
+                ms(times.last()),
+            ));
+        }
+        let at = Instant::now();
         let slices = encoder
             .encode(&test_pattern(ENCODE_SIDE, frame_id))
             .map_err(|err| format!("error al codificar el fotograma {frame_id}: {err}"))?;
+        times.push(at.elapsed());
+        if !slices.iter().any(|slice| slice.frame_id == frame_id) {
+            late += 1;
+        }
         for frame in split_frames(slices) {
             encoded += 1;
             let id = frame[0].frame_id;
@@ -576,6 +608,32 @@ mod tests {
         encoder
     }
 
+    /// Un plazo que no llega durante la prueba.
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(3600)
+    }
+
+    #[test]
+    fn a_check_out_of_time_says_how_far_it_got() {
+        let mut encoder = svt_av1();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let reason = check_encoder(&mut encoder, Codec::Av1, deadline)
+            .err()
+            .unwrap_or_default();
+        // En una máquina rápida puede acabar los 300 a tiempo; si no, dice hasta dónde llegó.
+        if !reason.is_empty() {
+            assert!(reason.contains("no terminó"), "{reason}");
+            assert!(
+                reason.contains(&format!("de {CHECK_FRAMES} fotogramas")),
+                "{reason}"
+            );
+            assert!(reason.contains("ms de mediana"), "{reason}");
+        }
+        let reason = check_encoder(&mut encoder, Codec::Av1, Instant::now())
+            .expect_err("sin tiempo no comprueba nada");
+        assert!(reason.contains("0 de 300 fotogramas"), "{reason}");
+    }
+
     #[test]
     fn the_pattern_matches_itself_and_not_another_frame() {
         let mut image = crate::convert::bgra_to_i420(&test_pattern(ENCODE_SIDE, 7)).unwrap();
@@ -590,7 +648,7 @@ mod tests {
 
     #[test]
     fn a_healthy_encoder_passes_the_image_check() {
-        let sample = check_encoder(&mut svt_av1(), Codec::Av1).expect("SVT-AV1 sano");
+        let sample = check_encoder(&mut svt_av1(), Codec::Av1, far()).expect("SVT-AV1 sano");
         assert_eq!(sample.len() as u64, SAMPLE_FRAMES);
         assert!(sample[0][0].keyframe, "la muestra empieza por un intra");
     }
@@ -633,7 +691,7 @@ mod tests {
 
     #[test]
     fn an_encoder_with_damaged_frames_is_rejected() {
-        let reason = check_encoder(&mut Corrupting(svt_av1()), Codec::Av1)
+        let reason = check_encoder(&mut Corrupting(svt_av1()), Codec::Av1, far())
             .expect_err("el vídeo dañado no pasa");
         assert!(
             reason.contains("no coincide") || reason.contains("no se decodifica"),
