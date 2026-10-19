@@ -920,7 +920,9 @@ fn h_a_raw_gamepad_follows_the_host_choice() {
     });
     assert!(sink.log().contains(&Recorded::RawDisconnected { slot: 2 }));
 
-    // Un descriptor que también declara teclado no va tal cual sin permiso de teclado.
+    // Un descriptor que también declara teclado no va tal cual sin permiso de teclado. El permiso
+    // puede llegar al anfitrión antes que la declaración nueva (van por caminos distintos) y
+    // activar un momento el mando anterior: lo que cuenta es dónde queda.
     input.send_pad(hid_pad(2, pad_with_keyboard()));
     allow(&mut host, &guest, id, pad);
     wait_until("el motivo", LIMIT, || {
@@ -928,9 +930,15 @@ fn h_a_raw_gamepad_follows_the_host_choice() {
             .gamepad
             .and_then(|shown| shown.note)
             .is_some_and(|note| note.contains("teclado"))
+            && sink.raw_slots().is_empty()
+            && !input.raw(2)
     });
-    assert!(sink.raw_slots().is_empty());
-    assert!(!input.raw(2));
+    assert!(
+        !status(&host, id)
+            .gamepad
+            .expect("el mando del invitado")
+            .raw
+    );
     guest.close();
     host.close();
     drop(server);

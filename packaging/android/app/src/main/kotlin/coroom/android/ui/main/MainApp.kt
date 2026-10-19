@@ -48,6 +48,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import coroom.android.R
 import coroom.android.platform.LogShare
+import coroom.android.ui.UiText
 import coroom.android.ui.components.CoroomIcon
 import coroom.android.ui.components.NoticeCard
 import coroom.android.ui.components.PillButton
@@ -164,7 +165,7 @@ private fun SignedInApp(main: MainViewModel, state: MainUiState, onEnableNotific
             val shown = chooser != null && runCatching { context.startActivity(chooser) }.isSuccess
             if (!shown) {
                 snackbar.showSnackbar(
-                    context.getString(if (chooser == null) R.string.log_share_empty else R.string.log_share_failed),
+                    UiText.res(if (chooser == null) R.string.log_share_empty else R.string.log_share_failed).resolve(context),
                 )
             }
         }
