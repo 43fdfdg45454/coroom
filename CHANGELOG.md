@@ -215,6 +215,13 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **Parpadeo en el escritorio con NVENC, AMF H.264 e Intel H.264/HEVC**: esos codificadores
+  usaban *intra-refresh*, que recodifica desde cero una franja de la pantalla en cada fotograma
+  para renovar la imagen entera en un segundo. Con la imagen quieta, esa franja se veía como un
+  temblor constante (en un juego queda tapada por el movimiento) y además gastaba bits sin que
+  nada cambiara. Ahora ningún codificador repinta por su cuenta: como ya hacían VA-API, Vulkan
+  Video y SVT-AV1, sale un intra al empezar y cuando el invitado lo pide tras una pérdida, y en
+  medio solo viajan diferencias.
 - **Invitados que decodificaban 4:4:4 en la CPU**: la app daba por hecho que toda NVIDIA
   decodifica HEVC 4:4:4 por hardware; las anteriores a Turing no pueden, y FFmpeg seguía por
   software sin avisar. Un invitado así recibía 1440p a 120 fps y decodificaba unos 50, con saltos,

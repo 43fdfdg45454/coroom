@@ -9,7 +9,8 @@
 //!   contadas en [`Encoder::cpu_copies`].
 //! - Por el pipeline ([`Encoder::encode_into`]) el paquete se copia una sola vez, entero, al búfer
 //!   del llamante; [`Encoder::encode`] lo reparte además en sus slices reales ([`crate::slices`]).
-//! - [`intra_refresh`] dice cómo se refresca cada backend sin IDR grandes.
+//! - Ningún backend repinta por su cuenta (*intra-refresh* apagado): GOP infinito e IDR solo al
+//!   empezar o cuando el invitado lo pide; con la imagen quieta solo viajan diferencias.
 //!
 //! Tope de resolución: `EncoderConfig.width × height` es un máximo ([`crate::EncoderConfig`]). La
 //! captura de pantalla trae su propio tamaño y el codificador se reabre al de cada fotograma
@@ -112,14 +113,11 @@ pub const SVT_MIN_VBV_MS: u64 = 20;
 ///   cambio de escena. SVT-AV1 no tiene *intra-refresh*; los intra salen al pedirlos (con
 ///   `pred-struct=1` admite forzarlos en cualquier fotograma).
 /// - **NVENC**: `preset=p1`, `tune=ull`, `rc=cbr`, `zerolatency`, `delay=0`, `rc-lookahead=0`,
-///   `forced-idr`, `intra-refresh` (con él, `g` es el periodo de la ola de refresco: un segundo) y
-///   `no-scenecut`.
+///   `forced-idr`, `intra-refresh=0` y `no-scenecut`.
 /// - **AMF**: `usage=ultralowlatency`, `rc=cbr`, `latency` (en AV1, `lowest_latency`),
-///   `preencode=0`, `async_depth=1`, `forced_idr` e `intra_refresh_mb` en H.264 (refresco en un
-///   segundo).
+///   `preencode=0`, `async_depth=1`, `forced_idr` e `intra_refresh_mb=0` en H.264.
 /// - **QSV**: `preset=veryfast`, `async_depth=1`, `low_delay_brc`, `forced_idr` y, en H.264 y
-///   HEVC, `scenario=remotegaming` e *intra-refresh* vertical (`int_ref_type`,
-///   `int_ref_cycle_size` de un segundo).
+///   HEVC, `scenario=remotegaming` e `int_ref_type=none`.
 /// - **VA-API**: `rc_mode=CBR`, `async_depth=1`. FFmpeg 8.1 no expone *intra-refresh* en VA-API.
 /// - **Vulkan Video**: `rc_mode=cbr`, `tune=ull`, `usage=stream`, `content=rendered`,
 ///   `async_depth=1`. FFmpeg 8.1 no expone *intra-refresh* en Vulkan.
@@ -323,9 +321,8 @@ pub fn low_latency_options_with(
             set("delay", "0".into());
             set("rc-lookahead", "0".into());
             set("forced-idr", "1".into());
-            set("intra-refresh", "1".into());
+            set("intra-refresh", "0".into());
             set("no-scenecut", "1".into());
-            set("g", fps.to_string());
         }
         Backend::Amf => {
             set("usage", "ultralowlatency".into());
@@ -359,8 +356,8 @@ pub fn low_latency_options_with(
             set("async_depth", "1".into());
             set("forced_idr", "1".into());
             if codec == Codec::H264 {
-                let mbs = config.width.div_ceil(16) * config.height.div_ceil(16);
-                set("intra_refresh_mb", mbs.div_ceil(fps).max(1).to_string());
+                // -1 deja el valor del driver: apagado explícito.
+                set("intra_refresh_mb", "0".into());
             }
         }
         Backend::Qsv => {
@@ -384,8 +381,8 @@ pub fn low_latency_options_with(
             }
             if codec != Codec::Av1 {
                 set("scenario", "remotegaming".into());
-                set("int_ref_type", "vertical".into());
-                set("int_ref_cycle_size", fps.to_string());
+                // -1 deja el valor del runtime: apagado explícito.
+                set("int_ref_type", "none".into());
             }
         }
         Backend::Vaapi => {
@@ -525,27 +522,6 @@ struct CeilingWindow {
     /// Fotogramas (no intra) por encima del presupuesto de un intervalo.
     late: u32,
     largest: usize,
-}
-
-/// Cómo se evita el IDR grande en estado estable con cada backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IntraRefresh {
-    /// *Intra-refresh* del codificador con esta opción de FFmpeg 8.1 (`intra-refresh` en NVENC,
-    /// `intra_refresh_mb` en AMF H.264, `int_ref_type` en QSV H.264/HEVC).
-    Native(&'static str),
-    /// Sin *intra-refresh* en FFmpeg 8.1 (VA-API, Vulkan Video, SVT-AV1, AMF HEVC/AV1, QSV AV1):
-    /// GOP infinito e IDR solo cuando el invitado lo pide (`KeyframeRequest`) o al empezar.
-    ForcedIdr,
-}
-
-/// *Intra-refresh* de `codec` con `backend` (lo mismo que pone [`low_latency_options`]).
-pub fn intra_refresh(codec: Codec, backend: Backend) -> IntraRefresh {
-    match (backend, codec) {
-        (Backend::Nvenc, _) => IntraRefresh::Native("intra-refresh"),
-        (Backend::Amf, Codec::H264) => IntraRefresh::Native("intra_refresh_mb"),
-        (Backend::Qsv, Codec::H264 | Codec::Hevc) => IntraRefresh::Native("int_ref_type"),
-        _ => IntraRefresh::ForcedIdr,
-    }
 }
 
 /// Codificador abierto con un tamaño concreto (el del flujo: la captura reducida al tope).
@@ -2320,7 +2296,7 @@ mod tests {
         };
         assert_eq!(get(&nvenc, "preset").as_deref(), Some("p1"));
         assert_eq!(get(&nvenc, "tune").as_deref(), Some("ull"));
-        assert_eq!(get(&nvenc, "intra-refresh").as_deref(), Some("1"));
+        assert_eq!(get(&nvenc, "forced-idr").as_deref(), Some("1"));
         assert_eq!(get(&nvenc, "bf").as_deref(), Some("0"));
         assert_eq!(get(&nvenc, "slices").as_deref(), Some("4"));
         let svt = low_latency_options(Codec::Av1, Backend::Software, &config(Codec::Av1));
@@ -2336,12 +2312,12 @@ mod tests {
         assert_eq!(get(&vaapi, "rc_mode").as_deref(), Some("CBR"));
     }
 
-    /// *Intra-refresh* verificado por opción en cada codificador compilado: donde
-    /// [`intra_refresh`] dice que existe, la opción está en el codificador y en
-    /// [`low_latency_options`]; donde no, el codificador no tiene ninguna opción de *intra-refresh*
-    /// (FFmpeg 8.1: VA-API y Vulkan) y se fuerza un IDR al pedirlo.
+    /// Ningún codificador repinta por su cuenta: con la imagen quieta, la franja de un
+    /// *intra-refresh* que recorre la pantalla fotograma a fotograma se ve como un parpadeo. En
+    /// cada codificador compilado, toda opción de *intra-refresh* que tenga se pide apagada (sin
+    /// pedirla queda la del driver), el GOP es infinito y el intra sale solo al pedirlo.
     #[test]
-    fn intra_refresh_is_verified_per_backend() {
+    fn no_encoder_refreshes_on_its_own() {
         const NAMES: [&str; 4] = [
             "intra-refresh",
             "intra_refresh_mb",
@@ -2358,49 +2334,52 @@ mod tests {
                 };
                 let name = av_codec.name().to_string_lossy().into_owned();
                 let options = low_latency_options(codec, backend, &config(codec));
-                match intra_refresh(codec, backend) {
-                    IntraRefresh::Native(option) => {
-                        assert!(option_exists(&av_codec, option), "{name}: falta `{option}`");
+                let get = |key: &str| {
+                    options
+                        .iter()
+                        .find(|(k, _)| *k == key)
+                        .map(|(_, v)| v.as_str())
+                };
+                for option in NAMES {
+                    if option_exists(&av_codec, option) {
                         assert!(
-                            options.iter().any(|(key, _)| *key == option),
-                            "{name}: `{option}` no se pide"
+                            matches!(get(option), Some("0" | "none")),
+                            "{name}: `{option}` no se pide apagado ({:?})",
+                            get(option)
                         );
                     }
-                    IntraRefresh::ForcedIdr => {
-                        if matches!(backend, Backend::Vaapi | Backend::VulkanVideo) {
-                            for option in NAMES {
-                                assert!(
-                                    !option_exists(&av_codec, option),
-                                    "{name} tiene `{option}`: actualizar `intra_refresh`"
-                                );
-                            }
-                        }
-                        let forced = if backend == Backend::Software {
-                            // SVT-AV1 con `pred-struct=1` admite intra en cualquier fotograma.
-                            "svtav1-params"
-                        } else {
-                            "forced_idr"
-                        };
-                        if backend != Backend::Vaapi && backend != Backend::VulkanVideo {
-                            assert!(
-                                options.iter().any(|(key, _)| key.starts_with(&forced[..4])),
-                                "{name}: sin intra forzado"
-                            );
-                        }
-                    }
+                }
+                assert_eq!(get("g"), Some(LONG_GOP.to_string().as_str()), "{name}: GOP");
+                let forced = if backend == Backend::Software {
+                    // SVT-AV1 con `pred-struct=1` admite intra en cualquier fotograma.
+                    "svtav1-params"
+                } else {
+                    "forced_idr"
+                };
+                if backend != Backend::Vaapi && backend != Backend::VulkanVideo {
+                    assert!(
+                        options.iter().any(|(key, _)| key.starts_with(&forced[..4])),
+                        "{name}: sin intra forzado"
+                    );
                 }
                 checked.push(name);
             }
         }
-        eprintln!("intra-refresh comprobado en: {checked:?}");
-        assert_eq!(
-            intra_refresh(Codec::H264, Backend::Vaapi),
-            IntraRefresh::ForcedIdr
-        );
-        assert_eq!(
-            intra_refresh(Codec::Av1, Backend::Nvenc),
-            IntraRefresh::Native("intra-refresh")
-        );
+        eprintln!("sin intra-refresh comprobado en: {checked:?}");
+        for (codec, backend) in [
+            (Codec::Hevc, Backend::Nvenc),
+            (Codec::H264, Backend::Amf),
+            (Codec::Hevc, Backend::Qsv),
+        ] {
+            let options = low_latency_options(codec, backend, &config(codec));
+            assert!(
+                options
+                    .iter()
+                    .any(|(key, value)| NAMES.contains(key)
+                        && matches!(value.as_str(), "0" | "none")),
+                "{codec:?}/{backend:?}: intra-refresh apagado aunque esta build no lo traiga"
+            );
+        }
     }
 
     /// Las opciones genéricas del diccionario llegan al contexto: `b`, `maxrate` y `bufsize`

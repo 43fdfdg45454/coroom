@@ -3,8 +3,8 @@
 //! Define los traits [`Encoder`] y [`Decoder`] (`docs/ARQUITECTURA.md` §3). La ruta principal es **Vulkan Video**
 //! vía `hwcontext_vulkan` de FFmpeg 8 (`h264_vulkan`, `hevc_vulkan`, `av1_vulkan`), con respaldo por
 //! fabricante (NVENC/NVDEC, AMF, QSV, VAAPI) y por software (SVT-AV1, dav1d, openh264). El
-//! codificador trabaja en baja latencia: sin B-frames, una referencia, CBR, intra-refresh y varios
-//! slices por fotograma para enviar cada uno en cuanto sale.
+//! codificador trabaja en baja latencia: sin B-frames, una referencia, CBR, GOP infinito (intra solo
+//! al pedirlo, sin *intra-refresh*) y varios slices por fotograma para enviar cada uno en cuanto sale.
 //!
 //! Módulos:
 //!
