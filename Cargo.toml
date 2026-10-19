@@ -23,18 +23,18 @@ todo = "warn"
 
 [workspace.dependencies]
 # Crates del workspace.
-coroom-proto = { path = "crates/proto", version = "1.0.0" }
-coroom-crypto = { path = "crates/crypto", version = "1.0.0" }
-coroom-transport = { path = "crates/transport", version = "1.0.0" }
-coroom-capture = { path = "crates/capture", version = "1.0.0" }
+coroom-proto = { path = "crates/proto" }
+coroom-crypto = { path = "crates/crypto" }
+coroom-transport = { path = "crates/transport" }
+coroom-capture = { path = "crates/capture" }
 # Sin FFmpeg por defecto: `coroom-session` lo pide fuera de Android (allí decodifica MediaCodec).
-coroom-codec = { path = "crates/codec", version = "1.0.0", default-features = false }
-coroom-audio = { path = "crates/audio", version = "1.0.0" }
-coroom-input = { path = "crates/input", version = "1.0.0" }
-coroom-render = { path = "crates/render", version = "1.0.0" }
-coroom-session = { path = "crates/session", version = "1.0.0" }
-coroom-ui = { path = "crates/ui", version = "1.0.0" }
-coroom-testkit = { path = "crates/testkit", version = "1.0.0" }
+coroom-codec = { path = "crates/codec", default-features = false }
+coroom-audio = { path = "crates/audio" }
+coroom-input = { path = "crates/input" }
+coroom-render = { path = "crates/render" }
+coroom-session = { path = "crates/session" }
+coroom-ui = { path = "crates/ui" }
+coroom-testkit = { path = "crates/testkit" }
 
 # Criptografía de identidad.
 ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["fast", "zeroize", "alloc", "pkcs8"] }

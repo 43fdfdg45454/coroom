@@ -19,8 +19,7 @@ on:
         description: Versión X.Y.Z
         required: true
         type: string
-        # La base de `Cargo.toml`: con 0.0.0, cargo no resuelve el workspace (las crates se piden
-        # entre sí con `^1.0.0`).
+        # La base de `Cargo.toml`.
         default: 1.0.0
 
 permissions:

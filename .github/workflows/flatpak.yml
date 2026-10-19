@@ -4,7 +4,7 @@ name: Flatpak
 # de flatpak-github-actions del runtime 26.08 y deja el .flatpak como artefacto. `packages.yml` lo
 # llama con la versión calculada en cada push a main y «Publicación» adjunta el paquete a la
 # release; en los pull requests que tocan el empaquetado se construye con la versión 1.0.0, la base
-# de `Cargo.toml` (las crates se piden entre sí con `^1.0.0`: con 0.0.0 cargo no las resuelve).
+# de `Cargo.toml`.
 on:
   pull_request:
     paths:
