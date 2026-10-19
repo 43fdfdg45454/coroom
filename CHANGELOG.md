@@ -222,6 +222,12 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
   nada cambiara. Ahora ningún codificador repinta por su cuenta: como ya hacían VA-API, Vulkan
   Video y SVT-AV1, sale un intra al empezar y cuando el invitado lo pide tras una pérdida, y en
   medio solo viajan diferencias.
+- **NVENC mandaba un IDR por cada cambio de bitrate**: FFmpeg reinicia NVENC con un IDR cada vez
+  que cambia el bitrate en marcha, y el control de tasa lo cambiaba unas diez veces por segundo.
+  Con la imagen quieta eso se veía como un temblor constante y gastaba ancho de banda en intras.
+  Ahora todos los codificadores siguen la misma regla: un cambio de menos del 20 % no se aplica,
+  las bajadas grandes se aplican al momento y las subidas como mucho una vez cada 4 s; el recorte
+  por pasarse del techo vuelve de una vez en lugar de en pasos.
 - **Invitados que decodificaban 4:4:4 en la CPU**: la app daba por hecho que toda NVIDIA
   decodifica HEVC 4:4:4 por hardware; las anteriores a Turing no pueden, y FFmpeg seguía por
   software sin avisar. Un invitado así recibía 1440p a 120 fps y decodificaba unos 50, con saltos,

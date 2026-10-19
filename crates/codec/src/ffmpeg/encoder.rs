@@ -226,21 +226,16 @@ pub const LATE_FRAME_SHARE: f64 = 0.1;
 /// pedido.
 pub const MIN_CEILING_TRIM: f64 = 0.25;
 
-/// Segundos seguidos en que los fotogramas caben con holgura antes de devolver parte del objetivo
-/// recortado ([`CEILING_RECOVER_STEP`]).
+/// Segundos seguidos en que los fotogramas caben con holgura ([`CEILING_RECOVER_ROOM`]) antes de
+/// devolver el objetivo recortado.
 pub const CEILING_RECOVER_SECONDS: u32 = 2;
 
-/// Lo que se multiplica el objetivo recortado al devolverlo en los backends que lo cambian en marcha
-/// ([`supports_live_bitrate`]): del mínimo ([`MIN_CEILING_TRIM`]) al pedido en seis pasos (12 s).
-/// En los demás (VA-API, Vulkan Video, AMF, SVT-AV1), cada paso reabre el codificador y saca un
-/// intra, así que se vuelve al pedido de una vez cuando caben con holgura
-/// ([`CEILING_RECOVER_ROOM`]). FFmpeg 8.1 no deja cambiar el control de tasa en marcha ni en VA-API
-/// (los parámetros globales solo van con los IDR y se calculan al abrir) ni en Vulkan
+/// Fracción del techo pedido por debajo de la cual se vuelve de una vez al objetivo pedido. Cada
+/// cambio de bitrate cuesta un intra en todos los backends (VA-API, Vulkan Video, AMF y SVT-AV1 se
+/// reabren; NVENC se reconfigura con un IDR, ver [`supports_live_bitrate`]), así que no se devuelve
+/// en pasos. FFmpeg 8.1 no deja cambiar el control de tasa en marcha ni en VA-API (los parámetros
+/// globales solo van con los IDR y se calculan al abrir) ni en Vulkan
 /// (`vkCmdControlVideoCodingKHR` solo al empezar la sesión).
-pub const CEILING_RECOVER_STEP: f64 = 1.25;
-
-/// Fracción del techo pedido por debajo de la cual un codificador que reabre vuelve de una vez al
-/// objetivo pedido.
 pub const CEILING_RECOVER_ROOM: f64 = 0.5;
 
 /// [`low_latency_options`] con el modo de tasa `mode` (donde el backend lo tiene,
@@ -481,6 +476,11 @@ pub fn software_format(backend: Backend, format: VideoFormat) -> ffi::AVPixelFor
 /// Si el backend acepta un bitrate nuevo sin reabrir el codificador: NVENC lo reconfigura en el
 /// siguiente fotograma (si la GPU anuncia `NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE`) y QSV con
 /// `MFXVideoENCODE_Reset`. SVT-AV1, AMF, VA-API y Vulkan de FFmpeg 8.1 solo lo leen al abrir.
+///
+/// Sin reabrir no quiere decir sin intra: FFmpeg 8.1 reconfigura NVENC con `resetEncoder` y
+/// `forceIDR` (`reconfig_encoder` de `nvenc.c`), y cada cambio es un IDR. Por eso ningún backend
+/// dice que cambia el bitrate en marcha ([`Encoder::live_bitrate`] falso): la sesión espacia los
+/// cambios igual en todos.
 pub fn supports_live_bitrate(backend: Backend) -> bool {
     matches!(backend, Backend::Nvenc | Backend::Qsv)
 }
@@ -489,23 +489,19 @@ pub fn supports_live_bitrate(backend: Backend) -> bool {
 /// objetivo pedido): `(recorte, segundos seguidos que caben)`. Si gastó más de
 /// [`CEILING_TOLERANCE`] veces lo que le tocaba o se pasaron más de [`LATE_FRAME_SHARE`] de sus
 /// fotogramas, baja en proporción (al menos un 10 %, hasta [`MIN_CEILING_TRIM`]); si cupo con
-/// holgura [`CEILING_RECOVER_SECONDS`] seguidos, sube [`CEILING_RECOVER_STEP`] (hasta 1) si
-/// `live`, o vuelve a 1 de una vez si gastó menos de [`CEILING_RECOVER_ROOM`] del techo.
-fn next_trim(trim: f64, fits: u32, window: &CeilingWindow, budget: f64, live: bool) -> (f64, u32) {
+/// holgura [`CEILING_RECOVER_SECONDS`] seguidos (menos de [`CEILING_RECOVER_ROOM`] del techo),
+/// vuelve a 1 de una vez.
+fn next_trim(trim: f64, fits: u32, window: &CeilingWindow, budget: f64) -> (f64, u32) {
     let allowed = budget * f64::from(window.frames.max(1));
     let spent = window.bytes as f64;
     let late = f64::from(window.late) > LATE_FRAME_SHARE * f64::from(window.frames);
-    // Sin bitrate en marcha cada paso reabre el codificador (un intra): se vuelve de una vez, y
-    // solo con holgura de sobra.
-    let room = if live { 0.9 } else { CEILING_RECOVER_ROOM };
+    // Cada paso cuesta un intra: se vuelve de una vez, y solo con holgura de sobra.
     if spent > allowed * CEILING_TOLERANCE || late {
         let over = (spent / allowed).max(1.0 / 0.9);
         ((trim / over).max(MIN_CEILING_TRIM), 0)
-    } else if window.late == 0 && spent < allowed * room && trim < 1.0 {
+    } else if window.late == 0 && spent < allowed * CEILING_RECOVER_ROOM && trim < 1.0 {
         if fits + 1 < CEILING_RECOVER_SECONDS {
             (trim, fits + 1)
-        } else if live {
-            ((trim * CEILING_RECOVER_STEP).min(1.0), 0)
         } else {
             (1.0, 0)
         }
@@ -1420,10 +1416,6 @@ impl Encoder for FfmpegEncoder {
         self.apply_bitrate(trimmed)
     }
 
-    fn live_bitrate(&self) -> bool {
-        supports_live_bitrate(self.backend)
-    }
-
     fn repeat_last(&mut self) -> Option<Result<Vec<EncodedSlice>, CodecError>> {
         let (last, frame_id) = self.last_hw.as_ref()?;
         let (mut hw, frame_id) = (last.clone(), *frame_id);
@@ -1837,9 +1829,9 @@ impl FfmpegEncoder {
 
     /// Con techo, mira que el codificador lo respete (ver [`CEILING_TOLERANCE`]): si en un segundo
     /// gasta de más o se pasan demasiados fotogramas del presupuesto de un intervalo, le baja el
-    /// objetivo en proporción; si caben con holgura [`CEILING_RECOVER_SECONDS`] seguidos, se lo
-    /// devuelve en pasos ([`CEILING_RECOVER_STEP`]). En [`per_frame_ceiling`], el recorte va en el
-    /// mismo fotograma que se pasa.
+    /// objetivo en proporción; si caben con holgura ([`CEILING_RECOVER_ROOM`])
+    /// [`CEILING_RECOVER_SECONDS`] seguidos, se lo devuelve de una vez. En [`per_frame_ceiling`], el
+    /// recorte va en el mismo fotograma que se pasa.
     fn watch_ceiling(&mut self, bytes: usize, keyframe: bool) {
         let Some(config) = self.config.filter(|_| self.capped()) else {
             return;
@@ -1876,13 +1868,7 @@ impl FfmpegEncoder {
         let window = std::mem::take(&mut self.ceiling_window);
         let spent = window.bytes as f64;
         let before = self.ceiling_trim;
-        let (trim, fits) = next_trim(
-            self.ceiling_trim,
-            self.ceiling_fits,
-            &window,
-            budget,
-            supports_live_bitrate(self.backend),
-        );
+        let (trim, fits) = next_trim(self.ceiling_trim, self.ceiling_fits, &window, budget);
         // Con control por fotograma, los recortes ya los hizo él; del segundo queda la vuelta.
         if trim >= before || !per_frame_ceiling(self.codec, self.backend) {
             (self.ceiling_trim, self.ceiling_fits) = (trim, fits);
@@ -2083,7 +2069,7 @@ mod tests {
     }
 
     /// Un codificador que se pasa del techo recibe menos objetivo en proporción, nunca por debajo de
-    /// [`MIN_CEILING_TRIM`] ni vuelta a tasa constante; si después cabe, lo recupera en pasos.
+    /// [`MIN_CEILING_TRIM`] ni vuelta a tasa constante; si después cabe con holgura, lo recupera.
     #[test]
     fn an_encoder_over_its_ceiling_gets_a_lower_target_until_it_fits() {
         let budget = 1000.0;
@@ -2094,42 +2080,30 @@ mod tests {
             largest: 0,
         };
         // Gastó el doble: la mitad de objetivo.
-        let (trim, fits) = next_trim(1.0, 0, &second(120_000, 0), budget, true);
+        let (trim, fits) = next_trim(1.0, 0, &second(120_000, 0), budget);
         assert!((trim - 0.5).abs() < 1e-9 && fits == 0, "{trim}");
         // Gasta lo de un segundo pero con muchos fotogramas pasados: baja un 10 %.
-        let (trim, _) = next_trim(1.0, 0, &second(60_000, 10), budget, true);
+        let (trim, _) = next_trim(1.0, 0, &second(60_000, 10), budget);
         assert!((trim - 0.9).abs() < 1e-9, "{trim}");
         // Por mucho que se pase, no baja de MIN_CEILING_TRIM.
         let mut trim = 1.0;
         for _ in 0..20 {
-            trim = next_trim(trim, 0, &second(600_000, 60), budget, true).0;
+            trim = next_trim(trim, 0, &second(600_000, 60), budget).0;
         }
         assert!((trim - MIN_CEILING_TRIM).abs() < 1e-9, "{trim}");
-        // Cabiendo con holgura, sube CEILING_RECOVER_STEP cada CEILING_RECOVER_SECONDS.
-        let (mut trim, mut fits) = (0.5, 0);
-        for _ in 0..CEILING_RECOVER_SECONDS {
-            (trim, fits) = next_trim(trim, fits, &second(30_000, 0), budget, true);
-        }
-        assert!(
-            (trim - 0.5 * CEILING_RECOVER_STEP).abs() < 1e-9 && fits == 0,
-            "{trim}"
-        );
         // Justo en el techo no se mueve.
-        assert_eq!(
-            next_trim(0.8, 3, &second(60_000, 2), budget, true),
-            (0.8, 0)
-        );
-        // Sin bitrate en marcha: de una vez, y solo con menos de CEILING_RECOVER_ROOM del techo.
+        assert_eq!(next_trim(0.8, 3, &second(60_000, 2), budget), (0.8, 0));
+        // Vuelve de una vez, y solo con menos de CEILING_RECOVER_ROOM del techo.
         let (mut trim, mut fits) = (MIN_CEILING_TRIM, 0);
         for _ in 0..CEILING_RECOVER_SECONDS {
-            (trim, fits) = next_trim(trim, fits, &second(40_000, 0), budget, false);
+            (trim, fits) = next_trim(trim, fits, &second(40_000, 0), budget);
         }
         assert!(
             (trim - MIN_CEILING_TRIM).abs() < 1e-9,
             "con poca holgura se queda: {trim}"
         );
         for _ in 0..CEILING_RECOVER_SECONDS {
-            (trim, fits) = next_trim(trim, fits, &second(20_000, 0), budget, false);
+            (trim, fits) = next_trim(trim, fits, &second(20_000, 0), budget);
         }
         assert!((trim - 1.0).abs() < 1e-9 && fits == 0, "{trim}");
     }
@@ -2310,6 +2284,22 @@ mod tests {
         assert_eq!(get(&qsv, "low_delay_brc").as_deref(), Some("1"));
         let vaapi = low_latency_options(Codec::H264, Backend::Vaapi, &config(Codec::H264));
         assert_eq!(get(&vaapi, "rc_mode").as_deref(), Some("CBR"));
+    }
+
+    /// NVENC y QSV cambian el bitrate sin reabrir, pero en NVENC cada cambio es un IDR (FFmpeg
+    /// 8.1): ningún backend dice que lo cambia en marcha y la sesión espacia los cambios igual en
+    /// todos.
+    #[test]
+    fn no_backend_changes_bitrate_live() {
+        assert!(supports_live_bitrate(Backend::Nvenc) && supports_live_bitrate(Backend::Qsv));
+        for codec in Codec::PREFERENCE {
+            for backend in Backend::ALL {
+                // Sin la GPU del backend (la CI) no abre el dispositivo.
+                if let Ok(encoder) = FfmpegEncoder::new(codec, backend) {
+                    assert!(!encoder.live_bitrate(), "{codec:?}/{backend:?}");
+                }
+            }
+        }
     }
 
     /// Ningún codificador repinta por su cuenta: con la imagen quieta, la franja de un

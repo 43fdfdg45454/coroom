@@ -1248,7 +1248,8 @@ pub(crate) const REOPEN_STEP: f64 = 0.20;
 
 /// Tiempo mínimo entre dos subidas de bitrate de un codificador sin bitrate en caliente. El control
 /// de tasa sube un 5 % cada 100 ms y su salida cambia con cada 10 %: aplicado tal cual, SVT-AV1,
-/// VA-API, AMF, Vulkan u OpenH264 se reabrían (y mandaban un intra) varias veces por segundo.
+/// VA-API, AMF, Vulkan u OpenH264 se reabrían (y mandaban un intra) varias veces por segundo, y
+/// NVENC, que se reconfigura con un IDR, mandaba unos diez por segundo.
 pub(crate) const REOPEN_INCREASE_PERIOD: Duration = Duration::from_secs(4);
 
 /// Sin captura durante esto y con un intra pedido, se vuelve a codificar el último fotograma (la
