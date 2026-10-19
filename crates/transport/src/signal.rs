@@ -202,7 +202,7 @@ impl SignalClient {
         self.observed
     }
 
-    /// Dirección del servidor (la del relay salvo que el `RelayToken` diga otra).
+    /// Dirección del servidor por la que se llegó; el relay atiende en ese mismo socket UDP.
     pub fn server_addr(&self) -> SocketAddr {
         self.server_addr
     }

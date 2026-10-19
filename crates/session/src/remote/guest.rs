@@ -398,6 +398,8 @@ struct Room {
     code: String,
     endpoint: Endpoint,
     signal: SignalSender,
+    /// Donde se llegó al servidor: el relay atiende en ese mismo socket UDP.
+    server: SocketAddr,
     host_pk: PublicKey,
     bundle: Option<KeyPackageBundle>,
     group: Option<RoomGroup>,
@@ -440,13 +442,9 @@ impl Room {
                 self.maybe_connect();
                 Ok(())
             }
-            SignalMessage::RelayToken {
-                token,
-                addr,
-                max_kbps,
-            } => {
+            SignalMessage::RelayToken { token, max_kbps } => {
                 let info = RelayInfo {
-                    addr,
+                    addr: self.server,
                     token,
                     max_kbps,
                 };
@@ -877,6 +875,7 @@ async fn run_guest(
         code,
         endpoint: endpoint.clone(),
         signal: signal.sender(),
+        server: signal.server_addr(),
         host_pk,
         bundle: Some(bundle),
         group: None,

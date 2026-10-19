@@ -116,18 +116,13 @@ async fn next(client: &mut Client) -> SignalMessage {
         .expect("sesión abierta")
 }
 
-/// `RelayToken` → datos de la ligadura con el relay.
-fn relay_info(message: SignalMessage) -> RelayInfo {
-    let SignalMessage::RelayToken {
-        token,
-        addr,
-        max_kbps,
-    } = message
-    else {
+/// `RelayToken` → datos de la ligadura con el relay, que está donde `client` llegó al servidor.
+fn relay_info(client: &Client, message: SignalMessage) -> RelayInfo {
+    let SignalMessage::RelayToken { token, max_kbps } = message else {
         panic!("se esperaba RelayToken: {message:?}");
     };
     RelayInfo {
-        addr,
+        addr: client.signal.server_addr(),
         token,
         max_kbps,
     }
@@ -444,7 +439,9 @@ fn hello(identity: &Identity, role: Role) -> Hello {
 async fn bind(client: &Client, token: SignalMessage) -> RelayBinding {
     tokio::time::timeout(
         TIMEOUT,
-        client.endpoint.bind_relay(relay_info(token).params()),
+        client
+            .endpoint
+            .bind_relay(relay_info(client, token).params()),
     )
     .await
     .expect("ligadura a tiempo")

@@ -6,6 +6,7 @@
 
 mod common;
 
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -812,19 +813,19 @@ async fn the_monthly_quota_cuts_the_relay_and_new_rooms_go_direct() {
         _ => None,
     })
     .await;
-    let relay_info = |message: SignalMessage| match message {
-        SignalMessage::RelayToken {
-            token,
-            addr,
-            max_kbps,
-        } => Some(RelayInfo {
-            addr,
-            token,
-            max_kbps,
-        }),
-        _ => None,
+    // El relay está en el socket de la señalización: cada uno se liga donde llegó al servidor.
+    let relay_info = |addr: SocketAddr| {
+        move |message: SignalMessage| match message {
+            SignalMessage::RelayToken { token, max_kbps } => Some(RelayInfo {
+                addr,
+                token,
+                max_kbps,
+            }),
+            _ => None,
+        }
     };
-    let host_relay = next_matching(&mut ana_signal, relay_info).await;
+    let ana_server = ana_signal.server_addr();
+    let host_relay = next_matching(&mut ana_signal, relay_info(ana_server)).await;
     let guest_peer = next_matching(&mut ana_signal, |message| match message {
         SignalMessage::PeerJoined { peer_id, .. } => Some(peer_id),
         _ => None,
@@ -838,7 +839,8 @@ async fn the_monthly_quota_cuts_the_relay_and_new_rooms_go_direct() {
         .await
         .expect("JoinRoom");
     let guest_peer = guest_peer.await;
-    let guest_relay = next_matching(&mut bea_signal, relay_info).await;
+    let bea_server = bea_signal.server_addr();
+    let guest_relay = next_matching(&mut bea_signal, relay_info(bea_server)).await;
 
     let host_binding = ana_endpoint
         .bind_relay(host_relay.params())

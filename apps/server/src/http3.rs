@@ -71,25 +71,8 @@ async fn handle_incoming(incoming: quinn::Incoming, state: Arc<ServerState>) {
     }
 }
 
-/// Dirección del relay que se anuncia en `RelayToken` a un cliente de esta conexión.
-fn relay_addr(state: &ServerState, connection: &quinn::Connection) -> SocketAddr {
-    if let Some(addr) = state.relay_addr {
-        return addr;
-    }
-    let udp = state.udp_addr;
-    if !udp.ip().is_unspecified() {
-        return canonical(udp);
-    }
-    let ip = connection
-        .local_ip()
-        .map(|ip| ip.to_canonical())
-        .unwrap_or_else(|| udp.ip());
-    SocketAddr::new(ip, udp.port())
-}
-
 async fn serve_h3(connection: quinn::Connection, state: Arc<ServerState>) {
     let remote = canonical(connection.remote_address());
-    let relay = relay_addr(&state, &connection);
     let mut h3_conn = match h3::server::builder()
         .enable_webtransport(true)
         .enable_extended_connect(true)
@@ -128,7 +111,7 @@ async fn serve_h3(connection: quinn::Connection, state: Arc<ServerState>) {
                     continue;
                 }
                 match WebTransportSession::accept(request, stream, h3_conn).await {
-                    Ok(session) => serve_signal(session, remote, relay, state).await,
+                    Ok(session) => serve_signal(session, remote, state).await,
                     Err(err) => debug!(%remote, error = %err, "sesión WebTransport fallida"),
                 }
                 return;
@@ -146,12 +129,7 @@ async fn serve_h3(connection: quinn::Connection, state: Arc<ServerState>) {
 type Session = WebTransportSession<h3_quinn::Connection, Bytes>;
 
 /// Sesión WebTransport `/signal`: el primer stream bidireccional es el de señalización.
-async fn serve_signal(
-    session: Session,
-    remote: SocketAddr,
-    relay: SocketAddr,
-    state: Arc<ServerState>,
-) {
+async fn serve_signal(session: Session, remote: SocketAddr, state: Arc<ServerState>) {
     let mut signal: Option<tokio::task::JoinHandle<()>> = None;
     let mut signal_done = false;
     loop {
@@ -168,7 +146,7 @@ async fn serve_signal(
         match accepted {
             Ok(Some(AcceptedBi::BidiStream(_, stream))) if signal.is_none() => {
                 let hub = Arc::clone(&state.hub);
-                signal = Some(tokio::spawn(hub.run(stream, remote, relay)));
+                signal = Some(tokio::spawn(hub.run(stream, remote)));
             }
             // Solo hay un stream de señalización por sesión; los demás se ignoran.
             Ok(Some(AcceptedBi::BidiStream(..))) => {}

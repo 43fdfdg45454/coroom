@@ -166,7 +166,6 @@ pub(crate) struct ServerState {
     pub(crate) udp: Arc<UdpStatus>,
     pub(crate) udp_addr: SocketAddr,
     pub(crate) tcp_addr: SocketAddr,
-    pub(crate) relay_addr: Option<SocketAddr>,
 }
 
 impl ServerState {
@@ -374,7 +373,6 @@ impl Server {
             udp: Arc::new(UdpStatus::default()),
             udp_addr,
             tcp_addr,
-            relay_addr: config.relay_addr,
         });
 
         Ok(Self {

@@ -76,7 +76,7 @@ por defecto, `files`, el certificado va en `./data/certs`:
 
 ```bash
 cd deploy
-cp .env.sample .env        # edita .env: COROOM_PUBLIC_HOST, COROOM_RELAY_ADDR, cuotas…
+cp .env.sample .env        # edita .env: COROOM_PUBLIC_HOST, cuotas…
 mkdir -p data/certs
 cp /ruta/a/fullchain.pem /ruta/a/privkey.pem data/certs/
 sudo chown -R 65532:65532 data
@@ -85,8 +85,7 @@ docker compose up -d
 docker compose logs -f server
 ```
 
-Compose lee las variables de `.env` y se niega a arrancar si faltan `COROOM_PUBLIC_HOST` o
-`COROOM_RELAY_ADDR`. En `./data` quedan `coroom.db` (cuentas, invitaciones, amigos, uso del relay),
+Compose lee las variables de `.env` y se niega a arrancar si falta `COROOM_PUBLIC_HOST`. En `./data` quedan `coroom.db` (cuentas, invitaciones, amigos, uso del relay),
 `certs/` (tu certificado) y, en modo autofirmado, `server.crt` y `server.key`.
 
 En el log verás los dos `bind`, el modo TLS y la huella del certificado. Abre
@@ -136,7 +135,6 @@ dispositivos vinculados abren la señalización y el relay.
 | `COROOM_PUBLIC_HOST` | **obligatoria** | Nombre por el que llegan los clientes: el del certificado y el de su URL |
 | `COROOM_PUBLIC_UDP_PORT` | `443` | Puerto UDP del host al que llegan los clientes: HTTP/3, señalización y relay |
 | `COROOM_PUBLIC_TCP_PORT` | `443` | Puerto TCP del host al que llegan los clientes: `/admin` y HTTP/2 de respaldo |
-| `COROOM_RELAY_ADDR` | **obligatoria** | Dirección UDP del relay que alcanzan los clientes: `<IP del servidor>:<COROOM_PUBLIC_UDP_PORT>` |
 | `COROOM_TLS_MODE` | `files` | `files` (tu certificado) o `self-signed` (generado por el servidor) |
 | `COROOM_TLS_CERT`, `COROOM_TLS_KEY` | `/data/certs/fullchain.pem`, `/data/certs/privkey.pem` | PEM del modo `files` (`./data/certs` en el host) |
 | `COROOM_REGISTRATION` | `invite` | `invite` (administrador e invitaciones) o `admin` (solo administrador) |
@@ -231,8 +229,10 @@ cada 10 minutos el servidor hace un handshake QUIC consigo mismo en
   (`curl --http3 https://coroom.example.com/health`).
 - **El servidor no arranca con `files`**: el log nombra el fichero que no pudo leer. Comprueba que
   están en `./data/certs`, que el usuario 65532 puede leerlos y que la cadena es la completa.
-- **El relay no conecta**: `COROOM_RELAY_ADDR` no es la dirección que alcanzan los clientes;
-  dentro de Docker el servidor no la conoce.
+- **El relay no conecta**: el relay atiende en el mismo puerto UDP que la señalización y cada
+  cliente se liga a la dirección por la que llegó al servidor (de la LAN, de una VPN o pública),
+  así que no hay que configurar ninguna. Sin relay, la sala va solo en directo: lo dice el aviso
+  del cliente (`COROOM_RELAY_ENABLED=false` o cuota del anfitrión agotada).
 - **«la sesión no es válida o ha caducado»** en un cliente: el token caduca a los 30 días o se
   revocó (contraseña cambiada, cuenta deshabilitada, `coroom logout`); `coroom login` otra vez.
 - **Demasiados intentos**: tras 5 fallos de login en un minuto (por cuenta y por IP) el servidor

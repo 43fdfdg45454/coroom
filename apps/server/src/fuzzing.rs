@@ -130,7 +130,6 @@ impl Harness {
                 udp: Arc::new(UdpStatus::default()),
                 udp_addr: any,
                 tcp_addr: any,
-                relay_addr: Some(any),
             }))
         })?;
         let relay_socket = {
@@ -200,11 +199,10 @@ impl Harness {
     /// `authenticate`) y se cierra; devuelve los mensajes que respondió el servidor.
     pub fn signal(&self, authenticate: bool, bytes: &[u8]) -> Vec<SignalMessage> {
         let hub = Arc::clone(&self.state.hub);
-        let relay: SocketAddr = (Ipv4Addr::LOCALHOST, 4433).into();
         let remote: SocketAddr = (Ipv4Addr::LOCALHOST, 50_000).into();
         self.runtime.block_on(async move {
             let (client, server) = tokio::io::duplex(1 << 16);
-            let session = tokio::spawn(hub.run(server, remote, relay));
+            let session = tokio::spawn(hub.run(server, remote));
             let (mut reader, mut writer) = tokio::io::split(client);
             let reading = tokio::spawn(async move {
                 let mut out = Vec::new();

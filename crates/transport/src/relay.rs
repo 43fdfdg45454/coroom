@@ -168,7 +168,7 @@ impl SegmentHook for RelayHook {
 /// Datos de una ligadura.
 #[derive(Debug, Clone)]
 pub struct RelayParams {
-    /// Dirección UDP del relay (la del `RelayToken`).
+    /// Dirección UDP del relay (la del servidor de señalización).
     pub addr: SocketAddr,
     /// Token del `RelayToken`.
     pub token: Vec<u8>,

@@ -215,6 +215,13 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **El relay funciona desde la misma red que el servidor** (protocolo 22; hay que actualizar
+  también el servidor). El servidor anunciaba el relay en `COROOM_RELAY_ADDR`, normalmente la IP
+  pública, y un cliente en la red local del servidor, detrás de un router que no devuelve hacia
+  adentro el tráfico a su propia IP pública, no lograba ligarse («ligadura con el relay: tiempo de
+  espera agotado») y, sin conexión directa, no entraba. El relay atiende en el mismo puerto UDP que
+  la señalización, así que ahora cada cliente se liga a la dirección por la que ya llegó al
+  servidor, sea de la LAN, de una VPN o pública.
 - **La calidad por el relay se estabiliza en unos 4 segundos, no en 30 o 40.** La sonda del
   enlace al arrancar podía medir de menos por el relay (46 Mbit/s en un camino que pasaba más de
   60), el objetivo se quedaba en el 70 % de eso y, sin pérdida ni techo de ráfaga, nadie volvía a
@@ -762,6 +769,8 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Eliminado
 
+- `COROOM_RELAY_ADDR` (y `--relay-addr`): el servidor ya no anuncia una dirección para el relay.
+  Puede quedar en el `.env`; no se usa.
 - El modo **«Juego»** de Compartir (una ventana con el audio solo de su aplicación): confundía
   con «Ventana», y el audio ya se elige aplicación por aplicación en «Audio que se envía». Quedan
   Pantalla y Ventana.

@@ -2650,11 +2650,9 @@ async fn run_host(
             .map_err(network("señalización"))?;
         match message {
             Some(SignalMessage::RoomCreated { code: created }) => code = Some(created),
-            Some(SignalMessage::RelayToken {
-                token,
-                addr,
-                max_kbps,
-            }) => relay = Some(Some((token, addr, max_kbps))),
+            Some(SignalMessage::RelayToken { token, max_kbps }) => {
+                relay = Some(Some((token, max_kbps)));
+            }
             Some(SignalMessage::QuotaExceeded { message }) => {
                 core.emit(SessionEvent::RelayUnavailable(message));
                 relay = Some(None);
@@ -2677,8 +2675,9 @@ async fn run_host(
     let (Some(code), Some(relay)) = (code, relay) else {
         return Err(SessionError::Network("sala incompleta".into()));
     };
-    let relay = relay.map(|(token, addr, max_kbps)| RelayInfo {
-        addr,
+    // El relay atiende en el mismo socket UDP que la señalización: se liga donde ya se llegó.
+    let relay = relay.map(|(token, max_kbps)| RelayInfo {
+        addr: signal.server_addr(),
         token,
         max_kbps,
     });

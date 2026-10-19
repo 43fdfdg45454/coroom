@@ -54,7 +54,8 @@ pub const RELAY_GRACE: Duration = Duration::from_secs(5);
 /// Datos del relay de la sala (del `RelayToken`).
 #[derive(Debug, Clone)]
 pub struct RelayInfo {
-    /// Dirección UDP del relay.
+    /// Dirección UDP del relay: la del servidor por la que llegó la señalización
+    /// ([`crate::SignalClient::server_addr`]), que atiende en el mismo socket.
     pub addr: SocketAddr,
     /// Token.
     pub token: Vec<u8>,

@@ -737,11 +737,7 @@ impl Hub {
         }
     }
 
-    fn relay_token(
-        &self,
-        grant: Grant,
-        relay_addr: SocketAddr,
-    ) -> Result<SignalMessage, (ErrorCode, String)> {
+    fn relay_token(&self, grant: Grant) -> Result<SignalMessage, (ErrorCode, String)> {
         let token = self.relay.grant(grant).ok_or_else(|| {
             (
                 ErrorCode::Internal,
@@ -750,7 +746,6 @@ impl Hub {
         })?;
         Ok(SignalMessage::RelayToken {
             token: token.to_vec(),
-            addr: relay_addr,
             max_kbps: self.relay.max_kbps(),
         })
     }
@@ -760,10 +755,9 @@ impl Hub {
         &self,
         state: RelayState,
         grant: Grant,
-        relay_addr: SocketAddr,
     ) -> Result<SignalMessage, (ErrorCode, String)> {
         match state {
-            RelayState::Available => self.relay_token(grant, relay_addr),
+            RelayState::Available => self.relay_token(grant),
             RelayState::Disabled => Ok(SignalMessage::RelayDisabled),
             RelayState::Quota => Ok(SignalMessage::QuotaExceeded {
                 message: QUOTA_MESSAGE.to_owned(),
@@ -793,13 +787,7 @@ impl Hub {
         }
     }
 
-    async fn create_room(
-        &self,
-        session: SessionId,
-        identity_pk: [u8; 32],
-        name: &str,
-        relay_addr: SocketAddr,
-    ) -> Reply {
+    async fn create_room(&self, session: SessionId, identity_pk: [u8; 32], name: &str) -> Reply {
         if name.chars().count() > MAX_ROOM_NAME {
             return Err((
                 ErrorCode::BadRequest,
@@ -879,7 +867,6 @@ impl Hub {
                 identity_pk,
                 host_user,
             },
-            relay_addr,
         )?;
         Ok(vec![SignalMessage::RoomCreated { code }, relay_message])
     }
@@ -890,7 +877,6 @@ impl Hub {
         code: &str,
         identity_pk: [u8; 32],
         key_package: Vec<u8>,
-        relay_addr: SocketAddr,
     ) -> Reply {
         let code = code.trim().to_ascii_uppercase();
         if !is_valid_room_code(&code) {
@@ -998,7 +984,6 @@ impl Hub {
                 identity_pk,
                 host_user: host_user_id,
             },
-            relay_addr,
         )?;
         Ok(vec![
             SignalMessage::Joined {
@@ -1252,17 +1237,10 @@ impl Hub {
         left
     }
 
-    async fn handle(
-        &self,
-        session: SessionId,
-        message: SignalMessage,
-        relay_addr: SocketAddr,
-    ) -> Reply {
+    async fn handle(&self, session: SessionId, message: SignalMessage) -> Reply {
         match message {
             SignalMessage::CreateRoom { identity_pk, name } => {
-                let reply = self
-                    .create_room(session, identity_pk, &name, relay_addr)
-                    .await;
+                let reply = self.create_room(session, identity_pk, &name).await;
                 if reply.is_ok() {
                     self.announce_session_activity(session).await;
                 }
@@ -1273,7 +1251,7 @@ impl Hub {
                 identity_pk,
                 key_package,
             } => {
-                let reply = self.join_room(session, &code, identity_pk, key_package, relay_addr);
+                let reply = self.join_room(session, &code, identity_pk, key_package);
                 if reply.is_ok() {
                     self.announce_session_activity(session).await;
                 }
@@ -1389,7 +1367,7 @@ impl Hub {
     }
 
     /// Atiende el stream de señalización de una sesión hasta que se cierra.
-    pub async fn run<S>(self: Arc<Self>, stream: S, remote: SocketAddr, relay_addr: SocketAddr)
+    pub async fn run<S>(self: Arc<Self>, stream: S, remote: SocketAddr)
     where
         S: AsyncRead + AsyncWrite + Send + 'static,
     {
@@ -1463,7 +1441,7 @@ impl Hub {
                 _ = &mut close_rx => None,
             };
             let Some(message) = message else { break };
-            match self.handle(session, message, relay_addr).await {
+            match self.handle(session, message).await {
                 Ok(replies) => {
                     for reply in replies {
                         if tx.send(reply).await.is_err() {
@@ -1591,10 +1569,9 @@ mod tests {
     #[test]
     fn the_same_account_sees_and_joins_its_rooms_on_other_devices() {
         let hub = Hub::new(HubConfig::new(8), Relay::new());
-        let addr: SocketAddr = ([127, 0, 0, 1], 4433).into();
         let (pc, mut pc_rx) = session_on(&hub, 1, "Equipo de ejemplo");
         let (phone, mut phone_rx) = session_on(&hub, 1, "Teléfono de ejemplo");
-        let created = block_on(hub.create_room(pc, [1; 32], "sala", addr)).expect("sala creada");
+        let created = block_on(hub.create_room(pc, [1; 32], "sala")).expect("sala creada");
         let Some(SignalMessage::RoomCreated { code }) = created.first().cloned() else {
             panic!("sin código: {created:?}");
         };
@@ -1614,7 +1591,7 @@ mod tests {
             [SignalMessage::OwnRooms { rooms: Vec::new() }]
         );
 
-        assert!(hub.join_room(phone, &code, [2; 32], vec![1], addr).is_ok());
+        assert!(hub.join_room(phone, &code, [2; 32], vec![1]).is_ok());
         let joined = drain(&mut pc_rx);
         assert!(
             matches!(
@@ -1626,7 +1603,7 @@ mod tests {
         );
         // Otra cuenta entra sin dispositivo: no está repetida.
         let (friend, _friend_rx) = session_on(&hub, 2, "Portátil de ejemplo");
-        assert!(hub.join_room(friend, &code, [3; 32], vec![1], addr).is_ok());
+        assert!(hub.join_room(friend, &code, [3; 32], vec![1]).is_ok());
         let joined = drain(&mut pc_rx);
         assert!(
             matches!(
@@ -1638,7 +1615,7 @@ mod tests {
 
         // Una segunda sala de la cuenta: pedir entrar va a la más nueva.
         let (laptop, _laptop_rx) = session_on(&hub, 1, "Portátil");
-        let newer = block_on(hub.create_room(laptop, [4; 32], "sala", addr)).expect("otra sala");
+        let newer = block_on(hub.create_room(laptop, [4; 32], "sala")).expect("otra sala");
         let Some(SignalMessage::RoomCreated { code: newer }) = newer.first().cloned() else {
             panic!("sin código");
         };
@@ -1671,8 +1648,7 @@ mod tests {
     fn guessing_room_codes_is_rate_limited_per_account() {
         let hub = Hub::new(HubConfig::new(8), Relay::new());
         let host = session(&hub, Some(1));
-        let addr: SocketAddr = ([127, 0, 0, 1], 4433).into();
-        let created = block_on(hub.create_room(host, [1; 32], "sala", addr)).expect("sala creada");
+        let created = block_on(hub.create_room(host, [1; 32], "sala")).expect("sala creada");
         let Some(SignalMessage::RoomCreated { code }) = created.first().cloned() else {
             panic!("sin código: {created:?}");
         };
@@ -1680,7 +1656,7 @@ mod tests {
         let guesser = session(&hub, Some(2));
         for _ in 0..MAX_JOIN_FAILURES {
             let err = hub
-                .join_room(guesser, wrong, [2; 32], vec![1], addr)
+                .join_room(guesser, wrong, [2; 32], vec![1])
                 .expect_err("no existe");
             assert_eq!(err.0, ErrorCode::RoomNotFound);
             assert!(err.1.contains("no existe la sala"), "{}", err.1);
@@ -1688,13 +1664,13 @@ mod tests {
         // Otra sesión de la misma cuenta hereda el límite, incluso con el código bueno.
         let again = session(&hub, Some(2));
         let err = hub
-            .join_room(again, &code, [2; 32], vec![1], addr)
+            .join_room(again, &code, [2; 32], vec![1])
             .expect_err("limitado");
         assert!(err.1.contains("demasiados"), "{}", err.1);
         // Otra cuenta no.
         let other = session(&hub, Some(3));
         let err = hub
-            .join_room(other, wrong, [3; 32], vec![1], addr)
+            .join_room(other, wrong, [3; 32], vec![1])
             .expect_err("no existe");
         assert!(err.1.contains("no existe la sala"), "{}", err.1);
         // Pasada la ventana, se olvida.
@@ -1708,7 +1684,7 @@ mod tests {
                 }
             }
         }
-        assert!(hub.join_room(again, &code, [2; 32], vec![1], addr).is_ok());
+        assert!(hub.join_room(again, &code, [2; 32], vec![1]).is_ok());
     }
 
     /// La sala de espera da paso a la sala del anfitrión: el «desconectado» de la sesión que se

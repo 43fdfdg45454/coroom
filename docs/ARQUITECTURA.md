@@ -152,7 +152,9 @@ Invitado ── HTTP/3 + WebTransport ──▶ Servidor (UDP) ◀── HTTP/3 
   mientras acepta entrantes, con un tiempo de apertura de 3 s; gana la primera conexión con la
   identidad verificada.
 - **Relay de respaldo**: con el `RelayToken` de la sala, cada par se **liga** al relay desde su
-  socket de medios (`Allocate` → `Challenge` con una galleta sin estado atada a su dirección →
+  socket de medios, en la dirección por la que llegó al servidor: el relay atiende en el mismo
+  socket UDP que la señalización, así que vale la de la LAN, la de una VPN o la pública sin
+  configurar ninguna (`Allocate` → `Challenge` con una galleta sin estado atada a su dirección →
   `Bind` firmado con el token → `Bound` firmado por el relay; el token nunca viaja) y lo refresca
   cada 10 s. Los pares remotos pasan a tener una dirección virtual (240.0.0.0/4) en el socket: lo
   que `quinn` manda ahí sale como `Data` hacia el relay, que lo reescribe con el par de origen y lo

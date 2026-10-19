@@ -341,18 +341,6 @@ pub struct Config {
     )]
     pub relay_max_kbps: u32,
 
-    /// Dirección UDP del relay que se anuncia en `RelayToken`: la que alcanzan los clientes.
-    #[arg(
-        long,
-        env = "COROOM_RELAY_ADDR",
-        value_name = "DIRECCIÓN",
-        hide_env = true,
-        help = "Dirección UDP del relay que se anuncia a los clientes (la que alcanzan: de la LAN, \
-                de una VPN o pública); por defecto, la \
-                dirección local de cada conexión con el puerto UDP [COROOM_RELAY_ADDR]"
-    )]
-    pub relay_addr: Option<SocketAddr>,
-
     /// Muestra esta ayuda.
     #[arg(short = 'h', long = "help", action = ArgAction::Help, global = true)]
     help: Option<bool>,
@@ -391,7 +379,6 @@ impl Config {
             relay_enabled: true,
             relay_quota_gb_per_month: 0.0,
             relay_max_kbps: 0,
-            relay_addr: None,
             help: None,
             version: None,
         }
@@ -440,7 +427,6 @@ mod tests {
         assert!(config.relay_enabled);
         assert_eq!(config.quota_bytes(), None);
         assert_eq!(config.relay_max_kbps, 0);
-        assert_eq!(config.relay_addr, None);
     }
 
     #[test]
@@ -451,8 +437,6 @@ mod tests {
             "change-me",
             "--max-guests-per-room",
             "3",
-            "--relay-addr",
-            "127.0.0.1:4433",
             "--registration",
             "admin",
             "--relay-enabled",
@@ -469,10 +453,6 @@ mod tests {
         .expect("configuración");
         assert_eq!(config.dev_token.as_deref(), Some("change-me"));
         assert_eq!(config.max_guests_per_room, 3);
-        assert_eq!(
-            config.relay_addr,
-            Some("127.0.0.1:4433".parse().expect("dirección"))
-        );
         assert_eq!(config.registration, Registration::Admin);
         assert!(!config.relay_enabled);
         assert_eq!(config.quota_bytes(), Some(500_000_000));
