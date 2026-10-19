@@ -173,7 +173,8 @@ Invitado ── HTTP/3 + WebTransport ──▶ Servidor (UDP) ◀── HTTP/3 
 - **Identidad de dispositivo**: par Ed25519 generado en el primer arranque y guardado en el llavero
   del sistema (o sellado con el portal `Secret` en Flatpak). Es la credencial MLS y la clave cruda
   del certificado QUIC; el dispositivo se vincula a la cuenta firmando un desafío y solo las claves
-  vinculadas abren señalización y relay. Dos amigos verifican sus claves con un número de seguridad.
+  vinculadas abren señalización y relay. Una clave es de una sola cuenta: si el equipo entra en
+  otra del mismo servidor, la clave pasa a esa y la anterior pierde el dispositivo y su sesión. Dos amigos verifican sus claves con un número de seguridad.
 - **Amigos y salas**: amistad por solicitud, con presencia; una sala tiene un anfitrión y N
   invitados, se abre con un código corto temporal o con invitación a amigos, y es un grupo MLS.
   Permisos por invitado (ranura de mando, teclado y ratón, solo mirar), aprobación de entrada,

@@ -659,6 +659,11 @@ impl Backend {
                 }
             }
             Effect::SaveSettings => self.save_settings(app, false),
+            Effect::ForgetCredentials(url) => self.spawn("olvidar", move |notify| {
+                if let Err(err) = forget_credentials(&url) {
+                    notify(Message::Event(Event::Failed(err)));
+                }
+            }),
             Effect::SaveRestoreTokens(tokens) => {
                 let path = crate::portal::restore_tokens_path();
                 self.spawn("portal", move |notify| {
@@ -1811,6 +1816,15 @@ fn account_info(server: ServerEntry, signed: account::SignedIn) -> AccountInfo {
         fingerprint: signed.fingerprint,
         avatar: signed.avatar,
     }
+}
+
+/// Borra la sesión guardada de `url` y, si era el último servidor, que se recupere al abrir.
+fn forget_credentials(url: &str) -> Result<(), String> {
+    let store = AccountStore::new(None, false);
+    if store.last_server().as_deref() == Some(url) {
+        store.set_last_server("");
+    }
+    store.delete(url)
 }
 
 /// Recupera la sesión del último servidor (si hay credenciales guardadas).

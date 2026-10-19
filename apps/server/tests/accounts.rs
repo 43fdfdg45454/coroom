@@ -132,7 +132,8 @@ async fn login_binds_the_device_only_with_a_valid_signature() {
         "un desafío solo sirve una vez"
     );
 
-    // Una identidad vinculada a ana no sirve para otra cuenta.
+    // El mismo equipo cierra sesión en ana y entra en bea: la identidad pasa a bea y ana deja de
+    // tenerla (su sesión en ese equipo cae); volver a entrar en ana la devuelve.
     admin
         .create_user(&coroom_transport::proto::api::CreateUser {
             username: "bea".to_owned(),
@@ -142,10 +143,25 @@ async fn login_binds_the_device_only_with_a_valid_signature() {
         })
         .await
         .expect("bea");
+    let bea = api
+        .login("bea", PASSWORD, &identity, "mismo")
+        .await
+        .expect("el equipo entra en bea");
+    let me = server.api_with(&bea.token).me().await.expect("/me de bea");
     assert_eq!(
-        api_code(api.login("bea", PASSWORD, &identity, "mismo").await),
-        (409, "device_in_use".to_owned())
+        me.device.map(|device| device.fingerprint),
+        Some(identity.fingerprint())
     );
+    assert!(
+        server.api_with(&token.token).me().await.is_err(),
+        "la sesión de ana en ese equipo cae"
+    );
+    let ana = api
+        .login("ana", PASSWORD, &identity, "mismo")
+        .await
+        .expect("y vuelve a ana");
+    assert!(server.api_with(&ana.token).me().await.is_ok());
+    assert!(server.api_with(&bea.token).me().await.is_err());
 
     // La interfaz web es solo para administradores; credenciales malas, respuesta uniforme.
     assert_eq!(

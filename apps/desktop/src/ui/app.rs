@@ -696,6 +696,8 @@ pub enum Effect {
     SetPadChoice(PadChoice),
     /// Guardar los ajustes.
     SaveSettings,
+    /// Borrar la sesión guardada de un servidor que se quitó de la lista.
+    ForgetCredentials(String),
     /// Guardar en `portal.json` los tokens con los que el portal de captura recuerda el permiso de
     /// pantalla (o borrarlo, si no queda ninguno).
     SaveRestoreTokens(crate::portal::RestoreTokens),
@@ -767,6 +769,13 @@ pub enum Dialog {
     QuitWhileGuest,
     /// Cambiar de servidor con la sala abierta.
     SwitchServerWhileHosting,
+    /// Quitar un servidor de la lista.
+    ForgetServer {
+        /// Su dirección.
+        url: String,
+        /// Su nombre, para la pregunta.
+        host: String,
+    },
     /// Desvincular un dispositivo.
     RevokeDevice {
         /// Dispositivo.
@@ -1733,6 +1742,7 @@ impl App {
                 effects
             }
             Dialog::SwitchServerWhileHosting => self.switch_server(),
+            Dialog::ForgetServer { url, .. } => login::forget(self, url),
             Dialog::RevokeDevice { device, .. } => vec![Effect::RevokeDevice(device)],
             Dialog::OfferHandoff { guest, name } => host::offer_handoff(self, guest, name),
             Dialog::HandoffOffered { .. } => host::accept_handoff(self),
@@ -2500,6 +2510,11 @@ impl App {
                 t!("app-cerrar-la-sala-y-cambiar-de-servidor").to_owned(),
                 t!("app-cambiar-de-servidor-cierra-la-sala").to_owned(),
                 vec![fill(), cancel(), confirm(t!("app-cerrar-y-cambiar"), true)],
+            ),
+            Dialog::ForgetServer { host, .. } => (
+                t!("app-quitar-host-de-la-lista", host = host),
+                t!("app-quitar-servidor-texto").to_owned(),
+                vec![fill(), cancel(), confirm(t!("app-quitar"), true)],
             ),
             Dialog::RevokeDevice { name, .. } => (
                 t!("app-cerrar-la-sesion-de-name", name = name),

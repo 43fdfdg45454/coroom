@@ -215,6 +215,13 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **Cambiar de cuenta en el mismo servidor** (hay que actualizar también el servidor): cerrar
+  sesión y entrar con otra cuenta fallaba con «esta identidad ya está vinculada a otra cuenta». La
+  identidad del equipo era de la primera cuenta para siempre. Ahora pasa a la cuenta que entra; la
+  anterior pierde ese dispositivo y su sesión en él, y vuelve a tenerlo al entrar otra vez.
+- **Quitar servidores de la lista**: el texto emergente «Más acciones» tapaba la única opción del
+  menú «⋯». Cada servidor tiene ahora un botón de papelera que pregunta antes y borra también la
+  sesión guardada en este equipo (el de la cuenta abierta no se quita: primero se cierra sesión).
 - **El pie del riel ancho ya no se ve desfasado**: la sala, el micrófono y «Volver a la sala» (o
   las peticiones, como anfitrión) quedan centrados en su fila y a la misma distancia. Antes el
   icono y el nombre de los botones iban pegados arriba y, como invitado, la fila de la sala quedaba

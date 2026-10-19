@@ -553,34 +553,46 @@ impl Db {
 
     // --- Dispositivos y sesiones ---------------------------------------------------------------
 
-    /// Vincula la clave `public_key` a `user_id` (o actualiza su nombre si ya lo estaba).
+    /// Vincula la clave `public_key` a `user_id` (o actualiza su nombre si ya lo estaba). Si la
+    /// tenía otra cuenta, pasa a esta: el equipo cerró sesión en aquella y entró en esta, y la
+    /// clave solo la tiene quien tiene el equipo. La otra cuenta pierde el dispositivo y sus
+    /// sesiones en él; su cuenta y lo demás quedan igual. Devuelve también esa otra cuenta.
     pub async fn upsert_device(
         &self,
         user_id: i64,
         public_key: &[u8; 32],
         name: &str,
-    ) -> DbResult<DeviceRow> {
+    ) -> DbResult<(DeviceRow, Option<i64>)> {
         let now = clock::now();
+        let mut tx = self.pool.begin().await?;
         let existing = sqlx::query("SELECT * FROM devices WHERE public_key = ?")
             .bind(public_key.as_slice())
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
+        let mut moved_from = None;
         if let Some(row) = existing {
             let device = device_from(&row, "")?;
-            if device.user_id != user_id {
-                return Err(DbError::Conflict("clave de dispositivo de otra cuenta"));
+            if device.user_id == user_id {
+                sqlx::query("UPDATE devices SET name = ?, last_seen_at = ? WHERE id = ?")
+                    .bind(name)
+                    .bind(now)
+                    .bind(device.id)
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+                let device = DeviceRow {
+                    name: name.to_owned(),
+                    last_seen_at: now,
+                    ..device
+                };
+                return Ok((device, None));
             }
-            sqlx::query("UPDATE devices SET name = ?, last_seen_at = ? WHERE id = ?")
-                .bind(name)
-                .bind(now)
+            // Las sesiones de la otra cuenta en este equipo caen con él (`ON DELETE CASCADE`).
+            sqlx::query("DELETE FROM devices WHERE id = ?")
                 .bind(device.id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
-            return Ok(DeviceRow {
-                name: name.to_owned(),
-                last_seen_at: now,
-                ..device
-            });
+            moved_from = Some(device.user_id);
         }
         let result = sqlx::query(
             "INSERT INTO devices (user_id, public_key, name, created_at, last_seen_at) \
@@ -591,20 +603,18 @@ impl Db {
         .bind(name)
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
-        .await
-        .map_err(|err| match DbError::from(err) {
-            DbError::Conflict(_) => DbError::Conflict("clave de dispositivo de otra cuenta"),
-            other => other,
-        })?;
-        Ok(DeviceRow {
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let device = DeviceRow {
             id: result.last_insert_rowid(),
             user_id,
             public_key: *public_key,
             name: name.to_owned(),
             created_at: now,
             last_seen_at: now,
-        })
+        };
+        Ok((device, moved_from))
     }
 
     /// Dispositivos de un usuario, del último usado al primero.
@@ -1174,19 +1184,16 @@ mod tests {
         let (db, _dir) = db().await;
         let ana = db.create_user("ana", "Ana", "h", false).await.expect("ana");
         let bea = db.create_user("bea", "Bea", "h", false).await.expect("bea");
-        let device = db
+        let (device, _) = db
             .upsert_device(ana.id, &[1; 32], "portátil")
             .await
             .expect("disp");
-        let again = db
+        let (again, moved) = db
             .upsert_device(ana.id, &[1; 32], "sobremesa")
             .await
             .expect("disp");
         assert_eq!(device.id, again.id);
-        assert!(matches!(
-            db.upsert_device(bea.id, &[1; 32], "robado").await,
-            Err(DbError::Conflict(_))
-        ));
+        assert_eq!(moved, None);
         db.create_session(&[7; 32], ana.id, Some(device.id), clock::now() + 60)
             .await
             .expect("sesión");
@@ -1206,6 +1213,19 @@ mod tests {
             .expect("caducada");
         assert!(db.session(&[9; 32]).await.expect("sesión").is_none());
         assert_eq!(db.purge_expired().await.expect("purga"), 1);
+
+        // El equipo cierra sesión en ana y entra en bea: la clave pasa a bea y la sesión de ana
+        // en él cae; ana sigue con su cuenta.
+        let (moved, from) = db
+            .upsert_device(bea.id, &[1; 32], "portátil")
+            .await
+            .expect("pasa a bea");
+        assert_eq!(from, Some(ana.id));
+        assert_eq!(moved.user_id, bea.id);
+        assert!(db.session(&[8; 32]).await.expect("sesión").is_none());
+        assert!(db.devices(ana.id).await.expect("lista").is_empty());
+        assert_eq!(db.devices(bea.id).await.expect("lista").len(), 1);
+        assert!(db.user_by_id(ana.id).await.expect("ana").is_some());
     }
 
     #[tokio::test]

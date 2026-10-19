@@ -171,7 +171,7 @@ pub enum Msg {
     Choose(String),
     /// Volver a la cuenta abierta sin cambiar de servidor.
     StayHere,
-    /// Olvidar un servidor conocido.
+    /// Quitar un servidor conocido de la lista (pregunta antes).
     Forget(String),
     /// URL.
     Url(String),
@@ -298,11 +298,10 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         }
         Msg::StayHere => return stay_here(app),
         Msg::Forget(url) => {
-            app.settings.forget_server(&url);
-            if app.settings.servers.is_empty() {
-                app.login.step = Step::AddServer;
-            }
-            return vec![Effect::SaveSettings];
+            app.dialog = Some(crate::ui::app::Dialog::ForgetServer {
+                host: host_of(&url),
+                url,
+            });
         }
         Msg::Url(url) => {
             state.url = url;
@@ -579,39 +578,14 @@ fn header(app: &App) -> Element<'_, Message> {
     .into()
 }
 
-/// El menú «⋯» de la fila de un servidor (sin flecha: es el botón de «más» de GNOME). Elegir
-/// una opción no abre el servidor: el menú se come el clic.
-fn server_menu(server: &ServerEntry) -> Element<'_, Message> {
-    let menu = coroom_ui::release::release_to_pick(
-        iced_widget::pick_list(
-            vec![ServerAction::Forget(server.url.clone())],
-            None::<ServerAction>,
-            |action| match action {
-                ServerAction::Forget(url) => on(Msg::Forget(url)),
-            },
-        )
-        .placeholder("⋯")
-        .handle(iced_widget::pick_list::Handle::None)
-        .padding(Padding::from([6.0, 10.0]))
-        .text_size(coroom_ui::tokens::text::SECONDARY)
-        .font(coroom_ui::font::UI),
-    );
-    ui::with_tooltip(menu, t!("pantalla-login-mas-acciones"))
-}
-
-/// Lo que se puede hacer con un servidor de la lista (el menú «⋯» de su fila).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ServerAction {
-    /// Quitarlo de la lista.
-    Forget(String),
-}
-
-impl std::fmt::Display for ServerAction {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ServerAction::Forget(_) => f.write_str(t!("pantalla-login-olvidar-servidor")),
-        }
+/// Quita `url` de la lista (ya confirmado): con él se borran la sesión guardada en este equipo y,
+/// si era el último usado, que se recupere al abrir. Sin servidores, se pasa a añadir uno.
+pub fn forget(app: &mut App, url: String) -> Vec<Effect> {
+    app.settings.forget_server(&url);
+    if app.settings.servers.is_empty() {
+        app.login.step = Step::AddServer;
     }
+    vec![Effect::SaveSettings, Effect::ForgetCredentials(url)]
 }
 
 fn on(msg: Msg) -> Message {
@@ -648,7 +622,18 @@ fn servers(app: &App) -> Element<'_, Message> {
                     t!("pantalla-login-certificado-propio"),
                 ));
             }
-            trailing.push(server_menu(server));
+            // El de la cuenta abierta no se quita desde aquí: primero se cierra la sesión.
+            let open = app
+                .account
+                .as_ref()
+                .is_some_and(|account| account.server.url == server.url);
+            if !open {
+                trailing.push(ui::icon_button(
+                    Icon::Trash,
+                    t!("pantalla-login-quitar-servidor"),
+                    Some(on(Msg::Forget(server.url.clone()))),
+                ));
+            }
             trailing.push(icon_with(Icon::ChevronRight, 18.0, SvgClass::Secondary));
             let line = ui::list_row(
                 Some(icon_with(Icon::Server, 22.0, SvgClass::Accent)),
@@ -1030,6 +1015,46 @@ mod tests {
             fingerprint: "ab".repeat(32),
             untrusted: untrusted.then(|| "autofirmado".to_owned()),
         }
+    }
+
+    #[test]
+    fn removing_a_server_asks_first_and_then_forgets_its_session() {
+        let mut app = app();
+        for url in ["https://a.example.com", "https://b.example.com"] {
+            app.settings.remember_server(ServerEntry {
+                url: url.to_owned(),
+                fingerprint: None,
+                tcp_port: None,
+                username: Some("ana".to_owned()),
+            });
+        }
+        // Primero pregunta, sin tocar nada.
+        let effects = app.update(Message::Login(Msg::Forget(
+            "https://a.example.com".to_owned(),
+        )));
+        assert!(effects.is_empty());
+        assert!(matches!(
+            &app.dialog,
+            Some(crate::ui::app::Dialog::ForgetServer { host, .. }) if host == "a.example.com"
+        ));
+        assert_eq!(app.settings.servers.len(), 2);
+        // Al confirmar, sale de la lista y se borra su sesión guardada.
+        let effects = app.update(Message::ConfirmDialog);
+        assert_eq!(
+            app.settings
+                .servers
+                .iter()
+                .map(|server| server.url.as_str())
+                .collect::<Vec<_>>(),
+            ["https://b.example.com"]
+        );
+        assert!(
+            effects.iter().any(
+                |e| matches!(e, Effect::ForgetCredentials(url) if url == "https://a.example.com")
+            ),
+            "{effects:?}"
+        );
+        assert!(effects.iter().any(|e| matches!(e, Effect::SaveSettings)));
     }
 
     #[test]

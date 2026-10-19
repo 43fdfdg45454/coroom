@@ -377,20 +377,20 @@ async fn login_complete(state: &ServerState, request: &Request) -> Handled {
         .map_err(db_error)?
         .filter(|user| !user.disabled)
         .ok_or_else(invalid_credentials)?;
-    let device = state
+    let (device, moved_from) = state
         .db
         .upsert_device(user.id, &pending.public_key, &pending.device_name)
         .await
-        .map_err(|err| match err {
-            DbError::Conflict(_) => fail(
-                StatusCode::CONFLICT,
-                "device_in_use",
-                "esta identidad ya está vinculada a otra cuenta; usa otro directorio de datos \
-                 (--data-dir) para esta cuenta",
-            ),
-            other => db_error(other),
-        })?;
-    info!(user = user.id, device = device.id, "dispositivo vinculado");
+        .map_err(db_error)?;
+    match moved_from {
+        Some(previous) => info!(
+            user = user.id,
+            device = device.id,
+            previous,
+            "dispositivo vinculado (antes era de otra cuenta)"
+        ),
+        None => info!(user = user.id, device = device.id, "dispositivo vinculado"),
+    }
     issue_session(state, &user, Some(device.id), SESSION_TTL).await
 }
 
