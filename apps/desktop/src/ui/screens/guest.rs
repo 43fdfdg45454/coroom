@@ -3219,6 +3219,7 @@ pub fn rail_footer<'a>(app: &'a App, state: &'a State, wide: bool) -> Element<'a
     let line = |icon: Icon, tint: SvgClass, label: Element<'a, Message>| -> Element<'a, Message> {
         row![icon_with(icon, size::ICON, tint), label]
             .spacing(space::XS)
+            .height(Length::Fill)
             .align_y(Alignment::Center)
             .into()
     };
@@ -3260,8 +3261,8 @@ pub fn rail_footer<'a>(app: &'a App, state: &'a State, wide: bool) -> Element<'a
             .into()
         });
         (
-            ui::with_tooltip(room, title.clone()),
-            ui::with_tooltip(mic, mic_tip),
+            ui::rail_tooltip(room, title.clone()),
+            ui::rail_tooltip(mic, mic_tip),
             back,
         )
     } else {

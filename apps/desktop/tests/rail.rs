@@ -252,3 +252,91 @@ fn icons_and_labels_stay_put_while_sharing_and_navigating() {
         }
     }
 }
+
+/// En el riel ancho, cada fila del pie (la sala del invitado, el micrófono, «Volver a la sala» o
+/// las peticiones) lleva su icono y su nombre centrados en su alto, así que van a un paso fijo y
+/// no se ven desfasadas: como anfitrión y como invitado, dentro y fuera del vídeo. Se mira lo
+/// dibujado: las franjas con tinta del pie.
+#[test]
+fn the_wide_footer_rows_are_centred_and_evenly_spaced() {
+    let mut shots = match ShotRenderer::new() {
+        Ok(shots) => shots,
+        Err(err) => {
+            eprintln!("sin prueba del riel: {err}");
+            return;
+        }
+    };
+    // Escena y filas que tiene su pie.
+    let cases: &[(&str, usize)] = &[
+        ("09-riel-ancho-sala-claro", 2),
+        ("13-video-ancho-claro", 2),
+        ("16-fuera-de-la-sala-claro", 3),
+    ];
+    for &(name, rows) in cases {
+        let mut app = scene(name);
+        app.window = Size::new(WIDE.0 as f32, WIDE.1 as f32);
+        let mut interface =
+            UserInterface::build(app.view(), app.window, Cache::new(), shots.renderer());
+        let mut bounds = Bounds::default();
+        interface.operate(shots.renderer(), &mut bounds);
+        let find = |name: &'static str| {
+            bounds
+                .0
+                .iter()
+                .find(|(found, _)| *found == Id::new(name))
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("falta «{name}»"))
+        };
+        let rail = find(RAIL_ID);
+        let mic = find(RAIL_MIC_ID);
+        let pitch = mic.height + 2.0;
+        let theme = app.theme;
+        let (_, (width, _, pixels)) = shots.interact(app.view(), WIDE, &theme, &[]);
+        let at = |x: u32, y: u32| {
+            let i = ((y * width + x) * 4) as usize;
+            [pixels[i], pixels[i + 1], pixels[i + 2]]
+        };
+        // El fondo del riel, a la izquierda de los iconos.
+        let paper = at(rail.x as u32 + 2, mic.center_y() as u32);
+        let inked = |y: u32| {
+            (rail.x as u32 + 8..(rail.x + rail.width) as u32 - 8).any(|x| {
+                let px = at(x, y);
+                px.iter()
+                    .zip(paper)
+                    .map(|(a, b)| a.abs_diff(b) as u32)
+                    .sum::<u32>()
+                    > 60
+            })
+        };
+        // Franjas con tinta entre la fila de encima del micrófono y la raya del pie.
+        let mut bands: Vec<(u32, u32)> = Vec::new();
+        for y in (mic.y - pitch) as u32..(mic.y + 2.0 * pitch - 2.0) as u32 {
+            if !inked(y) {
+                continue;
+            }
+            match bands.last_mut() {
+                Some((_, end)) if *end + 1 == y => *end = y,
+                _ => bands.push((y, y)),
+            }
+        }
+        let centres: Vec<f32> = bands
+            .iter()
+            .filter(|(start, end)| end > start)
+            .map(|(start, end)| (start + end + 1) as f32 / 2.0)
+            .collect();
+        assert_eq!(centres.len(), rows, "{name}: filas del pie {bands:?}");
+        assert!(
+            centres
+                .iter()
+                .any(|centre| (centre - mic.center_y()).abs() <= 1.5),
+            "{name}: el micrófono no está centrado en su botón ({mic:?}): {centres:?}"
+        );
+        for pair in centres.windows(2) {
+            assert!(
+                (pair[1] - pair[0] - pitch).abs() <= 1.5,
+                "{name}: filas del pie a {} px en vez de {pitch}: {centres:?}",
+                pair[1] - pair[0]
+            );
+        }
+    }
+}

@@ -215,6 +215,11 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **El pie del riel ancho ya no se ve desfasado**: la sala, el micrófono y «Volver a la sala» (o
+  las peticiones, como anfitrión) quedan centrados en su fila y a la misma distancia. Antes el
+  icono y el nombre de los botones iban pegados arriba y, como invitado, la fila de la sala quedaba
+  casi encima del micrófono. Sus textos emergentes salen a la derecha, como los de los destinos, y
+  no tapan la fila de abajo.
 - **El relay funciona desde la misma red que el servidor** (protocolo 22; hay que actualizar
   también el servidor). El servidor anunciaba el relay en `COROOM_RELAY_ADDR`, normalmente la IP
   pública, y un cliente en la red local del servidor, detrás de un router que no devuelve hacia

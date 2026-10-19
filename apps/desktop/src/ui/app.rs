@@ -2370,6 +2370,7 @@ impl App {
             |icon: Icon, tint: SvgClass, label: Element<'a, Message>| -> Element<'a, Message> {
                 row![icon_with(icon, size::ICON, tint), label]
                     .spacing(space::XS)
+                    .height(Length::Fill)
                     .align_y(Alignment::Center)
                     .into()
             };
@@ -2397,7 +2398,7 @@ impl App {
                 .on_press(Message::Navigate(Page::Host))
                 .into()
             });
-            (ui::with_tooltip(mic, mic_tip), pending)
+            (ui::rail_tooltip(mic, mic_tip), pending)
         } else {
             let mic = coroom_ui::animate::button(iced_widget::center(icon_with(
                 mic_icon,
