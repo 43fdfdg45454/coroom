@@ -256,6 +256,11 @@ async function loadUsers() {
           if (!user.disabled && !confirm(`¿Deshabilitar a ${user.username}? Se cerrarán sus sesiones.`)) return;
           patchUser(user, { disabled: !user.disabled });
         },
+      }),
+      self ? null : el("button", {
+        type: "button", class: "small danger", text: "Eliminar",
+        "aria-label": `Eliminar la cuenta de ${user.username}`,
+        onclick: () => deleteUser(user),
       }));
     const picture = user.avatar == null ? null : el("img", { class: "avatar", alt: "", width: 32, height: 32 });
     if (picture) loadAvatar(picture, user);
@@ -290,6 +295,17 @@ async function removeAvatar(user) {
   try {
     await api("DELETE", `/admin/users/${user.id}/avatar`);
     notify(`${user.username}: avatar quitado.`);
+    await loadUsers();
+  } catch (err) {
+    notify(err.message, true);
+  }
+}
+
+async function deleteUser(user) {
+  if (!confirm(`¿Eliminar la cuenta de ${user.username}? Se cierran sus sesiones y se borran sus dispositivos, amistades, avatar y uso del relay. No se puede deshacer.`)) return;
+  try {
+    await api("DELETE", `/admin/users/${user.id}`);
+    notify(`${user.username}: cuenta eliminada.`);
     await loadUsers();
   } catch (err) {
     notify(err.message, true);

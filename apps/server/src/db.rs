@@ -451,6 +451,17 @@ impl Db {
         Ok(())
     }
 
+    /// Borra al usuario con todo lo suyo (dispositivos, sesiones, amistades, solicitudes, avatar y
+    /// uso del relay, en cascada; las invitaciones que creó o usó quedan sin autor). `false` si no
+    /// existía.
+    pub async fn delete_user(&self, id: i64) -> DbResult<bool> {
+        let result = sqlx::query("DELETE FROM users WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Administradores habilitados.
     pub async fn count_active_admins(&self) -> DbResult<u64> {
         let count: i64 =

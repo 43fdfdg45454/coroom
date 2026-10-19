@@ -78,6 +78,7 @@ pub(crate) async fn handle(state: &ServerState, request: &Request, segments: &[&
         (&Method::GET, ["users"]) => users(state).await,
         (&Method::POST, ["users"]) => create_user(state, request).await,
         (&Method::PATCH, ["users", user]) => update_user(state, request, &admin, user).await,
+        (&Method::DELETE, ["users", user]) => delete_user(state, &admin, user).await,
         (&Method::POST, ["users", user, "password"]) => set_password(state, request, user).await,
         (&Method::DELETE, ["users", user, "avatar"]) => delete_avatar(state, user).await,
         (&Method::GET, ["invitations"]) => invitations(state).await,
@@ -202,6 +203,26 @@ async fn update_user(
         state.hub.disconnect_user(user_id);
     }
     ok(&admin_user(state, user_id).await?)
+}
+
+/// Elimina una cuenta para siempre: se le cierran las sesiones (y la sala que tenga abierta) y
+/// desaparece de las listas de amigos. La propia no: así siempre queda quien la pide, un
+/// administrador habilitado.
+async fn delete_user(state: &ServerState, admin: &SessionRow, segment: &str) -> Handled {
+    let user_id = id(segment)?;
+    if user_id == admin.user.id {
+        return Err(bad_request("no puedes eliminar tu propia cuenta"));
+    }
+    if !state.db.delete_user(user_id).await.map_err(db_error)? {
+        return Err(fail(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no existe ese usuario",
+        ));
+    }
+    state.hub.disconnect_user(user_id);
+    tracing::info!(user = user_id, "usuario eliminado por un administrador");
+    ok(&serde_json::json!({}))
 }
 
 async fn set_password(state: &ServerState, request: &Request, segment: &str) -> Handled {

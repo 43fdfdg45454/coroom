@@ -69,6 +69,7 @@ pub fn axis(axis: Axis) -> Option<GamepadAxis> {
 pub struct GamepadCapture {
     stop: Arc<AtomicBool>,
     slot: Arc<AtomicU8>,
+    paused: Arc<AtomicBool>,
     choice: Arc<Mutex<PadChoice>>,
     /// Sube con cada [`GamepadCapture::set_choice`]: el hilo solo mira `choice` cuando cambia.
     generation: Arc<AtomicU64>,
@@ -82,6 +83,7 @@ impl GamepadCapture {
     pub fn spawn(link: Arc<dyn PadLink>, choice: PadChoice) -> Result<Self, InputError> {
         let stop = Arc::new(AtomicBool::new(false));
         let slot = Arc::new(AtomicU8::new(0));
+        let paused = Arc::new(AtomicBool::new(false));
         let choice = Arc::new(Mutex::new(choice));
         let generation = Arc::new(AtomicU64::new(0));
         let pads = Arc::new(Mutex::new(Vec::new()));
@@ -89,6 +91,7 @@ impl GamepadCapture {
             let shared = Shared {
                 stop: Arc::clone(&stop),
                 slot: Arc::clone(&slot),
+                paused: Arc::clone(&paused),
                 choice: Arc::clone(&choice),
                 generation: Arc::clone(&generation),
                 pads: Arc::clone(&pads),
@@ -102,6 +105,7 @@ impl GamepadCapture {
         Ok(Self {
             stop,
             slot,
+            paused,
             choice,
             generation,
             pads,
@@ -112,6 +116,14 @@ impl GamepadCapture {
     /// Ranura asignada por el anfitrión (`None`: sin mando).
     pub fn set_slot(&self, slot: Option<u8>) {
         self.slot.store(slot.unwrap_or(0), Ordering::Release);
+    }
+
+    /// En pausa, el mando sigue declarado en su ranura (el anfitrión no lo ve desconectarse,
+    /// que a algunos juegos los descoloca) pero no se manda lo que se toca: al pausar, lo
+    /// convertido vuelve al reposo (botones sueltos, ejes al centro) y lo tal cual deja de mandar
+    /// informes; al reanudar se manda el estado de ese momento.
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Release);
     }
 
     /// Qué mando mandar.
@@ -141,6 +153,7 @@ impl Drop for GamepadCapture {
 struct Shared {
     stop: Arc<AtomicBool>,
     slot: Arc<AtomicU8>,
+    paused: Arc<AtomicBool>,
     choice: Arc<Mutex<PadChoice>>,
     generation: Arc<AtomicU64>,
     pads: Arc<Mutex<Vec<ConnectedPad>>>,
@@ -164,6 +177,80 @@ fn key_of(gilrs: &Gilrs, id: GamepadId) -> PadKey {
         product: pad.product_id().unwrap_or(0),
         name: pad.name().to_owned(),
     }
+}
+
+/// Lo que tiene tocado un mando: botones pulsados y ejes fuera del centro.
+type Held = (Vec<GamepadButton>, Vec<(GamepadAxis, i16)>);
+
+/// Lo que se manda al pausar (`held` es `None`: todo suelto y al centro) o al reanudar con lo
+/// que el mando tiene tocado en ese momento (botones pulsados y ejes, el resto al centro).
+fn pause_events(slot: u8, held: Option<Held>) -> Vec<InputEvent> {
+    let resumed = held.is_some();
+    let (buttons, values) = held.unwrap_or_default();
+    let released = GamepadButton::ALL
+        .into_iter()
+        .filter(|button| !resumed || buttons.contains(button))
+        .map(|button| InputEvent::GamepadButton {
+            slot,
+            button,
+            pressed: resumed,
+        });
+    let axes = GamepadAxis::ALL
+        .into_iter()
+        .map(|axis| InputEvent::GamepadAxis {
+            slot,
+            axis,
+            value: values
+                .iter()
+                .find(|(held, _)| *held == axis)
+                .map_or(0, |(_, value)| *value),
+        });
+    released.chain(axes).collect()
+}
+
+/// Lo que tiene tocado ahora el mando `id`: botones pulsados y ejes fuera del centro.
+fn held(gilrs: &Gilrs, id: GamepadId) -> Held {
+    let pad = gilrs.gamepad(id);
+    let buttons = [
+        Button::South,
+        Button::East,
+        Button::West,
+        Button::North,
+        Button::LeftTrigger,
+        Button::RightTrigger,
+        Button::Select,
+        Button::Start,
+        Button::Mode,
+        Button::LeftThumb,
+        Button::RightThumb,
+        Button::DPadUp,
+        Button::DPadDown,
+        Button::DPadLeft,
+        Button::DPadRight,
+    ]
+    .into_iter()
+    .filter(|held| pad.is_pressed(*held))
+    .filter_map(button)
+    .collect();
+    let mut axes: Vec<(GamepadAxis, i16)> = [
+        Axis::LeftStickX,
+        Axis::LeftStickY,
+        Axis::RightStickX,
+        Axis::RightStickY,
+    ]
+    .into_iter()
+    .filter_map(|held| Some((axis(held)?, stick_value(pad.value(held)))))
+    .collect();
+    for (trigger, held) in [
+        (Button::LeftTrigger2, GamepadAxis::LeftTrigger),
+        (Button::RightTrigger2, GamepadAxis::RightTrigger),
+    ] {
+        if let Some(data) = pad.button_data(trigger) {
+            axes.push((held, trigger_value(data.value())));
+        }
+    }
+    axes.retain(|(_, value)| *value != 0);
+    (buttons, axes)
 }
 
 /// El mando que va a la ranura según `choice`.
@@ -400,7 +487,7 @@ impl Drop for RawPad {
 }
 
 /// Declara el mando de la ranura y, si es HID legible, arranca su hilo en crudo.
-fn declare(link: &Arc<dyn PadLink>, slot: u8, key: &PadKey) -> RawPad {
+fn declare(link: &Arc<dyn PadLink>, slot: u8, key: &PadKey, paused: &Arc<AtomicBool>) -> RawPad {
     let device = |transport| PadData::Device {
         slot,
         device: GamepadDevice {
@@ -457,10 +544,10 @@ fn declare(link: &Arc<dyn PadLink>, slot: u8, key: &PadKey) -> RawPad {
         );
         let stop = Arc::new(AtomicBool::new(false));
         let thread = {
-            let (stop, link) = (Arc::clone(&stop), Arc::clone(link));
+            let (stop, link, paused) = (Arc::clone(&stop), Arc::clone(link), Arc::clone(paused));
             thread::Builder::new()
                 .name("mando-crudo".into())
-                .spawn(move || raw_loop(reader, info, slot, &link, &stop))
+                .spawn(move || raw_loop(reader, info, slot, &link, &stop, &paused))
                 .ok()
         };
         RawPad {
@@ -475,6 +562,7 @@ fn declare(link: &Arc<dyn PadLink>, slot: u8, key: &PadKey) -> RawPad {
         target_os = "windows"
     )))]
     {
+        let _ = paused;
         link.pad(device(GamepadTransport::Converted {
             reason: "el invitado todavía no manda mandos tal cual desde este sistema".into(),
         }));
@@ -483,7 +571,9 @@ fn declare(link: &Arc<dyn PadLink>, slot: u8, key: &PadKey) -> RawPad {
 }
 
 /// Hilo `mando-crudo`: lee los informes de característica, declara el mando y pasa cada informe
-/// de entrada tal cual mientras el anfitrión lo tenga así.
+/// de entrada tal cual mientras el anfitrión lo tenga así y no esté en pausa
+/// ([`GamepadCapture::set_paused`]: el anfitrión se queda con el último; al reanudar va el de
+/// ese momento).
 #[cfg(any(
     all(target_os = "linux", feature = "linux-portal"),
     target_os = "windows"
@@ -494,6 +584,7 @@ fn raw_loop(
     slot: u8,
     link: &Arc<dyn PadLink>,
     stop: &AtomicBool,
+    paused: &AtomicBool,
 ) {
     let features = reader.read_features(&info.summary);
     link.pad(PadData::Device {
@@ -518,7 +609,7 @@ fn raw_loop(
         match reader.read_report(&mut buffer, timeout) {
             Ok(Some(len)) => {
                 let data = buffer[..len].to_vec();
-                if link.raw(slot) {
+                if link.raw(slot) && !paused.load(Ordering::Acquire) {
                     link.pad(PadData::Report {
                         slot,
                         data: data.clone(),
@@ -533,9 +624,12 @@ fn raw_loop(
                 return;
             }
         }
+        // Lo último, cada `RESEND` sin informes nuevos (también al reanudar, a más tardar en un
+        // `RESEND`).
         if since.elapsed() >= RESEND
             && let Some(data) = &last
             && link.raw(slot)
+            && !paused.load(Ordering::Acquire)
         {
             link.pad(PadData::Report {
                 slot,
@@ -604,6 +698,8 @@ fn run(shared: &Shared) {
     let mut rumble: Option<PadRumble> = None;
     let mut motors = SlotMotors::new();
     let mut last_rumble = Instant::now();
+    // Si lo que se toca se está callando ([`GamepadCapture::set_paused`]).
+    let mut paused = false;
     while !shared.stop.load(Ordering::Acquire) {
         // Espera en los mandos: un botón despierta al momento; con ejes pendientes, hasta que
         // toque enviarlos; si no, hasta la siguiente mirada a la ranura y las salidas.
@@ -636,7 +732,10 @@ fn run(shared: &Shared) {
             let Some((slot, announced_id)) = announced else {
                 continue;
             };
-            if event.id != announced_id || raw.as_ref().is_some_and(|r| r.hid && link.raw(slot)) {
+            if paused
+                || event.id != announced_id
+                || raw.as_ref().is_some_and(|r| r.hid && link.raw(slot))
+            {
                 continue;
             }
             let at = instant_of(event.time);
@@ -707,11 +806,26 @@ fn run(shared: &Shared) {
                     kind: GamepadKind::Xbox,
                 });
                 let key = key_of(&gilrs, id);
-                raw = Some(declare(link, slot, &key));
+                raw = Some(declare(link, slot, &key, &shared.paused));
                 rumble = Some(PadRumble::new(&key.name, rumble_help()));
             }
             announced = wanted;
             publish = true;
+        }
+
+        // Pausa: el mando sigue en la ranura, en reposo; al reanudar, lo que se tenga tocado.
+        let pause = shared.paused.load(Ordering::Acquire);
+        if pause != paused {
+            paused = pause;
+            axes.reset();
+            if let Some((slot, id)) = announced
+                && !raw.as_ref().is_some_and(|r| r.hid && link.raw(slot))
+            {
+                let now = (!paused).then(|| held(&gilrs, id));
+                for event in pause_events(slot, now) {
+                    link.event(event);
+                }
+            }
         }
 
         if publish {
@@ -790,6 +904,59 @@ mod tests {
         );
         // Una hora futura (reloj ajustado) no se adelanta.
         assert!(instant_of(SystemTime::now() + Duration::from_secs(5)) <= Instant::now());
+    }
+
+    /// Al pausar, el mando vuelve al reposo sin desconectarse; al reanudar, se manda lo que se
+    /// tiene tocado en ese momento y el resto al centro.
+    #[test]
+    fn pausing_rests_the_pad_and_resuming_sends_what_is_held() {
+        let paused = pause_events(2, None);
+        assert!(
+            !paused
+                .iter()
+                .any(|event| matches!(event, InputEvent::GamepadDisconnected { .. })),
+            "no se desconecta"
+        );
+        for button in GamepadButton::ALL {
+            assert!(paused.contains(&InputEvent::GamepadButton {
+                slot: 2,
+                button,
+                pressed: false
+            }));
+        }
+        for axis in GamepadAxis::ALL {
+            assert!(paused.contains(&InputEvent::GamepadAxis {
+                slot: 2,
+                axis,
+                value: 0
+            }));
+        }
+        let resumed = pause_events(
+            2,
+            Some((vec![GamepadButton::A], vec![(GamepadAxis::LeftX, 12_000)])),
+        );
+        let pressed: Vec<_> = resumed
+            .iter()
+            .filter(|event| matches!(event, InputEvent::GamepadButton { .. }))
+            .collect();
+        assert_eq!(
+            pressed,
+            [&InputEvent::GamepadButton {
+                slot: 2,
+                button: GamepadButton::A,
+                pressed: true
+            }]
+        );
+        assert!(resumed.contains(&InputEvent::GamepadAxis {
+            slot: 2,
+            axis: GamepadAxis::LeftX,
+            value: 12_000
+        }));
+        assert!(resumed.contains(&InputEvent::GamepadAxis {
+            slot: 2,
+            axis: GamepadAxis::RightY,
+            value: 0
+        }));
     }
 
     #[test]

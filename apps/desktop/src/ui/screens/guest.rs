@@ -791,10 +791,10 @@ pub fn start(app: &mut App, code: String) -> Vec<Effect> {
     vec![Effect::StopLobby, Effect::Join(code)]
 }
 
-/// La ranura del mando que se envía a la sala: la que dio el anfitrión, salvo desde otra página
-/// del riel (no se envía nada; el anfitrión lo ve desconectarse y volver al regresar).
-pub fn sent_pad_slot(app: &App, allowed: Option<u8>) -> Option<u8> {
-    if app.away_from_room() { None } else { allowed }
+/// Si el mando va en pausa: desde otra página del riel sigue en su ranura del anfitrión (que no
+/// lo vea desconectarse, que a algunos juegos los descoloca) pero en reposo y sin mandar nada.
+pub fn pad_paused(app: &App) -> bool {
+    app.away_from_room()
 }
 
 /// Si el riel se ve junto a la sala: con la ventana normal (a pantalla completa se oculta, como
@@ -4872,18 +4872,15 @@ mod tests {
     }
 
     /// Desde el riel se va a otras páginas sin salir de la sala: la sesión, el vídeo y el chat
-    /// siguen; el teclado, el ratón y los mandos dejan de enviarse; al volver, todo como estaba.
+    /// siguen; el teclado, el ratón y los mandos dejan de enviarse (el mando sigue conectado en el
+    /// anfitrión, en reposo); al volver, todo como estaba.
     #[test]
     fn the_rail_leaves_the_video_without_leaving_the_room() {
         let mut app = app();
         shots::video(&mut app);
         assert_eq!((app.screen, app.page), (Screen::Guest, Page::Host));
         assert!(app.video_in_front() && !app.away_from_room());
-        assert_eq!(
-            sent_pad_slot(&app, Some(2)),
-            Some(2),
-            "en la sala, el mando va"
-        );
+        assert!(!pad_paused(&app), "en la sala, el mando va");
         let feed = Arc::clone(&app.guest.as_ref().expect("invitado").feed);
         for page in [Page::Home, Page::Friends, Page::Settings, Page::Account] {
             let effects = app.update(Message::Navigate(page));
@@ -4897,7 +4894,10 @@ mod tests {
             assert!(app.in_room_as_guest() && app.away_from_room(), "{page:?}");
             // La entrada no se envía (la ventana suelta lo pulsado al dejar de estar delante).
             assert!(!app.video_in_front(), "{page:?}: el vídeo no está delante");
-            assert_eq!(sent_pad_slot(&app, Some(2)), None, "{page:?}: ni el mando");
+            assert!(
+                pad_paused(&app),
+                "{page:?}: el mando, en reposo y sin desconectarse"
+            );
         }
         // La sala sigue: llegan estadísticas y mensajes, el vídeo se sigue recibiendo.
         set_added(&mut app, 48, 0.1, 22.0);
@@ -4915,7 +4915,7 @@ mod tests {
         app.update(Message::Navigate(Page::Host));
         assert_eq!((app.screen, app.page), (Screen::Guest, Page::Host));
         assert!(app.video_in_front());
-        assert_eq!(sent_pad_slot(&app, Some(2)), Some(2));
+        assert!(!pad_paused(&app));
         assert_eq!(
             app.guest.as_ref().map(|g| g.phase),
             Some(Phase::Video),

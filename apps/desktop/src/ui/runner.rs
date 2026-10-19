@@ -663,8 +663,8 @@ impl Ready {
     /// Tras cada cambio de la aplicación: si el vídeo dejó de estar delante (un diálogo como la
     /// oferta de traspaso, otra página del riel), el teclado y el ratón pasan a la interfaz y se
     /// sueltan en el anfitrión las teclas, el cursor y la tecla de pulsar para hablar. Desde otra
-    /// página tampoco se envía el mando (el anfitrión lo ve desconectarse y volver). La captura
-    /// mide el vídeo sin el riel.
+    /// página el mando queda en pausa: sigue conectado en el anfitrión, en reposo. La captura mide
+    /// el vídeo sin el riel.
     fn sync_in_front(&mut self) {
         let in_front = self.video_in_front();
         let video = self.video_size();
@@ -673,8 +673,7 @@ impl Ready {
         };
         input.capture.set_window_size(video.0, video.1);
         if let Some(gamepads) = &input.gamepads {
-            let allowed = input.capture.allowed().gamepad_slot;
-            gamepads.set_slot(guest::sent_pad_slot(&self.app, allowed));
+            gamepads.set_paused(guest::pad_paused(&self.app));
         }
         let actions = input.capture.set_in_front(in_front);
         self.apply(actions);
@@ -872,7 +871,7 @@ impl Ready {
         }
         if allowed != input.capture.allowed() {
             if let Some(gamepads) = &input.gamepads {
-                gamepads.set_slot(guest::sent_pad_slot(&self.app, allowed.gamepad_slot));
+                gamepads.set_slot(allowed.gamepad_slot);
             }
             let actions = input.capture.set_allowed(allowed);
             self.apply(actions);

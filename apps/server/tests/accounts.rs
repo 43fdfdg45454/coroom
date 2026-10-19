@@ -770,6 +770,86 @@ async fn signaling_rejects_tokens_of_another_device() {
     server.stop().await;
 }
 
+/// El administrador elimina una cuenta: se cierra su sesión abierta, no vuelve a entrar,
+/// desaparece de las listas de amigos y su nombre queda libre. La propia no se puede eliminar.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_admin_deletes_an_account_for_good() {
+    let server = start(|_| {}).await;
+    let admin = server.admin().await;
+    let (ana_id, ana) = server.user(&admin, "ana").await;
+    let (_, bea) = server.user(&admin, "bea").await;
+    let ana_api = server.api_with(&ana.token);
+    let bea_api = server.api_with(&bea.token);
+    ana_api.add_friend("bea").await.expect("solicitud");
+    let incoming = bea_api.friends().await.expect("amigos").incoming;
+    bea_api
+        .accept_friend(incoming[0].id)
+        .await
+        .expect("aceptar");
+    let (_ana_endpoint, mut signal) = server.signal(&ana_id, &ana.token).await;
+
+    let (status, _) = raw(
+        &admin,
+        Method::DELETE,
+        &format!("/admin/users/{}", ana.user.id),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let closed = tokio::time::timeout(TIMEOUT, async {
+        loop {
+            match signal.next_event().await {
+                Ok(Some(SignalMessage::Error { code, .. })) => break Some(code),
+                Ok(Some(_)) => continue,
+                _ => break None,
+            }
+        }
+    })
+    .await
+    .expect("cierre a tiempo");
+    assert_eq!(closed, Some(ErrorCode::Unauthorized));
+    assert_eq!(api_code(ana_api.me().await).0, 401, "su sesión ya no vale");
+    assert_eq!(
+        api_code(server.api().admin_login("ana", PASSWORD).await),
+        (401, "invalid_credentials".to_owned())
+    );
+    assert!(
+        bea_api.friends().await.expect("amigos").friends.is_empty(),
+        "ya no está entre los amigos"
+    );
+    let (_, users) = raw(&admin, Method::GET, "/admin/users", json!({})).await;
+    assert!(
+        !users["users"]
+            .as_array()
+            .expect("usuarios")
+            .iter()
+            .any(|user| user["username"] == "ana"),
+        "{users}"
+    );
+    // El nombre queda libre.
+    server.user(&admin, "ana").await;
+    // Otra vez: ya no existe.
+    let (status, _) = raw(
+        &admin,
+        Method::DELETE,
+        &format!("/admin/users/{}", ana.user.id),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 404);
+    // La propia no: así siempre queda un administrador.
+    let me = admin.me().await.expect("yo").user.id;
+    let (status, own) = raw(
+        &admin,
+        Method::DELETE,
+        &format!("/admin/users/{me}"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, 400, "{own}");
+    server.stop().await;
+}
+
 /// Datagrama de vídeo de `len` bytes de carga.
 fn object(group: u32, index: u16, count: u16, len: usize) -> Bytes {
     let header = ObjectHeader {
