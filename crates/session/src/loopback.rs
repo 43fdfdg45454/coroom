@@ -38,6 +38,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use coroom_capture::idle::IdleCapturer;
 use coroom_capture::{
     CaptureError, CaptureOptions, CapturedFrame, Capturer, CursorShape, CursorState, FramePixels,
     GpuFrames,
@@ -404,6 +405,9 @@ pub(crate) struct Shared {
     /// La fuente en uso no comparte nada ([`Capturer::shares_nothing`]): sala solo de voz o tras
     /// «Dejar de compartir». El codificador olvida el último fotograma y no lo repite.
     nothing_shared: AtomicBool,
+    /// Lo que se compartía dejó de existir (se cerró la ventana o se desconectó el monitor) y la
+    /// captura siguió sin compartir nada: la sesión lo avisa una vez ([`Shared::take_source_lost`]).
+    source_lost: AtomicBool,
 }
 
 /// Hueco para el [`CursorSink`] del sumidero de presentación.
@@ -482,6 +486,11 @@ impl Shared {
     #[cfg(test)]
     pub(crate) fn set_sharing(&self, sharing: bool) {
         self.nothing_shared.store(!sharing, Ordering::Release);
+    }
+
+    /// Si lo que se compartía dejó de existir desde la última vez que se preguntó.
+    pub(crate) fn take_source_lost(&self) -> bool {
+        self.source_lost.swap(false, Ordering::AcqRel)
     }
 
     /// Anota si la fuente que entra comparte algo.
@@ -1214,11 +1223,21 @@ pub(crate) fn capture_loop(
                 let applied = capturer.set_gpu_frames(frames);
                 debug!(?applied, "imágenes de la captura en marcha");
             }
-            let Some(frame) = capturer
-                .next_frame_timeout(POLL)
-                .map_err(PipelineError::Capture)?
-            else {
-                continue;
+            let frame = match capturer.next_frame_timeout(POLL) {
+                Ok(Some(frame)) => frame,
+                Ok(None) => continue,
+                // Se cerró la aplicación compartida (o se desconectó el monitor): la sala sigue
+                // sin compartir nada, como con «Dejar de compartir», en vez de terminar o de
+                // dejar a los invitados con el último fotograma.
+                Err(CaptureError::TargetLost) if !capturer.shares_nothing() => {
+                    capturer.stop();
+                    capturer = Box::new(IdleCapturer::new());
+                    shared.note_source(capturer.as_ref());
+                    shared.source_lost.store(true, Ordering::Release);
+                    debug!("lo compartido ya no existe: se sigue sin compartir nada");
+                    continue;
+                }
+                Err(err) => return Err(PipelineError::Capture(err)),
             };
             ledger.mark(frame.frame_id, Stage::Captured, frame.captured_at);
             ledger.record_cpu_copies(Stage::Captured, frame.cpu_copies);
@@ -2033,6 +2052,53 @@ mod tests {
     use coroom_capture::synthetic::SyntheticCapturer;
     use coroom_codec::openh264::{OpenH264Decoder, OpenH264Encoder};
     use coroom_testkit::timing_assert;
+
+    /// Captura cuya ventana ya se cerró: cada fotograma pedido es [`CaptureError::TargetLost`].
+    struct Closed;
+
+    impl Capturer for Closed {
+        fn targets(&self) -> Result<Vec<coroom_capture::CaptureTarget>, CaptureError> {
+            Ok(Vec::new())
+        }
+
+        fn start(&mut self, _target: &coroom_capture::CaptureTarget) -> Result<(), CaptureError> {
+            Ok(())
+        }
+
+        fn next_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+            Err(CaptureError::TargetLost)
+        }
+
+        fn stop(&mut self) {}
+    }
+
+    /// Si se cierra lo compartido, la captura sigue sin compartir nada (la sala pasa a solo voz)
+    /// y lo avisa una vez, en vez de terminar la sesión.
+    #[test]
+    fn a_lost_source_keeps_the_room_without_sharing() {
+        let shared = Arc::new(Shared::default());
+        let ledger = Arc::new(LatencyLedger::new());
+        let (tx, rx) = bounded::<CapturedFrame>(CHANNEL_CAPACITY);
+        let capture = {
+            let (shared, ledger, evict) = (Arc::clone(&shared), Arc::clone(&ledger), rx.clone());
+            thread::spawn(move || capture_loop(Box::new(Closed), tx, evict, &shared, &ledger))
+        };
+        assert!(shared.sharing());
+        let started = Instant::now();
+        while shared.sharing() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "la captura no dejó de compartir"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(shared.take_source_lost(), "lo avisa");
+        assert!(!shared.take_source_lost(), "una sola vez");
+        assert!(!shared.stopping(), "la sesión sigue");
+        shared.finish(None);
+        assert_eq!(capture.join().expect("hilo"), Ok(()));
+        assert!(rx.try_recv().is_err(), "sin fotogramas");
+    }
 
     /// Las opciones nuevas de la captura se recogen una vez (gana la última) y la que se adopte
     /// después las encuentra.

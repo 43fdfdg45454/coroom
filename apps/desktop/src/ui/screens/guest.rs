@@ -3834,6 +3834,27 @@ mod tests {
         );
     }
 
+    /// A pantalla completa el puntero se oculta con la barra cuando el ratón queda quieto y vuelve
+    /// con ella al moverlo; en ventana, siempre se ve.
+    #[test]
+    fn the_pointer_hides_with_the_bar_in_fullscreen() {
+        let mut app = watching();
+        app.update(Message::PointerMoved);
+        assert!(!app.hides_pointer(), "en ventana, no");
+        app.update(Message::FullscreenChanged(true));
+        app.update(Message::PointerMoved);
+        assert!(!app.hides_pointer(), "recién movido, con la barra");
+        app.now += motion::BAR_HIDE;
+        app.update(Message::Tick);
+        assert!(app.hides_pointer(), "quieto: se va con la barra");
+        app.update(Message::PointerMoved);
+        assert!(!app.hides_pointer(), "vuelve al moverlo");
+        app.now += motion::BAR_HIDE;
+        app.update(Message::Tick);
+        app.update(Message::FullscreenChanged(false));
+        assert!(!app.hides_pointer());
+    }
+
     /// A pantalla completa en una sala solo de voz la ventana sigue el refresco del monitor (con
     /// VRR no lo deja bajar al mínimo); con transmisión, o en ventana, manda el vídeo como siempre.
     #[test]

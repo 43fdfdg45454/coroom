@@ -145,6 +145,8 @@ struct Ready {
     next_sync: Instant,
     ime: Option<(iced_core::Rectangle, iced_core::input_method::Purpose)>,
     interaction: mouse::Interaction,
+    /// El puntero está oculto porque el ratón quieto escondió la barra ([`App::hides_pointer`]).
+    pointer_hidden: bool,
     /// La aplicación pidió salir (`Ctrl+Q` confirmado).
     quit: bool,
     /// Eventos ya convertidos que la interfaz recibe de golpe en el próximo dibujo.
@@ -434,6 +436,7 @@ impl Runner {
             next_sync: Instant::now(),
             ime: None,
             interaction: mouse::Interaction::None,
+            pointer_hidden: false,
             quit: false,
             pending: Vec::new(),
             idle_inhibit: None,
@@ -756,6 +759,7 @@ impl Ready {
             input.gamepads.take();
             let _ = self.window.set_cursor_grab(CursorGrabMode::None);
             self.window.set_cursor_visible(true);
+            self.pointer_hidden = false;
         }
     }
 
@@ -828,6 +832,7 @@ impl Ready {
             let _ = self.window.set_cursor_grab(CursorGrabMode::None);
             self.window.set_cursor_visible(true);
             input.confined = false;
+            self.pointer_hidden = false;
             return;
         }
         match self.window.set_cursor_grab(CursorGrabMode::Locked) {
@@ -1409,8 +1414,9 @@ impl Ready {
             .input
             .as_ref()
             .is_some_and(|input| input.capture.grabbed());
-        if !grabbed && mouse_interaction != self.interaction {
-            match conversion::mouse_interaction(mouse_interaction) {
+        let hide = self.app.hides_pointer();
+        if !grabbed && (mouse_interaction != self.interaction || hide != self.pointer_hidden) {
+            match conversion::mouse_interaction(mouse_interaction).filter(|_| !hide) {
                 Some(icon) => {
                     self.window.set_cursor(icon);
                     self.window.set_cursor_visible(true);
@@ -1418,6 +1424,7 @@ impl Ready {
                 None => self.window.set_cursor_visible(false),
             }
             self.interaction = mouse_interaction;
+            self.pointer_hidden = hide;
         }
         match redraw_request {
             // Un componente se está animando: el siguiente cuadro, al ritmo del compositor.

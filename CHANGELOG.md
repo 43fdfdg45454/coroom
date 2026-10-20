@@ -215,6 +215,13 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **Al cerrarse lo compartido, los invitados se quedaban con el último fotograma**: al cerrarse la
+  aplicación compartida, PipeWire solo deja el flujo en pausa, sin error, y la sala seguía
+  «compartiendo» una imagen fija. En Windows, el mismo caso cerraba la sala entera. Ahora la sala
+  pasa a solo voz y chat (como con «Dejar de compartir»), el anfitrión recibe un aviso y los
+  invitados ven «Nadie está compartiendo».
+- **El puntero no se ocultaba a pantalla completa**: la barra se escondía con el ratón quieto, pero el
+  puntero quedaba encima del vídeo. Ahora se oculta junto con la barra y vuelve al mover el ratón.
 - **El monitor bajaba a 48 Hz en una sala solo de voz a pantalla completa**: con la sincronización
   adaptativa (VRR) el monitor refresca al ritmo al que la ventana entrega cuadros, y sin nada
   compartido la ventana casi no dibujaba, así que el monitor caía al mínimo de su rango y el

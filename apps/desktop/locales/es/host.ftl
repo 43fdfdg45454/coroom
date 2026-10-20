@@ -191,6 +191,7 @@ host-activar-tu-microfono = Activar tu micrófono
 host-silenciarte = Silenciarte para toda la sala
 host-modo-solo-voz = Solo voz
 host-solo-voz-ayuda = La sala se abre sin compartir nada: voz y chat. Desde la sala puedes compartir la pantalla o una ventana cuando quieras.
+host-lo-compartido-se-cerro = Lo que compartías se cerró: la sala sigue solo con voz y chat.
 host-solo-voz-detalle = Nadie verá tu pantalla: los invitados verán «Nadie está compartiendo».
 host-no-compartes-nada = No compartes nada
 host-no-compartes-nada-detalle = La sala es de voz y chat. Tus invitados ven «Nadie está compartiendo».

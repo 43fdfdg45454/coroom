@@ -1063,6 +1063,17 @@ impl App {
                 .is_some_and(guest::State::nothing_shared)
     }
 
+    /// Si el puntero se oculta: a pantalla completa con el vídeo delante, cuando el ratón quieto
+    /// ya escondió la barra (vuelve a verse con ella al moverlo).
+    pub fn hides_pointer(&self) -> bool {
+        self.fullscreen
+            && self.video_in_front()
+            && self
+                .guest
+                .as_ref()
+                .is_some_and(|guest| !guest.bar_visible(self.now))
+    }
+
     /// Si hay que impedir que el escritorio se bloquee: con el vídeo del invitado delante y el
     /// anfitrión compartiendo algo, o con la sala propia compartiendo. Quien mira (o juega con un
     /// mando, que el sistema no cuenta como actividad) no toca el teclado ni el ratón.

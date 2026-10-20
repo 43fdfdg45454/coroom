@@ -2867,6 +2867,9 @@ async fn run_host(
                 if core.shared.stopping() {
                     break Ok(());
                 }
+                if core.shared.take_source_lost() {
+                    core.emit(SessionEvent::SourceLost);
+                }
                 ctx.announce_sharing();
                 let captured = core.shared.counters.captured.load(Ordering::Relaxed);
                 if stall.check(captured, core.shared.sharing(), Instant::now()) {

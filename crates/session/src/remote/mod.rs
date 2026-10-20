@@ -528,6 +528,9 @@ pub enum SessionEvent {
     Audio(audio::AudioIssue),
     /// Invitado: quién está en la sala (el anfitrión incluido), cada vez que cambia.
     Members(Vec<RoomMember>),
+    /// Anfitrión: lo que se compartía dejó de existir (se cerró la aplicación o se desconectó el
+    /// monitor); la sala sigue sin compartir nada y los invitados pasan a solo voz.
+    SourceLost,
     /// Invitado: el anfitrión comparte algo (`true`) o la sala es solo de voz y chat (`false`),
     /// al conectar y cada vez que cambia.
     Sharing(bool),
@@ -640,6 +643,9 @@ impl fmt::Display for SessionEvent {
             }
             SessionEvent::MoveToRoom { code, host_name } => {
                 write!(f, "La sala pasa a {host_name}: código {code}.")
+            }
+            SessionEvent::SourceLost => {
+                f.write_str("Lo que compartías se cerró: la sala sigue solo con voz y chat.")
             }
             SessionEvent::Sharing(true) => f.write_str("El anfitrión comparte su pantalla."),
             SessionEvent::Sharing(false) => {

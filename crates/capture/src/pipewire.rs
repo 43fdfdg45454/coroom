@@ -1859,6 +1859,20 @@ fn run_stream(
                 renegotiate_mailbox.fail(err);
             }
         });
+        // Cuando el compositor deja de compartir (se cerró la ventana o se desconectó el
+        // monitor) el nodo del portal desaparece y el flujo solo pasa a `Paused`, sin error: se
+        // mira en el registro.
+        let registry = core.get_registry_rc().map_err(backend)?;
+        let lost_mailbox = Arc::clone(&mailbox);
+        let _registry = registry
+            .add_listener_local()
+            .global_remove(move |id| {
+                if id == node_id {
+                    tracing::info!(node_id, "PipeWire: el nodo compartido ya no existe");
+                    lost_mailbox.fail(CaptureError::TargetLost);
+                }
+            })
+            .register();
         let _ = ready.send(Ok(()));
         main_loop.run();
         let _ = stream.disconnect();

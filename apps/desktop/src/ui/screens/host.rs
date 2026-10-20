@@ -2107,6 +2107,16 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
         }
         SessionEvent::Warning(message) => app.toast(Tone::Warning, message),
         SessionEvent::Audio(issue) => app.toast(Tone::Warning, settings::audio_issue_text(&issue)),
+        // La sesión ya siguió sin compartir nada: la pantalla queda como tras «Dejar de
+        // compartir». Si se estaba cambiando de fuente, la nueva llega igual.
+        SessionEvent::SourceLost if app.host.room.is_some() && app.host.switching.is_none() => {
+            app.host.mode = ShareMode::Nothing;
+            app.host.target = None;
+            app.host.picked = None;
+            set_changing(app, false);
+            app.toast(Tone::Info, t!("host-lo-compartido-se-cerro"));
+            effects.extend(apply_source(app));
+        }
         _ => {}
     }
     effects
@@ -5181,6 +5191,19 @@ mod tests {
         assert!(app.wants_idle_inhibit());
         app.update(Message::Host(Msg::StopSharing));
         assert!(!app.wants_idle_inhibit(), "solo voz: nada que capturar");
+    }
+
+    /// Si se cierra lo que se compartía, la sala queda como tras «Dejar de compartir» y lo dice.
+    #[test]
+    fn a_closed_source_leaves_a_voice_room() {
+        let mut app = app();
+        open_room(&mut app);
+        assert!(app.sharing_screen());
+        app.toasts.clear();
+        app.update(Message::Event(Event::Host(SessionEvent::SourceLost)));
+        assert_eq!(app.host.source(), SourceChoice::Nothing);
+        assert!(!app.sharing_screen());
+        assert_eq!(app.toasts.len(), 1, "avisa una vez");
     }
 
     /// Con la sala abierta, cambiar de servidor pregunta antes (la cierra para todos) y no se
