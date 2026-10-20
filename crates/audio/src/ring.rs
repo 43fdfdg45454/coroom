@@ -332,6 +332,14 @@ impl Shared {
         captured_at
     }
 
+    /// Captura: si la cola ya guarda todo lo que [`Shared::try_take`] deja detrás de la trama que
+    /// toma, de modo que con la próxima llegada empezaría a perder audio.
+    pub(crate) fn backlog_full(&self, format: AudioFormat) -> bool {
+        let needed = format.samples_per_frame();
+        let ring = self.lock();
+        ring.failure.is_none() && ring.samples.len() >= needed + needed.max(ring.last_chunk)
+    }
+
     /// Reproducción: espera a que en cola quede como mucho una trama (de las dos que se admiten).
     pub(crate) fn wait_ready(&self, format: AudioFormat) -> Result<(), AudioError> {
         let frame = format.samples_per_frame();

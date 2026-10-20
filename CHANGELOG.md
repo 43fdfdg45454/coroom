@@ -215,6 +215,13 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **Audio cortado y «picado» con un anfitrión Windows y dos aplicaciones sonando**: cada
+  aplicación se captura por separado y WASAPI entrega cada una con su propia fase. La mezcla sacaba
+  una trama cada vez que llegaba audio de cualquiera, así que con dos aplicaciones salían el doble
+  de tramas (cada una con una sola aplicación) y el invitado tenía que tirar la mitad. Ahora la
+  mezcla va al ritmo de una de las capturas y suma lo que haya de las demás; si esa aplicación
+  calla, el ritmo pasa a otra antes de perder audio. En Linux no se notaba porque PipeWire entrega
+  todas las aplicaciones a la vez.
 - **Parpadeo en el escritorio con NVENC, AMF H.264 e Intel H.264/HEVC**: esos codificadores
   usaban *intra-refresh*, que recodifica desde cero una franja de la pantalla en cada fotograma
   para renovar la imagen entera en un segundo. Con la imagen quieta, esa franja se veía como un

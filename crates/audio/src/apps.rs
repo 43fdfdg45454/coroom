@@ -5,12 +5,16 @@
 //! captura por flujo (PipeWire: el nodo de reproducción de la aplicación; WASAPI: el loopback de
 //! su proceso). La mezcla:
 //!
-//! - **Va al ritmo de las capturas**: espera a que alguna tenga una trama entera (un aviso común
-//!   a todas, [`Arrivals`]) y entonces toma lo que haya de cada una sin esperar a las demás (una
-//!   aplicación en silencio no entrega nada) y suma con el [`Mixer`], que deja pasar intacto un
-//!   flujo solo. El reloj es el del dispositivo (el grafo de PipeWire, el motor de WASAPI), no
-//!   uno propio: con uno propio, cualquier deriva o fase entre los dos relojes metía tramas de
-//!   silencio o tiraba audio. Mientras llega audio espera a la siguiente trama hasta
+//! - **Va al ritmo de una captura**: la que marca el ritmo es la primera que entregó una trama
+//!   entera; la mezcla espera a su siguiente trama (un aviso común a todas, [`Arrivals`]) y
+//!   entonces toma lo que haya de las demás sin esperarlas (una aplicación en silencio no entrega
+//!   nada) y suma con el [`Mixer`], que deja pasar intacto un flujo solo. Cada captura tiene su
+//!   propia fase (WASAPI despierta cada loopback por separado): mezclar en cuanto llegaba
+//!   cualquiera sacaba una trama por llegada, el doble de tramas con dos aplicaciones. Si la que
+//!   marca el ritmo deja de entregar (su aplicación calló), el ritmo pasa a otra en cuanto esta
+//!   tiene la cola llena, antes de perder audio. El reloj es el del dispositivo (el grafo de
+//!   PipeWire, el motor de WASAPI), no uno propio: con uno propio, cualquier deriva o fase entre
+//!   los dos relojes metía tramas de silencio o tiraba audio. Mientras llega audio espera a la siguiente trama hasta
 //!   [`SILENCE_AFTER`] después de la última, como una captura sola ([`Shared::read_frame`]);
 //!   sin audio, entrega silencio cada 10 ms con su propio reloj. Detrás de lo que toma no deja
 //!   más de una trama (10 ms) en cola por captura, y la trama lleva la hora de captura real de
@@ -177,6 +181,8 @@ pub struct AppMixSource {
     mixer: Mixer,
     /// Aviso de llegada común a todas las capturas.
     arrivals: Arc<Arrivals>,
+    /// Flujo de la captura que marca el ritmo de la mezcla.
+    lead: Option<String>,
     /// Cuándo se mezcló audio por última vez (no silencio).
     last_audio: Option<Instant>,
     /// Siguiente trama de silencio con el reloj propio (sin audio).
@@ -194,6 +200,7 @@ impl AppMixSource {
             scanner: None,
             mixer: Mixer::new(AudioFormat::GAME.channels),
             arrivals: Arc::default(),
+            lead: None,
             last_audio: None,
             next_tick: None,
             scratch: Vec::new(),
@@ -266,6 +273,30 @@ fn sync_taps(
     }
 }
 
+/// Si toca mezclar: cuando la captura que marca el ritmo (`lead`) tiene una trama. Sin ella (aún
+/// ninguna, o se cerró) marca el ritmo la primera que tenga una trama; si la que lo marca no
+/// entrega, otra con la cola llena, que si no empezaría a perder audio.
+fn pace(taps: &HashMap<String, Tap>, lead: &mut Option<String>, format: AudioFormat) -> bool {
+    let current = lead.as_ref().and_then(|stream| taps.get(stream));
+    if current.is_some_and(|tap| tap.shared.has_frame(format)) {
+        return true;
+    }
+    let next = taps
+        .iter()
+        .find(|(_, tap)| match current {
+            Some(_) => tap.shared.backlog_full(format),
+            None => tap.shared.has_frame(format),
+        })
+        .map(|(stream, _)| stream.clone());
+    match next {
+        Some(stream) => {
+            *lead = Some(stream);
+            true
+        }
+        None => false,
+    }
+}
+
 impl AudioSource for AppMixSource {
     fn format(&self) -> AudioFormat {
         self.format
@@ -314,6 +345,7 @@ impl AudioSource for AppMixSource {
             quit,
             thread: Some(thread),
         });
+        self.lead = None;
         self.last_audio = None;
         self.next_tick = None;
         Ok(())
@@ -339,12 +371,11 @@ impl AudioSource for AppMixSource {
         let format = self.format;
         loop {
             let seen = self.arrivals.generation();
-            let ready = self
-                .taps
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .values()
-                .any(|tap| tap.shared.has_frame(format));
+            let ready = pace(
+                &self.taps.lock().unwrap_or_else(PoisonError::into_inner),
+                &mut self.lead,
+                format,
+            );
             if ready || Instant::now() >= deadline {
                 break;
             }
@@ -388,6 +419,7 @@ impl AudioSource for AppMixSource {
 
     fn stop(&mut self) {
         self.scanner = None;
+        self.lead = None;
         let taps: Vec<Tap> = self
             .taps
             .lock()
@@ -466,9 +498,17 @@ mod tests {
         assert_eq!(apps[1].name, "Juego");
     }
 
-    /// Backend de prueba: dos flujos, uno que suena (llena su anillo) y otro mudo.
+    /// Backend de prueba: dos flujos, `a` (juego) y `b` (voz), cuyos anillos llena cada prueba.
+    #[derive(Default)]
     struct Fake {
-        loud: Mutex<Option<Arc<Shared>>>,
+        opened: Mutex<HashMap<String, Arc<Shared>>>,
+    }
+
+    impl Fake {
+        fn stream(&self, stream: &str) -> Arc<Shared> {
+            let opened = self.opened.lock().unwrap();
+            Arc::clone(opened.get(stream).expect("flujo abierto"))
+        }
     }
 
     impl AppBackend for Fake {
@@ -481,9 +521,10 @@ mod tests {
 
         fn open(&self, stream: &str, format: AudioFormat) -> Result<Tap, AudioError> {
             let shared = Shared::new(format);
-            if stream == "a" {
-                *self.loud.lock().unwrap() = Some(Arc::clone(&shared));
-            }
+            self.opened
+                .lock()
+                .unwrap()
+                .insert(stream.to_owned(), Arc::clone(&shared));
             Ok(Tap {
                 shared,
                 _guard: Box::new(()),
@@ -497,16 +538,14 @@ mod tests {
 
     #[test]
     fn the_mix_paces_itself_and_skips_excluded_apps() {
-        let fake = Arc::new(Fake {
-            loud: Mutex::new(None),
-        });
+        let fake = Arc::new(Fake::default());
         let mut source = AppMixSource::new(
             Arc::clone(&fake) as Arc<dyn AppBackend>,
             AppFilter::AllExcept(vec!["voz".into()]),
         );
         source.start(&AudioConfig::game()).expect("start");
         assert_eq!(source.taps.lock().unwrap().len(), 1, "voz no se abre");
-        let loud = fake.loud.lock().unwrap().clone().expect("juego abierto");
+        let loud = fake.stream("a");
         // El dispositivo fecha el búfer hace 30 ms: es la hora que lleva la trama mezclada.
         let device = Instant::now() - Duration::from_millis(30);
         loud.push(
@@ -536,15 +575,13 @@ mod tests {
 
     #[test]
     fn the_mix_follows_the_capture_clock_instead_of_inserting_silence() {
-        let fake = Arc::new(Fake {
-            loud: Mutex::new(None),
-        });
+        let fake = Arc::new(Fake::default());
         let mut source = AppMixSource::new(
             Arc::clone(&fake) as Arc<dyn AppBackend>,
             AppFilter::Only(vec!["juego".into()]),
         );
         source.start(&AudioConfig::game()).expect("start");
-        let loud = fake.loud.lock().unwrap().clone().expect("juego abierto");
+        let loud = fake.stream("a");
         let frame_of =
             |value: i16| std::iter::repeat_n(value, AudioFormat::GAME.samples_per_frame());
         // Un flujo solo pasa intacto por la mezcla: ni limitador ni redondeos, aunque vaya al
@@ -588,11 +625,82 @@ mod tests {
         );
     }
 
+    /// Dos aplicaciones con su propia fase, como dos loopback de WASAPI: cada 10 ms llega una
+    /// trama de cada una, a 5 ms de la otra. La mezcla saca una trama por cada 10 ms con las dos
+    /// sumadas, no una por llegada (el doble, que el receptor tenía que recortar).
+    #[test]
+    fn two_captures_out_of_phase_mix_at_one_frame_per_period() {
+        const FRAMES: u32 = 40;
+        let fake = Arc::new(Fake::default());
+        let mut source = AppMixSource::new(
+            Arc::clone(&fake) as Arc<dyn AppBackend>,
+            AppFilter::AllExcept(Vec::new()),
+        );
+        source.start(&AudioConfig::game()).expect("start");
+        let started = Instant::now();
+        let pushers: Vec<_> = [
+            ("a", 1000_i16, Duration::ZERO),
+            ("b", 100, FRAME_DURATION / 2),
+        ]
+        .into_iter()
+        .map(|(stream, value, phase)| {
+            let shared = fake.stream(stream);
+            thread::spawn(move || {
+                for frame in 0..FRAMES {
+                    let at = started + phase + FRAME_DURATION * frame;
+                    // El ritmo del dispositivo simulado, no una espera para sincronizar.
+                    thread::sleep(at.saturating_duration_since(Instant::now()));
+                    shared.push(
+                        AudioFormat::GAME,
+                        std::iter::repeat_n(value, AudioFormat::GAME.samples_per_frame()),
+                        None,
+                    );
+                }
+            })
+        })
+        .collect();
+        let mut frame = Vec::new();
+        let (mut audio, mut both) = (0_u32, 0_u32);
+        loop {
+            source.read(&mut frame).expect("trama");
+            let value = frame[0];
+            assert!(
+                frame.iter().all(|&s| s == value),
+                "trama partida: {:?}",
+                &frame[..4]
+            );
+            assert!(
+                matches!(value, 0 | 100 | 1000 | 1100),
+                "mezcla con valores ajenos: {value}"
+            );
+            if value == 0 {
+                if pushers.iter().all(|pusher| pusher.is_finished()) {
+                    break;
+                }
+                continue;
+            }
+            audio += 1;
+            both += u32::from(value == 1100);
+        }
+        for pusher in pushers {
+            pusher.join().expect("hilo");
+        }
+        // Con una trama por llegada salían 2 × FRAMES; seguir a una captura no pasa de una trama
+        // por cada una de las suyas, más algún relevo si una se atrasa en una máquina cargada.
+        assert!(audio > 0, "no salió audio");
+        assert!(
+            audio < FRAMES * 3 / 2,
+            "{audio} tramas con audio de {FRAMES} por aplicación: una por llegada"
+        );
+        coroom_testkit::timing_assert!(
+            audio <= FRAMES + 2 && both + 4 >= FRAMES,
+            "{audio} tramas con audio ({both} con las dos aplicaciones) de {FRAMES} por aplicación"
+        );
+    }
+
     #[test]
     fn the_filter_changes_while_mixing() {
-        let fake = Arc::new(Fake {
-            loud: Mutex::new(None),
-        });
+        let fake = Arc::new(Fake::default());
         let mut source = AppMixSource::new(
             Arc::clone(&fake) as Arc<dyn AppBackend>,
             AppFilter::Only(vec!["juego".into()]),
