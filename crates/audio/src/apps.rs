@@ -686,16 +686,76 @@ mod tests {
             pusher.join().expect("hilo");
         }
         // Con una trama por llegada salían 2 × FRAMES; seguir a una captura no pasa de una trama
-        // por cada una de las suyas, más algún relevo si una se atrasa en una máquina cargada.
+        // por cada una de las suyas, más algún relevo si los hilos de prueba se atrasan (lo
+        // determinista lo prueba `the_lead_capture_sets_the_pace`).
         assert!(audio > 0, "no salió audio");
-        assert!(
-            audio < FRAMES * 3 / 2,
-            "{audio} tramas con audio de {FRAMES} por aplicación: una por llegada"
-        );
         coroom_testkit::timing_assert!(
             audio <= FRAMES + 2 && both + 4 >= FRAMES,
             "{audio} tramas con audio ({both} con las dos aplicaciones) de {FRAMES} por aplicación"
         );
+    }
+
+    /// El ritmo, sin hilos ni relojes: llegan tramas de dos capturas desfasadas y se mezcla cada
+    /// vez que toca. Sale una mezcla por trama de la que marca el ritmo, con las dos sumadas; si
+    /// esa calla, la otra toma el ritmo cuando se le llena la cola, sin perder audio.
+    #[test]
+    fn the_lead_capture_sets_the_pace() {
+        const FRAMES: u32 = 40;
+        let format = AudioFormat::GAME;
+        let taps: HashMap<String, Tap> = ["a", "b"]
+            .into_iter()
+            .map(|stream| {
+                let tap = Tap {
+                    shared: Shared::new(format),
+                    _guard: Box::new(()),
+                };
+                (stream.to_owned(), tap)
+            })
+            .collect();
+        let push = |stream: &str| {
+            taps[stream].shared.push(
+                format,
+                std::iter::repeat_n(1, format.samples_per_frame()),
+                None,
+            );
+        };
+        let mut lead = None;
+        let mut scratch = Vec::new();
+        // Mezcla mientras toque y cuenta cuántas veces y cuántas con las dos capturas.
+        let mut mix = |lead: &mut Option<String>, mixes: &mut u32, both: &mut u32| {
+            while pace(&taps, lead, format) {
+                let taken = taps
+                    .values()
+                    .filter(|tap| tap.shared.try_take(format, &mut scratch).is_some())
+                    .count();
+                *mixes += 1;
+                *both += u32::from(taken == 2);
+            }
+        };
+        let (mut mixes, mut both) = (0, 0);
+        for _ in 0..FRAMES {
+            push("a");
+            mix(&mut lead, &mut mixes, &mut both);
+            push("b");
+            mix(&mut lead, &mut mixes, &mut both);
+        }
+        assert_eq!(lead.as_deref(), Some("a"), "marca el ritmo la primera");
+        assert_eq!(mixes, FRAMES, "una mezcla por trama, no una por llegada");
+        assert_eq!(both, FRAMES - 1, "todas con las dos salvo la primera");
+        // `a` calla: `b` tiene en cola la trama que llegó tras la última mezcla y se espera a
+        // `a`; con la siguiente, la cola de `b` está llena y toma el ritmo.
+        let (mut mixes, mut both) = (0, 0);
+        mix(&mut lead, &mut mixes, &mut both);
+        assert_eq!(mixes, 0, "una trama de retraso se espera");
+        push("b");
+        mix(&mut lead, &mut mixes, &mut both);
+        assert_eq!(
+            lead.as_deref(),
+            Some("b"),
+            "con la cola llena, el ritmo pasa a la otra"
+        );
+        assert_eq!(mixes, 2, "lo que esperaba sale entero");
+        assert!(!taps["b"].shared.has_frame(format));
     }
 
     #[test]
