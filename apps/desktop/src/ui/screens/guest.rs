@@ -3834,6 +3834,29 @@ mod tests {
         );
     }
 
+    /// A pantalla completa en una sala solo de voz la ventana sigue el refresco del monitor (con
+    /// VRR no lo deja bajar al mínimo); con transmisión, o en ventana, manda el vídeo como siempre.
+    #[test]
+    fn only_a_fullscreen_voice_room_keeps_the_monitor_refresh() {
+        let mut app = app();
+        shots::joined(&mut app, false, true);
+        app.update(Message::Event(Event::Guest(SessionEvent::Sharing(false))));
+        app.update(Message::Tick);
+        assert!(app.video_in_front());
+        assert!(!app.keeps_refresh(), "en ventana, no");
+        app.update(Message::FullscreenChanged(true));
+        assert!(
+            app.keeps_refresh(),
+            "a pantalla completa sin nada compartido"
+        );
+        app.update(Message::Event(Event::Guest(SessionEvent::Sharing(true))));
+        assert!(!app.keeps_refresh(), "con transmisión manda el vídeo");
+        app.update(Message::Event(Event::Guest(SessionEvent::Sharing(false))));
+        assert!(app.keeps_refresh());
+        app.update(Message::FullscreenChanged(false));
+        assert!(!app.keeps_refresh());
+    }
+
     /// Cerrar la ventana (o `Ctrl+Q`) dentro de una sala pregunta antes, como `Esc`; al
     /// confirmar, sale de la sala y cierra.
     #[test]

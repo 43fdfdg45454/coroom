@@ -3,7 +3,9 @@
 //! Cada animación es una función del tiempo ([`super::app::App::now`]), así que se ve igual a 60,
 //! 144 o 240 Hz y un cuadro perdido no la atrasa. Mientras algo se mueve
 //! ([`super::app::App::animating`]) la ventana dibuja un cuadro por refresco del monitor en el que
-//! está, y ninguno en reposo. El ritmo lo marca el sistema, nunca un número supuesto
+//! está, y ninguno en reposo (salvo a pantalla completa en una sala solo de voz, que sigue el
+//! refresco para que la sincronización adaptativa no baje el monitor al mínimo:
+//! [`super::app::App::keeps_refresh`]). El ritmo lo marca el sistema, nunca un número supuesto
 //! ([`FrameClock`]):
 //!
 //! - **Wayland**: la señal de cuadro del compositor. Justo antes de entregar la interfaz la ventana

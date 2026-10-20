@@ -1049,6 +1049,20 @@ impl App {
                 .is_some_and(|guest| guest.phase == guest::Phase::Video)
     }
 
+    /// Si la ventana dibuja a cada refresco del monitor aunque nada se mueva: a pantalla completa
+    /// en una sala solo de voz (el anfitrión no comparte nada). Con la sincronización adaptativa
+    /// (VRR) el monitor refresca al ritmo al que la ventana entrega cuadros, y en reposo bajaba al
+    /// mínimo de su rango: el puntero del sistema iba a ese ritmo. Con transmisión manda el vídeo,
+    /// como siempre.
+    pub fn keeps_refresh(&self) -> bool {
+        self.fullscreen
+            && self.video_in_front()
+            && self
+                .guest
+                .as_ref()
+                .is_some_and(guest::State::nothing_shared)
+    }
+
     /// Si hay que impedir que el escritorio se bloquee: con el vídeo del invitado delante y el
     /// anfitrión compartiendo algo, o con la sala propia compartiendo. Quien mira (o juega con un
     /// mando, que el sistema no cuenta como actividad) no toca el teclado ni el ratón.

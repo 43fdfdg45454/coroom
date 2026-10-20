@@ -1332,11 +1332,13 @@ impl Ready {
     }
 
     /// Pide el siguiente cuadro de animación al ritmo del compositor ([`pacing`]), si algo se
-    /// mueve. Con el teclado y el ratón tomados o en modo inmersivo no se anima nada: se leen en
+    /// mueve o la ventana tiene que seguir el refresco del monitor ([`App::keeps_refresh`]). Con el teclado y el ratón tomados o en modo inmersivo no se anima nada: se leen en
     /// este mismo hilo; con la ventana oculta, tampoco. Un dibujo que quedó esperando al vídeo
     /// (`video`) sale solo si el vídeo se detiene.
     fn schedule_frame(&mut self, now: Instant, video: Option<Duration>) {
-        let animating = (self.app.animating() || std::mem::take(&mut self.ui_frame))
+        let animating = (self.app.animating()
+            || self.app.keeps_refresh()
+            || std::mem::take(&mut self.ui_frame))
             && !self.input_taken()
             && !self.app.window_hidden;
         if !animating && video.is_none() {

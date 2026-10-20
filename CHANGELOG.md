@@ -215,6 +215,11 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **El monitor bajaba a 48 Hz en una sala solo de voz a pantalla completa**: con la sincronización
+  adaptativa (VRR) el monitor refresca al ritmo al que la ventana entrega cuadros, y sin nada
+  compartido la ventana casi no dibujaba, así que el monitor caía al mínimo de su rango y el
+  puntero se movía a ese ritmo. Ahora, a pantalla completa y sin nadie compartiendo, la ventana
+  dibuja a cada refresco del monitor. Con transmisión sigue mandando el ritmo del vídeo.
 - **Audio cortado y «picado» con un anfitrión Windows y dos aplicaciones sonando**: cada
   aplicación se captura por separado y WASAPI entrega cada una con su propia fase. La mezcla sacaba
   una trama cada vez que llegaba audio de cualquiera, así que con dos aplicaciones salían el doble
