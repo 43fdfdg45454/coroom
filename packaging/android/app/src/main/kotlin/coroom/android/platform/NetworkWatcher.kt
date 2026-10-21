@@ -35,6 +35,10 @@ class NetworkWatcher(
     private val connectivity = context.getSystemService(ConnectivityManager::class.java)
     private val _kind = MutableStateFlow<NetworkKind>(NetworkKind.Unknown)
     val kind: StateFlow<NetworkKind> = _kind.asStateFlow()
+    private val _metered = MutableStateFlow(connectivity.isActiveNetworkMetered)
+
+    /** Si la red de ahora tiene límite de datos (`isActiveNetworkMetered`): la versión nueva espera. */
+    val metered: StateFlow<Boolean> = _metered.asStateFlow()
 
     private var lastRoute: Pair<String?, Int?>? = null
     private var started = false
@@ -46,6 +50,7 @@ class NetworkWatcher(
 
         override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
             _kind.value = kindOf(capabilities)
+            _metered.value = connectivity.isActiveNetworkMetered
         }
 
         override fun onLost(network: Network) {

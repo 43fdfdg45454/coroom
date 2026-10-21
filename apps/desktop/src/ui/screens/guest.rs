@@ -40,7 +40,7 @@ use coroom_ui::sound::{Cue, cue};
 use coroom_ui::style::{ButtonClass, ContainerClass, SliderClass, SvgClass, TextClass};
 use coroom_ui::theme::{Palette, Tone};
 use coroom_ui::tokens::{motion, size, space, text as type_size};
-use coroom_ui::widget::{self as ui};
+use coroom_ui::widget::{self as ui, Kind};
 use iced_core::alignment::{Horizontal, Vertical};
 use iced_core::text::Wrapping;
 use iced_core::{Alignment, Length, Padding, Vector};
@@ -242,6 +242,13 @@ pub struct State {
     pub host_sharing: Option<bool>,
     /// La sala pasó a otro anfitrión: al terminar esta sesión, se entra en la de este código.
     pub moving_to: Option<String>,
+    /// El vídeo apagado: el anfitrión no lo manda y la entrada queda en pausa. No se recuerda
+    /// entre salas: cada sala arranca con el vídeo encendido.
+    pub video_off: bool,
+    /// Lo más ancho que mostró cada tramo de la píldora de la latencia (el de la cifra y el del
+    /// relay) con el texto de ahora: la de la barra y la de encima del vídeo miden lo mismo
+    /// aunque una desaparezca y vuelva, y vuelven a medir al cambiar de texto ([`pill_view`]).
+    pub pill_widest: [coroom_ui::slot::SharedWidest; 2],
 }
 
 /// Ventana en la que se cuentan los errores de decodificación.
@@ -326,14 +333,29 @@ impl State {
             level_changed_at: None,
             host_sharing: None,
             moving_to: None,
+            video_off: false,
             talk_order: Vec::new(),
             talk_since: std::collections::BTreeMap::new(),
+            pill_widest: Default::default(),
         }
     }
 
     /// Si el anfitrión dijo que no comparte nada (la sala es solo de voz y chat).
     pub fn nothing_shared(&self) -> bool {
         self.host_sharing == Some(false)
+    }
+
+    /// Si se ve la vista del vídeo apagado: con el vídeo apagado y el anfitrión compartiendo algo
+    /// (si deja de compartir, manda «Nadie comparte»).
+    pub fn video_off_shown(&self) -> bool {
+        self.video_off && !self.nothing_shared()
+    }
+
+    /// Si la sala es solo de voz en este equipo: el anfitrión no comparte nada o el vídeo está
+    /// apagado. No hay imagen que tapar: la barra queda fija y la ventana sigue el refresco del
+    /// monitor a pantalla completa.
+    pub fn voice_only(&self) -> bool {
+        self.nothing_shared() || self.video_off
     }
 
     /// Si el teclado y el ratón van a la sala o se está en modo inmersivo: la entrada se lee en
@@ -412,15 +434,16 @@ impl State {
         next
     }
 
-    /// Si la barra se ve (con el panel o el menú del sonido abiertos, o reconectando, siempre; en
-    /// modo inmersivo, nunca).
+    /// Si la barra se ve (con el panel o el menú del sonido abiertos, reconectando o con el vídeo
+    /// apagado, siempre; en modo inmersivo, nunca).
     pub fn bar_visible(&self, now: Instant) -> bool {
         self.phase == Phase::Video
             && !self.immersive
             && (now < self.bar_until
                 || self.panel.is_some()
                 || self.sound_menu
-                || self.reconnecting.is_some())
+                || self.reconnecting.is_some()
+                || self.video_off)
     }
 
     /// Cuánto le falta a la barra para estar en su sitio (0: en su sitio, 1: fuera por arriba)
@@ -760,6 +783,8 @@ pub enum Msg {
     MicVolumeDone,
     /// Audio del juego.
     ToggleGame,
+    /// Apagar o encender el vídeo (`Ctrl+Alt+I`).
+    ToggleVideo,
     /// Pantalla completa.
     ToggleFullscreen,
     /// Salir (pide confirmación).
@@ -794,7 +819,7 @@ pub fn start(app: &mut App, code: String) -> Vec<Effect> {
 /// Si el mando va en pausa: desde otra página del riel sigue en su ranura del anfitrión (que no
 /// lo vea desconectarse, que a algunos juegos los descoloca) pero en reposo y sin mandar nada.
 pub fn pad_paused(app: &App) -> bool {
-    app.away_from_room()
+    app.away_from_room() || app.guest.as_ref().is_some_and(|guest| guest.video_off)
 }
 
 /// Si el riel se ve junto a la sala: con la ventana normal (a pantalla completa se oculta, como
@@ -825,7 +850,12 @@ pub fn pointer_over_ui(app: &App, position: iced_core::Point, size: iced_core::S
     let Some(state) = app.guest.as_ref() else {
         return true;
     };
-    if state.phase != Phase::Video || !app.toasts.is_empty() || state.reconnecting.is_some() {
+    // Con el vídeo apagado, su vista (con su botón) ocupa el sitio de la imagen.
+    if state.phase != Phase::Video
+        || !app.toasts.is_empty()
+        || state.reconnecting.is_some()
+        || state.video_off_shown()
+    {
         return true;
     }
     if position.x <= video_left(app) {
@@ -1062,6 +1092,10 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             return vec![Effect::SetPadChoice(choice), Effect::SaveSettings];
         }
         Msg::ToggleImmersive => {
+            // Con el vídeo apagado, la entrada está en pausa.
+            if state.video_off {
+                return Vec::new();
+            }
             let immersive = !state.immersive;
             state.set_immersive(immersive, now);
             return vec![Effect::SetImmersive(immersive)];
@@ -1078,6 +1112,29 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         }
         Msg::MicVolumeDone => return app.settings_changed(),
         Msg::ToggleGame => return vec![Effect::ToggleGameAudio],
+        Msg::ToggleVideo => {
+            // En la prueba local no hay anfitrión que deje de mandar.
+            if state.probe || state.phase != Phase::Video {
+                return Vec::new();
+            }
+            state.video_off = !state.video_off;
+            state.reveal_bar(now);
+            let mut effects = Vec::new();
+            if state.video_off {
+                // Sin imagen no hay juego que tenga el ratón: sale del modo inmersivo.
+                if state.immersive {
+                    state.set_immersive(false, now);
+                    state.notice = None;
+                    effects.push(Effect::SetImmersive(false));
+                }
+            } else {
+                // La imagen vuelve con el fundido de entrada: tapa el último fotograma de antes
+                // de apagarlo hasta que llega la imagen completa que manda el anfitrión.
+                state.video_at = Some(now);
+            }
+            effects.push(Effect::SetVideoPaused(state.video_off));
+            return effects;
+        }
         Msg::ToggleFullscreen => return vec![Effect::SetFullscreen(!fullscreen)],
         Msg::Leave => {
             if app.probe {
@@ -1878,6 +1935,9 @@ const PILL_HEIGHT: f32 = 36.0;
 /// Margen del fondo de un grupo de botones de la barra.
 const GROUP_PADDING: f32 = 2.0;
 
+/// Separación entre los botones de un grupo de la barra.
+const GROUP_SPACING: f32 = 2.0;
+
 /// Lado de un grupo de un solo botón (el de control).
 const SINGLE_GROUP: f32 = size::CONTROL + 2.0 * GROUP_PADDING;
 
@@ -1896,6 +1956,9 @@ const BELOW_BAR: f32 = space::S + size::VIDEO_BAR + space::S;
 
 /// «AV1 · 1440p60 · 18,4 Mbit/s»: lo que llega (la ruta va con la latencia).
 fn bar_facts(state: &State) -> String {
+    if state.video_off {
+        return t!("room-solo-voz").to_owned();
+    }
     let mut facts = Vec::new();
     if let Some(codec) = state.codec.as_ref().and_then(|c| c.split(' ').next()) {
         facts.push(codec.to_owned());
@@ -1919,7 +1982,7 @@ fn bar_facts(state: &State) -> String {
 fn bar_group<'a>(buttons: Vec<Element<'a, Message>>) -> Element<'a, Message> {
     container(
         iced_widget::Row::with_children(buttons)
-            .spacing(2)
+            .spacing(GROUP_SPACING)
             .align_y(Alignment::Center),
     )
     .padding(GROUP_PADDING)
@@ -1957,7 +2020,25 @@ fn voice_group<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         state.sound_menu,
         on(Msg::ToggleSoundMenu),
     );
-    bar_group(vec![ui::reserved(size::CONTROL, size::CONTROL, mic), sound])
+    let video = bar_button(
+        if state.video_off {
+            Icon::MonitorOff
+        } else {
+            Icon::Monitor
+        },
+        if state.video_off {
+            t!("room-encender-el-video-tip", key = keys.video)
+        } else {
+            t!("room-apagar-el-video", key = keys.video)
+        },
+        state.video_off,
+        on(Msg::ToggleVideo),
+    );
+    bar_group(vec![
+        ui::reserved(size::CONTROL, size::CONTROL, mic),
+        sound,
+        video,
+    ])
 }
 
 /// Lo que va a la derecha del grupo de voz: el grupo de control (el modo inmersivo, si el
@@ -1968,6 +2049,24 @@ fn bar_tail<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     let keys = &app.settings.input.shortcuts;
     let allowed = state.stats.as_ref().map(|s| s.allowed).unwrap_or_default();
     let control = allowed.keyboard_mouse.then(|| {
+        if state.video_off {
+            // En pausa: apagado, sin pulsarse, y al pasar el ratón dice por qué.
+            let paused = button(center(
+                iced_widget::svg::Svg::<'a, coroom_ui::Theme>::new(Icon::Pointer.handle())
+                    .width(Length::Fixed(18.0))
+                    .height(Length::Fixed(18.0))
+                    .opacity(PAUSED_OPACITY)
+                    .class(SvgClass::Overlay),
+            ))
+            .width(Length::Fixed(size::CONTROL))
+            .height(Length::Fixed(size::CONTROL))
+            .padding(0)
+            .class(ButtonClass::Overlay { active: false });
+            return ui::with_tooltip(
+                bar_group(vec![paused.into()]),
+                t!("room-en-pausa-sin-video"),
+            );
+        }
         bar_group(vec![bar_button(
             Icon::Pointer,
             t!("room-modo-inmersivo", key = keys.immersive),
@@ -2129,6 +2228,60 @@ fn nothing_shared_view(state: &State) -> Element<'_, Message> {
     .into()
 }
 
+/// Opacidad del grupo de control en pausa (con el vídeo apagado).
+const PAUSED_OPACITY: f32 = 0.35;
+
+/// Lo que se ve en lugar del vídeo cuando el invitado lo apagó: qué sigue y qué no, y el botón
+/// para encenderlo con su atajo.
+fn video_off_view<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
+    let detail = match state.host_name.as_deref() {
+        Some(host) => t!("room-apagaste-el-video-detalle", host = host),
+        None => t!("room-apagaste-el-video-detalle-sin-nombre").to_owned(),
+    };
+    let key = app.settings.input.shortcuts.video;
+    let glyph = container(icon_with(Icon::MonitorOff, 28.0, SvgClass::Overlay))
+        .width(Length::Fixed(56.0))
+        .height(Length::Fixed(56.0))
+        .center_x(Length::Fixed(56.0))
+        .center_y(Length::Fixed(56.0))
+        .class(ContainerClass::OverlaySegmented);
+    let keys = container(
+        text(format!("Ctrl+Alt+{key}"))
+            .size(type_size::CAPTION)
+            .font(coroom_ui::font::SEMIBOLD)
+            .class(TextClass::Overlay),
+    )
+    .padding(Padding::from([1.0, 6.0]))
+    .class(ContainerClass::OverlaySegmented);
+    center(
+        column![
+            glyph,
+            text(t!("room-apagaste-el-video"))
+                .size(type_size::TITLE)
+                .font(coroom_ui::font::SEMIBOLD)
+                .class(TextClass::Overlay),
+            overlay_text(detail)
+                .wrapping(Wrapping::WordOrGlyph)
+                .align_x(Horizontal::Center),
+            container(ui::button_with(
+                Kind::Primary,
+                t!("room-encender-el-video"),
+                Some(Icon::Monitor),
+                Some(on(Msg::ToggleVideo)),
+            ))
+            .padding(Padding {
+                top: space::XS,
+                ..Padding::ZERO
+            }),
+            keys,
+        ]
+        .spacing(space::S)
+        .align_x(Alignment::Center)
+        .max_width(420.0),
+    )
+    .into()
+}
+
 /// La indicación del teclado y el ratón abajo al centro (como la píldora, a pantalla completa
 /// solo con la barra), solo si el anfitrión le dio ese permiso a este invitado: cómo soltarlos
 /// mientras se reenvían o, sueltos, cómo volver a usarlos. Sin nada compartido no hay imagen en
@@ -2138,7 +2291,7 @@ pub fn input_hint(app: &App, state: &State) -> Option<String> {
         .stats
         .as_ref()
         .is_some_and(|stats| stats.allowed.keyboard_mouse);
-    if !allowed || state.nothing_shared() {
+    if !allowed || state.voice_only() {
         return None;
     }
     Some(if state.forwarding {
@@ -2382,39 +2535,39 @@ fn pill_view<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
             .class(TextClass::Overlay)
             .wrapping(Wrapping::None)
     };
-    let dot: Element<'a, Message> = match pill.tone {
-        Some(tone) => ui::dot(tone),
-        None => ui::dot(Tone::Neutral),
+    let secondary = |content: String| {
+        text(content)
+            .size(type_size::SECONDARY)
+            .class(TextClass::OverlaySecondary)
+            .wrapping(Wrapping::None)
     };
-    let mut lead = row![dot].spacing(space::XS).align_y(Alignment::Center);
-    if pill.reconnecting {
-        lead = lead.push(icon_with(Icon::Refresh, 14.0, SvgClass::Overlay));
-    }
-    // Las cifras («48 ms», «5 s») en ranuras de ancho fijo: la píldora no cambia de ancho a cada
-    // medida. Un texto más largo que la muestra («Midiendo», un motivo del relay) ensancha la
-    // ranura, pero esos cambian de tarde en tarde. Sin cuenta animada sobre el vídeo: cada cuadro
-    // de la cuenta volvería a medir la interfaz y competiría con la entrega de los fotogramas.
-    lead = lead.push(ui::figure(
-        strong,
-        pill.lead.clone(),
-        &[stats::LATENCY_WIDEST],
-    ));
-    let reason_samples = [
-        t!("room-perdida-valor", value = "88"),
-        t!("room-segundos", secs = "88"),
-    ];
-    let reason = pill.reason.clone().map(|reason| {
-        let samples: Vec<&str> = reason_samples.iter().map(String::as_str).collect();
-        ui::figure_after(
-            |content: String| {
-                text(content)
-                    .size(type_size::SECONDARY)
-                    .class(TextClass::OverlaySecondary)
-            },
-            reason,
-            &samples,
-        )
-    });
+    let tone = pill.tone.unwrap_or(Tone::Neutral);
+    let reconnecting = pill.reconnecting;
+    // El punto (y, reconectando, la flecha) y la cifra.
+    let lead = |value: String| {
+        let mut lead = row![ui::dot(tone)]
+            .spacing(space::XS)
+            .align_y(Alignment::Center);
+        if reconnecting {
+            lead = lead.push(icon_with(Icon::Refresh, 14.0, SvgClass::Overlay));
+        }
+        lead.push(strong(value))
+    };
+    // Las cifras («48 ms», «5 s») no hacen saltar la píldora: cada tramo mide lo más ancho que
+    // ha mostrado con el mismo texto (sin suponer cuánto tarda la red; crece si hace falta y no
+    // se estrecha) y lleva lo suyo centrado, sin hueco entre el punto y la cifra ni al final. Lo
+    // más ancho se guarda en el estado (`pill_widest`), no en cada árbol: la píldora de la barra
+    // y la de encima del vídeo miden lo mismo aunque una se vaya y vuelva. Cuando cambia el texto
+    // (de «Midiendo» a «48 ms», de conectado a «Reconectando · 3 s»), vuelve a medir desde cero:
+    // un texto pasajero más largo no la deja ancha. Sin cuenta animada sobre el vídeo: cada
+    // cuadro de la cuenta volvería a medir la interfaz y competiría con la entrega de los
+    // fotogramas.
+    let steady =
+        |content: Element<'a, Message>, slot: usize, key: String| -> Element<'a, Message> {
+            ui::steady([], content)
+                .keep_widest_in(&state.pill_widest[slot], key)
+                .into()
+        };
     let segment = |content: Element<'a, Message>, message: Message| {
         button(content)
             .padding(Padding::from([4.0, 8.0]))
@@ -2427,14 +2580,31 @@ fn pill_view<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         let mut relay = row![strong(pill.route.clone().unwrap_or_default())]
             .spacing(space::XS)
             .align_y(Alignment::Center);
-        if let Some(reason) = reason {
-            relay = relay.push(sep()).push(reason);
+        if let Some(reason) = pill.reason.clone() {
+            relay = relay.push(sep()).push(secondary(reason));
         }
         row![
-            ui::with_tooltip(segment(lead.into(), connection), t!("room-latencia-tip")),
+            ui::with_tooltip(
+                segment(
+                    steady(
+                        lead(pill.lead.clone()).into(),
+                        0,
+                        pill_key("lead", &[Some(&pill.lead)])
+                    ),
+                    connection
+                ),
+                t!("room-latencia-tip")
+            ),
             sep(),
             ui::with_tooltip(
-                segment(relay.into(), Message::Diagnostics(diagnostics::Msg::Open)),
+                segment(
+                    steady(
+                        relay.into(),
+                        1,
+                        pill_key("relay", &[pill.route.as_deref(), pill.reason.as_deref()])
+                    ),
+                    Message::Diagnostics(diagnostics::Msg::Open)
+                ),
                 t!("room-por-que-relay")
             ),
         ]
@@ -2442,14 +2612,29 @@ fn pill_view<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         .align_y(Alignment::Center)
         .into()
     } else {
-        let mut all = lead;
+        let mut all = lead(pill.lead.clone());
         if let Some(route) = pill.route.clone() {
             all = all.push(sep()).push(strong(route));
         }
-        if let Some(reason) = reason {
-            all = all.push(sep()).push(reason);
+        if let Some(reason) = pill.reason.clone() {
+            all = all.push(sep()).push(secondary(reason));
         }
-        ui::with_tooltip(segment(all.into(), connection), t!("room-latencia-tip"))
+        let key = pill_key(
+            if pill.reconnecting {
+                "reconnecting"
+            } else {
+                "all"
+            },
+            &[
+                Some(&pill.lead),
+                pill.route.as_deref(),
+                pill.reason.as_deref(),
+            ],
+        );
+        ui::with_tooltip(
+            segment(steady(all.into(), 0, key), connection),
+            t!("room-latencia-tip"),
+        )
     };
     container(content)
         .padding(2)
@@ -2457,6 +2642,27 @@ fn pill_view<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         .center_y(Length::Fixed(PILL_HEIGHT))
         .class(ContainerClass::OverlayPill)
         .into()
+}
+
+/// La clave de lo más ancho de un tramo de la píldora ([`State::pill_widest`]): qué tramo es y
+/// su texto con cada número cambiado por un `#` («148 ms · Directa» y «9 ms · Directa» son lo
+/// mismo, así que al bajar de tres cifras a una no se estrecha; «Midiendo · Directa», otra cosa).
+pub fn pill_key(segment: &str, parts: &[Option<&str>]) -> String {
+    let mut key = segment.to_owned();
+    for part in parts {
+        key.push('|');
+        let mut in_number = false;
+        for c in part.unwrap_or_default().chars() {
+            let digit = c.is_ascii_digit();
+            if !digit {
+                key.push(c);
+            } else if !in_number {
+                key.push('#');
+            }
+            in_number = digit;
+        }
+    }
+    key
 }
 
 /// Fila de un dato del panel: el valor, a la derecha, en una ranura del ancho de la más ancha de
@@ -2991,6 +3197,12 @@ fn video<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
             .width(Length::Fill)
             .height(Length::Fill)
             .class(ContainerClass::Video)
+    } else if state.video_off {
+        // Tapa el último fotograma (con compositor, el vídeo va debajo de la interfaz).
+        container(video_off_view(app, state))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .class(ContainerClass::Video)
     } else {
         container(video_view(&state.feed))
             .width(Length::Fill)
@@ -3138,13 +3350,16 @@ fn video<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
                 .padding(space::S)
                 .into()
         });
-    // El menú del sonido, bajo su botón: a su derecha, el hueco de lo que hay en la barra a la
-    // derecha del grupo de voz.
+    // El menú del sonido, bajo su botón: a su derecha, el hueco del botón del vídeo (el último
+    // del grupo de voz) y el de lo que hay en la barra a la derecha del grupo.
     let menu = bar_hidden.filter(|_| state.sound_menu).map(|hidden| {
         container(Shift::new(
             row![
                 ui::fill(),
-                sound_menu(state),
+                container(sound_menu(state)).padding(Padding {
+                    right: size::CONTROL + GROUP_SPACING,
+                    ..Padding::ZERO
+                }),
                 ui::reserve([bar_tail(app, state)], None),
             ]
             .spacing(space::S),
@@ -3656,6 +3871,15 @@ pub(crate) mod shots {
         settled(app);
     }
 
+    /// Con el vídeo apagado: su vista en lugar de la imagen, quién habla y la barra fija (con
+    /// «Solo voz» y el modo inmersivo en pausa) aunque el ratón esté quieto.
+    pub(crate) fn guest_video_off(app: &mut App) {
+        guest_talking(app);
+        app.update(Message::Guest(Msg::ToggleVideo));
+        still(app);
+        settled(app);
+    }
+
     pub(crate) fn guest_reconnecting(app: &mut App) {
         video(app);
         app.update(Message::Event(Event::Guest(SessionEvent::Reconnecting {
@@ -3791,6 +4015,12 @@ pub(crate) mod shots {
         ("14-chat", guest_chat),
         ("14-burbujas", guest_bubbles),
         ("13-video-hablando", guest_talking),
+        ("13-video-apagado", guest_video_off),
+        ("13-video-apagado-pantalla-completa", |app| {
+            guest_video_off(app);
+            app.update(Message::FullscreenChanged(true));
+            still(app);
+        }),
         ("13-nadie-comparte", |app| {
             joined(app, true, false);
             app.update(Message::Event(Event::Guest(SessionEvent::Sharing(false))));
@@ -3904,6 +4134,31 @@ mod tests {
         assert!(!corrupt_video_notice(&mut window, &mut last, 80, t3));
         let t4 = t2 + CORRUPT_NOTICE_PERIOD + DECODE_WINDOW;
         assert!(corrupt_video_notice(&mut window, &mut last, 200, t4));
+    }
+
+    #[test]
+    fn the_pill_key_ignores_numbers_but_not_the_kind_of_text() {
+        let key = |parts: &[Option<&str>]| pill_key("all", parts);
+        assert_eq!(
+            key(&[Some("148 ms"), Some("Directa")]),
+            key(&[Some("9 ms"), Some("Directa")])
+        );
+        assert_eq!(
+            key(&[Some("48 ms"), None, Some("2 %")]),
+            key(&[Some("3 ms"), None, Some("12 %")])
+        );
+        assert_ne!(
+            key(&[Some("Midiendo"), Some("Directa")]),
+            key(&[Some("48 ms"), Some("Directa")])
+        );
+        assert_ne!(
+            key(&[Some("48 ms"), Some("Directa")]),
+            key(&[Some("48 ms"), None])
+        );
+        assert_ne!(
+            pill_key("lead", &[Some("48 ms")]),
+            pill_key("all", &[Some("48 ms")])
+        );
     }
 
     use super::*;
@@ -5161,6 +5416,81 @@ mod tests {
         })));
         let state = app.guest.as_ref().expect("invitado");
         assert!(!state.trying_paths() && !state.animating(Motion::FULL));
+    }
+
+    /// Apagar el vídeo: pide al anfitrión que no lo mande, deja la entrada en pausa (el mando en
+    /// reposo, como desde otra página del riel), la barra fija con «Solo voz» y, a pantalla
+    /// completa, el refresco de una sala de voz. Si el anfitrión deja de compartir, manda «Nadie
+    /// comparte». Al encenderlo vuelve todo y la imagen entra con su fundido; no se recuerda
+    /// para la sala siguiente.
+    #[test]
+    fn turning_the_video_off_pauses_the_input_and_keeps_the_bar() {
+        let mut app = app();
+        shots::video(&mut app);
+        let effects = app.update(Message::Guest(Msg::ToggleVideo));
+        assert_eq!(effects, [Effect::SetVideoPaused(true)]);
+        let state = app.guest.as_ref().expect("invitado");
+        assert!(state.video_off && state.video_off_shown() && state.voice_only());
+        assert_eq!(bar_facts(state), "Solo voz");
+        assert_eq!(
+            input_hint(&app, state),
+            None,
+            "no hay imagen en la que hacer clic"
+        );
+        assert!(pad_paused(&app), "el mando, en reposo y sin desconectarse");
+        assert!(!app.wants_idle_inhibit(), "sin imagen no hay qué mirar");
+        // La barra no se va aunque el ratón quede quieto, ni a pantalla completa.
+        app.now += motion::BAR_HIDE + Duration::from_secs(5);
+        app.update(Message::Tick);
+        assert!(app.guest.as_ref().is_some_and(|g| g.bar_visible(app.now)));
+        app.update(Message::FullscreenChanged(true));
+        assert!(
+            app.keeps_refresh(),
+            "a pantalla completa, como una sala de voz"
+        );
+        assert!(!app.hides_pointer());
+        assert!(
+            app.guest
+                .as_ref()
+                .is_some_and(|g| g.pill_visible(app.now, true)),
+            "la latencia a la vista"
+        );
+        // El modo inmersivo, en pausa.
+        assert!(app.update(Message::Guest(Msg::ToggleImmersive)).is_empty());
+        assert!(app.guest.as_ref().is_some_and(|g| !g.immersive));
+        // Deja de compartir: «Nadie comparte» manda.
+        app.update(Message::Event(Event::Guest(SessionEvent::Sharing(false))));
+        assert!(app.guest.as_ref().is_some_and(|g| !g.video_off_shown()));
+        app.update(Message::Event(Event::Guest(SessionEvent::Sharing(true))));
+        assert!(app.guest.as_ref().is_some_and(State::video_off_shown));
+        // Encenderlo.
+        app.update(Message::FullscreenChanged(false));
+        let effects = app.update(Message::Guest(Msg::ToggleVideo));
+        assert_eq!(effects, [Effect::SetVideoPaused(false)]);
+        let state = app.guest.as_ref().expect("invitado");
+        assert!(!state.video_off && !state.voice_only());
+        assert!(
+            state.cover(app.now, Motion::FULL).is_some(),
+            "la imagen entra con su fundido"
+        );
+        assert!(!pad_paused(&app));
+        assert!(app.wants_idle_inhibit());
+        // En modo inmersivo, apagarlo suelta el ratón.
+        app.update(Message::Guest(Msg::ToggleImmersive));
+        let effects = app.update(Message::Guest(Msg::ToggleVideo));
+        assert_eq!(
+            effects,
+            [Effect::SetImmersive(false), Effect::SetVideoPaused(true)]
+        );
+        assert!(
+            app.guest
+                .as_ref()
+                .is_some_and(|g| !g.immersive && g.video_off)
+        );
+        // La sala siguiente arranca con el vídeo encendido.
+        app.update(Message::Event(Event::GuestEnded(None)));
+        start(&mut app, "M3XK8P".into());
+        assert!(app.guest.as_ref().is_some_and(|g| !g.video_off));
     }
 
     /// El menú del sonido mantiene la barra; `Esc` lo cierra antes que nada (sin salir).

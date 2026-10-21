@@ -22,6 +22,8 @@ crossbeam-channel.workspace = true
 serde.workspace = true
 # Las credenciales de cada servidor (`account`), en JSON.
 serde_json.workspace = true
+# El SHA-256 de los paquetes de una versión nueva (`update`), por trozos.
+sha2.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "sync", "macros"] }
 tracing.workspace = true
 # El texto de las credenciales que entrega el almacén de la aplicación (`account::AccountStorage`).
@@ -36,6 +38,7 @@ coroom-codec.workspace = true
 
 [dev-dependencies]
 coroom-testkit.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

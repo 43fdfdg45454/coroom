@@ -93,6 +93,21 @@ class CoroomRepository(
      */
     val avatarRetry: StateFlow<Int> = _avatarRetry.asStateFlow()
 
+    private val _update = MutableStateFlow<UpdateState?>(null)
+
+    /** La versión nueva (`null` hasta que la parte en Rust la configura). */
+    val update: StateFlow<UpdateState?> = _update.asStateFlow()
+
+    private val _protocolMismatch = MutableStateFlow<CoroomEvent.ProtocolMismatch?>(null)
+
+    /** El servidor de la cuenta usa otro protocolo (se borra cuando vuelve a responder). */
+    val protocolMismatch: StateFlow<CoroomEvent.ProtocolMismatch?> = _protocolMismatch.asStateFlow()
+
+    private val _pendingInstall = MutableStateFlow<String?>(null)
+
+    /** El APK de la versión nueva que espera al instalador del sistema (ver `UpdateInstaller`). */
+    val pendingInstall: StateFlow<String?> = _pendingInstall.asStateFlow()
+
     private val lobbyMutex = Mutex()
     private var lobbyServer: String? = null
 
@@ -127,7 +142,12 @@ class CoroomRepository(
                 val cameBack = event.online && _serverStatus.value?.online != true
                 _serverStatus.value = event
                 if (cameBack) retryAvatars()
+                // Si responde, las versiones ya coinciden.
+                if (event.online) _protocolMismatch.value = null
             }
+            is CoroomEvent.Update -> _update.value = event.state
+            is CoroomEvent.UpdateInstall -> _pendingInstall.value = event.path
+            is CoroomEvent.ProtocolMismatch -> _protocolMismatch.value = event
             is CoroomEvent.Members -> retryAvatars()
             is CoroomEvent.OwnRooms -> _ownRooms.value = event.rooms
             // El avatar propio cambiado desde otro dispositivo.
@@ -290,6 +310,11 @@ class CoroomRepository(
         call("set_mic_muted") { put("muted", muted) }
     }
 
+    /** Apaga o enciende el vídeo del invitado (el anfitrión deja de mandarlo; la voz sigue). */
+    suspend fun setVideoPaused(paused: Boolean) {
+        call("set_video_paused") { put("paused", paused) }
+    }
+
     suspend fun setJoinMuted(muted: Boolean) {
         call("set_join_muted") { put("muted", muted) }
     }
@@ -308,6 +333,82 @@ class CoroomRepository(
     }
 
     suspend fun pads(): List<BridgePad> = callAs("pads", ListSerializer(BridgePad.serializer()))
+
+    // --- Versión nueva -------------------------------------------------------------------
+
+    /** Los ajustes guardados de la versión nueva y la carpeta de las descargas (en la caché). */
+    /** `noticeOnly`: esta compilación no puede instalar los APK de las publicaciones (solo avisa). */
+    suspend fun updateConfigure(
+        dir: String,
+        check: Boolean,
+        auto: Boolean,
+        intervalHours: Int,
+        lastCheck: Long?,
+        noticeOnly: Boolean,
+    ) {
+        _update.value = callAs("update_configure", UpdateState.serializer()) {
+            put("dir", dir)
+            put("check", check)
+            put("auto", auto)
+            put("interval_hours", intervalHours)
+            put("last_check", lastCheck)
+            put("notice_only", noticeOnly)
+        }
+    }
+
+    /** Busca en GitHub (bloquea en IO). Sin `manual`, solo si toca por el intervalo. */
+    suspend fun updateCheck(manual: Boolean) {
+        _update.value = callAs("update_check", UpdateState.serializer()) { put("manual", manual) }
+    }
+
+    /**
+     * La app es más vieja que el servidor: busca fuera del intervalo, como mucho una vez por hora y
+     * nunca con la búsqueda apagada.
+     */
+    suspend fun updateCheckExtra() {
+        _update.value = callAs("update_check", UpdateState.serializer()) { put("extra", true) }
+    }
+
+    /** La red tiene límite de datos (o ya no): la descarga automática espera a una sin límite. */
+    suspend fun updateSetMetered(on: Boolean) {
+        _update.value = callAs("update_set_metered", UpdateState.serializer()) { put("on", on) }
+    }
+
+    suspend fun updateSetCheck(on: Boolean) {
+        _update.value = callAs("update_set_check", UpdateState.serializer()) { put("on", on) }
+    }
+
+    suspend fun updateSetAuto(on: Boolean) {
+        _update.value = callAs("update_set_auto", UpdateState.serializer()) { put("on", on) }
+    }
+
+    suspend fun updateRetry() {
+        _update.value = callAs("update_retry", UpdateState.serializer())
+    }
+
+    /** «Descargar y actualizar»: la descarga y, al terminar, llega `update_install`. */
+    suspend fun updateNow() {
+        _update.value = callAs("update_now", UpdateState.serializer())
+    }
+
+    /** «Instalar ahora»: deja el APK listo para el instalador (o explica por qué no). */
+    suspend fun updateInstall() {
+        _pendingInstall.value = callText("update_install")
+    }
+
+    /** El instalador ya lo tiene (o el usuario lo dejó para después). */
+    fun installHandled() {
+        _pendingInstall.value = null
+    }
+
+    private val _installErrors = MutableSharedFlow<String?>(extraBufferCapacity = 4)
+
+    /** El instalador del sistema no pudo instalar la versión nueva (su motivo, si lo dijo). */
+    val installErrors: SharedFlow<String?> = _installErrors.asSharedFlow()
+
+    fun installFailed(message: String?) {
+        _installErrors.tryEmit(message)
+    }
 
     // --- Plataforma -----------------------------------------------------------------------
 

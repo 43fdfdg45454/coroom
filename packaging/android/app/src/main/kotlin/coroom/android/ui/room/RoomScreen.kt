@@ -44,6 +44,8 @@ fun RoomScreen(
     val imeVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
     val currentKeyboard by rememberUpdatedState(state.keyboardVisible)
     LaunchedEffect(state.keyboardVisible) { video.showKeyboard(state.keyboardVisible) }
+    // Con el vídeo apagado el ratón capturado vuelve al sistema: no le llega al anfitrión.
+    LaunchedEffect(state.videoOff) { if (state.videoOff) video.releaseMouse() }
     LaunchedEffect(imeVisible) {
         if (!imeVisible && currentKeyboard && state.panel != Panel.Chat) actions.onToggleKeyboard()
     }

@@ -144,6 +144,22 @@ impl KeyframeGate {
         {
             return KeyframeDecision::Ignore;
         }
+        Self::decide(&mut state, rtt, interval, now)
+    }
+
+    /// Intra para un invitado que vuelve a encender el vídeo: como una petición, pero ningún intra
+    /// anterior la sirve (no los recibía). Sigue la misma espera y el mismo retroceso que las
+    /// peticiones: encender y apagar seguido no fuerza un intra tras otro a los demás.
+    fn on_resume(&self, rtt: Duration, interval: Duration, now: Instant) -> KeyframeDecision {
+        Self::decide(&mut lock(&self.state), rtt, interval, now)
+    }
+
+    fn decide(
+        state: &mut GateState,
+        rtt: Duration,
+        interval: Duration,
+        now: Instant,
+    ) -> KeyframeDecision {
         // Pedido y aún sin salir (si en un segundo no salió, el codificador no estaba: se vuelve a
         // pedir).
         let pending = state.forced.is_some_and(|forced| {
@@ -162,7 +178,7 @@ impl KeyframeGate {
                 KeyframeDecision::Later(spacing - now.saturating_duration_since(at))
             }
             _ => {
-                Self::force(&mut state, now);
+                Self::force(state, now);
                 KeyframeDecision::Now
             }
         }
@@ -192,6 +208,28 @@ impl KeyframeGate {
 struct GuestLink {
     sender: Arc<MediaSender>,
     control: ControlSender,
+    /// Si recibe el vídeo ([`VideoState`]).
+    video: VideoState,
+    /// El último `CodecSelected` que recibió (códec y formato): al encender el vídeo, si es el de
+    /// ahora, solo le hace falta un intra.
+    announced: Option<(Codec, VideoFormat)>,
+}
+
+/// El vídeo de un invitado, que puede apagarlo ([`ControlMessage::VideoPaused`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoState {
+    /// Lo recibe.
+    On,
+    /// Lo apagó: no recibe vídeo (ni FEC, ni reparaciones, ni sondas), no cuenta para la tasa ni
+    /// para el códec y su entrada no se aplica.
+    Paused,
+    /// Lo volvió a encender y se renegocia el códec con él: cuenta para el códec y para codificar,
+    /// pero aún no recibe nada (lo que saliese ahora podría ir en un códec o un formato que no
+    /// decodifica, y abrirlo le fallaría).
+    Resuming,
+    /// Ya tiene el `CodecSelected` de lo que se codifica: empieza a recibir con el siguiente intra
+    /// (lo anterior no le serviría sin él).
+    AwaitingKeyframe,
 }
 
 /// Un destino del fotograma cifrado: un emisor y el control de su invitado.
@@ -208,9 +246,12 @@ pub(crate) struct Links {
 }
 
 impl Links {
+    /// Destinos del vídeo: los invitados que lo reciben (encendido y, si acaban de encenderlo,
+    /// con el códec ya anunciado y desde un intra).
     fn targets(&self) -> Vec<Target> {
         self.guests
             .values()
+            .filter(|link| link.video == VideoState::On)
             .map(|link| Target {
                 sender: Arc::clone(&link.sender),
                 controls: vec![link.control.clone()],
@@ -222,8 +263,39 @@ impl Links {
         self.guests.len()
     }
 
+    /// Invitados conectados con el vídeo encendido: sin ninguno, no se codifica.
+    fn watching(&self) -> usize {
+        self.guests
+            .values()
+            .filter(|link| link.video != VideoState::Paused)
+            .count()
+    }
+
+    /// Con un intra a punto de salir, quien esperaba uno para empezar ya lo recibe.
+    fn admit_on_keyframe(&mut self) {
+        for link in self.guests.values_mut() {
+            if link.video == VideoState::AwaitingKeyframe {
+                link.video = VideoState::On;
+            }
+        }
+    }
+
     fn contains(&self, guest: GuestId) -> bool {
         self.guests.contains_key(&guest)
+    }
+
+    /// Si `guest` está conectado y con el vídeo encendido (aunque aún no lo reciba).
+    fn watches(&self, guest: GuestId) -> bool {
+        self.guests
+            .get(&guest)
+            .is_some_and(|link| link.video != VideoState::Paused)
+    }
+
+    /// Si `guest` está conectado y no recibe el vídeo (lo apagó o acaba de encenderlo).
+    fn misses_video(&self, guest: GuestId) -> bool {
+        self.guests
+            .get(&guest)
+            .is_some_and(|link| link.video != VideoState::On)
     }
 
     fn controls(&self) -> Vec<ControlSender> {
@@ -257,11 +329,13 @@ impl Links {
             .collect()
     }
 
-    /// Bitrate para el codificador: el mínimo de los objetivos de todos los emisores, descontada
-    /// la FEC de cada uno ([`MediaSender::encoder_target_kbps`]).
+    /// Bitrate para el codificador: el mínimo de los objetivos de los emisores de quienes ven el
+    /// vídeo, descontada la FEC de cada uno ([`MediaSender::encoder_target_kbps`]). Quien lo
+    /// apagó no recibe vídeo: su enlace no frena a los demás.
     fn min_target(&self) -> Option<u32> {
         self.guests
             .values()
+            .filter(|link| link.video == VideoState::On)
             .map(|link| link.sender.encoder_target_kbps())
             .min()
     }
@@ -701,7 +775,13 @@ fn send_loop(
     let mut group: u32 = 0;
     let mut sent = 0u64;
     while let Some(frame) = recv_or_stop(rx, shared) {
-        let targets = lock(links).targets();
+        let targets = {
+            let mut links = lock(links);
+            if frame.keyframe {
+                links.admit_on_keyframe();
+            }
+            links.targets()
+        };
         if targets.is_empty() {
             continue;
         }
@@ -1086,9 +1166,55 @@ impl HostCtx {
         }
     }
 
+    /// Se codifica mientras alguien vea el vídeo: sin invitados, o con todos con el vídeo
+    /// apagado, el codificador descansa (la captura sigue, para tener la imagen al volver).
     fn update_active(&self) {
-        let connected = lock(&self.links).connected();
-        self.encode.active.store(connected > 0, Ordering::Release);
+        let watching = lock(&self.links).watching();
+        self.encode.active.store(watching > 0, Ordering::Release);
+    }
+
+    /// El invitado `guest` apagó (`paused`) o volvió a encender su vídeo
+    /// ([`ControlMessage::VideoPaused`]). Apagado, su enlace sale de los destinos del vídeo, de
+    /// la tasa y del códec, y su entrada se descarta (lo pulsado se suelta; su mando sigue en su
+    /// ranura, en reposo). Al encenderlo vuelve a contar y se renegocia con él (el codificador
+    /// solo se reabre si cambia el códec o el formato); recibe desde el primer intra después de
+    /// tener el `CodecSelected` de lo que se codifica ([`VideoState`], [`resume_video`]).
+    fn set_video_paused(self: &Arc<Self>, guest: GuestId, paused: bool) {
+        let changed = match lock(&self.links).guests.get_mut(&guest) {
+            Some(link) if paused && link.video != VideoState::Paused => {
+                link.video = VideoState::Paused;
+                true
+            }
+            // No recibe nada hasta que se haya negociado con él ([`resume_video`]).
+            Some(link) if !paused && link.video == VideoState::Paused => {
+                link.video = VideoState::Resuming;
+                true
+            }
+            _ => false,
+        };
+        if !changed {
+            return;
+        }
+        if let Some(status) = lock(&self.core.guests).get_mut(&guest) {
+            status.video_paused = paused;
+        }
+        tracing::info!(
+            guest = guest.0,
+            paused,
+            "el invitado {} el vídeo",
+            if paused { "apagó" } else { "encendió" }
+        );
+        self.input.job(Job::VideoPaused { guest, paused });
+        self.update_active();
+        let ctx = Arc::clone(self);
+        tokio::spawn(async move {
+            if paused {
+                // Sin él puede caber un códec mejor para los que siguen viendo.
+                negotiate(&ctx, None, false).await;
+            } else {
+                negotiate(&ctx, Some(guest), true).await;
+            }
+        });
     }
 
     /// Tras conectar un invitado: objetivo actual, evento y, si en [`CAPABILITIES_TIMEOUT`] no
@@ -1200,6 +1326,8 @@ impl HostCtx {
             status.path = None;
             status.rtt_ms = None;
             status.target_kbps = None;
+            // Cada conexión empieza con el vídeo encendido (al reconectar, el invitado lo repite).
+            status.video_paused = false;
         }
         lock(&self.guest_caps).remove(&guest);
         self.voice_state(guest, false);
@@ -1489,6 +1617,7 @@ fn attach(ctx: &Arc<HostCtx>, guest: GuestId, connection: PeerConnection, contro
     voice_reader(ctx, connection.clone(), guest);
     tokio::spawn(control_datagrams(
         Arc::clone(ctx),
+        guest,
         connection.clone(),
         Arc::clone(&sender),
     ));
@@ -1499,6 +1628,8 @@ fn attach(ctx: &Arc<HostCtx>, guest: GuestId, connection: PeerConnection, contro
         GuestLink {
             sender: Arc::clone(&sender),
             control: reply.clone(),
+            video: VideoState::On,
+            announced: None,
         },
     );
     ctx.after_attach(
@@ -1507,7 +1638,7 @@ fn attach(ctx: &Arc<HostCtx>, guest: GuestId, connection: PeerConnection, contro
         connection.remote_address(),
         &reply,
     );
-    tokio::spawn(probe_link(Arc::clone(ctx), Arc::clone(&sender)));
+    tokio::spawn(probe_link(Arc::clone(ctx), guest, Arc::clone(&sender)));
     tokio::spawn(control_reader(
         Arc::clone(ctx),
         guest,
@@ -1526,12 +1657,15 @@ fn attach(ctx: &Arc<HostCtx>, guest: GuestId, connection: PeerConnection, contro
 /// contra un limitador, el techo de ráfaga) y se fija el ritmo del pacing. Después, cada
 /// [`PROBE_POLL`] se mira si el control de tasa de algún receptor pide una sonda
 /// ([`MediaSender::probe_due`]: subir el techo cuando frena) y sale, corta
-/// ([`CHECK_PROBE_PACKETS`]).
-async fn probe_link(ctx: Arc<HostCtx>, sender: Arc<MediaSender>) {
+/// ([`CHECK_PROBE_PACKETS`]). Con el vídeo apagado no sale ninguna: la sonda es para el vídeo.
+async fn probe_link(ctx: Arc<HostCtx>, guest: GuestId, sender: Arc<MediaSender>) {
     let paces = startup_probe_paces(ctx.max_kbps.load(Ordering::Acquire));
     for (train, pace) in paces.into_iter().enumerate() {
         if train > 0 {
             tokio::time::sleep(PROBE_SPACING).await;
+        }
+        if lock(&ctx.links).misses_video(guest) {
+            break;
         }
         if let Err(err) = sender.send_probe(pace).await {
             debug!(error = %err, "no se pudo enviar la sonda del enlace");
@@ -1544,6 +1678,9 @@ async fn probe_link(ctx: Arc<HostCtx>, sender: Arc<MediaSender>) {
             tokio::time::sleep(PROBE_POLL).await;
             if ctx.core.ended() {
                 return;
+            }
+            if lock(&ctx.links).misses_video(guest) {
+                continue;
             }
             if let Some(pace) = sender.probe_due() {
                 debug!(kbps = pace, "sonda periódica del enlace");
@@ -1591,13 +1728,21 @@ async fn watch_relay(
 /// Atiende las copias en datagrama de los `Nack`, `KeyframeRequest` y `Feedback` de una conexión:
 /// llegan antes que las del stream de control cuando este perdió un paquete. Las repetidas no
 /// reenvían ni aplican nada (`MediaSender::on_nack`, `KeyframeGate`, `MediaSender::on_feedback`).
+/// Con el vídeo apagado, las peticiones de vídeo se ignoran ([`video_request_while_paused`]).
 async fn control_datagrams(
     ctx: Arc<HostCtx>,
+    guest: GuestId,
     connection: PeerConnection,
     sender: Arc<MediaSender>,
 ) {
     while let Ok(datagram) = connection.read_control_datagram().await {
-        match coroom_transport::proto::control::parse_control_datagram(&datagram) {
+        let message = coroom_transport::proto::control::parse_control_datagram(&datagram);
+        if let Ok(message) = &message
+            && video_request_while_paused(&ctx, guest, message)
+        {
+            continue;
+        }
+        match message {
             Ok(ControlMessage::Nack {
                 track,
                 group,
@@ -1617,8 +1762,22 @@ async fn control_datagrams(
     }
 }
 
+/// Si `message` pide vídeo (un `Nack` de vídeo o un `KeyframeRequest`) y `guest` no lo recibe
+/// (lo tiene apagado o acaba de encenderlo): no se le repara ni se fuerza un intra por él (lo que
+/// quedase en vuelo al apagarlo; al encenderlo, su intra ya lo pide [`resume_video`]).
+fn video_request_while_paused(ctx: &HostCtx, guest: GuestId, message: &ControlMessage) -> bool {
+    let video = matches!(
+        message,
+        ControlMessage::Nack {
+            track: Track::Video,
+            ..
+        } | ControlMessage::KeyframeRequest { .. }
+    );
+    video && lock(&ctx.links).misses_video(guest)
+}
+
 /// Lee el control de un invitado: `Feedback`, `Nack` y `Ping` los atiende el emisor; un
-/// `KeyframeRequest` pide un intra.
+/// `KeyframeRequest` pide un intra; `VideoPaused` apaga o enciende su vídeo.
 async fn control_reader(
     ctx: Arc<HostCtx>,
     guest: GuestId,
@@ -1631,6 +1790,9 @@ async fn control_reader(
             Ok(Some(message)) => message,
             Ok(None) | Err(_) => break,
         };
+        if video_request_while_paused(&ctx, guest, &message) {
+            continue;
+        }
         let rest = sender.handle_control(message, &reply);
         match rest {
             Some(ControlMessage::KeyframeRequest { group }) => {
@@ -1686,6 +1848,7 @@ async fn control_reader(
                 }
             }
             Some(ControlMessage::Chat(sealed)) => ctx.chat_from_guest(guest, &sealed),
+            Some(ControlMessage::VideoPaused { paused }) => ctx.set_video_paused(guest, paused),
             Some(ControlMessage::HandoffReply { code }) => {
                 // Un código que no es de sala cuenta como «no».
                 let code =
@@ -1706,14 +1869,23 @@ async fn control_reader(
 /// abrir un codificador de GPU tarda), se lo pasa al hilo `encode` y lo anuncia a todos con
 /// `CodecSelected`. Si no cambia, solo se lo anuncia a `guest` (el que acaba de llegar). Si el
 /// códec elegido no abre en ese formato, prueba el de siempre y luego los demás códecs comunes.
+/// Solo cuentan los invitados que ven el vídeo: quien lo apagó no decodifica nada.
 async fn renegotiate(ctx: &Arc<HostCtx>, guest: Option<GuestId>) {
+    negotiate(ctx, guest, false).await;
+}
+
+/// [`renegotiate`]; con `resumed`, `guest` acaba de encender su vídeo: si sigue el mismo códec y
+/// ya tiene su `CodecSelected` (se anuncia a todos, también a quien lo tiene apagado), solo le
+/// hace falta el intra ([`resume_video`]); volver a anunciárselo le haría reabrir el
+/// decodificador sin necesidad.
+async fn negotiate(ctx: &Arc<HostCtx>, guest: Option<GuestId>, resumed: bool) {
     let mut current = ctx.current.lock().await;
     let named: Vec<(String, GuestCapabilities)> = {
         let caps = lock(&ctx.guest_caps);
         let links = lock(&ctx.links);
         let statuses = lock(&ctx.core.guests);
         caps.iter()
-            .filter(|(id, _)| links.contains(**id))
+            .filter(|(id, _)| links.watches(**id))
             .map(|(id, caps)| {
                 let name = statuses
                     .get(id)
@@ -1752,12 +1924,26 @@ async fn renegotiate(ctx: &Arc<HostCtx>, guest: Option<GuestId>) {
             }
         }
         if current.is_some_and(|(c, _, f)| c == codec && f == format) {
-            if let Some(guest) = guest {
-                announce(ctx, codec, format, Some(guest));
-                // El invitado acaba de abrir (o va a abrir) su decodificador: necesita un intra.
-                // Con la pantalla quieta, el hilo `encode` repite el último fotograma.
-                ctx.core.shared.request_keyframe();
+            let (watches, known) = guest.map_or((false, false), |guest| {
+                let links = lock(&ctx.links);
+                let known = links
+                    .guests
+                    .get(&guest)
+                    .is_some_and(|link| link.announced == Some((codec, format)));
+                (links.watches(guest), known)
+            });
+            if let Some(guest) = guest.filter(|_| watches) {
+                if !(resumed && known) {
+                    announce(ctx, codec, format, Some(guest));
+                }
+                if !resumed {
+                    // El invitado acaba de abrir (o va a abrir) su decodificador: necesita un
+                    // intra. Con la pantalla quieta, el hilo `encode` repite el último fotograma.
+                    ctx.core.shared.request_keyframe();
+                }
             }
+            // Quien encendió el vídeo, con el códec ya anunciado, empieza con el próximo intra.
+            resume_video(ctx, codec, format, true);
             return;
         }
         let mut formats = vec![format];
@@ -1844,6 +2030,8 @@ async fn renegotiate(ctx: &Arc<HostCtx>, guest: Option<GuestId>) {
                     *current = Some((codec, backend, format));
                     ctx.core.emit(SessionEvent::VideoCodec { codec, detail });
                     announce(ctx, codec, format, None);
+                    // El codificador nuevo empieza con un intra: no hace falta pedir otro.
+                    resume_video(ctx, codec, format, false);
                     ctx.core.shared.request_keyframe();
                     return;
                 }
@@ -1866,7 +2054,13 @@ fn frame_interval(fps: u32) -> Duration {
 /// Atiende un `KeyframeRequest` del grupo `group` de un invitado con este RTT ([`KeyframeGate`]).
 fn keyframe_request(ctx: &Arc<HostCtx>, group: u32, rtt: Duration) {
     let interval = frame_interval(ctx.video().fps);
-    match ctx.gate.on_request(group, rtt, interval, Instant::now()) {
+    let decision = ctx.gate.on_request(group, rtt, interval, Instant::now());
+    keyframe_decision(ctx, decision);
+}
+
+/// Lleva a cabo lo que decidió el [`KeyframeGate`]: un intra ya, uno aplazado o ninguno.
+fn keyframe_decision(ctx: &Arc<HostCtx>, decision: KeyframeDecision) {
+    match decision {
         KeyframeDecision::Now => ctx.core.shared.request_keyframe(),
         KeyframeDecision::Later(wait) => {
             bump(&ctx.core.shared.counters.coalesced_requests);
@@ -1879,6 +2073,41 @@ fn keyframe_request(ctx: &Arc<HostCtx>, group: u32, rtt: Duration) {
         }
         KeyframeDecision::Ignore => bump(&ctx.core.shared.counters.coalesced_requests),
     }
+}
+
+/// Con `codec` en `format` ya decidido (bajo `HostCtx::current`): los invitados que encendieron
+/// el vídeo ([`VideoState::Resuming`]) y ya tienen ese `CodecSelected` pasan a esperar el próximo
+/// intra para empezar a recibir. Con `keyframe`, ese intra se pide con el ritmo de
+/// [`KeyframeGate`]: quien apaga y enciende seguido no fuerza un intra tras otro a los demás. Uno
+/// sin capacidades aún sigue esperando: lo admite la negociación que las traiga.
+fn resume_video(ctx: &Arc<HostCtx>, codec: Codec, format: VideoFormat, keyframe: bool) {
+    let rtt = {
+        let caps = lock(&ctx.guest_caps);
+        let mut links = lock(&ctx.links);
+        links
+            .guests
+            .iter_mut()
+            .filter(|(id, link)| {
+                link.video == VideoState::Resuming
+                    && link.announced == Some((codec, format))
+                    && caps.contains_key(id)
+            })
+            .map(|(id, link)| {
+                debug!(
+                    guest = id.0,
+                    "vídeo encendido: empieza con el próximo intra"
+                );
+                link.video = VideoState::AwaitingKeyframe;
+                link.sender.connection().rtt()
+            })
+            .max()
+    };
+    let Some(rtt) = rtt.filter(|_| keyframe) else {
+        return;
+    };
+    let interval = frame_interval(ctx.video().fps);
+    let decision = ctx.gate.on_resume(rtt, interval, Instant::now());
+    keyframe_decision(ctx, decision);
 }
 
 /// Envía `CodecSelected` a `guest` o, con `None`, a todos los conectados.
@@ -1894,11 +2123,18 @@ fn announce(ctx: &HostCtx, codec: Codec, format: VideoFormat, guest: Option<Gues
         chroma,
         color,
     };
-    let controls = lock(&ctx.links).guest_controls();
-    for (id, control) in controls {
-        if guest.is_none_or(|guest| guest == id) {
-            let _ = control.send(&message);
-        }
+    // A todos, también a quien tiene el vídeo apagado: al encenderlo ya sabe qué decodificar.
+    let controls: Vec<ControlSender> = lock(&ctx.links)
+        .guests
+        .iter_mut()
+        .filter(|(id, _)| guest.is_none_or(|guest| guest == **id))
+        .map(|(_, link)| {
+            link.announced = Some((codec, format));
+            link.control.clone()
+        })
+        .collect();
+    for control in controls {
+        let _ = control.send(&message);
     }
 }
 
@@ -2415,6 +2651,7 @@ impl Room {
                 gamepad: None,
                 can_host: false,
                 device,
+                video_paused: false,
             },
         );
         self.ctx.core.emit(SessionEvent::GuestJoined {
@@ -3005,6 +3242,49 @@ mod tests {
             gate.on_request(41, RTT, INTERVAL, at(2_000)),
             KeyframeDecision::Now
         );
+    }
+
+    /// El intra de quien enciende el vídeo no lo sirve uno anterior (no lo recibió), pero sigue
+    /// la espera y el retroceso de los demás: apagar y encender seguido no fuerza un intra tras
+    /// otro a la sala.
+    #[test]
+    fn resume_keyframes_are_spaced_like_requests() {
+        let gate = KeyframeGate::default();
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        gate.on_sent(100, at(0));
+        // Una petición de un grupo anterior estaría servida; el encendido no.
+        assert_eq!(
+            gate.on_request(90, RTT, INTERVAL, at(500)),
+            KeyframeDecision::Ignore
+        );
+        assert_eq!(
+            gate.on_resume(RTT, INTERVAL, at(500)),
+            KeyframeDecision::Now
+        );
+        // Encendido otra vez antes de que salga: va con ese.
+        assert_eq!(
+            gate.on_resume(RTT, INTERVAL, at(505)),
+            KeyframeDecision::Ignore
+        );
+        gate.on_sent(130, at(510));
+        // Y otra, enseguida: se aplaza; las que lleguen mientras, con él.
+        let decision = gate.on_resume(RTT, INTERVAL, at(520));
+        let KeyframeDecision::Later(first) = decision else {
+            unreachable!("se aplaza: {decision:?}");
+        };
+        assert_eq!(
+            gate.on_resume(RTT, INTERVAL, at(521)),
+            KeyframeDecision::Ignore
+        );
+        gate.fire_deferred(at(520) + first);
+        let sent = at(520) + first + Duration::from_millis(5);
+        gate.on_sent(140, sent);
+        let decision = gate.on_resume(RTT, INTERVAL, sent + Duration::from_millis(1));
+        let KeyframeDecision::Later(second) = decision else {
+            unreachable!("se aplaza: {decision:?}");
+        };
+        assert!(second > first, "retroceso: {first:?} → {second:?}");
     }
 
     /// Sin nada compartido no sale el audio del juego (lo que suena en el equipo), y la voz sí.

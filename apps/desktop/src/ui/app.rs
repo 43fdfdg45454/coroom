@@ -26,13 +26,16 @@ use iced_widget::{column, container, row};
 
 use super::avatars;
 use super::notify;
+use super::screens::updates;
 use super::screens::{
     account, chat, diagnostics, friends, guest, home, host, login, settings as settings_screen,
 };
 use super::settings::{ServerEntry, Settings, SoundEvent, ThemeChoice};
 use super::system::SystemAppearance;
 use super::video::VideoFeed;
-use crate::update::Update;
+#[cfg(test)]
+use crate::update::ReportKind;
+use crate::update::{Command, ProtocolGap, Release, Report, Updater};
 
 /// Lo que este equipo puede hacer con 4:4:4 y HDR, para explicarlo en Ajustes.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -49,19 +52,45 @@ pub struct VideoSupport {
     pub hdr_display: Option<bool>,
 }
 
-/// Estado del aviso de versión nueva.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// Estado de la versión nueva: la búsqueda, la descarga y el aviso de versiones distintas.
+#[derive(Debug, Clone, PartialEq)]
 pub struct UpdateState {
-    /// Comprobando ahora.
+    /// Buscando ahora.
     pub checking: bool,
-    /// La comprobación la pidió el usuario (se le contesta con un toast).
+    /// La búsqueda la pidió el usuario (se le contesta con un toast).
     pub manual: bool,
-    /// Versión nueva publicada.
-    pub available: Option<Update>,
     /// Último error (se reintenta en el siguiente intervalo).
     pub error: Option<String>,
-    /// Cuándo toca la próxima comprobación automática.
+    /// Cuándo toca la próxima búsqueda automática.
     pub next_check: Option<Instant>,
+    /// La versión nueva: qué hay, en qué punto está la descarga y qué toca hacer.
+    pub updater: Updater,
+    /// El servidor (su nombre, como está en la lista) y la aplicación hablan protocolos distintos.
+    pub protocol: Option<(String, ProtocolGap)>,
+    /// Se está preguntando al servidor qué protocolo usa.
+    pub probing_protocol: bool,
+    /// El servidor al que ya se le preguntó en esta racha de rechazos (se olvida cuando vuelve a
+    /// contestar): una pregunta por racha, no una por reintento.
+    pub protocol_asked: Option<String>,
+    /// La última búsqueda de versión fuera del intervalo, por una app más vieja que el servidor.
+    pub extra_check_at: Option<Instant>,
+}
+
+impl UpdateState {
+    /// Para esta copia ([`crate::update::channel`]), con la actualización automática o no.
+    pub fn new(channel: crate::update::Channel, auto: bool) -> Self {
+        Self {
+            checking: false,
+            manual: false,
+            error: None,
+            next_check: None,
+            updater: Updater::new(channel, auto),
+            protocol: None,
+            probing_protocol: false,
+            protocol_asked: None,
+            extra_check_at: None,
+        }
+    }
 }
 
 /// Cuenta con la que se entró.
@@ -188,6 +217,10 @@ pub struct PageChange {
 
 /// Cuántas páginas recuerda «atrás» (`Alt+←`).
 const HISTORY: usize = 16;
+
+/// Entre dos búsquedas de versión fuera del intervalo (la app es más vieja que el servidor), por
+/// lo menos esto.
+const EXTRA_CHECK_BACKOFF: Duration = Duration::from_secs(3600);
 
 /// Estado del servidor para la insignia de la cabecera (lo mide la sala de espera).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -367,9 +400,20 @@ pub enum Event {
     /// Resultado de buscar una versión nueva, con la hora (segundos desde 1970) de la consulta.
     UpdateChecked {
         /// `Ok(None)`: esta es la última.
-        result: Result<Option<Update>, String>,
+        result: Result<Option<Release>, String>,
         /// Cuándo se consultó.
         at: u64,
+    },
+    /// La descarga (o la instalación por Flatpak) de la versión nueva avanzó, se pausó o terminó.
+    UpdateReport(Report),
+    /// El servidor rechazó la conexión por la versión del protocolo.
+    ProtocolRejected,
+    /// Qué protocolo usa el servidor `host` (su sondeo), o por qué no se supo.
+    ProtocolChecked {
+        /// El servidor, como está en la lista.
+        host: String,
+        /// Su versión del protocolo.
+        result: Result<u16, String>,
     },
     /// Lo que este equipo hace con 4:4:4 y HDR.
     VideoSupport(VideoSupport),
@@ -484,6 +528,8 @@ pub enum Message {
     Diagnostics(diagnostics::Msg),
     /// Chat de la sala (anfitrión o invitado).
     Chat(chat::Msg),
+    /// La versión nueva (los avisos y Acerca de).
+    Update(updates::Msg),
     /// La ventana ganó o perdió el foco del escritorio.
     WindowFocused(bool),
     /// El sistema dice si la ventana está tapada u oculta del todo (minimizada).
@@ -690,6 +736,8 @@ pub enum Effect {
     ToggleMic,
     /// Alternar el audio del juego del invitado.
     ToggleGameAudio,
+    /// Apagar (`true`) o encender el vídeo del invitado.
+    SetVideoPaused(bool),
     /// Pasar el ratón a modo inmersivo (`true`) o escritorio.
     SetImmersive(bool),
     /// Qué mando envía el invitado.
@@ -715,8 +763,19 @@ pub enum Effect {
     MicTest(Option<MicTest>),
     /// Buscar una versión nueva.
     CheckUpdates,
+    /// Una orden de la versión nueva (descargar, pausar, descartar o reiniciar).
+    UpdateCommand(Command),
+    /// Preguntar al servidor qué protocolo usa (versiones distintas).
+    ProbeProtocol {
+        /// Su dirección.
+        url: String,
+        /// Puerto TCP de respaldo.
+        tcp_port: Option<u16>,
+    },
     /// Abrir un enlace en el navegador.
     OpenUrl(String),
+    /// Abrir una carpeta en el gestor de archivos.
+    OpenFolder(String),
     /// Ver qué hace este equipo con 4:4:4 y HDR.
     LoadVideoSupport,
     /// Mirar qué se puede compartir con esa fuente (monitores o ventanas y lo que suena).
@@ -958,6 +1017,7 @@ impl App {
     /// Aplicación con estos ajustes y la apariencia del sistema.
     pub fn new(settings: Settings, system: SystemAppearance, fonts: Fonts, now: Instant) -> Self {
         let login = login::State::new(&settings);
+        let update = UpdateState::new(crate::update::channel(), settings.updates.auto);
         let mut app = Self {
             theme: Theme::new(Mode::Light, Accent::Blue, fonts),
             dark: Palette::new(Mode::Dark, Accent::Blue),
@@ -999,7 +1059,7 @@ impl App {
             overlay_since: None,
             probe: false,
             version: env!("CARGO_PKG_VERSION"),
-            update: UpdateState::default(),
+            update,
             video_support: None,
             carried_mute: None,
         };
@@ -1050,17 +1110,14 @@ impl App {
     }
 
     /// Si la ventana dibuja a cada refresco del monitor aunque nada se mueva: a pantalla completa
-    /// en una sala solo de voz (el anfitrión no comparte nada). Con la sincronización adaptativa
+    /// en una sala solo de voz (el anfitrión no comparte nada o el vídeo está apagado). Con la sincronización adaptativa
     /// (VRR) el monitor refresca al ritmo al que la ventana entrega cuadros, y en reposo bajaba al
     /// mínimo de su rango: el puntero del sistema iba a ese ritmo. Con transmisión manda el vídeo,
     /// como siempre.
     pub fn keeps_refresh(&self) -> bool {
         self.fullscreen
             && self.video_in_front()
-            && self
-                .guest
-                .as_ref()
-                .is_some_and(guest::State::nothing_shared)
+            && self.guest.as_ref().is_some_and(guest::State::voice_only)
     }
 
     /// Si el puntero se oculta: a pantalla completa con el vídeo delante, cuando el ratón quieto
@@ -1074,15 +1131,12 @@ impl App {
                 .is_some_and(|guest| !guest.bar_visible(self.now))
     }
 
-    /// Si hay que impedir que el escritorio se bloquee: con el vídeo del invitado delante y el
-    /// anfitrión compartiendo algo, o con la sala propia compartiendo. Quien mira (o juega con un
+    /// Si hay que impedir que el escritorio se bloquee: con el vídeo del invitado delante (y
+    /// encendido) y el anfitrión compartiendo algo, o con la sala propia compartiendo. Quien mira (o juega con un
     /// mando, que el sistema no cuenta como actividad) no toca el teclado ni el ratón.
     pub fn wants_idle_inhibit(&self) -> bool {
-        let watching = self.video_in_front()
-            && self
-                .guest
-                .as_ref()
-                .is_some_and(|guest| !guest.nothing_shared());
+        let watching =
+            self.video_in_front() && self.guest.as_ref().is_some_and(|guest| !guest.voice_only());
         watching || self.sharing_screen()
     }
 
@@ -1221,7 +1275,16 @@ impl App {
         let sharing = self.sharing_screen();
         let handing_to = self.host.handoff.as_ref().map(|(_, name)| name.clone());
         let back = matches!(message, Message::Shortcut(Shortcut::Back));
-        let effects = self.reduce(message);
+        let mut effects = self.reduce(message);
+        // Con una sala abierta (propia o de otro, también esperando a entrar) la versión nueva no
+        // se descarga ni se reinicia.
+        let room = self.room_open();
+        // (El aviso de sala abierta para los demás procesos lo da `runner` con
+        // `Backend::update_room`.)
+        if room != self.update.updater.room_open() {
+            let commands = self.update.updater.set_room_open(room);
+            effects.extend(self.update_commands(commands));
+        }
         match (had_overlay, self.overlay_open()) {
             (false, true) => {
                 self.overlay_since = Some(self.now);
@@ -1456,6 +1519,7 @@ impl App {
             Message::Avatar(msg) => avatars::update(self, msg),
             Message::Diagnostics(msg) => diagnostics::update(self, msg),
             Message::Chat(msg) => chat::update(self, msg),
+            Message::Update(msg) => updates::update(self, msg),
             Message::WindowFocused(focused) => {
                 chat::update(self, chat::Msg::WindowFocused(focused))
             }
@@ -1482,6 +1546,92 @@ impl App {
                 .then_some(self.now);
     }
 
+    /// Si hay una sala abierta: la propia (también abriéndose) o la de otro (también esperando a
+    /// entrar). La prueba local no cuenta.
+    pub fn room_open(&self) -> bool {
+        self.host.is_open() || self.in_room_as_guest()
+    }
+
+    /// Las órdenes de la versión nueva, como efectos. Reiniciar guarda antes los ajustes.
+    pub fn update_commands(&mut self, commands: Vec<Command>) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        for command in commands {
+            if command == Command::Restart {
+                effects.extend(self.flush_settings());
+            }
+            effects.push(Effect::UpdateCommand(command));
+        }
+        effects
+    }
+
+    /// Lo que avisa la descarga de la versión nueva (lo de una descarga anterior no cambia nada).
+    fn update_report(&mut self, report: Report) -> Vec<Effect> {
+        let commands = report.apply(&mut self.update.updater);
+        // La publicación aún no traía el paquete: se vuelve a mirar antes que el intervalo.
+        let interval = self.settings.updates.interval_hours.max(1);
+        let hours = self.update.updater.recheck_hours(interval);
+        if hours < interval && self.settings.updates.check && !crate::update::disabled_by_env() {
+            let soon = self.now + Duration::from_secs(u64::from(hours) * 3600);
+            self.update.next_check = Some(self.update.next_check.map_or(soon, |at| at.min(soon)));
+        }
+        self.update_commands(commands)
+    }
+
+    /// El servidor rechazó la conexión por la versión del protocolo: se le pregunta cuál usa para
+    /// explicar quién tiene que actualizarse. Una vez por racha de rechazos (el vestíbulo reintenta
+    /// cada pocos segundos), hasta que el servidor vuelva a contestar.
+    fn protocol_rejected(&mut self) -> Vec<Effect> {
+        let Some(account) = &self.account else {
+            return Vec::new();
+        };
+        let (url, tcp_port) = (account.server.url.clone(), account.server.tcp_port);
+        if self.update.probing_protocol || self.update.protocol_asked.as_ref() == Some(&url) {
+            return Vec::new();
+        }
+        self.update.probing_protocol = true;
+        self.update.protocol_asked = Some(url.clone());
+        vec![Effect::ProbeProtocol { url, tcp_port }]
+    }
+
+    /// La aplicación es más vieja que el servidor y no se sabe de la versión nueva: una búsqueda
+    /// fuera del intervalo, como mucho una por hora.
+    pub fn extra_update_check(&mut self) -> Vec<Effect> {
+        if self.update.updater.release().is_some()
+            || self
+                .update
+                .extra_check_at
+                .is_some_and(|at| self.now.duration_since(at) < EXTRA_CHECK_BACKOFF)
+        {
+            return Vec::new();
+        }
+        let effects = self.check_updates(false);
+        if !effects.is_empty() {
+            self.update.extra_check_at = Some(self.now);
+        }
+        effects
+    }
+
+    /// Qué protocolo usa el servidor `host`.
+    fn protocol_checked(&mut self, host: String, result: Result<u16, String>) -> Vec<Effect> {
+        self.update.probing_protocol = false;
+        let protocol = match result {
+            Ok(protocol) => protocol,
+            Err(err) => {
+                tracing::debug!(error = %err, "no se supo el protocolo del servidor");
+                return Vec::new();
+            }
+        };
+        self.update.protocol = crate::update::protocol_gap(protocol).map(|gap| (host, gap));
+        // La aplicación es la vieja y no se sabe aún de la versión nueva: se busca ya.
+        if matches!(
+            self.update.protocol,
+            Some((_, ProtocolGap::ClientOlder { .. }))
+        ) {
+            return self.extra_update_check();
+        }
+        Vec::new()
+    }
+
     /// Pide buscar una versión nueva (`manual`: lo pidió el usuario y se le contesta).
     pub fn check_updates(&mut self, manual: bool) -> Vec<Effect> {
         if self.update.checking {
@@ -1495,27 +1645,32 @@ impl App {
         vec![Effect::CheckUpdates]
     }
 
-    fn update_checked(&mut self, result: Result<Option<Update>, String>, at: u64) -> Vec<Effect> {
+    fn update_checked(&mut self, result: Result<Option<Release>, String>, at: u64) -> Vec<Effect> {
         let manual = std::mem::take(&mut self.update.manual);
         self.update.checking = false;
+        let enabled = self.settings.updates.check && !crate::update::disabled_by_env();
         let hours = u64::from(self.settings.updates.interval_hours.max(1));
-        self.update.next_check = (self.settings.updates.check && !crate::update::disabled_by_env())
-            .then(|| self.now + Duration::from_secs(hours * 3600));
+        self.update.next_check = enabled.then(|| self.now + Duration::from_secs(hours * 3600));
         match result {
-            Ok(update) => {
+            Ok(release) => {
                 self.update.error = None;
                 if manual {
-                    match &update {
-                        Some(update) => self.toast(
+                    match &release {
+                        Some(release) => self.toast(
                             Tone::Info,
-                            t!("app-hay-una-version-nueva", version = update.version),
+                            t!("app-hay-una-version-nueva", version = release.version),
                         ),
                         None => self.toast(Tone::Success, t!("app-tienes-la-ultima-version")),
                     }
                 }
-                self.update.available = update;
                 self.settings.updates.last_check = Some(at);
-                vec![Effect::SaveSettings]
+                let mut effects = vec![Effect::SaveSettings];
+                // Una búsqueda pedida a mano con la búsqueda apagada solo contesta.
+                if enabled {
+                    let commands = self.update.updater.found(release);
+                    effects.extend(self.update_commands(commands));
+                }
+                effects
             }
             Err(err) => {
                 if manual {
@@ -1909,6 +2064,11 @@ impl App {
                     },
                     online: Some(online),
                 };
+                // Con el servidor de vuelta, las versiones ya coinciden.
+                if online {
+                    self.update.protocol = None;
+                    self.update.protocol_asked = None;
+                }
                 Vec::new()
             }
             Event::Invited(invitation) => {
@@ -1971,6 +2131,9 @@ impl App {
                 effects
             }
             Event::UpdateChecked { result, at } => self.update_checked(result, at),
+            Event::UpdateReport(report) => self.update_report(report),
+            Event::ProtocolRejected => self.protocol_rejected(),
+            Event::ProtocolChecked { host, result } => self.protocol_checked(host, result),
             Event::ShareOptions(options) => {
                 host::on_share_options(self, options);
                 Vec::new()
@@ -2147,9 +2310,9 @@ impl App {
         }
     }
 
-    /// La insignia del servidor ([`App::server_badge_text`]) con el RTT en una ranura de ancho
-    /// fijo («888 ms»): no cambia de ancho con cada medida. Un clic abre el diagnóstico donde se
-    /// pone en un botón.
+    /// La insignia del servidor ([`App::server_badge_text`]) de ancho estable: mide lo más ancho
+    /// que ha mostrado y lleva el punto y el texto centrados, sin hueco al final. Un clic abre el
+    /// diagnóstico donde se pone en un botón.
     pub fn server_badge<'a>(&self) -> Element<'a, Message> {
         let tone = match self.server_status.online {
             Some(false) => Tone::Error,
@@ -2164,22 +2327,26 @@ impl App {
                     .as_ref()
                     .map(AccountInfo::host)
                     .unwrap_or_default();
-                // «host ·» en una línea y la cifra en su ranura, contando hasta cada medida nueva.
-                let widest = t!("app-rtt-ms", rtt = 888);
-                ui::status_badge_with(
-                    tone,
-                    row![
-                        ui::one_line(t!("app-host-separador", host = host), ui::badge_text),
-                        ui::count_after(
-                            ui::badge_text,
-                            rtt,
-                            |rtt| t!("app-rtt-ms", rtt = rtt.round() as u64),
-                            &[widest.as_str()],
-                        ),
-                    ]
-                    .spacing(4)
-                    .align_y(Alignment::Center),
-                )
+                // «host ·» en una línea y la cifra justo después, contando hasta cada medida
+                // nueva. Sin suponer cuánto tarda la red: la píldora mide lo que muestra y, si
+                // una medida la ensancha, ya no se estrecha mientras siga en la cabecera
+                // (`keep_widest`), así que no salta de ancho con cada medida; lo que sobra se
+                // reparte a los dos lados.
+                let line = row![
+                    ui::one_line(
+                        t!("app-host-separador", host = host.as_str()),
+                        ui::badge_text
+                    ),
+                    ui::count_after(
+                        ui::badge_text,
+                        rtt,
+                        |rtt| t!("app-rtt-ms", rtt = rtt.round() as u64),
+                        &[],
+                    ),
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center);
+                ui::status_badge_steady(tone, line, [], true)
             }
         }
     }
@@ -2910,6 +3077,10 @@ pub(crate) mod tests {
     #[test]
     fn update_checks_are_scheduled_and_answered() {
         let mut app = app();
+        app.update.updater = Updater::new(
+            crate::update::Channel::Notice(crate::update::NoticeOnly::Unpackaged),
+            true,
+        );
         app.schedule_update_check(true);
         if crate::update::disabled_by_env() {
             assert!(app.update(Message::Tick).is_empty());
@@ -2918,17 +3089,18 @@ pub(crate) mod tests {
         assert_eq!(app.update(Message::Tick), [Effect::CheckUpdates]);
         assert!(app.update.checking);
         assert!(app.update(Message::Tick).is_empty(), "una sola a la vez");
-        let update = Update {
-            version: "0.2.0".to_owned(),
-            url: "https://github.com/43fdfdg45454/coroom/releases/tag/v0.2.0".to_owned(),
-        };
+        let update = Release::new("0.2.0");
         let effects = app.update(Message::Event(Event::UpdateChecked {
             result: Ok(Some(update.clone())),
             at: 1_790_000_000,
         }));
-        assert_eq!(effects, [Effect::SaveSettings]);
+        assert_eq!(effects, [Effect::SaveSettings], "esta copia solo avisa");
         assert_eq!(app.settings.updates.last_check, Some(1_790_000_000));
-        assert_eq!(app.update.available, Some(update.clone()));
+        assert_eq!(app.update.updater.release(), Some(&update));
+        assert_eq!(
+            app.update.updater.home_notice(),
+            crate::update::HomeNotice::Available
+        );
         assert!(app.toasts.is_empty(), "la automática no molesta");
         let next = app.update.next_check.expect("siguiente comprobación");
         assert_eq!(next - app.now, Duration::from_secs(24 * 3600));
@@ -2945,13 +3117,217 @@ pub(crate) mod tests {
             at: 1_790_000_100,
         }));
         assert!(app.toasts.iter().any(|t| t.text.contains("sin red")));
-        assert!(app.update.available.is_some());
+        assert!(app.update.updater.release().is_some());
         assert_eq!(app.settings.updates.last_check, Some(1_790_000_000));
         // Desactivada: no se programa.
         app.settings.updates.check = false;
         app.schedule_update_check(true);
         assert_eq!(app.update.next_check, None);
         assert!(app.check_updates(false).is_empty());
+    }
+
+    /// Una publicación con el zip de Windows (la descarga no sale de la prueba: son efectos).
+    fn zip_release() -> Release {
+        let mut release = Release::new("2.1.0");
+        let name = crate::update::Package::WindowsZip.asset_name("2.1.0");
+        release.assets.push(coroom_session::update::Asset {
+            url: format!("{}v2.1.0/{name}", coroom_session::update::DOWNLOADS),
+            name,
+            size: 61_000_000,
+            sha256: Some([7; 32]),
+        });
+        release
+    }
+
+    fn zip_app() -> App {
+        let mut app = signed_in();
+        app.update.updater = Updater::new(
+            crate::update::Channel::Package(crate::update::Package::WindowsZip),
+            true,
+        );
+        app
+    }
+
+    fn found(app: &mut App, release: &Release) -> Vec<Effect> {
+        app.update(Message::Event(Event::UpdateChecked {
+            result: Ok(Some(release.clone())),
+            at: 1_790_000_000,
+        }))
+    }
+
+    /// Con una sala abierta (propia o de otro) no se descarga: la descarga se pausa y sigue al
+    /// cerrarla; lista, «Reiniciar y actualizar» no hace nada con la sala abierta.
+    #[test]
+    fn updates_wait_for_the_room_to_close() {
+        if crate::update::disabled_by_env() {
+            return;
+        }
+        let mut app = zip_app();
+        let release = zip_release();
+        let effects = found(&mut app, &release);
+        let download = |generation| {
+            Effect::UpdateCommand(Command::Download {
+                release: release.clone(),
+                generation,
+            })
+        };
+        let report =
+            |generation, kind| Message::Event(Event::UpdateReport(Report { generation, kind }));
+        assert!(effects.contains(&download(1)));
+        app.update(report(
+            1,
+            ReportKind::Progress(crate::update::Progress::bytes(20_740_000, 61_000_000)),
+        ));
+        assert_eq!(
+            app.update.updater.home_notice(),
+            crate::update::HomeNotice::None,
+            "mientras descarga, Inicio no muestra nada"
+        );
+
+        // Se abre la sala propia: pausa.
+        app.host.starting = true;
+        assert_eq!(
+            app.update(Message::Tick),
+            [Effect::UpdateCommand(Command::Pause)]
+        );
+        assert!(matches!(
+            app.update.updater.stage(),
+            crate::update::Stage::Paused(progress) if progress.percent() == 34
+        ));
+        app.update(report(
+            1,
+            ReportKind::Paused(crate::update::Progress::bytes(20_740_000, 61_000_000)),
+        ));
+        // Se cierra: sigue.
+        app.host.starting = false;
+        assert_eq!(app.update(Message::Tick), [download(2)]);
+        // Lo que avise tarde la descarga anterior no cuenta.
+        app.update(report(1, ReportKind::Finished(Ok(()))));
+        assert!(!app.update.updater.can_restart());
+        app.update(report(2, ReportKind::Finished(Ok(()))));
+        assert!(app.update.updater.can_restart());
+
+        // En la sala de otro (también esperando a entrar): lista, pero sin reiniciar.
+        app.guest = Some(guest::State::new(
+            "K7Q2MZ".into(),
+            VideoFeed::detached(),
+            app.now,
+        ));
+        app.update(Message::Tick);
+        assert_eq!(
+            app.update.updater.home_notice(),
+            crate::update::HomeNotice::Ready { can_restart: false }
+        );
+        assert!(
+            app.update(Message::Update(updates::Msg::Restart))
+                .is_empty()
+        );
+        app.guest = None;
+        app.update(Message::Tick);
+        let effects = app.update(Message::Update(updates::Msg::Restart));
+        assert_eq!(
+            effects.last(),
+            Some(&Effect::UpdateCommand(Command::Restart))
+        );
+    }
+
+    /// «Actualizar automáticamente» apagado: solo el aviso, y lo bajado se tira.
+    #[test]
+    fn auto_off_leaves_only_the_notice() {
+        if crate::update::disabled_by_env() {
+            return;
+        }
+        let mut app = zip_app();
+        let release = zip_release();
+        found(&mut app, &release);
+        let effects = app.update(Message::Update(updates::Msg::Auto(false)));
+        assert!(!app.settings.updates.auto);
+        assert!(effects.contains(&Effect::UpdateCommand(Command::Pause)));
+        assert!(effects.contains(&Effect::UpdateCommand(Command::Discard)));
+        assert_eq!(
+            app.update.updater.home_notice(),
+            crate::update::HomeNotice::Available
+        );
+        // Una búsqueda nueva tampoco descarga.
+        let effects = found(&mut app, &release);
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::UpdateCommand(Command::Download { .. })))
+        );
+        // «Buscar versiones nuevas» apagado lo apaga todo.
+        app.update(Message::Update(updates::Msg::Auto(true)));
+        let effects = app.update(Message::Settings(settings_screen::Msg::UpdateChecks(false)));
+        assert!(effects.contains(&Effect::UpdateCommand(Command::Discard)));
+        assert_eq!(app.update.updater.release(), None);
+        assert_eq!(
+            app.update.updater.home_notice(),
+            crate::update::HomeNotice::None
+        );
+    }
+
+    /// El servidor rechaza el protocolo: se le pregunta cuál usa y se dice quién quedó atrás;
+    /// con el servidor de vuelta, el aviso se va.
+    #[test]
+    fn protocol_rejection_explains_who_is_behind() {
+        let mut app = zip_app();
+        let effects = app.update(Message::Event(Event::ProtocolRejected));
+        let [Effect::ProbeProtocol { url, .. }] = effects.as_slice() else {
+            panic!("{effects:?}");
+        };
+        assert_eq!(url, &app.account.as_ref().expect("cuenta").server.url);
+        assert!(
+            app.update(Message::Event(Event::ProtocolRejected))
+                .is_empty(),
+            "una pregunta a la vez"
+        );
+        let client = coroom_transport::proto::PROTOCOL_VERSION;
+        let effects = app.update(Message::Event(Event::ProtocolChecked {
+            host: "coroom.example.com".into(),
+            result: Ok(client + 1),
+        }));
+        assert_eq!(
+            app.update.protocol,
+            Some((
+                "coroom.example.com".to_owned(),
+                ProtocolGap::ClientOlder {
+                    server: client + 1,
+                    client
+                }
+            ))
+        );
+        if !crate::update::disabled_by_env() {
+            assert_eq!(effects, [Effect::CheckUpdates], "se busca la versión nueva");
+        }
+        // El vestíbulo reintenta cada pocos segundos: ni otra pregunta ni otra búsqueda.
+        assert!(
+            app.update(Message::Event(Event::ProtocolRejected))
+                .is_empty(),
+            "una pregunta por racha"
+        );
+        app.update(Message::Event(Event::UpdateChecked {
+            result: Err("sin red".to_owned()),
+            at: 1_790_000_000,
+        }));
+        assert!(
+            app.update(Message::Event(Event::ProtocolChecked {
+                host: "coroom.example.com".into(),
+                result: Ok(client + 1),
+            }))
+            .is_empty(),
+            "una búsqueda extra por hora como mucho"
+        );
+        app.update(Message::Event(Event::ServerStatus {
+            rtt_ms: Some(10.0),
+            online: true,
+        }));
+        assert_eq!(app.update.protocol, None);
+        // Una racha nueva vuelve a preguntar.
+        assert!(matches!(
+            app.update(Message::Event(Event::ProtocolRejected))
+                .as_slice(),
+            [Effect::ProbeProtocol { .. }]
+        ));
     }
 
     #[test]

@@ -11,3 +11,4 @@ pub mod home;
 pub mod host;
 pub mod login;
 pub mod settings;
+pub mod updates;

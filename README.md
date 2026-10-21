@@ -79,11 +79,29 @@ Flatpak, el MSIX y el `.zip` de Windows, el driver de mando virtual de Windows
 
 ### Linux: Flatpak
 
+coroom tiene un repositorio Flatpak firmado en <https://43fdfdg45454.github.io/coroom/> (GitHub
+Pages; la CI lo actualiza con cada publicación). Instalado desde ahí, se actualiza solo: la
+aplicación avisa, baja la versión nueva por el portal de Flatpak y se reinicia con ella, y
+`flatpak update` también la actualiza. Cada actualización baja solo lo que cambió.
+
+```bash
+flatpak install --user https://43fdfdg45454.github.io/coroom/io.github._43fdfdg45454.coroom.flatpakref
+flatpak run io.github._43fdfdg45454.coroom
+```
+
+El `.flatpakref` trae la clave y el repositorio, y el runtime llega de Flathub si falta. También
+vale añadir solo el repositorio (`flatpak remote-add --user --if-not-exists coroom
+https://43fdfdg45454.github.io/coroom/coroom.flatpakrepo` y luego `flatpak install --user coroom
+io.github._43fdfdg45454.coroom`, con el remoto `flathub` para el runtime) o instalar el
+`coroom-X.Y.Z-x86_64.flatpak` de una publicación, que configura el mismo repositorio:
+
 ```bash
 flatpak install --user flathub org.freedesktop.Platform//26.08   # el runtime, si no lo tienes
 flatpak install --user coroom-X.Y.Z-x86_64.flatpak
-flatpak run io.github._43fdfdg45454.coroom
 ```
+
+Los `.flatpak` de antes del repositorio iban en la rama `master` y no se actualizan: instala uno
+nuevo una vez y quita el viejo con `flatpak uninstall --user io.github._43fdfdg45454.coroom//master`.
 
 Permisos del paquete (`packaging/flatpak/io.github._43fdfdg45454.coroom.yml`): Wayland (X11 solo de
 respaldo), la GPU (`--device=dri`), la red, PipeWire para el audio
@@ -668,6 +686,17 @@ publica una versión.
    `ghcr.io/<propietario>/coroom-server:X.Y.Z` (y `:latest`), sin volver a compilar; crea la etiqueta `vX.Y.Z` sobre el
    commit y la release de GitHub con los paquetes, `SHA256SUMS` y las notas sacadas de los commits
    desde la versión anterior.
+4. **Repositorio Flatpak**: el job del Flatpak copia el repositorio publicado en GitHub Pages
+   (`ostree pull --mirror`), pone la versión nueva encima, firma los commits y el resumen con la
+   clave OpenPGP del secreto `COROOM_FLATPAK_GPG_KEY`, genera las deltas desde la versión
+   anterior y poda a las dos anteriores (`tools/flatpak-repo.sh`); el `.flatpak` de la release sale
+   de ese commit con `--repo-url` y la clave pública. Después de la release, la CI lo despliega en
+   Pages (origen «GitHub Actions», sin rama) con el `.flatpakrepo`, el `.flatpakref` y una página
+   que explica cómo instalar. Sin el secreto (forks), o si falla algo de la parte firmada (lo
+   avisa), el `.flatpak` sale sin firmar, la publicación sigue y Pages no se toca. Para probarla
+   antes de main: «Flatpak» a mano desde la pestaña Actions con `repo-dry-run`, que copia lo
+   publicado, firma y comprueba, y deja el sitio en el artefacto `flatpak-repo` sin desplegarlo. El APK se firma con `COROOM_ANDROID_KEYSTORE` (PKCS12 en base64) y sus contraseñas
+   (`packaging/android/README.md`).
 
 En las demás ramas y en los pull requests solo corren las comprobaciones (con una versión de
 pre-release de GitVersion que no se publica). `Cargo.toml` lleva `1.0.0` como base: los binarios

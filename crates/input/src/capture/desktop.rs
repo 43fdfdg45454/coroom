@@ -29,6 +29,8 @@ pub struct ShortcutKeys {
     pub pads: KeyCode,
     /// Soltar el teclado y el ratón (`R`): deja de reenviar hasta el próximo clic en el vídeo.
     pub release: KeyCode,
+    /// Apagar o encender el vídeo (`I`).
+    pub video: KeyCode,
 }
 
 impl Default for ShortcutKeys {
@@ -42,6 +44,7 @@ impl Default for ShortcutKeys {
             game: KeyCode::KeyV,
             pads: KeyCode::KeyJ,
             release: KeyCode::KeyR,
+            video: KeyCode::KeyI,
         }
     }
 }
@@ -200,6 +203,30 @@ impl InputCapture {
         })
     }
 
+    /// La tecla de pulsar para hablar con el teclado en la interfaz pero la sala abierta (el
+    /// invitado apagó el vídeo): si `physical` es esa tecla, abre o cierra el micrófono como con
+    /// el vídeo delante (`Some`, con lo que haya que hacer: la tecla no es de la interfaz); si no,
+    /// `None`. Ni atajos ni reenvío al anfitrión. El estado es el mismo que con el vídeo delante:
+    /// lo que se pulse con el vídeo apagado se suelta bien al encenderlo, y al revés.
+    pub fn push_to_talk_key(
+        &mut self,
+        physical: PhysicalKey,
+        pressed: bool,
+        repeat: bool,
+    ) -> Option<Vec<Action>> {
+        let PhysicalKey::Code(code) = physical else {
+            return None;
+        };
+        if self.push_to_talk != Some(code) {
+            return None;
+        }
+        if repeat || pressed == self.talking {
+            return Some(Vec::new());
+        }
+        self.talking = pressed;
+        Some(vec![Action::PushToTalk(pressed)])
+    }
+
     /// Tecla de pulsar para hablar (`None`: activación por voz).
     pub fn set_push_to_talk(&mut self, key: Option<KeyCode>) {
         self.push_to_talk = key;
@@ -302,6 +329,8 @@ impl InputCapture {
             Some(vec![Action::ToggleGameMute])
         } else if code == keys.pads {
             Some(vec![Action::TogglePads])
+        } else if code == keys.video {
+            Some(vec![Action::ToggleVideo])
         } else if code == keys.quit {
             let mut out = self.release();
             out.push(Action::Quit);
@@ -326,12 +355,8 @@ impl InputCapture {
             {
                 return actions;
             }
-            if self.push_to_talk == Some(code) {
-                if repeat || pressed == self.talking {
-                    return Vec::new();
-                }
-                self.talking = pressed;
-                return vec![Action::PushToTalk(pressed)];
+            if let Some(actions) = self.push_to_talk_key(physical, pressed, repeat) {
+                return actions;
             }
             if code == KeyCode::Escape && pressed && !self.allowed.keyboard_mouse {
                 return vec![Action::Quit];
@@ -808,6 +833,65 @@ mod tests {
         );
     }
 
+    /// Con el vídeo apagado el teclado es de la interfaz, pero la tecla de hablar sigue abriendo
+    /// y cerrando el micrófono; nada más (ni atajos ni reenvío). Pulsada con el vídeo apagado, se
+    /// suelta bien con él encendido.
+    #[test]
+    fn push_to_talk_works_with_the_video_behind() {
+        let mut capture = allowed();
+        capture.set_push_to_talk(Some(KeyCode::F12));
+        assert!(capture.set_in_front(true).is_empty());
+        // Se apaga el vídeo sin hablar: el micrófono no se toca.
+        assert!(
+            !capture
+                .set_in_front(false)
+                .contains(&Action::PushToTalk(false))
+        );
+        let key = |code| PhysicalKey::Code(code);
+        assert_eq!(
+            capture.push_to_talk_key(key(KeyCode::F12), true, false),
+            Some(vec![Action::PushToTalk(true)])
+        );
+        assert_eq!(
+            capture.push_to_talk_key(key(KeyCode::F12), true, true),
+            Some(Vec::new()),
+            "la repetición no cuenta (y no es de la interfaz)"
+        );
+        assert_eq!(
+            capture.push_to_talk_key(key(KeyCode::KeyW), true, false),
+            None
+        );
+        assert_eq!(
+            capture.push_to_talk_key(key(KeyCode::KeyI), true, false),
+            None
+        );
+        // Se enciende el vídeo con la tecla pulsada: el soltar llega a la captura.
+        assert!(capture.set_in_front(true).is_empty());
+        assert_eq!(
+            press(&mut capture, KeyCode::F12, false),
+            vec![Action::PushToTalk(false)]
+        );
+        // Y al revés: pulsada con el vídeo delante, al apagarlo se cierra y el soltar no repite.
+        assert_eq!(
+            press(&mut capture, KeyCode::F12, true),
+            vec![Action::PushToTalk(true)]
+        );
+        assert!(
+            capture
+                .set_in_front(false)
+                .contains(&Action::PushToTalk(false))
+        );
+        assert_eq!(
+            capture.push_to_talk_key(key(KeyCode::F12), false, false),
+            Some(Vec::new())
+        );
+        capture.set_push_to_talk(None);
+        assert_eq!(
+            capture.push_to_talk_key(key(KeyCode::F12), true, false),
+            None
+        );
+    }
+
     #[test]
     fn covering_the_video_releases_keys_cursor_and_push_to_talk() {
         let mut capture = allowed();
@@ -925,6 +1009,11 @@ mod tests {
         assert_eq!(
             key(&mut capture, KeyCode::KeyV, true),
             vec![Action::ToggleGameMute]
+        );
+        assert_eq!(
+            key(&mut capture, KeyCode::KeyI, true),
+            vec![Action::ToggleVideo],
+            "el vídeo se apaga en el invitado: no llega al anfitrión"
         );
         key(&mut capture, KeyCode::AltLeft, false);
         key(&mut capture, KeyCode::ControlLeft, false);

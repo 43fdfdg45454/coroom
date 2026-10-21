@@ -88,6 +88,11 @@ data class RoomUiState(
     val notice: UiText? = null,
     val noticeSeq: Int = 0,
     val micMuted: Boolean = true,
+    /**
+     * El vídeo apagado: el anfitrión no lo manda, el tacto, el teclado, el ratón y los mandos no
+     * le llegan y la barra queda fija. No se recuerda: cada sala arranca con el vídeo encendido.
+     */
+    val videoOff: Boolean = false,
     /** Si se entró con micrófono (permiso concedido). */
     val micAvailable: Boolean = false,
     val touchMode: TouchMode = TouchMode.Trackpad,
@@ -110,10 +115,11 @@ data class RoomUiState(
 
     /**
      * Lo que no deja esconder la barra: un panel (el chat) o el diálogo de salir abiertos, el
-     * teclado en pantalla en uso o una reconexión en curso.
+     * teclado en pantalla en uso, una reconexión en curso o el vídeo apagado (no hay imagen que
+     * tapar).
      */
     val overlayPinned: Boolean
-        get() = panel != Panel.None || confirmLeave || keyboardVisible || reconnecting != null
+        get() = panel != Panel.None || confirmLeave || keyboardVisible || reconnecting != null || videoOff
 
     /** La barra se dibuja entera (si no, solo la píldora reducida a punto y latencia). */
     val overlayVisible: Boolean get() = overlayShown || overlayPinned
@@ -207,6 +213,7 @@ class RoomViewModel(
                 steps = JoinStep.entries.associateWith { StepState.Pending },
                 reconnecting = null,
                 stats = null,
+                videoOff = false,
             )
         }
         join()
@@ -381,6 +388,24 @@ class RoomViewModel(
                 repository.setMicMuted(muted)
             } catch (error: BridgeException) {
                 _state.update { it.copy(micMuted = !muted) }
+                showNotice(UiText.Raw(error.message.orEmpty()))
+            }
+        }
+    }
+
+    /** Apaga o enciende el vídeo (botón de la barra o de la vista del vídeo apagado). */
+    fun toggleVideo() {
+        revealOverlay()
+        val off = !_state.value.videoOff
+        // Sin imagen, el teclado en pantalla no tiene a quién escribir.
+        _state.update { it.copy(videoOff = off, keyboardVisible = if (off) false else it.keyboardVisible) }
+        viewModelScope.launch {
+            try {
+                repository.setVideoPaused(off)
+            } catch (error: BridgeException) {
+                // Solo falla sin sala (la sesión no cambió): se deshace, salvo que ya se haya
+                // vuelto a pulsar.
+                _state.update { if (it.videoOff == off) it.copy(videoOff = !off) else it }
                 showNotice(UiText.Raw(error.message.orEmpty()))
             }
         }

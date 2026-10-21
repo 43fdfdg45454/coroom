@@ -16,6 +16,7 @@ import coroom.android.bridge.Invitation
 import coroom.android.bridge.OwnRoom
 import coroom.android.bridge.RoomCode
 import coroom.android.bridge.TouchMode
+import coroom.android.bridge.UpdateState
 import coroom.android.platform.Gamepad
 import coroom.android.settings.Settings
 import coroom.android.ui.UiText
@@ -72,6 +73,12 @@ data class MainUiState(
     val busy: Boolean = false,
     /** La hora para «hace N min», que avanza cada medio minuto. */
     val nowMs: Long = System.currentTimeMillis(),
+    /** La versión nueva (`null` hasta que arranca la parte en Rust). */
+    val update: UpdateState? = null,
+    /** El servidor de la cuenta usa otro protocolo. */
+    val protocolMismatch: CoroomEvent.ProtocolMismatch? = null,
+    /** El APK que espera al instalador del sistema. */
+    val pendingInstall: String? = null,
 )
 
 /** Entrar en una sala: lo abre la actividad de la sala. */
@@ -159,6 +166,21 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
             container.settings.settings.collect { settings -> _state.update { it.copy(settings = settings) } }
         }
         viewModelScope.launch { repository.events.collect(::onEvent) }
+        viewModelScope.launch { repository.update.collect { update -> _state.update { it.copy(update = update) } } }
+        viewModelScope.launch {
+            repository.protocolMismatch.collect { mismatch -> _state.update { it.copy(protocolMismatch = mismatch) } }
+        }
+        viewModelScope.launch {
+            repository.pendingInstall.collect { path -> _state.update { it.copy(pendingInstall = path) } }
+        }
+        viewModelScope.launch {
+            repository.installErrors.collect { message ->
+                _messages.send(
+                    message?.let { UiText.res(R.string.update_install_failed, it) }
+                        ?: UiText.res(R.string.update_install_failed_unknown),
+                )
+            }
+        }
         // Las invitaciones dicen «hace N min»: se recompone cada medio minuto.
         viewModelScope.launch {
             while (isActive) {
@@ -351,6 +373,47 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
             _messages.send(UiText.res(R.string.message_notifications_denied))
         }
     }
+
+    // --- Versión nueva ------------------------------------------------------------------
+
+    /** Los botones de la versión nueva (Inicio, Ajustes y Servidor). */
+    val updateActions = UpdateActions(
+        checkNow = { updateCall { repository.updateCheck(manual = true) } },
+        retry = { updateCall { repository.updateRetry() } },
+        updateNow = { updateCall { repository.updateNow() } },
+        install = { updateCall { repository.updateInstall() } },
+        setCheck = { on ->
+            updateCall {
+                // A Rust primero (la búsqueda de después ya la ve encendida); luego se guarda.
+                repository.updateSetCheck(on)
+                container.settings.setUpdatesCheck(on)
+                // Al encenderla se busca enseguida.
+                if (on) repository.updateCheck(manual = true)
+            }
+        },
+        setAuto = { on ->
+            updateCall {
+                repository.updateSetAuto(on)
+                container.settings.setUpdatesAuto(on)
+            }
+        },
+        setInterval = { hours -> viewModelScope.launch { container.settings.setUpdatesInterval(hours) } },
+    )
+
+    private fun updateCall(action: suspend () -> Unit) {
+        viewModelScope.launch {
+            try {
+                action()
+            } catch (error: BridgeException) {
+                _messages.send(UiText.Raw(error.message.orEmpty()))
+            }
+        }
+    }
+
+    /** El instalador ya tiene el APK (o se dejó para después). */
+    fun installHandled() = repository.installHandled()
+
+    fun installFailed(message: String?) = repository.installFailed(message)
 
     /** Comparte el registro: los ficheros que haya o, si todavía no hay nada escrito, se dice. */
     fun shareLog() {

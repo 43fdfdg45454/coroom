@@ -10,7 +10,9 @@
 //! - (e) expulsión: `ReleaseAll` y la ranura queda libre;
 //! - (f) latencia de entrada (`recibido − enviado` con el reloj de la sesión) p95 < 5 ms;
 //! - (h) un mando tal cual sigue lo que elige el anfitrión;
-//! - (i) la vibración de un mando tal cual llega solo al invitado de su ranura.
+//! - (i) la vibración de un mando tal cual llega solo al invitado de su ranura;
+//! - (j) con el vídeo apagado, lo suyo se suelta y se descarta (el mando sigue en su ranura)
+//!   hasta encenderlo.
 //!
 //! El emisor suma los `MouseMove` relativos cuando el paquete pendiente se llena (64 eventos: un
 //! parón de más de 64 ms del hilo a 1000 Hz) y funde siempre los `GamepadAxis` del mismo eje: el
@@ -1087,6 +1089,89 @@ fn i_rumble_reaches_only_the_guest_of_its_slot() {
 
     first.close();
     second.close();
+    host.close();
+    drop(server);
+}
+
+#[test]
+fn j_a_guest_with_the_video_off_moves_nothing_and_keeps_the_pad() {
+    let _serial = serial();
+    let server = TestServer::start();
+    let sink = RecordingSink::new();
+    let mut host = host(&server, &sink);
+    let code = room_code(&host);
+    let mut guest = guest(&server, &code);
+    let id = connected(&host, &guest, 0);
+    allow(
+        &mut host,
+        &guest,
+        id,
+        Permissions {
+            keyboard_mouse: true,
+            gamepad_slot: Some(2),
+            voice: false,
+            gamepad_raw: true,
+        },
+    );
+    guest.input().send(InputEvent::GamepadButton {
+        slot: 2,
+        button: GamepadButton::A,
+        pressed: true,
+    });
+    guest.input().send(key(17, true));
+    wait_until("el botón y la W", LIMIT, || sink.events_of(id).len() == 2);
+
+    guest.set_video_paused(true).expect("apagar el vídeo");
+    wait_until("ReleaseAll", LIMIT, || {
+        sink.log().contains(&Recorded::ReleaseAll { guest: id })
+    });
+    assert!(status(&host, id).video_paused);
+    let at_pause = sink.len();
+    let dropped = status(&host, id).input.dropped;
+    guest.input().send(key(30, true));
+    guest.input().send(InputEvent::GamepadButton {
+        slot: 2,
+        button: GamepadButton::B,
+        pressed: true,
+    });
+    wait_until("los descartes con el vídeo apagado", LIMIT, || {
+        status(&host, id).input.dropped >= dropped + 2
+    });
+    assert_eq!(
+        sink.len(),
+        at_pause,
+        "nada más tras ReleaseAll: {:?}",
+        sink.log()
+    );
+    assert!(
+        !sink.log().contains(&Recorded::GamepadReleased { slot: 2 }),
+        "el mando sigue enchufado: {:?}",
+        sink.log()
+    );
+    assert_eq!(sink.assigned_slots(), vec![2], "en su ranura");
+
+    guest.set_video_paused(false).expect("encender el vídeo");
+    wait_until("el anfitrión lo ve encendido", LIMIT, || {
+        !status(&host, id).video_paused
+    });
+    guest.input().send(key(31, true));
+    wait_until("la S tras encenderlo", LIMIT, || {
+        sink.events_of(id).last() == Some(&key(31, true))
+    });
+    guest.input().send(InputEvent::GamepadButton {
+        slot: 2,
+        button: GamepadButton::X,
+        pressed: true,
+    });
+    wait_until("el mando tras encenderlo", LIMIT, || {
+        sink.events_of(id).last()
+            == Some(&InputEvent::GamepadButton {
+                slot: 2,
+                button: GamepadButton::X,
+                pressed: true,
+            })
+    });
+    guest.close();
     host.close();
     drop(server);
 }

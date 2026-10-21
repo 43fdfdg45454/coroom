@@ -44,6 +44,10 @@
 //! Desde la versión 18 la vibración de los mandos que no van tal cual por HID viaja como el
 //! estado de sus dos motores ([`ControlMessage::GamepadRumble`]), al final de la lista para no
 //! mover los índices de `postcard` de los demás.
+//!
+//! Desde la versión 23 el invitado puede apagar su vídeo ([`ControlMessage::VideoPaused`]): el
+//! anfitrión deja de mandarle vídeo (y de contarlo para la tasa y el códec) e ignora su entrada,
+//! pero le sigue mandando el audio, la voz y el chat. También va al final.
 
 use serde::{Deserialize, Serialize};
 
@@ -556,6 +560,15 @@ pub enum ControlMessage {
         /// Motor pequeño (alta frecuencia), de 0 a 65 535.
         weak: u16,
     },
+    /// Invitado → anfitrión: si apagó su vídeo (`true`) o lo vuelve a encender. Apagado, el
+    /// anfitrión no le manda vídeo (ni FEC, ni reparaciones, ni sondas), no lo cuenta para la tasa
+    /// ni para elegir el códec y descarta su entrada; el audio, la voz, el chat y el control siguen
+    /// igual. Al encenderlo, el anfitrión le manda un fotograma intra en el acto. Cada sala empieza
+    /// con el vídeo encendido (no hace falta mandarlo al conectar).
+    VideoPaused {
+        /// Si está apagado.
+        paused: bool,
+    },
 }
 
 impl ControlMessage {
@@ -737,6 +750,29 @@ mod tests {
             decode::<ControlMessage>(&body).expect("decodificar"),
             rumble
         );
+    }
+
+    /// `VideoPaused` va detrás de `GamepadRumble` (no mueve los índices de los demás) y solo por
+    /// el stream: es un estado que no se puede perder.
+    #[test]
+    fn video_paused_goes_last_and_only_by_the_stream() {
+        let rumble = postcard::to_allocvec(&ControlMessage::GamepadRumble {
+            slot: 1,
+            strong: 0,
+            weak: 0,
+        })
+        .expect("rumble");
+        for paused in [true, false] {
+            let message = ControlMessage::VideoPaused { paused };
+            let body = postcard::to_allocvec(&message).expect("pausa");
+            assert_eq!(body[0], rumble[0] + 1);
+            assert!(!message.is_urgent() && !message.fits_datagram());
+            assert_eq!(control_datagram_tagged(&message, 0), None);
+            assert_eq!(
+                decode::<ControlMessage>(&body).expect("decodificar"),
+                message
+            );
+        }
     }
     use proptest::prelude::*;
 
@@ -950,6 +986,7 @@ mod tests {
             (1u8..=8, any::<u16>(), any::<u16>()).prop_map(|(slot, strong, weak)| {
                 ControlMessage::GamepadRumble { slot, strong, weak }
             }),
+            any::<bool>().prop_map(|paused| ControlMessage::VideoPaused { paused }),
             prop::collection::vec(
                 (
                     any::<u32>(),

@@ -192,6 +192,10 @@ pub struct Guest {
     pads: Arc<Mutex<AndroidPads>>,
     cursor: Arc<CursorSlot>,
     relayed: AtomicBool,
+    /// El vídeo apagado ([`Guest::set_video_paused`]): ni tacto, ni teclado, ni ratón salen; lo
+    /// de los mandos sigue su cuenta (el anfitrión no lo aplica) para que el mando no pierda su
+    /// ranura.
+    video_off: AtomicBool,
     /// Los componentes de MediaCodec por códec, para decir en el registro cuál decodifica.
     decoders: Vec<AndroidChoice>,
     stop: Arc<AtomicBool>,
@@ -382,6 +386,7 @@ impl Guest {
             pads: Arc::new(Mutex::new(pads)),
             cursor,
             relayed: AtomicBool::new(false),
+            video_off: AtomicBool::new(false),
             decoders: choices,
             stop: Arc::new(AtomicBool::new(false)),
             poller: Mutex::new(None),
@@ -511,6 +516,30 @@ impl Guest {
         }
     }
 
+    /// Apaga (`true`) o enciende el vídeo: el anfitrión deja de mandarlo y no aplica la entrada
+    /// de este invitado, que suelta aquí lo que tenía pulsado (el anfitrión ya lo soltó). No se
+    /// recuerda: cada sala arranca con el vídeo encendido. Solo falla sin sesión, y entonces no
+    /// cambia nada (un aviso que no llega al anfitrión, reconectando, lo repite la conexión
+    /// siguiente: la sesión no lo da por error).
+    pub fn set_video_paused(&self, paused: bool) -> Result<(), String> {
+        lock(&self.session)
+            .as_ref()
+            .ok_or_else(|| "ya no estás en la sala".to_owned())?
+            .set_video_paused(paused)
+            .map_err(|err| err.to_string())?;
+        if self.video_off.swap(paused, Ordering::AcqRel) != paused && paused {
+            // Lo que se suelta no hace falta mandarlo: el anfitrión lo soltó todo al apagarlo.
+            let _ = lock(&self.touch).reset();
+            let _ = lock(&self.mouse).release();
+        }
+        Ok(())
+    }
+
+    /// Si el vídeo está apagado.
+    pub fn video_paused(&self) -> bool {
+        self.video_off.load(Ordering::Acquire)
+    }
+
     /// Un `MotionEvent` del tacto sobre el vídeo. Devuelve cuándo llamar a [`Guest::touch_tick`]
     /// (reloj de `getEventTime()`), o `None`.
     pub fn touch(
@@ -520,6 +549,9 @@ impl Guest {
         pointers: &[TouchPointer],
         time_ms: u64,
     ) -> Option<u64> {
+        if self.video_paused() {
+            return None;
+        }
         let action = TouchAction::from_android(action_masked, action_pointer_id)?;
         let mut touch = lock(&self.touch);
         for event in touch.on_touch(action, pointers, time_ms) {
@@ -556,6 +588,10 @@ impl Guest {
 
     /// Una tecla del teclado (no de un mando). `false` si no tiene equivalente.
     pub fn key(&self, keycode: i32, scancode: i32, pressed: bool) -> bool {
+        // Con el vídeo apagado, la tecla es de Android (atrás vuelve, como fuera de la sala).
+        if self.video_paused() {
+            return false;
+        }
         let Some(code) = evdev_from_android(keycode, scancode) else {
             return false;
         };
@@ -566,6 +602,9 @@ impl Guest {
     /// Texto del teclado en pantalla que no es ninguna tecla (ñ, á, emoji): un evento por
     /// carácter, sin los de control. `false` si no había nada que mandar.
     pub fn text(&self, text: &str) -> bool {
+        if self.video_paused() {
+            return false;
+        }
         let mut sent = false;
         for event in mouse::text_events(text) {
             self.input.send(event);
@@ -576,6 +615,9 @@ impl Guest {
 
     /// Movimiento relativo del ratón capturado.
     pub fn mouse_move(&self, dx: f32, dy: f32) {
+        if self.video_paused() {
+            return;
+        }
         if let Some(event) = lock(&self.mouse).motion(dx, dy) {
             self.input.send(event);
         }
@@ -583,6 +625,9 @@ impl Guest {
 
     /// Un botón del ratón capturado (`MotionEvent.getActionButton()`). `false` si no es de ratón.
     pub fn mouse_button(&self, button: i32, pressed: bool) -> bool {
+        if self.video_paused() {
+            return false;
+        }
         let (known, event) = lock(&self.mouse).button(button, pressed);
         if let Some(event) = event {
             self.input.send(event);
@@ -592,6 +637,9 @@ impl Guest {
 
     /// La rueda del ratón capturado, en muescas de Android.
     pub fn mouse_wheel(&self, horizontal: f32, vertical: f32) {
+        if self.video_paused() {
+            return;
+        }
         if let Some(event) = lock(&self.mouse).wheel(horizontal, vertical) {
             self.input.send(event);
         }

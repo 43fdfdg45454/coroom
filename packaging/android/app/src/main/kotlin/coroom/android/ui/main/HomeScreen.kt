@@ -70,6 +70,8 @@ fun HomeScreen(
     onAskToJoin: (Friend) -> Unit,
     onOpenAccount: () -> Unit,
     onOpenFriends: () -> Unit,
+    /** Los botones de los avisos de la versión nueva y de versiones distintas. */
+    updates: UpdateActions = UpdateActions.None,
 ) {
     val account = state.account ?: return
     val colors = MaterialTheme.colorScheme
@@ -113,6 +115,13 @@ fun HomeScreen(
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             Greeting(account, state.serverOnline)
+            // Versiones distintas con el servidor; si la app es la vieja, su aviso ya lleva la
+            // acción de la versión nueva (un fallo sí se explica aparte).
+            val mismatch = state.protocolMismatch
+            mismatch?.let { ProtocolBanner(it.host, it.gap, state.update, updates) }
+            if (mismatch?.gap?.clientOlder != true || state.update?.stage == "failed") {
+                UpdateBanner(state.update, updates)
+            }
             JoinCard(
                 code = code,
                 onCode = { code = RoomCode.clean(it) },

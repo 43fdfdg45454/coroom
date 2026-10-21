@@ -8,6 +8,7 @@
 //! la aplicación (sus catálogos); aquí solo el aspecto.
 
 use iced_core::Padding;
+use iced_core::alignment::{Horizontal, Vertical};
 use iced_core::text::Wrapping;
 use iced_widget::{container, text};
 
@@ -16,7 +17,7 @@ use crate::font::SEMIBOLD;
 use crate::style::ContainerClass;
 use crate::theme::Tone;
 use crate::tokens::text as type_size;
-use crate::widget::one_line;
+use crate::widget::{cap_centered, one_line};
 
 /// Cuándo surte efecto lo que se cambia.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,15 +41,21 @@ impl When {
 /// Etiqueta de cuándo surte efecto un ajuste, con el texto `label`: en una línea y, si no cabe,
 /// acortada con «…» y entera al pasar el ratón.
 pub fn tag<'a, M: 'a>(when: When, label: impl text::IntoFragment<'a>) -> Element<'a, M> {
-    container(one_line(label.into_fragment().into_owned(), |label| {
+    const SIZE: f32 = type_size::CAPTION - 1.0;
+    const LINE: text::LineHeight = text::LineHeight::Absolute(iced_core::Pixels(14.0));
+    let label = one_line(label.into_fragment().into_owned(), |label| {
         text(label)
-            .size(type_size::CAPTION - 1.0)
+            .size(SIZE)
             .font(SEMIBOLD)
+            .line_height(LINE)
             .wrapping(Wrapping::None)
-    }))
-    .padding(Padding::from([2.0, 8.0]))
-    .class(ContainerClass::Badge(when.tone()))
-    .into()
+    });
+    container(cap_centered(label, SIZE))
+        .padding(Padding::from([2.0, 8.0]))
+        .align_x(Horizontal::Center)
+        .align_y(Vertical::Center)
+        .class(ContainerClass::Badge(when.tone()))
+        .into()
 }
 
 /// «Al momento».

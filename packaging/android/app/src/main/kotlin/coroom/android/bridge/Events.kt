@@ -141,6 +141,24 @@ sealed interface CoroomEvent {
     /** Paso de la lista de «Entrando en la sala»: `server`, `path`, `probe` o `keys`. */
     @Serializable
     data class JoinProgress(val step: String = "", val done: Boolean = false) : CoroomEvent
+
+    /** El estado de la versión nueva, entero en cada cambio. */
+    data class Update(val state: UpdateState) : CoroomEvent
+
+    /** Toca instalar la versión nueva: el APK ya comprobado. */
+    @Serializable
+    data class UpdateInstall(val path: String = "") : CoroomEvent
+
+    /** El servidor rechazó la conexión por la versión del protocolo: quién quedó atrás. */
+    @Serializable
+    data class ProtocolMismatch(
+        val host: String = "",
+        val kind: String = "",
+        val server: Int = 0,
+        val client: Int = 0,
+    ) : CoroomEvent {
+        val gap: ProtocolGap get() = ProtocolGap(kind, server, client)
+    }
 }
 
 /** Los eventos que solo importan dentro de una sala. */
@@ -187,6 +205,9 @@ fun parseEvent(text: String): CoroomEvent? = try {
         "rumble" -> json.decode(CoroomEvent.Rumble.serializer())
         "join_progress" -> json.decode(CoroomEvent.JoinProgress.serializer())
         "permissions" -> json.decode(CoroomEvent.Permissions.serializer())
+        "update" -> CoroomEvent.Update(json.decode(UpdateState.serializer()))
+        "update_install" -> json.decode(CoroomEvent.UpdateInstall.serializer())
+        "protocol_mismatch" -> json.decode(CoroomEvent.ProtocolMismatch.serializer())
         else -> null
     }
 } catch (_: IllegalArgumentException) {

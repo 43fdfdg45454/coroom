@@ -593,9 +593,16 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         Msg::CheckUpdates => return app.check_updates(true),
         Msg::UpdateChecks(on) => {
             settings.updates.check = on;
-            // Al activarla, se comprueba enseguida; al quitarla, no se vuelve a preguntar.
-            let due = on && app.update.available.is_none();
+            // Al activarla, se busca enseguida; al quitarla, no se vuelve a preguntar y se para y
+            // se olvida la versión nueva (también la descarga).
+            let due = on && app.update.updater.release().is_none();
             app.schedule_update_check(due);
+            if !on {
+                let commands = app.update.updater.disable();
+                let mut effects = app.settings_changed();
+                effects.extend(app.update_commands(commands));
+                return effects;
+            }
         }
         Msg::UpdateInterval(choice) => settings.updates.interval_hours = choice.value,
     }
@@ -686,16 +693,7 @@ fn key_captured(app: &mut App, name: String) -> Vec<Effect> {
             };
             let mut shortcuts = app.settings.input.shortcuts.clone();
             let letter = letter.to_ascii_uppercase();
-            match index {
-                0 => shortcuts.immersive = letter,
-                1 => shortcuts.release = letter,
-                2 => shortcuts.stats = letter,
-                3 => shortcuts.chat = letter,
-                4 => shortcuts.leave = letter,
-                5 => shortcuts.mic = letter,
-                6 => shortcuts.game = letter,
-                _ => shortcuts.pads = letter,
-            }
+            *shortcuts.letter_mut(index) = letter;
             if !shortcuts.is_valid() {
                 app.toast(
                     Tone::Warning,
@@ -2338,7 +2336,7 @@ fn connected_pads(app: &App) -> Element<'_, Message> {
 // --- Atajos de teclado ---------------------------------------------------------------------------
 
 /// Qué hace cada atajo del invitado, en el orden de [`Shortcuts::letters`].
-fn shortcut_names() -> [&'static str; 8] {
+fn shortcut_names() -> [&'static str; 9] {
     [
         t!("settings-atajo-inmersivo"),
         t!("settings-atajo-soltar"),
@@ -2348,6 +2346,7 @@ fn shortcut_names() -> [&'static str; 8] {
         t!("settings-atajo-microfono"),
         t!("settings-atajo-juego"),
         t!("settings-atajo-mandos"),
+        t!("settings-atajo-video"),
     ]
 }
 
@@ -2655,61 +2654,18 @@ pub fn release_page(version: &str) -> String {
 }
 
 fn updates<'a>(app: &'a App) -> Vec<Element<'a, Message>> {
-    let state = &app.update;
     let updates = &app.settings.updates;
     let disabled = crate::update::disabled_by_env();
-    let status = if disabled {
-        t!(
-            "settings-desactivado-con-este-paquete",
-            valor = crate::update::DISABLE_ENV
-        )
-    } else if state.checking {
-        t!("settings-comprobando-en-las-publicaciones").to_owned()
-    } else if let Some(update) = &state.available {
-        t!(
-            "settings-hay-una-version-nueva",
-            version = update.version,
-            current = app.version
-        )
-    } else if let Some(err) = &state.error {
-        t!("settings-la-ultima-comprobacion-fallo", err = err)
-    } else if updates.last_check.is_some() {
-        t!("settings-tienes-la-ultima-version").to_owned()
-    } else {
-        t!("settings-pregunta-a-las-publicaciones").to_owned()
-    };
+    // El texto y la acción de cada punto de la versión nueva ([`super::updates`]).
+    let (status, action) = super::updates::status(app);
     // Del alto de la más larga de las que pueden salir sin más datos (y de la de ahora).
     let status_variants = vec![
         t!("settings-comprobando-en-las-publicaciones").to_owned(),
-        t!("settings-tienes-la-ultima-version").to_owned(),
         t!("settings-pregunta-a-las-publicaciones").to_owned(),
         status.clone(),
     ];
-    let see = |url: Option<String>| -> Element<'a, Message> {
-        ui::button_with(
-            Kind::Primary,
-            t!("settings-ver-la-version-nueva"),
-            Some(Icon::ExternalLink),
-            url.map(Message::OpenUrl),
-        )
-        .into()
-    };
-    let check = |enabled: bool| -> Element<'a, Message> {
-        ui::normal(
-            if state.checking {
-                t!("settings-comprobando")
-            } else {
-                t!("settings-comprobar-ahora")
-            },
-            enabled.then_some(on(Msg::CheckUpdates)),
-        )
-        .into()
-    };
-    // Con una versión nueva, «Ver la versión nueva» en el sitio de «Comprobar ahora».
-    let action = match &state.available {
-        Some(update) => see(Some(update.url.clone())),
-        None => check(!state.checking && !disabled),
-    };
+    let check_sample: Element<'a, Message> =
+        ui::normal(t!("settings-comprobar-ahora"), None::<Message>).into();
     let intervals: Vec<Choice<u32>> = crate::update::INTERVAL_CHOICES
         .iter()
         .map(|hours| {
@@ -2742,7 +2698,13 @@ fn updates<'a>(app: &'a App) -> Vec<Element<'a, Message>> {
             t!("settings-version-nueva"),
             Some(varying(status_variants, help(status))),
             None,
-            steady(vec![see(None), check(false)], action),
+            steady(vec![check_sample], action),
+        ),
+        setting(
+            t!("update-automatico"),
+            Some(help(t!("update-automatico-ayuda"))),
+            None,
+            super::updates::auto_switch(app),
         ),
         setting(
             t!("settings-buscar-versiones-nuevas"),
@@ -2829,6 +2791,7 @@ pub(crate) mod shots {
 
     use super::SettingsPage;
     use crate::ui::app::{App, AudioDevice, Event, Load, Message, Page};
+    use crate::ui::screens::updates::shots as updates;
     use crate::ui::settings::KnownPeer;
     use crate::ui::shots::{Builder, signed_in, unix_ago};
 
@@ -2968,6 +2931,31 @@ pub(crate) mod shots {
         }),
         ("21-ajustes-acerca", |app| {
             settings_page(app, SettingsPage::About)
+        }),
+        // Cada punto de la versión nueva ([`crate::ui::screens::updates`]).
+        ("21-ajustes-acerca-al-dia", |app| {
+            settings_page(app, SettingsPage::About);
+            updates::up_to_date(app);
+        }),
+        ("21-ajustes-acerca-buscando", |app| {
+            settings_page(app, SettingsPage::About);
+            updates::checking(app);
+        }),
+        ("21-ajustes-acerca-descargando", |app| {
+            settings_page(app, SettingsPage::About);
+            updates::downloading(app);
+        }),
+        ("21-ajustes-acerca-en-pausa", |app| {
+            settings_page(app, SettingsPage::About);
+            updates::paused(app);
+        }),
+        ("21-ajustes-acerca-lista", |app| {
+            settings_page(app, SettingsPage::About);
+            updates::ready(app, false);
+        }),
+        ("21-ajustes-acerca-msix", |app| {
+            settings_page(app, SettingsPage::About);
+            updates::msix(app);
         }),
     ];
 }
@@ -3520,7 +3508,7 @@ mod tests {
     #[test]
     fn shortcuts_are_captured_and_must_not_collide() {
         let mut app = open(SettingsPage::Gamepads);
-        assert_eq!(Shortcuts::default().letters().len(), 8);
+        assert_eq!(Shortcuts::default().letters().len(), 9);
         app.update(Message::Settings(Msg::Capture(Capture::Shortcut(0))));
         assert!(
             app.update(Message::Settings(Msg::KeyCaptured("k".into())))
@@ -3550,6 +3538,13 @@ mod tests {
         app.update(Message::Settings(Msg::Capture(Capture::Shortcut(1))));
         app.update(Message::Settings(Msg::KeyCaptured("t".into())));
         assert_eq!(app.settings.input.shortcuts.release, 'T');
+        // Apagar el vídeo es el último y choca como los demás.
+        app.update(Message::Settings(Msg::Capture(Capture::Shortcut(8))));
+        app.update(Message::Settings(Msg::KeyCaptured("m".into())));
+        assert_eq!(app.settings.input.shortcuts.video, 'I');
+        app.update(Message::Settings(Msg::Capture(Capture::Shortcut(8))));
+        app.update(Message::Settings(Msg::KeyCaptured("y".into())));
+        assert_eq!(app.settings.input.shortcuts.video, 'Y');
         app.update(Message::Settings(Msg::Capture(Capture::Shortcut(1))));
         app.update(Message::Settings(Msg::CancelCapture));
         assert_eq!(app.settings_page.capturing, None);

@@ -119,6 +119,8 @@ pub struct Backend {
     settings_save: Option<thread::JoinHandle<()>>,
     /// La prueba del micrófono en marcha: se para poniendo el aviso.
     mic_test: Option<Arc<RunningMicTest>>,
+    /// Las descargas de la versión nueva.
+    updates: crate::update::Worker,
 }
 
 /// La prueba del micrófono en marcha: con qué dispositivos, su aviso de parar y el volumen, que
@@ -241,6 +243,7 @@ impl Backend {
             compositor,
             settings_save: None,
             mic_test: None,
+            updates: crate::update::Worker::default(),
         }
     }
 
@@ -314,6 +317,12 @@ impl Backend {
         } else {
             self.guest_controls().map(|controls| controls.audio)
         }
+    }
+
+    /// Hay (o ya no hay) una sala abierta: las descargas de la versión nueva de los demás procesos
+    /// de coroom esperan mientras tanto.
+    pub fn update_room(&self, open: bool) {
+        self.updates.set_room_open(open);
     }
 
     /// Hace `effect`. `app` da el contexto (cuenta, ajustes).
@@ -658,6 +667,13 @@ impl Backend {
                     controls.audio.toggle_game();
                 }
             }
+            Effect::SetVideoPaused(paused) => {
+                if let Some(run) = lock(&self.guest).as_ref()
+                    && let Err(err) = lock(&run.session).set_video_paused(paused)
+                {
+                    (self.notify)(Message::Event(Event::Failed(err.to_string())));
+                }
+            }
             Effect::SaveSettings => self.save_settings(app, false),
             Effect::ForgetCredentials(url) => self.spawn("olvidar", move |notify| {
                 if let Err(err) = forget_credentials(&url) {
@@ -725,6 +741,25 @@ impl Backend {
                     }));
                 });
             }
+            Effect::UpdateCommand(command) => {
+                let notify = Arc::clone(&self.notify);
+                self.updates
+                    .execute(command, app.update.updater.channel(), move |report| {
+                        notify(Message::Event(Event::UpdateReport(report)));
+                    });
+            }
+            Effect::ProbeProtocol { url, tcp_port } => self.spawn("protocolo", move |notify| {
+                let result = account::probe_server(&url, tcp_port).map(|probe| probe.protocol);
+                notify(Message::Event(Event::ProtocolChecked {
+                    host: crate::ui::app::host_of(&url),
+                    result,
+                }));
+            }),
+            Effect::OpenFolder(folder) => self.spawn("carpeta", move |notify| {
+                if let Err(err) = crate::update::open_folder(&folder) {
+                    notify(Message::Event(Event::Failed(err)));
+                }
+            }),
             Effect::OpenUrl(url) => self.spawn("enlace", move |notify| {
                 if let Err(err) = crate::update::open_url(&url) {
                     notify(Message::Event(Event::Failed(t!(
@@ -1921,6 +1956,7 @@ fn lobby_ui_event(event: LobbyEvent) -> Option<Event> {
             rtt_ms: None,
             online: false,
         },
+        LobbyEvent::ProtocolRejected => Event::ProtocolRejected,
         LobbyEvent::SendFailed(None) => Event::JoinRequestFailed {
             message: t!("backend-sin-conexion-para-pedir-entrar").to_owned(),
         },

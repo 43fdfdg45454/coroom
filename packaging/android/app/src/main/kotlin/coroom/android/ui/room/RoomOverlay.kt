@@ -15,6 +15,7 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
@@ -25,8 +26,11 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
@@ -37,6 +41,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
@@ -47,15 +52,18 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.coerceAtLeast
 import coroom.android.R
 import coroom.android.bridge.ChatMessage
 import coroom.android.bridge.Member
 import coroom.android.bridge.RoomStats
 import coroom.android.bridge.TouchMode
 import coroom.android.ui.components.CoroomIcon
+import coroom.android.ui.components.PillButton
 import coroom.android.ui.components.StatusDot
 import coroom.android.ui.text
 import coroom.android.ui.theme.CoroomText
@@ -77,6 +85,8 @@ class RoomActions(
     val onRevealOverlay: () -> Unit,
     /** «Compartir registro» desde el panel de conexión. */
     val onShareLog: () -> Unit,
+    /** Apagar o encender el vídeo. */
+    val onToggleVideo: () -> Unit = {},
 )
 
 /**
@@ -94,6 +104,10 @@ fun RoomOverlay(state: RoomUiState, actions: RoomActions) {
     val panelOpen = state.panel != Panel.None
     val overlayVisible = state.overlayVisible
     Box(modifier = Modifier.fillMaxSize()) {
+        // Con el vídeo apagado, su vista tapa la imagen (y los toques no llegan al juego).
+        AnimatedVisibility(visible = state.videoOff, enter = fadeIn(), exit = fadeOut()) {
+            VideoOffView(state.hostName, onTurnOn = actions.onToggleVideo)
+        }
         // Con un panel abierto el vídeo se oscurece y tocarlo cierra el panel (no llega al juego).
         AnimatedVisibility(visible = panelOpen, enter = fadeIn(), exit = fadeOut()) {
             Box(
@@ -126,7 +140,7 @@ fun RoomOverlay(state: RoomUiState, actions: RoomActions) {
             }
 
             AnimatedVisibility(
-                visible = overlayVisible && !panelOpen,
+                visible = overlayVisible && !panelOpen && !state.videoOff,
                 modifier = Modifier.align(Alignment.BottomStart).padding(start = 14.dp, bottom = 12.dp),
                 enter = slideInVertically { it } + fadeIn(),
                 exit = slideOutVertically { it } + fadeOut(),
@@ -210,7 +224,8 @@ fun ConnectionPill(state: RoomUiState, onClick: () -> Unit, modifier: Modifier =
     val colors = MaterialTheme.colorScheme
     val rtt = state.shownRttMs?.let { stringResource(R.string.unit_ms, formatNumber(it, 0)) } ?: stringResource(R.string.no_value)
     val route = routeText(state.shownRelayed)
-    val detail = listOfNotNull(route, state.codec?.takeIf { it.isNotBlank() }).joinToString(" · ")
+    val media = if (state.videoOff) stringResource(R.string.room_voice_only) else state.codec?.takeIf { it.isNotBlank() }
+    val detail = listOfNotNull(route, media).joinToString(" · ")
     val quality = stringResource(
         when {
             state.reconnecting != null -> R.string.quality_reconnecting
@@ -235,18 +250,19 @@ fun ConnectionPill(state: RoomUiState, onClick: () -> Unit, modifier: Modifier =
             .background(CoroomTheme.colors.overlay)
             .clickable(role = Role.Button, onClick = onClick)
             .semantics(mergeDescendants = true) { contentDescription = description }
-            .padding(start = 10.dp, end = 12.dp),
+            // El mismo margen a los dos lados: el contenido, centrado en la píldora.
+            .padding(horizontal = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         StatusDot(qualityColor(state))
         Text(
             text = if (state.reconnecting != null) stringResource(R.string.quality_reconnecting) else rtt,
-            style = CoroomText.supporting.copy(fontWeight = FontWeight.SemiBold),
+            style = CoroomText.pill.copy(fontWeight = FontWeight.SemiBold),
             color = colors.onSurface,
         )
         AnimatedVisibility(visible = expanded) {
-            Text(text = detail, style = CoroomText.supporting, color = colors.onSurfaceVariant)
+            Text(text = detail, style = CoroomText.pill, color = colors.onSurfaceVariant)
         }
         // Con la barra escondida no se ve el aviso del chat de la barra lateral: va aquí.
         AnimatedVisibility(visible = !expanded && state.unreadChat, enter = fadeIn(), exit = fadeOut()) {
@@ -288,74 +304,93 @@ private fun OverlayChip(@DrawableRes icon: Int, text: String, modifier: Modifier
             .height(32.dp)
             .clip(RoundedCornerShape(16.dp))
             .background(CoroomTheme.colors.overlay)
-            .padding(start = 10.dp, end = 12.dp),
+            .padding(horizontal = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         CoroomIcon(icon, contentDescription = null, size = 18.dp)
-        Text(text = text, style = CoroomText.supporting, color = MaterialTheme.colorScheme.onSurface)
+        Text(text = text, style = CoroomText.pill, color = MaterialTheme.colorScheme.onSurface)
     }
 }
 
-/** La barra vertical de la derecha: micrófono, teclado, modo táctil, chat, conexión y salir. */
+/** La barra vertical de la derecha: micrófono, vídeo, teclado, modo táctil, chat, conexión y salir. */
 @Composable
 private fun RoomRail(state: RoomUiState, actions: RoomActions, modifier: Modifier = Modifier) {
     val colors = MaterialTheme.colorScheme
-    Column(
+    BoxWithConstraints(
         modifier = modifier
             .fillMaxHeight()
             .width(60.dp)
             .clip(RoundedCornerShape(30.dp))
-            .background(CoroomTheme.colors.overlayStrong)
-            .padding(vertical = 8.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.SpaceBetween,
+            .background(CoroomTheme.colors.overlayStrong),
     ) {
-        RailButton(
-            icon = if (state.micMuted) R.drawable.ic_mic_off else R.drawable.ic_mic,
-            description = stringResource(if (state.micMuted) R.string.rail_mic_unmute else R.string.rail_mic_mute),
-            active = !state.micMuted,
-            onClick = actions.onToggleMic,
-        )
-        RailButton(
-            icon = R.drawable.ic_keyboard,
-            description = stringResource(if (state.keyboardVisible) R.string.rail_keyboard_hide else R.string.rail_keyboard_show),
-            active = state.keyboardVisible,
-            onClick = actions.onToggleKeyboard,
-        )
-        RailButton(
-            icon = if (state.touchMode == TouchMode.Trackpad) R.drawable.ic_trackpad else R.drawable.ic_pointer,
-            description = stringResource(R.string.rail_touch_mode),
-            onClick = actions.onCycleTouchMode,
-        )
-        Box {
+        // Los botones repartidos a lo alto; en un teléfono bajo, en horizontal, no caben con su
+        // tamaño de toque y la barra se desliza en lugar de encogerlos.
+        val gap = ((maxHeight - RAIL_PADDING * 2 - RAIL_BUTTON * RAIL_BUTTONS) / (RAIL_BUTTONS - 1)).coerceAtLeast(0.dp)
+        Column(
+            modifier = Modifier
+                .fillMaxHeight()
+                .verticalScroll(rememberScrollState())
+                .padding(vertical = RAIL_PADDING),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(gap),
+        ) {
             RailButton(
-                icon = R.drawable.ic_message_square,
-                description = stringResource(if (state.unreadChat) R.string.rail_chat_unread else R.string.rail_chat),
-                onClick = { actions.onTogglePanel(Panel.Chat) },
+                icon = if (state.micMuted) R.drawable.ic_mic_off else R.drawable.ic_mic,
+                description = stringResource(if (state.micMuted) R.string.rail_mic_unmute else R.string.rail_mic_mute),
+                active = !state.micMuted,
+                onClick = actions.onToggleMic,
             )
-            if (state.unreadChat) {
-                Box(
-                    Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(top = 6.dp, end = 6.dp)
-                        .size(10.dp)
-                        .background(colors.error, CircleShape),
+            RailButton(
+                icon = if (state.videoOff) R.drawable.ic_monitor_off else R.drawable.ic_monitor,
+                description = stringResource(if (state.videoOff) R.string.rail_video_on else R.string.rail_video_off),
+                active = state.videoOff,
+                onClick = actions.onToggleVideo,
+            )
+            // El teclado y el modo táctil, en pausa con el vídeo apagado.
+            val paused = stringResource(R.string.rail_paused_without_video)
+            RailButton(
+                icon = R.drawable.ic_keyboard,
+                description = if (state.videoOff) paused else stringResource(if (state.keyboardVisible) R.string.rail_keyboard_hide else R.string.rail_keyboard_show),
+                active = state.keyboardVisible,
+                onClick = actions.onToggleKeyboard,
+                enabled = !state.videoOff,
+            )
+            RailButton(
+                icon = if (state.touchMode == TouchMode.Trackpad) R.drawable.ic_trackpad else R.drawable.ic_pointer,
+                description = if (state.videoOff) paused else stringResource(R.string.rail_touch_mode),
+                onClick = actions.onCycleTouchMode,
+                enabled = !state.videoOff,
+            )
+            Box {
+                RailButton(
+                    icon = R.drawable.ic_message_square,
+                    description = stringResource(if (state.unreadChat) R.string.rail_chat_unread else R.string.rail_chat),
+                    onClick = { actions.onTogglePanel(Panel.Chat) },
                 )
+                if (state.unreadChat) {
+                    Box(
+                        Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(top = 6.dp, end = 6.dp)
+                            .size(10.dp)
+                            .background(colors.error, CircleShape),
+                    )
+                }
             }
+            RailButton(
+                icon = R.drawable.ic_activity,
+                description = stringResource(R.string.rail_connection),
+                onClick = { actions.onTogglePanel(Panel.Connection) },
+            )
+            RailButton(
+                icon = R.drawable.ic_log_out,
+                description = stringResource(R.string.rail_leave),
+                onClick = { actions.onAskLeave(true) },
+                container = colors.errorContainer,
+                tint = colors.onErrorContainer,
+            )
         }
-        RailButton(
-            icon = R.drawable.ic_activity,
-            description = stringResource(R.string.rail_connection),
-            onClick = { actions.onTogglePanel(Panel.Connection) },
-        )
-        RailButton(
-            icon = R.drawable.ic_log_out,
-            description = stringResource(R.string.rail_leave),
-            onClick = { actions.onAskLeave(true) },
-            container = colors.errorContainer,
-            tint = colors.onErrorContainer,
-        )
     }
 }
 
@@ -367,20 +402,86 @@ private fun RailButton(
     active: Boolean = false,
     container: Color? = null,
     tint: Color? = null,
+    enabled: Boolean = true,
 ) {
     val colors = MaterialTheme.colorScheme
     val background = container ?: if (active) colors.primaryContainer else Color.Transparent
     val iconTint = tint ?: if (active) colors.onPrimaryContainer else colors.onSurface
     Box(
         modifier = Modifier
-            .size(44.dp)
+            .size(RAIL_BUTTON)
+            .alpha(if (enabled) 1f else PAUSED_ALPHA)
             .clip(CircleShape)
             .background(background)
-            .clickable(role = Role.Button, onClick = onClick)
+            .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
             .semantics { contentDescription = description },
         contentAlignment = Alignment.Center,
     ) {
         CoroomIcon(icon, contentDescription = null, tint = iconTint)
+    }
+}
+
+/** Botones de la barra lateral: micrófono, vídeo, teclado, modo táctil, chat, conexión y salir. */
+private const val RAIL_BUTTONS = 7
+
+/** Lado de un botón de la barra lateral (su zona de toque). */
+private val RAIL_BUTTON = 44.dp
+
+/** Margen de arriba y abajo de la barra lateral. */
+private val RAIL_PADDING = 8.dp
+
+/** Lo apagado de la barra mientras el vídeo está apagado (el teclado, el modo táctil). */
+private const val PAUSED_ALPHA = 0.35f
+
+/**
+ * Lo que se ve en lugar del vídeo cuando el invitado lo apagó: qué sigue y qué no, y el botón
+ * para encenderlo. Tapa la imagen y se queda con los toques (no llegan al juego).
+ */
+@Composable
+private fun VideoOffView(hostName: String?, onTurnOn: () -> Unit) {
+    val colors = MaterialTheme.colorScheme
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .pointerInput(Unit) { detectTapGestures { } }
+            .semantics { liveRegion = LiveRegionMode.Polite },
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            modifier = Modifier.widthIn(max = 420.dp).padding(horizontal = 24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(56.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Color.White.copy(alpha = 0.08f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                CoroomIcon(R.drawable.ic_monitor_off, contentDescription = null, tint = colors.onSurfaceVariant, size = 28.dp)
+            }
+            Text(
+                text = stringResource(R.string.room_video_off_title),
+                style = CoroomText.cardTitle.copy(fontWeight = FontWeight.SemiBold),
+                color = colors.onSurface,
+            )
+            Text(
+                text = hostName?.let { stringResource(R.string.room_video_off_body, it) }
+                    ?: stringResource(R.string.room_video_off_body_no_name),
+                style = CoroomText.supporting,
+                color = colors.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+            PillButton(
+                text = stringResource(R.string.room_video_on),
+                onClick = onTurnOn,
+                modifier = Modifier.padding(top = 6.dp),
+                height = 44.dp,
+                icon = R.drawable.ic_monitor,
+            )
+        }
     }
 }
 
@@ -502,6 +603,16 @@ private fun RoomOverlayHiddenPreview() {
     CoroomTheme(darkTheme = true, dynamicColor = false) {
         Box(Modifier.fillMaxSize().background(Color(0xFF3D8B4A))) {
             RoomOverlay(PreviewRoom.state.copy(overlayShown = false), PreviewRoom.actions)
+        }
+    }
+}
+
+@Preview(name = "Sala: vídeo apagado", widthDp = 844, heightDp = 390)
+@Composable
+private fun RoomVideoOffPreview() {
+    CoroomTheme(darkTheme = true, dynamicColor = false) {
+        Box(Modifier.fillMaxSize().background(Color(0xFF3D8B4A))) {
+            RoomOverlay(PreviewRoom.state.copy(videoOff = true), PreviewRoom.actions)
         }
     }
 }

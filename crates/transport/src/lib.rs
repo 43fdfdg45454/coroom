@@ -14,6 +14,8 @@
 //!   UPnP para que lleguen en directo).
 //! - [`signal`]: [`SignalClient`] (señalización por WebTransport desde el mismo socket).
 //! - [`api`]: [`ApiClient`] (API de cuentas, amigos y uso por HTTP/3 con respaldo HTTP/2 por TCP).
+//! - [`download`]: descargas grandes por HTTPS con redirecciones y reanudación (`Range`), para
+//!   las versiones nuevas de la aplicación.
 //! - [`loopback`]: el bucle UDP de la prueba de latencia local.
 //! - `lossy` (feature `test-util`): proxy UDP con pérdida y retardo para los tests.
 
@@ -22,6 +24,7 @@ pub use coroom_proto as proto;
 
 pub mod api;
 pub mod connect;
+pub mod download;
 mod error;
 mod eyeballs;
 pub mod fec;

@@ -44,6 +44,8 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import coroom.android.R
 import coroom.android.bridge.ServerProbe
+import coroom.android.bridge.UpdateState
+import coroom.android.bridge.displayHost
 import coroom.android.bridge.formatFingerprint
 import coroom.android.ui.components.CoroomIcon
 import coroom.android.ui.components.LabeledField
@@ -68,6 +70,8 @@ fun ServerScreen(
     onDisplayName: (String) -> Unit,
     onToggleInvitation: () -> Unit,
     onSubmit: () -> Unit,
+    update: UpdateState? = null,
+    updates: UpdateActions = UpdateActions.None,
 ) {
     val colors = MaterialTheme.colorScheme
     Surface(color = colors.background, modifier = Modifier.fillMaxSize()) {
@@ -97,6 +101,9 @@ fun ServerScreen(
             }
 
             LabeledFieldServer(state, onUrl, onProbeNow)
+
+            // La app o el servidor quedaron atrás: quién y qué hacer (boceto «versiones distintas»).
+            state.probe?.protocolGap?.let { ProtocolBanner(displayHost(state.url), it, update, updates) }
 
             AnimatedVisibility(
                 visible = state.probe != null && state.trust != TrustState.NotNeeded,

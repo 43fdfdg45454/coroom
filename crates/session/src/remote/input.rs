@@ -145,6 +145,9 @@ pub(crate) enum Job {
     },
     /// Pausa global.
     Paused(bool),
+    /// El invitado apagó (o volvió a encender) su vídeo: con él apagado su entrada no se aplica
+    /// (como en pausa, solo para él) y su mando sigue en su ranura, en reposo.
+    VideoPaused { guest: GuestId, paused: bool },
     /// Conexión EIS de la captura nueva (cambio de fuente con la sala abierta, Linux).
     Eis(EisProvider),
     /// El invitado salió, fue expulsado o perdió la conexión.
@@ -500,6 +503,8 @@ struct GuestState {
     last_packet: Option<Instant>,
     /// Se soltó lo suyo por silencio: el siguiente paquete se reconcilia con la vista.
     stale: bool,
+    /// Apagó su vídeo ([`Job::VideoPaused`]): su entrada se descarta como en pausa.
+    video_paused: bool,
 }
 
 /// Cuándo y cómo llegó un paquete de entrada.
@@ -679,6 +684,7 @@ impl Worker {
                 continue;
             };
             if state.stale
+                || state.video_paused
                 || !state.view.any_pressed()
                 || now.saturating_duration_since(last) < STALE_AFTER
             {
@@ -732,6 +738,7 @@ impl Worker {
                 self.user_paused = paused;
                 self.update_paused();
             }
+            Job::VideoPaused { guest, paused } => self.video_paused(guest, paused),
             Job::GuestGone(guest) => self.gone(guest),
         }
     }
@@ -771,7 +778,29 @@ impl Worker {
         }
     }
 
-    /// Aplica un paquete; devuelve `false` si se descartó entero (antiguo o en pausa).
+    /// `guest` apagó o encendió su vídeo. Al apagarlo se suelta lo suyo (teclas, botones y su
+    /// mando convertido, que vuelve al reposo); el mando tal cual sigue creado con su último
+    /// informe, como cuando el invitado se va a otra página (deja de mandarlos). Al encenderlo
+    /// su entrada vuelve a aplicarse: la vista sigue la suya durante la pausa, así que no se
+    /// reconstruye lo que pulsó entretanto.
+    fn video_paused(&mut self, guest: GuestId, paused: bool) {
+        let state = self.guests.entry(guest).or_default();
+        if state.video_paused == paused {
+            return;
+        }
+        state.video_paused = paused;
+        state.dirty = true;
+        debug!(
+            guest = guest.0,
+            paused, "entrada del invitado según su vídeo"
+        );
+        if paused && let Err(err) = self.sink.release_all(guest) {
+            self.warn(&err);
+        }
+    }
+
+    /// Aplica un paquete; devuelve `false` si se descartó entero (antiguo o en pausa, la de todos
+    /// o la de su vídeo apagado).
     fn packet(
         &mut self,
         guest: GuestId,
@@ -786,8 +815,8 @@ impl Worker {
             queued_us,
             network_us,
         } = timing;
-        let paused = self.paused;
         let entry = self.guests.entry(guest).or_default();
+        let paused = self.paused || entry.video_paused;
         entry.stats_changed = true;
         entry.last_packet = Some(received);
         // Lo más antiguo que lo último aplicado (o repetido) ya no sirve.
@@ -1027,7 +1056,10 @@ impl Worker {
                     self.apply_pad_mode(guest);
                 }
                 PadData::Report { slot, data } => {
-                    if self.paused || !state.pad.as_ref().is_some_and(PadState::guest_sends_raw) {
+                    if self.paused
+                        || state.video_paused
+                        || !state.pad.as_ref().is_some_and(PadState::guest_sends_raw)
+                    {
                         state.dropped += 1;
                         self.totals.1 += 1;
                         continue;
@@ -1938,6 +1970,81 @@ mod tests {
         worker.core.shared.set_sharing(true);
         worker.housekeeping(Instant::now());
         assert!(worker.paused);
+    }
+
+    /// Con el vídeo apagado, la entrada de ese invitado (y solo la suya) se descarta aunque llegue:
+    /// al apagarlo se suelta lo suyo, su mando sigue en su ranura (no se libera ni se reasigna) y
+    /// al encenderlo se aplica lo siguiente sin reconstruir lo de entretanto.
+    #[test]
+    fn a_guest_with_the_video_off_injects_nothing_and_keeps_the_pad() {
+        let sink = RecordingSink::new();
+        let mut worker = worker(&sink);
+        let (paused, watching) = (GuestId(1), GuestId(2));
+        for (guest, slot) in [(paused, 1), (watching, 2)] {
+            worker.handle(Job::Permissions {
+                guest,
+                permissions: Permissions {
+                    keyboard_mouse: true,
+                    gamepad_slot: Some(slot),
+                    ..Permissions::VIEW_ONLY
+                },
+            });
+        }
+        let s0 = packet(
+            &mut worker,
+            paused,
+            0,
+            &InputState::default(),
+            vec![key(30, true)],
+        );
+        assert_eq!(sink.events_of(paused), vec![key(30, true)]);
+        let pads_before = sink
+            .log()
+            .iter()
+            .filter(|r| matches!(r, Recorded::GamepadReleased { .. }))
+            .count();
+        worker.handle(Job::VideoPaused {
+            guest: paused,
+            paused: true,
+        });
+        assert_eq!(
+            sink.log().last(),
+            Some(&Recorded::ReleaseAll { guest: paused })
+        );
+        // Lo suyo no entra; lo del otro, sí.
+        let s1 = packet(&mut worker, paused, 1, &s0, vec![key(48, true)]);
+        let pad = InputEvent::GamepadButton {
+            slot: 1,
+            button: coroom_input::GamepadButton::A,
+            pressed: true,
+        };
+        let s2 = packet(&mut worker, paused, 2, &s1, vec![pad]);
+        packet(
+            &mut worker,
+            watching,
+            0,
+            &InputState::default(),
+            vec![key(57, true)],
+        );
+        assert_eq!(sink.events_of(paused), vec![key(30, true)]);
+        assert_eq!(sink.events_of(watching), vec![key(57, true)]);
+        assert_eq!(worker.guests[&paused].dropped, 2);
+        assert!(!worker.paused, "la pausa es solo suya");
+        // El mando sigue en su ranura: ni se libera ni se quita.
+        assert_eq!(
+            sink.log()
+                .iter()
+                .filter(|r| matches!(r, Recorded::GamepadReleased { .. }))
+                .count(),
+            pads_before
+        );
+        // Encendido: lo siguiente se aplica tal cual (lo que pulsó entretanto no se reconstruye).
+        worker.handle(Job::VideoPaused {
+            guest: paused,
+            paused: false,
+        });
+        packet(&mut worker, paused, 3, &s2, vec![key(44, true)]);
+        assert_eq!(sink.events_of(paused), vec![key(30, true), key(44, true)]);
     }
 
     /// Un invitado del que no llega nada en [`STALE_AFTER`] con algo pulsado: se suelta lo suyo y

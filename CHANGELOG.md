@@ -9,6 +9,22 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Añadido
 
+- **Apagar el vídeo** (protocolo 23; hay que actualizar también el servidor): el invitado puede
+  quedarse solo con la voz y el chat con el botón de la barra o Ctrl+Alt+I (también en Android). El
+  anfitrión deja de mandarle imagen, y de codificar si nadie mira; su conexión ya no frena la
+  calidad de los demás y su entrada queda en pausa con el mando enchufado. Al volver a encenderlo
+  llega una imagen completa al momento. En Personas, el anfitrión lo ve como «Solo voz».
+- **Actualización automática** desde las publicaciones de GitHub: el Flatpak, el zip de Windows y
+  el APK de Android descargan solos la versión nueva (comprobando su SHA-256) y preguntan antes de
+  reiniciar, nunca con una sala abierta. Se puede apagar en Ajustes → Acerca de. Cuando la app y el
+  servidor no comparten versión de protocolo, se explica cuál de los dos hay que actualizar.
+- **Repositorio Flatpak firmado en GitHub Pages** (`https://43fdfdg45454.github.io/coroom/`): la CI
+  publica en cada versión un repositorio OSTree firmado con deltas desde la anterior, y el
+  `.flatpak` de la release ya lo trae configurado (`.flatpakref` y `.flatpakrepo` para instalarlo
+  desde ahí). Si la firma falla, la publicación sigue con el `.flatpak` sin firmar. Las
+  instalaciones anteriores (rama `master`) se sustituyen una vez a mano; el APK de Android se firma
+  con una clave estable (hay que desinstalar una vez el APK anterior) y la CI comprueba que no salga
+  con la de depuración.
 - **Vibración con todos los mandos compartidos** (protocolo 18; hay que actualizar también el
   servidor y, en un anfitrión Windows, **reinstalar el driver de mandos** con el `install.ps1` de
   esta versión: el anterior no sirve y los mandos no se crean hasta actualizarlo): además de los
@@ -215,6 +231,9 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- Las insignias y píldoras (contador de la sala, latencia, servidor, EN VIVO, etiquetas) llevan el
+  contenido centrado; la del servidor mide lo que muestra, sin hueco a la derecha, y no salta de
+  ancho con cada medida.
 - **Mandos XInput de un invitado Windows que no llegaban o llegaban mal**: los mandos XInput (los
   de Xbox por cable y los compatibles en modo XInput) tienen en Windows una interfaz HID que no es
   el mando, sino una copia que arma el driver para DirectInput (gatillos en un solo eje, sin botón

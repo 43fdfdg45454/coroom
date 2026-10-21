@@ -9,6 +9,9 @@ name: CI
 # 3. «Publicación», solo en main y solo si todo lo anterior pasó: etiqueta la imagen en GHCR, crea la
 #    etiqueta vX.Y.Z y la release de GitHub con los paquetes y las notas. Nadie crea etiquetas ni
 #    toca la versión a mano.
+# 4. «Repositorio Flatpak», detrás de la release: sube a GitHub Pages el repositorio Flatpak firmado
+#    que dejó «Paquetes» (con la versión nueva encima de las publicadas), del que se actualizan
+#    las instalaciones del Flatpak. Sin la clave COROOM_FLATPAK_GPG_KEY no hay nada que subir.
 on:
   push:
     branches: ["**"]
@@ -242,7 +245,7 @@ jobs:
     uses: ./.github/workflows/packages.yml
     with:
       version: ${{ needs.version.outputs.version }}
-    secrets: inherit # la clave de firma del APK (android.yml), si está
+    secrets: inherit # las claves de firma del APK (android.yml) y del repositorio Flatpak (flatpak.yml), si están
 
   publish:
     name: Publicación ${{ needs.version.outputs.version }}
@@ -290,9 +293,11 @@ jobs:
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
+      # Solo lo que va a la release (el repositorio Flatpak, `flatpak-repo`, lo sube «pages»).
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
+          pattern: "{flatpak,windows,android,coroomvhid-*,digest-*}"
 
       - name: Paquetes
         run: |
@@ -337,20 +342,56 @@ jobs:
             exit 1
           fi
 
-      # Notas: los commits desde la etiqueta anterior (o desde el principio, en la primera).
+      # Notas: los commits desde la etiqueta anterior (o desde el principio, en la primera). El
+      # repositorio Flatpak solo se nombra si «Paquetes» lo firmó (con la clave del secreto). Los
+      # pasos de una sola vez (instalar a mano, quitar el Flatpak de la rama `master`, desinstalar
+      # el APK de la clave anterior) solo salen si la versión anterior es de antes de la
+      # actualización automática (FIRST_AUTO_UPDATE, la primera que la trae).
       - name: Notas de la versión
+        env:
+          FLATPAK_REPO: ${{ needs.packages.outputs.flatpak-repo }}
+          FIRST_AUTO_UPDATE: 2.1.0
         run: |
           previous="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
           range="${previous:+$previous..}HEAD"
           image="${{ steps.image.outputs.name }}:$VERSION"
+          pages="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}/"
+          app=io.github._43fdfdg45454.coroom
+          migration=false
+          if [ -n "$previous" ] && [ "${previous#v}" != "$FIRST_AUTO_UPDATE" ] &&
+            [ "$(printf '%s\n' "${previous#v}" "$FIRST_AUTO_UPDATE" | sort -V | head -1)" = "${previous#v}" ]; then
+            migration=true
+          fi
           {
             echo "## coroom $VERSION"
             echo
+            echo "### Actualización automática"
+            echo
+            if [ "$FLATPAK_REPO" = true ]; then
+              echo "coroom se actualiza solo con el Flatpak, el \`.zip\` portátil de Windows y el APK de Android: avisa en Inicio, baja la versión nueva y se reinicia con ella. El MSIX sigue solo con el aviso. En el Flatpak, la actualización llega cuando el repositorio queda publicado en GitHub Pages, unos minutos después de esta release."
+            else
+              echo "coroom se actualiza solo con el \`.zip\` portátil de Windows y el APK de Android: avisa en Inicio, baja la versión nueva y se reinicia con ella. El Flatpak de esta versión va sin firmar y el MSIX, solo con el aviso."
+            fi
+            echo
+            if [ "$migration" = true ]; then
+              echo "Las versiones de antes de la actualización automática no saben actualizarse: se instala una a mano, una sola vez, y desde ahí se actualiza sola."
+              echo
+              if [ "$FLATPAK_REPO" = true ]; then
+                echo "- **Linux**: el \`.flatpak\` de esta versión, que ya trae el repositorio Flatpak firmado (<$pages>). Si tenías uno anterior, quítalo después con \`flatpak uninstall --user $app//master\`: las versiones viejas iban en la rama \`master\` y las nuevas van en \`stable\`."
+              fi
+              echo "- **Windows**: el \`.zip\` de esta versión, descomprimido en una carpeta en la que puedas escribir (no dentro de Archivos de programa)."
+              echo "- **Android**: la clave de firma cambió y Android no deja instalar este APK encima del anterior. Desinstala una vez la app vieja (se borra la sesión guardada: hay que volver a entrar) e instala este."
+              echo
+            fi
             echo "### Paquetes"
             echo
-            echo "- **Linux**: \`coroom-$VERSION-x86_64.flatpak\` (\`flatpak install --user coroom-$VERSION-x86_64.flatpak\`)."
-            echo "- **Windows**: \`coroom-$VERSION-x64.msix\` (firmado con el certificado de prueba \`coroom-dev.cer\`, que hay que instalar antes) o el portátil \`coroom-$VERSION-windows-x64.zip\`."
-            echo "- **Android** (9 o posterior, invitado): \`coroom-$VERSION-android.apk\`, para instalar desde el archivo."
+            if [ "$FLATPAK_REPO" = true ]; then
+              echo "- **Linux**: \`coroom-$VERSION-x86_64.flatpak\` (\`flatpak install --user coroom-$VERSION-x86_64.flatpak\`), con el repositorio configurado. También desde el repositorio: \`flatpak install --user ${pages}$app.flatpakref\`."
+            else
+              echo "- **Linux**: \`coroom-$VERSION-x86_64.flatpak\` (\`flatpak install --user coroom-$VERSION-x86_64.flatpak\`)."
+            fi
+            echo "- **Windows**: el portátil \`coroom-$VERSION-windows-x64.zip\`, que se actualiza solo, o \`coroom-$VERSION-x64.msix\` (firmado con el certificado de prueba \`coroom-dev.cer\`, que hay que instalar antes; avisa de las versiones nuevas, pero cada una se instala a mano)."
+            echo "- **Android** (9 o posterior, invitado): \`coroom-$VERSION-android.apk\`, para instalar desde el archivo; se actualiza solo."
             echo "- **Servidor**: \`docker pull $image\`."
             echo "- **Driver de mando virtual** (Windows 10 22H2 u 11, x64 o ARM64): \`coroomvhid-$VERSION-x64.zip\` o \`coroomvhid-$VERSION-ARM64.zip\`. Driver UMDF2 en modo usuario, firmado en la CI con un certificado autofirmado de un solo uso (\`coroomvhid.cer\`, en el paquete; su clave privada se borró al terminar la compilación). Se instala con \`install.ps1\` en una consola de administrador, sin firma de prueba y con el arranque seguro y la integridad de memoria activados; \`uninstall.ps1\` lo quita todo, también el certificado. Los mandos convertidos llegan como Xbox 360 (XInput, hasta cuatro; después, HID genéricos) y los tal cual con el VID/PID y el descriptor del mando del invitado. Antes de publicarse se instala y se prueba en un Windows de la CI. Es opcional: sin él, coroom funciona y el mando puede ir como teclas."
             echo
@@ -373,3 +414,63 @@ jobs:
           body_path: notes.md
           files: upload/*
           fail_on_unmatched_files: true
+
+  # El repositorio Flatpak firmado (tools/flatpak-repo.sh, en «Paquetes») a GitHub Pages, con origen
+  # «GitHub Actions» y sin rama: cada despliegue sustituye el sitio entero, y por eso el repositorio
+  # ya trae lo publicado antes. Va detrás de la release para que las instalaciones no vean una
+  # versión que no llegó a publicarse. Las ejecuciones de main van en fila (concurrency de arriba),
+  # así que la siguiente copia lo que esta despliega.
+  pages:
+    name: Repositorio Flatpak (GitHub Pages)
+    needs: [version, packages, publish]
+    if: needs.version.outputs.publish == 'true' && needs.packages.outputs.flatpak-repo == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write # el despliegue
+      id-token: write # deploy-pages se identifica con OIDC
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url || steps.deployment-retry.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      # Una ejecución vieja relanzada a mano no devuelve Pages a una versión anterior: si lo
+      # desplegado (el fichero `version` del sitio) es más nuevo, no se despliega.
+      - name: Versión desplegada
+        id: deployed
+        run: |
+          url="https://${GITHUB_REPOSITORY_OWNER,,}.github.io/${GITHUB_REPOSITORY#*/}/version"
+          deployed="$(curl -fsSL "$url" 2>/dev/null | head -1 | tr -d '[:space:]' || true)"
+          [[ "$deployed" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || deployed=
+          echo "En Pages: ${deployed:-nada}; esta ejecución: $VERSION"
+          if [ -n "$deployed" ] && [ "$deployed" != "$VERSION" ] &&
+            [ "$(printf '%s\n' "$deployed" "$VERSION" | sort -V | tail -1)" = "$deployed" ]; then
+            echo "::warning::GitHub Pages ya tiene la versión $deployed, más nueva que $VERSION: no se despliega"
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/download-artifact@v8
+        if: steps.deployed.outputs.deploy == 'true'
+        with:
+          name: flatpak-repo
+          path: site
+
+      - uses: actions/upload-pages-artifact@v5
+        if: steps.deployed.outputs.deploy == 'true'
+        with:
+          path: site
+
+      # Un segundo intento si el primero falla (la API de Pages a veces no termina a tiempo).
+      - id: deployment
+        if: steps.deployed.outputs.deploy == 'true'
+        continue-on-error: true
+        uses: actions/deploy-pages@v5
+
+      - id: deployment-retry
+        if: steps.deployed.outputs.deploy == 'true' && steps.deployment.outcome == 'failure'
+        uses: actions/deploy-pages@v5

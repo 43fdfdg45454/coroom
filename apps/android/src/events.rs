@@ -188,6 +188,24 @@ pub enum UiEvent {
         /// Por qué, si no fue al salir.
         error: Option<String>,
     },
+    /// El estado de la versión nueva (Inicio y Ajustes), entero en cada cambio.
+    Update(crate::update::UpdateView),
+    /// Toca instalar la versión nueva: el APK ya comprobado, para el instalador del sistema.
+    UpdateInstall {
+        /// Ruta del APK.
+        path: String,
+    },
+    /// El servidor rechazó la conexión por la versión del protocolo: cuál de los dos quedó atrás.
+    ProtocolMismatch {
+        /// El servidor (su nombre, como en la dirección).
+        host: String,
+        /// `client_older` (hay que actualizar la app) o `server_older`.
+        kind: &'static str,
+        /// Protocolo del servidor.
+        server: u16,
+        /// Protocolo de esta app.
+        client: u16,
+    },
 }
 
 /// Alguien de la sala.
@@ -303,6 +321,8 @@ pub fn from_lobby(event: LobbyEvent) -> Option<UiEvent> {
         }),
         LobbyEvent::SendFailed(message) => Some(UiEvent::JoinRequestFailed { message }),
         LobbyEvent::Signal(message) => from_signal(message),
+        // Se le pregunta al servidor qué protocolo usa (`App`) y llega como `ProtocolMismatch`.
+        LobbyEvent::ProtocolRejected => None,
     }
 }
 

@@ -839,6 +839,11 @@ fn main() -> ExitCode {
     if coroom_session::codec::ffmpeg::probe_child::run_if_requested() {
         return ExitCode::SUCCESS;
     }
+    // Una versión nueva preparada y sin instalar (zip portátil de Windows) se instala antes que
+    // nada y se abre con los mismos argumentos.
+    if let Some(code) = coroom_desktop::update::on_startup() {
+        return ExitCode::from(u8::try_from(code).unwrap_or(1));
+    }
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(err) => {
@@ -864,8 +869,15 @@ fn main() -> ExitCode {
     let code = match cli.command {
         Some(Command::Doctor) => doctor(),
         Some(Command::Probe(args)) => probe(&args),
-        Some(Command::Host(args)) => host(&args),
-        Some(Command::Join(args)) => join(&args),
+        // Con la sala abierta, las descargas de la versión nueva de los demás procesos esperan.
+        Some(Command::Host(args)) => {
+            let _room = coroom_desktop::update::RoomGuard::hold();
+            host(&args)
+        }
+        Some(Command::Join(args)) => {
+            let _room = coroom_desktop::update::RoomGuard::hold();
+            join(&args)
+        }
         Some(Command::Login(args)) => print_result(account::login(&LoginOptions {
             account: args.account.options(),
             invitation: args.invitation.clone(),
@@ -895,7 +907,11 @@ fn main() -> ExitCode {
             &args.code,
         )),
         None => match ui::run(Launch::App) {
-            Ok(_) => ExitCode::SUCCESS,
+            Ok(_) => {
+                // «Reiniciar y actualizar»: con la ventana ya cerrada, la versión nueva.
+                coroom_desktop::update::finish_restart();
+                ExitCode::SUCCESS
+            }
             Err(err) => {
                 eprintln!("error: {err}");
                 ExitCode::FAILURE

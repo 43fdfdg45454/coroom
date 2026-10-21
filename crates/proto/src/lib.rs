@@ -55,8 +55,10 @@ pub mod video;
 /// entra con una cuenta que ya está en la sala (`signal::SignalMessage::PeerJoined`) y las salas
 /// propias abiertas en otros dispositivos (`signal::SignalMessage::OwnRooms`, al final); la 22, el
 /// `RelayToken` sin dirección: el relay atiende en el mismo socket UDP que la señalización, así
-/// que cada cliente se liga a la dirección por la que ya llegó al servidor.
-pub const PROTOCOL_VERSION: u16 = 22;
+/// que cada cliente se liga a la dirección por la que ya llegó al servidor; la 23, el vídeo
+/// apagado del invitado (`control::ControlMessage::VideoPaused`, al final): el anfitrión no le
+/// manda vídeo, no lo cuenta para la tasa ni el códec e ignora su entrada.
+pub const PROTOCOL_VERSION: u16 = 23;
 
 /// Identificadores ALPN (RFC 7301) que el socket QUIC usa para demultiplexar conexiones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

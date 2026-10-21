@@ -160,6 +160,48 @@ impl ShotRenderer {
         (messages, (size.0, size.1, pixels))
     }
 
+    /// Dibuja el trozo de interfaz que da `build` (un componente suelto) en `size` lógico a
+    /// `scale` (1.0, o 2.0 para HiDPI), con `theme`: ancho, alto y RGBA físicos. Con dos pasadas,
+    /// como [`ShotRenderer::render`], por eso `build` y no el elemento.
+    pub fn draw<'a, M: 'a>(
+        &mut self,
+        build: impl Fn() -> coroom_ui::Element<'a, M>,
+        size: (u32, u32),
+        theme: &coroom_ui::Theme,
+        scale: f32,
+    ) -> (u32, u32, Vec<u8>) {
+        let width = (size.0 as f32 * scale).round() as u32;
+        let height = (size.1 as f32 * scale).round() as u32;
+        let viewport = Viewport::with_physical_size(Size::new(width, height), scale);
+        let mut cache = user_interface::Cache::new();
+        for _ in 0..2 {
+            let mut interface =
+                UserInterface::build(build(), viewport.logical_size(), cache, &mut self.renderer);
+            let mut messages: Vec<M> = Vec::new();
+            let mut clipboard = iced_core::clipboard::Null;
+            let _ = interface.update(
+                &[UiEvent::Window(window::Event::RedrawRequested(
+                    Instant::now(),
+                ))],
+                mouse::Cursor::Unavailable,
+                &mut self.renderer,
+                &mut clipboard,
+                &mut messages,
+            );
+            interface.draw(
+                &mut self.renderer,
+                theme,
+                &renderer::Style {
+                    text_color: theme.text_color(),
+                },
+                mouse::Cursor::Unavailable,
+            );
+            cache = interface.into_cache();
+        }
+        let pixels = self.renderer.screenshot(&viewport, theme.background());
+        (width, height, pixels)
+    }
+
     /// Orden de foco de `app` (accesibilidad): los campos enfocables en el orden en que
     /// los recorre `Tab` (el de la interfaz, como hace la ventana con `focus_next`), con su
     /// identificador (`None` si no tiene), y el índice enfocado tras cada una de `presses`
@@ -267,6 +309,13 @@ const LOGIN_BUILDERS: &[(&str, Builder)] = &[
         app.update(Message::SwitchServer);
     }),
     ("02-servidor-nuevo", new_server),
+    // Un servidor con un protocolo más nuevo: el aviso de versiones distintas encima del informe.
+    ("02-servidor-version-distinta", |app| {
+        new_server(app);
+        if let Probe::Done { probe, .. } = &mut app.login.probe {
+            probe.protocol = coroom_transport::proto::PROTOCOL_VERSION + 1;
+        }
+    }),
     ("03-entrar", sign_in),
     ("04-crear-cuenta", create_account),
     ("04-recuperando-sin-respuesta", |app| {

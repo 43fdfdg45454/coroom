@@ -148,6 +148,7 @@ class AppContainer(private val app: Application) {
         pushSettings()
         watchEvents()
         manageLobby()
+        manageUpdates()
         if (loaded.replacedLost) settings.setHasSavedSession(false)
         _startup.value = Startup.Ready(sessionLost = loaded.replacedLost)
     }
@@ -226,7 +227,50 @@ class AppContainer(private val app: Application) {
 
     private enum class LobbyWish { Open, Closed, CloseSoon }
 
+    /**
+     * La versión nueva: los ajustes y si la red tiene límite de datos llegan a Rust, la última
+     * búsqueda se guarda y, con la app delante, se busca al abrirla y cada hora (Rust decide si
+     * toca por el intervalo). Sin internet no encuentra nada y la app sigue igual.
+     */
+    private fun manageUpdates() {
+        val dir = java.io.File(app.cacheDir, "updates").absolutePath
+        // La compilación de depuración va firmada con otra clave: Android no instalaría encima el APK
+        // de las publicaciones, así que solo avisa.
+        val noticeOnly = BuildConfig.DEBUG
+        scope.launch {
+            settings.settings
+                .map { Triple(it.updatesCheck, it.updatesAuto, it.updatesIntervalHours) }
+                .distinctUntilChanged()
+                .collect { (check, auto, interval) ->
+                    val lastCheck = settings.settings.first().updatesLastCheck
+                    runCatching {
+                        repository.updateConfigure(dir, check, auto, interval, lastCheck, noticeOnly)
+                    }
+                    runCatching { repository.updateSetMetered(network.metered.value) }
+                    runCatching { repository.updateCheck(manual = false) }
+                }
+        }
+        // Con límite de datos la descarga automática espera a una red sin límite.
+        scope.launch {
+            network.metered.collect { metered -> runCatching { repository.updateSetMetered(metered) } }
+        }
+        scope.launch {
+            repository.update.map { it?.lastCheck }.distinctUntilChanged().collect { at ->
+                if (at != null) settings.setUpdatesLastCheck(at)
+            }
+        }
+        scope.launch {
+            _foreground.collectLatest { foreground ->
+                while (foreground) {
+                    runCatching { repository.updateCheck(manual = false) }
+                    delay(UPDATE_POLL_MS)
+                }
+            }
+        }
+    }
+
     private companion object {
         const val BACKGROUND_LOBBY_MS = 60_000L
+        const val UPDATE_POLL_MS = 60 * 60_000L
     }
 }

@@ -4,7 +4,7 @@ name: Android
 # y x86_64, y el APK de packaging/android con Gradle. Lo llama packages.yml; a mano, desde la
 # pestaña Actions.
 #
-# Firma: con los secretos COROOM_ANDROID_KEYSTORE (el .jks en base64),
+# Firma: con los secretos COROOM_ANDROID_KEYSTORE (el almacén PKCS12 en base64),
 # COROOM_ANDROID_KEYSTORE_PASSWORD, COROOM_ANDROID_KEY_ALIAS y COROOM_ANDROID_KEY_PASSWORD, la clave
 # de la publicación; sin ellos, la de depuración del runner (el APK instala, pero no se actualiza
 # encima de uno firmado con otra clave).
@@ -104,13 +104,24 @@ jobs:
         with:
           gradle-version: ${{ steps.gradle.outputs.version }}
 
+      # El almacén es PKCS12 (lo que crea keytool desde Java 9; un JKS también vale: Java abre los
+      # dos con el tipo por defecto). En un PKCS12 la clave lleva la contraseña del almacén, así que
+      # COROOM_ANDROID_KEY_PASSWORD es la misma. Si falta alguno de los cuatro secretos, Gradle firma
+      # con la clave de depuración: se avisa aquí para que no pase sin verse.
       - name: Clave de firma
         env:
           KEYSTORE: ${{ secrets.COROOM_ANDROID_KEYSTORE }}
+          KEYSTORE_PASSWORD: ${{ secrets.COROOM_ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.COROOM_ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.COROOM_ANDROID_KEY_PASSWORD }}
         run: |
           if [ -n "$KEYSTORE" ]; then
-            echo "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/coroom.jks"
-            echo "COROOM_ANDROID_KEYSTORE=$RUNNER_TEMP/coroom.jks" >> "$GITHUB_ENV"
+            if [ -z "$KEYSTORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASSWORD" ]; then
+              echo "::error::COROOM_ANDROID_KEYSTORE está, pero falta COROOM_ANDROID_KEYSTORE_PASSWORD, COROOM_ANDROID_KEY_ALIAS o COROOM_ANDROID_KEY_PASSWORD"
+              exit 1
+            fi
+            printf '%s' "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/coroom.p12"
+            echo "COROOM_ANDROID_KEYSTORE=$RUNNER_TEMP/coroom.p12" >> "$GITHUB_ENV"
           else
             echo "::warning::sin COROOM_ANDROID_KEYSTORE: el APK va firmado con la clave de depuración del runner"
           fi
@@ -126,6 +137,21 @@ jobs:
           mkdir -p out
           cp app/build/outputs/apk/release/app-release.apk "out/coroom-$VERSION-android.apk"
           ls -l out
+
+      # Con la clave de la publicación, el APK no puede ir con la de depuración: Android no
+      # instalaría la versión siguiente encima. La huella queda en el resumen del job.
+      - name: Firma del APK
+        env:
+          KEYSTORE: ${{ secrets.COROOM_ANDROID_KEYSTORE }}
+        run: |
+          build_tools="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          certs="$("$build_tools/apksigner" verify --print-certs "packaging/android/out/coroom-$VERSION-android.apk")"
+          echo "$certs"
+          echo "Firma del APK: $(echo "$certs" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$KEYSTORE" ] && echo "$certs" | grep -q 'certificate DN: .*CN=Android Debug'; then
+            echo "::error::el APK salió firmado con la clave de depuración aunque COROOM_ANDROID_KEYSTORE está"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v7
         with:

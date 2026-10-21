@@ -1,9 +1,9 @@
 name: Paquetes
 
 # Construye todo lo que se adjunta a una publicación, con la versión que calcula ci.yml: el
-# Flatpak (flatpak.yml), el MSIX firmado con el certificado de prueba y el .zip portátil de Windows,
-# la imagen de coroom-server por arquitectura (en GHCR solo por digest, sin etiqueta; «Publicación»
-# las une y las etiqueta), el driver de mando virtual firmado con su certificado de un solo uso
+# Flatpak y su repositorio firmado para GitHub Pages (flatpak.yml), el MSIX firmado con el
+# certificado de prueba y el .zip portátil de Windows, la imagen de coroom-server por arquitectura
+# (en GHCR solo por digest, sin etiqueta; «Publicación» las une y las etiqueta), el driver de mando virtual firmado con su certificado de un solo uso
 # (driver.yml) y el APK del invitado Android (android.yml). Lo llama ci.yml en cada push a main; a
 # mano, desde la pestaña Actions.
 on:
@@ -13,6 +13,10 @@ on:
         description: Versión X.Y.Z
         required: true
         type: string
+    outputs:
+      flatpak-repo:
+        description: "«true» si el artefacto flatpak-repo trae el repositorio Flatpak firmado para GitHub Pages"
+        value: ${{ jobs.flatpak.outputs.repo }}
   workflow_dispatch:
     inputs:
       version:
@@ -34,6 +38,7 @@ jobs:
     uses: ./.github/workflows/flatpak.yml
     with:
       version: ${{ inputs.version }}
+    secrets: inherit # la clave del repositorio Flatpak (COROOM_FLATPAK_GPG_KEY), si está
 
   driver:
     name: Driver de mando virtual

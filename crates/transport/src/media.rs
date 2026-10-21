@@ -1945,6 +1945,20 @@ impl ReceiverCore {
         self.track_intervals.insert(track, interval);
     }
 
+    /// Olvida el estado de `track`: grupos abiertos, fotogramas sin recoger y el grupo
+    /// esperado, de modo que el primer grupo que llegue después es la nueva base. Para cuando el
+    /// emisor deja de enviar la pista a este receptor y vuelve más tarde (el invitado que apaga el
+    /// vídeo): el contador de grupos siguió avanzando para los demás y, sin esto, el salto
+    /// (menor que [`RESET_DISTANCE`]) se contaría como cientos de objetos perdidos.
+    pub fn resync(&mut self, track: Track) {
+        self.groups.retain(|(t, _), _| *t != track);
+        self.ready.retain(|frame| frame.track != track);
+        self.next.remove(&track);
+        if track == Track::Video {
+            self.last_keyframe_request = None;
+        }
+    }
+
     /// Intervalo de fotograma de `track`.
     pub fn track_interval(&self, track: Track) -> Duration {
         self.track_intervals
@@ -2613,6 +2627,13 @@ impl MediaReceiver {
         }
     }
 
+    /// Olvida el estado de `track` (ver [`ReceiverCore::resync`]).
+    pub fn resync(&self, track: Track) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.core.resync(track);
+        }
+    }
+
     /// Contadores.
     pub fn stats(&self) -> ReceiverStats {
         self.inner
@@ -3241,6 +3262,42 @@ mod tests {
         assert_eq!(a.payload, payload(3000, 1));
         assert_eq!(b.payload, payload(500, 2));
         assert_eq!(core.stats().delivered, 3);
+    }
+
+    /// Tras `resync`, el primer grupo que llega es la base: el salto de grupos que el emisor envió
+    /// a otros mientras tanto no cuenta como pérdida ni abre huecos que pedir.
+    #[test]
+    fn resync_takes_the_next_group_as_the_base() {
+        let mut core = ReceiverCore::new(INTERVAL);
+        let now = Instant::now();
+        for group in 0..5 {
+            let (packets, _) = packetize(group, &payload(10, group as u8), 1184, 0);
+            core.push(&packets[0], now, None);
+        }
+        let (pending, _) = packetize(6, &payload(10, 6), 1184, 0);
+        core.push(&pending[0], now, None);
+        while core.pop_frame().is_some() {}
+        let before = core.stats();
+        core.resync(Track::Video);
+        assert!(
+            core.pop_frame().is_none(),
+            "lo pendiente de vídeo se olvida"
+        );
+        assert_eq!(
+            core.open_group_count(),
+            0,
+            "ni el hueco del 5 ni el 6 siguen abiertos"
+        );
+        let (resumed, _) = packetize(600, &payload(10, 7), 1184, 0);
+        core.push(&resumed[0], now, None);
+        let frame = core.pop_frame().expect("el 600 es la nueva base");
+        assert_eq!(frame.group, 600);
+        core.poll(now + Duration::from_secs(1), Duration::from_millis(5));
+        let after = core.stats();
+        assert_eq!(after.lost_objects, before.lost_objects);
+        assert_eq!(after.dropped, before.dropped);
+        assert_eq!(after.keyframe_requests, before.keyframe_requests);
+        assert_eq!(core.open_group_count(), 0);
     }
 
     #[test]

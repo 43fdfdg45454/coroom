@@ -31,7 +31,10 @@
 //!   después de cada corte, como mucho 500 ms después;
 //! - (p) con la sala abierta, el anfitrión baja la resolución máxima y los fps (y luego los
 //!   sube) y el invitado sigue presentando, con el tamaño y la cadencia nuevos;
-//! - (s) el audio del juego solo sale mientras se comparte algo.
+//! - (s) el audio del juego solo sale mientras se comparte algo;
+//! - (t) un invitado con el vídeo apagado sigue oyendo el juego sin recibir vídeo, no frena a
+//!   los demás (su enlace no cuenta para la tasa), sin nadie mirando no se codifica, y al
+//!   encenderlo llega un intra en el acto.
 //!
 //! Los tests (a)–(e) usan OpenH264 en los dos extremos, para que sus cotas de
 //! tiempo sigan siendo comparables.
@@ -1903,5 +1906,364 @@ fn s_a_policed_link_settles_within_five_seconds() {
     viewer.close();
     host.close();
     drop(proxy);
+    drop(server);
+}
+
+/// Audio del juego que le llegó a un invitado hasta ahora.
+fn game_audio_received(guest: &RemoteSession) -> u64 {
+    guest
+        .summary()
+        .audio
+        .and_then(|audio| {
+            audio
+                .track(coroom_session::latency::AudioTrack::Game)
+                .map(|game| game.counters.received)
+        })
+        .unwrap_or(0)
+}
+
+/// Si el anfitrión ya ve con el vídeo apagado (o encendido) al invitado de `user`.
+fn host_sees_paused(host: &RemoteSession, user: u64, paused: bool) -> bool {
+    host.guests()
+        .iter()
+        .any(|status| status.user == user && status.video_paused == paused)
+}
+
+/// (t) Un invitado apaga el vídeo: deja de recibirlo pero sigue oyendo el juego, el otro sigue
+/// viendo; con los dos apagados el anfitrión deja de codificar; al encenderlo, el anfitrión
+/// fuerza un intra y la imagen vuelve.
+#[test]
+fn t_a_guest_with_the_video_off_hears_the_room_but_gets_no_video() {
+    use coroom_session::audio::synthetic::{CaptureSink, ToneSource};
+    use coroom_session::remote::{GuestAudio, HostAudio};
+    let _serial = serial();
+    let server = TestServer::start();
+    let account = server.config();
+    let mut host = RemoteSession::host(
+        account.identity,
+        account.config,
+        Box::new(SyntheticCapturer::new(640, 360, FPS)),
+        EncoderSet::openh264(),
+        video(None),
+        Arc::new(LatencyLedger::new()),
+    )
+    .with_host_audio(HostAudio {
+        game: Some(Box::new(ToneSource::new(440.0, 2))),
+        game_bitrate: 0,
+        frame_ms: 10,
+        voice: None,
+        speaker: None,
+    });
+    host.start().expect("arranque del anfitrión");
+    let code = room_code(&host);
+    let watcher_account = server.config();
+    let watcher_user = watcher_account.user;
+    let mut watcher = guest(watcher_account, &code, None);
+    let listener_account = server.config();
+    let listener_user = listener_account.user;
+    // Con altavoz (de prueba): el audio del juego se cuenta al recibirlo.
+    let mut listener = RemoteSession::guest(
+        listener_account.identity,
+        listener_account.config,
+        &code,
+        DecoderSet::openh264(),
+        Box::new(NullSink),
+        None,
+        Arc::new(LatencyLedger::new()),
+    )
+    .with_guest_audio(GuestAudio {
+        speaker: Some(Box::new(CaptureSink::new(2))),
+        voice: None,
+        mute_game: false,
+        frame_ms: 10,
+    });
+    listener.start().expect("arranque del invitado");
+    wait_until("el vídeo en los dos", Duration::from_secs(20), || {
+        watcher.summary().frames_presented >= u64::from(FPS)
+            && listener.summary().frames_presented >= u64::from(FPS)
+    });
+    assert!(
+        host.set_video_paused(true).is_err(),
+        "solo el invitado apaga su vídeo"
+    );
+
+    // Apaga el vídeo: el anfitrión lo sabe y deja de mandarle vídeo, no audio.
+    listener.set_video_paused(true).expect("apagar el vídeo");
+    assert!(listener.video_paused());
+    wait_until(
+        "el anfitrión lo ve apagado",
+        Duration::from_secs(10),
+        || host_sees_paused(&host, listener_user, true),
+    );
+    let received = wait_steady("lo recibido con el vídeo apagado", || {
+        listener.video_counters().received
+    });
+    let watched = watcher.summary().frames_presented;
+    let heard = game_audio_received(&listener);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        listener.video_counters().received,
+        received,
+        "con el vídeo apagado no llega ni un fotograma"
+    );
+    assert!(
+        watcher.summary().frames_presented > watched,
+        "el otro sigue viendo"
+    );
+    assert!(
+        game_audio_received(&listener) > heard,
+        "el audio del juego sigue llegando"
+    );
+
+    // Los dos apagados: no se codifica nada.
+    watcher.set_video_paused(true).expect("apagar el vídeo");
+    wait_until("los dos apagados", Duration::from_secs(10), || {
+        host_sees_paused(&host, watcher_user, true)
+    });
+    let encoded = wait_steady("la cuenta de codificados", || host.video_counters().encoded);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        host.video_counters().encoded,
+        encoded,
+        "sin nadie mirando no se codifica"
+    );
+
+    // Lo enciende uno: se vuelve a codificar y le llega la imagen.
+    let watched = watcher.summary().frames_presented;
+    watcher.set_video_paused(false).expect("encender el vídeo");
+    wait_until("la imagen al encenderlo", Duration::from_secs(20), || {
+        watcher.summary().frames_presented > watched
+    });
+
+    // Lo enciende el otro con el codificador en marcha: un intra para él en el acto.
+    let forced = host.video_counters().forced_keyframes;
+    let presented = listener.summary().frames_presented;
+    let resumed = Instant::now();
+    listener.set_video_paused(false).expect("encender el vídeo");
+    wait_until("la imagen al encenderlo", Duration::from_secs(20), || {
+        listener.summary().frames_presented > presented
+    });
+    let first = resumed.elapsed();
+    println!("primer fotograma tras encender el vídeo: {first:?}");
+    assert!(
+        host.video_counters().forced_keyframes > forced,
+        "el anfitrión manda un intra al encenderlo"
+    );
+    assert!(host_sees_paused(&host, listener_user, false));
+    timing_assert!(
+        first < Duration::from_millis(500),
+        "la imagen tardó {first:?} en volver"
+    );
+    listener.close();
+    watcher.close();
+    host.close();
+    drop(server);
+}
+
+/// Bitrate del codificador del anfitrión según lo que le anuncia a `guest` (`TargetBitrate`).
+fn encoder_kbps(guest: &RemoteSession) -> u32 {
+    guest.link().map_or(0, |link| link.target_kbps)
+}
+
+/// (t) Un invitado con un enlace de 2 Mbit/s frena el vídeo de la sala mientras lo mira (el
+/// codificador va a lo que cabe en su enlace); con el vídeo apagado deja de contar y el
+/// codificador sube a lo que cabe en el del otro.
+#[test]
+fn t_a_guest_with_the_video_off_does_not_hold_back_the_room() {
+    let _serial = serial();
+    let server = TestServer::start();
+    let port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .and_then(|socket| socket.local_addr())
+        .expect("puerto libre")
+        .port();
+    let host_addr: SocketAddr = (std::net::Ipv4Addr::LOCALHOST, port).into();
+    let proxy = server
+        .runtime
+        .block_on(UdpLossy::start(
+            host_addr,
+            LossyConfig {
+                loss: 0.0,
+                delay: Duration::from_millis(5),
+                jitter: Duration::from_millis(1),
+                rate_bps: Some(2_000_000),
+                queue_limit: Duration::from_millis(15),
+                seed: 11,
+                outages: None,
+            },
+        ))
+        .expect("proxy");
+    let mut host_config = server.config();
+    host_config.bind = Some(host_addr);
+    host_config.advertise_candidates = Some(vec![proxy.addr()]);
+    let mut host = RemoteSession::host(
+        host_config.identity,
+        host_config.config,
+        Box::new(NoisyCapturer::new(SyntheticCapturer::new(640, 360, FPS))),
+        EncoderSet::openh264(),
+        LoopbackConfig {
+            bitrate_kbps: 20_000,
+            ..video(None)
+        },
+        Arc::new(LatencyLedger::new()),
+    );
+    host.start().expect("arranque del anfitrión");
+    let code = room_code(&host);
+    // El lento, por el limitador; el rápido, por el relay (sin límite).
+    let mut slow_config = server.config();
+    slow_config.advertise_candidates = Some(Vec::new());
+    let slow_user = slow_config.user;
+    let mut slow = guest(slow_config, &code, None);
+    let mut fast_config = server.config();
+    fast_config.force_relay = true;
+    let mut fast = guest(fast_config, &code, None);
+    wait_until("el vídeo en los dos", Duration::from_secs(20), || {
+        fast.summary().frames_presented > 0 && slow.summary().frames_presented > 0
+    });
+    // Asentado el control de tasa del lento (la prueba (s) lo mide), manda él.
+    let mut held = Vec::new();
+    wait_until(
+        "el vídeo frenado por el lento",
+        Duration::from_secs(20),
+        || {
+            let kbps = encoder_kbps(&fast);
+            held.push(kbps);
+            kbps > 0 && kbps <= 2_000
+        },
+    );
+    slow.set_video_paused(true).expect("apagar el vídeo");
+    wait_until(
+        "el anfitrión lo ve apagado",
+        Duration::from_secs(10),
+        || host_sees_paused(&host, slow_user, true),
+    );
+    let paused = Instant::now();
+    // El codificador y los objetivos de los dos enlaces, cada medio segundo.
+    let mut freed = Vec::new();
+    let deadline = paused + Duration::from_secs(30);
+    let took = loop {
+        let kbps = encoder_kbps(&fast);
+        let targets: Vec<(u64, Option<u32>)> = host
+            .guests()
+            .iter()
+            .map(|status| (status.user, status.target_kbps))
+            .collect();
+        freed.push((paused.elapsed().as_millis(), kbps, targets));
+        if kbps > 4_000 {
+            break paused.elapsed();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "el vídeo sigue al ritmo del lento (frenado: {:?}): {freed:?}",
+            held.last()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    println!(
+        "frenado: {:?} kbit/s; libre tras {took:?}: {freed:?}",
+        held.last()
+    );
+    timing_assert!(
+        took < Duration::from_secs(5),
+        "el vídeo tardó {took:?} en dejar de ir al ritmo del lento"
+    );
+    fast.close();
+    slow.close();
+    host.close();
+    drop(proxy);
+    drop(server);
+}
+
+/// (t) Un invitado apaga el vídeo unos segundos mientras otro sigue mirando y lo vuelve a
+/// encender: el anfitrión siguió numerando los grupos para el otro, y el salto no cuenta como
+/// pérdida (antes, cientos de grupos «perdidos» llevaban la pérdida informada casi al 100 % y el
+/// control de tasa bajaba el vídeo de todos y subía la FEC al máximo). Le llega un intra, no
+/// fotogramas sueltos que no puede decodificar.
+#[test]
+fn t_a_guest_turning_the_video_back_on_reports_no_loss() {
+    let _serial = serial();
+    let server = TestServer::start();
+    let account = server.config();
+    let mut host = RemoteSession::host(
+        account.identity,
+        account.config,
+        Box::new(SyntheticCapturer::new(640, 360, FPS)),
+        EncoderSet::openh264(),
+        video(None),
+        Arc::new(LatencyLedger::new()),
+    );
+    host.start().expect("arranque del anfitrión");
+    let code = room_code(&host);
+    let mut watcher = guest(server.config(), &code, None);
+    let resumer_account = server.config();
+    let resumer_user = resumer_account.user;
+    let mut resumer = guest(resumer_account, &code, None);
+    wait_until("el vídeo en los dos", Duration::from_secs(20), || {
+        watcher.summary().frames_presented >= u64::from(FPS)
+            && resumer.summary().frames_presented >= u64::from(FPS)
+    });
+    let before = encoder_kbps(&watcher);
+
+    resumer.set_video_paused(true).expect("apagar el vídeo");
+    wait_until(
+        "el anfitrión lo ve apagado",
+        Duration::from_secs(10),
+        || host_sees_paused(&host, resumer_user, true),
+    );
+    // Lo que quedase en vuelo al apagarlo ya llegó (o venció).
+    wait_steady("lo recibido con el vídeo apagado", || {
+        resumer.video_counters().received
+    });
+    let link = resumer.link().expect("enlace");
+    // Dos segundos de vídeo para el otro: el contador de grupos avanza unos 2 × FPS.
+    let watched = watcher.video_counters().received;
+    wait_until(
+        "dos segundos de vídeo del otro",
+        Duration::from_secs(20),
+        || watcher.video_counters().received >= watched + 2 * u64::from(FPS),
+    );
+
+    let presented = resumer.summary().frames_presented;
+    let errors = resumer.summary().decode_errors;
+    resumer.set_video_paused(false).expect("encender el vídeo");
+    wait_until("la imagen al encenderlo", Duration::from_secs(20), || {
+        resumer.summary().frames_presented > presented
+    });
+    // Un segundo de vídeo después de volver, para que el Feedback de ese tramo llegue al
+    // anfitrión y su control de tasa reaccione si tuviese que hacerlo.
+    let resumed = resumer.video_counters().received;
+    let mut targets = Vec::new();
+    wait_until(
+        "un segundo de vídeo tras encenderlo",
+        Duration::from_secs(20),
+        || {
+            targets.push(encoder_kbps(&watcher));
+            resumer.video_counters().received >= resumed + u64::from(FPS)
+        },
+    );
+    let after = resumer.link().expect("enlace");
+    let dropped = after.groups_dropped - link.groups_dropped;
+    println!(
+        "tras encender: {dropped} grupos perdidos, pérdida {:.2} % → {:.2} %; objetivo {before} → \
+         {targets:?} kbit/s",
+        link.loss_percent, after.loss_percent
+    );
+    // El salto fue de unos 2 × FPS grupos: sin volver a tomar la base, serían todos perdidos.
+    assert!(
+        dropped < u64::from(FPS) / 2,
+        "el salto de grupos contó como pérdida: {dropped} grupos"
+    );
+    assert_eq!(
+        resumer.summary().decode_errors,
+        errors,
+        "le llegó algo que no podía decodificar"
+    );
+    let lowest = targets.iter().copied().min().unwrap_or(0);
+    timing_assert!(
+        lowest * 2 >= before,
+        "el objetivo del codificador bajó de {before} a {lowest} kbit/s al encender el vídeo"
+    );
+    resumer.close();
+    watcher.close();
+    host.close();
     drop(server);
 }

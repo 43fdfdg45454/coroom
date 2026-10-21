@@ -14,6 +14,9 @@
 //! servidor y llamadas a su API), con el almacén de credenciales tras
 //! [`account::AccountStorage`], que implementa cada plataforma.
 //!
+//! [`update`] busca versiones nuevas en las publicaciones de GitHub, descarga y comprueba los
+//! paquetes y decide cuándo se descarga y se reinicia (nunca con una sala abierta).
+//!
 //! Reexporta [`coroom_audio`], [`coroom_capture`], [`coroom_codec`], [`coroom_input`] y
 //! [`coroom_transport`] como [`audio`], [`capture`], [`codec`], [`input`] y [`transport`] para que
 //! las aplicaciones de `apps/` no dependan directamente de ellas.
@@ -34,6 +37,7 @@ pub mod loopback;
 pub mod preview;
 pub mod remote;
 pub mod stats;
+pub mod update;
 
 use latency::{LatencyLedger, LatencySummary};
 use loopback::{FrameSink, LoopbackConfig, LoopbackPipeline};

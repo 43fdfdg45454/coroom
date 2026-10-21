@@ -5,12 +5,19 @@ name: Flatpak
 # llama con la versión calculada en cada push a main y «Publicación» adjunta el paquete a la
 # release; en los pull requests que tocan el empaquetado se construye con la versión 1.0.0, la base
 # de `Cargo.toml`.
+#
+# En las publicaciones de main, con la clave del secreto COROOM_FLATPAK_GPG_KEY, además deja el
+# repositorio Flatpak firmado (tools/flatpak-repo.sh: lo publicado en GitHub Pages más esta versión,
+# con deltas) en el artefacto `flatpak-repo`, y el .flatpak lleva ese repositorio y su clave:
+# instalado una vez, se actualiza solo. «Repositorio Flatpak» (ci.yml) lo sube a Pages después de
+# la release. Sin la clave (forks) o fuera de main, el .flatpak sale sin firmar y no se publica nada.
 on:
   pull_request:
     paths:
       - "packaging/flatpak/**"
       - "packaging/icons/**"
       - "tools/prune-cargo-target.py"
+      - "tools/flatpak-repo.sh"
       - ".github/workflows/flatpak.yml"
   workflow_dispatch:
     inputs:
@@ -19,6 +26,11 @@ on:
         required: false
         type: string
         default: 1.0.0
+      repo-dry-run:
+        description: Probar el repositorio firmado con la clave (artefacto flatpak-repo; no se despliega)
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       version:
@@ -26,6 +38,15 @@ on:
         required: false
         type: string
         default: 1.0.0
+      repo-dry-run:
+        description: Probar el repositorio firmado con la clave (artefacto flatpak-repo; no se despliega)
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      repo:
+        description: "«true» si el artefacto flatpak-repo trae el repositorio firmado para GitHub Pages"
+        value: ${{ jobs.flatpak.outputs.repo }}
 
 permissions:
   contents: read
@@ -34,6 +55,8 @@ jobs:
   flatpak:
     name: Flatpak (x86_64)
     runs-on: ubuntu-latest
+    outputs:
+      repo: ${{ steps.repo.outputs.publish == 'true' }}
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08
       options: --privileged
@@ -62,14 +85,30 @@ jobs:
           key: flatpak-builder-x86_64-${{ github.sha }}
           restore-keys: flatpak-builder-x86_64-
 
+      # La build queda en el repositorio OSTree `repo`, rama `stable`; el paquete lo hace el paso
+      # siguiente.
       - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
           manifest-path: packaging/flatpak/io.github._43fdfdg45454.coroom.yml
-          bundle: coroom-${{ inputs.version || '1.0.0' }}-x86_64.flatpak
+          branch: stable
+          build-bundle: false
           cache: true
           restore-cache: false
           save-cache: false
           upload-artifact: false
+
+      # La clave solo llega en las publicaciones de main (como `publish` de ci.yml) y en la prueba
+      # a mano (`repo-dry-run`, desde la pestaña Actions: copia lo publicado, firma y comprueba, y
+      # deja el sitio en el artefacto sin desplegarlo). En los pull requests el paquete sale sin
+      # firmar aunque el secreto exista. Si la parte firmada falla, el script avisa y saca el
+      # paquete sin firmar: la publicación no se queda sin paquetes por esto.
+      - name: Repositorio Flatpak y paquete
+        id: repo
+        env:
+          VERSION: ${{ inputs.version || '1.0.0' }}
+          COROOM_FLATPAK_RELEASE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          COROOM_FLATPAK_GPG_KEY: ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.repo-dry-run)) && secrets.COROOM_FLATPAK_GPG_KEY || '' }}
+        run: tools/flatpak-repo.sh repo "coroom-$VERSION-x86_64.flatpak" site
 
       # Tamaño de lo que se guarda (flatpak-builder ya poda sus módulos viejos al terminar).
       - name: Tamaño del estado de flatpak-builder
@@ -80,3 +119,12 @@ jobs:
           name: flatpak
           path: coroom-${{ inputs.version || '1.0.0' }}-x86_64.flatpak
           if-no-files-found: error
+
+      # El sitio entero de Pages (repo/ y los ficheros para instalar); ci.yml lo despliega.
+      - uses: actions/upload-artifact@v7
+        if: steps.repo.outputs.publish == 'true'
+        with:
+          name: flatpak-repo
+          path: site
+          if-no-files-found: error
+          retention-days: 7

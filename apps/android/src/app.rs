@@ -57,6 +57,17 @@ pub struct App {
     devices: Arc<Devices>,
     guest: Mutex<Option<Arc<Guest>>>,
     settings: Mutex<Settings>,
+    /// La versión nueva.
+    updates: Arc<crate::update::Updates>,
+    /// Se está preguntando al servidor qué protocolo usa (tras un rechazo por la versión).
+    probing_protocol: Arc<AtomicBool>,
+    /// El servidor al que ya se le preguntó en esta racha de rechazos (se olvida cuando la sala de
+    /// espera vuelve a conectar): una pregunta por racha, no una por reintento.
+    protocol_asked: Mutex<Option<String>>,
+    /// La sala actual (sube al entrar y al salir): un `Ended` tardío de una sala anterior no
+    /// cierra la nueva para la versión nueva. Con el candado se cambia también la sala abierta de
+    /// [`crate::update::Updates`].
+    room: Mutex<u64>,
 }
 
 /// Ajustes de la sala que se aplican al entrar (y en marcha si ya se está dentro).
@@ -182,6 +193,45 @@ struct Muted {
     muted: bool,
 }
 
+#[derive(Debug, Deserialize)]
+struct Paused {
+    paused: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct UpdateCheck {
+    /// Pedida a mano: busca aunque no toque por el intervalo.
+    #[serde(default)]
+    manual: bool,
+    /// Fuera del intervalo porque la app es más vieja que el servidor (como mucho una por hora).
+    #[serde(default)]
+    extra: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct On {
+    on: bool,
+}
+
+/// El nombre del servidor de una dirección (`https://coroom.example.com:4433` →
+/// `coroom.example.com`).
+fn host_of(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    match host.rsplit_once(':') {
+        // Sin el puerto (también tras una IPv6 entre corchetes).
+        Some((name, port))
+            if !port.is_empty()
+                && port.chars().all(|c| c.is_ascii_digit())
+                && (!name.contains(':') || name.ends_with(']')) =>
+        {
+            name.to_owned()
+        }
+        _ => host.to_owned(),
+    }
+}
+
 fn signed_in(signed: &SignedIn) -> Value {
     json!({
         "server": signed.credentials.server,
@@ -191,6 +241,14 @@ fn signed_in(signed: &SignedIn) -> Value {
         "avatar": signed.avatar,
         "fingerprint": signed.fingerprint,
     })
+}
+
+/// Encola `event`; con la cola llena se descarta el más viejo.
+fn push((tx, rx): &(Sender<UiEvent>, Receiver<UiEvent>), event: UiEvent) {
+    if let Err(crossbeam_channel::TrySendError::Full(event)) = tx.try_send(event) {
+        let _ = rx.try_recv();
+        let _ = tx.try_send(event);
+    }
 }
 
 fn args<T: DeserializeOwned>(text: &str) -> Result<T, String> {
@@ -213,16 +271,38 @@ impl App {
                 game_volume: 100,
                 join_muted: false,
             }),
+            updates: Arc::new(crate::update::Updates::default()),
+            probing_protocol: Arc::new(AtomicBool::new(false)),
+            protocol_asked: Mutex::new(None),
+            room: Mutex::new(0),
         }
     }
 
     /// Encola un evento para la interfaz; con la cola llena se descarta el más viejo.
     pub fn emit(&self, event: UiEvent) {
-        let (tx, rx) = &self.events;
-        if let Err(crossbeam_channel::TrySendError::Full(event)) = tx.try_send(event) {
-            let _ = rx.try_recv();
-            let _ = tx.try_send(event);
+        push(&self.events, event);
+    }
+
+    /// Se cierra la sala `session` (`None`: la que haya): la versión nueva puede volver a
+    /// descargarse. La de una sala anterior no cambia nada.
+    fn room_closed(&self, session: Option<u64>) {
+        let mut room = lock(&self.room);
+        if session.is_some_and(|session| session != *room) {
+            return;
         }
+        *room += 1;
+        self.updates.set_room_open(false, &self.emitter());
+    }
+
+    /// Lo que encola eventos sin pasar por [`App::emit`] (la versión nueva).
+    fn emitter(&self) -> guest::Emit {
+        let events = self.events.clone();
+        Arc::new(move |event| push(&events, event))
+    }
+
+    /// La versión nueva.
+    pub fn updates(&self) -> &Arc<crate::update::Updates> {
+        &self.updates
     }
 
     /// El siguiente evento en JSON, esperando hasta `timeout`.
@@ -291,10 +371,16 @@ impl App {
             "probe_server" => {
                 let probe: Probe = args(text)?;
                 let found = account::probe_server(&probe.url, probe.tcp_port)?;
+                // Versiones distintas: cuál de los dos quedó atrás (`null` si coinciden).
+                let gap = coroom_session::update::protocol_gap(found.protocol).map(|gap| {
+                    let (kind, server, client) = crate::update::gap_kind(gap);
+                    json!({ "kind": kind, "server": server, "client": client })
+                });
                 Ok(json!({
                     "name": found.name,
                     "version": found.version,
                     "protocol": found.protocol,
+                    "protocol_gap": gap,
                     "http3": found.http3,
                     "udp_reachable": found.udp_reachable,
                     "fingerprint": found.fingerprint,
@@ -421,6 +507,13 @@ impl App {
                 guest.audio().set_mic_muted(muted.muted);
                 Ok(Value::Null)
             }
+            "set_video_paused" => {
+                let paused: Paused = args(text)?;
+                self.guest()
+                    .ok_or_else(|| NOT_IN_ROOM.to_owned())?
+                    .set_video_paused(paused.paused)?;
+                Ok(Value::Null)
+            }
             "pads" => Ok(guest::pad_list(&self.devices)),
             "join" => {
                 let join: Join = args(text)?;
@@ -446,7 +539,98 @@ impl App {
                     .map(|path| path.to_string_lossy().into_owned())
                     .collect::<Vec<_>>(),
             )),
+            "update_configure" => {
+                let config: crate::update::Config = args(text)?;
+                self.updates.configure(config, &self.emitter());
+                self.update_state()
+            }
+            "update_check" => {
+                let check: UpdateCheck = args(text)?;
+                if check.extra && !check.manual {
+                    self.updates.check_extra(&self.emitter());
+                } else {
+                    self.updates.check(check.manual, &self.emitter());
+                }
+                self.update_state()
+            }
+            // La red pasó a tener límite de datos (o dejó de tenerlo).
+            "update_set_metered" => {
+                let on: On = args(text)?;
+                self.updates.set_metered(on.on, &self.emitter());
+                self.update_state()
+            }
+            "update_set_check" => {
+                let on: On = args(text)?;
+                self.updates.set_enabled(on.on, &self.emitter());
+                self.update_state()
+            }
+            "update_set_auto" => {
+                let on: On = args(text)?;
+                self.updates.set_auto(on.on, &self.emitter());
+                self.update_state()
+            }
+            "update_retry" => {
+                self.updates.retry(&self.emitter());
+                self.update_state()
+            }
+            "update_now" => {
+                self.updates.update_now(&self.emitter());
+                self.update_state()
+            }
+            // La ruta del APK listo, para el instalador del sistema.
+            "update_install" => self.updates.install().map(Value::from),
+            "update_state" => self.update_state(),
             _ => Err(format!("operación desconocida: {method}")),
+        }
+    }
+
+    fn update_state(&self) -> Result<Value, String> {
+        serde_json::to_value(self.updates.view()).map_err(|err| err.to_string())
+    }
+
+    /// El servidor rechazó la sala de espera por la versión del protocolo: se le pregunta cuál usa
+    /// (en otro hilo) y se avisa de quién quedó atrás; si es la app, se busca la versión nueva.
+    fn protocol_rejected(self: &Arc<Self>, server: Option<String>) {
+        let Some(url) = server.or_else(|| self.store.last_server()) else {
+            return;
+        };
+        {
+            let mut asked = lock(&self.protocol_asked);
+            if asked.as_ref() == Some(&url) || self.probing_protocol.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            *asked = Some(url.clone());
+        }
+        let app = Arc::clone(self);
+        let spawned = thread::Builder::new()
+            .name("coroom-protocolo".to_owned())
+            .spawn(move || {
+                let probed = account::probe_server(&url, None);
+                app.probing_protocol.store(false, Ordering::Release);
+                let gap = match probed {
+                    Ok(probe) => coroom_session::update::protocol_gap(probe.protocol),
+                    Err(err) => {
+                        tracing::debug!(error = %err, "no se supo el protocolo del servidor");
+                        None
+                    }
+                };
+                let Some(gap) = gap else { return };
+                let (kind, server, client) = crate::update::gap_kind(gap);
+                app.emit(UiEvent::ProtocolMismatch {
+                    host: host_of(&url),
+                    kind,
+                    server,
+                    client,
+                });
+                // La app quedó atrás: buscar la versión nueva ya (como mucho una vez por hora fuera
+                // del intervalo, y nunca con la búsqueda apagada).
+                if kind == "client_older" {
+                    app.updates.check_extra(&app.emitter());
+                }
+            });
+        if let Err(err) = spawned {
+            self.probing_protocol.store(false, Ordering::Release);
+            tracing::warn!(error = %err, "no se pudo preguntar el protocolo al servidor");
         }
     }
 
@@ -465,7 +649,14 @@ impl App {
         if join.code.trim().is_empty() {
             return Err("falta el código de la sala".to_owned());
         }
-        self.leave();
+        self.drop_guest();
+        // Con una sala abierta (también entrando) la versión nueva no se descarga.
+        let session = {
+            let mut room = lock(&self.room);
+            *room += 1;
+            self.updates.set_room_open(true, &self.emitter());
+            *room
+        };
         let settings = *lock(&self.settings);
         let request = JoinRequest {
             code: join.code,
@@ -479,7 +670,13 @@ impl App {
             .name("coroom-entrar".to_owned())
             .spawn(move || {
                 let emit_app = Arc::clone(&app);
-                let emit: guest::Emit = Arc::new(move |event| emit_app.emit(event));
+                let emit: guest::Emit = Arc::new(move |event| {
+                    // Antes que el evento: quien lo lea ya ve la sala cerrada.
+                    if matches!(event, UiEvent::Ended { .. }) {
+                        emit_app.room_closed(Some(session));
+                    }
+                    emit_app.emit(event);
+                });
                 match Guest::join(&app.store, &app.devices, &request, Arc::clone(&emit)) {
                     Ok(guest) => *lock(&app.guest) = Some(guest),
                     Err(error) => emit(UiEvent::Ended { error: Some(error) }),
@@ -489,8 +686,14 @@ impl App {
         Ok(())
     }
 
-    /// Sale de la sala, si se está en una.
+    /// Sale de la sala, si se está en una (la versión nueva ya puede descargarse).
     pub fn leave(&self) {
+        self.room_closed(None);
+        self.drop_guest();
+    }
+
+    /// Cierra la sesión de la sala, si hay una (sin tocar la versión nueva).
+    fn drop_guest(&self) {
         let guest = lock(&self.guest).take();
         if let Some(guest) = guest {
             guest.leave();
@@ -547,6 +750,7 @@ impl App {
         let (outbox, inbox) = mpsc::channel();
         let app = Arc::clone(self);
         let thread_stop = Arc::clone(&stop);
+        let server = options.server.clone();
         let spawned = thread::Builder::new()
             .name("coroom-lobby".to_owned())
             .spawn(move || {
@@ -556,6 +760,14 @@ impl App {
                     Ok((session, identity))
                 };
                 lobby::run(&session, &thread_stop, &inbox, &mut |event| {
+                    match event {
+                        lobby::LobbyEvent::ProtocolRejected => {
+                            app.protocol_rejected(server.clone());
+                        }
+                        // Vuelve a conectar: las versiones coinciden; una racha nueva pregunta.
+                        lobby::LobbyEvent::Online { .. } => *lock(&app.protocol_asked) = None,
+                        _ => {}
+                    }
                     if let Some(event) = events::from_lobby(event) {
                         app.emit(event);
                     }
@@ -616,6 +828,58 @@ mod tests {
 
     fn call(app: &Arc<App>, method: &str, args: &str) -> Value {
         serde_json::from_str(&app.call(method, args)).expect("respuesta en JSON")
+    }
+
+    #[test]
+    fn host_of_drops_scheme_port_and_path() {
+        assert_eq!(
+            host_of("https://coroom.example.com:4433/x"),
+            "coroom.example.com"
+        );
+        assert_eq!(host_of("https://coroom.example.com"), "coroom.example.com");
+        assert_eq!(host_of("https://[2001:db8::1]:4433"), "[2001:db8::1]");
+        assert_eq!(host_of("coroom.example.com"), "coroom.example.com");
+    }
+
+    /// La versión nueva: se configura, contesta su estado y lo emite; sin la versión lista no
+    /// hay APK que instalar; al entrar en una sala queda abierta para la versión nueva.
+    #[test]
+    fn update_calls_answer_the_state() {
+        let (dir, app) = app();
+        let cache = dir.path().join("updates");
+        let configured = call(
+            &app,
+            "update_configure",
+            &json!({ "dir": cache, "check": true, "auto": true }).to_string(),
+        );
+        assert_eq!(configured["ok"]["stage"], json!("idle"));
+        assert_eq!(configured["ok"]["auto"], json!(true));
+        assert_eq!(configured["ok"]["enabled"], json!(true));
+        let event = app.next_event(Duration::ZERO).expect("evento");
+        let event: Value = serde_json::from_str(&event).expect("json");
+        assert_eq!(event["type"], json!("update"));
+        assert_eq!(
+            call(&app, "update_install", ""),
+            json!({ "error": crate::update::CANNOT_INSTALL })
+        );
+        assert_eq!(
+            call(&app, "update_set_auto", r#"{"on": false}"#)["ok"]["auto"],
+            json!(false)
+        );
+        // Entrar (aunque falle por no tener cuenta) abre y cierra la sala para la versión nueva.
+        call(&app, "join", r#"{"code": "K7Q2MZ"}"#);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut ended = false;
+        while !ended && std::time::Instant::now() < deadline {
+            if let Some(event) = app.next_event(Duration::from_millis(100)) {
+                ended = event.contains("\"ended\"");
+            }
+        }
+        assert!(ended);
+        assert_eq!(
+            call(&app, "update_state", "")["ok"]["room_open"],
+            json!(false)
+        );
     }
 
     #[test]
@@ -741,6 +1005,10 @@ mod tests {
             call(&app, "set_mic_muted", r#"{"muted": true}"#),
             json!({ "error": NOT_IN_ROOM })
         );
+        assert_eq!(
+            call(&app, "set_video_paused", r#"{"paused": true}"#),
+            json!({ "error": NOT_IN_ROOM })
+        );
         assert_eq!(call(&app, "stats", ""), json!({ "ok": null }));
         assert!(
             call(&app, "join", r#"{"code": "  "}"#)
@@ -765,8 +1033,11 @@ mod tests {
             call(&app, "join", r#"{"code": "K7Q2MZ"}"#),
             json!({ "ok": null })
         );
-        let event = app.next_event(Duration::from_secs(10)).expect("evento");
-        let event: Value = serde_json::from_str(&event).expect("json");
+        // Los de la versión nueva (la sala se abre y se cierra para ella) no cuentan.
+        let event = std::iter::from_fn(|| app.next_event(Duration::from_secs(10)))
+            .map(|event| serde_json::from_str::<Value>(&event).expect("json"))
+            .find(|event| event["type"] != json!("update"))
+            .expect("evento");
         assert_eq!(event["type"], json!("ended"));
         assert!(event["error"].as_str().is_some());
         assert!(app.guest().is_none());

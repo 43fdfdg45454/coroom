@@ -837,6 +837,9 @@ pub struct GuestStatus {
     /// Nombre de su dispositivo, si su cuenta ya estaba en la sala (`PeerJoined::device`): va
     /// también entre paréntesis en [`GuestStatus::name`].
     pub device: Option<String>,
+    /// Si apagó su vídeo ([`RemoteSession::set_video_paused`]): solo voz, sin vídeo, y su entrada
+    /// en pausa (su mando sigue en su ranura, en reposo).
+    pub video_paused: bool,
 }
 
 /// Cómo puede llegar el mando físico de un invitado.
@@ -1066,6 +1069,17 @@ pub(crate) struct Core {
     pub(crate) game_audio: AtomicBool,
     /// Chat: claves por época, límite de ritmo e historial (anfitrión).
     pub(crate) chat: Mutex<chat::ChatState>,
+    /// Invitado: apagó su vídeo ([`RemoteSession::set_video_paused`]). Cada sesión empieza con
+    /// el vídeo encendido; con él apagado, cada conexión nueva se lo repite al anfitrión.
+    pub(crate) video_paused: AtomicBool,
+    /// Invitado: cuándo volvió a encender el vídeo, hasta que `media_loop` lo recoge para medir
+    /// el tiempo hasta el primer fotograma decodificado.
+    pub(crate) video_resumed: Mutex<Option<Instant>>,
+    /// Invitado: el último `CodecSelected` que llegó con el vídeo apagado, sin aplicar (el
+    /// anfitrión elige sin contar con él, quizá algo que no decodifica): se aplica al encenderlo,
+    /// cuando el anfitrión ya habrá vuelto a negociar con él. Su cerrojo guarda también el cambio
+    /// de [`Core::video_paused`].
+    pub(crate) held_codec: Mutex<Option<(Codec, coroom_codec::VideoFormat)>>,
 }
 
 /// Cerrojo que sobrevive a un pánico de otro hilo (el estado se sustituye entero).
@@ -1113,6 +1127,9 @@ impl Core {
             cursor_seq: AtomicU32::new(0),
             cursor_datagram_us: AtomicU64::new(0),
             port_mapping: Mutex::new(None),
+            video_paused: AtomicBool::new(false),
+            video_resumed: Mutex::new(None),
+            held_codec: Mutex::new(None),
         }
     }
 
@@ -1813,6 +1830,74 @@ impl RemoteSession {
     /// [`HostControl::set_video`].
     pub fn set_video(&self, change: VideoChange) -> Result<(), SessionError> {
         self.host_control()?.set_video(change)
+    }
+
+    /// Invitado: apaga (`paused`) o vuelve a encender el vídeo, sin salir de la sala. Apagado, el
+    /// anfitrión deja de mandarle vídeo (si nadie más lo ve, deja de codificar), no lo cuenta
+    /// para la tasa ni para el códec y descarta su entrada; el audio, la voz, el chat y el
+    /// control siguen igual. Al encenderlo, el anfitrión vuelve a negociar el códec contando con
+    /// él y le manda un intra (con el ritmo de los intra forzados); el tiempo hasta el primer
+    /// fotograma decodificado queda en el registro. La entrada local (teclado, ratón, mandos) la
+    /// pone en pausa quien llama, como al dejar el vídeo por otra página. No se recuerda entre
+    /// sesiones: cada una empieza con el vídeo encendido.
+    ///
+    /// Solo falla en el anfitrión ([`SessionError::GuestOnly`]): sin conexión, o si el aviso no
+    /// sale porque la conexión se cae, lo repite la conexión siguiente al abrirse.
+    pub fn set_video_paused(&self, paused: bool) -> Result<(), SessionError> {
+        if self.core.role != Role::Guest {
+            return Err(SessionError::GuestOnly);
+        }
+        // Todo bajo el cerrojo del enlace: una conexión nueva publica su control y repite el
+        // estado bajo el mismo cerrojo (`guest::receive`), así que el anfitrión acaba siempre con
+        // el último.
+        let link = lock(&self.core.link);
+        let held = {
+            let mut held = lock(&self.core.held_codec);
+            if self.core.video_paused.swap(paused, Ordering::AcqRel) == paused {
+                return Ok(());
+            }
+            if paused { None } else { held.take() }
+        };
+        *lock(&self.core.video_resumed) = (!paused).then(Instant::now);
+        tracing::info!(
+            paused,
+            "vídeo {}",
+            if paused { "apagado" } else { "encendido" }
+        );
+        if !paused {
+            // Mientras estuvo apagado, el anfitrión siguió numerando los grupos de vídeo para los
+            // demás: el primero que llegue es la nueva base, no un hueco de cientos de grupos
+            // perdidos (que el control de tasa tomaría por pérdida y bajaría la tasa de todos).
+            if let Some(receiver) = &link.receiver {
+                receiver.resync(coroom_transport::proto::media::Track::Video);
+            }
+            // El códec que eligió el anfitrión mientras tanto, si es algo que este invitado
+            // anuncia (si no, la negociación de ahora traerá otro).
+            if let Some((codec, format)) = held
+                && let Some(decode) = lock(&self.core.decode).clone()
+                && decode.announces(codec, format)
+            {
+                let restart = decode.wanted() == Some((codec, format));
+                guest::select_codec(&self.core, &decode, codec, format, restart);
+            }
+        }
+        // Sin conexión aún (o reconectando), lo dice la conexión siguiente al abrirse. Un envío
+        // que falla es una conexión que se cae: la siguiente también lo repite.
+        if let Some(control) = &link.control
+            && let Err(err) = control
+                .send(&coroom_transport::proto::control::ControlMessage::VideoPaused { paused })
+        {
+            tracing::warn!(
+                error = %err,
+                "no se pudo avisar al anfitrión del vídeo; lo repetirá la reconexión"
+            );
+        }
+        Ok(())
+    }
+
+    /// Invitado: si tiene el vídeo apagado ([`RemoteSession::set_video_paused`]).
+    pub fn video_paused(&self) -> bool {
+        self.core.video_paused.load(Ordering::Acquire)
     }
 
     /// Invitado: deja la conexión actual y vuelve a entrar en la sala enseguida (el mismo camino

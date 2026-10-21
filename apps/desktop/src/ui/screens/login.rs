@@ -408,6 +408,16 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                     Ok(probe) => Probe::Done { url, probe },
                     Err(err) => Probe::Failed(err),
                 };
+                // La aplicación es más vieja que el servidor: se busca la versión nueva para el
+                // botón del aviso.
+                if let Probe::Done { probe, .. } = &app.login.probe
+                    && matches!(
+                        crate::update::protocol_gap(probe.protocol),
+                        Some(crate::update::ProtocolGap::ClientOlder { .. })
+                    )
+                {
+                    return app.extra_update_check();
+                }
             }
             Vec::new()
         }
@@ -732,7 +742,17 @@ fn add_server(app: &App) -> Element<'_, Message> {
                 Some((t!("pantalla-login-reintentar"), on(Msg::Check))),
             ));
         }
-        Probe::Done { probe, .. } => form = form.push(probe_report(app, probe)),
+        Probe::Done { url, probe } => {
+            // Versiones distintas: quién tiene que actualizarse, encima del informe.
+            if let Some(gap) = crate::update::protocol_gap(probe.protocol) {
+                form = form.push(crate::ui::screens::updates::protocol_banner(
+                    app,
+                    &host_of(url),
+                    gap,
+                ));
+            }
+            form = form.push(probe_report(app, probe));
+        }
     }
     let ready = matches!(&state.probe, Probe::Done { probe, .. }
         if probe.untrusted.is_none() || state.trusted);

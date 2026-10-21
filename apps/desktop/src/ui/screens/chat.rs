@@ -1317,12 +1317,17 @@ pub fn with_unread<'a>(
     // Como en el boceto: 16 px de alto, redondo con una cifra, en la esquina del botón (sin
     // moverlo: el botón mide lo mismo con y sin mensajes).
     let single = label.chars().count() == 1;
-    let badge = container(
+    const SIZE: f32 = 10.5;
+    let badge = container(ui::cap_centered(
         text(label)
-            .size(10.5)
+            .size(SIZE)
             .font(coroom_ui::font::SEMIBOLD)
+            .line_height(iced_core::text::LineHeight::Absolute(iced_core::Pixels(
+                14.0,
+            )))
             .wrapping(Wrapping::None),
-    )
+        SIZE,
+    ))
     .padding(Padding::from([0.0, if single { 0.0 } else { 4.0 }]))
     .center_x(if single {
         Length::Fixed(16.0)

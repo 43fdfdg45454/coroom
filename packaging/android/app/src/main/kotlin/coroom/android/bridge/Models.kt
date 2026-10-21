@@ -42,6 +42,41 @@ data class ServerProbe(
     val fingerprint: String = "",
     /** `null` si las raíces del sistema validan el certificado; si no, por qué. */
     val untrusted: String? = null,
+    /** El servidor y la app usan protocolos distintos: quién quedó atrás (`null`: coinciden). */
+    @SerialName("protocol_gap") val protocolGap: ProtocolGap? = null,
+)
+
+/** Versiones distintas del protocolo entre el servidor y la app. */
+@Serializable
+data class ProtocolGap(
+    /** `client_older` (hay que actualizar la app) o `server_older` (el servidor). */
+    val kind: String = "",
+    val server: Int = 0,
+    val client: Int = 0,
+) {
+    val clientOlder: Boolean get() = kind == "client_older"
+}
+
+/** La versión nueva (evento `update` y las operaciones `update_*`). */
+@Serializable
+data class UpdateState(
+    /** `idle`, `notice`, `downloading`, `paused`, `ready` o `failed`. */
+    val stage: String = "idle",
+    val version: String? = null,
+    val url: String = "",
+    val current: String = "",
+    val percent: Int = 0,
+    @SerialName("total_bytes") val totalBytes: Long? = null,
+    val error: String? = null,
+    /** Por qué está en pausa: `room` (una sala abierta) o `metered` (red con límite de datos). */
+    val waiting: String? = null,
+    @SerialName("room_open") val roomOpen: Boolean = false,
+    @SerialName("can_install") val canInstall: Boolean = false,
+    val auto: Boolean = true,
+    val enabled: Boolean = true,
+    val checking: Boolean = false,
+    @SerialName("last_check") val lastCheck: Long? = null,
+    @SerialName("check_error") val checkError: String? = null,
 )
 
 /** Qué hace un amigo conectado. */

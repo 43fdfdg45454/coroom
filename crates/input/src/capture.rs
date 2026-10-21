@@ -111,6 +111,8 @@ pub enum Action {
     ToggleGameMute,
     /// Mostrar u ocultar el panel de mandos (`Ctrl+Alt+J`).
     TogglePads,
+    /// Apagar o encender el vídeo del invitado (`Ctrl+Alt+I`).
+    ToggleVideo,
     /// La tecla de pulsar para hablar se pulsó (`true`) o se soltó.
     PushToTalk(bool),
 }

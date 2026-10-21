@@ -105,6 +105,7 @@ class RoomActivity : ComponentActivity() {
                         onClearNotice = room::clearNotice,
                         onRevealOverlay = room::revealOverlay,
                         onShareLog = room::shareLog,
+                        onToggleVideo = room::toggleVideo,
                     ),
                     onCancelJoin = room::leave,
                     onRetry = room::retry,

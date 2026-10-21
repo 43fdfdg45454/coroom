@@ -608,20 +608,91 @@ pub fn status_badge<'a, M: 'a>(tone: Tone, label: impl text::IntoFragment<'a>) -
     )
 }
 
-/// [`status_badge`] con lo que se quiera tras el punto (un texto y una cifra de ancho fijo, por
-/// ejemplo, escritos con [`badge_text`]).
+/// [`status_badge`] con lo que se quiera tras el punto (un texto, por ejemplo, escrito con
+/// [`badge_text`]). Para una cifra que cambia, [`status_badge_steady`].
 pub fn status_badge_with<'a, M: 'a>(
     tone: Tone,
     content: impl Into<Element<'a, M>>,
 ) -> Element<'a, M> {
+    badge_frame(tone, badge_line(tone, content.into()))
+}
+
+/// [`status_badge_with`] que no cambia de ancho con lo que muestra («● 14 ms», «● host · 2 ms»):
+/// la píldora mide lo que la mayor de `samples` (lo mismo que `content` con las cifras más
+/// anchas, cada una tras su punto) y el punto y `content` van centrados dentro, con el mismo
+/// margen a los dos lados, sin hueco al final. Con `keep_widest`, las muestras cubren lo
+/// habitual y no el peor caso: si `content` no cabe, la píldora crece una vez y ya no se
+/// estrecha ([`crate::slot::Reserve::keep_widest`]).
+pub fn status_badge_steady<'a, M: 'a>(
+    tone: Tone,
+    content: impl Into<Element<'a, M>>,
+    samples: impl IntoIterator<Item = Element<'a, M>>,
+    keep_widest: bool,
+) -> Element<'a, M> {
+    let samples = samples.into_iter().map(|sample| badge_line(tone, sample));
+    let slot = steady(samples, badge_line(tone, content.into()));
+    let slot = if keep_widest {
+        slot.keep_widest()
+    } else {
+        slot
+    };
+    badge_frame(tone, slot.into())
+}
+
+/// Insignia con un icono del tono (12 px) en lugar del punto, con el mismo marco y el texto
+/// centrado como [`status_badge`] («Solo voz»).
+pub fn icon_badge<'a, M: 'a>(
+    tone: Tone,
+    glyph: Icon,
+    label: impl text::IntoFragment<'a>,
+) -> Element<'a, M> {
+    let label = one_line(label.into_fragment().into_owned(), badge_text);
+    badge_frame(
+        tone,
+        row![
+            icon_with(glyph, 12.0, SvgClass::Tone(tone)),
+            cap_centered(label, type_size::CAPTION)
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .into(),
+    )
+}
+
+/// El punto y lo que le sigue, en una línea, con el punto a la altura del centro de las
+/// mayúsculas y las cifras.
+fn badge_line<'a, M: 'a>(tone: Tone, content: Element<'a, M>) -> Element<'a, M> {
+    row![dot_shape(tone), cap_centered(content, type_size::CAPTION)]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .into()
+}
+
+/// `content` (texto de `size` px con la letra de la interfaz) con el centro de sus mayúsculas y
+/// sus cifras en el centro de su caja: lo que sobra o falta según las métricas de la fuente
+/// ([`crate::font::cap_drop`]) se añade abajo o arriba. Para lo que va centrado en una píldora;
+/// con Inter no cambia nada.
+pub fn cap_centered<'a, M: 'a>(content: impl Into<Element<'a, M>>, size: f32) -> Element<'a, M> {
+    let shift = 2.0 * crate::font::cap_drop() * size;
+    if shift.abs() < 0.05 {
+        return content.into();
+    }
+    let padding = if shift > 0.0 {
+        Padding::ZERO.bottom(shift)
+    } else {
+        Padding::ZERO.top(-shift)
+    };
+    container(content).padding(padding).into()
+}
+
+/// La píldora de una insignia de estado, con lo de dentro centrado en los dos ejes.
+fn badge_frame<'a, M: 'a>(tone: Tone, content: Element<'a, M>) -> Element<'a, M> {
     crate::animate::ToneFade::new(
-        container(
-            row![dot_shape(tone), content.into()]
-                .spacing(6)
-                .align_y(Alignment::Center),
-        )
-        .padding(Padding::from([3.0, 10.0]))
-        .class(ContainerClass::Badge(tone)),
+        container(content)
+            .padding(Padding::from([3.0, 10.0]))
+            .align_x(Horizontal::Center)
+            .align_y(Vertical::Center)
+            .class(ContainerClass::Badge(tone)),
         tone,
     )
     .into()
@@ -629,7 +700,10 @@ pub fn status_badge_with<'a, M: 'a>(
 
 /// El texto de las insignias de estado (12/600).
 pub fn badge_text<'a>(content: String) -> Text<'a> {
-    text(content).size(type_size::CAPTION).font(SEMIBOLD)
+    text(content)
+        .size(type_size::CAPTION)
+        .font(SEMIBOLD)
+        .line_height(iced_core::text::LineHeight::Absolute(Pixels(16.0)))
 }
 
 /// Punto de estado (cambia de tono con un fundido).
@@ -1029,12 +1103,17 @@ pub struct RailItem<'a, M> {
     pub on_press: M,
 }
 
-/// Contador pequeño del riel (una cifra o dos, en una ranura del ancho de «88»).
+/// Contador pequeño del riel (una cifra o dos, centradas en una ranura del ancho de «88»).
 pub fn rail_count<'a, M: 'a>(count: impl Into<String>) -> Element<'a, M> {
-    container(figure(badge_text, count, &["88"]))
-        .padding(Padding::from([0.0, 5.0]))
-        .class(ContainerClass::Badge(Tone::Neutral))
-        .into()
+    container(cap_centered(
+        figure_centered(badge_text, count, &["88"]),
+        type_size::CAPTION,
+    ))
+    .padding(Padding::from([0.0, 5.0]))
+    .align_x(Horizontal::Center)
+    .align_y(Vertical::Center)
+    .class(ContainerClass::Badge(Tone::Neutral))
+    .into()
 }
 
 /// Identificador de la caja del icono del destino `index` del riel (`top` y luego `bottom`): las
@@ -1502,8 +1581,30 @@ pub fn figure<'a, M: 'a>(
     figure_aligned(style, value, widest, Horizontal::Right)
 }
 
+/// [`figure`] centrada en su ranura: para una cifra sola dentro de una píldora (un contador),
+/// que queda en el centro con el mismo margen a los dos lados.
+pub fn figure_centered<'a, M: 'a>(
+    style: impl Fn(String) -> Text<'a>,
+    value: impl Into<String>,
+    widest: &[&str],
+) -> Element<'a, M> {
+    figure_aligned(style, value, widest, Horizontal::Center)
+}
+
+/// Ranura de ancho estable para el contenido de una píldora: `content` centrado en el ancho de
+/// la mayor de `samples` (lo mismo con las cifras más anchas, medido con la letra de verdad). Así
+/// la píldora no cambia de ancho con cada valor y lo que sobra se reparte a los dos lados en vez
+/// de quedar al final. [`crate::slot::Reserve::keep_widest`] para muestras de lo habitual.
+pub fn steady<'a, M: 'a>(
+    samples: impl IntoIterator<Item = Element<'a, M>>,
+    content: impl Into<Element<'a, M>>,
+) -> crate::slot::Reserve<'a, M> {
+    reserve(samples, Some(content.into())).align_x(Horizontal::Center)
+}
+
 /// [`figure`] alineada a la izquierda: para una cifra que sigue a un texto en la misma línea
-/// («servidor · 12 ms»), donde el hueco de la ranura queda al final y no en medio.
+/// fuera de una píldora («servidor · 12 ms»), donde el hueco de la ranura queda al final y no en
+/// medio. Dentro de una píldora, [`steady`] con la línea entera.
 pub fn figure_after<'a, M: 'a>(
     style: impl Fn(String) -> Text<'a>,
     value: impl Into<String>,

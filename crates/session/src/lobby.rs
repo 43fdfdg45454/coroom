@@ -38,6 +38,10 @@ pub enum LobbyEvent {
     Signal(SignalMessage),
     /// Un mensaje de la cola no salió: sin conexión (`None`) o con este error.
     SendFailed(Option<String>),
+    /// El servidor rechazó la conexión por la versión del protocolo (llega antes del `Offline` de
+    /// ese intento): la aplicación le pregunta su versión para decir cuál de los dos quedó atrás
+    /// ([`crate::update::protocol_gap`]).
+    ProtocolRejected,
 }
 
 /// Abre la sala de espera y la mantiene hasta `stop`, reconectando tras [`RETRY`] si se corta.
@@ -94,7 +98,12 @@ pub fn run_once(
             &session.trust,
         )
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| {
+            if crate::update::is_protocol_rejection(&err) {
+                on_event(LobbyEvent::ProtocolRejected);
+            }
+            err.to_string()
+        })?;
         let mut tick = tokio::time::interval(TICK);
         let mut status_tick = tokio::time::interval(SERVER_STATUS_EVERY);
         let result = loop {

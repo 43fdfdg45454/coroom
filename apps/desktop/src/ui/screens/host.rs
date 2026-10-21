@@ -3566,21 +3566,28 @@ fn live_glow(app: &App) -> f32 {
     })
 }
 
-/// La etiqueta «EN VIVO» con lo que lleva transmitiendo, en una ranura de ancho fijo.
+/// La etiqueta «EN VIVO» con lo que lleva transmitiendo, de ancho fijo (el de la cifra más
+/// ancha) y con el texto centrado.
 fn live_tag<'a>(glow: f32, seconds: u64) -> Element<'a, Message> {
-    container(
+    let line = |elapsed: String| -> Element<'a, Message> {
         row![
             ui::badge_text(t!("host-en-vivo").to_owned()).wrapping(Wrapping::None),
-            ui::figure(
-                ui::badge_text,
-                stats::elapsed(seconds),
-                &[stats::elapsed_widest(seconds)]
-            ),
+            ui::badge_text(elapsed).wrapping(Wrapping::None),
         ]
         .spacing(6)
-        .align_y(Alignment::Center),
-    )
+        .align_y(Alignment::Center)
+        .into()
+    };
+    container(ui::cap_centered(
+        ui::steady(
+            [line(stats::elapsed_widest(seconds).to_owned())],
+            line(stats::elapsed(seconds)),
+        ),
+        type_size::CAPTION,
+    ))
     .padding(Padding::from([3.0, 10.0]))
+    .align_x(iced_core::alignment::Horizontal::Center)
+    .align_y(iced_core::alignment::Vertical::Center)
     .class(ContainerClass::LiveTag { glow })
     .into()
 }
@@ -4064,9 +4071,15 @@ fn latency_badge<'a>(rtt_ms: Option<f64>, with_tip: bool) -> Element<'a, Message
             t!("host-latencia-midiendo").to_owned(),
         ),
     };
-    let badge = ui::status_badge_with(
+    // Del ancho de «● 888 ms» en todas las filas (para que queden en columna), con el punto y
+    // la cifra centrados. Sin `keep_widest`: un pico de cuatro cifras ensancha la de su fila solo
+    // mientras dura, no la descuadra para siempre.
+    let line = |value: String| ui::badge_text(value).wrapping(Wrapping::None);
+    let badge = ui::status_badge_steady(
         tone,
-        ui::figure(ui::badge_text, value, &[stats::LATENCY_WIDEST]),
+        line(value),
+        [line(stats::LATENCY_WIDEST.to_owned()).into()],
+        false,
     );
     if with_tip {
         ui::with_tooltip(badge, tip)
@@ -4316,19 +4329,31 @@ fn guest_row<'a>(app: &'a App, room: &'a Room, status: &'a GuestStatus) -> Eleme
         }
         None => facts.push(t!("host-conectando").to_owned()),
     }
+    // Con el vídeo apagado, que su entrada no llega va antes que sus permisos: es lo que explica
+    // que no mueva nada (la fila corta lo que no cabe por el final).
+    let input = permissions.keyboard_mouse || permissions.gamepad_slot.is_some();
+    if status.video_paused && input {
+        facts.push(t!("host-entrada-en-pausa").to_owned());
+    }
     facts.push(permissions_label(&permissions));
-    if !status.input_key && (permissions.keyboard_mouse || permissions.gamepad_slot.is_some()) {
+    if !status.input_key && input {
         facts.push(t!("host-esperando-la-clave").to_owned());
     }
     let talking = room.voice.talkers.contains(&id.0);
+    let sharing = app
+        .host
+        .shared
+        .as_ref()
+        .is_some_and(|shared| shared.mode != ShareMode::Nothing);
     let header = row![
         avatars::ringed_view(app, &status.name, status.avatar, size::AVATAR, talking),
         column![
-            ui::one_line(status.name.clone(), ui::strong),
+            ui::one_line(status.name.clone(), ui::strong).width(Length::Fill),
             ui::one_line(facts.join(" · "), ui::secondary).width(Length::Fill)
         ]
         .spacing(2)
         .width(Length::Fill),
+        video_slot(status.video_paused, sharing && status.path.is_some()),
         speaking_slot(talking, compact(app)),
         trailing(latency_badge(status.rtt_ms, true), compact(app)),
         chevron(app, Person::Guest(id), &status.name),
@@ -4341,6 +4366,26 @@ fn guest_row<'a>(app: &'a App, room: &'a Room, status: &'a GuestStatus) -> Eleme
         header.into(),
         guest_details(app, room, status),
     )
+}
+
+/// A la derecha del nombre de un invitado, si mira lo que se comparte: «Viendo» (`watching`: hay
+/// algo compartido y está conectado, con un camino) o, con el vídeo apagado, «Solo voz» (así se
+/// sabe por qué no mueve nada en el juego). Si no, nada. Con el hueco de la más ancha reservado,
+/// para que las etiquetas de todas las filas queden en columna.
+fn video_slot<'a>(paused: bool, watching: bool) -> Element<'a, Message> {
+    let voice_only = || -> Element<'a, Message> {
+        let tag = ui::icon_badge(Tone::Info, Icon::MonitorOff, t!("host-solo-voz"));
+        ui::with_tooltip(tag, t!("host-solo-voz-tip"))
+    };
+    let watching_tag = || ui::status_badge(Tone::Success, t!("host-viendo"));
+    let current = if paused {
+        Some(voice_only())
+    } else {
+        watching.then(watching_tag)
+    };
+    ui::reserve([voice_only(), watching_tag()], current)
+        .align_x(Horizontal::Right)
+        .into()
 }
 
 /// «Pasarle la sala»: desactivado mientras otra oferta espera respuesta y, con el motivo al pasar
@@ -4948,6 +4993,7 @@ pub(crate) mod shots {
             gamepad: None,
             can_host: true,
             device: None,
+            video_paused: false,
         }
     }
 
@@ -5103,6 +5149,22 @@ pub(crate) mod shots {
             super::settle(app);
             app.toasts.clear();
         }),
+        ("09-sala-solo-voz", |app| {
+            host_room(app);
+            // Carla apagó el vídeo: «Solo voz» y su entrada en pausa.
+            let guests = app.host.room.as_ref().map(|room| {
+                let guests = room.guests.iter().map(|status| GuestStatus {
+                    video_paused: status.guest == GuestId(2),
+                    ..status.clone()
+                });
+                (guests.collect(), room.voice.clone())
+            });
+            if let Some((guests, voice)) = guests {
+                app.update(Message::Event(Event::HostGuests(guests, voice)));
+            }
+            super::settle(app);
+            app.toasts.clear();
+        }),
         ("09-sala-persona-abierta", |app| {
             host_room(app);
             expanded(app, Person::Guest(GuestId(2)));
@@ -5163,6 +5225,7 @@ mod tests {
             gamepad: None,
             can_host: true,
             device: None,
+            video_paused: false,
         }
     }
 

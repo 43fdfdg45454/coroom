@@ -965,6 +965,19 @@ impl DecodeControl {
         (self.opener)(&self.usable(), codec, format)
     }
 
+    /// Si el invitado anuncia que decodifica `codec` en `format` (lo que dicen sus capacidades:
+    /// los decodificadores que quedan y lo que acepta además de 4:2:0 SDR).
+    pub(crate) fn announces(&self, codec: Codec, format: VideoFormat) -> bool {
+        let usable = self.usable();
+        usable.available().iter().any(|&(c, _)| c == codec)
+            && crate::remote::GuestCapabilities::from_decoders(
+                &usable,
+                self.accept.0,
+                self.accept.1,
+            )
+            .accepts(codec, format)
+    }
+
     /// Aparta el decodificador `backend` de `codec`.
     fn exclude(&self, codec: Codec, backend: DecoderBackend) {
         let mut excluded = self.excluded.lock().unwrap_or_else(PoisonError::into_inner);
@@ -975,7 +988,17 @@ impl DecodeControl {
 
     /// Aparta todos los decodificadores de `codec` y pide renegociar sin él. Si con eso no quedase
     /// ninguno, se vuelve a empezar con todos: mejor reintentar que quedarse sin vídeo.
-    fn give_up_codec(&self, codec: Codec) {
+    ///
+    /// Solo si el invitado lo anunciaba (`announced`, de [`DecodeControl::announces`] antes de
+    /// apartar nada): un códec o un formato que no anunció y le llega igual (un `CodecSelected`
+    /// que no era para él) no dice nada de sus decodificadores; entonces solo se vuelven a
+    /// anunciar las capacidades, sin apartar ninguno, para que el anfitrión elija otra vez.
+    fn give_up_codec(&self, codec: Codec, announced: bool) {
+        if !announced {
+            warn!(%codec, "llegó un códec o un formato que no se anunció; se vuelve a anunciar");
+            self.renegotiate.store(true, Ordering::Release);
+            return;
+        }
         for &(c, backend) in self.set.available() {
             if c == codec {
                 self.exclude(c, backend);
@@ -1816,7 +1839,7 @@ pub(crate) fn decode_loop(
                     // Ningún decodificador de este códec abre: se renegocia sin él.
                     warn!(%codec, %format, error = %err, "no abre ningún decodificador");
                     unavailable = Some(wanted);
-                    control.give_up_codec(codec);
+                    control.give_up_codec(codec, control.announces(codec, format));
                 }
             }
             health = DecodeHealth::default();
@@ -1906,12 +1929,20 @@ pub(crate) fn decode_loop(
             // El decodificador no saca imagen con los intra que recibe: el siguiente del orden.
             let (codec, backend) = (failed.codec(), failed.backend());
             drop(failed);
-            bump(&shared.counters.decoder_fallbacks);
-            control.exclude(codec, backend);
+            let format = opened_format.unwrap_or(VideoFormat::SDR_420);
             health = DecodeHealth::default();
             need_keyframe = true;
             shared.request_keyframe();
-            let format = opened_format.unwrap_or(VideoFormat::SDR_420);
+            if !control.announces(codec, format) {
+                // Un flujo que no se anunció no dice nada de este decodificador: no se aparta;
+                // se vuelve a anunciar lo que se decodifica para que el anfitrión elija otra vez.
+                opened_format = None;
+                unavailable = control.wanted();
+                control.give_up_codec(codec, false);
+                continue;
+            }
+            bump(&shared.counters.decoder_fallbacks);
+            control.exclude(codec, backend);
             match control.open(codec, format) {
                 Ok(next) => {
                     warn!(
@@ -1929,7 +1960,7 @@ pub(crate) fn decode_loop(
                     );
                     opened_format = None;
                     unavailable = control.wanted();
-                    control.give_up_codec(codec);
+                    control.give_up_codec(codec, true);
                 }
             }
         }
@@ -2522,6 +2553,45 @@ mod tests {
         control.request(Codec::H264, VideoFormat::SDR_420);
         let decoded = run_decode(&control, &shared, &[(21, false), (22, true), (23, false)]);
         assert_eq!(decoded, vec![22, 23], "espera al intra del códec nuevo");
+    }
+
+    /// Un `CodecSelected` de algo que el invitado no anunció (otro códec, o 4:4:4 sin aceptarlo)
+    /// no abre, pero no aparta nada: solo vuelve a anunciar las capacidades. Antes, AV1 quedaba
+    /// fuera para toda la sesión y la sala bajaba a H.264.
+    #[test]
+    fn an_unannounced_codec_or_format_excludes_nothing() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let inner = fake_opener(Vec::new(), Arc::clone(&seen));
+        let control =
+            DecodeControl::new(av1_set()).with_opener(Box::new(move |set, codec, format| {
+                if format.is_default() {
+                    inner(set, codec, format)
+                } else {
+                    Err(CodecError::Unsupported("solo 4:2:0".into()))
+                }
+            }));
+        assert!(control.announces(Codec::Av1, VideoFormat::SDR_420));
+        assert!(!control.announces(Codec::Av1, VideoFormat::SDR_444));
+        assert!(!control.announces(Codec::Hevc, VideoFormat::SDR_420));
+        let shared = Shared::default();
+        for (codec, format) in [
+            (Codec::Av1, VideoFormat::SDR_444),
+            (Codec::Hevc, VideoFormat::SDR_420),
+        ] {
+            control.request(codec, format);
+            assert!(run_decode(&control, &shared, &[(1, true), (2, false)]).is_empty());
+            assert!(
+                control.take_renegotiation(),
+                "{codec} {format}: se vuelve a anunciar"
+            );
+            assert_eq!(control.usable().available().len(), 3, "{codec} {format}");
+        }
+        // Y lo anunciado sigue abriendo.
+        control.request(Codec::Av1, VideoFormat::SDR_420);
+        assert_eq!(
+            run_decode(&control, &shared, &[(3, true), (4, false)]),
+            vec![3, 4]
+        );
     }
 
     /// Tras un grupo perdido (un hueco en los ids) no se decodifica contra referencias que faltan:

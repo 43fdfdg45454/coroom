@@ -39,12 +39,16 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 unic-langid.workspace = true
 winit.workspace = true
+# La versión nueva del zip portátil de Windows (`update::zip`); en todas las plataformas para
+# probar la extracción y el cambio de ficheros también en Linux.
+zip.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `settings`: tema y acento del sistema; `open_uri`: abrir la página de una versión nueva;
 # `secret`: la clave del llavero dentro de Flatpak; `notification`: los mensajes del chat con la
-# ventana sin foco; `file_chooser`: elegir el tono del chat.
-ashpd = { workspace = true, features = ["settings", "open_uri", "secret", "notification", "file_chooser", "inhibit"] }
+# ventana sin foco; `file_chooser`: elegir el tono del chat; `flatpak`: la actualización por el
+# portal de Flatpak (`UpdateMonitor` y `Spawn` de la versión nueva).
+ashpd = { workspace = true, features = ["settings", "open_uri", "secret", "notification", "file_chooser", "inhibit", "flatpak"] }
 futures-util.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -53,11 +57,13 @@ winreg.workspace = true
 # el diálogo de abrir fichero para elegirlo; `Win32_Graphics_Dwm` y `Win32_System_Performance`: el
 # vblank del compositor de escritorio, que marca el ritmo de las animaciones;
 # `Win32_UI_WindowsAndMessaging`: «Mostrar animaciones» (`SystemParametersInfoW`), el movimiento
-# reducido.
+# reducido; `Win32_Storage_Packaging_Appx`: si corre como MSIX (`GetCurrentPackageFullName`), que
+# no se actualiza solo.
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Media_Audio",
+    "Win32_Storage_Packaging_Appx",
     "Win32_System_Com",
     "Win32_System_Performance",
     "Win32_System_Power",

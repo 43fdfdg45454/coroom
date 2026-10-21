@@ -1062,6 +1062,14 @@ async fn receive(
         link.connection = Some(connection.clone());
         link.receiver = Some(Arc::clone(&receiver));
         link.control = Some(reply.clone());
+        // Con el vídeo apagado (antes de reconectar, o mientras se conectaba), la conexión nueva
+        // empieza con el vídeo encendido en el anfitrión: se le repite antes que las capacidades,
+        // así no cuenta con este invitado al negociar. Bajo el cerrojo del enlace, como el cambio
+        // en `RemoteSession::set_video_paused`: uno a la vez no deja al anfitrión con el estado
+        // de antes.
+        if core.video_paused.load(Ordering::Acquire) {
+            let _ = reply.send(&ControlMessage::VideoPaused { paused: true });
+        }
     }
     let playing = Arc::new(AtomicBool::new(false));
     let audio_task = if lock(&core.audio_tx).is_some() {
@@ -1183,6 +1191,41 @@ async fn measure_rtt(
         * 1000.0
 }
 
+/// Aplica un `CodecSelected` de `codec` en `format`. Con `restart` es el mismo flujo reabierto
+/// (otro `CodecSelected` igual: el anfitrión volvió a abrir su codificador) y se vuelve a abrir el
+/// decodificador; si no, se pide el nuevo y se dice con qué se decodifica.
+pub(super) fn select_codec(
+    core: &Core,
+    decode: &DecodeControl,
+    codec: coroom_codec::Codec,
+    format: coroom_codec::VideoFormat,
+    restart: bool,
+) {
+    if restart {
+        decode.restart();
+        return;
+    }
+    decode.request(codec, format);
+    let backend = decode
+        .set
+        .available()
+        .iter()
+        .find(|&&(c, backend)| c == codec && coroom_codec::decoder_supports(c, backend, format))
+        .map(|(_, backend)| *backend);
+    let detail = match backend {
+        Some(backend) => {
+            let label = decoder_label(codec, backend);
+            if format.is_default() {
+                format!("decodifica {label}")
+            } else {
+                format!("decodifica {label} · {format}")
+            }
+        }
+        None => format!("sin decodificador para este códec en {format}"),
+    };
+    core.emit(SessionEvent::VideoCodec { codec, detail });
+}
+
 /// Mensajes de control del anfitrión: reloj, marcas de tiempo, bitrate objetivo, códec y cursor.
 async fn control_loop(
     core: Arc<Core>,
@@ -1190,7 +1233,9 @@ async fn control_loop(
     receiver: Arc<MediaReceiver>,
     decode: Arc<DecodeControl>,
 ) {
-    let mut codec = None;
+    // Aún no llegó ningún `CodecSelected` por esta conexión: el primero no reabre el
+    // decodificador aunque sea el de antes de reconectar.
+    let mut first_codec = true;
     let mut timings = Timings::default();
     loop {
         let message = match control.recv().await {
@@ -1224,36 +1269,20 @@ async fn control_loop(
                 );
                 let selected = codec_from_wire(selected);
                 let format = format_from_wire(chroma, color);
-                if codec == Some((selected, format)) {
-                    // Mismo códec, otro flujo: el anfitrión reabrió su codificador.
-                    decode.restart();
-                } else {
-                    codec = Some((selected, format));
-                    decode.request(selected, format);
-                    let backend = decode
-                        .set
-                        .available()
-                        .iter()
-                        .find(|&&(c, backend)| {
-                            c == selected && coroom_codec::decoder_supports(c, backend, format)
-                        })
-                        .map(|(_, backend)| *backend);
-                    let detail = match backend {
-                        Some(backend) => {
-                            let label = decoder_label(selected, backend);
-                            if format.is_default() {
-                                format!("decodifica {label}")
-                            } else {
-                                format!("decodifica {label} · {format}")
-                            }
-                        }
-                        None => format!("sin decodificador para este códec en {format}"),
-                    };
-                    core.emit(SessionEvent::VideoCodec {
-                        codec: selected,
-                        detail,
-                    });
+                // Mismo códec otra vez por esta conexión: el anfitrión reabrió su codificador.
+                let restart = !first_codec && decode.wanted() == Some((selected, format));
+                first_codec = false;
+                {
+                    let mut held = lock(&core.held_codec);
+                    if core.video_paused.load(Ordering::Acquire) {
+                        // Con el vídeo apagado, el anfitrión elige sin contar con este invitado
+                        // (quizá algo que no decodifica): se aplica al encenderlo.
+                        debug!(codec = %selected, %format, "códec elegido con el vídeo apagado");
+                        *held = Some((selected, format));
+                        continue;
+                    }
                 }
+                select_codec(&core, &decode, selected, format, restart);
             }
             Some(ControlMessage::Cursor {
                 x,
@@ -1617,7 +1646,27 @@ async fn media_loop(
     let mut watch = VideoWatch::new(shared.counters.decoded.load(Ordering::Relaxed));
     let mut tick = tokio::time::interval(WATCH_PERIOD);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Lo que se mide al volver a encender el vídeo: hasta el primer fotograma decodificado.
+    let mut resumed: Option<Resumed> = None;
     loop {
+        if let Some(at) = lock(&core.video_resumed).take() {
+            resumed = Some(Resumed {
+                at,
+                first: None,
+                last: None,
+            });
+            // Para el vigilante, una conexión que empieza: el intra viene de camino.
+            watch = VideoWatch::new(shared.counters.decoded.load(Ordering::Relaxed));
+        }
+        let paused = core.video_paused.load(Ordering::Acquire);
+        if paused {
+            resumed = None;
+        }
+        if let Some(resume) = &resumed
+            && resume.decoded(ledger)
+        {
+            resumed = None;
+        }
         // `recv_frame` se puede cancelar: lo recibido se queda en el receptor.
         let received = tokio::select! {
             frame = receiver.recv_frame() => Some(frame),
@@ -1642,6 +1691,10 @@ async fn media_loop(
                     silence.as_secs_f64()
                 )));
             }
+            // Con el vídeo apagado no llega vídeo: no hay nada que vigilar ni que pedir.
+            if paused {
+                continue;
+            }
             let decoded = shared.counters.decoded.load(Ordering::Relaxed);
             if watch.stalled(now, decoded, codec_known) {
                 shared.request_keyframe();
@@ -1664,6 +1717,15 @@ async fn media_loop(
         let frame_id = extend_frame_id(last_id, frame.group);
         last_id = Some(frame_id);
         last_group = frame.group;
+        if paused {
+            // Lo que quedaba en vuelo al apagarlo: no se decodifica (el decodificador, que sigue
+            // abierto, espera al intra que llega al encenderlo).
+            continue;
+        }
+        if let Some(resume) = resumed.as_mut() {
+            resume.first.get_or_insert(frame_id);
+            resume.last = Some(frame_id);
+        }
         watch.received_at = Some(frame.received_at);
         bump(&shared.counters.received);
         shared
@@ -1720,6 +1782,40 @@ async fn media_loop(
         }
         let rtt = receiver.clock_rtt().unwrap_or_default();
         request_keyframe(receiver, frame.group, shared, &mut last_request, rtt);
+    }
+}
+
+/// El vídeo se volvió a encender en `at`: los fotogramas que llegaron desde entonces, hasta que
+/// uno se decodifique.
+struct Resumed {
+    at: Instant,
+    first: Option<u64>,
+    last: Option<u64>,
+}
+
+/// Fotogramas que se miran como mucho para encontrar el primero decodificado tras encender el
+/// vídeo (el intra es el primero; si se perdió, uno de los que siguen).
+const RESUME_SCAN: u64 = 256;
+
+impl Resumed {
+    /// Si ya se decodificó alguno de los fotogramas llegados desde que se encendió: lo deja en el
+    /// registro con el tiempo desde que se pidió.
+    fn decoded(&self, ledger: &crate::latency::LatencyLedger) -> bool {
+        let (Some(first), Some(last)) = (self.first, self.last) else {
+            return false;
+        };
+        let decoded = (first..=last.min(first.saturating_add(RESUME_SCAN)))
+            .filter_map(|id| ledger.timeline(id)?.at(Stage::Decoded))
+            .min();
+        let Some(decoded) = decoded else {
+            return false;
+        };
+        let ms = decoded.saturating_duration_since(self.at).as_secs_f64() * 1000.0;
+        tracing::info!(
+            ms = format_args!("{ms:.1}"),
+            "primer fotograma decodificado tras encender el vídeo"
+        );
+        true
     }
 }
 

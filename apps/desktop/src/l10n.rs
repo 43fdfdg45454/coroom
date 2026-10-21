@@ -2,7 +2,8 @@
 //!
 //! El español (`locales/es/`) es el único idioma completo y va embebido en el binario, en un
 //! fichero por pantalla (`coroom.ftl` con lo común y lo que aún no se ha repartido, `home.ftl`,
-//! `host.ftl`, `room.ftl`, `chat.ftl`, `settings.ftl`, `diagnostics.ftl`); los identificadores
+//! `host.ftl`, `room.ftl`, `chat.ftl`, `settings.ftl`, `diagnostics.ftl`, `update.ftl`); los
+//! identificadores
 //! son únicos en todo el idioma.
 //! La interfaz pide cada texto por su identificador con [`t!`](crate::t):
 //!
@@ -39,6 +40,7 @@ pub const CATALOGS: &[(&str, &[&str])] = &[(
         include_str!("../locales/es/chat.ftl"),
         include_str!("../locales/es/settings.ftl"),
         include_str!("../locales/es/diagnostics.ftl"),
+        include_str!("../locales/es/update.ftl"),
     ],
 )];
 

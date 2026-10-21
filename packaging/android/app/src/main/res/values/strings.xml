@@ -245,6 +245,14 @@
     <string name="room_reconnecting">Se perdió la conexión: reconectando (intento %1$d de %2$d)…</string>
     <string name="rail_mic_mute">Silenciar el micrófono</string>
     <string name="rail_mic_unmute">Activar el micrófono</string>
+    <string name="rail_video_off">Apagar el vídeo</string>
+    <string name="rail_video_on">Encender el vídeo</string>
+    <string name="rail_paused_without_video">En pausa mientras el vídeo está apagado</string>
+    <string name="room_voice_only">Solo voz</string>
+    <string name="room_video_off_title">Apagaste el vídeo</string>
+    <string name="room_video_off_body">Sigues oyendo la sala y hablando. Mientras tanto no recibes la imagen, y tu teclado, ratón y mandos no le llegan a %1$s.</string>
+    <string name="room_video_on">Encender el vídeo</string>
+    <string name="room_video_off_body_no_name">Sigues oyendo la sala y hablando. Mientras tanto no recibes la imagen, y tu teclado, ratón y mandos no le llegan al anfitrión.</string>
     <string name="rail_keyboard_show">Mostrar el teclado</string>
     <string name="rail_keyboard_hide">Ocultar el teclado</string>
     <string name="rail_touch_mode">Cambiar el control táctil</string>
@@ -290,4 +298,58 @@
     <string name="chat_placeholder">Escribe un mensaje</string>
     <string name="chat_send">Enviar</string>
     <string name="chat_host_name">%1$s · anfitrión</string>
+
+    <!-- Versión nueva: Inicio, Ajustes y el instalador del sistema (boceto «Actualización automática»). -->
+    <string name="update_news">Novedades</string>
+    <string name="update_restart">Instalar ahora</string>
+    <string name="update_close_room">Sal de la sala para instalarla</string>
+    <string name="update_see">Ver la versión nueva</string>
+    <string name="update_available">Hay una versión nueva de coroom: %1$s (tienes la %2$s).</string>
+    <string name="update_ready_title">coroom %1$s está lista para instalar</string>
+    <string name="update_ready_body">Tienes la %1$s. Android te pedirá confirmar la instalación; al terminar, vuelve a abrir coroom.</string>
+    <string name="update_ready_room">Podrás instalarla cuando salgas de la sala.</string>
+    <string name="update_failed_title">No se pudo descargar coroom %1$s</string>
+    <string name="update_failed_body">%1$s. Se reintenta en la próxima búsqueda.</string>
+    <string name="update_section">Actualizaciones</string>
+    <string name="update_status_title">Versión nueva</string>
+    <string name="update_up_to_date">Tienes la última versión. Última búsqueda: %1$s.</string>
+    <string name="update_never_checked">Pregunta a las publicaciones del proyecto en GitHub, sin enviar nada tuyo.</string>
+    <string name="update_checking">Buscando en las publicaciones de GitHub…</string>
+    <string name="update_checking_button">Buscando…</string>
+    <string name="update_check_now">Buscar ahora</string>
+    <string name="update_check_failed">La última búsqueda falló: %1$s.</string>
+    <string name="update_downloading">Descargando coroom %1$s · %2$d %% de %3$d MB</string>
+    <string name="update_downloading_no_size">Descargando coroom %1$s · %2$d %%</string>
+    <string name="update_paused">Descarga de coroom %1$s en pausa mientras hay una sala abierta (%2$d %%).</string>
+    <string name="update_paused_metered">Descarga de coroom %1$s en pausa hasta que haya una red sin límite de datos (%2$d %%).</string>
+    <string name="update_ready_about">coroom %1$s está lista para instalar.</string>
+    <string name="update_failed_about">No se pudo descargar coroom %1$s: %2$s. Se reintenta en la próxima búsqueda.</string>
+    <string name="update_notice_about">Hay una versión nueva: %1$s (tienes la %2$s).</string>
+    <string name="update_auto">Actualizar automáticamente</string>
+    <string name="update_auto_body">Descarga las versiones nuevas de GitHub e instala cuando lo pides. Nunca descarga con una sala abierta ni, sola, con una red con límite de datos.</string>
+    <string name="update_check">Buscar versiones nuevas</string>
+    <string name="update_check_body">Al abrir coroom y después con esta frecuencia. Apagado, no se consulta GitHub nunca.</string>
+    <string name="update_daily">Una vez al día</string>
+    <string name="update_weekly">Una vez a la semana</string>
+    <string name="update_unknown_sources_title">Permitir que coroom se actualice</string>
+    <string name="update_unknown_sources_body">Para instalar la versión nueva, Android pide permitir «Instalar apps desconocidas» para coroom. Se activa una sola vez: coroom solo instala los APK de sus publicaciones en GitHub, después de comprobar su SHA-256, y Android te pregunta antes de cada instalación.</string>
+    <string name="update_unknown_sources_open">Abrir los ajustes</string>
+    <string name="update_unknown_sources_later">Ahora no</string>
+    <string name="update_install_failed">No se pudo instalar la versión nueva: %1$s</string>
+    <string name="update_install_failed_unknown">No se pudo instalar la versión nueva.</string>
+    <string name="update_other_signature">el APK de la publicación está firmado con otra clave que esta app (una compilación propia o de depuración); instálalo a mano desde la página de la versión</string>
+    <string name="update_confirm_title">La versión nueva de coroom está lista</string>
+    <string name="update_confirm_text">Toca para confirmar la instalación.</string>
+    <string name="update_confirm_later">Android necesita que confirmes la instalación con coroom abierto; vuelve a pulsar «Instalar ahora»</string>
+    <string name="notification_channel_updates">Versión nueva</string>
+    <string name="time_days_ago">hace %1$d d</string>
+
+    <!-- Versiones distintas con el servidor. -->
+    <string name="protocol_client_older_title">Tu coroom es más viejo que el servidor</string>
+    <string name="protocol_client_older_body">%1$s usa el protocolo %2$d y tu app el %3$d. Actualiza para conectarte.</string>
+    <string name="protocol_server_older_title">El servidor necesita actualizarse</string>
+    <string name="protocol_server_older_body">%1$s usa el protocolo %2$d y tu app el %3$d. Avísale a quien lo administra que lo actualice; mientras tanto no puedes conectarte a él.</string>
+    <string name="protocol_update_restart">Instalar ahora</string>
+    <string name="protocol_download_update">Descargar y actualizar</string>
+    <string name="protocol_percent">%1$d %%</string>
 </resources>

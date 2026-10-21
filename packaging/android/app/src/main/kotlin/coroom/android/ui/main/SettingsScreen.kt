@@ -70,6 +70,8 @@ fun SettingsScreen(
     onLogout: () -> Unit,
     /** «Compartir registro»: los ficheros del registro por la hoja de compartir del sistema. */
     onShareLog: () -> Unit,
+    /** La versión nueva (sección «Actualizaciones»). */
+    updates: UpdateActions = UpdateActions.None,
 ) {
     val colors = MaterialTheme.colorScheme
     val context = LocalContext.current
@@ -183,6 +185,11 @@ fun SettingsScreen(
                         )
                     }
                 }
+            }
+
+            SettingsHeader(stringResource(R.string.update_section))
+            ListCard {
+                UpdateSettings(state.update, settings.updatesIntervalHours, updates)
             }
 
             SettingsHeader(stringResource(R.string.settings_help))

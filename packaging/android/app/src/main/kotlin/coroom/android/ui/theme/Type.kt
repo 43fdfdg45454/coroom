@@ -4,6 +4,7 @@ import androidx.compose.material3.Typography
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.unit.sp
 
 /** La tipografía del sistema (Roboto): los tamaños de Material 3 tal cual. */
@@ -31,6 +32,15 @@ object CoroomText {
 
     /** Segunda línea de una fila. */
     val supporting = TextStyle(fontSize = 13.sp, lineHeight = 18.sp)
+
+    /**
+     * El texto de una píldora («● 14 ms», los chips de la sala): como [supporting], con la letra
+     * centrada en el alto de la línea (no repartido según el ascendente y el descendente), para
+     * que las cifras y las mayúsculas queden en el medio de la píldora.
+     */
+    val pill = supporting.copy(
+        lineHeightStyle = LineHeightStyle(LineHeightStyle.Alignment.Center, LineHeightStyle.Trim.None),
+    )
 
     /** Etiqueta de un campo. */
     val label = TextStyle(fontSize = 12.sp)

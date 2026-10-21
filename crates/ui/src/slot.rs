@@ -26,6 +26,7 @@ use iced_core::{
     overlay, renderer,
 };
 use iced_widget::Space;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::widget::{Text, with_tooltip};
 use crate::{Element, Renderer, Theme};
@@ -42,6 +43,41 @@ pub struct Reserve<'a, M> {
     children: Vec<Element<'a, M>>,
     align_x: Alignment,
     align_y: Alignment,
+    /// Si no vuelve a estrecharse tras crecer por lo mostrado ([`Reserve::keep_widest`]).
+    keep_widest: bool,
+    /// Lo más ancho, guardado fuera del árbol con su clave ([`Reserve::keep_widest_in`]).
+    shared: Option<(SharedWidest, String)>,
+}
+
+/// Lo más ancho y lo más alto que ocupó una [`Reserve`] con [`Reserve::keep_widest`].
+#[derive(Debug, Default)]
+struct Widest(Size);
+
+/// Lo más ancho y lo más alto que ocupó lo mostrado en una o varias [`Reserve`] con
+/// [`Reserve::keep_widest_in`], fuera del árbol de `iced`: lo comparten las copias de una pieza
+/// que se dibuja en dos sitios (la píldora de la sala en la barra y sobre el vídeo) y sobrevive a
+/// que una desaparezca y vuelva. Va con una clave: el tipo de lo que se muestra (por ejemplo, el
+/// texto con las cifras cambiadas por `#`); si cambia, vuelve a medir desde cero.
+#[derive(Debug, Clone, Default)]
+pub struct SharedWidest(Arc<Mutex<(String, Size)>>);
+
+impl SharedWidest {
+    /// Lo guardado para `key` (cero si la clave es otra).
+    pub fn get(&self, key: &str) -> Size {
+        let guard = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.0 == key { guard.1 } else { Size::ZERO }
+    }
+
+    /// `size` con lo guardado para `key` (lo mayor de los dos), que queda guardado; con otra
+    /// clave, empieza de nuevo por `size`.
+    fn widen(&self, key: &str, size: Size) -> Size {
+        let mut guard = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.0 != key {
+            *guard = (key.to_owned(), Size::ZERO);
+        }
+        guard.1 = guard.1.max(size);
+        guard.1
+    }
 }
 
 impl<'a, M: 'a> Reserve<'a, M> {
@@ -57,7 +93,26 @@ impl<'a, M: 'a> Reserve<'a, M> {
             children,
             align_x: Alignment::Start,
             align_y: Alignment::Center,
+            keep_widest: false,
+            shared: None,
         }
+    }
+
+    /// Que, si lo mostrado la hizo crecer (una cifra con más dígitos que las muestras), no
+    /// vuelva a estrecharse mientras siga en la interfaz: crece una vez y no salta de ancho a cada
+    /// valor que cruza el límite. Para muestras que cubren lo habitual y no el peor caso.
+    pub fn keep_widest(mut self) -> Self {
+        self.keep_widest = true;
+        self
+    }
+
+    /// Como [`Reserve::keep_widest`], pero guardado en `widest` con la clave `key` en vez de en
+    /// el árbol: lo comparten todas las ranuras con el mismo `widest`, sobrevive a que la ranura
+    /// salga de la interfaz y vuelva, y empieza de cero cuando cambia `key` (otro tipo de texto),
+    /// así que un texto pasajero más largo no la deja ancha para siempre.
+    pub fn keep_widest_in(mut self, widest: &SharedWidest, key: impl Into<String>) -> Self {
+        self.shared = Some((widest.clone(), key.into()));
+        self
     }
 
     /// Alineación horizontal de lo mostrado (los números, a la derecha).
@@ -74,6 +129,14 @@ impl<'a, M: 'a> Reserve<'a, M> {
 }
 
 impl<M> iced_core::Widget<M, Theme, Renderer> for Reserve<'_, M> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<Widest>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(Widest::default())
+    }
+
     fn children(&self) -> Vec<Tree> {
         self.children.iter().map(Tree::new).collect()
     }
@@ -99,9 +162,17 @@ impl<M> iced_core::Widget<M, Theme, Renderer> for Reserve<'_, M> {
             .zip(&mut tree.children)
             .map(|(child, tree)| child.as_widget_mut().layout(tree, renderer, &loose))
             .collect();
-        let intrinsic = nodes
+        let mut intrinsic = nodes
             .iter()
             .fold(Size::ZERO, |size, node| size.max(node.size()));
+        if self.keep_widest {
+            let widest = tree.state.downcast_mut::<Widest>();
+            intrinsic = intrinsic.max(widest.0);
+            widest.0 = intrinsic;
+        }
+        if let Some((widest, key)) = &self.shared {
+            intrinsic = widest.widen(key, intrinsic);
+        }
         let size = limits.resolve(Length::Shrink, Length::Shrink, intrinsic);
         nodes[0].align_mut(self.align_x, self.align_y, size);
         layout::Node::with_children(size, nodes)
@@ -447,5 +518,36 @@ impl<'a, M: 'a> iced_core::Widget<M, Theme, Renderer> for OneLine<'a, M> {
 impl<'a, M: 'a> From<OneLine<'a, M>> for Element<'a, M> {
     fn from(line: OneLine<'a, M>) -> Self {
         Element::new(line)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_widest_grows_is_shared_and_resets_with_another_key() {
+        let widest = SharedWidest::default();
+        let copy = widest.clone();
+        assert_eq!(
+            widest.widen("# ms", Size::new(40.0, 20.0)),
+            Size::new(40.0, 20.0)
+        );
+        // La otra copia (la píldora de la barra) ve lo mismo y no la estrecha.
+        assert_eq!(
+            copy.widen("# ms", Size::new(30.0, 20.0)),
+            Size::new(40.0, 20.0)
+        );
+        assert_eq!(copy.get("# ms"), Size::new(40.0, 20.0));
+        // Otro texto: vuelve a medir desde cero.
+        assert_eq!(
+            widest.widen("Midiendo", Size::new(70.0, 20.0)),
+            Size::new(70.0, 20.0)
+        );
+        assert_eq!(copy.get("# ms"), Size::ZERO);
+        assert_eq!(
+            copy.widen("# ms", Size::new(30.0, 20.0)),
+            Size::new(30.0, 20.0)
+        );
     }
 }

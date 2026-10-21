@@ -241,6 +241,7 @@ fn shortcut_keys(shortcuts: &Shortcuts) -> ShortcutKeys {
         game: letter_key(shortcuts.game).unwrap_or(default.game),
         pads: letter_key(shortcuts.pads).unwrap_or(default.pads),
         release: letter_key(shortcuts.release).unwrap_or(default.release),
+        video: letter_key(shortcuts.video).unwrap_or(default.video),
     }
 }
 
@@ -412,6 +413,17 @@ impl Runner {
                     updates.interval_hours,
                 );
                 app.schedule_update_check(due);
+                // Una versión que no se pudo instalar no se vuelve a bajar sola.
+                if let Some((version, reason)) = crate::update::blocked_install() {
+                    app.update.updater.block(&version, &reason);
+                }
+                // La versión nueva no se pudo instalar al reiniciar o al arrancar.
+                if let Some(err) = crate::update::take_install_failure() {
+                    app.toast(
+                        coroom_ui::theme::Tone::Error,
+                        t!("update-no-se-pudo-instalar", err = err),
+                    );
+                }
             }
             Launch::Probe(options) => {
                 app.probe = true;
@@ -645,6 +657,10 @@ impl Ready {
     }
 
     fn run_effects(&mut self, effects: Vec<Effect>) {
+        // Una sala abierta aquí pausa también las descargas de la versión nueva de los demás
+        // procesos de coroom.
+        self.backend
+            .update_room(self.app.update.updater.room_open());
         for effect in effects {
             match effect {
                 Effect::Copy(text) => {
@@ -658,6 +674,12 @@ impl Ready {
                     self.run_effects(more);
                 }
                 Effect::Quit => self.quit = true,
+                // «Reiniciar y actualizar»: se cierra la ventana y, al salir, `main` abre la
+                // versión nueva (`update::finish_restart`).
+                Effect::UpdateCommand(crate::update::Command::Restart) => {
+                    crate::update::request_restart();
+                    self.quit = true;
+                }
                 Effect::FocusChat(on) => self.focus_chat(on),
                 Effect::SetImmersive(on) => {
                     if let Some(input) = self.input.as_mut() {
@@ -800,6 +822,9 @@ impl Ready {
                 Action::TogglePads => {
                     self.dispatch(Message::Guest(guest::Msg::TogglePeople));
                 }
+                Action::ToggleVideo => {
+                    self.dispatch(Message::Guest(guest::Msg::ToggleVideo));
+                }
                 Action::ToggleChat => {
                     self.dispatch(Message::Chat(super::screens::chat::Msg::Toggle));
                 }
@@ -907,7 +932,8 @@ impl Ready {
         }
     }
 
-    /// Si el vídeo del invitado está delante (y nada lo tapa).
+    /// Si el vídeo del invitado está delante (y nada lo tapa). Con el vídeo apagado, no: la
+    /// entrada queda en pausa como desde otra página del riel.
     fn video_in_front(&self) -> bool {
         self.input.is_some()
             && self.app.screen == Screen::Guest
@@ -916,7 +942,22 @@ impl Ready {
                 .app
                 .guest
                 .as_ref()
-                .is_some_and(|guest| guest.phase == Phase::Video)
+                .is_some_and(|guest| guest.phase == Phase::Video && !guest.video_off)
+    }
+
+    /// Si la tecla de pulsar para hablar se atiende aunque el vídeo no esté delante: en la sala
+    /// con el vídeo apagado (sin un diálogo encima ni escribiendo en el chat, que tienen el
+    /// teclado). Con el vídeo encendido la atiende la captura.
+    fn talks_with_video_off(&self) -> bool {
+        self.input.is_some()
+            && self.app.screen == Screen::Guest
+            && self.app.dialog.is_none()
+            && !self.app.chat.composing
+            && self
+                .app
+                .guest
+                .as_ref()
+                .is_some_and(|guest| guest.phase == Phase::Video && guest.video_off)
     }
 
     /// Atajos `Ctrl+Alt` de la sala con el teclado en la interfaz (escribiendo en el chat): los
@@ -944,6 +985,9 @@ impl Ready {
             self.dispatch(Message::Guest(guest::Msg::ToggleStats));
         } else if code == keys.pads {
             self.dispatch(Message::Guest(guest::Msg::TogglePeople));
+        } else if code == keys.video {
+            // Con el vídeo apagado el teclado está en la interfaz: el atajo llega por aquí.
+            self.dispatch(Message::Guest(guest::Msg::ToggleVideo));
         } else if code == keys.quit {
             let effects = guest::leave(&mut self.app);
             self.run_effects(effects);
@@ -1132,6 +1176,17 @@ impl Ready {
                     } else {
                         capture_now = true;
                     }
+                } else if self.talks_with_video_off()
+                    && let Some(actions) = self.input.as_mut().and_then(|input| {
+                        input
+                            .capture
+                            .push_to_talk_key(key.physical_key, pressed, key.repeat)
+                    })
+                {
+                    // Con el vídeo apagado el teclado es de la interfaz, salvo la tecla de
+                    // pulsar para hablar.
+                    self.apply(actions);
+                    return;
                 } else if pressed
                     && !key.repeat
                     && let Some(code) = code

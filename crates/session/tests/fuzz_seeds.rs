@@ -455,6 +455,8 @@ fn fuzz_seeds() {
             counter: 2,
             ciphertext: vec![0x3c; 16],
         }),
+        ControlMessage::VideoPaused { paused: true },
+        ControlMessage::VideoPaused { paused: false },
         ControlMessage::Bye,
     ];
     let frames: Vec<Vec<u8>> = control.iter().map(frame).collect();

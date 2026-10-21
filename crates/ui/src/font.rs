@@ -13,9 +13,11 @@
 
 use std::borrow::Cow;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use iced_core::Font;
 use iced_core::font::Weight;
+use iced_widget::graphics::text::cosmic_text;
 
 /// Inter Regular embebida (subconjunto latino, SIL OFL 1.1).
 pub const INTER_REGULAR: &[u8] = include_bytes!("../assets/fonts/Inter-Regular.otf");
@@ -112,6 +114,8 @@ impl Fonts {
         if let Some(mono) = mono {
             db.set_monospace_family(mono);
         }
+        let drop = measure_cap_drop(system.raw());
+        CAP_DROP.store(drop.to_bits(), Ordering::Relaxed);
         Self { family, mono }
     }
 
@@ -124,6 +128,53 @@ impl Fonts {
 /// La base de fuentes de `cosmic-text`.
 mod cosmic_db {
     pub use iced_widget::graphics::text::cosmic_text::fontdb::Database;
+}
+
+/// [`cap_drop`] de la letra elegida (los bits de un `f32`; 0 hasta [`Fonts::detect`]).
+static CAP_DROP: AtomicU32 = AtomicU32::new(0);
+
+/// Cuánto quedan las mayúsculas y las cifras por debajo del centro de su línea (negativo: por
+/// encima), en fracción del tamaño de letra, con la letra de la interfaz en seminegrita (la de
+/// las insignias). `cosmic-text` centra en el alto de la línea la caja de la letra (ascendente
+/// más descendente), no las mayúsculas, así que cuánto se desvían depende de las métricas de
+/// cada fuente: 0 con Inter (y Adwaita Sans), unas centésimas con otras. Se lee de la fuente al
+/// elegirla ([`Fonts::detect`]); [`crate::widget::cap_centered`] lo compensa en las píldoras.
+pub fn cap_drop() -> f32 {
+    f32::from_bits(CAP_DROP.load(Ordering::Relaxed))
+}
+
+/// [`cap_drop`] de la familia `sans-serif` de `system` en seminegrita, con las mismas métricas
+/// que usa `cosmic-text` para colocar la línea; 0 si la fuente no dice su altura de mayúsculas.
+fn measure_cap_drop(system: &mut cosmic_text::FontSystem) -> f32 {
+    use cosmic_text::fontdb::{Family, Query, Stretch, Style, Weight as DbWeight};
+    let query = Query {
+        families: &[Family::SansSerif],
+        weight: DbWeight::SEMIBOLD,
+        stretch: Stretch::Normal,
+        style: Style::Normal,
+    };
+    let Some(id) = system.db().query(&query) else {
+        return 0.0;
+    };
+    let Some(font) = system.get_font(id, DbWeight::SEMIBOLD) else {
+        return 0.0;
+    };
+    let metrics = font.metrics();
+    match metrics.cap_height {
+        Some(cap) => cap_drop_of(metrics.ascent, metrics.descent, cap, metrics.units_per_em),
+        None => 0.0,
+    }
+}
+
+/// [`cap_drop`] de una fuente con ascendente `ascent`, descendente `descent` (negativo, como lo
+/// dan las métricas) y mayúsculas de `cap`, en unidades de `units_per_em`. En una línea de alto L
+/// la base cae en (L - (a + d)) / 2 + a (con d positivo), las mayúsculas van de ahí `cap` hacia
+/// arriba y su centro queda (a - d - cap) / 2 por debajo de L / 2.
+fn cap_drop_of(ascent: f32, descent: f32, cap: f32, units_per_em: u16) -> f32 {
+    if units_per_em == 0 {
+        return 0.0;
+    }
+    (ascent + descent - cap) / 2.0 / f32::from(units_per_em)
 }
 
 /// La familia de una descripción de fuente de GTK o KDE: `"Cantarell 11"` → `"Cantarell"`,
@@ -150,10 +201,33 @@ mod tests {
     }
 
     #[test]
+    fn cap_drop_has_the_sign_of_where_the_capitals_fall() {
+        // Inter: justo en el centro.
+        assert!(cap_drop_of(1984.0, -494.0, 1490.0, 2048).abs() < 1e-6);
+        // FreeSans (ascendente 900, descendente 300, mayúsculas 729 en 1000): por encima del
+        // centro, así que negativo (se compensa con margen arriba).
+        let free_sans = cap_drop_of(900.0, -300.0, 729.0, 1000);
+        assert!((free_sans + 0.0645).abs() < 1e-4, "{free_sans}");
+        // Ascendente grande para sus mayúsculas: caen por debajo, positivo.
+        assert!(cap_drop_of(2210.0, -514.0, 1434.0, 2048) > 0.05);
+        assert_eq!(cap_drop_of(1.0, -1.0, 1.0, 0), 0.0);
+    }
+
+    #[test]
     fn the_embedded_font_is_always_available() {
         assert!(INTER_REGULAR.len() > 10_000 && INTER_SEMIBOLD.len() > 10_000);
         let fonts = Fonts::detect(Some("Una Fuente Que No Existe 12"));
         assert!(!fonts.family.is_empty());
+        // Las mayúsculas de Inter caen justo en el centro de la línea (ascendente 1984,
+        // descendente 494 y mayúsculas de 1490 en 2048): con ella no hay nada que compensar.
+        if fonts.family == EMBEDDED_FAMILY {
+            assert!(cap_drop().abs() < 0.001, "Inter: {}", cap_drop());
+        }
+        assert!(
+            cap_drop().abs() < 0.08,
+            "una desviación razonable: {}",
+            cap_drop()
+        );
         assert_eq!(SEMIBOLD.weight, Weight::Semibold);
         assert!(Fonts::default().is_embedded());
     }

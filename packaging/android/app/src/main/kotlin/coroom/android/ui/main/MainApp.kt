@@ -99,11 +99,15 @@ fun MainApp(
                     onDisplayName = login::setDisplayName,
                     onToggleInvitation = login::toggleInvitationMode,
                     onSubmit = login::submit,
+                    update = state.update,
+                    updates = main.updateActions,
                 )
             }
             else -> StartupScreen(state.phase, onRetry = main::retryResume, onSignInAgain = main::signInAgain)
         }
     }
+    // El APK nuevo al instalador del sistema, en cualquier fase (también antes de entrar).
+    UpdateInstallHost(state.pendingInstall, onHandled = main::installHandled, onFailed = main::installFailed)
 }
 
 /** Arrancando, recuperando la sesión o un error que impide seguir, siempre explicado. */
@@ -195,6 +199,7 @@ private fun SignedInApp(main: MainViewModel, state: MainUiState, onEnableNotific
                     onAskToJoin = main::askToJoin,
                     onOpenAccount = { nav.selectTab(SettingsRoute) },
                     onOpenFriends = { nav.selectTab(FriendsRoute) },
+                    updates = main.updateActions,
                 )
             }
             composable<FriendsRoute> {
@@ -220,6 +225,7 @@ private fun SignedInApp(main: MainViewModel, state: MainUiState, onEnableNotific
                     onEnableNotifications = onEnableNotifications,
                     onLogout = main::logout,
                     onShareLog = main::shareLog,
+                    updates = main.updateActions,
                 )
             }
         }

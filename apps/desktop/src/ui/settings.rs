@@ -797,6 +797,8 @@ pub struct Shortcuts {
     pub game: char,
     /// Panel de mandos.
     pub pads: char,
+    /// Apagar o encender el vídeo.
+    pub video: char,
 }
 
 impl Default for Shortcuts {
@@ -810,13 +812,14 @@ impl Default for Shortcuts {
             mic: 'M',
             game: 'V',
             pads: 'J',
+            video: 'I',
         }
     }
 }
 
 impl Shortcuts {
-    /// Las ocho letras, en orden.
-    pub fn letters(&self) -> [char; 8] {
+    /// Las nueve letras, en orden (el de [`Shortcuts::letter_mut`]).
+    pub fn letters(&self) -> [char; 9] {
         [
             self.immersive,
             self.release,
@@ -826,7 +829,23 @@ impl Shortcuts {
             self.mic,
             self.game,
             self.pads,
+            self.video,
         ]
+    }
+
+    /// La letra del atajo `index` de [`Shortcuts::letters`] (más allá del último, el último).
+    pub fn letter_mut(&mut self, index: usize) -> &mut char {
+        match index {
+            0 => &mut self.immersive,
+            1 => &mut self.release,
+            2 => &mut self.stats,
+            3 => &mut self.chat,
+            4 => &mut self.leave,
+            5 => &mut self.mic,
+            6 => &mut self.game,
+            7 => &mut self.pads,
+            _ => &mut self.video,
+        }
     }
 
     /// Si no hay letras repetidas y todas son letras ASCII.
@@ -839,23 +858,28 @@ impl Shortcuts {
                 .all(|(i, a)| letters[i + 1..].iter().all(|b| !a.eq_ignore_ascii_case(b)))
     }
 
-    /// Ajustes de antes del atajo de soltar el teclado y el ratón: si su letra (la de fábrica)
-    /// ya la usa otro atajo elegido, toma la primera libre en lugar de perder los demás.
-    fn free_release(&mut self) {
-        let taken = |letter: char, shortcuts: &Self| {
-            shortcuts.letters()[..]
-                .iter()
-                .enumerate()
-                .any(|(index, other)| index != 1 && other.eq_ignore_ascii_case(&letter))
-        };
-        if !taken(self.release, self) {
-            return;
-        }
-        if let Some(letter) = std::iter::once(Self::default().release)
-            .chain('A'..='Z')
-            .find(|letter| !taken(*letter, self))
-        {
-            self.release = letter;
+    /// Ajustes de antes de un atajo nuevo (soltar el teclado y el ratón, apagar el vídeo): si
+    /// su letra de fábrica ya la usa otro atajo elegido, toma la primera libre en lugar de
+    /// perder los demás.
+    fn free_new(&mut self) {
+        // Índices en `letters`: soltar y el vídeo.
+        for index in [1, 8] {
+            let taken = |letter: char, shortcuts: &Self| {
+                shortcuts.letters()[..]
+                    .iter()
+                    .enumerate()
+                    .any(|(other, used)| other != index && used.eq_ignore_ascii_case(&letter))
+            };
+            if !taken(self.letters()[index], self) {
+                continue;
+            }
+            let default = Self::default().letters()[index];
+            if let Some(letter) = std::iter::once(default)
+                .chain('A'..='Z')
+                .find(|letter| !taken(*letter, self))
+            {
+                *self.letter_mut(index) = letter;
+            }
         }
     }
 }
@@ -904,6 +928,8 @@ pub struct Updates {
     pub interval_hours: u32,
     /// Última comprobación, en segundos desde 1970.
     pub last_check: Option<u64>,
+    /// Descargar e instalar sola la versión nueva (si este paquete puede); apagado, solo se avisa.
+    pub auto: bool,
 }
 
 impl Default for Updates {
@@ -912,6 +938,7 @@ impl Default for Updates {
             check: true,
             interval_hours: 24,
             last_check: None,
+            auto: true,
         }
     }
 }
@@ -986,7 +1013,7 @@ impl Settings {
             self.video.preset = QualityPreset::matching(&self.video);
         }
         if !self.input.shortcuts.is_valid() {
-            self.input.shortcuts.free_release();
+            self.input.shortcuts.free_new();
         }
         if !self.input.shortcuts.is_valid() {
             self.input.shortcuts = Shortcuts::default();
@@ -1175,6 +1202,7 @@ mod tests {
             check: false,
             interval_hours: 168,
             last_check: Some(1_790_000_000),
+            auto: false,
         };
         settings.remember_server(ServerEntry {
             url: "https://coroom.example.com".into(),
@@ -1306,6 +1334,10 @@ mod tests {
             "intervalo fuera de las opciones"
         );
         assert!(loaded.updates.check, "se comprueba por defecto");
+        assert!(
+            loaded.updates.auto,
+            "sin el campo (ajustes de antes), se actualiza sola"
+        );
         std::fs::write(&path, "[audio]\nvoice = false\n").expect("escribir");
         let loaded = Settings::load(&path).0;
         assert!(
@@ -1458,6 +1490,20 @@ mod tests {
             'R',
             "sin choque, la de fábrica"
         );
+    }
+
+    /// Lo mismo con apagar el vídeo (`I`): unos ajustes de antes con la I en otro atajo la
+    /// conservan y el vídeo toma una libre; sin choque, la I.
+    #[test]
+    fn the_video_shortcut_takes_a_free_letter_in_old_settings() {
+        let old: Settings = toml::from_str("[input.shortcuts]\nchat = \"I\"\n").expect("leer");
+        let shortcuts = old.sanitized().input.shortcuts;
+        assert_eq!(shortcuts.chat, 'I');
+        assert_ne!(shortcuts.video, 'I');
+        assert!(shortcuts.is_valid(), "{shortcuts:?}");
+        assert_eq!(Settings::default().sanitized().input.shortcuts.video, 'I');
+        let old: Settings = toml::from_str("[input.shortcuts]\nmic = \"K\"\n").expect("leer");
+        assert_eq!(old.sanitized().input.shortcuts.video, 'I');
     }
 
     #[test]

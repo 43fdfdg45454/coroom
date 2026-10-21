@@ -13,6 +13,7 @@
 //! - [`guest`]: la sesión dentro de una sala (vídeo, audio, tacto, teclado, mandos y cursor).
 //! - [`mouse`]: el ratón o el touchpad conectado al teléfono y el texto del teclado en pantalla.
 //! - [`avatars`]: la caché de disco de los avatares.
+//! - [`update`]: la versión nueva (buscar, descargar y comprobar el APK).
 //! - `log`: el registro, a logcat y a `<filesDir>/logs/coroom.log` (lo que se comparte).
 
 pub mod app;
@@ -24,6 +25,7 @@ mod log;
 pub mod mouse;
 pub mod store;
 mod surface;
+pub mod update;
 
 use std::sync::{Arc, OnceLock};
 

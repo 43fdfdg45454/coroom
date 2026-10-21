@@ -476,16 +476,21 @@ pub fn view<'a>(app: &'a App) -> Element<'a, Message> {
 /// Avisos de la bandeja: versión nueva y el uso del relay.
 fn notices(app: &App) -> Vec<Element<'_, Message>> {
     let mut out = Vec::new();
-    if let Some(update) = &app.update.available {
-        out.push(ui::banner(
-            Tone::Info,
-            t!(
-                "home-update-available",
-                version = update.version,
-                current = app.version
-            ),
-            Some((t!("home-update-see"), Message::OpenUrl(update.url.clone()))),
-        ));
+    // Versiones distintas con el servidor; después, la versión nueva ([`super::updates`]).
+    let mut client_older = false;
+    if let Some((host, gap)) = &app.update.protocol {
+        out.push(super::updates::protocol_banner(app, host, *gap));
+        client_older = matches!(gap, crate::update::ProtocolGap::ClientOlder { .. });
+    }
+    // Si la app es la vieja, su aviso ya lleva la acción de la versión nueva (un fallo sí se
+    // explica aparte).
+    let redundant = client_older
+        && matches!(
+            app.update.updater.home_notice(),
+            crate::update::HomeNotice::Available | crate::update::HomeNotice::Ready { .. }
+        );
+    if !redundant {
+        out.extend(super::updates::home_banner(app));
     }
     if let Some(usage) = &app.usage {
         if !usage.relay_enabled {
@@ -1022,6 +1027,7 @@ pub(crate) mod shots {
 
     use super::Msg;
     use crate::ui::app::{App, Event, Invitation, Message, Page};
+    use crate::ui::screens::updates::shots as updates;
     use crate::ui::shots::{Builder, signed_in};
     use coroom_transport::proto::api::Friends;
     use coroom_transport::proto::signal::Activity;
@@ -1058,10 +1064,13 @@ pub(crate) mod shots {
         app.home.friends_updated = Some(ago(app, 2));
         app.home.code = "K7Q2MZ".to_owned();
         // Aviso de versión nueva.
-        app.update.available = Some(crate::update::Update {
-            version: "0.2.0".to_owned(),
-            url: format!("{}/tag/v0.2.0", crate::update::RELEASES_PAGE),
-        });
+        app.update.updater = crate::update::Updater::new(
+            crate::update::Channel::Notice(crate::update::NoticeOnly::Unpackaged),
+            true,
+        );
+        app.update
+            .updater
+            .found(Some(crate::update::Release::new("0.2.0")));
     }
 
     /// Inicio tras pedirle entrar a Bea: «Pedido…» en su fila.
@@ -1100,7 +1109,53 @@ pub(crate) mod shots {
         ("05-inicio-pedido", home_asked),
         ("06-inicio-vacio", home_empty),
         ("06-inicio-sin-servidor", home_offline),
+        // La versión nueva ([`crate::ui::screens::updates`]): lista, lista con la sala abierta,
+        // no se pudo descargar y carpeta sin permiso; y las versiones distintas con el servidor.
+        ("05-inicio-version-lista", |app| {
+            home_update(app);
+            updates::ready(app, false);
+        }),
+        ("05-inicio-version-lista-con-sala", |app| {
+            crate::ui::screens::host::shots::host_room_join_request(app);
+            app.update(Message::Navigate(Page::Home));
+            updates::ready(app, true);
+        }),
+        ("05-inicio-version-fallo", |app| {
+            home_update(app);
+            updates::failed(app);
+        }),
+        ("05-inicio-version-carpeta", |app| {
+            home_update(app);
+            updates::unwritable(app);
+        }),
+        ("05-inicio-version-no-instalada", |app| {
+            home_update(app);
+            updates::install_failed(app);
+        }),
+        ("05-inicio-version-app-vieja", |app| {
+            home_update(app);
+            updates::ready(app, false);
+            updates::protocol(app, true);
+        }),
+        ("05-inicio-version-app-vieja-descargando", |app| {
+            home_update(app);
+            updates::downloading(app);
+            app.update.updater.update_now();
+            updates::protocol(app, true);
+        }),
+        ("05-inicio-version-servidor-viejo", |app| {
+            home_update(app);
+            updates::up_to_date(app);
+            updates::protocol(app, false);
+        }),
     ];
+
+    /// Inicio sin la invitación, para ver el aviso de la versión nueva.
+    fn home_update(app: &mut App) {
+        home(app);
+        app.invitations.clear();
+        app.home.invited_at.clear();
+    }
 }
 
 #[cfg(test)]

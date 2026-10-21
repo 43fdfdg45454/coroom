@@ -81,6 +81,11 @@ class LoginViewModel(private val container: AppContainer) : ViewModel() {
                     trust = if (probe.untrusted != null) TrustState.Ask else TrustState.NotNeeded,
                 )
             }
+            // La app quedó atrás del servidor: buscar ya la versión nueva para ofrecerla aquí (Rust
+            // limita estas búsquedas fuera del intervalo a una por hora).
+            if (probe.protocolGap?.clientOlder == true && repository.update.value?.version == null) {
+                runCatching { repository.updateCheckExtra() }
+            }
         } catch (error: BridgeException) {
             _state.update { it.copy(probing = false, probeError = error.message) }
         }

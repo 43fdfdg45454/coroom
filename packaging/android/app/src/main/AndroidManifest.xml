@@ -11,6 +11,9 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- La vibración de los mandos que manda el juego. -->
     <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- La versión nueva: el APK de las publicaciones, comprobado, al instalador del sistema
+         (Android pregunta antes de instalar; la app explica antes por qué hace falta). -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- Nada es obligatorio: televisores, tabletas sin micro o teléfonos sin mando. -->
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
@@ -51,6 +54,11 @@
             android:windowSoftInputMode="adjustNothing|stateHidden"
             android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenSize|screenLayout|smallestScreenSize|uiMode|density|touchscreen"
             tools:ignore="DiscouragedApi,LockedOrientationActivity" />
+
+        <!-- Lo que contesta el instalador del sistema al instalar la versión nueva (solo él). -->
+        <receiver
+            android:name=".platform.UpdateInstallReceiver"
+            android:exported="false" />
 
         <!-- «Compartir registro» (Ajustes): solo los ficheros de files/logs, de lectura y para la app elegida. -->
         <provider
