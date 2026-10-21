@@ -107,12 +107,14 @@ jobs:
           toolchain: ${{ steps.rust.outputs.channel }}
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: openh264-asm
 
       # Las mismas dependencias que la CI de Linux (ci.yml).
       - name: Dependencias de sistema
         run: |
           sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libclang-dev pkg-config mesa-vulkan-drivers libxkbcommon-dev libwayland-dev libva2 libva-drm2 libvpl2 libudev-dev cmake meson ninja-build
+          sudo apt-get install -y libpipewire-0.3-dev libclang-dev pkg-config mesa-vulkan-drivers libxkbcommon-dev libwayland-dev libva2 libva-drm2 libvpl2 libudev-dev cmake meson ninja-build nasm
 
       - name: Caché de meson
         uses: actions/cache@v4

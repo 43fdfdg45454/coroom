@@ -71,13 +71,16 @@ jobs:
           toolchain: ${{ steps.rust.outputs.channel }}
           components: clippy, rustfmt
 
+      # La clave cambió al añadir NASM en Linux: lo de OpenH264 guardado sin ensamblador no sirve.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: openh264-asm
 
       - uses: ./.github/actions/version
         with:
           version: ${{ needs.version.outputs.version }}
 
-      # aws-lc-sys compila ensamblador con NASM en Windows y el runner no lo trae.
+      # aws-lc-sys y OpenH264 compilan ensamblador con NASM y el runner de Windows no lo trae.
       - name: NASM
         if: runner.os == 'Windows'
         uses: ilammy/setup-nasm@v1
@@ -85,12 +88,13 @@ jobs:
       # Captura por PipeWire (libpipewire + bindgen/libclang), ventana Wayland/X11, lavapipe para
       # los tests de render sin GPU, los cargadores de VA-API y oneVPL que abre FFmpeg (si la build
       # los trae estáticos, sobran), libudev para los mandos (`gilrs`), cmake (libopus de
-      # `opusic-sys`) y meson + ninja (el procesado de voz de `webrtc-audio-processing`).
+      # `opusic-sys`), meson + ninja (el procesado de voz de `webrtc-audio-processing`) y NASM (el
+      # ensamblador de OpenH264; sin él no enlaza, ver `coroom_codec::openh264`).
       - name: Dependencias de sistema
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libclang-dev pkg-config mesa-vulkan-drivers libxkbcommon-dev libwayland-dev libva2 libva-drm2 libvpl2 libudev-dev cmake meson ninja-build
+          sudo apt-get install -y libpipewire-0.3-dev libclang-dev pkg-config mesa-vulkan-drivers libxkbcommon-dev libwayland-dev libva2 libva-drm2 libvpl2 libudev-dev cmake meson ninja-build nasm
 
       # abseil-cpp para la compilación de `webrtc-audio-processing`: los ficheros y SHA-256 de su
       # wrap, en el directorio que lee meson (`MESON_PACKAGE_CACHE_DIR`, .cargo/config.toml).

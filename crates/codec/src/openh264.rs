@@ -21,6 +21,26 @@ use crate::{
     PixelFormat, RawFrame,
 };
 
+/// En x86 OpenH264 se compila con su ensamblador (SSE2/AVX2) solo si encuentra NASM; si no, la
+/// crate `openh264-sys2` lo desactiva sin avisar y codificar y decodificar va varias veces más
+/// lento (en la CI, 60 ms por fotograma de 720p en vez de 8). Referenciar una función que solo
+/// existe con el ensamblador hace que el enlace falle sin NASM en lugar de seguir en silencio.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+mod requires_nasm {
+    // Única declaración externa de este módulo: no se llama nunca, solo se enlaza.
+    #[allow(unsafe_code)]
+    unsafe extern "C" {
+        /// SAD de 16×16 con SSE2 (`codec/common/x86/satd_sad.asm`). Si el enlace dice que falta,
+        /// instala NASM y vuelve a compilar.
+        fn WelsSampleSad16x16_sse2(a: *mut u8, a_stride: i32, b: *mut u8, b_stride: i32) -> i32;
+    }
+
+    /// Mantiene la referencia en el binario aunque nada la use.
+    #[used]
+    static OPENH264_NEEDS_NASM: unsafe extern "C" fn(*mut u8, i32, *mut u8, i32) -> i32 =
+        WelsSampleSad16x16_sse2;
+}
+
 /// Tipo de NAL de un slice IDR (H.264 §7.4.1.2.3).
 const NAL_IDR: u8 = 5;
 

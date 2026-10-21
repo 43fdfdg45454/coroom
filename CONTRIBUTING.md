@@ -18,7 +18,7 @@ Rust estable (lo fija `rust-toolchain.toml`) y, en Linux, las dependencias de si
 
 ```bash
 sudo apt-get install libpipewire-0.3-dev libclang-dev pkg-config mesa-vulkan-drivers \
-  libxkbcommon-dev libwayland-dev libva2 libva-drm2 libvpl2 libudev-dev cmake meson ninja-build
+  libxkbcommon-dev libwayland-dev libva2 libva-drm2 libvpl2 libudev-dev cmake meson ninja-build nasm
 tools/fetch-meson-wraps.sh     # abseil para el procesado de voz de WebRTC
 tools/fetch-ffmpeg.sh          # FFmpeg 8 LGPL fijado en tools/ffmpeg.lock (ver el README)
 cargo build

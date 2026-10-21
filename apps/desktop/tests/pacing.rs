@@ -38,9 +38,10 @@
 //! eso van en los tests `#[ignore]` de la batería (`-- --ignored`, en la PC de referencia junto a
 //! `qa_stream`); en la CI quedan las comprobaciones que no dependen de la carga: la sonda mide y
 //! todos los fotogramas llegan. Que la sonda mida más del doble del máximo (antes nunca pasaba de
-//! él) y que los fotogramas sean del tamaño que la regla anterior recortaba también dependen de la
-//! carga (la sonda es una ráfaga contra reloj; un codificador que no da abasto produce menos
-//! bit/s): van con `timing_assert!`, que avisa sin hacer fallar la prueba, como las cotas 2 y 3.
+//! él) también depende de la carga (la sonda es una ráfaga contra reloj): va con `timing_assert!`,
+//! que avisa sin hacer fallar la prueba, como las cotas 2 y 3. Del tamaño de los fotogramas solo
+//! se exige que se acerquen al recorte de la regla anterior (la mitad): un codificador que no da
+//! abasto en el runner produce menos bit/s, y eso no dice nada del reparto.
 
 mod common;
 
@@ -266,13 +267,6 @@ fn check(profile: &Profile, latency: bool) {
     assert!(
         before >= clip.mul_f64(0.5),
         "{}: con ~{:.0} B por fotograma la regla anterior ni se acercaba al share ({before:?} de \
-         {clip:?})",
-        profile.name,
-        mean_bits / 8.0
-    );
-    timing_assert!(
-        before == clip,
-        "{}: con ~{:.0} B por fotograma la regla anterior no recortaba al share ({before:?} de \
          {clip:?})",
         profile.name,
         mean_bits / 8.0

@@ -149,11 +149,12 @@ está en [`deploy/README.md`](deploy/README.md).
 ## Compilar y probar
 
 Requisitos: Rust estable (lo fija `rust-toolchain.toml`) y un compilador de C para `aws-lc-rs` y
-OpenH264 (gcc o clang en Linux; las herramientas de compilación de MSVC y NASM en Windows). En
-Linux, además:
+OpenH264 (gcc o clang en Linux; las herramientas de compilación de MSVC en Windows) y NASM, el
+ensamblador de OpenH264 en x86 (sin él no enlaza: OpenH264 iría varias veces más lento). En Linux,
+además:
 
 ```bash
-sudo apt-get install -y libpipewire-0.3-dev libclang-dev pkg-config libxkbcommon-dev libwayland-dev mesa-vulkan-drivers libudev-dev cmake meson ninja-build
+sudo apt-get install -y libpipewire-0.3-dev libclang-dev pkg-config libxkbcommon-dev libwayland-dev mesa-vulkan-drivers libudev-dev cmake meson ninja-build nasm
 tools/fetch-meson-wraps.sh
 ```
 

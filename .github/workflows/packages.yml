@@ -77,7 +77,7 @@ jobs:
         with:
           version: ${{ inputs.version }}
 
-      # aws-lc-sys compila ensamblador con NASM en Windows y el runner no lo trae.
+      # aws-lc-sys y OpenH264 compilan ensamblador con NASM y el runner de Windows no lo trae.
       - uses: ilammy/setup-nasm@v1
 
       # FFmpeg LGPL de tools/ffmpeg.lock (sus DLL van en el paquete) y libclang para `bindgen`.
