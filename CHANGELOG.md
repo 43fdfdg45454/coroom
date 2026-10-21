@@ -234,6 +234,9 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 - Las insignias y píldoras (contador de la sala, latencia, servidor, EN VIVO, etiquetas) llevan el
   contenido centrado; la del servidor mide lo que muestra, sin hueco a la derecha, y no salta de
   ancho con cada medida.
+- Con la Inter incluida (cuando el sistema no tiene ninguna de las letras de escritorio
+  conocidas), los títulos y botones salen en seminegrita: antes salían con la normal, porque la
+  seminegrita incluida no se reconocía como «Inter».
 - **Mandos XInput de un invitado Windows que no llegaban o llegaban mal**: los mandos XInput (los
   de Xbox por cable y los compatibles en modo XInput) tienen en Windows una interfaz HID que no es
   el mando, sino una copia que arma el driver para DirectInput (gatillos en un solo eje, sin botón

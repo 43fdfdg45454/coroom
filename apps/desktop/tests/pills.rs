@@ -261,6 +261,53 @@ fn cases(servers: &Servers) -> Vec<Case> {
     ]
 }
 
+/// Qué letras de `family` hay en la base de fuentes (de dónde vienen) y con cuál se dibuja de
+/// verdad una insignia, con su ancho: si una píldora sale descentrada en una plataforma, dice si
+/// es otra letra que la esperada.
+fn describe_faces(family: &str) {
+    use iced_widget::graphics::text::cosmic_text as ct;
+    let mut fonts = iced_widget::graphics::text::font_system()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let system = fonts.raw();
+    for face in system.db().faces() {
+        if !face
+            .families
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(family))
+        {
+            continue;
+        }
+        let source = match &face.source {
+            ct::fontdb::Source::Binary(_) => "embebida".to_owned(),
+            ct::fontdb::Source::File(path) => path.display().to_string(),
+            ct::fontdb::Source::SharedFile(path, _) => path.display().to_string(),
+        };
+        eprintln!(
+            "{family}: cara {} ({:?}) de {source}",
+            face.post_script_name, face.weight
+        );
+    }
+    let attrs = ct::Attrs::new()
+        .family(ct::Family::SansSerif)
+        .weight(ct::Weight::SEMIBOLD);
+    let mut buffer = ct::Buffer::new(system, ct::Metrics::new(12.0, 16.0));
+    buffer.set_text(system, "EN LINEA", &attrs, ct::Shaping::Advanced, None);
+    buffer.shape_until_scroll(system, false);
+    for run in buffer.layout_runs() {
+        let used: std::collections::BTreeSet<String> = run
+            .glyphs
+            .iter()
+            .filter_map(|glyph| system.db().face(glyph.font_id))
+            .map(|face| face.post_script_name.clone())
+            .collect();
+        eprintln!(
+            "{family}: «EN LINEA» a 12 px con {used:?}, {:.2} px de ancho",
+            run.line_w
+        );
+    }
+}
+
 /// Fuentes con las que se mide: Inter (la embebida, con las mayúsculas justo en el centro de la
 /// línea) y, si está instalada, FreeSans (con las mayúsculas por encima del centro: lo compensa
 /// [`ui::cap_centered`]). La fuente es global en el proceso: por eso todo va en un solo test.
@@ -287,6 +334,7 @@ fn pill_content_is_centered_and_the_server_pill_keeps_its_width() {
             "{family}: mayúsculas {:+.4} em del centro",
             coroom_ui::font::cap_drop()
         );
+        describe_faces(family);
         for mode in [Mode::Light, Mode::Dark] {
             let theme = Theme::new(mode, Accent::Blue, fonts);
             for case in cases(&servers) {

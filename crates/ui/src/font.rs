@@ -95,6 +95,7 @@ impl Fonts {
         system.load_font(Cow::Borrowed(INTER_REGULAR));
         system.load_font(Cow::Borrowed(INTER_SEMIBOLD));
         let db = system.raw().db_mut();
+        adopt_embedded_inter(db);
         let has = |db: &cosmic_db::Database, name: &str| {
             db.faces().any(|face| {
                 face.families
@@ -128,6 +129,45 @@ impl Fonts {
 /// La base de fuentes de `cosmic-text`.
 mod cosmic_db {
     pub use iced_widget::graphics::text::cosmic_text::fontdb::Database;
+}
+
+/// Deja la Inter embebida como la única «Inter» de la base de fuentes. Su SemiBold se llama
+/// «Inter SemiBold», sin la familia tipográfica «Inter»: sin esto, donde el sistema no trae Inter
+/// (Windows, el Flatpak) el texto en seminegrita salía con la Regular, y donde sí la trae se
+/// dibujaba con la del sistema, de otra versión y otras medidas. Las caras embebidas pasan a la
+/// familia «Inter» y las del sistema con ese nombre se quitan, así que se dibuja igual en todas
+/// partes. Se puede llamar más de una vez.
+fn adopt_embedded_inter(db: &mut cosmic_db::Database) {
+    use cosmic_text::fontdb::{FaceInfo, ID, Language, Source};
+    let embedded = |face: &FaceInfo| {
+        matches!(face.source, Source::Binary(_)) && face.post_script_name.starts_with("Inter-")
+    };
+    let is_inter = |face: &FaceInfo| {
+        face.families
+            .iter()
+            .any(|(family, _)| family.eq_ignore_ascii_case(EMBEDDED_FAMILY))
+    };
+    let system: Vec<ID> = db
+        .faces()
+        .filter(|face| !embedded(face) && is_inter(face))
+        .map(|face| face.id)
+        .collect();
+    for id in system {
+        db.remove_face(id);
+    }
+    let unnamed: Vec<FaceInfo> = db
+        .faces()
+        .filter(|face| embedded(face) && !is_inter(face))
+        .cloned()
+        .collect();
+    for mut face in unnamed {
+        db.remove_face(face.id);
+        face.families.insert(
+            0,
+            (EMBEDDED_FAMILY.to_owned(), Language::English_UnitedStates),
+        );
+        db.push_face_info(face);
+    }
 }
 
 /// [`cap_drop`] de la letra elegida (los bits de un `f32`; 0 hasta [`Fonts::detect`]).
@@ -230,5 +270,32 @@ mod tests {
         );
         assert_eq!(SEMIBOLD.weight, Weight::Semibold);
         assert!(Fonts::default().is_embedded());
+    }
+
+    /// La seminegrita de «Inter» es la SemiBold embebida (no la Regular, ni la Inter que traiga
+    /// el sistema), y la normal, la Regular embebida.
+    #[test]
+    fn inter_semibold_is_the_embedded_semibold() {
+        use cosmic_text::fontdb::{Family, Query, Source, Stretch, Style, Weight as DbWeight};
+        Fonts::detect(Some("Inter 11"));
+        let mut fonts = iced_widget::graphics::text::font_system()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let db = fonts.raw().db();
+        for (weight, name) in [
+            (DbWeight::SEMIBOLD, "Inter-SemiBold"),
+            (DbWeight::NORMAL, "Inter-Regular"),
+        ] {
+            let query = Query {
+                families: &[Family::Name(EMBEDDED_FAMILY)],
+                weight,
+                stretch: Stretch::Normal,
+                style: Style::Normal,
+            };
+            let face = db.query(&query).and_then(|id| db.face(id)).expect("Inter");
+            assert_eq!(face.post_script_name, name);
+            assert_eq!(face.weight, weight);
+            assert!(matches!(face.source, Source::Binary(_)), "{name} embebida");
+        }
     }
 }

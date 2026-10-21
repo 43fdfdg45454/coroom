@@ -617,15 +617,19 @@ mod tests {
         }
     }
 
-    /// La 2.1.0 con un APK ya descargado en `dir` (así no hace falta la red).
+    /// Una versión más nueva que cualquiera de la app: la CI compila con la versión de la
+    /// publicación (`CURRENT`), que puede ser cualquiera.
+    const NEXT: &str = "99.0.0";
+
+    /// La [`NEXT`] con un APK ya descargado en `dir` (así no hace falta la red).
     fn release_in(dir: &Path) -> Release {
-        let mut release = Release::new("2.1.0");
-        let name = Package::AndroidApk.asset_name("2.1.0");
+        let mut release = Release::new(NEXT);
+        let name = Package::AndroidApk.asset_name(NEXT);
         std::fs::create_dir_all(dir).expect("carpeta");
         let path = dir.join(&name);
         std::fs::write(&path, b"APK de ejemplo").expect("escribir");
         release.assets.push(shared::Asset {
-            url: format!("{}v2.1.0/{name}", shared::DOWNLOADS),
+            url: format!("{}v{NEXT}/{name}", shared::DOWNLOADS),
             name,
             size: 14,
             sha256: Some(shared::sha256_file(&path).expect("sha")),
@@ -652,20 +656,20 @@ mod tests {
         // Sin configurar está apagada: solo la búsqueda a mano.
         assert!(!updates.check_with(false, &emit, || Ok(None)));
         updates.configure(config(dir.path(), false), &emit);
-        assert!(updates.check_with(false, &emit, || Ok(Some(Release::new("2.1.0")))));
+        assert!(updates.check_with(false, &emit, || Ok(Some(Release::new(NEXT)))));
         let view = updates.view();
         assert_eq!(
             view.stage, "notice",
             "sin actualización automática, solo el aviso"
         );
-        assert_eq!(view.version.as_deref(), Some("2.1.0"));
+        assert_eq!(view.version.as_deref(), Some(NEXT));
         assert!(view.last_check.is_some());
         // Acaba de buscar: hasta el siguiente intervalo, nada.
         assert!(!updates.check_with(false, &emit, || panic!("no toca")));
         // Un error no borra lo que se sabía.
         assert!(updates.check_with(true, &emit, || Err("sin red".to_owned())));
         assert_eq!(updates.view().check_error.as_deref(), Some("sin red"));
-        assert_eq!(updates.view().version.as_deref(), Some("2.1.0"));
+        assert_eq!(updates.view().version.as_deref(), Some(NEXT));
         // «Buscar versiones nuevas» apagado lo olvida todo.
         updates.set_enabled(false, &emit);
         assert_eq!(updates.view().stage, "idle");
@@ -689,7 +693,7 @@ mod tests {
         let view = wait_for(&updates, "ready");
         assert_eq!(view.stage, "ready", "{view:?}");
         assert!(view.can_install);
-        let apk = dir.path().join(Package::AndroidApk.asset_name("2.1.0"));
+        let apk = dir.path().join(Package::AndroidApk.asset_name(NEXT));
         assert_eq!(updates.install(), Ok(apk.to_string_lossy().into_owned()));
         // Lista con una sala abierta: no se instala hasta salir.
         updates.set_room_open(true, &emit);
@@ -717,7 +721,7 @@ mod tests {
         updates.set_auto(true, &emit);
         updates.update_now(&emit);
         let deadline = Instant::now() + Duration::from_secs(20);
-        let apk = dir.path().join(Package::AndroidApk.asset_name("2.1.0"));
+        let apk = dir.path().join(Package::AndroidApk.asset_name(NEXT));
         let installed = loop {
             let found = lock(&events).iter().any(
                 |event| matches!(event, UiEvent::UpdateInstall { path } if Path::new(path) == apk),
@@ -743,7 +747,7 @@ mod tests {
         std::fs::write(&partial, b"a medias").expect("escribir");
         assert_eq!(newest_apk(dir.path()), None);
         let release = release_in(dir.path());
-        assert_eq!(newest_apk(dir.path()), shared::Version::parse("2.1.0"));
+        assert_eq!(newest_apk(dir.path()), shared::Version::parse(NEXT));
         let updates = Arc::new(Updates::default());
         let (_, emit) = recorder();
         let mut config = config(dir.path(), true);
@@ -765,7 +769,7 @@ mod tests {
         let updates = Arc::new(Updates::default());
         let (_, emit) = recorder();
         updates.configure(config(dir.path(), true), &emit);
-        updates.check_with(false, &emit, || Ok(Some(Release::new("2.1.0"))));
+        updates.check_with(false, &emit, || Ok(Some(Release::new(NEXT))));
         let deadline = Instant::now() + Duration::from_secs(20);
         while updates.view().stage != "idle" && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
