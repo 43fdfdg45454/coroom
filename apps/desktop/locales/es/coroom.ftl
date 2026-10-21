@@ -196,6 +196,7 @@ portal-no-se-pudo-olvidar-el-permiso = no se pudo olvidar el permiso de pantalla
 ## runner
 
 runner-error-del-bucle-de-la-ventana = error del bucle de la ventana: { $err }
+runner-la-gpu-ya-no-puede-mostrar-la-ventana = el escritorio dejó de aceptar las imágenes de la ventana dibujadas con { $gpu }. Suele pasar cuando la app no ve la GPU con la que dibuja el escritorio, por ejemplo dentro de un contenedor sin su driver: ábrela donde esa GPU esté disponible
 runner-transmision-en-curso = Transmisión de coroom en curso
 runner-este-equipo = este equipo
 runner-no-hay-pantalla-disponible-cause-prueba = no hay pantalla disponible ({ $cause }); prueba las órdenes sin ventana (`coroom --help`)

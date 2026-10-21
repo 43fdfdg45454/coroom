@@ -790,6 +790,23 @@ pub enum Acquired {
     Skip,
 }
 
+/// Configura `surface` para `device`. Si el adaptador ya no puede presentar en ella (el escritorio
+/// cerró la conexión con la ventana, por ejemplo porque no pudo importar sus imágenes), devuelve
+/// [`RenderError::SurfaceRejected`] en vez del pánico con el que `wgpu` trata el error de
+/// validación.
+pub fn configure_surface(
+    surface: &::wgpu::Surface<'_>,
+    device: &::wgpu::Device,
+    config: &::wgpu::SurfaceConfiguration,
+) -> Result<(), RenderError> {
+    let scope = device.push_error_scope(::wgpu::ErrorFilter::Validation);
+    surface.configure(device, config);
+    match pollster::block_on(scope.pop()) {
+        None => Ok(()),
+        Some(err) => Err(RenderError::SurfaceRejected(err.to_string())),
+    }
+}
+
 /// Pide la imagen de la superficie; reconfigura si está desactualizada.
 pub fn acquire(
     surface: &::wgpu::Surface<'_>,
@@ -803,9 +820,9 @@ pub fn acquire(
             }
             ::wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
                 drop(texture);
-                surface.configure(device, config);
+                configure_surface(surface, device, config)?;
             }
-            ::wgpu::CurrentSurfaceTexture::Outdated => surface.configure(device, config),
+            ::wgpu::CurrentSurfaceTexture::Outdated => configure_surface(surface, device, config)?,
             ::wgpu::CurrentSurfaceTexture::Timeout | ::wgpu::CurrentSurfaceTexture::Occluded => {
                 return Ok(Acquired::Skip);
             }

@@ -494,6 +494,9 @@ pub struct PresentFrame {
 pub enum RenderError {
     /// La superficie se perdió (ventana minimizada o cambio de GPU) y hay que recrearla.
     SurfaceLost,
+    /// El adaptador ya no puede presentar en la superficie (el escritorio cerró la conexión con la
+    /// ventana): no tiene arreglo sin abrir otra conexión.
+    SurfaceRejected(String),
     /// El adaptador no admite lo que se pide.
     Unsupported(String),
     /// Error interno del backend gráfico.
@@ -504,6 +507,9 @@ impl fmt::Display for RenderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             RenderError::SurfaceLost => f.write_str("se perdió la superficie de la ventana"),
+            RenderError::SurfaceRejected(what) => {
+                write!(f, "la GPU ya no puede mostrar la ventana: {what}")
+            }
             RenderError::Unsupported(what) => write!(f, "función gráfica no admitida: {what}"),
             RenderError::Backend(what) => write!(f, "error del backend gráfico: {what}"),
         }

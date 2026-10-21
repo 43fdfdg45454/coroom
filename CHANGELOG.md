@@ -215,6 +215,11 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **La ventana se cerraba de golpe si el escritorio rechazaba las imágenes de la GPU elegida**: pasa
+  cuando la app solo ve una GPU distinta de la que usa el escritorio (por ejemplo, dentro de un
+  contenedor sin el driver de esa GPU). El escritorio corta la conexión con la ventana y la app
+  abortaba al reconfigurarla. Ahora se cierra con un mensaje que lo explica y nombra la GPU, y el
+  registro dice qué GPU dibuja la ventana y recoge los avisos de la biblioteca gráfica.
 - **Al cerrarse lo compartido, los invitados se quedaban con el último fotograma**: al cerrarse la
   aplicación compartida, PipeWire solo deja el flujo en pausa, sin error, y la sala seguía
   «compartiendo» una imagen fija. En Windows, el mismo caso cerraba la sala entera. Ahora la sala

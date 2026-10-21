@@ -33,10 +33,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
+use coroom_render::RenderError;
 use coroom_render::hdr::{HDR_FORMAT, HdrOutput};
 use coroom_render::layer::VideoLayer;
 use coroom_render::overlay::OverlayBlit;
-use coroom_render::wgpu::{Acquired, GpuContext, HdrSurface, SurfaceSetup, acquire};
+use coroom_render::wgpu::{
+    Acquired, GpuContext, HdrSurface, SurfaceSetup, acquire, configure_surface,
+};
 use iced_core::Color;
 use iced_wgpu::wgpu;
 
@@ -68,6 +71,9 @@ struct Inner {
     layers: HashMap<u64, VideoLayer>,
     /// Hay que reconfigurar la superficie antes de la próxima composición.
     outdated: bool,
+    /// La GPU ya no puede presentar en la superficie (el escritorio cerró la conexión con la
+    /// ventana): no se vuelve a configurar ni a componer, y la ventana se cierra.
+    rejected: bool,
     presented: u64,
     /// Modo de presentación de menor latencia que eligió la configuración de la superficie
     /// (`Immediate` o `Mailbox` si existen), al que se vuelve al quitar la sincronización vertical.
@@ -80,6 +86,13 @@ struct Inner {
     /// (media exponencial), para saber si el vídeo sigue llegando.
     last_video: Option<Instant>,
     video_interval: Option<Duration>,
+}
+
+impl Inner {
+    fn reject(&mut self, err: &RenderError) {
+        tracing::error!(error = %err, "la GPU ya no puede mostrar la ventana");
+        self.rejected = true;
+    }
 }
 
 /// Cómo sale a la pantalla un dibujo de la interfaz ([`Compositor::draw_ui`]).
@@ -146,6 +159,7 @@ impl Compositor {
                 feeds: Vec::new(),
                 layers: HashMap::new(),
                 outdated: false,
+                rejected: false,
                 presented: 0,
                 low_latency_mode: setup.config.present_mode,
                 vsync: false,
@@ -160,6 +174,21 @@ impl Compositor {
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Configura la superficie con `inner.config`, salvo que la GPU ya no pueda presentar en ella.
+    fn configure(&self, inner: &mut Inner) {
+        if inner.rejected {
+            return;
+        }
+        if let Err(err) = configure_surface(&inner.surface, &self.device, &inner.config) {
+            inner.reject(&err);
+        }
+    }
+
+    /// Si la GPU ya no puede presentar en la ventana (el motivo está en el registro).
+    pub fn rejected(&self) -> bool {
+        self.lock().rejected
     }
 
     fn submit_lock(&self) -> MutexGuard<'_, ()> {
@@ -187,7 +216,7 @@ impl Compositor {
         let mut inner = self.lock();
         inner.config.width = width.max(1);
         inner.config.height = height.max(1);
-        inner.surface.configure(&self.device, &inner.config);
+        self.configure(&mut inner);
         inner.outdated = false;
         inner.ui = None;
         inner.ui_back = None;
@@ -209,7 +238,7 @@ impl Compositor {
         if inner.vsync {
             inner.config.present_mode = wgpu::PresentMode::Fifo;
         }
-        inner.surface.configure(&self.device, &inner.config);
+        self.configure(&mut inner);
         if setup.render_format != inner.render_format {
             inner.render_format = setup.render_format;
             inner.blit = OverlayBlit::new(&self.device, setup.render_format);
@@ -367,12 +396,19 @@ impl Compositor {
     /// fuentes: su fotograma no se mostró y el pipeline lo cuenta como descarte.
     fn composite(&self, inner: &mut Inner, before_present: Option<impl FnOnce()>) {
         if inner.outdated {
-            inner.surface.configure(&self.device, &inner.config);
+            self.configure(inner);
             inner.outdated = false;
+        }
+        if inner.rejected {
+            return;
         }
         let frame = match acquire(&inner.surface, &self.device, &inner.config) {
             Ok(Acquired::Frame(frame)) => frame,
             Ok(Acquired::Skip) => return,
+            Err(err @ RenderError::SurfaceRejected(_)) => {
+                inner.reject(&err);
+                return;
+            }
             Err(err) => {
                 tracing::warn!(error = %err, "no se pudo dibujar la ventana");
                 inner.outdated = true;

@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use coroom_render::hdr::HdrOutput;
-use coroom_render::wgpu::{GpuContext, HdrSurface, create_instance};
+use coroom_render::wgpu::{GpuContext, HdrSurface, configure_surface, create_instance};
 use coroom_session::input::capture::{Action, CaptureMode, InputCapture, ShortcutKeys};
 use coroom_session::input::gamepad::{ConnectedPad, GamepadCapture, PadLink};
 use coroom_session::input::keymap::keycode_from_name;
@@ -207,16 +207,17 @@ pub fn run(launch: Launch) -> Result<Option<Ended>, String> {
         error: None,
         result: None,
     };
-    event_loop
-        .run_app(&mut runner)
-        .map_err(|err| t!("runner-error-del-bucle-de-la-ventana", err = err))?;
+    let looped = event_loop.run_app(&mut runner);
     if let Some(mut ready) = runner.ready.take() {
         let result = ready.backend.shutdown();
         runner.result = runner.result.or(result);
     }
+    // El motivo propio antes que el del bucle: si la GPU dejó de poder mostrar la ventana, el
+    // escritorio cerró la conexión y `winit` sale con un código que no lo explica.
     if let Some(err) = runner.error {
         return Err(err);
     }
+    looped.map_err(|err| t!("runner-error-del-bucle-de-la-ventana", err = err))?;
     Ok(runner.result)
 }
 
@@ -311,6 +312,23 @@ fn chat_focused<M, T, R: iced_core::Renderer>(
 }
 
 impl Runner {
+    /// Cierra la ventana si la aplicación terminó o si la GPU ya no puede mostrarla (el escritorio
+    /// cerró la conexión: el detalle de `wgpu` ya está en el registro).
+    fn exit_if_done(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(ready) = self.ready.as_ref() else {
+            return;
+        };
+        if ready.compositor.rejected() {
+            self.error = Some(t!(
+                "runner-la-gpu-ya-no-puede-mostrar-la-ventana",
+                gpu = ready.gpu.adapter_summary().name.clone()
+            ));
+            event_loop.exit();
+        } else if ready.should_exit() {
+            event_loop.exit();
+        }
+    }
+
     fn open(&mut self, event_loop: &ActiveEventLoop) -> Result<Ready, String> {
         let attributes = system::window_attributes(
             Window::default_attributes()
@@ -329,6 +347,8 @@ impl Runner {
             .map_err(|err| t!("runner-no-se-pudo-crear-la-superficie", err = err))?;
         let gpu = GpuContext::new(&instance, Some(&surface))
             .map_err(|err| t!("runner-no-se-pudo-preparar-la-gpu", err = err))?;
+        let adapter = gpu.adapter_summary();
+        tracing::info!(gpu = %adapter.name, backend = %adapter.backend, "GPU de la ventana");
         let size = window.inner_size();
         let settings_path = settings::path_in(&settings::data_dir());
         let (settings, warning) = Settings::load(&settings_path);
@@ -336,7 +356,8 @@ impl Runner {
         let setup = gpu
             .surface_setup_with(&surface, size.width, size.height, hdr_requested)
             .map_err(|err| t!("runner-no-se-pudo-preparar-la-ventana", err = err))?;
-        surface.configure(&gpu.device, &setup.config);
+        configure_surface(&surface, &gpu.device, &setup.config)
+            .map_err(|err| t!("runner-no-se-pudo-preparar-la-ventana", err = err))?;
         let hdr = make_hdr(&gpu, setup.hdr);
         let hdr_display = gpu.hdr_available(&surface);
         let compositor = Compositor::new(&gpu, surface, &setup, hdr);
@@ -1549,9 +1570,7 @@ impl ApplicationHandler<UserEvent> for Runner {
                 ready.window.request_redraw();
             }
         }
-        if ready.should_exit() {
-            event_loop.exit();
-        }
+        self.exit_if_done(event_loop);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -1559,9 +1578,7 @@ impl ApplicationHandler<UserEvent> for Runner {
             return;
         };
         ready.window_event(event_loop, event);
-        if ready.should_exit() {
-            event_loop.exit();
-        }
+        self.exit_if_done(event_loop);
     }
 
     fn device_event(
