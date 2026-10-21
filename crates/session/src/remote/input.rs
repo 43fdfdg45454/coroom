@@ -64,7 +64,7 @@ use coroom_transport::proto::input::{
     stream_preamble,
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
-use tracing::debug;
+use tracing::{debug, info};
 
 use super::{Command, Core, GuestPad, PadTransport, lock};
 use crate::latency::InputLatency;
@@ -1000,6 +1000,17 @@ impl Worker {
             }
             match pad {
                 PadData::Device { slot, device } => {
+                    // La misma declaración otra vez (el invitado no vio la respuesta, o se reabrió
+                    // su canal de entrada): el mando sigue como está y se le vuelve a decir el modo.
+                    if let Some(known) = state
+                        .pad
+                        .as_ref()
+                        .filter(|known| known.slot == slot && known.device == device)
+                    {
+                        let raw = known.guest_sends_raw();
+                        self.command(Command::GamepadMode { guest, slot, raw });
+                        continue;
+                    }
                     if state.pad.as_ref().is_some_and(|pad| pad.active)
                         && let Err(err) = self.sink.disconnect_raw(slot)
                     {
@@ -1051,6 +1062,15 @@ impl Worker {
         match (check, pad.active) {
             (Ok(()), false) if !paused => match self.sink.connect_raw(pad.slot, &pad.device) {
                 Ok(()) => {
+                    info!(
+                        guest = ?guest,
+                        slot = pad.slot,
+                        name = %pad.device.name,
+                        vendor = format_args!("{:04x}", pad.device.vendor),
+                        product = format_args!("{:04x}", pad.device.product),
+                        hid = matches!(pad.device.transport, GamepadTransport::Hid { .. }),
+                        "mando del invitado creado igual que el suyo"
+                    );
                     pad.active = true;
                     pad.note = None;
                 }
@@ -1071,6 +1091,14 @@ impl Worker {
                     Err(reason) if !reason.is_empty() => Some(reason),
                     _ => None,
                 };
+                info!(
+                    guest = ?guest,
+                    slot = pad.slot,
+                    name = %pad.device.name,
+                    paused,
+                    reason = pad.note.as_deref().unwrap_or("tal cual no permitido"),
+                    "mando del invitado convertido a Xbox 360"
+                );
             }
         }
         let (slot, raw) = (pad.slot, pad.guest_sends_raw());
@@ -1346,7 +1374,15 @@ impl PadLink for GuestInput {
     }
 
     fn pad(&self, data: PadData) {
+        // Una declaración nueva espera su propia respuesta: la que hubiera era de la anterior.
+        if let PadData::Device { slot, .. } = &data {
+            lock(&self.inner.pad_modes).remove(slot);
+        }
         self.send_pad(data);
+    }
+
+    fn answered(&self, slot: u8) -> bool {
+        lock(&self.inner.pad_modes).contains_key(&slot)
     }
 
     fn raw(&self, slot: u8) -> bool {
@@ -1490,6 +1526,67 @@ mod tests {
         events: Vec<InputEvent>,
     ) -> InputState {
         texts(worker, guest, seq, before, events, 0)
+    }
+
+    /// La misma declaración otra vez (el invitado no vio la respuesta, o se reabrió su canal de
+    /// entrada) no recrea el mando: se le vuelve a contestar el modo cada vez.
+    #[test]
+    fn a_repeated_declaration_keeps_the_pad_and_is_answered_again() {
+        let sink = RecordingSink::new();
+        let mut worker = worker(&sink);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *lock(&worker.core.commands) = Some(tx);
+        let guest = GuestId(1);
+        worker.handle(Job::Permissions {
+            guest,
+            permissions: Permissions {
+                gamepad_slot: Some(2),
+                gamepad_raw: true,
+                ..Permissions::VIEW_ONLY
+            },
+        });
+        let declared = PadData::Device {
+            slot: 2,
+            device: GamepadDevice {
+                name: "Mando de ejemplo".to_owned(),
+                vendor: 0x1234,
+                product: 0x5678,
+                version: 0,
+                bus: 3,
+                transport: GamepadTransport::XInput,
+            },
+        };
+        for _ in 0..3 {
+            worker.handle(Job::Declare {
+                guest,
+                pads: vec![declared.clone()],
+            });
+        }
+        let log = sink.log();
+        let connected = log
+            .iter()
+            .filter(|entry| matches!(entry, Recorded::RawConnected { slot: 2, .. }))
+            .count();
+        assert_eq!(connected, 1, "{log:?}");
+        assert!(
+            !log.iter()
+                .any(|entry| matches!(entry, Recorded::RawDisconnected { .. })),
+            "{log:?}"
+        );
+        let mut answers = 0;
+        while let Ok(command) = rx.try_recv() {
+            if matches!(
+                command,
+                Command::GamepadMode {
+                    slot: 2,
+                    raw: false,
+                    ..
+                }
+            ) {
+                answers += 1;
+            }
+        }
+        assert_eq!(answers, 3);
     }
 
     /// Como [`packet`], con los textos numerados desde `text_seq`.

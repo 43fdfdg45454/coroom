@@ -75,6 +75,11 @@ pub trait PadLink: Send + Sync {
     fn pad(&self, data: PadData);
     /// Si el anfitrión tiene el mando de `slot` tal cual (`GamepadMode`).
     fn raw(&self, slot: u8) -> bool;
+    /// Si el anfitrión ya contestó la última declaración (`PadData::Device`) del mando de `slot`
+    /// con su modo (`GamepadMode`). Mientras no, la declaración se repite cada
+    /// [`DECLARE_RETRY`]: se pierde si sale antes de que esté abierto el canal de entrada o al
+    /// reabrirse.
+    fn answered(&self, slot: u8) -> bool;
     /// Informes de salida del anfitrión desde la última llamada: ranura y bytes.
     fn outputs(&self) -> Vec<(u8, Vec<u8>)>;
     /// Lo que el anfitrión pide ahora a los motores del mando de `slot` (el último
@@ -124,6 +129,10 @@ pub struct ConnectedPad {
     /// Si es el que va a la ranura.
     pub active: bool,
 }
+
+/// Cada cuánto se repite la declaración del mando de la ranura mientras el anfitrión no la
+/// contesta ([`PadLink::answered`]).
+pub const DECLARE_RETRY: Duration = Duration::from_millis(500);
 
 /// Intervalo mínimo entre dos envíos de ejes (1000 Hz); los botones no esperan.
 pub const PERIOD: Duration = Duration::from_millis(1);
@@ -226,6 +235,27 @@ pub(crate) fn pick_index<'a>(
     match choice {
         PadChoice::Auto => connected.len().checked_sub(1),
         PadChoice::Pad(key) => connected.position(|k| k == key),
+    }
+}
+
+/// Si `path` es una colección HID que Windows marca como de un mando XInput (`…&IG_00#…`, la
+/// marca documentada para reconocerlos). Solo dice que XInput ve ese mando: si la colección es el
+/// mando real o una copia la decide su dispositivo padre ([`crate::hidwin`]).
+pub fn is_xinput_path(path: &[u8]) -> bool {
+    path.windows(4)
+        .any(|part| part.eq_ignore_ascii_case(b"&IG_"))
+}
+
+/// Para el diagnóstico: las interfaces HID de mando conectadas, quién publica cada una y cómo
+/// iría el mando (solo en Windows, donde un mando XInput tiene una copia HID que no es él).
+pub fn report() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        crate::hidwin::report()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Vec::new()
     }
 }
 
@@ -563,6 +593,23 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    #[test]
+    fn xinput_collections_are_recognised() {
+        assert!(is_xinput_path(
+            br"\\?\HID#VID_045E&PID_028E&IG_00#8&2c5a4b1&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}"
+        ));
+        assert!(is_xinput_path(
+            br"\\?\hid#vid_045e&pid_02ff&ig_00#9&1d0c6f2a&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}"
+        ));
+        // Un mando HID de verdad (Bluetooth o USB) no lleva `IG_`.
+        assert!(!is_xinput_path(
+            br"\\?\HID#VID_054C&PID_0CE6&MI_03#8&1a2b3c4&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}"
+        ));
+        assert!(!is_xinput_path(
+            br"\\?\HID#{00001124-0000-1000-8000-00805f9b34fb}_VID&0002045e_PID&0b13#9&2c0e&0&0000#{4d1e55b2-f16f-11cf-88cb-001111000030}"
+        ));
+    }
 
     #[test]
     fn values_have_a_minimal_deadzone() {

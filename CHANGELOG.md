@@ -215,6 +215,24 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **Mandos XInput de un invitado Windows que no llegaban o llegaban mal**: los mandos XInput (los
+  de Xbox por cable y los compatibles en modo XInput) tienen en Windows una interfaz HID que no es
+  el mando, sino una copia que arma el driver para DirectInput (gatillos en un solo eje, sin botón
+  Guía ni vibración). coroom la mandaba tal cual, y en el anfitrión se creaba un mando con la
+  identidad de un Xbox 360 que los juegos no leían. Ahora coroom mira quién publica cada interfaz
+  HID: si su dispositivo padre es de la clase HID, el descriptor es el del mando y va tal cual; si
+  no, el mando va como Xbox 360 con su identidad. `coroom doctor` muestra, en Windows, cada
+  interfaz HID de mando con su padre, su clase y cómo iría.
+- **El anfitrión no veía el mando de un invitado aunque le diera ranura**: el invitado avisaba de
+  su mando una sola vez, y si ese aviso salía antes de que estuviera abierto el canal de entrada
+  se perdía. Ahora lo repite hasta que la sala del anfitrión le contesta, y vuelve a hacerlo si
+  el canal se reabre; el anfitrión no recrea el mando por recibir el mismo aviso dos veces.
+- **Los mandos dejan rastro en el registro**: el invitado anota los mandos que se conectan y
+  desconectan, con qué modo entra cada uno en su ranura y cuándo se deja de poder leer uno en
+  crudo; el anfitrión, cómo creó el mando de cada ranura o por qué va convertido.
+- **Las invitaciones no se veían con la sala propia abierta**: llegaban por la señalización de la
+  sala y la pantalla del anfitrión las descartaba (el servidor no las guarda, así que se perdían).
+  Ahora aparecen al momento, con su aviso y su sonido, como en la sala de espera.
 - **La ventana se cerraba de golpe si el escritorio rechazaba las imágenes de la GPU elegida**: pasa
   cuando la app solo ve una GPU distinta de la que usa el escritorio (por ejemplo, dentro de un
   contenedor sin el driver de esa GPU). El escritorio corta la conexión con la ventana y la app

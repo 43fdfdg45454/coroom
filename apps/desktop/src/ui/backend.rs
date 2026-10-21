@@ -1320,7 +1320,9 @@ fn forward_events(
 }
 
 /// Los eventos de una sesión que no son de la sala sino de la cuenta (los mismos que la sala de
-/// espera reparte): presencia y actividad de los amigos, y las peticiones de entrar.
+/// espera reparte): presencia y actividad de los amigos, las peticiones de entrar y las
+/// invitaciones. El servidor no guarda las invitaciones: la que llega con la sala abierta solo
+/// se ve si pasa por aquí.
 fn lobby_event(event: &SessionEvent) -> Option<Event> {
     Some(match event {
         SessionEvent::Presence { user, online } => Event::Presence {
@@ -1357,6 +1359,15 @@ fn lobby_event(event: &SessionEvent) -> Option<Event> {
             from_user: *from_user,
             from_name: from_name.clone(),
         },
+        SessionEvent::Invited {
+            from_user,
+            from_name,
+            code,
+        } => Event::Invited(Invitation {
+            from_user: *from_user,
+            from_name: from_name.clone(),
+            code: code.clone(),
+        }),
         _ => return None,
     })
 }
@@ -2019,6 +2030,25 @@ fn codec_preference(choice: CodecChoice) -> Option<coroom_session::codec::Codec>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Una invitación que llega por la señalización de una sala (la propia abierta, o una en la
+    /// que se está) va a la interfaz como la de la sala de espera: si no, se pierde.
+    #[test]
+    fn invitations_reach_the_interface_from_an_open_room() {
+        let event = lobby_event(&SessionEvent::Invited {
+            from_user: 5,
+            from_name: "Bea".to_owned(),
+            code: "ABC123".to_owned(),
+        });
+        assert!(
+            matches!(
+                &event,
+                Some(Event::Invited(Invitation { from_user: 5, from_name, code }))
+                    if from_name == "Bea" && code == "ABC123"
+            ),
+            "{event:?}"
+        );
+    }
 
     /// Una sesión que se suelta en otro hilo (el de `close_detached`) retiene la salida hasta
     /// soltarse del todo: si no, su `vkDestroyDevice` corre a la vez que los destructores del

@@ -50,8 +50,8 @@ use super::chat::{self, Surface};
 use super::host::Takeover;
 use super::{diagnostics, settings};
 use crate::ui::app::{
-    App, Dialog, Effect, EndKind, Event, HEADERBAR_HEIGHT, Invitation, Message, Page, RAIL_MIC_ID,
-    Screen, quality_tone,
+    App, Dialog, Effect, EndKind, Event, HEADERBAR_HEIGHT, Message, Page, RAIL_MIC_ID, Screen,
+    quality_tone,
 };
 use crate::ui::avatars;
 use crate::ui::settings::{DEFAULT_VOICE_VOLUME, KnownPeer, MAX_VOICE_VOLUME, voice_gain};
@@ -1500,17 +1500,6 @@ fn session_event(app: &mut App, event: SessionEvent) -> Vec<Effect> {
             }
             state.members = members;
             return effects;
-        }
-        SessionEvent::Invited {
-            from_user,
-            from_name,
-            code,
-        } => {
-            return app.update(Message::Event(Event::Invited(Invitation {
-                from_user,
-                from_name,
-                code,
-            })));
         }
         _ => {}
     }

@@ -10,11 +10,11 @@ use std::time::{Duration, Instant, SystemTime};
 use coroom_proto::input::{GamepadDevice, GamepadTransport, PadData};
 use gilrs::ff::{BaseEffect, BaseEffectType, Effect, EffectBuilder};
 use gilrs::{Axis, Button, EventType, GamepadId, Gilrs, GilrsBuilder};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::{
-    AxisFilter, ConnectedPad, IDLE_POLL, Motors, PERIOD, PadChoice, PadKey, PadKind, PadLink,
-    PadOutputs, PadRumble, pick_index, stick_value, trigger_value,
+    AxisFilter, ConnectedPad, DECLARE_RETRY, IDLE_POLL, Motors, PERIOD, PadChoice, PadKey, PadKind,
+    PadLink, PadOutputs, PadRumble, pick_index, stick_value, trigger_value,
 };
 #[cfg(target_os = "linux")]
 use super::{EvdevMotors, evdev_motors};
@@ -475,6 +475,9 @@ struct RawPad {
     outputs: Option<PadOutputs>,
     /// Si es HID (lo convertido se calla cuando el anfitrión lo tiene tal cual).
     hid: bool,
+    /// Su declaración (la del hilo en crudo, si es HID, cuando la haga), para repetirla mientras
+    /// el anfitrión no la conteste.
+    declared: Arc<Mutex<Option<PadData>>>,
 }
 
 impl Drop for RawPad {
@@ -499,11 +502,12 @@ fn declare(link: &Arc<dyn PadLink>, slot: u8, key: &PadKey, paused: &Arc<AtomicB
             transport,
         },
     };
-    let idle = |hid| RawPad {
+    let idle = |hid, declared: Option<PadData>| RawPad {
         stop: Arc::new(AtomicBool::new(false)),
         thread: None,
         outputs: None,
         hid,
+        declared: Arc::new(Mutex::new(declared)),
     };
     #[cfg(any(
         all(target_os = "linux", feature = "linux-portal"),
@@ -519,8 +523,17 @@ fn declare(link: &Arc<dyn PadLink>, slot: u8, key: &PadKey, paused: &Arc<AtomicB
                         .into(),
                 }
             };
-            link.pad(device(transport));
-            return idle(false);
+            info!(
+                slot,
+                name = %key.name,
+                vendor = format_args!("{:04x}", key.vendor),
+                product = format_args!("{:04x}", key.product),
+                transport = ?transport,
+                "mando en la ranura"
+            );
+            let declared = device(transport);
+            link.pad(declared.clone());
+            return idle(false, Some(declared));
         };
         let opened = platform::open(&info).and_then(|reader| {
             let writer = reader.try_clone()?;
@@ -530,10 +543,11 @@ fn declare(link: &Arc<dyn PadLink>, slot: u8, key: &PadKey, paused: &Arc<AtomicB
             Ok(pair) => pair,
             Err(err) => {
                 warn!(error = %err, "{}", platform::HELP);
-                link.pad(device(GamepadTransport::Converted {
+                let declared = device(GamepadTransport::Converted {
                     reason: "el invitado no tiene permiso para leer el mando en crudo".into(),
-                }));
-                return idle(false);
+                });
+                link.pad(declared.clone());
+                return idle(false, Some(declared));
             }
         };
         let outputs = PadOutputs::new(
@@ -543,15 +557,22 @@ fn declare(link: &Arc<dyn PadLink>, slot: u8, key: &PadKey, paused: &Arc<AtomicB
             platform::WRITE_HELP,
         );
         let stop = Arc::new(AtomicBool::new(false));
+        let declared = Arc::new(Mutex::new(None));
         let thread = {
-            let (stop, link, paused) = (Arc::clone(&stop), Arc::clone(link), Arc::clone(paused));
+            let (stop, link, paused, declared) = (
+                Arc::clone(&stop),
+                Arc::clone(link),
+                Arc::clone(paused),
+                Arc::clone(&declared),
+            );
             thread::Builder::new()
                 .name("mando-crudo".into())
-                .spawn(move || raw_loop(reader, info, slot, &link, &stop, &paused))
+                .spawn(move || raw_loop(reader, info, slot, &link, &stop, &paused, &declared))
                 .ok()
         };
         RawPad {
             stop,
+            declared,
             thread,
             outputs: Some(outputs),
             hid: true,
@@ -563,10 +584,11 @@ fn declare(link: &Arc<dyn PadLink>, slot: u8, key: &PadKey, paused: &Arc<AtomicB
     )))]
     {
         let _ = paused;
-        link.pad(device(GamepadTransport::Converted {
+        let declared = device(GamepadTransport::Converted {
             reason: "el invitado todavía no manda mandos tal cual desde este sistema".into(),
-        }));
-        idle(false)
+        });
+        link.pad(declared.clone());
+        idle(false, Some(declared))
     }
 }
 
@@ -585,9 +607,18 @@ fn raw_loop(
     link: &Arc<dyn PadLink>,
     stop: &AtomicBool,
     paused: &AtomicBool,
+    declared: &Mutex<Option<PadData>>,
 ) {
     let features = reader.read_features(&info.summary);
-    link.pad(PadData::Device {
+    info!(
+        slot,
+        name = %info.name,
+        vendor = format_args!("{:04x}", info.vendor),
+        product = format_args!("{:04x}", info.product),
+        bytes = info.descriptor.len(),
+        "mando en la ranura, tal cual por HID"
+    );
+    let device = PadData::Device {
         slot,
         device: GamepadDevice {
             name: info.name.clone(),
@@ -600,7 +631,9 @@ fn raw_loop(
                 features,
             },
         },
-    });
+    };
+    *declared.lock().unwrap_or_else(PoisonError::into_inner) = Some(device.clone());
+    link.pad(device);
     let mut buffer = vec![0u8; coroom_proto::hid::MAX_REPORT_BYTES];
     let mut last: Option<Vec<u8>> = None;
     let mut since = std::time::Instant::now();
@@ -620,7 +653,12 @@ fn raw_loop(
             }
             Ok(None) => {}
             Err(err) => {
-                debug!(error = %err, "mando en crudo");
+                warn!(
+                    error = %err,
+                    name = %info.name,
+                    "se dejó de leer el mando en crudo: no llega nada de él hasta que se vuelva a \
+                     conectar"
+                );
                 return;
             }
         }
@@ -698,6 +736,7 @@ fn run(shared: &Shared) {
     let mut rumble: Option<PadRumble> = None;
     let mut motors = SlotMotors::new();
     let mut last_rumble = Instant::now();
+    let mut last_declared = Instant::now();
     // Si lo que se toca se está callando ([`GamepadCapture::set_paused`]).
     let mut paused = false;
     while !shared.stop.load(Ordering::Acquire) {
@@ -715,13 +754,19 @@ fn run(shared: &Shared) {
             match event.event {
                 EventType::Connected => {
                     let key = key_of(&gilrs, event.id);
-                    debug!(name = %key.name, "mando conectado");
+                    info!(
+                        name = %key.name,
+                        vendor = format_args!("{:04x}", key.vendor),
+                        product = format_args!("{:04x}", key.product),
+                        "mando conectado"
+                    );
                     connected.retain(|(id, _)| *id != event.id);
                     connected.push((event.id, key));
                     publish = true;
                     repick = true;
                 }
                 EventType::Disconnected => {
+                    info!("mando desconectado");
                     connected.retain(|(id, _)| *id != event.id);
                     publish = true;
                     repick = true;
@@ -807,6 +852,7 @@ fn run(shared: &Shared) {
                 });
                 let key = key_of(&gilrs, id);
                 raw = Some(declare(link, slot, &key, &shared.paused));
+                last_declared = Instant::now();
                 rumble = Some(PadRumble::new(&key.name, rumble_help()));
             }
             announced = wanted;
@@ -846,6 +892,25 @@ fn run(shared: &Shared) {
         }
 
         let now = Instant::now();
+        // La declaración, otra vez, mientras el anfitrión no la conteste.
+        if let (Some((slot, _)), Some(pad)) = (announced, raw.as_ref())
+            && now.saturating_duration_since(last_declared) >= DECLARE_RETRY
+            && !link.answered(slot)
+        {
+            last_declared = now;
+            let declared = pad
+                .declared
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(declared) = declared {
+                debug!(
+                    slot,
+                    "el anfitrión no contestó la declaración del mando: se repite"
+                );
+                link.pad(declared);
+            }
+        }
         // Vibración y luces del anfitrión: solo con un mando tal cual, y no en cada vuelta.
         if let (Some((slot, _)), Some(outputs)) =
             (announced, raw.as_mut().and_then(|raw| raw.outputs.as_mut()))
@@ -989,6 +1054,9 @@ mod tests {
         fn raw(&self, _: u8) -> bool {
             self.raw.load(Ordering::Acquire)
         }
+        fn answered(&self, _: u8) -> bool {
+            true
+        }
         fn outputs(&self) -> Vec<(u8, Vec<u8>)> {
             Vec::new()
         }
@@ -1003,6 +1071,7 @@ mod tests {
             thread: None,
             outputs: None,
             hid,
+            declared: Arc::new(Mutex::new(None)),
         }
     }
 

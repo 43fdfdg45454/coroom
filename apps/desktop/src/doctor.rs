@@ -65,6 +65,13 @@ pub fn report() -> Result<Vec<String>, String> {
         "  ranuras de mando: {} (COROOM_MAX_GAMEPADS)",
         coroom_session::input::max_gamepads()
     ));
+    let pads = coroom_session::input::gamepad::report();
+    if !pads.is_empty() {
+        out.push("Mandos del invitado (interfaces HID):".to_owned());
+        for line in pads {
+            out.push(format!("  {line}"));
+        }
+    }
     out.push("Audio:".to_owned());
     for line in coroom_session::audio::status() {
         out.push(format!("  {line}"));

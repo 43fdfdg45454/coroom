@@ -27,8 +27,8 @@ use coroom_proto::input::{GamepadDevice, GamepadTransport, PadData};
 use tracing::debug;
 
 use crate::gamepad::{
-    AxisFilter, ConnectedPad, Motors, PadChoice, PadKey, PadKind, PadLink, PadRumble, pick_index,
-    stick_value, trigger_value,
+    AxisFilter, ConnectedPad, DECLARE_RETRY, Motors, PadChoice, PadKey, PadKind, PadLink,
+    PadRumble, pick_index, stick_value, trigger_value,
 };
 use crate::keymap::evdev;
 use crate::{GamepadAxis, GamepadButton, GamepadKind, InputEvent, Rumble};
@@ -476,6 +476,9 @@ pub struct AndroidPads {
     announced: Option<(u8, i32)>,
     axes: AxisFilter,
     rumble: Option<PadRumble>,
+    /// La declaración del mando de la ranura y cuándo salió, para repetirla mientras el
+    /// anfitrión no la conteste ([`PadLink::answered`]).
+    declared: Option<(PadData, Instant)>,
 }
 
 impl std::fmt::Debug for AndroidPads {
@@ -501,6 +504,7 @@ impl AndroidPads {
             announced: None,
             axes: AxisFilter::default(),
             rumble: None,
+            declared: None,
         }
     }
 
@@ -665,6 +669,14 @@ impl AndroidPads {
 
     /// La vibración que pide el anfitrión para la ranura, al mando que va en ella (si cambió).
     pub fn poll(&mut self) {
+        // La declaración, otra vez, mientras el anfitrión no la conteste.
+        if let (Some((slot, _)), Some((declared, at))) = (self.announced, self.declared.as_mut())
+            && at.elapsed() >= DECLARE_RETRY
+            && !self.link.answered(slot)
+        {
+            *at = Instant::now();
+            self.link.pad(declared.clone());
+        }
         let (Some((slot, device_id)), Some(state)) = (self.announced, self.rumble.as_mut()) else {
             return;
         };
@@ -745,12 +757,13 @@ impl AndroidPads {
             }
         }
         self.axes.reset();
+        self.declared = None;
         if let (Some((slot, _)), Some(key)) = (wanted, key) {
             self.link.event(InputEvent::GamepadConnected {
                 slot,
                 kind: GamepadKind::Xbox,
             });
-            self.link.pad(PadData::Device {
+            let declared = PadData::Device {
                 slot,
                 device: GamepadDevice {
                     name: key.name.clone(),
@@ -763,7 +776,9 @@ impl AndroidPads {
                         reason: CONVERTED_REASON.to_owned(),
                     },
                 },
-            });
+            };
+            self.link.pad(declared.clone());
+            self.declared = Some((declared, Instant::now()));
             self.rumble = Some(PadRumble::new(&key.name, RUMBLE_HELP));
         }
         self.announced = wanted;
@@ -1013,6 +1028,8 @@ mod tests {
         events: Mutex<Vec<(InputEvent, Option<Instant>)>>,
         pads: Mutex<Vec<PadData>>,
         rumble: Mutex<Rumble>,
+        /// Si el anfitrión todavía no contestó la declaración.
+        unanswered: std::sync::atomic::AtomicBool,
     }
 
     impl Link {
@@ -1040,6 +1057,9 @@ mod tests {
         }
         fn raw(&self, _: u8) -> bool {
             false
+        }
+        fn answered(&self, _: u8) -> bool {
+            !self.unanswered.load(std::sync::atomic::Ordering::Acquire)
         }
         fn outputs(&self) -> Vec<(u8, Vec<u8>)> {
             Vec::new()
@@ -1106,6 +1126,36 @@ mod tests {
 
     fn axis(slot: u8, axis: GamepadAxis, value: i16) -> InputEvent {
         InputEvent::GamepadAxis { slot, axis, value }
+    }
+
+    /// Mientras el anfitrión no contesta la declaración, se repite; contestada, no.
+    #[test]
+    fn the_declaration_is_repeated_until_the_host_answers() {
+        use std::sync::atomic::Ordering;
+        let (mut pads, link, _) = pads();
+        link.unanswered.store(true, Ordering::Release);
+        pads.device_added(7, key("Mando de ejemplo"));
+        pads.set_slot(Some(2));
+        let first = link.take_pads();
+        assert_eq!(first.len(), 1);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let repeated = loop {
+            pads.poll();
+            let sent = link.take_pads();
+            if !sent.is_empty() || Instant::now() >= deadline {
+                break sent;
+            }
+            std::thread::yield_now();
+        };
+        assert_eq!(repeated, first, "se repite la misma declaración");
+
+        link.unanswered.store(false, Ordering::Release);
+        let quiet = Instant::now() + 2 * DECLARE_RETRY;
+        while Instant::now() < quiet {
+            pads.poll();
+            std::thread::yield_now();
+        }
+        assert!(link.take_pads().is_empty(), "contestada, no se repite");
     }
 
     #[test]
