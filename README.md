@@ -8,8 +8,8 @@ contenido va cifrado de extremo a extremo con MLS, SFrame y HPKE: el servidor no
 | Inicio | Sala abierta |
 | --- | --- |
 | ![Inicio: compartir la pantalla o unirse a una sala](docs/screenshots/inicio.png) | ![Sala abierta con sus invitados y permisos](docs/screenshots/sala.png) |
-| **Invitado, con las estadísticas** | **Ajustes de vídeo** |
-| ![Invitado jugando, con las estadísticas de la conexión](docs/screenshots/invitado.png) | ![Ajustes de vídeo en el tema oscuro](docs/screenshots/ajustes.png) |
+| **Invitado, con el panel de Conexión** | **Ajustes de vídeo** |
+| ![Invitado jugando, con el panel de Conexión](docs/screenshots/invitado.png) | ![Ajustes de vídeo en el tema oscuro](docs/screenshots/ajustes.png) |
 
 Las capturas salen de `cargo test -p coroom --test shots` (con datos ficticios) y son también las
 de la ficha de AppStream del Flatpak.
@@ -47,6 +47,8 @@ dos NAT distintas, pantallas HDR y de 120 Hz), en [`docs/ARQUITECTURA.md`](docs/
 | [`docs/ARQUITECTURA.md`](docs/ARQUITECTURA.md) | Decisiones de la pila, presupuesto de latencia, conexión, estructura y validaciones pendientes |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Compilar, probar, estilo y cómo proponer cambios |
 | [`CHANGELOG.md`](CHANGELOG.md) | Cambios de cada versión |
+| [`PRODUCT.md`](PRODUCT.md) | Para quién es coroom y qué compromisos tiene la interfaz |
+| [`DESIGN.md`](DESIGN.md) | El sistema de diseño: paleta, tipografía, butacas y señalética |
 
 | Ruta | Contenido |
 |---|---|
@@ -56,7 +58,7 @@ dos NAT distintas, pantallas HDR y de 120 Hz), en [`docs/ARQUITECTURA.md`](docs/
 | `crates/capture` | Trait `Capturer`; backends sintético, `pipewire` (Linux) y `wgc` (Windows) |
 | `crates/codec` | Traits `Encoder`/`Decoder`; espacio de color y formato (`color`: BT.709, BT.2020 PQ, 4:2:0/4:4:4), BGRA → I420/NV12/I444/NV24 (`yuv`) y → P010 HDR10, OpenH264, FFmpeg (`rsmpeg`), sondeo de capacidades, importación de imágenes de GPU y slices |
 | `crates/render` | Trait `Presenter`; dispositivo `wgpu` compartido con Vulkan Video (`GpuContext`), capa de vídeo para la interfaz (`VideoLayer`, I420/NV12/I444/P010 con la matriz y la transferencia del flujo), salida HDR (`hdr`), importación sin copias, presentador offscreen y nulo |
-| `crates/ui` | Sistema de diseño `coroom-ui` para `iced`: tokens, tema (paleta Adwaita, acento, contraste AA), fuentes, iconos Lucide y componentes |
+| `crates/ui` | Sistema de diseño `coroom-ui` para `iced`: tokens, tema (paleta teñida con el acento del sistema, contraste AA), fuentes, iconos Lucide y componentes (butacas, señalética del código, entradas) |
 | `crates/session` | Trait `Session`; marcas por etapa (`latency`), pipeline local, `LocalSession` y `RemoteSession` |
 | `crates/input` | Captura en el invitado (`InputCapture`, mandos con `gilrs`, `InputSender`, guiones JSON), trait `InputSink` con libei + uinput (Linux), `SendInput` y el cliente del driver de mando virtual (Windows) y `RecordingSink`; tabla de teclas evdev ↔ *scancode* |
 | `crates/audio` | Traits `AudioSource` y `AudioSink`; PipeWire (Linux), WASAPI (Windows) y sintéticos; Opus (`codec`), buffer de jitter, mezcla, procesado de voz y VAD, sincronía A/V |
@@ -224,7 +226,7 @@ COROOM_DATA_DIR=/tmp/coroom-b cargo run --release -p coroom   # perfil aparte: a
    crear la cuenta. La sesión se guarda en el llavero y la próxima vez se entra solo.
 3. **Inicio**: «Compartir mi pantalla» abre la sala (elige pantalla o fuente de prueba, audio y
    voz; el código grande se copia con un clic y los amigos conectados se invitan desde ahí);
-   «Unirme a una sala» entra con un código o con una invitación recibida.
+   «Unirse con código» entra con un código, y la Bandeja, con una invitación recibida.
 4. **En la sala**, el invitado ve los pasos de la conexión y la **calidad esperada** (RTT medido
    durante un segundo + 25 ms de pipeline: Excelente ≤ 40 ms, Buena ≤ 70, Aceptable ≤ 110, Mala
    por encima) y después el vídeo. Si se cae la red, reintenta 5 veces (0,5 s, 1 s, 2 s, 4 s y
@@ -237,7 +239,7 @@ COROOM_DATA_DIR=/tmp/coroom-b cargo run --release -p coroom   # perfil aparte: a
 | `F11` | siempre | pantalla completa |
 | `Esc` | siempre | cierra el diálogo o el menú y sale de la pantalla completa; en la sala, pregunta si salir (en el vídeo con teclado permitido, va al juego) |
 | `Tab`, `Mayús+Tab` | formularios | siguiente y anterior campo |
-| `Ctrl+Alt+G/S/C/M/V/J/Q` | vídeo | inmersivo, estadísticas, chat, micrófono, audio del juego, mandos y salir (las letras se cambian en Ajustes → Mandos) |
+| `Ctrl+Alt+G/S/C/M/V/J/Q` | vídeo | inmersivo, conexión, chat, micrófono, audio del juego, personas y salir (las letras se cambian en Ajustes → Atajos de teclado) |
 
 «Avanzado» en Compartir explica qué hace este equipo con **4:4:4** y **HDR** (con qué códecs y si la
 pantalla muestra HDR; «no disponible con este códec» si el elegido no lo admite) y los dos
@@ -247,8 +249,8 @@ el mismo sitio; la ventana presenta en modo inmediato.
 
 Los ajustes (calidad, audio, atajos, red, apariencia, actualizaciones, servidores recientes y
 números de seguridad de los anfitriones) se guardan al cambiarlos en `settings.toml` del directorio
-de datos (`COROOM_DATA_DIR`, o `$XDG_DATA_HOME/coroom`, `%APPDATA%\coroom`). Ajustes → Cuenta y
-servidor cierra la sesión de otros equipos de tu cuenta, y el diagnóstico (el botón del servidor en
+de datos (`COROOM_DATA_DIR`, o `$XDG_DATA_HOME/coroom`, `%APPDATA%\coroom`). La página Cuenta
+desvincula otros equipos de tu cuenta, y el diagnóstico (el botón del servidor en
 la cabecera, o la píldora de latencia en la sala) explica la ruta de la sala, los candidatos de
 conexión directa, la latencia por etapa y lo que dice `coroom doctor`, con «Copiar informe» sin
 direcciones ni nombres.
@@ -395,16 +397,16 @@ derivada del secreto HPKE): ni el relay ni otro invitado pueden leerla ni falsif
 | Atajo | Qué hace |
 |---|---|
 | `Ctrl+Alt+G` | alterna el **modo escritorio** (cursor libre, posición absoluta) y el **modo inmersivo** (cursor capturado y oculto, movimiento relativo, para juegos en primera persona) |
-| `Ctrl+Alt+S` | muestra u oculta el panel de estadísticas |
+| `Ctrl+Alt+S` | abre o cierra el panel «Conexión» |
 | `Ctrl+Alt+C` | abre o cierra el chat de la sala |
 | `Ctrl+Alt+M` / `Ctrl+Alt+V` | silencia o reactiva el micrófono / el audio del juego |
-| `Ctrl+Alt+J` | panel de mandos: cuál envías (automático o uno concreto) |
+| `Ctrl+Alt+J` | abre o cierra «Personas» (el mando que envías se elige en Ajustes → Mandos) |
 | `Ctrl+Alt+Q` | sale (con teclado y ratón permitidos, `Esc` va al juego) |
 
 Al perder el foco se suelta todo lo pulsado y el cursor. En modo inmersivo, si el cursor se
 suelta, un clic en la ventana lo vuelve a capturar. El overlay dice qué permite el anfitrión
 ("solo mirar", "teclado y ratón", "mando en ranura 2") y la latencia de entrada que mide el
-anfitrión. Las letras se cambian en Ajustes → Mandos.
+anfitrión. Las letras se cambian en Ajustes → Atajos de teclado.
 
 **Mandos tal cual.** Con varios mandos conectados, el invitado elige en el panel de mandos cuál
 envía: **Automático** (el último que conectes; si lo desconectas, el siguiente) o uno concreto,

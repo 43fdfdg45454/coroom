@@ -231,6 +231,21 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **Ajustes → Acerca de dice por qué no se puede cambiar «Actualizar automáticamente»** cuando
+  está desactivado: porque «Buscar versiones nuevas» está apagado, porque el paquete MSIX no puede
+  actualizarse solo o porque esa copia de coroom no viene de un paquete que se actualice.
+- **Añadir servidor**: con la huella de un certificado propio todavía sin aceptar, la acción
+  principal es «Confiar» («Comprobar» queda al lado), y mientras el servidor no responde al
+  iniciar sesión o al recuperar la sesión guardada hay un «Cancelar» que no espera más.
+- **La build de FFmpeg fijada para desarrollo y la CI ya no existía en su origen**, que borra las
+  diarias al cambiar de mes: la descarga daba 404 en cuanto caducaba la caché y las
+  comprobaciones fallaban antes de compilar. Ahora se fija la última de un mes ya cerrado (la de
+  fin de octubre, FFmpeg 8.1.3), que el origen conserva, y `tools/ffmpeg.lock` explica cuál
+  conviene fijar.
+- **Las comprobaciones de Linux de la CI se compilan en la imagen `ubuntu-24.04`** y no en
+  `ubuntu-latest`: con la imagen nueva (26.04), los bindings de FFmpeg salen mal (bindgen deja
+  opacas sus estructuras) y la aplicación no compila. Vuelven a `ubuntu-latest` cuando los
+  bindings se generen bien ahí.
 - Las insignias y píldoras (contador de la sala, latencia, servidor, EN VIVO, etiquetas) llevan el
   contenido centrado; la del servidor mide lo que muestra, sin hueco a la derecha, y no salta de
   ancho con cada medida.
@@ -754,6 +769,30 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Cambiado
 
+- **Interfaz de escritorio rediseñada alrededor de la sala y sus butacas**: los neutros (fondo,
+  barra lateral, tarjetas, bordes y botones) van teñidos con el color de acento del sistema, en
+  vez de la base gris de Adwaita, y el texto sigue cumpliendo el contraste AA con cualquier
+  acento. Los avatares son butacas (respaldo redondeado) con una lámpara de estado: verde si está
+  conectado o su conexión es directa, ámbar si va por el relay. Inicio tiene «Compartir mi
+  pantalla» como bloque principal, con la fila de butacas de tu sala y su estado en palabras, y
+  «Unirse con código» al lado; las invitaciones son entradas con el código en señalética (cada
+  carácter en su celda, de tres en tres) y «Entrar» en el talón, y con tu sala abierta invitas a
+  un amigo desde «En línea ahora». La sala del anfitrión abre con la fila de butacas de sus
+  integrantes y el código en una entrada con «Copiar», y el piloto rojo «En vivo» ya no parece un
+  error. Compartir fija abajo una barra con el resumen y «Abrir la sala». Como invitado,
+  «Entrando» enciende tu butaca al conectar y da la latencia esperada en señalética; el panel
+  (Chat, Personas y Conexión) abre con las butacas de la sala, Personas separa «Tu voz» de «Los
+  demás» y Conexión enseña el número de seguridad con «Comparar». El chat lleva la butaca de quien
+  escribe, Ajustes alinea los controles en una columna (y los baja bajo el texto en una ventana
+  estrecha) y Diagnóstico da una fila por etapa.
+- **Invitado Android rediseñado con el mismo lenguaje**: los avatares son butacas con lámpara
+  (verde conectado, ámbar por el relay) y hay un piloto «En vivo»; el tema de respaldo tiñe los
+  neutros con el color primario (el color dinámico del sistema sigue igual). Inicio enseña el
+  código en señalética y las salas y las invitaciones como entradas con su talón, y los amigos van
+  en una lista agrupada con lámpara. La sala y «Entrando» muestran la fila de butacas de quienes
+  están, con la tuya en contorno hasta que conectas, y la píldora de latencia dice la calidad con
+  palabras («14 ms · buena»). Desde 840 dp la navegación pasa a un riel lateral, los botones
+  siguen una sola jerarquía y TalkBack lee cada butaca de una vez («Bea, Anfitrión»).
 - **Un codificador por hardware que no acaba la comprobación de imagen dice por qué**: antes solo
   se leía «la comprobación de imagen no terminó en 20 s». Ahora el diagnóstico y el registro dicen
   cuántos de los 300 fotogramas llegó a codificar, cuánto tardó cada uno (mediana y máximo) y

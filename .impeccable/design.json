@@ -1,0 +1,921 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-16T00:00:00Z",
+  "title": "Design System: coroom",
+  "extensions": {
+    "colorMeta": {
+      "accent-base": {
+        "role": "primary",
+        "displayName": "Acento del sistema (azul por defecto)",
+        "canonical": "#3584e4",
+        "tonalRamp": [
+          "oklch(15% 0.087 255)",
+          "oklch(27% 0.110 255)",
+          "oklch(38% 0.131 255)",
+          "oklch(50% 0.155 255)",
+          "oklch(62% 0.151 255)",
+          "oklch(74% 0.127 255)",
+          "oklch(85% 0.106 255)",
+          "oklch(95% 0.087 255)"
+        ]
+      },
+      "accent-bg": {
+        "role": "primary",
+        "displayName": "Acento como fondo",
+        "canonical": "#3986e5",
+        "tonalRamp": [
+          "oklch(15% 0.086 255)",
+          "oklch(27% 0.109 255)",
+          "oklch(38% 0.130 255)",
+          "oklch(50% 0.153 255)",
+          "oklch(62% 0.149 255)",
+          "oklch(74% 0.126 255)",
+          "oklch(85% 0.105 255)",
+          "oklch(95% 0.086 255)"
+        ]
+      },
+      "accent-text": {
+        "role": "primary",
+        "displayName": "Acento como texto",
+        "canonical": "#245a9d",
+        "tonalRamp": [
+          "oklch(15% 0.065 256)",
+          "oklch(27% 0.082 256)",
+          "oklch(38% 0.098 256)",
+          "oklch(50% 0.115 256)",
+          "oklch(62% 0.113 256)",
+          "oklch(74% 0.095 256)",
+          "oklch(85% 0.079 256)",
+          "oklch(95% 0.065 256)"
+        ]
+      },
+      "focus": {
+        "role": "primary",
+        "displayName": "Foco",
+        "canonical": "#2864ad",
+        "tonalRamp": [
+          "oklch(15% 0.069 255)",
+          "oklch(27% 0.088 255)",
+          "oklch(38% 0.105 255)",
+          "oklch(50% 0.124 255)",
+          "oklch(62% 0.121 255)",
+          "oklch(74% 0.102 255)",
+          "oklch(85% 0.085 255)",
+          "oklch(95% 0.069 255)"
+        ]
+      },
+      "selected": {
+        "role": "primary",
+        "displayName": "Elegido en el riel",
+        "canonical": "#c0d3ec",
+        "tonalRamp": [
+          "oklch(15% 0.021 255)",
+          "oklch(27% 0.027 255)",
+          "oklch(38% 0.032 255)",
+          "oklch(50% 0.038 255)",
+          "oklch(62% 0.037 255)",
+          "oklch(74% 0.031 255)",
+          "oklch(85% 0.026 255)",
+          "oklch(95% 0.021 255)"
+        ]
+      },
+      "highlight": {
+        "role": "primary",
+        "displayName": "Relleno suave de acento",
+        "canonical": "#e7f0fc",
+        "tonalRamp": [
+          "oklch(15% 0.010 256)",
+          "oklch(27% 0.013 256)",
+          "oklch(38% 0.015 256)",
+          "oklch(50% 0.018 256)",
+          "oklch(62% 0.017 256)",
+          "oklch(74% 0.015 256)",
+          "oklch(85% 0.012 256)",
+          "oklch(95% 0.010 256)"
+        ]
+      },
+      "success-solid": {
+        "role": "secondary",
+        "displayName": "Verde de «salida»",
+        "canonical": "#1e9e5e",
+        "tonalRamp": [
+          "oklch(15% 0.076 155)",
+          "oklch(27% 0.096 155)",
+          "oklch(38% 0.115 155)",
+          "oklch(50% 0.135 155)",
+          "oklch(62% 0.132 155)",
+          "oklch(74% 0.111 155)",
+          "oklch(85% 0.093 155)",
+          "oklch(95% 0.076 155)"
+        ]
+      },
+      "warning-solid": {
+        "role": "secondary",
+        "displayName": "Ámbar de pasillo",
+        "canonical": "#c18a16",
+        "tonalRamp": [
+          "oklch(15% 0.071 79)",
+          "oklch(27% 0.090 79)",
+          "oklch(38% 0.107 79)",
+          "oklch(50% 0.126 79)",
+          "oklch(62% 0.123 79)",
+          "oklch(74% 0.104 79)",
+          "oklch(85% 0.087 79)",
+          "oklch(95% 0.071 79)"
+        ]
+      },
+      "live-solid": {
+        "role": "secondary",
+        "displayName": "Piloto rojo de «en vivo»",
+        "canonical": "#f0392b",
+        "tonalRamp": [
+          "oklch(15% 0.116 29)",
+          "oklch(27% 0.148 29)",
+          "oklch(38% 0.176 29)",
+          "oklch(50% 0.207 29)",
+          "oklch(62% 0.202 29)",
+          "oklch(74% 0.171 29)",
+          "oklch(85% 0.142 29)",
+          "oklch(95% 0.116 29)"
+        ]
+      },
+      "error-solid": {
+        "role": "secondary",
+        "displayName": "Rojo de error",
+        "canonical": "#d7263d",
+        "tonalRamp": [
+          "oklch(15% 0.110 21)",
+          "oklch(27% 0.140 21)",
+          "oklch(38% 0.167 21)",
+          "oklch(50% 0.196 21)",
+          "oklch(62% 0.191 21)",
+          "oklch(74% 0.162 21)",
+          "oklch(85% 0.135 21)",
+          "oklch(95% 0.110 21)"
+        ]
+      },
+      "neutral-solid": {
+        "role": "secondary",
+        "displayName": "Lámpara neutra",
+        "canonical": "#747d8c",
+        "tonalRamp": [
+          "oklch(15% 0.013 261)",
+          "oklch(27% 0.017 261)",
+          "oklch(38% 0.020 261)",
+          "oklch(50% 0.024 261)",
+          "oklch(62% 0.023 261)",
+          "oklch(74% 0.020 261)",
+          "oklch(85% 0.016 261)",
+          "oklch(95% 0.013 261)"
+        ]
+      },
+      "destructive-bg": {
+        "role": "secondary",
+        "displayName": "Fondo destructivo",
+        "canonical": "#c21f33",
+        "tonalRamp": [
+          "oklch(15% 0.103 22)",
+          "oklch(27% 0.130 22)",
+          "oklch(38% 0.156 22)",
+          "oklch(50% 0.183 22)",
+          "oklch(62% 0.179 22)",
+          "oklch(74% 0.151 22)",
+          "oklch(85% 0.126 22)",
+          "oklch(95% 0.103 22)"
+        ]
+      },
+      "seat-1": {
+        "role": "tertiary",
+        "displayName": "Butaca azul",
+        "canonical": "#3a6fd8",
+        "tonalRamp": [
+          "oklch(15% 0.090 262)",
+          "oklch(27% 0.114 262)",
+          "oklch(38% 0.137 262)",
+          "oklch(50% 0.161 262)",
+          "oklch(62% 0.157 262)",
+          "oklch(74% 0.133 262)",
+          "oklch(85% 0.110 262)",
+          "oklch(95% 0.090 262)"
+        ]
+      },
+      "seat-2": {
+        "role": "tertiary",
+        "displayName": "Butaca turquesa",
+        "canonical": "#1a7f8c",
+        "tonalRamp": [
+          "oklch(15% 0.046 208)",
+          "oklch(27% 0.059 208)",
+          "oklch(38% 0.070 208)",
+          "oklch(50% 0.083 208)",
+          "oklch(62% 0.081 208)",
+          "oklch(74% 0.068 208)",
+          "oklch(85% 0.057 208)",
+          "oklch(95% 0.046 208)"
+        ]
+      },
+      "seat-3": {
+        "role": "tertiary",
+        "displayName": "Butaca verde",
+        "canonical": "#2e8548",
+        "tonalRamp": [
+          "oklch(15% 0.066 150)",
+          "oklch(27% 0.084 150)",
+          "oklch(38% 0.100 150)",
+          "oklch(50% 0.118 150)",
+          "oklch(62% 0.115 150)",
+          "oklch(74% 0.097 150)",
+          "oklch(85% 0.081 150)",
+          "oklch(95% 0.066 150)"
+        ]
+      },
+      "seat-4": {
+        "role": "tertiary",
+        "displayName": "Butaca ocre",
+        "canonical": "#a36600",
+        "tonalRamp": [
+          "oklch(15% 0.065 69)",
+          "oklch(27% 0.082 69)",
+          "oklch(38% 0.098 69)",
+          "oklch(50% 0.115 69)",
+          "oklch(62% 0.113 69)",
+          "oklch(74% 0.095 69)",
+          "oklch(85% 0.079 69)",
+          "oklch(95% 0.065 69)"
+        ]
+      },
+      "seat-5": {
+        "role": "tertiary",
+        "displayName": "Butaca naranja",
+        "canonical": "#c4501a",
+        "tonalRamp": [
+          "oklch(15% 0.085 42)",
+          "oklch(27% 0.108 42)",
+          "oklch(38% 0.129 42)",
+          "oklch(50% 0.152 42)",
+          "oklch(62% 0.148 42)",
+          "oklch(74% 0.125 42)",
+          "oklch(85% 0.104 42)",
+          "oklch(95% 0.085 42)"
+        ]
+      },
+      "seat-6": {
+        "role": "tertiary",
+        "displayName": "Butaca roja",
+        "canonical": "#cf3a4a",
+        "tonalRamp": [
+          "oklch(15% 0.097 19)",
+          "oklch(27% 0.124 19)",
+          "oklch(38% 0.148 19)",
+          "oklch(50% 0.174 19)",
+          "oklch(62% 0.170 19)",
+          "oklch(74% 0.143 19)",
+          "oklch(85% 0.119 19)",
+          "oklch(95% 0.097 19)"
+        ]
+      },
+      "seat-7": {
+        "role": "tertiary",
+        "displayName": "Butaca rosa",
+        "canonical": "#c04888",
+        "tonalRamp": [
+          "oklch(15% 0.088 350)",
+          "oklch(27% 0.112 350)",
+          "oklch(38% 0.134 350)",
+          "oklch(50% 0.157 350)",
+          "oklch(62% 0.154 350)",
+          "oklch(74% 0.130 350)",
+          "oklch(85% 0.108 350)",
+          "oklch(95% 0.088 350)"
+        ]
+      },
+      "seat-8": {
+        "role": "tertiary",
+        "displayName": "Butaca morada",
+        "canonical": "#8750c8",
+        "tonalRamp": [
+          "oklch(15% 0.095 302)",
+          "oklch(27% 0.121 302)",
+          "oklch(38% 0.144 302)",
+          "oklch(50% 0.170 302)",
+          "oklch(62% 0.166 302)",
+          "oklch(74% 0.140 302)",
+          "oklch(85% 0.117 302)",
+          "oklch(95% 0.095 302)"
+        ]
+      },
+      "window": {
+        "role": "neutral",
+        "displayName": "Ventana (vestíbulo)",
+        "canonical": "#f1f4f7",
+        "tonalRamp": [
+          "oklch(15% 0.003 248)",
+          "oklch(27% 0.003 248)",
+          "oklch(38% 0.004 248)",
+          "oklch(50% 0.005 248)",
+          "oklch(62% 0.005 248)",
+          "oklch(74% 0.004 248)",
+          "oklch(85% 0.003 248)",
+          "oklch(95% 0.003 248)"
+        ]
+      },
+      "sidebar": {
+        "role": "neutral",
+        "displayName": "Riel",
+        "canonical": "#dae2ed",
+        "tonalRamp": [
+          "oklch(15% 0.009 256)",
+          "oklch(27% 0.012 256)",
+          "oklch(38% 0.014 256)",
+          "oklch(50% 0.016 256)",
+          "oklch(62% 0.016 256)",
+          "oklch(74% 0.013 256)",
+          "oklch(85% 0.011 256)",
+          "oklch(95% 0.009 256)"
+        ]
+      },
+      "card": {
+        "role": "neutral",
+        "displayName": "Tarjeta",
+        "canonical": "#ffffff",
+        "tonalRamp": [
+          "oklch(15% 0.000 90)",
+          "oklch(27% 0.000 90)",
+          "oklch(38% 0.000 90)",
+          "oklch(50% 0.000 90)",
+          "oklch(62% 0.000 90)",
+          "oklch(74% 0.000 90)",
+          "oklch(85% 0.000 90)",
+          "oklch(95% 0.000 90)"
+        ]
+      },
+      "button": {
+        "role": "neutral",
+        "displayName": "Botón normal",
+        "canonical": "#dee2eb",
+        "tonalRamp": [
+          "oklch(15% 0.007 267)",
+          "oklch(27% 0.009 267)",
+          "oklch(38% 0.010 267)",
+          "oklch(50% 0.012 267)",
+          "oklch(62% 0.012 267)",
+          "oklch(74% 0.010 267)",
+          "oklch(85% 0.008 267)",
+          "oklch(95% 0.007 267)"
+        ]
+      },
+      "text": {
+        "role": "neutral",
+        "displayName": "Texto",
+        "canonical": "#20252e",
+        "tonalRamp": [
+          "oklch(15% 0.010 262)",
+          "oklch(27% 0.012 262)",
+          "oklch(38% 0.015 262)",
+          "oklch(50% 0.017 262)",
+          "oklch(62% 0.017 262)",
+          "oklch(74% 0.014 262)",
+          "oklch(85% 0.012 262)",
+          "oklch(95% 0.010 262)"
+        ]
+      },
+      "text-secondary": {
+        "role": "neutral",
+        "displayName": "Texto secundario",
+        "canonical": "#56595f",
+        "tonalRamp": [
+          "oklch(15% 0.005 264)",
+          "oklch(27% 0.007 264)",
+          "oklch(38% 0.008 264)",
+          "oklch(50% 0.010 264)",
+          "oklch(62% 0.010 264)",
+          "oklch(74% 0.008 264)",
+          "oklch(85% 0.007 264)",
+          "oklch(95% 0.005 264)"
+        ]
+      },
+      "border": {
+        "role": "neutral",
+        "displayName": "Filete",
+        "canonical": "#d6dae5",
+        "tonalRamp": [
+          "oklch(15% 0.008 270)",
+          "oklch(27% 0.010 270)",
+          "oklch(38% 0.013 270)",
+          "oklch(50% 0.015 270)",
+          "oklch(62% 0.014 270)",
+          "oklch(74% 0.012 270)",
+          "oklch(85% 0.010 270)",
+          "oklch(95% 0.008 270)"
+        ]
+      },
+      "border-strong": {
+        "role": "neutral",
+        "displayName": "Contorno marcado",
+        "canonical": "#a4adbe",
+        "tonalRamp": [
+          "oklch(15% 0.014 263)",
+          "oklch(27% 0.018 263)",
+          "oklch(38% 0.021 263)",
+          "oklch(50% 0.025 263)",
+          "oklch(62% 0.024 263)",
+          "oklch(74% 0.021 263)",
+          "oklch(85% 0.017 263)",
+          "oklch(95% 0.014 263)"
+        ]
+      },
+      "outline": {
+        "role": "neutral",
+        "displayName": "Línea que se ve sola",
+        "canonical": "#768191",
+        "tonalRamp": [
+          "oklch(15% 0.015 258)",
+          "oklch(27% 0.019 258)",
+          "oklch(38% 0.022 258)",
+          "oklch(50% 0.026 258)",
+          "oklch(62% 0.025 258)",
+          "oklch(74% 0.021 258)",
+          "oklch(85% 0.018 258)",
+          "oklch(95% 0.015 258)"
+        ]
+      },
+      "window-dark": {
+        "role": "neutral",
+        "displayName": "Ventana en oscuro (sala a media luz)",
+        "canonical": "#171c24",
+        "tonalRamp": [
+          "oklch(15% 0.009 260)",
+          "oklch(27% 0.012 260)",
+          "oklch(38% 0.014 260)",
+          "oklch(50% 0.016 260)",
+          "oklch(62% 0.016 260)",
+          "oklch(74% 0.013 260)",
+          "oklch(85% 0.011 260)",
+          "oklch(95% 0.009 260)"
+        ]
+      },
+      "sidebar-dark": {
+        "role": "neutral",
+        "displayName": "Riel en oscuro (pasillo)",
+        "canonical": "#0d141d",
+        "tonalRamp": [
+          "oklch(15% 0.011 255)",
+          "oklch(27% 0.014 255)",
+          "oklch(38% 0.017 255)",
+          "oklch(50% 0.020 255)",
+          "oklch(62% 0.020 255)",
+          "oklch(74% 0.017 255)",
+          "oklch(85% 0.014 255)",
+          "oklch(95% 0.011 255)"
+        ]
+      },
+      "card-dark": {
+        "role": "neutral",
+        "displayName": "Tarjeta en oscuro",
+        "canonical": "#252a31",
+        "tonalRamp": [
+          "oklch(15% 0.008 257)",
+          "oklch(27% 0.010 257)",
+          "oklch(38% 0.012 257)",
+          "oklch(50% 0.014 257)",
+          "oklch(62% 0.014 257)",
+          "oklch(74% 0.011 257)",
+          "oklch(85% 0.010 257)",
+          "oklch(95% 0.008 257)"
+        ]
+      },
+      "text-dark": {
+        "role": "neutral",
+        "displayName": "Texto en oscuro",
+        "canonical": "#f1f3f7",
+        "tonalRamp": [
+          "oklch(15% 0.003 265)",
+          "oklch(27% 0.004 265)",
+          "oklch(38% 0.005 265)",
+          "oklch(50% 0.005 265)",
+          "oklch(62% 0.005 265)",
+          "oklch(74% 0.004 265)",
+          "oklch(85% 0.004 265)",
+          "oklch(95% 0.003 265)"
+        ]
+      },
+      "overlay": {
+        "role": "neutral",
+        "displayName": "Oscuro de la sala sobre el vídeo",
+        "canonical": "#171c24",
+        "tonalRamp": [
+          "oklch(15% 0.009 260)",
+          "oklch(27% 0.012 260)",
+          "oklch(38% 0.014 260)",
+          "oklch(50% 0.016 260)",
+          "oklch(62% 0.016 260)",
+          "oklch(74% 0.013 260)",
+          "oklch(85% 0.011 260)",
+          "oklch(95% 0.009 260)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Cifra destacada",
+        "purpose": "Una cifra grande, como el RTT de la estimación de calidad."
+      },
+      "title": {
+        "displayName": "Título de página",
+        "purpose": "Uno por pantalla, en la cabecera."
+      },
+      "heading": {
+        "displayName": "Encabezado",
+        "purpose": "Sección o bloque."
+      },
+      "body": {
+        "displayName": "Cuerpo",
+        "purpose": "Texto corriente."
+      },
+      "body-strong": {
+        "displayName": "Cuerpo en seminegrita",
+        "purpose": "Títulos de fila y de tarjeta y el texto de los botones."
+      },
+      "secondary": {
+        "displayName": "Secundario",
+        "purpose": "Subtítulos y ayudas, en el color secundario."
+      },
+      "caption": {
+        "displayName": "Pie",
+        "purpose": "Pies, el nombre bajo una butaca, etiquetas de tecla."
+      },
+      "badge": {
+        "displayName": "Insignia",
+        "purpose": "El texto de las insignias de estado."
+      },
+      "sign-large": {
+        "displayName": "Señalética grande",
+        "purpose": "El código de la sala abierta, en celdas de 40 por 52 px."
+      },
+      "sign-small": {
+        "displayName": "Señalética pequeña",
+        "purpose": "El código dentro de una invitación, en celdas de 20 por 26 px."
+      },
+      "mono": {
+        "displayName": "Monoespaciada",
+        "purpose": "Solo datos técnicos: huellas, números de seguridad, direcciones."
+      }
+    },
+    "shadows": [
+      {
+        "name": "dialog",
+        "value": "0 8px 28px rgba(13,20,29,0.22)",
+        "purpose": "Diálogos modales (en oscuro, negro al 55 %)."
+      },
+      {
+        "name": "toast",
+        "value": "0 4px 16px rgba(13,20,29,0.25)",
+        "purpose": "Toasts (en oscuro, negro al 50 %)."
+      },
+      {
+        "name": "menu",
+        "value": "0 4px 16px rgba(13,20,29,0.15)",
+        "purpose": "Desplegables (en oscuro, negro al 45 %)."
+      },
+      {
+        "name": "button-hover",
+        "value": "0 2px 6px rgba(13,20,29,0.14)",
+        "purpose": "Botones con relleno bajo el ratón (en oscuro, negro al 40 %)."
+      },
+      {
+        "name": "button-primary-hover",
+        "value": "0 2px 10px rgba(57,134,229,0.35)",
+        "purpose": "El botón principal bajo el ratón brilla con el acento (45 % en oscuro)."
+      },
+      {
+        "name": "live-glow",
+        "value": "0 2px 18px rgba(240,57,43,0.45)",
+        "purpose": "El brillo de la tarjeta «en vivo» al empezar a compartir; se apaga y en reposo no hay sombra."
+      }
+    ],
+    "motion": [
+      {
+        "name": "press",
+        "value": "60ms cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "El botón se hunde al 96 % al pulsarlo; vuelve con resorte."
+      },
+      {
+        "name": "hover",
+        "value": "90ms linear",
+        "purpose": "Color y fondo al pasar el ratón."
+      },
+      {
+        "name": "quick",
+        "value": "140ms cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "Interruptores e insignias."
+      },
+      {
+        "name": "panel",
+        "value": "200ms cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "Paneles, desplegables, toasts, diálogos."
+      },
+      {
+        "name": "screen",
+        "value": "260ms cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "Cambio de pantalla; la nueva se desliza 36 px."
+      },
+      {
+        "name": "moment",
+        "value": "420ms cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "Abrir la sala, entrar en una, pasarla; con escalonado."
+      },
+      {
+        "name": "exit",
+        "value": "70% de la entrada, ease-in-out",
+        "purpose": "Todo lo que sale lo hace más rápido de lo que entró."
+      },
+      {
+        "name": "stagger",
+        "value": "30ms",
+        "purpose": "Entre los bloques de una pantalla y los elementos de una lista."
+      },
+      {
+        "name": "stagger-menu",
+        "value": "15ms",
+        "purpose": "Entre las opciones de un desplegable."
+      },
+      {
+        "name": "toast-life",
+        "value": "4s",
+        "purpose": "Lo que dura un toast en pantalla."
+      },
+      {
+        "name": "bar-hide",
+        "value": "2500ms",
+        "purpose": "Lo que tarda en ocultarse la barra del vídeo sin mover el ratón."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "rail-wide",
+        "value": "1312px"
+      }
+    ],
+    "seat": {
+      "back": 0.42,
+      "base": 0.18,
+      "initials": 0.4,
+      "number": 0.36,
+      "outline": "1.5px",
+      "lamp": 0.28,
+      "lampMin": "8px",
+      "lampGap": "2px",
+      "ringGap": "3px",
+      "ringWidth": "2px",
+      "row": "44px",
+      "list": "36px",
+      "compact": "32px",
+      "rowMin": 4,
+      "labelSlot": "68px"
+    },
+    "sign": {
+      "group": 3,
+      "large": {
+        "width": "40px",
+        "height": "52px",
+        "text": "30px",
+        "gap": "4px",
+        "groupGap": "16px",
+        "radius": "8px"
+      },
+      "small": {
+        "width": "20px",
+        "height": "26px",
+        "text": "15px",
+        "gap": "2px",
+        "groupGap": "8px",
+        "radius": "6px"
+      }
+    },
+    "ticket": {
+      "dot": "2px",
+      "pitch": "6px"
+    },
+    "sizes": {
+      "railNarrow": "60px",
+      "railWide": "200px",
+      "content": "880px",
+      "narrow": "440px",
+      "control": "36px",
+      "icon": "16px",
+      "iconLarge": "32px",
+      "dot": "8px",
+      "statsPanel": "340px",
+      "videoBar": "52px"
+    },
+    "accents": {
+      "blue": "#3584e4",
+      "teal": "#2190a4",
+      "green": "#3a944a",
+      "yellow": "#c88800",
+      "orange": "#ed5b00",
+      "red": "#e62d42",
+      "pink": "#d56199",
+      "purple": "#9141ac",
+      "slate": "#6f8396"
+    },
+    "android": {
+      "evidence": "Solo desde el código fuente; sin capturas.",
+      "shapes": {
+        "extraSmall": "6dp",
+        "small": "10dp",
+        "medium": "14dp",
+        "large": "20dp",
+        "extraLarge": "28dp"
+      },
+      "seat": {
+        "back": 0.42,
+        "base": 0.18,
+        "initial": 0.4,
+        "lamp": 0.3,
+        "lampMin": "12dp",
+        "lampRing": "2dp",
+        "row": "44dp",
+        "gap": "8dp",
+        "fade": "220ms"
+      },
+      "fallbackPrimary": {
+        "light": "#0F5CB7",
+        "dark": "#A2C9FE"
+      },
+      "navigationTint": {
+        "light": 0.08,
+        "dark": 0.07
+      },
+      "lamps": {
+        "light": {
+          "success": "#037E38",
+          "caution": "#9C6F02",
+          "live": "#DA2A32"
+        },
+        "dark": {
+          "success": "#5ED27D",
+          "caution": "#F1B74A",
+          "live": "#FF766F"
+        }
+      }
+    }
+  },
+  "components": [
+    {
+      "name": "Botón principal",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "La acción que el bloque existe para hacer; uno por bloque.",
+      "html": "<button class=\"ds-btn-primary\">Compartir</button>",
+      "css": ".ds-btn-primary { font-family:'Adwaita Sans', Cantarell, Inter, 'Noto Sans', 'Segoe UI Variable Text', 'Segoe UI', Ubuntu, sans-serif; font-size:14px; font-weight:600; height:36px; padding:8px 16px; border:none; border-radius:8px; cursor:pointer; transition: background-color 90ms linear, box-shadow 90ms linear, transform 60ms cubic-bezier(0.16,1,0.3,1); background:#3986e5; color:#1c1d22; } .ds-btn-primary:hover { background:#4486d7; transform:translateY(-1px); box-shadow:0 2px 10px rgba(57,134,229,0.35); } .ds-btn-primary:active { transform:scale(0.96); } .ds-btn-primary:focus-visible { outline:2px solid #2864ad; outline-offset:2px; }"
+    },
+    {
+      "name": "Botón normal",
+      "kind": "button",
+      "refersTo": "button-normal",
+      "description": "El neutro teñido, para las acciones corrientes.",
+      "html": "<button class=\"ds-btn-normal\">Aceptar</button>",
+      "css": ".ds-btn-normal { font-family:'Adwaita Sans', Cantarell, Inter, 'Noto Sans', 'Segoe UI Variable Text', 'Segoe UI', Ubuntu, sans-serif; font-size:14px; font-weight:600; height:36px; padding:8px 16px; border:none; border-radius:8px; cursor:pointer; transition: background-color 90ms linear, box-shadow 90ms linear, transform 60ms cubic-bezier(0.16,1,0.3,1); background:#dee2eb; color:#20252e; } .ds-btn-normal:hover { background:#d0d5df; transform:translateY(-1px); box-shadow:0 2px 6px rgba(13,20,29,0.14); } .ds-btn-normal:active { background:#c2c8d4; transform:scale(0.96); } .ds-btn-normal:focus-visible { outline:2px solid #2864ad; outline-offset:2px; }"
+    },
+    {
+      "name": "Botón destructivo suave",
+      "kind": "button",
+      "refersTo": "button-destructive-soft",
+      "description": "Dejar de compartir, expulsar, olvidar un servidor.",
+      "html": "<button class=\"ds-btn-soft\">Dejar de compartir</button>",
+      "css": ".ds-btn-soft { font-family:'Adwaita Sans', Cantarell, Inter, 'Noto Sans', 'Segoe UI Variable Text', 'Segoe UI', Ubuntu, sans-serif; font-size:14px; font-weight:600; height:36px; padding:8px 16px; border:none; border-radius:8px; cursor:pointer; transition: background-color 90ms linear, box-shadow 90ms linear, transform 60ms cubic-bezier(0.16,1,0.3,1); background:#f9e1e4; color:#b3192b; } .ds-btn-soft:hover { background:color-mix(in srgb, #f9e1e4 85%, #d7263d); transform:translateY(-1px); box-shadow:0 2px 6px rgba(13,20,29,0.14); } .ds-btn-soft:active { background:color-mix(in srgb, #f9e1e4 70%, #d7263d); transform:scale(0.96); } .ds-btn-soft:focus-visible { outline:2px solid #2864ad; outline-offset:2px; }"
+    },
+    {
+      "name": "Campo de texto",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "Campo estándar; borde de foco de 2 px.",
+      "html": "<input class=\"ds-input\" placeholder=\"R4W8TX\">",
+      "css": ".ds-input { font-family:'Adwaita Sans', Cantarell, Inter, 'Noto Sans', 'Segoe UI Variable Text', 'Segoe UI', Ubuntu, sans-serif; font-size:14px; height:36px; padding:8px 12px; box-sizing:border-box; background:#ffffff; color:#20252e; border:1px solid #d6dae5; border-radius:8px; outline:none; } .ds-input::placeholder { color:#737579; } .ds-input:hover { border-color:#a4adbe; } .ds-input:focus-visible { border:2px solid #2864ad; padding:7px 11px; }"
+    },
+    {
+      "name": "Riel de navegación",
+      "kind": "nav",
+      "refersTo": "nav-item-selected",
+      "description": "El plano más teñido; el destino elegido lleva un relleno suave de acento, sin franja.",
+      "html": "<nav class=\"ds-rail\"><button class=\"ds-rail-item ds-rail-item-on\" aria-label=\"Inicio\"><svg width=\"20\" height=\"20\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8\"/><path d=\"M3 10a2 2 0 0 1 .709-1.528l7-6a2 2 0 0 1 2.582 0l7 6A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z\"/></svg></button><button class=\"ds-rail-item\" aria-label=\"Amigos\"><svg width=\"20\" height=\"20\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><path d=\"M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2\"/><circle cx=\"9\" cy=\"7\" r=\"4\"/><path d=\"M22 21v-2a4 4 0 0 0-3-3.87\"/><path d=\"M16 3.13a4 4 0 0 1 0 7.75\"/></svg></button></nav>",
+      "css": ".ds-rail { display:flex; flex-direction:column; gap:2px; width:60px; padding:8px; box-sizing:border-box; background:#dae2ed; } .ds-rail-item { width:44px; height:44px; display:flex; align-items:center; justify-content:center; border:none; border-radius:8px; background:transparent; color:#20252e; cursor:pointer; transition:background-color 90ms linear; } .ds-rail-item:hover { background:rgba(32,37,46,0.07); } .ds-rail-item:active { background:rgba(32,37,46,0.12); } .ds-rail-item:focus-visible { outline:2px solid #2864ad; outline-offset:-2px; } .ds-rail-item-on, .ds-rail-item-on:hover { background:#c0d3ec; color:#245a9d; }"
+    },
+    {
+      "name": "Insignia de estado",
+      "kind": "chip",
+      "refersTo": "badge-success",
+      "description": "Punto del tono y texto; siempre dice el estado también en palabras.",
+      "html": "<span class=\"ds-badge ds-badge-ok\"><i></i>Directa · 14 ms</span> <span class=\"ds-badge ds-badge-warn\"><i></i>Relay · 61 ms</span> <span class=\"ds-badge ds-badge-live\"><i></i>En vivo 12:04</span>",
+      "css": ".ds-badge { font-family:'Adwaita Sans', Cantarell, Inter, 'Noto Sans', 'Segoe UI Variable Text', 'Segoe UI', Ubuntu, sans-serif; display:inline-flex; align-items:center; gap:6px; padding:3px 10px; border-radius:999px; font-size:12px; font-weight:600; font-variant-numeric:tabular-nums; } .ds-badge i { width:8px; height:8px; border-radius:999px; } .ds-badge-ok { background:#e0f1e8; color:#13703f; } .ds-badge-ok i { background:#1e9e5e; } .ds-badge-warn { background:#fbf2df; color:#8a5a00; } .ds-badge-warn i { background:#c18a16; } .ds-badge-live { background:#fde3e1; color:#c22a1c; } .ds-badge-live i { background:#f0392b; }"
+    },
+    {
+      "name": "Fila de butacas",
+      "kind": "custom",
+      "refersTo": "seat-row",
+      "description": "La firma: los integrantes de una sala como butacas, con su lámpara de enlace, el anillo de quien habla y las libres en contorno (solo en la sala propia).",
+      "html": "<div class=\"ds-seats\"><span class=\"ds-seat-slot\"><span class=\"ds-seat\" style=\"background:#3a6fd8\">A</span></span><span class=\"ds-seat-slot ds-seat-talking\"><span class=\"ds-seat\" style=\"background:#c4501a\">B<i class=\"ds-lamp ds-lamp-ok\"></i></span></span><span class=\"ds-seat-slot\"><span class=\"ds-seat\" style=\"background:#8750c8\">C<i class=\"ds-lamp ds-lamp-warn\"></i></span></span><span class=\"ds-seat-slot\"><span class=\"ds-seat ds-seat-free\">4</span></span></div>",
+      "css": ".ds-seats { font-family:'Adwaita Sans', Cantarell, Inter, 'Noto Sans', 'Segoe UI Variable Text', 'Segoe UI', Ubuntu, sans-serif; display:flex; gap:8px; padding:16px; background:#ffffff; border:1px solid #d6dae5; border-radius:12px; } .ds-seat-slot { padding:3px; border:2px solid transparent; border-radius:21.48px 21.48px 10.92px 10.92px; margin:-2px; } .ds-seat-talking { border-color:#1e9e5e; } .ds-seat { position:relative; display:flex; align-items:center; justify-content:center; width:44px; height:44px; border-radius:18.48px 18.48px 7.92px 7.92px; color:#ffffff; font-size:17.6px; font-weight:600; } .ds-seat-free { box-sizing:border-box; background:transparent; border:1.5px solid #a4adbe; color:#56595f; font-size:15.84px; } .ds-lamp { position:absolute; right:0; bottom:0; width:12px; height:12px; border-radius:999px; border:2px solid #ffffff; } .ds-lamp-ok { background:#1e9e5e; } .ds-lamp-warn { background:#c18a16; }"
+    },
+    {
+      "name": "Entrada con código en señalética",
+      "kind": "card",
+      "refersTo": "ticket",
+      "description": "Tarjeta con cuerpo, punteado y talón; el código de la sala va en celdas de tres en tres.",
+      "html": "<div class=\"ds-ticket\"><div class=\"ds-ticket-body\"><div><strong>Bea te invita a su sala</strong><br><span class=\"ds-ticket-sub\">Caduca en 0:52</span></div><div class=\"ds-code\"><span><b>K</b><b>7</b><b>Q</b></span><span><b>2</b><b>M</b><b>Z</b></span></div></div><div class=\"ds-perforation\"></div><div class=\"ds-ticket-stub\"><button class=\"ds-ticket-btn\">Entrar</button></div></div>",
+      "css": ".ds-ticket { font-family:'Adwaita Sans', Cantarell, Inter, 'Noto Sans', 'Segoe UI Variable Text', 'Segoe UI', Ubuntu, sans-serif; display:flex; align-items:center; background:#ffffff; color:#20252e; border:1px solid #d6dae5; border-radius:12px; font-size:14px; } .ds-ticket-body { flex:1; display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 16px; } .ds-ticket strong { font-weight:600; } .ds-ticket-sub { font-size:13px; color:#56595f; } .ds-code { display:flex; gap:8px; } .ds-code span { display:flex; gap:2px; } .ds-code b { display:flex; align-items:center; justify-content:center; width:20px; height:26px; border-radius:6px; background:#e7f0fc; font-size:15px; font-weight:600; } .ds-perforation { align-self:stretch; width:2px; margin:8px 0; background-image:radial-gradient(circle, #768191 1px, transparent 1.1px); background-size:2px 6px; background-repeat:repeat-y; } .ds-ticket-stub { padding:12px 16px; } .ds-ticket-btn { font-family:'Adwaita Sans', Cantarell, Inter, 'Noto Sans', 'Segoe UI Variable Text', 'Segoe UI', Ubuntu, sans-serif; font-size:14px; font-weight:600; height:36px; padding:8px 16px; border:none; border-radius:8px; cursor:pointer; transition: background-color 90ms linear, box-shadow 90ms linear, transform 60ms cubic-bezier(0.16,1,0.3,1); background:#3986e5; color:#1c1d22; } .ds-ticket-btn:hover { background:#4486d7; } .ds-ticket-btn:focus-visible { outline:2px solid #2864ad; outline-offset:2px; }"
+    },
+    {
+      "name": "Código de sala grande",
+      "kind": "custom",
+      "refersTo": "code-cell-large",
+      "description": "El código de la sala abierta: celdas de 40 por 52 px, letra de 30 px en seminegrita.",
+      "html": "<div class=\"ds-sign\"><span><b>K</b><b>7</b><b>Q</b></span><span><b>2</b><b>M</b><b>Z</b></span></div>",
+      "css": ".ds-sign { font-family:'Adwaita Sans', Cantarell, Inter, 'Noto Sans', 'Segoe UI Variable Text', 'Segoe UI', Ubuntu, sans-serif; display:inline-flex; gap:16px; color:#20252e; } .ds-sign span { display:flex; gap:4px; } .ds-sign b { display:flex; align-items:center; justify-content:center; width:40px; height:52px; border-radius:8px; background:#e7f0fc; font-size:30px; font-weight:600; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "La sala",
+    "overview": "coroom es una sala: una pantalla, unas butacas y un código en una entrada. La ventana toma las luces de la sala del color de acento del sistema: en claro es el vestíbulo, en oscuro la sala a media luz, y en ninguno de los dos hay un gris puro. Las personas son butacas, los estados son las lámparas de la sala y los códigos van en señalética. Todo lo demás es un escritorio de GNOME o de KDE bien hecho: tarjetas con filete fino, listas agrupadas, un riel lateral adaptable, la letra del sistema.\n\nLa densidad es la de una aplicación de trabajo: controles de 36 px, cuerpo de 14 px, espaciado en múltiplos de 4. La interfaz no decora: el color dice estado o identidad, el movimiento dice que algo cambió, y durante la partida todo lo que flota sobre el vídeo se aparta solo.\n\nEl sistema descarta las dos salidas habituales de la categoría: el vestíbulo «gamer» oscuro con neón y la ventana gris de toolkit con un solo color de acento.",
+    "keyCharacteristics": [
+      "Los neutros llevan el tinte del acento del sistema; el riel lateral es el plano más teñido.",
+      "Todo texto cumple contraste AA (4,5:1) con cualquier acento; lo que se dibuja solo con una línea, 3:1. El tema ajusta los colores hasta llegar; lo recorren los tests de `crates/ui`.",
+      "Las personas se dibujan siempre con la silueta de la butaca, nunca con un círculo.",
+      "Tres lámparas con un solo significado cada una: verde (bien, directo), ámbar (relay, aviso), piloto rojo (se está compartiendo).",
+      "Los códigos de sala van en celdas de ancho fijo, en seminegrita, de tres en tres.",
+      "Las tarjetas no llevan sombra: la sombra es de lo que flota.",
+      "Movimiento breve (de 60 a 420 ms), con la salida al 70 % de la entrada, y nada espera a una animación para aceptar un clic."
+    ],
+    "rules": [
+      {
+        "name": "La regla de las luces",
+        "body": "Ningún neutro es gris puro: todos salen de mezclar un neutro con el acento del sistema. Un color nuevo se añade a la paleta de `theme.rs` con su receta, no a una pantalla.",
+        "section": "colors"
+      },
+      {
+        "name": "La regla del piloto",
+        "body": "El rojo de «en vivo» solo dice que se está compartiendo. Nunca va en un aviso en línea ni en un error, y el rojo de error nunca dice «en vivo».",
+        "section": "colors"
+      },
+      {
+        "name": "La regla de una lámpara, un significado",
+        "body": "Verde es conectado o directo; ámbar es relay o calidad justa. El estado siempre va también dicho en palabras al lado («Directa», «Relay», «14 ms»).",
+        "section": "colors"
+      },
+      {
+        "name": "La regla del AA con cualquier acento",
+        "body": "Ningún color de texto se fija a mano contra un fondo: se pide a la paleta, que lo ajusta. Vale igual para un acento amarillo que para uno pizarra.",
+        "section": "colors"
+      },
+      {
+        "name": "La regla de la señalética",
+        "body": "Un código de sala nunca se escribe de corrido ni en monoespaciada: cada carácter va en su celda de ancho fijo, en mayúsculas, en seminegrita, agrupados de tres en tres con un hueco mayor entre grupos. El ancho no cambia con las letras que lleve.",
+        "section": "typography"
+      },
+      {
+        "name": "La regla de los dos pesos",
+        "body": "Solo 400 y 600. Ni cursivas ni versalitas ni un tercer peso.",
+        "section": "typography"
+      },
+      {
+        "name": "La regla de lo que no baila",
+        "body": "Lo que cambia de valor (una latencia, una cuenta atrás) va en una ranura del ancho de su variante mayor: la píldora no cambia de ancho al cambiar la cifra.",
+        "section": "typography"
+      },
+      {
+        "name": "La regla de lo que flota",
+        "body": "Solo lleva sombra lo que está encima de otra cosa (diálogo, menú, toast) o lo que responde al ratón. Una tarjeta en reposo, nunca.",
+        "section": "elevation"
+      },
+      {
+        "name": "La regla de la butaca",
+        "body": "Una persona es siempre una butaca: su foto recortada a la silueta o sus iniciales sobre su color. No hay avatares redondos.",
+        "section": "shapes"
+      }
+    ],
+    "dos": [
+      "Do pedir todos los colores a la paleta de `crates/ui/src/theme.rs`; es el único sitio con colores fijos y un test lo comprueba.",
+      "Do dibujar a cada persona como una butaca, con los radios del 42 % y del 18 % del lado.",
+      "Do decir el estado de la conexión con su lámpara y con palabras («Directa», «Relay · 61 ms»).",
+      "Do poner los códigos de sala en celdas de señalética, de tres en tres.",
+      "Do usar una entrada, con su punteado y su talón, para lo que da paso a una sala: una invitación, unirse con un código, el código de la sala propia.",
+      "Do dejar un solo botón principal por bloque.",
+      "Do reservar el hueco de lo que aparece y desaparece, para que nada se mueva.",
+      "Do respetar el movimiento reducido y el factor de duración del sistema.",
+      "Do seguir en cada plataforma sus convenciones: en el escritorio las de GNOME y KDE, en Android Material 3 con el color dinámico del sistema."
+    ],
+    "donts": [
+      "Don't usar un gris puro ni un color fijo fuera de `theme.rs`.",
+      "Don't usar el rojo de «en vivo» para un aviso o un error, ni el de error para decir que se está compartiendo.",
+      "Don't poner sombra a una tarjeta en reposo.",
+      "Don't dibujar avatares redondos.",
+      "Don't enseñar butacas libres numeradas al invitado: no conoce el aforo.",
+      "Don't escribir un código de sala de corrido o en monoespaciada.",
+      "Don't añadir un tercer peso de letra ni otra familia.",
+      "Don't hacer que algo espere a una animación para aceptar un clic.",
+      "Don't destacar más de una entrada a la vez.",
+      "Don't hacer el vestíbulo «gamer» oscuro con neón ni la ventana gris de toolkit con un solo color de acento."
+    ]
+  }
+}
