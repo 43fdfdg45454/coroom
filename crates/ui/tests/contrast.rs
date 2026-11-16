@@ -3,7 +3,13 @@
 //! Windows). Los planos van teñidos del acento, así que cada acento da fondos distintos: el riel,
 //! el relleno del elegido y el velo de «bajo el ratón» también se comprueban.
 
+use coroom_ui::Theme;
+use coroom_ui::editor::EditorClass;
+use coroom_ui::font::Fonts;
+use coroom_ui::style::{ButtonClass, ContainerClass, InputClass, SliderClass};
 use coroom_ui::theme::{AA, AA_LARGE, Accent, Mode, Palette, Rgb, SEATS, Tone, WHITE, contrast};
+use iced_core::{Background, Color};
+use iced_widget::{button, container, pick_list, slider, text_editor, text_input, toggler};
 
 fn hsl(h: f32, s: f32, l: f32) -> Rgb {
     let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
@@ -452,4 +458,375 @@ fn seats_keep_one_colour_per_person_in_both_modes() {
         assert_eq!(light.avatar(name), dark.avatar(name), "{name}");
         assert!(SEATS.contains(&light.avatar(name).0), "{name}");
     }
+}
+
+/// Un color de un estilo sobre `under` (con su transparencia aplicada).
+fn flat(color: Color, under: Rgb) -> Rgb {
+    let opaque = Rgb::from_unit(f64::from(color.r), f64::from(color.g), f64::from(color.b));
+    under.mix(opaque, color.a)
+}
+
+/// El color de un fondo de estilo sobre `under`.
+fn fill(background: Background, under: Rgb) -> Rgb {
+    match background {
+        Background::Color(color) => flat(color, under),
+        Background::Gradient(_) => panic!("los estilos de coroom no llevan degradados"),
+    }
+}
+
+/// Lo que un control dibuja sin texto que lo explique se ve por sí solo (3:1, WCAG 1.4.11) en
+/// los dos modos y con cualquier acento: el tirador y el carril vacío de un deslizador, el
+/// segmento elegido, un interruptor apagado o desactivado y el punteado de una entrada. Y el
+/// texto de ejemplo de un campo no se confunde con uno escrito.
+#[test]
+fn controls_show_on_their_planes_with_any_accent() {
+    let mut failures = Vec::new();
+    for accent in accents() {
+        for mode in [Mode::Light, Mode::Dark] {
+            let theme = Theme::new(mode, accent, Fonts::default());
+            let p = theme.palette;
+            let planes = [
+                ("tarjeta", p.card),
+                ("ventana", p.window),
+                ("diálogo", p.dialog),
+            ];
+
+            // Deslizadores sobre la ventana: tirador y carril vacío, en reposo, bajo el ratón y
+            // arrastrando.
+            for class in [SliderClass::Accent, SliderClass::AccentMuted] {
+                for status in [
+                    slider::Status::Active,
+                    slider::Status::Hovered,
+                    slider::Status::Dragged,
+                ] {
+                    let style = <Theme as slider::Catalog>::style(&theme, &class, status);
+                    for (name, plane) in planes {
+                        let what = format!("deslizador {class:?} {status:?}/{name}");
+                        check(
+                            &mut failures,
+                            &p,
+                            &format!("tirador de {what}"),
+                            fill(style.handle.background, plane),
+                            plane,
+                            AA_LARGE,
+                        );
+                        check(
+                            &mut failures,
+                            &p,
+                            &format!("carril vacío de {what}"),
+                            fill(style.rail.backgrounds.1, plane),
+                            plane,
+                            AA_LARGE,
+                        );
+                    }
+                    assert_ne!(
+                        style.rail.backgrounds.0, style.rail.backgrounds.1,
+                        "{mode:?} {accent:?} {class:?}: lo recorrido se distingue de lo que falta"
+                    );
+                }
+            }
+            // Deslizadores sobre el vídeo: el panel, con un fotograma blanco o negro debajo.
+            for class in [SliderClass::Overlay, SliderClass::OverlayMuted] {
+                let style =
+                    <Theme as slider::Catalog>::style(&theme, &class, slider::Status::Active);
+                for (name, video) in [("vídeo blanco", WHITE), ("vídeo negro", p.video_backdrop)]
+                {
+                    let panel = over(p.overlay, p.overlay_alpha, video);
+                    let what = format!("deslizador {class:?}/{name}");
+                    check(
+                        &mut failures,
+                        &p,
+                        &format!("tirador de {what}"),
+                        fill(style.handle.background, panel),
+                        panel,
+                        AA_LARGE,
+                    );
+                    check(
+                        &mut failures,
+                        &p,
+                        &format!("carril vacío de {what}"),
+                        fill(style.rail.backgrounds.1, panel),
+                        panel,
+                        AA_LARGE,
+                    );
+                }
+            }
+
+            // Selector segmentado: el filete del elegido contra el fondo del grupo, y su texto
+            // sobre su relleno.
+            let group = <Theme as container::Catalog>::style(&theme, &ContainerClass::Segmented);
+            let thumb = <Theme as button::Catalog>::style(
+                &theme,
+                &ButtonClass::SegmentThumb,
+                button::Status::Active,
+            );
+            for (name, plane) in planes {
+                let track = fill(group.background.expect("fondo del grupo"), plane);
+                let chosen = fill(thumb.background.expect("relleno del elegido"), track);
+                assert!(thumb.border.width >= 1.0, "el elegido lleva filete");
+                check(
+                    &mut failures,
+                    &p,
+                    &format!("filete del segmento elegido/{name}"),
+                    flat(thumb.border.color, track),
+                    track,
+                    AA_LARGE,
+                );
+                check(
+                    &mut failures,
+                    &p,
+                    &format!("texto del segmento elegido/{name}"),
+                    flat(thumb.text_color, chosen),
+                    chosen,
+                    AA,
+                );
+                assert_ne!(
+                    chosen, track,
+                    "{mode:?} {accent:?}: el elegido tiene su relleno"
+                );
+            }
+
+            // Interruptor: apagado, encendido y desactivado en las dos posiciones.
+            let switch = |status| <Theme as toggler::Catalog>::style(&theme, &(), status);
+            let off = switch(toggler::Status::Active { is_toggled: false });
+            let on = switch(toggler::Status::Active { is_toggled: true });
+            assert_eq!(off.background_border_width, 0.0);
+            for (name, plane) in planes {
+                let track = fill(off.background, plane);
+                check(
+                    &mut failures,
+                    &p,
+                    &format!("interruptor apagado/{name}"),
+                    track,
+                    plane,
+                    AA_LARGE,
+                );
+                check(
+                    &mut failures,
+                    &p,
+                    &format!("tirador del interruptor apagado/{name}"),
+                    fill(off.foreground, track),
+                    track,
+                    AA_LARGE,
+                );
+                let lit = fill(on.background, plane);
+                check(
+                    &mut failures,
+                    &p,
+                    &format!("tirador del interruptor encendido/{name}"),
+                    fill(on.foreground, lit),
+                    lit,
+                    AA_LARGE,
+                );
+                for is_toggled in [false, true] {
+                    let disabled = switch(toggler::Status::Disabled { is_toggled });
+                    let what = format!("interruptor desactivado ({is_toggled})/{name}");
+                    assert!(
+                        disabled.background_border_width >= 1.0,
+                        "{what}: lleva contorno"
+                    );
+                    check(
+                        &mut failures,
+                        &p,
+                        &format!("contorno de {what}"),
+                        flat(disabled.background_border_color, plane),
+                        plane,
+                        AA_LARGE,
+                    );
+                    let inside = fill(disabled.background, plane);
+                    check(
+                        &mut failures,
+                        &p,
+                        &format!("tirador de {what}"),
+                        fill(disabled.foreground, inside),
+                        inside,
+                        AA_LARGE,
+                    );
+                    // No parece uno apagado que responde: el carril lleno es solo del activo.
+                    assert_ne!(inside, track, "{mode:?} {accent:?} {what}: no es «apagado»");
+                }
+            }
+
+            // Campos: el texto de ejemplo se lee (AA) pero pesa mucho menos que el valor, y en un
+            // campo desactivado no se pinta (se leería como algo escrito).
+            for (status, name) in [
+                (text_input::Status::Active, "campo"),
+                (text_input::Status::Hovered, "campo bajo el ratón"),
+                (text_input::Status::Disabled, "campo desactivado"),
+            ] {
+                let style =
+                    <Theme as text_input::Catalog>::style(&theme, &InputClass::Normal, status);
+                let ground = fill(style.background, p.card);
+                if status == text_input::Status::Disabled {
+                    assert_eq!(style.placeholder.a, 0.0, "{name}: sin texto de ejemplo");
+                    check(
+                        &mut failures,
+                        &p,
+                        &format!("valor/{name}"),
+                        flat(style.value, ground),
+                        ground,
+                        AA,
+                    );
+                    continue;
+                }
+                let placeholder = flat(style.placeholder, ground);
+                check(
+                    &mut failures,
+                    &p,
+                    &format!("texto de ejemplo/{name}"),
+                    placeholder,
+                    ground,
+                    AA,
+                );
+                let value = contrast(flat(style.value, ground), ground);
+                let example = contrast(placeholder, ground);
+                if value < 2.0 * example {
+                    failures.push(format!(
+                        "{mode:?} {accent:?}: el texto de ejemplo ({example:.1}:1) se \
+                         confunde con el valor ({value:.1}:1)"
+                    ));
+                }
+            }
+
+            // El borde de los campos dice dónde están (no tienen relleno propio): 3:1 con su
+            // plano en reposo, bajo el ratón y desactivados; con el foco, el anillo de acento,
+            // más grueso; con un error, el del error. Lo mismo el editor de varias líneas y el
+            // selector desplegable.
+            let input = |class: InputClass, status| {
+                <Theme as text_input::Catalog>::style(&theme, &class, status).border
+            };
+            let editor = |status| {
+                <Theme as text_editor::Catalog>::style(&theme, &EditorClass::Normal, status).border
+            };
+            let select = |status| <Theme as pick_list::Catalog>::style(&theme, &(), status).border;
+            let resting = [
+                (
+                    "campo",
+                    input(InputClass::Normal, text_input::Status::Active),
+                ),
+                (
+                    "campo bajo el ratón",
+                    input(InputClass::Normal, text_input::Status::Hovered),
+                ),
+                (
+                    "campo desactivado",
+                    input(InputClass::Normal, text_input::Status::Disabled),
+                ),
+                ("editor", editor(text_editor::Status::Active)),
+                ("editor bajo el ratón", editor(text_editor::Status::Hovered)),
+                ("editor desactivado", editor(text_editor::Status::Disabled)),
+                ("selector", select(pick_list::Status::Active)),
+                ("selector bajo el ratón", select(pick_list::Status::Hovered)),
+            ];
+            let focused = [
+                (
+                    "campo",
+                    input(
+                        InputClass::Normal,
+                        text_input::Status::Focused { is_hovered: false },
+                    ),
+                ),
+                (
+                    "editor",
+                    editor(text_editor::Status::Focused { is_hovered: false }),
+                ),
+                (
+                    "selector",
+                    select(pick_list::Status::Opened { is_hovered: false }),
+                ),
+            ];
+            for (name, plane) in planes {
+                for (control, border) in resting {
+                    assert!(border.width >= 1.0, "{control}: lleva borde");
+                    check(
+                        &mut failures,
+                        &p,
+                        &format!("borde de {control}/{name}"),
+                        flat(border.color, plane),
+                        plane,
+                        AA_LARGE,
+                    );
+                }
+                for (control, border) in focused {
+                    check(
+                        &mut failures,
+                        &p,
+                        &format!("anillo de foco de {control}/{name}"),
+                        flat(border.color, plane),
+                        plane,
+                        AA_LARGE,
+                    );
+                }
+            }
+            let rest = input(InputClass::Normal, text_input::Status::Active);
+            for (control, border) in focused {
+                assert_eq!(border.color, p.focus.color(), "{control}: anillo de acento");
+                assert!(
+                    border.width > rest.width,
+                    "{control}: el foco se distingue del reposo también por el grosor"
+                );
+            }
+            for status in [
+                text_input::Status::Active,
+                text_input::Status::Focused { is_hovered: false },
+            ] {
+                let invalid = input(InputClass::Invalid, status);
+                assert_eq!(
+                    invalid.color,
+                    p.error.solid.color(),
+                    "el error, en su color"
+                );
+                assert!(
+                    invalid.width > rest.width,
+                    "el error se distingue del reposo"
+                );
+            }
+            // El editor sobre el vídeo: borde contra el panel, con un fotograma claro u oscuro.
+            for status in [text_editor::Status::Active, text_editor::Status::Hovered] {
+                let style =
+                    <Theme as text_editor::Catalog>::style(&theme, &EditorClass::Overlay, status);
+                for (name, video) in [("vídeo blanco", WHITE), ("vídeo negro", p.video_backdrop)]
+                {
+                    let panel = over(p.overlay, p.overlay_alpha, video);
+                    check(
+                        &mut failures,
+                        &p,
+                        &format!("borde del editor sobre el vídeo {status:?}/{name}"),
+                        flat(style.border.color, panel),
+                        panel,
+                        AA_LARGE,
+                    );
+                }
+            }
+            for class in [EditorClass::Normal, EditorClass::Overlay] {
+                let disabled = <Theme as text_editor::Catalog>::style(
+                    &theme,
+                    &class,
+                    text_editor::Status::Disabled,
+                );
+                assert_eq!(
+                    disabled.placeholder.a, 0.0,
+                    "{class:?}: sin texto de ejemplo"
+                );
+            }
+
+            // El punteado de una entrada (y el resto de lo que se dibuja con `outline`).
+            for (name, plane) in planes.into_iter().chain([("riel", p.sidebar)]) {
+                check(
+                    &mut failures,
+                    &p,
+                    &format!("punteado de la entrada/{name}"),
+                    p.outline,
+                    plane,
+                    AA_LARGE,
+                );
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} controles que no se ven:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
 }

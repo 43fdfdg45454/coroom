@@ -1,5 +1,5 @@
 # Textos de la versión nueva (identificadores con el prefijo `update-`): los avisos de Inicio, la
-# fila «Versión nueva» de Ajustes → Acerca de y el aviso de versiones distintas con el servidor.
+# fila «Estado» de las actualizaciones en Ajustes → Acerca de y el aviso de versiones distintas con el servidor.
 
 ## Botones
 update-novedades = Novedades
@@ -38,6 +38,5 @@ update-app-vieja = Tu coroom es más viejo que el servidor
 update-app-vieja-texto = { $host } usa el protocolo { $server } y tu app el { $client }. Actualiza para conectarte.
 update-actualizar-y-reiniciar = Actualizar y reiniciar
 update-descargar-y-actualizar = Descargar y actualizar
-update-porcentaje = { $percent } %
 update-servidor-viejo = El servidor necesita actualizarse
 update-servidor-viejo-texto = { $host } usa el protocolo { $server } y tu app el { $client }. Avísale a quien lo administra que lo actualice; mientras tanto no puedes conectarte a él.

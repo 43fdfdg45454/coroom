@@ -568,6 +568,46 @@ fn relay_line(
     line
 }
 
+/// Por qué se va por el relay, para enseñarlo. Es el motivo que da la sesión, salvo cuando solo
+/// cuenta los candidatos que dieron error («1 de 4 direcciones fallaron», con las otras tres sin
+/// respuesta o sin probar, se lee como si tres hubieran ido bien): entonces se dice que ninguna
+/// sirvió y qué le pasó a cada una, que es lo que enseña la lista de debajo.
+fn relay_why(route: &Route) -> Option<String> {
+    let reason = route.relay_reason.as_ref()?;
+    let count = |wanted: fn(&CandidateOutcome) -> bool| {
+        route
+            .candidates
+            .iter()
+            .filter(|candidate| wanted(&candidate.outcome))
+            .count()
+    };
+    let failed = count(|outcome| matches!(outcome, CandidateOutcome::Failed(_)));
+    let worked = count(|outcome| {
+        matches!(
+            outcome,
+            CandidateOutcome::Connected | CandidateOutcome::Duplicate
+        )
+    });
+    if failed == 0 || worked > 0 {
+        return Some(reason.clone());
+    }
+    let silent = count(|outcome| matches!(outcome, CandidateOutcome::NoResponse));
+    let untried = count(|outcome| matches!(outcome, CandidateOutcome::Cancelled));
+    let mut parts = Vec::new();
+    if silent > 0 {
+        parts.push(t!("diagnostics-motivo-sin-respuesta", n = silent));
+    }
+    parts.push(t!("diagnostics-motivo-con-error", n = failed));
+    if untried > 0 {
+        parts.push(t!("diagnostics-motivo-sin-probar", n = untried));
+    }
+    let detail = parts.join(", ");
+    Some(match route.candidates.len() {
+        1 => t!("diagnostics-motivo-la-unica", detail = detail),
+        total => t!("diagnostics-motivo-ninguna", total = total, detail = detail),
+    })
+}
+
 /// Candidatos, el router y el relay de una ruta.
 fn route_lines(
     candidates: &[CandidateReport],
@@ -922,11 +962,8 @@ fn guest_report(app: &App, out: &mut Vec<String>) {
         path_word(side.route.path)
     ));
     if side.route.path == Some(Path::Relayed) {
-        let reason = side
-            .route
-            .relay_reason
-            .clone()
-            .unwrap_or_else(|| t!("diagnostics-relay-sin-probar").to_owned());
+        let reason =
+            relay_why(&side.route).unwrap_or_else(|| t!("diagnostics-relay-sin-probar").to_owned());
         out.push(format!("{}: {reason}", t!("diagnostics-informe-motivo")));
     }
     if let Some(reconnecting) = &side.reconnecting {
@@ -989,7 +1026,7 @@ fn host_report(app: &App, out: &mut Vec<String>) {
             path_word(status.path)
         ));
         if status.path == Some(Path::Relayed)
-            && let Some(reason) = route.and_then(|route| route.relay_reason.as_ref())
+            && let Some(reason) = route.and_then(relay_why)
         {
             out.push(format!("  {}: {reason}", t!("diagnostics-informe-motivo")));
         }
@@ -1394,7 +1431,7 @@ fn guest_banner<'a>(app: &App) -> Element<'a, Message> {
     }
     match side.route.path {
         Some(Path::Relayed) => {
-            let mut text = match &side.route.relay_reason {
+            let mut text = match relay_why(&side.route) {
                 Some(reason) => t!("diagnostics-relay-motivo", reason = reason),
                 None => t!("diagnostics-relay-sin-probar").to_owned(),
             };
@@ -1692,7 +1729,7 @@ fn host_body<'a>(app: &'a App) -> Vec<Element<'a, Message>> {
         .align_y(Alignment::Center);
         let mut block = column![rule::horizontal(1), heading].spacing(gap::S);
         if status.path == Some(Path::Relayed)
-            && let Some(reason) = route.and_then(|route| route.relay_reason.as_ref())
+            && let Some(reason) = route.and_then(relay_why)
         {
             block = block.push(
                 ui::secondary(t!("diagnostics-relay-motivo", reason = reason))
@@ -2175,6 +2212,14 @@ mod tests {
         assert_eq!(guest.route.path, Some(Path::Relayed));
         assert_eq!(guest.route.candidates.len(), 4);
         assert!(guest.route.relay_reason.is_some());
+        // Una dio error, dos no respondieron y una quedó sin probar: ninguna sirvió, y se dice
+        // así, no «1 de 4 direcciones fallaron».
+        assert_eq!(
+            relay_why(&guest.route).as_deref(),
+            Some(
+                "ninguna de las 4 direcciones sirvió (2 sin respuesta, 1 con error, 1 sin probar)"
+            )
+        );
         assert!(guest.route.tried_at.is_some());
         assert_eq!(
             guest.route.probe,

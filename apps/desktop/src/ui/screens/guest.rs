@@ -1785,38 +1785,23 @@ fn waiting_header<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     .into()
 }
 
-/// La lámpara de la butaca propia: el enlace con el anfitrión. Verde si la ruta es directa,
-/// ámbar si va por el relay, apagada mientras se reconecta; sin conexión todavía, ninguna.
-fn own_lamp(state: &State) -> Option<Tone> {
-    if state.reconnecting.is_some() {
-        return Some(Tone::Neutral);
-    }
-    state.path.map(|path| match path {
-        Path::Direct => Tone::Success,
-        Path::Relayed => Tone::Warning,
-    })
-}
-
-/// Quién ocupa cada butaca de la sala, en su orden: quien aloja primero y los demás como
-/// llegaron. La propia aparece cuando la conexión con el anfitrión está hecha (se enciende) y
-/// lleva la lámpara de su ruta ([`own_lamp`]); de los demás este equipo no conoce el enlace, así
-/// que van sin lámpara. Quien habla lleva el anillo. Antes de la lista de la sala se sabe, como
-/// mucho, quién aloja y que uno mismo ha entrado.
-fn room_seats<'a>(app: &'a App, state: &'a State) -> Vec<Seated<'a>> {
-    let lamp = own_lamp(state);
+/// Quién se sabe que está en la sala, en su orden: quien aloja primero y los demás como
+/// llegaron. Solo personas conocidas: el invitado no sabe cuántas caben, así que no hay butacas
+/// libres. Tampoco lámparas de enlace: este equipo solo conoce el suyo, que se dice en palabras
+/// (el paso de la conexión al entrar, el resumen de «Personas»). Quien habla lleva el anillo.
+/// `with_you`: con la butaca propia (cuando la conexión con el anfitrión está hecha); la sala de
+/// espera la dibuja aparte ([`own_place`]). Antes de la lista de la sala se sabe, como mucho,
+/// quién aloja y que uno mismo ha entrado.
+fn room_seats<'a>(app: &'a App, state: &'a State, with_you: bool) -> Vec<Seated<'a>> {
+    let with_you = with_you && state.path.is_some();
     if state.members.is_empty() {
         let mut seats = Vec::new();
         if let Some(host) = state.host_name.as_deref() {
             seats.push(Seated::new(host));
         }
-        if state.path.is_some()
-            && let Some(account) = app.account.as_ref()
-        {
-            seats.push(
-                Seated::new(&account.display_name)
-                    .picture(avatars::of(app, account.avatar))
-                    .lamp(lamp),
-            );
+        if with_you && let Some(account) = app.account.as_ref() {
+            seats
+                .push(Seated::new(&account.display_name).picture(avatars::of(app, account.avatar)));
         }
         return seats;
     }
@@ -1824,15 +1809,51 @@ fn room_seats<'a>(app: &'a App, state: &'a State) -> Vec<Seated<'a>> {
     members.sort_by_key(|member| (member.guest != 0, member.guest));
     members
         .into_iter()
-        .filter(|member| !member.you || state.path.is_some())
+        .filter(|member| !member.you || with_you)
         .map(|member| {
             let picture = avatars::of_member(app, member.guest, member.you).or(member.avatar);
             Seated::new(&member.name)
                 .picture(avatars::of(app, picture))
-                .lamp(if member.you { lamp } else { None })
                 .talking(member_talks(state, member))
         })
         .collect()
+}
+
+/// Tu sitio en la sala de espera, al final de la fila (quien entra es el último en llegar): una
+/// butaca en contorno, sin número, con «Tú» debajo, que se ocupa (tu butaca, con tu color o tu
+/// foto) al completarse la conexión con el anfitrión. Mide lo mismo que las demás de la fila.
+fn own_place<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
+    let side = seat::ROW;
+    let name = app
+        .account
+        .as_ref()
+        .map(|account| account.display_name.as_str())
+        .or_else(|| {
+            state
+                .members
+                .iter()
+                .find(|member| member.you)
+                .map(|member| member.name.as_str())
+        });
+    let seat: Element<'a, Message> = match name.filter(|_| state.path.is_some()) {
+        Some(name) => avatars::view(app, name, avatars::of_member(app, 0, true), side),
+        None => container(iced_widget::Space::new())
+            .width(Length::Fixed(side))
+            .height(Length::Fixed(side))
+            .class(ContainerClass::SeatEmpty {
+                side,
+                on: coroom_ui::style::Surface::Window,
+            })
+            .into(),
+    };
+    column![
+        container(seat).padding(coroom_ui::avatar::RING_PADDING),
+        ui::caption(t!("room-tu")).wrapping(Wrapping::None),
+    ]
+    .spacing(space::XXS)
+    .width(Length::Fixed(seat::LABEL))
+    .align_x(Alignment::Center)
+    .into()
 }
 
 /// El texto del aviso de reconexión: la cuenta atrás y el intento.
@@ -1857,12 +1878,21 @@ fn reconnect_text(app: &App, reconnecting: &Reconnecting) -> String {
 /// Ancho máximo de la columna de la sala de espera.
 const WAITING_WIDTH: f32 = size::NARROW + 80.0;
 
-/// Lo que ocupa una fila de butacas con los nombres debajo y `people` personas (con las libres
-/// hasta el mínimo), sin pasar de `max`: para centrarla, que una fila que envuelve no se encoge
-/// sola a lo que ocupan sus butacas.
+/// Lo que ocupa una fila de butacas con los nombres debajo y `people` personas, sin pasar de
+/// `max`: para centrarla, que una fila que envuelve no se encoge sola a lo que ocupan sus
+/// butacas.
 fn named_row_width(people: usize, max: f32) -> f32 {
-    let seats = people.max(seat::ROW_MIN) as f32;
-    (seats * seat::LABEL + (seats - 1.0) * space::XS).min(max)
+    if people == 0 {
+        return 0.0;
+    }
+    let seats = people as f32;
+    (seats * seat::LABEL + (seats - 1.0) * space::XS).min(max.max(seat::LABEL))
+}
+
+/// La fila de butacas de una sala ajena con los nombres debajo: solo quienes están, sin butacas
+/// libres.
+fn named_seats(on: coroom_ui::style::Surface) -> SeatRow {
+    SeatRow::default().min(0).names(SeatNames::Below).on(on)
 }
 
 fn connecting<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
@@ -1908,16 +1938,16 @@ fn connecting<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         ),
         step(video, t!("room-video"), state.codec.clone(), None),
     ]);
-    // La sala a la que se entra: su código en señalética (si se entró con uno) y sus butacas,
-    // con los nombres debajo. La de quien aloja se ocupa al saber quién es; la propia, al
-    // completarse la conexión.
+    // La sala a la que se entra: su código en señalética (si se entró con uno) y quien ya se
+    // sabe que está, con los nombres debajo: quien aloja en cuanto se sabe quién es, los demás
+    // si ya llegó la lista y, al final, tu sitio, que se ocupa al completarse la conexión.
     let mut heading = row![ui::title(t!("room-entrando-en-la-sala"))]
         .spacing(space::S)
         .align_y(Alignment::Center);
     if !state.code.trim().is_empty() {
         heading = heading.push(ui::code_cells(&state.code, CodeSize::Small));
     }
-    let people = room_seats(app, state);
+    let people = room_seats(app, state, false);
     // Lo que queda para la columna junto al riel y, si está abierto, el chat.
     let chat_width = if state.panel == Some(Tab::Chat) {
         size::STATS_PANEL
@@ -1926,14 +1956,26 @@ fn connecting<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     };
     let room = (app.window.width - video_left(app) - chat_width - 2.0 * space::L)
         .clamp(seat::LABEL, WAITING_WIDTH);
-    let seats = container(seat_row(
-        &app.theme,
-        &people,
-        SeatRow::default()
-            .names(SeatNames::Below)
-            .on(coroom_ui::style::Surface::Window),
-    ))
-    .width(Length::Fixed(named_row_width(people.len(), room)));
+    let others = (!people.is_empty()).then(|| {
+        container(seat_row(
+            &app.theme,
+            &people,
+            named_seats(coroom_ui::style::Surface::Window),
+        ))
+        .width(Length::Fixed(named_row_width(
+            people.len(),
+            room - seat::LABEL - space::XS,
+        )))
+        .into()
+    });
+    let mut seats = iced_widget::Row::new()
+        .spacing(space::XS)
+        .align_y(Alignment::Start);
+    if let Some(others) = others {
+        let others: Element<'a, Message> = others;
+        seats = seats.push(others);
+    }
+    let seats = seats.push(own_place(app, state));
     let header = column![heading.wrap(), seats]
         .spacing(space::M)
         .width(Length::Fill)
@@ -1960,14 +2002,7 @@ fn connecting<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
         .push(header)
         .push(above(space::M, steps))
         .push(ui::slot(state.reconnecting.as_ref().map(|reconnecting| {
-            above(
-                space::M,
-                ui::banner(
-                    Tone::Warning,
-                    reconnect_text(app, reconnecting),
-                    Some((t!("room-reintentar-ya"), on(Msg::Reconnect))),
-                ),
-            )
+            above(space::M, reconnect_banner(app, reconnecting))
         })))
         .push(ui::slot(
             state
@@ -2009,39 +2044,15 @@ fn connecting<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     stack![page, ui::slot(bubbles)].into()
 }
 
-/// El aviso de reconexión sobre el vídeo, con el oscuro de la barra en los dos modos: la lámpara
-/// ámbar, lo que pasa en palabras y «Reintentar ya».
-fn reconnect_notice<'a>(app: &'a App, reconnecting: &'a Reconnecting) -> Element<'a, Message> {
-    container(
-        row![
-            ui::dot(Tone::Warning),
-            text(reconnect_text(app, reconnecting))
-                .size(type_size::BODY)
-                .class(TextClass::Overlay)
-                .width(Length::Fill)
-                .wrapping(Wrapping::WordOrGlyph),
-            button(
-                text(t!("room-reintentar-ya"))
-                    .size(type_size::BODY)
-                    .font(coroom_ui::font::SEMIBOLD)
-                    .wrapping(Wrapping::None)
-            )
-            .padding(Padding::from([6.0, 12.0]))
-            .class(ButtonClass::Overlay { active: false })
-            .on_press(on(Msg::Reconnect)),
-        ]
-        .spacing(space::S)
-        .align_y(Alignment::Center),
+/// El aviso de reconexión, en la sala de espera y sobre el vídeo: el aviso en línea de siempre
+/// (fondo ámbar opaco con su icono, que se lee sobre cualquier imagen en los dos modos y no se
+/// confunde con la barra), con lo que pasa en palabras y «Reintentar ya».
+fn reconnect_banner<'a>(app: &'a App, reconnecting: &'a Reconnecting) -> Element<'a, Message> {
+    ui::banner(
+        Tone::Warning,
+        reconnect_text(app, reconnecting),
+        Some((t!("room-reintentar-ya"), on(Msg::Reconnect))),
     )
-    .padding(Padding {
-        top: space::XS,
-        right: space::XS,
-        bottom: space::XS,
-        left: space::M,
-    })
-    .width(Length::Fill)
-    .class(ContainerClass::Overlay)
-    .into()
 }
 
 // --- Sobre el vídeo -------------------------------------------------------------------------------
@@ -2066,6 +2077,31 @@ fn bar_button<'a>(
             .on_press(message),
         tip,
     )
+}
+
+/// Botón de la barra o del panel de algo que se apaga (el micrófono, el sonido, el vídeo, la voz
+/// de alguien). Apagado (`off`) lleva su icono tachado sobre un velo neutro, nunca el relleno de
+/// acento: ese queda para «panel o menú abierto» y «opción activa» (`active`), así el mismo
+/// relleno no quiere decir dos cosas. El velo tiene su sitio siempre: apagar no mueve nada.
+fn bar_switch<'a>(
+    glyph: Icon,
+    tip: impl text::IntoFragment<'a>,
+    off: bool,
+    active: bool,
+    message: Message,
+) -> Element<'a, Message> {
+    stack![
+        container(iced_widget::Space::new())
+            .width(Length::Fixed(size::CONTROL))
+            .height(Length::Fixed(size::CONTROL))
+            .class(if off && !active {
+                ContainerClass::OverlaySegmented
+            } else {
+                ContainerClass::Transparent
+            }),
+        bar_button(glyph, tip, active, message),
+    ]
+    .into()
 }
 
 fn overlay_text<'a>(
@@ -2161,7 +2197,7 @@ fn voice_group<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     let game_muted = stats_now.is_some_and(|s| s.game_muted);
     let keys = &app.settings.input.shortcuts;
     let mic = voice.then(|| {
-        bar_button(
+        bar_switch(
             if mic_muted { Icon::MicOff } else { Icon::Mic },
             if mic_muted {
                 t!("room-activar-el-microfono", key = keys.mic)
@@ -2169,20 +2205,22 @@ fn voice_group<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
                 t!("room-silenciar-el-microfono", key = keys.mic)
             },
             mic_muted,
+            false,
             on(Msg::ToggleMic),
         )
     });
-    let sound = bar_button(
+    let sound = bar_switch(
         if game_muted {
             Icon::VolumeOff
         } else {
             Icon::Volume
         },
         t!("room-sonido-del-juego-tip", key = keys.game),
+        game_muted,
         state.sound_menu,
         on(Msg::ToggleSoundMenu),
     );
-    let video = bar_button(
+    let video = bar_switch(
         if state.video_off {
             Icon::MonitorOff
         } else {
@@ -2194,6 +2232,7 @@ fn voice_group<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
             t!("room-apagar-el-video", key = keys.video)
         },
         state.video_off,
+        false,
         on(Msg::ToggleVideo),
     );
     bar_group(vec![
@@ -2396,7 +2435,7 @@ fn stage<'a>(
     detail: String,
     action: Option<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    let people = room_seats(app, state);
+    let people = room_seats(app, state, true);
     // Con el panel abierto, todo se centra en lo que queda a su izquierda (como el aviso de
     // abajo): el panel va encima del plano y no debe tapar lo que se lee.
     let beside_panel = if state.panel.is_some() && !state.immersive {
@@ -2412,9 +2451,7 @@ fn stage<'a>(
     let seats = container(seat_row(
         &app.theme,
         &people,
-        SeatRow::default()
-            .names(SeatNames::Below)
-            .on(coroom_ui::style::Surface::Overlay),
+        named_seats(coroom_ui::style::Surface::Overlay),
     ))
     .width(Length::Fixed(row_width));
     // Lo que dice el anillo, en palabras, en una línea con su sitio guardado: que alguien
@@ -2975,7 +3012,7 @@ fn stat_section<'a>(title: &str, rows: Vec<Element<'a, Message>>) -> Element<'a,
 /// Botón de silenciar lo que regula un deslizador, delante de su raíl: altavoz (suena) o altavoz
 /// tachado (silenciado), con «Silenciar» / «Activar sonido».
 fn mute_button<'a>(muted: bool, message: Message) -> Element<'a, Message> {
-    bar_button(
+    bar_switch(
         if muted { Icon::VolumeOff } else { Icon::Volume },
         if muted {
             t!("room-activar-sonido")
@@ -2983,6 +3020,7 @@ fn mute_button<'a>(muted: bool, message: Message) -> Element<'a, Message> {
             t!("room-silenciar")
         },
         muted,
+        false,
         message,
     )
 }
@@ -3018,10 +3056,30 @@ fn member_order(member: &RoomMember) -> u8 {
 /// Lado del avatar en «Personas».
 const MEMBER_AVATAR: f32 = 28.0;
 
-/// Una persona de «Personas», en su caja de alto fijo: su butaca (con el anillo si habla y, la
-/// propia, con la lámpara de su ruta), su nombre, su papel con «Hablando» en una ranura
-/// reservada, el número de seguridad (del anfitrión, con quien va el cifrado; su sitio queda en
-/// todas las filas) y su volumen debajo.
+/// Lo que el anfitrión te deja hacer, en palabras, para tu fila de «Personas»: teclado y ratón,
+/// el mando con su ranura y la voz; o que solo puedes mirar. `None` hasta que llegan las
+/// estadísticas (con ellas vienen los permisos).
+fn own_permissions(state: &State) -> Option<String> {
+    let stats = state.stats.as_ref()?;
+    let allowed = stats.allowed;
+    let input = allowed.keyboard_mouse || allowed.gamepad_slot.is_some();
+    let voice = stats.voice || stats.mic_muted;
+    Some(match (input, voice) {
+        (false, false) => t!("room-solo-puedes-mirar").to_owned(),
+        (false, true) => t!("room-puedes-usar", label = t!("room-voz")),
+        (true, false) => t!("room-puedes-usar", label = allowed.label()),
+        (true, true) => t!(
+            "room-puedes-usar",
+            label = format!("{}, {}", allowed.label(), t!("room-voz"))
+        ),
+    })
+}
+
+/// Una persona de «Personas»: su butaca (con el anillo si habla), su nombre, su papel con
+/// «Hablando» en una ranura reservada, el número de seguridad (del anfitrión, con quien va el
+/// cifrado; su sitio queda en todas las filas) y su volumen debajo. Las de los demás, en cajas de
+/// alto fijo. La propia lleva además, a todo el ancho y entera (sin acortar), lo que el anfitrión
+/// te deja hacer; mide lo que ocupe, que va sola en su sección.
 fn person_view<'a>(app: &'a App, state: &'a State, member: &'a RoomMember) -> Element<'a, Message> {
     let talks = member_talks(state, member);
     let role = if member.guest == 0 {
@@ -3054,26 +3112,19 @@ fn person_view<'a>(app: &'a App, state: &'a State, member: &'a RoomMember) -> El
         )
     });
     let picture = avatars::of_member(app, member.guest, member.you).or(member.avatar);
+    let texts = column![
+        text(ui::ellipsize(&name, PERSON_NAME_MAX).into_owned())
+            .size(type_size::BODY)
+            .font(coroom_ui::font::SEMIBOLD)
+            .class(TextClass::Overlay)
+            .wrapping(Wrapping::None),
+        facts,
+    ]
+    .spacing(2)
+    .width(Length::Fill);
     let head = row![
-        coroom_ui::avatar::ringed_lamp(
-            &app.theme,
-            &member.name,
-            avatars::of(app, picture),
-            MEMBER_AVATAR,
-            talks,
-            member.you.then(|| own_lamp(state)).flatten(),
-            coroom_ui::style::Surface::Overlay,
-        ),
-        column![
-            text(ui::ellipsize(&name, PERSON_NAME_MAX).into_owned())
-                .size(type_size::BODY)
-                .font(coroom_ui::font::SEMIBOLD)
-                .class(TextClass::Overlay)
-                .wrapping(Wrapping::None),
-            facts,
-        ]
-        .spacing(2)
-        .width(Length::Fill),
+        avatars::ringed_view(app, &member.name, picture, MEMBER_AVATAR, talks),
+        texts,
         ui::reserved(size::CONTROL, size::CONTROL, safety),
     ]
     .spacing(space::XS)
@@ -3083,6 +3134,18 @@ fn person_view<'a>(app: &'a App, state: &'a State, member: &'a RoomMember) -> El
     } else {
         volume_row(state, member)
     };
+    if member.you {
+        let permissions = own_permissions(state).map(|permissions| {
+            overlay_text(permissions)
+                .size(type_size::CAPTION)
+                .wrapping(Wrapping::WordOrGlyph)
+                .into()
+        });
+        return column![head, ui::slot(permissions), volume]
+            .spacing(space::XXS)
+            .width(Length::Fill)
+            .into();
+    }
     container(column![head, volume].spacing(space::XS))
         .width(Length::Fill)
         .height(Length::Fixed(PERSON_HEIGHT))
@@ -3108,7 +3171,7 @@ fn own_volume_row<'a>(app: &App, state: &State) -> Element<'a, Message> {
         percent,
         5,
         DEFAULT_VOICE_VOLUME,
-        Some(bar_button(
+        Some(bar_switch(
             if muted { Icon::MicOff } else { Icon::Mic },
             if muted {
                 t!("room-activar-tu-microfono")
@@ -3116,6 +3179,7 @@ fn own_volume_row<'a>(app: &App, state: &State) -> Element<'a, Message> {
                 t!("room-silenciarte")
             },
             muted,
+            false,
             on(Msg::ToggleMic),
         )),
         t!("room-volumen-porcentaje", percent = percent),
@@ -3145,7 +3209,8 @@ fn volume_row<'a>(state: &State, member: &RoomMember) -> Element<'a, Message> {
     )
 }
 
-/// Cuántos hay en la sala y, en palabras, lo que dice la lámpara de la butaca propia.
+/// Cuántos hay en la sala y, en palabras, cómo va tu conexión con quien aloja (directa, por el
+/// servidor o reconectando): en la fila de butacas no hay lámparas de enlace.
 fn room_summary(state: &State) -> String {
     let count = state.members.len();
     if state.reconnecting.is_some() {
@@ -3158,16 +3223,20 @@ fn room_summary(state: &State) -> String {
     }
 }
 
-/// Pestaña «Personas»: abre con la fila de butacas de la sala (quien aloja primero, la propia con
-/// la lámpara de su ruta, el anillo en quien habla y las libres numeradas) y debajo, cómo se oye
-/// a cada uno. Primero la voz propia: lo alto que te oyen los demás, con el micrófono que te
+/// Pestaña «Personas»: abre con la fila de butacas de quienes están en la sala (quien aloja
+/// primero, el anillo en quien habla; sin butacas libres, que el invitado no sabe cuántas caben)
+/// con el resumen de tu conexión en palabras y debajo, cómo se oye a cada uno. Primero la voz propia: lo alto que te oyen los demás, con el micrófono que te
 /// silencia para todos. Después los demás, con quien aloja delante: el deslizador es lo alto que
 /// se le oye en este equipo y el altavoz deja de oírle aquí (los demás le siguen oyendo).
 fn people_tab<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     let mut content = Column::new()
         .spacing(space::M)
         .padding(Padding::from([space::S, space::M]));
-    let seats = seat_row(&app.theme, &room_seats(app, state), SeatRow::overlay());
+    let seats = seat_row(
+        &app.theme,
+        &room_seats(app, state, true),
+        SeatRow::overlay().min(0),
+    );
     if state.members.is_empty() {
         content = content
             .push(column![seats, overlay_text(t!("room-esperando-la-lista"))].spacing(space::XS));
@@ -3316,10 +3385,7 @@ fn connection_tab<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
                     None => route_label(path).to_owned(),
                 },
                 Tone::Warning,
-                match &state.relay_reason {
-                    Some(reason) => capitalize(reason),
-                    None => t!("room-por-el-relay-del-servidor").to_owned(),
-                },
+                t!("room-relay-en-llano").to_owned(),
             ),
         };
         link_rows.push(
@@ -3337,6 +3403,11 @@ fn connection_tab<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
             .into(),
         );
         link_rows.push(note(meaning));
+        if path == Path::Relayed
+            && let Some(reason) = &state.relay_reason
+        {
+            link_rows.push(note(capitalize(reason)));
+        }
     }
     if let Some(link) = summary.and_then(|summary| summary.link.as_ref()) {
         link_rows.push(stat_row(
@@ -3572,7 +3643,7 @@ fn video<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
     let bar = bar_hidden.map(|hidden| {
         let reconnect = state.reconnecting.as_ref().map(|reconnecting| {
             container(
-                container(reconnect_notice(app, reconnecting))
+                container(reconnect_banner(app, reconnecting))
                     .center_x(Length::Fill)
                     .max_width(640),
             )
@@ -3982,6 +4053,7 @@ pub(crate) mod shots {
         if let Some(state) = app.guest.as_mut() {
             state.path = None;
         }
+        chat_members(app);
         chat::shots::conversation(app);
         app.update(Message::Guest(Msg::TogglePanel(Tab::Chat)));
         app.chat.composing = false;
@@ -4101,6 +4173,11 @@ pub(crate) mod shots {
     /// sala».
     pub(crate) fn guest_away_home(app: &mut App) {
         video(app);
+        // Bea aloja la sala en la que estás: en Inicio sale «En sala», como lo diría el servidor.
+        app.update(Message::Event(Event::Activity {
+            user: 2,
+            activity: coroom_transport::proto::signal::Activity::Hosting,
+        }));
         app.update(Message::Navigate(Page::Home));
         app.page_change = None;
     }
@@ -4236,6 +4313,31 @@ pub(crate) mod shots {
                 _ => 4,
             },
             avatar: crate::ui::shots::sample_avatar(name),
+        }
+    }
+
+    /// En las capturas, quien aloja es la misma persona que en el resto de pantallas (su avatar
+    /// de ejemplo, el de la lista de amigos): si la escena entró en una sala y no puso la lista
+    /// de la sala, se pone la mínima, quien aloja y uno mismo. Sin pasar por `Members`, que
+    /// escribiría en el chat quién entra. Lo llama el montaje de las escenas, no los ayudantes
+    /// que usan las pruebas.
+    pub(crate) fn known_host(app: &mut App) {
+        let you = app
+            .account
+            .as_ref()
+            .map(|account| account.display_name.clone());
+        let Some(state) = app.guest.as_mut() else {
+            return;
+        };
+        if !state.members.is_empty() {
+            return;
+        }
+        let Some(host) = state.host_name.clone() else {
+            return;
+        };
+        state.members = vec![member(0, 0, &host, false)];
+        if let Some(you) = you {
+            state.members.push(member(1, 1, &you, true));
         }
     }
 
@@ -5932,30 +6034,32 @@ mod tests {
         assert_eq!(app.settings.audio.game_volume, 70);
     }
 
-    /// La fila de butacas de la sala: quien aloja primero y los demás como llegaron. La propia
-    /// se enciende al completarse la conexión y lleva la lámpara de su ruta (verde directa, ámbar
-    /// por el relay, apagada mientras se reconecta), dicha también en palabras; de los demás
-    /// este equipo no conoce el enlace, así que van sin lámpara.
+    /// La fila de butacas de una sala ajena: solo quienes se sabe que están (quien aloja primero
+    /// y los demás como llegaron), sin butacas libres ni lámparas de enlace. La propia entra al
+    /// completarse la conexión; cómo va esa conexión se dice en palabras.
     #[test]
-    fn your_seat_lights_up_with_the_link_and_the_host_sits_first() {
+    fn the_seat_row_only_shows_who_is_known_and_says_your_link_in_words() {
         let mut app = app();
         shots::joined(&mut app, false, false);
-        let seats = |app: &App| -> Vec<(String, Option<Tone>)> {
+        let seats = |app: &App, with_you: bool| -> Vec<String> {
             let state = app.guest.as_ref().expect("invitado");
-            room_seats(app, state)
-                .iter()
-                .map(|person| (person.name.to_owned(), person.lamp))
-                .collect()
+            let seats = room_seats(app, state, with_you);
+            assert!(
+                seats.iter().all(|person| person.lamp.is_none()),
+                "sin lámparas de enlace"
+            );
+            seats.iter().map(|person| person.name.to_owned()).collect()
         };
-        let sits = |name: &str, lamp: Option<Tone>| (name.to_owned(), lamp);
         let you = app.account.as_ref().expect("cuenta").display_name.clone();
         // Antes de la lista: quien aloja y, con la conexión hecha, uno mismo.
+        assert_eq!(seats(&app, true), ["Bea".to_owned(), you]);
         assert_eq!(
-            seats(&app),
-            [sits("Bea", None), sits(&you, Some(Tone::Success))]
+            seats(&app, false),
+            ["Bea"],
+            "la sala de espera te pinta aparte"
         );
         app.guest.as_mut().expect("invitado").path = None;
-        assert_eq!(seats(&app), [sits("Bea", None)], "sin conexión, sin butaca");
+        assert_eq!(seats(&app, true), ["Bea"], "sin conexión, sin butaca");
         // Con la lista (llega desordenada): quien aloja, y los demás por orden de llegada.
         let member = |guest: u32, name: &str, you: bool| RoomMember {
             guest,
@@ -5970,23 +6074,17 @@ mod tests {
             member(1, "Ana", true),
             member(0, "Bea", false),
         ]))));
-        assert_eq!(seats(&app), [sits("Bea", None), sits("Carla", None)]);
+        assert_eq!(seats(&app, true), ["Bea", "Carla"]);
         app.update(Message::Event(Event::Guest(SessionEvent::Connected {
             path: Path::Relayed,
             remote: "192.0.2.10:4433".parse().expect("dirección"),
         })));
-        assert_eq!(
-            seats(&app),
-            [
-                sits("Bea", None),
-                sits("Ana", Some(Tone::Warning)),
-                sits("Carla", None)
-            ]
-        );
+        assert_eq!(seats(&app, true), ["Bea", "Ana", "Carla"]);
+        assert_eq!(seats(&app, false), ["Bea", "Carla"]);
         let state = app.guest.as_ref().expect("invitado");
         assert_eq!(
             room_summary(state),
-            "3 en la sala · tu conexión va por el relay"
+            "3 en la sala · tu conexión va por el servidor (relay)"
         );
         app.update(Message::Event(Event::Guest(SessionEvent::Reconnecting {
             attempt: 1,
@@ -5994,20 +6092,62 @@ mod tests {
             retry_in: Duration::from_secs(3),
             reason: "la red dejó de responder".to_owned(),
         })));
-        assert_eq!(seats(&app)[1], sits("Ana", Some(Tone::Neutral)));
+        let state = app.guest.as_ref().expect("invitado");
+        assert_eq!(
+            room_summary(state),
+            "3 en la sala · reconectando con el anfitrión"
+        );
         app.update(Message::Event(Event::Guest(SessionEvent::Reconnected {
             path: Path::Direct,
         })));
-        assert_eq!(seats(&app)[1], sits("Ana", Some(Tone::Success)));
         let state = app.guest.as_ref().expect("invitado");
         assert_eq!(room_summary(state), "3 en la sala · tu conexión es directa");
-        // La fila con los nombres debajo mide lo que sus butacas (cuatro como poco) y no pasa
-        // del ancho que le dejan.
-        let four = 4.0 * seat::LABEL + 3.0 * space::XS;
-        assert_eq!(named_row_width(2, 1000.0), four);
-        assert_eq!(named_row_width(4, 1000.0), four);
-        assert!(named_row_width(6, 1000.0) > four);
+        // La fila con los nombres debajo mide lo que sus butacas (ninguna libre) y no pasa del
+        // ancho que le dejan.
+        assert_eq!(named_row_width(0, 1000.0), 0.0);
+        assert_eq!(named_row_width(1, 1000.0), seat::LABEL);
+        assert_eq!(
+            named_row_width(3, 1000.0),
+            3.0 * seat::LABEL + 2.0 * space::XS
+        );
         assert_eq!(named_row_width(6, 300.0), 300.0);
+        assert_eq!(named_seats(coroom_ui::style::Surface::Window).min, 0);
+    }
+
+    /// Tu fila de «Personas» dice lo que el anfitrión te deja hacer, con los permisos de verdad.
+    #[test]
+    fn your_row_says_what_the_host_lets_you_do() {
+        let mut app = watching();
+        let set = |app: &mut App, keyboard_mouse: bool, slot: Option<u8>, voice: bool| {
+            let stats = app
+                .guest
+                .as_mut()
+                .and_then(|state| state.stats.as_mut())
+                .expect("estadísticas");
+            stats.allowed.keyboard_mouse = keyboard_mouse;
+            stats.allowed.gamepad_slot = slot;
+            stats.voice = voice;
+            stats.mic_muted = false;
+            own_permissions(app.guest.as_ref().expect("invitado"))
+        };
+        assert_eq!(
+            set(&mut app, true, Some(2), true).as_deref(),
+            Some("Puedes usar: teclado y ratón, mando en ranura 2, voz")
+        );
+        assert_eq!(
+            set(&mut app, true, None, false).as_deref(),
+            Some("Puedes usar: teclado y ratón")
+        );
+        assert_eq!(
+            set(&mut app, false, None, true).as_deref(),
+            Some("Puedes usar: voz")
+        );
+        assert_eq!(
+            set(&mut app, false, None, false).as_deref(),
+            Some("Solo puedes mirar y escuchar")
+        );
+        app.guest.as_mut().expect("invitado").stats = None;
+        assert_eq!(own_permissions(app.guest.as_ref().expect("invitado")), None);
     }
 
     /// Sin imagen, la barra dice «Solo voz» en lugar de lo que llega: con el vídeo apagado y

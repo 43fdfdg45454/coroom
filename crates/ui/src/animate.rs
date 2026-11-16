@@ -958,10 +958,21 @@ impl<M> iced_core::Widget<M, Theme, Renderer> for Switch<'_, M> {
             iced_core::Background::Gradient(_) => iced_core::Color::TRANSPARENT,
         };
         let bounds = layout.bounds();
+        // El contorno del carril (el de un interruptor desactivado) va con el estilo, como el
+        // fondo: mezclado entre apagado y encendido.
+        let mix_width = |off: f32, on: f32| off + (on - off) * position.clamp(0.0, 1.0);
         renderer.fill_quad(
             renderer::Quad {
                 bounds,
-                border: iced_core::border::rounded(bounds.height / 2.0),
+                border: iced_core::Border {
+                    color: crate::style::mix(
+                        off.background_border_color,
+                        on.background_border_color,
+                        position,
+                    ),
+                    width: mix_width(off.background_border_width, on.background_border_width),
+                    radius: iced_core::border::radius(bounds.height / 2.0),
+                },
                 ..renderer::Quad::default()
             },
             crate::style::mix(color(off.background), color(on.background), position),

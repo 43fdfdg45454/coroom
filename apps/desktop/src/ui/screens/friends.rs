@@ -259,6 +259,17 @@ pub(crate) fn updated(app: &App) -> Option<String> {
     Some(t!("home-updated", ago = super::settings::ago_secs(elapsed)))
 }
 
+/// De cuándo es lo último que se supo de los amigos, para decirlo sin conexión con el servidor:
+/// como [`updated`], pero sin «ahora mismo», que junto a «sin conexión» se contradice.
+pub(crate) fn last_known(app: &App) -> Option<String> {
+    let at = app.home.friends_updated?;
+    if app.now.saturating_duration_since(at).as_secs() < 60 {
+        Some(t!("home-updated-moments").to_owned())
+    } else {
+        updated(app)
+    }
+}
+
 /// Dibuja la página.
 pub fn view<'a>(app: &'a App) -> Element<'a, Message> {
     let state = &app.friends_page;
@@ -268,7 +279,7 @@ pub fn view<'a>(app: &'a App) -> Element<'a, Message> {
     let stale = home::server_down(app);
     let count: Option<Element<'a, Message>> = app.friends.loaded().map(|friends| {
         let online = friends.friends.iter().any(|friend| friend.online);
-        let text = match updated(app).filter(|_| stale) {
+        let text = match last_known(app).filter(|_| stale) {
             Some(updated) => format!("{} · {updated}", summary(friends)),
             None => summary(friends),
         };
