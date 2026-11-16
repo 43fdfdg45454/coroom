@@ -59,7 +59,7 @@ base64 = { version = "=0.23.1", default-features = false, features = ["std"] }
 criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
 # Servidor y red.
-tokio = { version = "=1.53.2", default-features = false }
+tokio = { version = "=1.53.3", default-features = false }
 quinn = { version = "=0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
 # Solo para nombrar `RttEstimator` en el controlador de congestión propio (misma versión que quinn).
 quinn-proto = { version = "=0.11.19", default-features = false }
@@ -158,7 +158,7 @@ reis = { version = "=0.7.1", default-features = false }
 evdev = { version = "=0.13.2", default-features = false }
 gilrs = { version = "=0.11.2", default-features = false, features = ["wgi"] }
 # `CLOCK_MONOTONIC` para las marcas de tiempo de EI (la misma versión que usa `reis`).
-rustix = { version = "=1.1.5", default-features = false, features = ["std", "time", "event"] }
+rustix = { version = "=1.1.6", default-features = false, features = ["std", "time", "event"] }
 # El mapa XKB que anuncia el teclado de EI: qué tecla y qué nivel dan cada carácter del texto sin
 # tecla física (`InputEvent::Text`). Enlaza con la libxkbcommon del sistema (y de la Platform del
 # Flatpak).
