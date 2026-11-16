@@ -9,6 +9,23 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Añadido
 
+- **El mando que no llega al juego se explica, a los dos lados** (protocolo 24; hay que actualizar
+  también el servidor): el anfitrión le dice al invitado cómo está su mando en su equipo (creado,
+  en pausa o sin crear y por qué). El invitado ve en su fila de Personas qué mando envía y cómo
+  llega (tal cual o convertido, y por qué) y, si no llega, el motivo y qué hacer: no hay ninguno
+  conectado, el elegido en Ajustes no está, lo conectado no parece un mando, el equipo del
+  anfitrión no pudo crearlo, el anfitrión pausó la entrada o no comparte nada, o no contesta. Lo
+  mismo sale en una línea abajo, sobre el vídeo, y en un aviso al ocurrir. El anfitrión ve en la
+  fila del invitado «su mando no funciona» aunque esté cerrada y, al abrirla, el motivo entero con
+  cómo arreglarlo y un botón para copiarlo; antes era un aviso de cuatro segundos, una vez por
+  sesión y sin decir de quién. También dice si el mando llega tal cual o convertido y que la
+  entrada no llega mientras no comparte nada. En Android, el panel de conexión lo dice en «Tu
+  mando», con un aviso cuando deja de llegar.
+- **El invitado elige qué mando envía.** Al recibir la ranura, con un solo mando se envía ese;
+  con varios, o con solo algo que no parece un mando, sale un selector sobre el vídeo: se elige
+  con un clic o pulsando un botón del mando que se quiera usar, y la elección se recuerda. El que
+  se envía ya no cambia porque se conecte otro, y en Personas «Cambiar» abre el selector.
+
 - **Apagar el vídeo** (protocolo 23; hay que actualizar también el servidor): el invitado puede
   quedarse solo con la voz y el chat con el botón de la barra o Ctrl+Alt+I (también en Android). El
   anfitrión deja de mandarle imagen, y de codificar si nadie mira; su conexión ya no frena la
@@ -231,6 +248,22 @@ compartir cliente y servidor) va aparte, en `PROTOCOL_VERSION` y en `GET /versio
 
 ### Corregido
 
+- **En automático ya no se envía un teclado o un ratón como mando.** En Linux el sistema lista
+  como joystick cualquier cosa con un botón y dos ejes (y en Flatpak, sin el filtro de udev, aún
+  más: teclados con teclas multimedia, ratones y paneles táctiles), y el automático cogía el último
+  de esa lista. Ahora cada dispositivo se clasifica por los botones que declara, y lo que no parece
+  un mando solo se envía si se elige a propósito (aparece marcado en el selector y en Ajustes →
+  Mandos). En Windows cuentan como mando los que el sistema reconoce como tal.
+- **Un mando de Xbox por cable con un nombre largo ya no tumba la entrada del anfitrión** (Linux):
+  con 79 bytes o más, crear el mando virtual hacía caer el hilo que inyecta la entrada de todos
+  los invitados, sin ningún aviso. El nombre se recorta y se limpia.
+- **Un mando tal cual ya no se queda mudo si se corta su lectura**: el invitado lo vuelve a abrir
+  y, si se sigue cortando, lo manda convertido; y si es el anfitrión el que deja de poder
+  entregar sus informes, vuelve al convertido con el motivo a la vista.
+- **Quitar y volver a dar la misma ranura deprisa** ya no deja el mando sin declarar, y la fila
+  del anfitrión no conserva el mando de una conexión que se cayó.
+- El nombre del mando y los motivos que escribe el otro extremo se enseñan en una línea, sin
+  caracteres de control ni marcas de dirección.
 - **Ajustes → Acerca de dice por qué no se puede cambiar «Actualizar automáticamente»** cuando
   está desactivado: porque «Buscar versiones nuevas» está apagado, porque el paquete MSIX no puede
   actualizarse solo o porque esa copia de coroom no viene de un paquete que se actualice.

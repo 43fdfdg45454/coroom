@@ -464,6 +464,17 @@ pub fn describe_guest(status: &GuestStatus) -> String {
     } else {
         String::new()
     };
+    // El mando que no se pudo crear, con el motivo entero: sin esto la consola solo decía que el
+    // invitado tenía ranura.
+    if let Some(problem) = &status.gamepad_problem {
+        return format!(
+            "Invitado {} ({}) · {path}{rtt} · {} · SU MANDO NO FUNCIONA: no se pudo crear en este \
+             equipo: {problem}",
+            status.guest.0,
+            status.name,
+            permissions_label(&status.permissions),
+        );
+    }
     let pad = status.gamepad.as_ref().map_or_else(String::new, |pad| {
         let mode = match (&pad.note, pad.raw) {
             (_, true) => "tal cual".to_owned(),

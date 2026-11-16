@@ -29,8 +29,8 @@ use coroom_session::input::{InputEvent, Rumble};
 use coroom_session::latency::{LatencyLedger, LatencySummary, LinkSummary};
 use coroom_session::loopback::{CursorSink, DecodedFrame, FrameSink, SinkError};
 use coroom_session::remote::{
-    AudioControl, GuestAudio, GuestInput, RemoteConfig, RemoteSession, SessionEvent, TalkMode,
-    VoiceInput,
+    AudioControl, GuestAudio, GuestInput, HostPadState, RemoteConfig, RemoteSession, SessionEvent,
+    TalkMode, VoiceInput,
 };
 use coroom_transport::quic::Path;
 
@@ -200,6 +200,30 @@ pub struct Guest {
     decoders: Vec<AndroidChoice>,
     stop: Arc<AtomicBool>,
     poller: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+/// Cómo va el mando de la ranura `slot` de `guest` ([`UiEvent::PadState`]).
+fn pad_state_event(guest: &Guest, slot: u8) -> UiEvent {
+    let pads = lock(&guest.pads).pads();
+    let report = guest.input.pad_report(slot);
+    let (host, reason) = match report.as_ref().map(|report| &report.state) {
+        Some(HostPadState::Ready) => (Some("ready"), None),
+        Some(HostPadState::Paused) => (Some("paused"), None),
+        Some(HostPadState::Failed(reason)) => (Some("failed"), Some(reason.clone())),
+        None => (None, None),
+    };
+    UiEvent::PadState {
+        slot,
+        pad: pads
+            .iter()
+            .find(|pad| pad.active)
+            .map(|pad| pad.key.name.clone()),
+        connected: pads.len(),
+        raw: guest.input.pad_mode(slot),
+        host,
+        reason,
+        note: report.and_then(|report| report.note),
+    }
 }
 
 /// Los componentes de MediaCodec de cada códec que se anuncia, el preferido primero:
@@ -466,6 +490,7 @@ impl Guest {
             .name("coroom-mandos".to_owned())
             .spawn(move || {
                 let mut allowed: Option<Allowed> = None;
+                let mut pad_state: Option<UiEvent> = None;
                 while !stop.load(Ordering::Acquire) {
                     let Some(guest) = guest.upgrade() else {
                         return;
@@ -491,6 +516,15 @@ impl Guest {
                         lock(&guest.touch).set_host_frame(width, height);
                     }
                     lock(&guest.pads).poll();
+                    // Cómo va el mando, a la interfaz cuando cambia: sin esto el teléfono no decía
+                    // si su mando llegaba al juego ni por qué no.
+                    let state = now.gamepad_slot.map(|slot| pad_state_event(&guest, slot));
+                    if state != pad_state {
+                        if let Some(event) = state.clone() {
+                            emit(event);
+                        }
+                        pad_state = state;
+                    }
                     drop(guest);
                     thread::sleep(IDLE_POLL);
                 }

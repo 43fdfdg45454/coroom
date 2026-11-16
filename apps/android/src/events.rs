@@ -164,6 +164,25 @@ pub enum UiEvent {
         /// Si terminó.
         done: bool,
     },
+    /// Cómo va el mando que se envía a la ranura (solo con ranura): cuál, cuántos hay conectados
+    /// y lo que dice el anfitrión de él. Se manda cada vez que cambia.
+    PadState {
+        /// La ranura.
+        slot: u8,
+        /// El mando que se envía (`None`: ninguno).
+        pad: Option<String>,
+        /// Mandos conectados al teléfono.
+        connected: usize,
+        /// Si el anfitrión lo tiene tal cual (`None`: aún no contestó).
+        raw: Option<bool>,
+        /// Cómo está en el equipo del anfitrión: `ready`, `paused` o `failed` (`None`: no lo ha
+        /// dicho).
+        host: Option<&'static str>,
+        /// Por qué no se pudo crear (con `failed`).
+        reason: Option<String>,
+        /// Por qué va convertido, si lo dijo.
+        note: Option<String>,
+    },
     /// Lo que el anfitrión deja hacer.
     Permissions {
         /// Teclado y ratón (el tacto).
@@ -466,6 +485,30 @@ mod tests {
         );
         let json = serde_json::to_value(UiEvent::ChatCleared).expect("json");
         assert_eq!(json, serde_json::json!({"type": "chat_cleared"}));
+        // El estado del mando, con los nombres que lee `Events.kt`.
+        let json = serde_json::to_value(UiEvent::PadState {
+            slot: 2,
+            pad: Some("Mando de ejemplo".to_owned()),
+            connected: 1,
+            raw: Some(false),
+            host: Some("failed"),
+            reason: Some("no se puede abrir /dev/uinput".to_owned()),
+            note: None,
+        })
+        .expect("json");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "pad_state",
+                "slot": 2,
+                "pad": "Mando de ejemplo",
+                "connected": 1,
+                "raw": false,
+                "host": "failed",
+                "reason": "no se puede abrir /dev/uinput",
+                "note": null
+            })
+        );
     }
 
     #[test]

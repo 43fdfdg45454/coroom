@@ -219,11 +219,12 @@ settings-sonido-error = Error
 ## Mandos
 settings-mando-que-envias = Mando que envías
 settings-el-ultimo-que-conectes = El último que conectes
-settings-mando-automatico-ayuda = Si lo desconectas, el anterior que siga conectado. Dentro de una sala eliges uno en concreto en «Mandos conectados».
+settings-mando-automatico-ayuda = Si lo desconectas, el anterior que siga conectado. Un teclado o un ratón que el sistema liste como mando no se envía solo. Dentro de una sala eliges uno en concreto en «Mandos conectados».
 settings-mando-elegido-ayuda = Solo «{ $name }»; si no está conectado, ninguno.
 settings-mandos-conectados = Mandos conectados
 settings-mandos-conectados-ayuda = Los de este equipo: el que elijas es el que envías a la sala.
 settings-mandos-conectados-fuera = Se ven cuando estás en la sala de alguien.
+settings-no-parece-un-mando = no parece un mando
 settings-sin-sala = Sin sala
 settings-usar-el-ultimo-que-conectes = Usar el último que conectes
 settings-ranura-preferida = Ranura preferida al dar mando

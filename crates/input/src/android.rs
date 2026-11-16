@@ -27,7 +27,7 @@ use coroom_proto::input::{GamepadDevice, GamepadTransport, PadData};
 use tracing::debug;
 
 use crate::gamepad::{
-    AxisFilter, ConnectedPad, DECLARE_RETRY, Motors, PadChoice, PadKey, PadKind, PadLink,
+    AxisFilter, ConnectedPad, DECLARE_RETRY, Motors, PadChoice, PadKey, PadKind, PadLink, PadLooks,
     PadRumble, pick_index, stick_value, trigger_value,
 };
 use crate::keymap::evdev;
@@ -527,6 +527,7 @@ impl AndroidPads {
             .iter()
             .map(|(id, device)| ConnectedPad {
                 key: device.key.clone(),
+                looks: PadLooks::Gamepad,
                 kind: PadKind::Converted(CONVERTED_KIND.to_owned()),
                 active: Some(*id) == active,
             })
@@ -737,8 +738,13 @@ impl AndroidPads {
 
     /// Qué mando va a qué ranura ahora, y lo que cambie se anuncia.
     fn reassign(&mut self) {
-        let active = pick_index(&self.choice, self.devices.iter().map(|(_, d)| &d.key))
-            .map(|index| &self.devices[index]);
+        let active = pick_index(
+            &self.choice,
+            self.devices
+                .iter()
+                .map(|(_, d)| (&d.key, PadLooks::Gamepad)),
+        )
+        .map(|index| &self.devices[index]);
         let wanted = self.slot.zip(active.map(|(id, _)| *id));
         let key = active.map(|(_, device)| device.key.clone());
         if wanted == self.announced {
@@ -1169,6 +1175,7 @@ mod tests {
             pads.pads(),
             vec![ConnectedPad {
                 key: key("Mando de ejemplo"),
+                looks: PadLooks::Gamepad,
                 kind: PadKind::Converted(CONVERTED_KIND.to_owned()),
                 active: false,
             }]

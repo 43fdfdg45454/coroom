@@ -4698,19 +4698,28 @@ fn guest_row<'a>(app: &'a App, room: &'a Room, status: &'a GuestStatus) -> Eleme
     // Con el vídeo apagado, que su entrada no llega va antes que sus permisos: es lo que explica
     // que no mueva nada (la fila corta lo que no cabe por el final).
     let input = permissions.keyboard_mouse || permissions.gamepad_slot.is_some();
+    let sharing = app
+        .host
+        .shared
+        .as_ref()
+        .is_some_and(|shared| shared.mode != ShareMode::Nothing);
     if status.video_paused && input {
         facts.push(t!("host-entrada-en-pausa").to_owned());
+    } else if input && !sharing {
+        // Sin nada compartido su entrada no llega a este equipo: se dice, o su mando parece
+        // conectado y no hace nada.
+        facts.push(t!("host-su-mando-en-pausa").to_owned());
+    }
+    // Un mando que no se pudo crear, también antes que los permisos: «mando en ranura N» a secas
+    // haría creer que funciona (y con la fila cerrada no se ve nada más).
+    if status.gamepad_problem.is_some() {
+        facts.push(t!("host-su-mando-no-funciona").to_owned());
     }
     facts.push(permissions_label(&permissions));
     if !status.input_key && input {
         facts.push(t!("host-esperando-la-clave").to_owned());
     }
     let talking = room.voice.talkers.contains(&id.0);
-    let sharing = app
-        .host
-        .shared
-        .as_ref()
-        .is_some_and(|shared| shared.mode != ShareMode::Nothing);
     let narrow = compact(app);
     let watching = sharing && status.path.is_some();
     // Junto al nombre, qué hace: si mira lo que se comparte y si habla. En la sala estrecha solo
@@ -4929,7 +4938,13 @@ fn pad_line<'a>(app: &'a App, status: &'a GuestStatus) -> Element<'a, Message> {
                 PadTransport::Converted => t!("host-solo-convertido"),
             };
             (
-                t!("host-su-mando-name", name = pad.name.as_str()),
+                // Cómo llega va delante del nombre: es lo que la línea corta si no cabe. Sin el
+                // mando creado no llega de ninguna forma: lo dice el aviso de debajo.
+                match (status.gamepad_problem.is_some(), pad.raw) {
+                    (true, _) => t!("host-su-mando-name", name = pad.name.as_str()),
+                    (false, true) => t!("host-su-mando-tal-cual", name = pad.name.as_str()),
+                    (false, false) => t!("host-su-mando-convertido", name = pad.name.as_str()),
+                },
                 pad.note
                     .as_ref()
                     .map(|note| t!("host-va-convertido-note", note = note.as_str())),
@@ -4969,15 +4984,35 @@ fn pad_line<'a>(app: &'a App, status: &'a GuestStatus) -> Element<'a, Message> {
     ]
     .spacing(space::S)
     .align_y(Alignment::Center);
-    if compact(app) {
-        return column![texts, row![ui::fill(), selects]]
+    let line: Element<'a, Message> = if compact(app) {
+        column![texts, row![ui::fill(), selects]]
             .spacing(space::XS)
-            .into();
-    }
-    row![texts, selects]
-        .spacing(space::S)
-        .align_y(Alignment::Center)
-        .into()
+            .into()
+    } else {
+        row![texts, selects]
+            .spacing(space::S)
+            .align_y(Alignment::Center)
+            .into()
+    };
+    // El mando que no se pudo crear: el motivo entero (con cómo arreglarlo) mientras dure, y se
+    // puede copiar. Un aviso que se va a los cuatro segundos no sirve para una regla udev.
+    let Some(problem) = &status.gamepad_problem else {
+        return line;
+    };
+    column![
+        line,
+        ui::banner(
+            Tone::Error,
+            t!(
+                "host-mando-sin-crear",
+                name = status.name.as_str(),
+                problem = problem.as_str()
+            ),
+            Some((t!("host-copiar-motivo"), Message::Copy(problem.clone()))),
+        ),
+    ]
+    .spacing(space::XS)
+    .into()
 }
 
 /// La bandeja de los que piden entrar, justo bajo la cabecera (lo primero que hay que contestar,
@@ -5411,6 +5446,7 @@ pub(crate) mod shots {
             input_key: true,
             input: InputLatency::default(),
             gamepad: None,
+            gamepad_problem: None,
             can_host: true,
             device: None,
             video_paused: false,
@@ -5555,6 +5591,7 @@ pub(crate) mod shots {
     pub(crate) fn scroll_of(name: &str) -> f32 {
         match name {
             "09-sala-estrecha-personas" => 420.0,
+            "09-sala-mando-sin-crear" => 360.0,
             _ => 0.0,
         }
     }
@@ -5605,6 +5642,30 @@ pub(crate) mod shots {
         }),
         ("09-sala-persona-abierta", |app| {
             host_room(app);
+            expanded(app, Person::Guest(GuestId(2)));
+        }),
+        // El mando de Carla no se pudo crear en este equipo: se ve con la fila cerrada y, abierta,
+        // el motivo entero con cómo arreglarlo.
+        ("09-sala-mando-sin-crear", |app| {
+            host_room(app);
+            let guests = app.host.room.as_ref().map(|room| {
+                let guests = room.guests.iter().map(|status| GuestStatus {
+                    gamepad_problem: (status.guest == GuestId(2)).then(|| {
+                        "no se puede abrir /dev/uinput para crear el mando virtual. Instala la \
+                         regla udev de coroom y vuelve a entrar en la sesión:\n  echo \
+                         'KERNEL==\"uinput\", SUBSYSTEM==\"misc\", TAG+=\"uaccess\"' | sudo \
+                         tee /etc/udev/rules.d/60-coroom-uinput.rules"
+                            .to_owned()
+                    }),
+                    ..status.clone()
+                });
+                (guests.collect(), room.voice.clone())
+            });
+            if let Some((guests, voice)) = guests {
+                app.update(Message::Event(Event::HostGuests(guests, voice)));
+            }
+            super::settle(app);
+            app.toasts.clear();
             expanded(app, Person::Guest(GuestId(2)));
         }),
         ("09-sala-tu-fila-abierta", |app| {
@@ -5667,6 +5728,7 @@ mod tests {
             input_key: true,
             input: Default::default(),
             gamepad: None,
+            gamepad_problem: None,
             can_host: true,
             device: None,
             video_paused: false,

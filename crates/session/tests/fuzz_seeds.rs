@@ -457,6 +457,18 @@ fn fuzz_seeds() {
         }),
         ControlMessage::VideoPaused { paused: true },
         ControlMessage::VideoPaused { paused: false },
+        ControlMessage::GamepadStatus {
+            slot: 1,
+            state: coroom_transport::proto::control::PadState::Ready,
+            note: None,
+        },
+        ControlMessage::GamepadStatus {
+            slot: 2,
+            state: coroom_transport::proto::control::PadState::Failed(
+                "no se puede abrir /dev/uinput".to_owned(),
+            ),
+            note: Some("su descriptor no declara un mando".to_owned()),
+        },
         ControlMessage::Bye,
     ];
     let frames: Vec<Vec<u8>> = control.iter().map(frame).collect();

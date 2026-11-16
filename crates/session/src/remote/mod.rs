@@ -85,7 +85,8 @@ pub mod wire;
 
 pub use audio::{AudioControl, GuestAudio, HostAudio, TalkMode, VoiceInput, talker_label};
 pub use chat::{CHAT_RATE_MESSAGES, CHAT_RATE_WINDOW, ChatAuthor, ChatLine};
-pub use input::{GuestInput, eis_provider};
+pub use coroom_transport::proto::control::PadState as HostPadState;
+pub use input::{GuestInput, PadReport, eis_provider};
 pub use negotiate::{GuestCapabilities, choose_codec};
 
 use std::collections::BTreeMap;
@@ -832,6 +833,9 @@ pub struct GuestStatus {
     pub input: InputLatency,
     /// El mando físico que declaró para su ranura, si lo hay.
     pub gamepad: Option<GuestPad>,
+    /// Por qué el mando de su ranura no existe en este equipo (no se pudo crear el mando virtual),
+    /// para enseñarlo en su fila. `None` si existe o si no tiene ranura.
+    pub gamepad_problem: Option<String>,
     /// Si puede quedarse de anfitrión (lo anuncia con lo que decodifica; hasta entonces, no).
     pub can_host: bool,
     /// Nombre de su dispositivo, si su cuenta ya estaba en la sala (`PeerJoined::device`): va
@@ -953,6 +957,13 @@ pub(crate) enum Command {
         guest: GuestId,
         slot: u8,
         raw: bool,
+    },
+    /// Avisar al invitado de cómo está aquí el mando de su ranura (`GamepadStatus`).
+    GamepadStatus {
+        guest: GuestId,
+        slot: u8,
+        state: coroom_transport::proto::control::PadState,
+        note: Option<String>,
     },
     /// Informe de salida para el mando tal cual del invitado (`GamepadOutput`).
     GamepadOutput {

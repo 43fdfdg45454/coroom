@@ -77,6 +77,44 @@ room-mando-desconectado = Mando desconectado: { $name }.
 room-sigues-enviando = Sigues enviando el { $name }.
 room-ahora-envias = Ahora envías el { $name }.
 room-no-envias-ningun-mando = Ya no envías ningún mando.
+# Tu mando, en tu fila de «Personas» (y, si no llega al juego, también abajo sobre el vídeo y en un aviso)
+room-mando-sin-leer = No se pueden leer los mandos de este equipo: { $err }.
+room-mando-ninguno = Tienes la ranura { $slot }, pero no hay ningún mando conectado a este equipo. Conecta uno y se enviará solo.
+room-mando-elegido-ausente = No envías ningún mando: «{ $name }», el que elegiste, no está conectado. Conéctalo o elige otro.
+room-mando-no-parece = No envías ningún mando: «{ $name }» no parece un mando. Si lo es, elígelo.
+room-mando-elige = No envías ningún mando: hay { $count } conectados. Elige cuál.
+room-mando-esperando = Enviando «{ $name }» a la ranura { $slot }: esperando la respuesta de { $host }…
+room-mando-sin-respuesta = { $host } no contesta a tu mando («{ $name }»): puede que tu entrada no le esté llegando. Sal de la sala y vuelve a entrar.
+room-mando-fallo-anfitrion = «{ $name }» no llega al juego: el equipo de { $host } no pudo crear tu mando ({ $reason }). Lo tiene que arreglar { $host } en su equipo.
+room-mando-pausa-anfitrion = «{ $name }» no llega al juego ahora: { $host } ha pausado el teclado y los mandos de los invitados, o no comparte nada.
+room-mando-pausa-fuera = «{ $name }» está en reposo mientras no ves la sala.
+room-mando-tal-cual = Envías «{ $name }» en la ranura { $slot }, tal cual.
+room-mando-convertido = Envías «{ $name }» en la ranura { $slot }, convertido a Xbox 360.
+room-mando-convertido-porque = Envías «{ $name }» en la ranura { $slot }, convertido a Xbox 360: { $reason }.
+room-mando-raro = Ojo: no parece un mando.
+room-mando-el-anfitrion = el anfitrión
+# Lo mismo en una línea, abajo sobre el vídeo
+room-mando-corto-sin-leer = No se pueden leer tus mandos
+room-mando-corto-ninguno = Ranura { $slot }: no hay ningún mando conectado
+room-mando-corto-elegido-ausente = Tu mando elegido no está conectado
+room-mando-corto-no-parece = Lo conectado no parece un mando
+room-mando-corto-elige = Elige qué mando envías
+# Selector de mando sobre el vídeo
+room-selector-te-dio = { $host } te ha dado un mando
+room-selector-elige = Ranura { $slot } · elige cuál envías
+room-selector-cambiar-titulo = Qué mando envías
+room-selector-tal-cual = llegará tal cual si { $host } lo permite
+room-selector-convertido = llegará como Xbox 360
+room-selector-no-parece = no parece un mando
+room-selector-pulsa = O pulsa un botón del mando que quieras usar.
+room-selector-enviar = Enviar
+room-selector-ahora-no = Ahora no
+room-mando-cambiar = Cambiar
+room-mando-elegir = Elegir mando
+room-mando-dado-envias = El anfitrión te ha dado el mando en la ranura { $slot }: envías «{ $name }».
+room-mando-corto-sin-respuesta = El anfitrión no contesta a tu mando
+room-mando-corto-fallo-anfitrion = Tu mando no llega: fallo en el equipo del anfitrión
+room-mando-corto-pausa-anfitrion = Tu mando está en pausa por el anfitrión
 
 ## Barra superior y píldora
 room-directa = Directa

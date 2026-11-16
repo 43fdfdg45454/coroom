@@ -48,6 +48,10 @@
 //! Desde la versión 23 el invitado puede apagar su vídeo ([`ControlMessage::VideoPaused`]): el
 //! anfitrión deja de mandarle vídeo (y de contarlo para la tasa y el códec) e ignora su entrada,
 //! pero le sigue mandando el audio, la voz y el chat. También va al final.
+//!
+//! Desde la versión 24 el anfitrión le dice al invitado cómo está en su equipo el mando de su
+//! ranura ([`ControlMessage::GamepadStatus`]): creado, en pausa o sin crear y por qué. Hasta
+//! entonces el invitado solo sabía si iba tal cual o convertido. También va al final.
 
 use serde::{Deserialize, Serialize};
 
@@ -569,6 +573,54 @@ pub enum ControlMessage {
         /// Si está apagado.
         paused: bool,
     },
+    /// Anfitrión → invitado: cómo está en el equipo del anfitrión el mando de su ranura. Se manda
+    /// al darle la ranura, al contestar cada declaración y cada vez que cambia: sin él, un mando
+    /// que el anfitrión no pudo crear se queda mudo sin que el invitado sepa por qué.
+    GamepadStatus {
+        /// Ranura.
+        slot: u8,
+        /// Cómo está.
+        state: PadState,
+        /// Por qué va convertido a Xbox 360 si el invitado lo declaró para ir tal cual (como mucho
+        /// [`PAD_REASON_MAX`] bytes; `None`: va como se declaró o no se pidió tal cual).
+        note: Option<String>,
+    },
+}
+
+/// Longitud máxima, en bytes, de un motivo de [`ControlMessage::GamepadStatus`].
+pub const PAD_REASON_MAX: usize = 600;
+
+/// Cómo está en el equipo del anfitrión el mando de un invitado
+/// ([`ControlMessage::GamepadStatus`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PadState {
+    /// Creado: lo que mande el invitado le llega al juego.
+    Ready,
+    /// Creado, pero el anfitrión no aplica ahora la entrada de los invitados: la pausó o no
+    /// comparte nada.
+    Paused,
+    /// No existe: el anfitrión no pudo crearlo. Con el motivo (como mucho [`PAD_REASON_MAX`]
+    /// bytes), para enseñárselo al invitado.
+    Failed(String),
+}
+
+/// `text` sin caracteres de control ni marcas de dirección (lo escribe el otro extremo y se
+/// enseña en la interfaz) y recortado a `max` bytes en un límite de carácter.
+pub fn display_text(text: &str, max: usize) -> String {
+    let mut out = String::with_capacity(text.len().min(max));
+    for c in text.chars() {
+        let c = if c.is_whitespace() { ' ' } else { c };
+        let hidden = c.is_control()
+            || matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}');
+        if hidden {
+            continue;
+        }
+        if out.len() + c.len_utf8() > max {
+            break;
+        }
+        out.push(c);
+    }
+    out
 }
 
 impl ControlMessage {
@@ -774,6 +826,47 @@ mod tests {
             );
         }
     }
+
+    /// `GamepadStatus` va detrás de `VideoPaused` (no mueve los índices de los demás) y solo por
+    /// el stream: es un estado que no se puede perder.
+    #[test]
+    fn gamepad_status_goes_last_and_only_by_the_stream() {
+        let paused =
+            postcard::to_allocvec(&ControlMessage::VideoPaused { paused: true }).expect("pausa");
+        for state in [
+            PadState::Ready,
+            PadState::Paused,
+            PadState::Failed("sin permiso en /dev/uinput".to_owned()),
+        ] {
+            let message = ControlMessage::GamepadStatus {
+                slot: 2,
+                state,
+                note: Some("su descriptor no declara un mando".to_owned()),
+            };
+            let body = postcard::to_allocvec(&message).expect("estado");
+            assert_eq!(body[0], paused[0] + 1);
+            assert!(!message.is_urgent() && !message.fits_datagram());
+            assert_eq!(control_datagram_tagged(&message, 0), None);
+            assert_eq!(
+                decode::<ControlMessage>(&body).expect("decodificar"),
+                message
+            );
+        }
+    }
+
+    /// Lo que escribe el otro extremo y se enseña en la interfaz va sin caracteres de control ni
+    /// marcas de dirección, en una línea y recortado sin partir un carácter.
+    #[test]
+    fn display_text_is_one_clean_line() {
+        assert_eq!(
+            display_text("Mando\u{202e} de\n\tejemplo\u{0}\u{200b}", 64),
+            "Mando de  ejemplo"
+        );
+        assert_eq!(display_text("añil", 2), "a");
+        assert_eq!(display_text("añil", 3), "añ");
+        assert_eq!(display_text("mando", 0), "");
+    }
+
     use proptest::prelude::*;
 
     fn track() -> impl Strategy<Value = Track> {
@@ -987,6 +1080,17 @@ mod tests {
                 ControlMessage::GamepadRumble { slot, strong, weak }
             }),
             any::<bool>().prop_map(|paused| ControlMessage::VideoPaused { paused }),
+            (1u8..=8, 0u8..3, ".{0,40}", prop::option::of(".{0,40}")).prop_map(
+                |(slot, kind, reason, note)| ControlMessage::GamepadStatus {
+                    slot,
+                    state: match kind {
+                        0 => PadState::Ready,
+                        1 => PadState::Paused,
+                        _ => PadState::Failed(reason),
+                    },
+                    note,
+                }
+            ),
             prop::collection::vec(
                 (
                     any::<u32>(),

@@ -57,8 +57,10 @@ pub mod video;
 /// `RelayToken` sin dirección: el relay atiende en el mismo socket UDP que la señalización, así
 /// que cada cliente se liga a la dirección por la que ya llegó al servidor; la 23, el vídeo
 /// apagado del invitado (`control::ControlMessage::VideoPaused`, al final): el anfitrión no le
-/// manda vídeo, no lo cuenta para la tasa ni el códec e ignora su entrada.
-pub const PROTOCOL_VERSION: u16 = 23;
+/// manda vídeo, no lo cuenta para la tasa ni el códec e ignora su entrada; la 24, el estado del
+/// mando del invitado en el equipo del anfitrión (`control::ControlMessage::GamepadStatus`, al
+/// final): creado, en pausa o sin crear y por qué.
+pub const PROTOCOL_VERSION: u16 = 24;
 
 /// Identificadores ALPN (RFC 7301) que el socket QUIC usa para demultiplexar conexiones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

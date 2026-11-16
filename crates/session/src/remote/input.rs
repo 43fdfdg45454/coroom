@@ -57,11 +57,12 @@ use coroom_transport::PeerConnection;
 use coroom_transport::crypto::hpke::PairwiseSecret;
 use coroom_transport::crypto::input::{Channel, InputCipher, Role};
 use coroom_transport::media::{MediaReceiver, MediaSender};
+use coroom_transport::proto::control::{PAD_REASON_MAX, PadState as HostPad, display_text};
 use coroom_transport::proto::hid;
 use coroom_transport::proto::input::{
-    GamepadDevice, GamepadTransport, InputMessage, InputPacket, InputState, PadData, STALE_AFTER,
-    STREAM_PREAMBLE_LEN, StreamFrames, parse_datagram, parse_stream_preamble, seq_after,
-    stream_preamble,
+    GamepadDevice, GamepadTransport, InputMessage, InputPacket, InputState, MAX_PAD_NAME, PadData,
+    STALE_AFTER, STREAM_PREAMBLE_LEN, StreamFrames, parse_datagram, parse_stream_preamble,
+    seq_after, stream_preamble,
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use tracing::{debug, info};
@@ -407,12 +408,34 @@ struct PadState {
     active: bool,
     /// Por qué no va tal cual, si se pidió.
     note: Option<String>,
+    /// Informes en crudo seguidos que el sumidero no aceptó ([`RAW_FAILURES`]).
+    raw_failures: u32,
+}
+
+/// Informes en crudo seguidos sin aceptar a partir de los cuales el mando tal cual se da por
+/// roto y vuelve el convertido: uno suelto puede ser un informe de tamaño raro; muchos seguidos,
+/// un mando que el sistema ya no lee, y el invitado solo manda en crudo.
+const RAW_FAILURES: u32 = 20;
+
+/// Bytes que se enseñan como mucho del nombre que declara un invitado (128 caracteres) y de una
+/// nota de por qué va convertido (puede traer la regla udev que falta).
+const NAME_BYTES: usize = MAX_PAD_NAME * 4;
+const NOTE_BYTES: usize = 1024;
+
+/// El motivo de un fallo del mando para el invitado: la primera frase (lo demás son las
+/// instrucciones para arreglarlo en el equipo del anfitrión, que a él no le sirven).
+fn guest_reason(reason: &str) -> String {
+    let first = reason.split_once(['\n']).map_or(reason, |(first, _)| first);
+    let first = first.split_once(". ").map_or(first, |(first, _)| first);
+    display_text(first.trim_end_matches([':', '.', ' ']), PAD_REASON_MAX)
 }
 
 impl PadState {
+    /// Lo que se enseña en la fila del invitado. El nombre y el motivo los escribe él: van en
+    /// una línea y sin caracteres de control ni marcas de dirección.
     fn status(&self) -> GuestPad {
         GuestPad {
-            name: self.device.name.clone(),
+            name: display_text(&self.device.name, NAME_BYTES),
             vendor: self.device.vendor,
             product: self.device.product,
             transport: match self.device.transport {
@@ -421,7 +444,10 @@ impl PadState {
                 GamepadTransport::Converted { .. } => PadTransport::Converted,
             },
             raw: self.active,
-            note: self.note.clone(),
+            note: self
+                .note
+                .as_deref()
+                .map(|note| display_text(note, NOTE_BYTES)),
         }
     }
 
@@ -480,6 +506,11 @@ impl Samples {
 struct GuestState {
     permissions: Permissions,
     pad: Option<PadState>,
+    /// Por qué el mando virtual de su ranura no existe (el sumidero no pudo crearlo). Mientras
+    /// dure, nada de lo que mande su mando llega a ningún sitio: se enseña en su fila y se le dice.
+    pad_problem: Option<String>,
+    /// Lo último que se le dijo de su mando (`GamepadStatus`): ranura, estado y nota.
+    told: Option<(u8, HostPad, Option<String>)>,
     /// Última secuencia aplicada.
     last_seq: Option<u32>,
     /// Los textos ya tecleados.
@@ -776,6 +807,10 @@ impl Worker {
         for guest in guests {
             self.apply_pad_mode(guest);
         }
+        // A cada invitado con mando se le dice que su entrada está en pausa (o que ya no).
+        for state in self.guests.values_mut() {
+            state.dirty = true;
+        }
     }
 
     /// `guest` apagó o encendió su vídeo. Al apagarlo se suelta lo suyo (teclas, botones y su
@@ -987,15 +1022,18 @@ impl Worker {
             errors.push(err);
         }
         if slot_changed {
+            // Un mando que no llegó a crearse no se puede soltar: eso no es otro fallo.
+            let missing = std::mem::take(&mut state.pad_problem).is_some();
             if let Some(slot) = old.gamepad_slot
                 && let Err(err) = self.sink.release_gamepad(slot)
+                && !missing
             {
                 errors.push(err);
             }
             if let Some(slot) = permissions.gamepad_slot
                 && let Err(err) = self.sink.assign_gamepad(slot)
             {
-                errors.push(err);
+                self.pad_failed(guest, slot, &err);
             }
         }
         if permissions.keyboard_mouse && !old.keyboard_mouse {
@@ -1005,14 +1043,64 @@ impl Worker {
             self.warn(&err);
         }
         if slot_changed {
-            // El invitado vuelve a declarar su mando para la ranura nueva.
+            // El invitado vuelve a declarar su mando para la ranura nueva, y se le dice cómo está.
             if let Some(state) = self.guests.get_mut(&guest) {
                 state.pad = None;
+                state.told = None;
             }
         } else if old.gamepad_raw != permissions.gamepad_raw
             || old.keyboard_mouse != permissions.keyboard_mouse
         {
             self.apply_pad_mode(guest);
+        }
+    }
+
+    /// El mando virtual de la ranura `slot` de `guest` no se pudo crear: el motivo queda en su
+    /// estado (su fila lo enseña mientras dure y a él se le dice) y el anfitrión recibe un aviso
+    /// con su nombre. El aviso genérico de [`Worker::warn`] no vale aquí: sale una vez por texto y
+    /// sin decir de quién es el mando, así que el segundo invitado sin mando no avisaba de nada.
+    fn pad_failed(&mut self, guest: GuestId, slot: u8, err: &InputError) {
+        let reason = err.to_string();
+        let Some(state) = self.guests.get_mut(&guest) else {
+            return;
+        };
+        let again = state.pad_problem.as_deref() == Some(reason.as_str());
+        state.pad_problem = Some(reason);
+        state.dirty = true;
+        if again {
+            return;
+        }
+        let name = lock(&self.core.guests)
+            .get(&guest)
+            .map(|status| status.name.clone())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| format!("invitado {}", guest.0));
+        self.core.warn(format!(
+            "No se pudo crear el mando de {name} (ranura {slot}): lo que pulse no llega al \
+             juego. El motivo y cómo arreglarlo están en su fila de Personas."
+        ));
+    }
+
+    /// Si el mando virtual de la ranura de `guest` no se pudo crear, otro intento: el anfitrión
+    /// pudo arreglarlo entretanto (la regla udev, el driver). Se hace cuando el invitado declara
+    /// su mando, no en cada paquete.
+    fn retry_pad(&mut self, guest: GuestId) {
+        let Some(state) = self.guests.get(&guest) else {
+            return;
+        };
+        let (Some(slot), true) = (state.permissions.gamepad_slot, state.pad_problem.is_some())
+        else {
+            return;
+        };
+        match self.sink.assign_gamepad(slot) {
+            Ok(()) => {
+                info!(guest = ?guest, slot, "el mando del invitado ya se pudo crear");
+                if let Some(state) = self.guests.get_mut(&guest) {
+                    state.pad_problem = None;
+                    state.dirty = true;
+                }
+            }
+            Err(err) => self.pad_failed(guest, slot, &err),
         }
     }
 
@@ -1029,14 +1117,19 @@ impl Worker {
             }
             match pad {
                 PadData::Device { slot, device } => {
+                    self.retry_pad(guest);
+                    let state = self.guests.get_mut(&guest).expect("invitado");
                     // La misma declaración otra vez (el invitado no vio la respuesta, o se reabrió
-                    // su canal de entrada): el mando sigue como está y se le vuelve a decir el modo.
+                    // su canal de entrada): el mando sigue como está y se le vuelven a decir el
+                    // modo y el estado.
                     if let Some(known) = state
                         .pad
                         .as_ref()
                         .filter(|known| known.slot == slot && known.device == device)
                     {
                         let raw = known.guest_sends_raw();
+                        state.told = None;
+                        state.dirty = true;
                         self.command(Command::GamepadMode { guest, slot, raw });
                         continue;
                     }
@@ -1051,8 +1144,10 @@ impl Worker {
                         device,
                         active: false,
                         note: None,
+                        raw_failures: 0,
                     });
                     state.dirty = true;
+                    state.told = None;
                     self.apply_pad_mode(guest);
                 }
                 PadData::Report { slot, data } => {
@@ -1066,12 +1161,57 @@ impl Worker {
                     }
                     state.applied += 1;
                     self.totals.0 += 1;
-                    if let Err(err) = self.sink.raw_report(slot, &data) {
+                    let result = self.sink.raw_report(slot, &data);
+                    let failures = self
+                        .guests
+                        .get_mut(&guest)
+                        .and_then(|state| state.pad.as_mut())
+                        .map(|pad| {
+                            pad.raw_failures = match result {
+                                Ok(()) => 0,
+                                Err(_) => pad.raw_failures + 1,
+                            };
+                            pad.raw_failures
+                        });
+                    if let Err(err) = result {
                         self.warn(&err);
+                        if failures.is_some_and(|failures| failures >= RAW_FAILURES) {
+                            self.raw_broke(guest, &err);
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// El mando tal cual de `guest` dejó de aceptar sus informes ([`RAW_FAILURES`] seguidos):
+    /// vuelve el convertido, con el motivo a la vista, y se le avisa para que mande convertido.
+    /// Sin esto el mando se quedaba muerto: el invitado solo mandaba informes en crudo, a nada.
+    fn raw_broke(&mut self, guest: GuestId, err: &InputError) {
+        let Some(pad) = self
+            .guests
+            .get_mut(&guest)
+            .and_then(|state| state.pad.as_mut())
+        else {
+            return;
+        };
+        let slot = pad.slot;
+        pad.active = false;
+        pad.raw_failures = 0;
+        pad.note = Some(format!(
+            "el mando tal cual dejó de aceptar sus informes ({err})"
+        ));
+        if let Err(err) = self.sink.disconnect_raw(slot) {
+            self.pad_failed(guest, slot, &err);
+        }
+        if let Some(state) = self.guests.get_mut(&guest) {
+            state.dirty = true;
+        }
+        self.command(Command::GamepadMode {
+            guest,
+            slot,
+            raw: false,
+        });
     }
 
     /// Pone el mando de `guest` tal cual o convertido según su permiso, su declaración y la
@@ -1082,15 +1222,23 @@ impl Worker {
             return;
         };
         let permissions = state.permissions;
+        // Sin el mando virtual de la ranura no hay nada que sustituir por el suyo: el motivo que
+        // cuenta es ese, no un «la ranura no está asignada» del sumidero.
+        let missing = state.pad_problem.is_some();
         let Some(pad) = state.pad.as_mut() else {
             return;
         };
-        let check = if permissions.gamepad_raw {
+        let check = if missing {
+            Err(String::new())
+        } else if permissions.gamepad_raw {
             check_device(&pad.device, &permissions)
         } else {
             Err(String::new())
         };
         let mut error = None;
+        // Quitar el tal cual vuelve a crear el convertido: si eso falla, la ranura se queda sin
+        // mando.
+        let mut lost = None;
         match (check, pad.active) {
             (Ok(()), false) if !paused => match self.sink.connect_raw(pad.slot, &pad.device) {
                 Ok(()) => {
@@ -1115,7 +1263,7 @@ impl Worker {
             (check, active) => {
                 if active {
                     if let Err(err) = self.sink.disconnect_raw(pad.slot) {
-                        error = Some(err);
+                        lost = Some(err);
                     }
                     pad.active = false;
                 }
@@ -1137,6 +1285,13 @@ impl Worker {
         state.dirty = true;
         if let Some(err) = error {
             self.warn(&err);
+        }
+        if let Some(err) = lost {
+            // Otro intento de dejar el convertido; si tampoco, el motivo queda en su fila.
+            match self.sink.assign_gamepad(slot) {
+                Ok(()) => self.warn(&err),
+                Err(err) => self.pad_failed(guest, slot, &err),
+            }
         }
         self.command(Command::GamepadMode { guest, slot, raw });
     }
@@ -1213,9 +1368,27 @@ impl Worker {
         }
         if let Some(slot) = state.permissions.gamepad_slot
             && let Err(err) = self.sink.release_gamepad(slot)
+            && state.pad_problem.is_none()
         {
             self.warn(&err);
         }
+    }
+
+    /// Lo que hay que decirle a un invitado de su mando: ranura, estado en este equipo y por qué
+    /// va convertido. `None` si no tiene ranura.
+    fn pad_report(state: &GuestState, paused: bool) -> Option<(u8, HostPad, Option<String>)> {
+        let slot = state.permissions.gamepad_slot?;
+        let host = match &state.pad_problem {
+            Some(reason) => HostPad::Failed(guest_reason(reason)),
+            None if paused => HostPad::Paused,
+            None => HostPad::Ready,
+        };
+        let note = state
+            .pad
+            .as_ref()
+            .and_then(|pad| pad.note.as_deref())
+            .map(guest_reason);
+        Some((slot, host, note))
     }
 
     /// Pasa a los `GuestStatus` lo de los invitados que cambiaron algo inmediato (ranura,
@@ -1223,10 +1396,28 @@ impl Worker {
     /// tienen muestras nuevas (ordenar [`LATENCY_WINDOW`] muestras por etapa no se hace por
     /// paquete).
     fn publish(&mut self, periodic: bool) {
-        let mut updates: Vec<(GuestId, InputLatency, Option<GuestPad>)> = Vec::new();
+        let mut updates: Vec<(GuestId, InputLatency, Option<GuestPad>, Option<String>)> =
+            Vec::new();
+        let mut reports = Vec::new();
+        let paused = self.paused;
         for (guest, state) in &mut self.guests {
             if !(state.dirty || (periodic && state.stats_changed)) {
                 continue;
+            }
+            if state.dirty {
+                // Al invitado, cómo está su mando aquí, solo cuando cambia.
+                let report = Self::pad_report(state, paused);
+                if report != state.told {
+                    state.told.clone_from(&report);
+                    if let Some((slot, host, note)) = report {
+                        reports.push(Command::GamepadStatus {
+                            guest: *guest,
+                            slot,
+                            state: host,
+                            note,
+                        });
+                    }
+                }
             }
             state.dirty = false;
             state.stats_changed = false;
@@ -1244,7 +1435,11 @@ impl Worker {
                     state.repaired,
                 ),
                 state.pad.as_ref().map(PadState::status),
+                state.pad_problem.clone(),
             ));
+        }
+        for report in reports {
+            self.command(report);
         }
         if periodic {
             self.core
@@ -1255,10 +1450,11 @@ impl Worker {
             return;
         }
         let mut guests = lock(&self.core.guests);
-        for (guest, latency, pad) in updates {
+        for (guest, latency, pad, problem) in updates {
             if let Some(status) = guests.get_mut(&guest) {
                 status.input = latency;
                 status.gamepad = pad;
+                status.gamepad_problem = problem;
             }
         }
     }
@@ -1279,6 +1475,17 @@ struct GuestInputInner {
     pad_outputs: Mutex<VecDeque<(u8, Vec<u8>)>>,
     /// Lo que el anfitrión pide a los motores de cada ranura (`GamepadRumble`), el último.
     pad_rumble: Mutex<BTreeMap<u8, Rumble>>,
+    /// Cómo está en el equipo del anfitrión el mando de cada ranura (`GamepadStatus`), lo último.
+    pad_reports: Mutex<BTreeMap<u8, PadReport>>,
+}
+
+/// Lo que el anfitrión dice del mando de la ranura del invitado ([`GuestInput::pad_report`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PadReport {
+    /// Cómo está en su equipo: creado, en pausa o sin crear y por qué.
+    pub state: HostPad,
+    /// Por qué va convertido, si se declaró para ir tal cual.
+    pub note: Option<String>,
 }
 
 /// Informes de salida del anfitrión que se guardan como mucho hasta que el hilo de mandos los
@@ -1336,7 +1543,15 @@ impl GuestInput {
     pub(crate) fn set_allowed(&self, allowed: Allowed) {
         // La vibración de una ranura que ya no es suya no vale (el anfitrión quitó ese mando).
         lock(&self.inner.pad_rumble).retain(|slot, _| allowed.gamepad_slot == Some(*slot));
-        *lock(&self.inner.allowed) = allowed;
+        let old = std::mem::replace(&mut *lock(&self.inner.allowed), allowed);
+        if old.gamepad_slot != allowed.gamepad_slot {
+            // Ranura nueva (o la misma, quitada y vuelta a dar): el anfitrión olvidó el mando y
+            // espera otra declaración, así que la respuesta y el estado de antes ya no valen. Sin
+            // esto, quitar y dar la misma ranura deprisa dejaba el mando mudo: el hilo de mandos
+            // no llegaba a ver el cambio y seguía dando la declaración por contestada.
+            lock(&self.inner.pad_modes).clear();
+            lock(&self.inner.pad_reports).clear();
+        }
     }
 
     pub(crate) fn set_frame(&self, width: u32, height: u32) {
@@ -1355,6 +1570,7 @@ impl GuestInput {
         lock(&self.inner.pad_outputs).clear();
         // Y los motores se paran hasta que diga otra cosa (también al terminar la sesión).
         lock(&self.inner.pad_rumble).clear();
+        lock(&self.inner.pad_reports).clear();
     }
 
     /// Envía datos del mando tal cual al anfitrión (si la entrada ya está lista).
@@ -1366,6 +1582,30 @@ impl GuestInput {
 
     pub(crate) fn set_pad_mode(&self, slot: u8, raw: bool) {
         lock(&self.inner.pad_modes).insert(slot, raw);
+    }
+
+    /// Lo que el anfitrión dice del mando de `slot` (`GamepadStatus`). Los textos los escribe el
+    /// otro extremo: se guardan en una línea, sin caracteres de control y acotados.
+    pub(crate) fn set_pad_report(&self, slot: u8, state: HostPad, note: Option<String>) {
+        let clean = |text: &str| display_text(text, PAD_REASON_MAX);
+        let state = match state {
+            HostPad::Failed(reason) => HostPad::Failed(clean(&reason)),
+            other => other,
+        };
+        let note = note
+            .map(|note| clean(&note))
+            .filter(|note| !note.is_empty());
+        lock(&self.inner.pad_reports).insert(slot, PadReport { state, note });
+    }
+
+    /// Cómo está en el equipo del anfitrión el mando de `slot`, si ya lo dijo.
+    pub fn pad_report(&self, slot: u8) -> Option<PadReport> {
+        lock(&self.inner.pad_reports).get(&slot).cloned()
+    }
+
+    /// Si el anfitrión tiene tal cual el mando de `slot` (`None`: aún no contestó la declaración).
+    pub fn pad_mode(&self, slot: u8) -> Option<bool> {
+        lock(&self.inner.pad_modes).get(&slot).copied()
     }
 
     pub(crate) fn push_pad_output(&self, slot: u8, data: Vec<u8>) {
@@ -1619,6 +1859,284 @@ mod tests {
             }
         }
         assert_eq!(answers, 3);
+    }
+
+    /// Permisos de solo mando en `slot`, tal cual si se puede.
+    fn pad_only(slot: u8) -> Permissions {
+        Permissions {
+            gamepad_slot: Some(slot),
+            gamepad_raw: true,
+            ..Permissions::VIEW_ONLY
+        }
+    }
+
+    /// Un mando de ejemplo declarado para `slot` (por HID con un descriptor de mando, o XInput).
+    fn declared(slot: u8, hid: bool) -> PadData {
+        // Mando con un informe de entrada de 8 bytes (página genérica, uso «Game Pad»).
+        let descriptor = vec![
+            0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x75, 0x08, 0x95, 0x08, 0x81, 0x02, 0xC0,
+        ];
+        PadData::Device {
+            slot,
+            device: GamepadDevice {
+                name: "Mando de ejemplo".to_owned(),
+                vendor: 0x1234,
+                product: 0x5678,
+                version: 0,
+                bus: 3,
+                transport: if hid {
+                    GamepadTransport::Hid {
+                        descriptor,
+                        features: Vec::new(),
+                    }
+                } else {
+                    GamepadTransport::XInput
+                },
+            },
+        }
+    }
+
+    /// Lo que el hilo le dice al invitado de su mando (`GamepadStatus`), en orden.
+    fn told(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Command>,
+    ) -> Vec<(u8, HostPad, Option<String>)> {
+        let mut out = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            if let Command::GamepadStatus {
+                slot, state, note, ..
+            } = command
+            {
+                out.push((slot, state, note));
+            }
+        }
+        out
+    }
+
+    /// El caso del que se quejaba el anfitrión: no se puede crear el mando virtual. Antes solo
+    /// salía un aviso de 4 s, una vez por sesión y sin decir de quién; la fila del invitado seguía
+    /// como si nada y el invitado creía que su mando funcionaba. Ahora el motivo queda en el
+    /// estado de ese invitado mientras dure, cada invitado tiene su aviso con su nombre y a cada
+    /// uno se le dice; cuando el anfitrión lo arregla, basta que el invitado vuelva a declarar.
+    #[test]
+    fn a_pad_that_cannot_be_created_is_told_to_the_host_and_to_the_guest() {
+        let sink = RecordingSink::new();
+        sink.break_pads("no se puede abrir /dev/uinput para crear el mando virtual. Instala la regla udev:\n  echo …");
+        let mut worker = worker(&sink);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *lock(&worker.core.commands) = Some(tx);
+        let events = worker.core.events_rx.clone();
+        let (bea, carla) = (GuestId(1), GuestId(2));
+        for (guest, slot) in [(bea, 1), (carla, 2)] {
+            worker.handle(Job::Permissions {
+                guest,
+                permissions: pad_only(slot),
+            });
+        }
+        worker.publish(false);
+        // En el estado de cada uno, entero (con cómo arreglarlo), mientras dure.
+        for guest in [bea, carla] {
+            let problem = worker.guests[&guest].pad_problem.clone().expect("motivo");
+            assert!(
+                problem.contains("/dev/uinput") && problem.contains("regla udev"),
+                "{problem}"
+            );
+        }
+        // Un aviso por invitado, con su ranura (antes, uno solo para los dos y sin decir de quién).
+        let mut warnings = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let crate::remote::SessionEvent::Warning(text) = event {
+                warnings.push(text);
+            }
+        }
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains("ranura 1") && warnings[1].contains("ranura 2"),
+            "{warnings:?}"
+        );
+        // A cada invitado, que su mando no existe y por qué: la primera frase, sin las
+        // instrucciones para el equipo del anfitrión.
+        let reports = told(&mut rx);
+        assert_eq!(reports.len(), 2, "{reports:?}");
+        for (report, slot) in reports.iter().zip([1, 2]) {
+            assert_eq!(report.0, slot);
+            assert_eq!(
+                report.1,
+                HostPad::Failed(
+                    "no se puede abrir /dev/uinput para crear el mando virtual".to_owned()
+                )
+            );
+        }
+        // El invitado declara su mando: no se intenta sustituir un mando que no existe, y la nota
+        // no dice el «la ranura no está asignada» del sumidero.
+        worker.handle(Job::Declare {
+            guest: bea,
+            pads: vec![declared(1, true)],
+        });
+        assert!(sink.raw_slots().is_empty());
+        assert_eq!(
+            worker.guests[&bea]
+                .pad
+                .as_ref()
+                .and_then(|pad| pad.note.clone()),
+            None
+        );
+        // El anfitrión instala la regla; el invitado vuelve a conectar el mando: ya funciona.
+        sink.fix_pads();
+        worker.handle(Job::Declare {
+            guest: bea,
+            pads: vec![declared(1, false)],
+        });
+        worker.publish(false);
+        assert_eq!(worker.guests[&bea].pad_problem, None);
+        assert_eq!(sink.assigned_slots(), vec![1]);
+        assert_eq!(told(&mut rx).last(), Some(&(1, HostPad::Ready, None)));
+        // Carla sigue sin mando hasta que declare: quitarle la ranura no da otro aviso.
+        worker.handle(Job::Permissions {
+            guest: carla,
+            permissions: Permissions::VIEW_ONLY,
+        });
+        assert!(events.try_recv().is_err());
+    }
+
+    /// Al invitado se le dice cómo está su mando solo cuando cambia: creado al darle la ranura, en
+    /// pausa cuando el anfitrión pausa la entrada o deja de compartir, y por qué va convertido.
+    #[test]
+    fn the_guest_is_told_how_its_pad_is_only_when_it_changes() {
+        let sink = RecordingSink::new().without_raw();
+        let mut worker = worker(&sink);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *lock(&worker.core.commands) = Some(tx);
+        let guest = GuestId(1);
+        worker.handle(Job::Permissions {
+            guest,
+            permissions: pad_only(3),
+        });
+        worker.publish(false);
+        worker.publish(true);
+        assert_eq!(told(&mut rx), vec![(3, HostPad::Ready, None)]);
+        // Declara un mando para ir tal cual y este anfitrión no los recrea: va convertido, y por qué.
+        worker.handle(Job::Declare {
+            guest,
+            pads: vec![declared(3, true)],
+        });
+        worker.publish(false);
+        let reports = told(&mut rx);
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0].1, HostPad::Ready);
+        assert!(
+            reports[0]
+                .2
+                .as_deref()
+                .is_some_and(|note| note.contains("tal cual")),
+            "{reports:?}"
+        );
+        // Pausa del anfitrión y vuelta.
+        worker.handle(Job::Paused(true));
+        worker.publish(false);
+        worker.handle(Job::Paused(false));
+        worker.publish(false);
+        let states: Vec<HostPad> = told(&mut rx)
+            .into_iter()
+            .map(|(_, state, _)| state)
+            .collect();
+        assert_eq!(states, vec![HostPad::Paused, HostPad::Ready]);
+        // Sin ranura no hay nada que decir.
+        worker.handle(Job::Permissions {
+            guest,
+            permissions: Permissions::VIEW_ONLY,
+        });
+        worker.publish(false);
+        assert!(told(&mut rx).is_empty());
+    }
+
+    /// Un mando tal cual cuyos informes dejan de entrar vuelve a convertido con el motivo a la
+    /// vista, y al invitado se le dice que mande convertido: antes se quedaba muerto (solo mandaba
+    /// informes en crudo, a nada) con un único aviso. Un informe suelto que falla no lo cambia.
+    #[test]
+    fn a_raw_pad_that_stops_taking_reports_falls_back_to_converted() {
+        let sink = RecordingSink::new();
+        let mut worker = worker(&sink);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        *lock(&worker.core.commands) = Some(tx);
+        let guest = GuestId(1);
+        worker.handle(Job::Permissions {
+            guest,
+            permissions: pad_only(1),
+        });
+        worker.handle(Job::Declare {
+            guest,
+            pads: vec![declared(1, true)],
+        });
+        assert_eq!(sink.raw_slots(), vec![1]);
+        let report = || Job::Declare {
+            guest,
+            pads: vec![PadData::Report {
+                slot: 1,
+                data: vec![0; 8],
+            }],
+        };
+        worker.handle(report());
+        sink.break_raw_reports();
+        for _ in 0..RAW_FAILURES - 1 {
+            worker.handle(report());
+        }
+        assert_eq!(sink.raw_slots(), vec![1], "todavía tal cual");
+        worker.handle(report());
+        assert!(sink.raw_slots().is_empty(), "vuelve el convertido");
+        let pad = worker.guests[&guest].pad.as_ref().expect("mando");
+        assert!(!pad.active);
+        assert!(
+            pad.note
+                .as_deref()
+                .is_some_and(|note| note.contains("dejó de aceptar"))
+        );
+        let mut modes = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            if let Command::GamepadMode { raw, .. } = command {
+                modes.push(raw);
+            }
+        }
+        assert_eq!(modes, vec![true, false]);
+    }
+
+    /// El nombre del mando y el motivo los escribe el invitado y se pintan en la fila del
+    /// anfitrión: van en una línea, sin caracteres de control ni marcas de dirección.
+    #[test]
+    fn what_a_guest_declares_is_shown_as_one_clean_line() {
+        let sink = RecordingSink::new();
+        let mut worker = worker(&sink);
+        let guest = GuestId(1);
+        worker.handle(Job::Permissions {
+            guest,
+            permissions: pad_only(1),
+        });
+        worker.handle(Job::Declare {
+            guest,
+            pads: vec![PadData::Device {
+                slot: 1,
+                device: GamepadDevice {
+                    name: "Mando\n\u{202e}de ejemplo".to_owned(),
+                    vendor: 0x1234,
+                    product: 0x5678,
+                    version: 0,
+                    bus: 3,
+                    transport: GamepadTransport::Converted {
+                        reason: "sin\tpermiso\u{0}".to_owned(),
+                    },
+                },
+            }],
+        });
+        let status = worker.guests[&guest].pad.as_ref().expect("mando").status();
+        assert_eq!(status.name, "Mando de ejemplo");
+        assert_eq!(status.note.as_deref(), Some("sin permiso"));
+        assert_eq!(
+            guest_reason("no se puede. Instala la regla:\n  echo"),
+            "no se puede"
+        );
+        assert_eq!(
+            guest_reason("driver sin instalar: instálalo"),
+            "driver sin instalar: instálalo"
+        );
     }
 
     /// Como [`packet`], con los textos numerados desde `text_seq`.

@@ -34,9 +34,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use coroom_session::input::capture::Allowed;
-use coroom_session::input::gamepad::{ConnectedPad, PadChoice, PadKey};
+use coroom_session::input::gamepad::{ConnectedPad, PadChoice, PadKey, PadKind, PadLooks};
 use coroom_session::latency::{AudioTrack, LatencySummary};
-use coroom_session::remote::{QualityLevel, RoomMember, SessionEvent, talker_label};
+use coroom_session::remote::{
+    HostPadState, PadReport, QualityLevel, RoomMember, SessionEvent, talker_label,
+};
 use coroom_transport::Path;
 use coroom_ui::Element;
 use coroom_ui::animate::Shift;
@@ -212,8 +214,18 @@ pub struct State {
     pub game_volume: u8,
     /// Mandos conectados a este equipo (`None`: aún no se sabe).
     pub pads: Option<Vec<ConnectedPad>>,
-    /// Si el mando que se envía va tal cual.
-    pub pads_raw: bool,
+    /// Lo que se sabe del enlace del mando que se envía.
+    pub pad_link: PadLink,
+    /// Desde cuándo se espera a que el anfitrión conteste la declaración del mando.
+    pub pad_asked_at: Option<Instant>,
+    /// El mando marcado en el selector.
+    pub pad_pick: Option<PadKey>,
+    /// Si el selector se abrió a mano («Cambiar», «Elegir mando»).
+    pub pad_picker_open: bool,
+    /// Si se cerró con «Ahora no» (vuelve con otra ranura o con «Elegir mando»).
+    pub pad_picker_dismissed: bool,
+    /// La última pulsación de un mando ya vista (`None`: aún ninguna lista de mandos).
+    pub pad_pressed_seen: Option<u64>,
     /// Hasta cuándo se ve la barra.
     pub bar_until: Instant,
     /// Cuándo empezó a verse la barra (para su entrada).
@@ -323,7 +335,12 @@ impl State {
             volumes: std::collections::BTreeMap::new(),
             game_volume: DEFAULT_VOICE_VOLUME,
             pads: None,
-            pads_raw: false,
+            pad_link: PadLink::default(),
+            pad_asked_at: None,
+            pad_pick: None,
+            pad_picker_open: false,
+            pad_picker_dismissed: false,
+            pad_pressed_seen: None,
             bar_until: now,
             bar_shown_at: now,
             immersive: false,
@@ -774,10 +791,18 @@ pub enum Msg {
     GameVolume(u8),
     /// Al soltar el deslizador del juego: recordarlo en los ajustes.
     GameVolumeDone,
-    /// Mandos conectados y si el que se envía va tal cual.
-    Pads(Vec<ConnectedPad>, bool),
-    /// Elegir qué mando enviar (Ajustes → Mandos).
+    /// Mandos conectados y lo que se sabe del enlace del que se envía.
+    Pads(Vec<ConnectedPad>, PadLink),
+    /// Elegir qué mando enviar (Ajustes → Mandos o el selector de la sala).
     ChoosePad(PadChoice),
+    /// Marcar un mando en el selector de la sala.
+    PickPad(PadKey),
+    /// Enviar el marcado en el selector.
+    SendPickedPad,
+    /// Abrir el selector («Cambiar», «Elegir mando»).
+    OpenPadPicker,
+    /// Cerrar el selector sin elegir («Ahora no»).
+    ClosePadPicker,
     /// Abre o cierra el menú del sonido del juego (botón de sonido de la barra).
     ToggleSoundMenu,
     /// Inmersivo.
@@ -1082,21 +1107,77 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             app.settings.audio.game_volume = state.game_volume;
             return app.settings_changed();
         }
-        Msg::Pads(pads, raw) => {
+        Msg::Pads(pads, link) => {
+            let before = app
+                .guest
+                .as_ref()
+                .and_then(|state| pad_status(app, state, now));
+            let Some(state) = app.guest.as_mut() else {
+                return Vec::new();
+            };
             let slot = state.stats.as_ref().and_then(|s| s.allowed.gamepad_slot);
             let notice = state
                 .pads
                 .as_ref()
                 .and_then(|before| pads_notice(before, &pads, slot.is_some()));
+            // Desde cuándo se espera la respuesta del anfitrión a la declaración del mando.
+            let waiting = slot.is_some() && link.raw.is_none() && pads.iter().any(|pad| pad.active);
+            state.pad_asked_at = match (waiting, state.pad_asked_at) {
+                (true, asked) => asked.or(Some(now)),
+                (false, _) => None,
+            };
+            // Pulsar un botón de un mando con el selector a la vista lo elige (la primera lista
+            // solo marca hasta dónde se ha visto: una pulsación de antes no cuenta).
+            let pressed = link.pressed.clone();
+            let fresh = state.pad_pressed_seen.is_some_and(|seen| pressed.0 != seen);
+            state.pad_pressed_seen = Some(pressed.0);
             state.pads = Some(pads);
-            state.pads_raw = raw;
-            if let Some(notice) = notice {
-                app.toast(Tone::Info, notice);
+            state.pad_link = link;
+            if fresh
+                && let Some(key) = pressed.1
+                && app
+                    .guest
+                    .as_ref()
+                    .is_some_and(|state| picker_visible(app, state))
+            {
+                return update(app, Msg::ChoosePad(PadChoice::Pad(key)));
+            }
+            // Un mando que deja de llegar al juego se dice entero, con el motivo; si no, lo de
+            // siempre (se conectó o se desconectó uno).
+            let after = app
+                .guest
+                .as_ref()
+                .and_then(|state| pad_status(app, state, now))
+                .filter(|after| after.problem.is_some());
+            match after {
+                Some(after) if before.as_ref() != Some(&after) => app.toast(after.tone, after.text),
+                Some(_) => {}
+                None => {
+                    if let Some(notice) = notice {
+                        app.toast(Tone::Info, notice);
+                    }
+                }
             }
         }
         Msg::ChoosePad(choice) => {
+            state.pad_picker_open = false;
             app.settings.input.pad = choice.clone();
             return vec![Effect::SetPadChoice(choice), Effect::SaveSettings];
+        }
+        Msg::PickPad(key) => state.pad_pick = Some(key),
+        Msg::SendPickedPad => {
+            if let Some(key) = picker_choice(app, app.guest.as_ref().expect("sala")) {
+                return update(app, Msg::ChoosePad(PadChoice::Pad(key)));
+            }
+        }
+        Msg::OpenPadPicker => {
+            state.pad_picker_open = true;
+            state.pad_picker_dismissed = false;
+            state.pad_pick = None;
+        }
+        Msg::ClosePadPicker => {
+            state.pad_picker_open = false;
+            state.pad_picker_dismissed = true;
         }
         Msg::ToggleImmersive => {
             // Con el vídeo apagado, la entrada está en pausa.
@@ -1171,6 +1252,362 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
         }
     }
     Vec::new()
+}
+
+/// Lo que se sabe del enlace del mando que se envía, aparte de la lista de conectados.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PadLink {
+    /// Si el anfitrión lo tiene tal cual (`None`: aún no contestó la declaración).
+    pub raw: Option<bool>,
+    /// Lo que el anfitrión dice de él: creado, en pausa o sin crear y por qué.
+    pub report: Option<PadReport>,
+    /// Por qué no se leen los mandos de este equipo, si no se pudieron abrir.
+    pub error: Option<String>,
+    /// La última pulsación de un botón de un mando: contador y cuál.
+    pub pressed: (u64, Option<PadKey>),
+}
+
+/// Por qué el mando propio no llega al juego.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PadProblem {
+    /// No se pueden leer los mandos de este equipo.
+    Unreadable,
+    /// No hay ninguno conectado.
+    NoPad,
+    /// El elegido en Ajustes no está conectado.
+    ChosenMissing,
+    /// Lo conectado no parece un mando (y en automático no se envía).
+    NotAPad,
+    /// Hay varios mandos y el invitado tiene que elegir cuál envía.
+    Choose,
+    /// El anfitrión no contesta la declaración.
+    NoAnswer,
+    /// El anfitrión no pudo crear el mando en su equipo.
+    HostFailed,
+    /// El anfitrión pausó la entrada o no comparte nada.
+    HostPaused,
+}
+
+/// Cómo va el mando propio, para decirlo en la sala.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PadStatus {
+    /// Tono del texto y del icono.
+    pub tone: Tone,
+    /// La frase entera, para tu fila de «Personas» y para el aviso.
+    pub text: String,
+    /// Si no llega al juego, por qué (va también abajo, sobre el vídeo).
+    pub problem: Option<PadProblem>,
+}
+
+/// Cuánto se espera la respuesta del anfitrión a la declaración del mando antes de decir que no
+/// contesta (el mando la repite cada medio segundo).
+pub const PAD_ANSWER_WAIT: Duration = Duration::from_secs(5);
+
+/// Cómo va el mando que el anfitrión te dejó usar: cuál envías y cómo llega o, si no llega al
+/// juego, por qué y qué hacer. `None` sin ranura de mando o antes de saber qué hay conectado.
+pub fn pad_status(app: &App, state: &State, now: Instant) -> Option<PadStatus> {
+    let slot = state.stats.as_ref()?.allowed.gamepad_slot?;
+    let link = &state.pad_link;
+    let problem = |tone, problem, text: String| {
+        Some(PadStatus {
+            tone,
+            text,
+            problem: Some(problem),
+        })
+    };
+    if let Some(err) = &link.error {
+        return problem(
+            Tone::Error,
+            PadProblem::Unreadable,
+            t!("room-mando-sin-leer", err = err),
+        );
+    }
+    let pads = state.pads.as_ref()?;
+    let Some(active) = pads.iter().find(|pad| pad.active) else {
+        return match (&app.settings.input.pad, pads.last()) {
+            (PadChoice::Pad(key), _) if !pads.iter().any(|pad| &pad.key == key) => problem(
+                Tone::Warning,
+                PadProblem::ChosenMissing,
+                t!("room-mando-elegido-ausente", name = key.name),
+            ),
+            (_, Some(_))
+                if pads
+                    .iter()
+                    .filter(|pad| pad.looks == PadLooks::Gamepad)
+                    .count()
+                    > 1 =>
+            {
+                problem(
+                    Tone::Info,
+                    PadProblem::Choose,
+                    t!("room-mando-elige", count = pads.len()),
+                )
+            }
+            (_, Some(other)) => problem(
+                Tone::Warning,
+                PadProblem::NotAPad,
+                t!("room-mando-no-parece", name = other.key.name),
+            ),
+            (_, None) => problem(
+                Tone::Warning,
+                PadProblem::NoPad,
+                t!("room-mando-ninguno", slot = slot),
+            ),
+        };
+    };
+    let name = active.key.name.as_str();
+    let host = state
+        .host_name
+        .clone()
+        .unwrap_or_else(|| t!("room-mando-el-anfitrion").to_owned());
+    if pad_paused(app) {
+        return Some(PadStatus {
+            tone: Tone::Neutral,
+            text: t!("room-mando-pausa-fuera", name = name),
+            problem: None,
+        });
+    }
+    let report = link.report.as_ref();
+    match report.map(|report| &report.state) {
+        Some(HostPadState::Failed(reason)) => {
+            return problem(
+                Tone::Error,
+                PadProblem::HostFailed,
+                t!(
+                    "room-mando-fallo-anfitrion",
+                    name = name,
+                    host = host,
+                    reason = reason
+                ),
+            );
+        }
+        Some(HostPadState::Paused) => {
+            return problem(
+                Tone::Warning,
+                PadProblem::HostPaused,
+                t!("room-mando-pausa-anfitrion", name = name, host = host),
+            );
+        }
+        Some(HostPadState::Ready) | None => {}
+    }
+    let Some(raw) = link.raw else {
+        let late = state
+            .pad_asked_at
+            .is_some_and(|asked| now.saturating_duration_since(asked) >= PAD_ANSWER_WAIT);
+        if late {
+            return problem(
+                Tone::Warning,
+                PadProblem::NoAnswer,
+                t!("room-mando-sin-respuesta", name = name, host = host),
+            );
+        }
+        return Some(PadStatus {
+            tone: Tone::Neutral,
+            text: t!(
+                "room-mando-esperando",
+                name = name,
+                slot = slot,
+                host = host
+            ),
+            problem: None,
+        });
+    };
+    // Por qué va convertido: lo que dijo el anfitrión o, si no, lo que impide leerlo en crudo aquí.
+    let reason = report
+        .and_then(|report| report.note.clone())
+        .or_else(|| match &active.kind {
+            PadKind::Converted(reason) => Some(reason.clone()),
+            PadKind::Hid | PadKind::XInput => None,
+        });
+    let mut text = match (raw, reason) {
+        (true, _) => t!("room-mando-tal-cual", name = name, slot = slot),
+        (false, Some(reason)) => t!(
+            "room-mando-convertido-porque",
+            name = name,
+            slot = slot,
+            reason = reason
+        ),
+        (false, None) => t!("room-mando-convertido", name = name, slot = slot),
+    };
+    if active.looks == PadLooks::NotAPad {
+        text.push(' ');
+        text.push_str(t!("room-mando-raro"));
+    }
+    Some(PadStatus {
+        tone: Tone::Neutral,
+        text,
+        problem: None,
+    })
+}
+
+/// Si el selector de mando está a la vista: con ranura, con la lista de mandos y sin estar
+/// fuera de la sala, cuando se abrió a mano o cuando no va ningún mando y hay alguno conectado
+/// (dos o más, o solo dudosos, o el elegido no está) y no se dijo «Ahora no».
+pub fn picker_visible(app: &App, state: &State) -> bool {
+    let has_slot = state
+        .stats
+        .as_ref()
+        .is_some_and(|stats| stats.allowed.gamepad_slot.is_some());
+    let Some(pads) = state.pads.as_ref() else {
+        return false;
+    };
+    if !has_slot || pad_paused(app) || state.pad_link.error.is_some() || pads.is_empty() {
+        return false;
+    }
+    state.pad_picker_open || (!state.pad_picker_dismissed && !pads.iter().any(|pad| pad.active))
+}
+
+/// El mando marcado en el selector: el que se marcó, si sigue conectado; si no, el que va, el
+/// elegido si está, el primero que parezca un mando o el primero.
+pub fn picker_choice(app: &App, state: &State) -> Option<PadKey> {
+    let pads = state.pads.as_ref()?;
+    let connected = |key: &PadKey| pads.iter().any(|pad| &pad.key == key);
+    state
+        .pad_pick
+        .clone()
+        .filter(|key| connected(key))
+        .or_else(|| {
+            pads.iter()
+                .find(|pad| pad.active)
+                .map(|pad| pad.key.clone())
+        })
+        .or_else(|| match &app.settings.input.pad {
+            PadChoice::Pad(key) if connected(key) => Some(key.clone()),
+            _ => None,
+        })
+        .or_else(|| {
+            pads.iter()
+                .find(|pad| pad.looks == PadLooks::Gamepad)
+                .or(pads.first())
+                .map(|pad| pad.key.clone())
+        })
+}
+
+/// Ancho del selector de mando.
+const PICKER_WIDTH: f32 = 320.0;
+
+/// El selector de mando sobre el vídeo, abajo al centro: quién te dio la ranura, los mandos
+/// conectados (el marcado, con borde; cómo llegaría cada uno; los dudosos, dichos), que también
+/// vale pulsar un botón del que quieras usar, y «Enviar» o «Ahora no».
+fn picker_view<'a>(app: &'a App, state: &'a State) -> Option<Element<'a, Message>> {
+    if !picker_visible(app, state) {
+        return None;
+    }
+    let slot = state.stats.as_ref()?.allowed.gamepad_slot?;
+    let pads = state.pads.as_ref()?;
+    let picked = picker_choice(app, state);
+    let host = state
+        .host_name
+        .clone()
+        .unwrap_or_else(|| t!("room-el-anfitrion").to_owned());
+    let sending = pads.iter().any(|pad| pad.active);
+    let title = if sending {
+        t!("room-selector-cambiar-titulo").to_owned()
+    } else {
+        t!("room-selector-te-dio", host = host.as_str())
+    };
+    let head = row![
+        icon_with(Icon::Gamepad, 18.0, SvgClass::Overlay),
+        column![
+            text(title)
+                .size(type_size::BODY)
+                .font(coroom_ui::font::SEMIBOLD)
+                .class(TextClass::Overlay)
+                .wrapping(Wrapping::WordOrGlyph),
+            overlay_text(t!("room-selector-elige", slot = slot))
+                .size(type_size::CAPTION)
+                .wrapping(Wrapping::WordOrGlyph),
+        ]
+        .spacing(2)
+        .width(Length::Fill),
+    ]
+    .spacing(space::XS)
+    .align_y(Alignment::Center);
+    let mut list = Column::new().spacing(space::XXS);
+    for pad in pads {
+        let how = if pad.looks == PadLooks::NotAPad {
+            t!("room-selector-no-parece").to_owned()
+        } else {
+            match pad.kind {
+                PadKind::Hid | PadKind::XInput => {
+                    t!("room-selector-tal-cual", host = host.as_str())
+                }
+                PadKind::Converted(_) => t!("room-selector-convertido").to_owned(),
+            }
+        };
+        let chosen = picked.as_ref() == Some(&pad.key);
+        let label = column![
+            text(ui::ellipsize(&pad.key.name, 40).into_owned())
+                .size(type_size::SECONDARY)
+                .font(if chosen {
+                    coroom_ui::font::SEMIBOLD
+                } else {
+                    coroom_ui::font::UI
+                })
+                .wrapping(Wrapping::None),
+            text(how)
+                .size(type_size::CAPTION)
+                .class(if chosen {
+                    TextClass::Inherit
+                } else {
+                    TextClass::OverlaySecondary
+                })
+                .wrapping(Wrapping::WordOrGlyph),
+        ]
+        .spacing(2)
+        .width(Length::Fill);
+        list = list.push(
+            button(label)
+                .width(Length::Fill)
+                .padding(Padding::from([space::XS, space::S]))
+                .class(ButtonClass::Overlay { active: chosen })
+                .on_press(on(Msg::PickPad(pad.key.clone()))),
+        );
+    }
+    let actions = row![
+        ui::primary(t!("room-selector-enviar"), Some(on(Msg::SendPickedPad))),
+        button(
+            text(t!("room-selector-ahora-no"))
+                .size(type_size::BODY)
+                .font(coroom_ui::font::SEMIBOLD)
+                .class(TextClass::Overlay)
+        )
+        .padding(Padding::from([space::XS, space::M]))
+        .class(ButtonClass::Overlay { active: false })
+        .on_press(on(Msg::ClosePadPicker)),
+    ]
+    .spacing(space::XS);
+    Some(
+        container(
+            column![
+                head,
+                list,
+                overlay_text(t!("room-selector-pulsa"))
+                    .size(type_size::CAPTION)
+                    .wrapping(Wrapping::WordOrGlyph),
+                actions,
+            ]
+            .spacing(space::S),
+        )
+        .padding(space::M)
+        .width(Length::Fixed(PICKER_WIDTH))
+        .class(ContainerClass::Overlay)
+        .into(),
+    )
+}
+
+/// El problema del mando en una línea, para la indicación de abajo sobre el vídeo.
+pub fn pad_problem_short(problem: PadProblem, slot: u8) -> String {
+    match problem {
+        PadProblem::Unreadable => t!("room-mando-corto-sin-leer").to_owned(),
+        PadProblem::NoPad => t!("room-mando-corto-ninguno", slot = slot),
+        PadProblem::ChosenMissing => t!("room-mando-corto-elegido-ausente").to_owned(),
+        PadProblem::NotAPad => t!("room-mando-corto-no-parece").to_owned(),
+        PadProblem::Choose => t!("room-mando-corto-elige").to_owned(),
+        PadProblem::NoAnswer => t!("room-mando-corto-sin-respuesta").to_owned(),
+        PadProblem::HostFailed => t!("room-mando-corto-fallo-anfitrion").to_owned(),
+        PadProblem::HostPaused => t!("room-mando-corto-pausa-anfitrion").to_owned(),
+    }
 }
 
 /// Aviso de un mando que se conectó o se desconectó, con el que se envía ahora si hay ranura.
@@ -1283,8 +1720,10 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
         Event::GuestStats(stats) => {
             let mut notice = None;
             let mut corrupt = false;
+            let mut before_slot = None;
             if let Some(state) = app.guest.as_mut() {
                 let before = state.stats.as_ref().map(|old| old.allowed);
+                before_slot = before.and_then(|allowed| allowed.gamepad_slot);
                 if let Some(before) = before {
                     notice = permissions_notice(before, stats.allowed);
                 }
@@ -1307,8 +1746,48 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
                 }
                 state.tick(now);
             }
-            if let Some((tone, text)) = notice {
-                app.toast(tone, text);
+            // Con el mando recién dado, si no llega al juego se dice por qué en vez de dar la buena
+            // noticia a secas (antes: «te ha dado el mando» y nada más, aunque no hubiera ninguno).
+            let gained_pad = before_slot.is_none()
+                && app
+                    .guest
+                    .as_ref()
+                    .and_then(|state| state.stats.as_ref())
+                    .is_some_and(|stats| stats.allowed.gamepad_slot.is_some());
+            if gained_pad && let Some(state) = app.guest.as_mut() {
+                // Ranura nueva: el selector vuelve a salir aunque antes se dijera «Ahora no».
+                state.pad_picker_dismissed = false;
+            }
+            let pad = app
+                .guest
+                .as_ref()
+                .and_then(|state| pad_status(app, state, now));
+            let sending = app
+                .guest
+                .as_ref()
+                .and_then(|state| state.pads.as_ref())
+                .and_then(|pads| pads.iter().find(|pad| pad.active))
+                .map(|pad| pad.key.name.clone());
+            let slot = app
+                .guest
+                .as_ref()
+                .and_then(|state| state.stats.as_ref())
+                .and_then(|stats| stats.allowed.gamepad_slot);
+            match (notice, pad) {
+                // Recién dado: si no llega al juego, por qué; si llega, cuál envías.
+                (_, Some(pad)) if gained_pad && pad.problem.is_some() => {
+                    app.toast(pad.tone, pad.text);
+                }
+                (Some((tone, _)), Some(_)) if gained_pad && sending.is_some() => app.toast(
+                    tone,
+                    t!(
+                        "room-mando-dado-envias",
+                        slot = slot.unwrap_or_default(),
+                        name = sending.unwrap_or_default()
+                    ),
+                ),
+                (Some((tone, text)), _) => app.toast(tone, text),
+                (None, _) => {}
             }
             if corrupt {
                 app.toast(Tone::Warning, t!("room-el-video-llega-danado").to_owned());
@@ -2594,12 +3073,27 @@ pub fn input_hint(app: &App, state: &State) -> Option<String> {
     })
 }
 
+/// Si el mando no llega al juego, eso en una línea para la indicación de abajo (va antes que la
+/// del teclado y el ratón: es lo que hay que arreglar). Con el mando en reposo por estar fuera de
+/// la sala, nada.
+pub fn pad_hint(app: &App, state: &State) -> Option<String> {
+    let slot = state.stats.as_ref()?.allowed.gamepad_slot?;
+    let problem = pad_status(app, state, app.now)?.problem?;
+    Some(pad_problem_short(problem, slot))
+}
+
 fn input_hint_view<'a>(app: &App, state: &State) -> Option<Element<'a, Message>> {
-    let hint = input_hint(app, state)?;
-    let glyph = if state.forwarding {
+    let pad = pad_hint(app, state);
+    let glyph = if pad.is_some() {
+        Icon::Gamepad
+    } else if state.forwarding {
         Icon::Keyboard
     } else {
         Icon::Mouse
+    };
+    let hint = match pad {
+        Some(pad) => pad,
+        None => input_hint(app, state)?,
     };
     let content = row![
         icon_with(glyph, 16.0, SvgClass::Overlay),
@@ -3141,16 +3635,71 @@ fn person_view<'a>(app: &'a App, state: &'a State, member: &'a RoomMember) -> El
                 .wrapping(Wrapping::WordOrGlyph)
                 .into()
         });
-        return column![head, ui::slot(permissions), volume]
-            .spacing(space::XXS)
-            .width(Length::Fill)
-            .into();
+        return column![
+            head,
+            ui::slot(permissions),
+            ui::slot(own_pad_view(app, state)),
+            volume
+        ]
+        .spacing(space::XXS)
+        .width(Length::Fill)
+        .into();
     }
     container(column![head, volume].spacing(space::XS))
         .width(Length::Fill)
         .height(Length::Fixed(PERSON_HEIGHT))
         .clip(true)
         .into()
+}
+
+/// Tu mando, en tu fila de «Personas»: cuál envías y cómo llega o, si no llega al juego, por qué
+/// y qué hacer, entero (sin acortar) y con el color del aviso. Solo con ranura de mando.
+fn own_pad_view<'a>(app: &'a App, state: &State) -> Option<Element<'a, Message>> {
+    let status = pad_status(app, state, app.now)?;
+    let (glyph, color) = match status.problem {
+        Some(_) => (
+            Icon::CircleAlert,
+            Some(dark(app).tone(status.tone).text.color()),
+        ),
+        None => (Icon::Gamepad, None),
+    };
+    let class = color.map_or(SvgClass::Overlay, |_| SvgClass::Tone(status.tone));
+    let mut line = text(status.text)
+        .size(type_size::CAPTION)
+        .wrapping(Wrapping::WordOrGlyph)
+        .width(Length::Fill);
+    line = match color {
+        Some(color) => line.class(TextClass::Custom(color)),
+        None => line.class(TextClass::Overlay),
+    };
+    // Cambiar de mando sin ir a Ajustes: con uno enviándose, «Cambiar»; sin ninguno y con
+    // alguno conectado (el selector cerrado con «Ahora no»), «Elegir mando».
+    let pads = state.pads.as_deref().unwrap_or_default();
+    let action = if pads.iter().any(|pad| pad.active) {
+        Some(t!("room-mando-cambiar"))
+    } else if !pads.is_empty() && !picker_visible(app, state) {
+        Some(t!("room-mando-elegir"))
+    } else {
+        None
+    };
+    let mut content = row![icon_with(glyph, 14.0, class), line]
+        .spacing(space::XS)
+        .align_y(Alignment::Center);
+    if let Some(label) = action {
+        content = content.push(
+            button(
+                text(label)
+                    .size(type_size::CAPTION)
+                    .font(coroom_ui::font::SEMIBOLD)
+                    .class(TextClass::Overlay)
+                    .wrapping(Wrapping::None),
+            )
+            .padding(Padding::from([space::XXS, space::XS]))
+            .class(ButtonClass::Overlay { active: false })
+            .on_press(on(Msg::OpenPadPicker)),
+        );
+    }
+    Some(content.into())
 }
 
 /// La voz propia: lo alto que te oyen los demás (de 0 a 200 % de 5 en 5; Ctrl+clic, 100 %), con
@@ -3725,15 +4274,25 @@ fn video<'a>(app: &'a App, state: &'a State) -> Element<'a, Message> {
             .into()
         });
     // Abajo al centro, el aviso (3 s) o la indicación del teclado y el ratón; con el panel
-    // abierto, centrados en lo que queda a su izquierda.
-    let bottom = match state.notice(now) {
+    // abierto, centrados en lo que queda a su izquierda. Encima, el selector de mando si hace
+    // falta elegir (no se va con la barra: hasta elegir no se envía ningún mando).
+    let hint = match state.notice(now) {
         Some(notice) => Some(notice_view(app, notice)),
         None => state
             .pill_visible(now, app.fullscreen)
             .then(|| input_hint_view(app, state))
             .flatten(),
+    };
+    let bottom = match (picker_view(app, state), hint) {
+        (Some(picker), Some(hint)) => Some(
+            column![picker, hint]
+                .spacing(space::S)
+                .align_x(Alignment::Center)
+                .into(),
+        ),
+        (picker, hint) => picker.or(hint),
     }
-    .map(|content| {
+    .map(|content: Element<'a, Message>| {
         let right = if state.panel.is_some() && !immersive {
             size::STATS_PANEL + 2.0 * space::S
         } else {
@@ -4264,6 +4823,7 @@ pub(crate) mod shots {
                 product,
                 name: name.to_owned(),
             },
+            looks: coroom_session::input::gamepad::PadLooks::Gamepad,
             kind,
             active,
         }
@@ -4287,14 +4847,92 @@ pub(crate) mod shots {
         let first = sample_pad(0x1234, 0x5678, "Mando de ejemplo", PadKind::Hid, true);
         let second = sample_pad(0x1234, 0x9abc, "Mando de ejemplo 2", PadKind::XInput, false);
         app.settings.input.pad = PadChoice::Pad(first.key.clone());
-        app.update(Message::Guest(Msg::Pads(vec![first.clone()], true)));
-        app.update(Message::Guest(Msg::Pads(vec![first, second], true)));
+        let tal_cual = super::PadLink {
+            raw: Some(true),
+            ..super::PadLink::default()
+        };
+        app.update(Message::Guest(Msg::Pads(
+            vec![first.clone()],
+            tal_cual.clone(),
+        )));
+        app.update(Message::Guest(Msg::Pads(
+            vec![first, second],
+            tal_cual.clone(),
+        )));
         speaking(app, &["anfitrión"]);
         if let Some(stats) = app.guest.as_mut().and_then(|state| state.stats.as_mut()) {
             stats.voice = true;
         }
         app.update(Message::Guest(Msg::MicVolume(120)));
         app.update(Message::Guest(Msg::ShowTab(Tab::People)));
+        app.toasts.clear();
+        settled(app);
+    }
+
+    /// «Personas» con el mando que no llega al juego porque el equipo del anfitrión no pudo
+    /// crearlo: el motivo en tu fila, en la indicación de abajo y en el aviso.
+    pub(crate) fn guest_pad_failed(app: &mut App) {
+        guest_people(app);
+        let pad = sample_pad(0x1234, 0x5678, "Mando de ejemplo", PadKind::Hid, true);
+        app.update(Message::Guest(Msg::Pads(
+            vec![pad],
+            super::PadLink {
+                raw: Some(false),
+                report: Some(coroom_session::remote::PadReport {
+                    state: coroom_session::remote::HostPadState::Failed(
+                        "no se puede abrir /dev/uinput para crear el mando virtual".to_owned(),
+                    ),
+                    note: None,
+                }),
+                error: None,
+                pressed: Default::default(),
+            },
+        )));
+        settled(app);
+    }
+
+    /// El selector de mando sobre el vídeo: la ranura recién dada con dos mandos y un teclado
+    /// conectados, ninguno enviándose todavía.
+    pub(crate) fn guest_pad_picker(app: &mut App) {
+        video(app);
+        app.settings.input.pad = PadChoice::Auto;
+        let mut keyboard = sample_pad(
+            0x1234,
+            0x0001,
+            "Teclado de ejemplo",
+            PadKind::Converted("sin interfaz HID en crudo".to_owned()),
+            false,
+        );
+        keyboard.looks = coroom_session::input::gamepad::PadLooks::NotAPad;
+        app.update(Message::Guest(Msg::Pads(
+            vec![
+                sample_pad(0x1234, 0x5678, "Mando de ejemplo", PadKind::Hid, false),
+                sample_pad(
+                    0x1234,
+                    0x9abc,
+                    "Mando de ejemplo 2",
+                    PadKind::Converted("sin interfaz HID en crudo".to_owned()),
+                    false,
+                ),
+                keyboard,
+            ],
+            super::PadLink::default(),
+        )));
+        let mut stats = sample_stats();
+        stats.allowed.gamepad_slot = Some(2);
+        app.update(Message::Event(Event::GuestStats(Box::new(stats))));
+        app.toasts.clear();
+        settled(app);
+    }
+
+    /// «Personas» con ranura de mando y ningún mando conectado.
+    pub(crate) fn guest_no_pad(app: &mut App) {
+        guest_people(app);
+        app.settings.input.pad = PadChoice::Auto;
+        app.update(Message::Guest(Msg::Pads(
+            Vec::new(),
+            super::PadLink::default(),
+        )));
         app.toasts.clear();
         settled(app);
     }
@@ -4551,6 +5189,9 @@ pub(crate) mod shots {
             settled(app);
         }),
         ("14-personas", guest_people),
+        ("14-personas-mando-sin-crear", guest_pad_failed),
+        ("14-personas-sin-mando", guest_no_pad),
+        ("13-video-elegir-mando", guest_pad_picker),
         ("16-fuera-de-la-sala", guest_away_home),
         ("16-fuera-de-la-sala-mandos", guest_away_pads),
         ("15-reconectando", guest_reconnecting),
@@ -4899,6 +5540,276 @@ mod tests {
             state.pill_visible(app.now, true),
             "y vuelve al mover el ratón"
         );
+    }
+
+    /// Tu mando: qué envías y cómo llega o, si no llega al juego, por qué y quién lo arregla. Va
+    /// en tu fila de «Personas», en una línea abajo sobre el vídeo y en un aviso al ocurrir (antes
+    /// solo había «el anfitrión te ha dado el mando», hubiera mando o no, y nada si fallaba).
+    #[test]
+    fn your_pad_says_what_you_send_or_why_it_does_not_reach_the_game() {
+        use coroom_session::input::gamepad::{PadKind, PadLooks};
+        let mut app = watching();
+        let status = |app: &App| pad_status(app, app.guest.as_ref().expect("invitado"), app.now);
+        let hint = |app: &App| pad_hint(app, app.guest.as_ref().expect("invitado"));
+        let pads = |app: &mut App, pads: Vec<ConnectedPad>, link: PadLink| {
+            app.update(Message::Guest(Msg::Pads(pads, link)));
+        };
+        let last_toast = |app: &App| app.toasts.last().map(|toast| toast.text.clone());
+        // Sin ranura de mando no hay nada que decir.
+        pads(&mut app, Vec::new(), PadLink::default());
+        assert_eq!(status(&app), None);
+        assert_eq!(hint(&app), None);
+        // El anfitrión da la ranura 2 y no hay ningún mando: el aviso dice eso, no la buena
+        // noticia a secas.
+        app.toasts.clear();
+        let mut stats = shots::sample_stats();
+        stats.allowed.gamepad_slot = Some(2);
+        app.update(Message::Event(Event::GuestStats(Box::new(stats))));
+        let none = status(&app).expect("estado");
+        assert_eq!(none.problem, Some(PadProblem::NoPad));
+        assert_eq!(none.tone, Tone::Warning);
+        assert!(
+            none.text.contains("ranura 2") && none.text.contains("no hay ningún mando conectado"),
+            "{}",
+            none.text
+        );
+        assert_eq!(last_toast(&app), Some(none.text.clone()));
+        assert_eq!(
+            hint(&app).as_deref(),
+            Some("Ranura 2: no hay ningún mando conectado")
+        );
+        // Solo hay un teclado que el sistema lista como mando: no se envía, y se dice cuál es.
+        let keyboard = ConnectedPad {
+            looks: PadLooks::NotAPad,
+            ..shots::sample_pad(
+                0x1234,
+                0x0001,
+                "Teclado de ejemplo",
+                PadKind::Converted("sin interfaz HID en crudo".to_owned()),
+                false,
+            )
+        };
+        pads(&mut app, vec![keyboard], PadLink::default());
+        let odd = status(&app).expect("estado");
+        assert_eq!(odd.problem, Some(PadProblem::NotAPad));
+        assert!(
+            odd.text.contains("«Teclado de ejemplo» no parece un mando"),
+            "{}",
+            odd.text
+        );
+        assert_eq!(last_toast(&app), Some(odd.text));
+        // El mando elegido en Ajustes no está conectado.
+        let pad = shots::sample_pad(0x1234, 0x5678, "Mando de ejemplo", PadKind::Hid, true);
+        app.settings.input.pad = PadChoice::Pad(pad.key.clone());
+        pads(&mut app, Vec::new(), PadLink::default());
+        let missing = status(&app).expect("estado");
+        assert_eq!(missing.problem, Some(PadProblem::ChosenMissing));
+        assert!(
+            missing
+                .text
+                .contains("«Mando de ejemplo», el que elegiste, no está conectado")
+        );
+        // Se conecta: se declara y se espera al anfitrión sin alarmar; si no contesta, se dice.
+        app.toasts.clear();
+        pads(&mut app, vec![pad.clone()], PadLink::default());
+        let waiting = status(&app).expect("estado");
+        assert_eq!(waiting.problem, None);
+        assert!(
+            waiting.text.contains("esperando la respuesta de"),
+            "{}",
+            waiting.text
+        );
+        assert_eq!(hint(&app), None);
+        app.now += PAD_ANSWER_WAIT;
+        assert_eq!(
+            status(&app).and_then(|status| status.problem),
+            Some(PadProblem::NoAnswer)
+        );
+        // Contesta: llega tal cual.
+        let ready = |raw: bool, note: Option<&str>| PadLink {
+            raw: Some(raw),
+            report: Some(PadReport {
+                state: HostPadState::Ready,
+                note: note.map(str::to_owned),
+            }),
+            error: None,
+            pressed: Default::default(),
+        };
+        pads(&mut app, vec![pad.clone()], ready(true, None));
+        let sent = status(&app).expect("estado");
+        assert_eq!(sent.problem, None);
+        assert_eq!(
+            sent.text,
+            "Envías «Mando de ejemplo» en la ranura 2, tal cual."
+        );
+        assert_eq!(hint(&app), None);
+        // O convertido, con el motivo que da el anfitrión.
+        pads(
+            &mut app,
+            vec![pad.clone()],
+            ready(false, Some("su descriptor no declara un mando")),
+        );
+        assert_eq!(
+            status(&app).map(|status| status.text).as_deref(),
+            Some(
+                "Envías «Mando de ejemplo» en la ranura 2, convertido a Xbox 360: su descriptor \
+                 no declara un mando."
+            )
+        );
+        // El equipo del anfitrión no pudo crear el mando: error, con su motivo y quién lo arregla.
+        app.toasts.clear();
+        let failed = PadLink {
+            raw: Some(false),
+            report: Some(PadReport {
+                state: HostPadState::Failed("no se puede abrir /dev/uinput".to_owned()),
+                note: None,
+            }),
+            error: None,
+            pressed: Default::default(),
+        };
+        pads(&mut app, vec![pad.clone()], failed.clone());
+        let broken = status(&app).expect("estado");
+        assert_eq!(broken.problem, Some(PadProblem::HostFailed));
+        assert_eq!(broken.tone, Tone::Error);
+        assert!(
+            broken.text.contains("no llega al juego")
+                && broken.text.contains("no se puede abrir /dev/uinput")
+                && broken.text.contains("Lo tiene que arreglar"),
+            "{}",
+            broken.text
+        );
+        assert_eq!(last_toast(&app), Some(broken.text.clone()));
+        assert_eq!(
+            hint(&app).as_deref(),
+            Some("Tu mando no llega: fallo en el equipo del anfitrión")
+        );
+        // El mismo estado otra vez no repite el aviso.
+        app.toasts.clear();
+        pads(&mut app, vec![pad.clone()], failed);
+        assert_eq!(last_toast(&app), None);
+        // El anfitrión pausa la entrada o deja de compartir.
+        pads(
+            &mut app,
+            vec![pad.clone()],
+            PadLink {
+                raw: Some(false),
+                report: Some(PadReport {
+                    state: HostPadState::Paused,
+                    note: None,
+                }),
+                error: None,
+                pressed: Default::default(),
+            },
+        );
+        assert_eq!(
+            status(&app).and_then(|status| status.problem),
+            Some(PadProblem::HostPaused)
+        );
+        // Este equipo no puede leer los mandos.
+        pads(
+            &mut app,
+            Vec::new(),
+            PadLink {
+                error: Some("sin acceso a /dev/input".to_owned()),
+                ..PadLink::default()
+            },
+        );
+        let unreadable = status(&app).expect("estado");
+        assert_eq!(unreadable.problem, Some(PadProblem::Unreadable));
+        assert!(unreadable.text.contains("sin acceso a /dev/input"));
+    }
+
+    /// El selector de mando: con varios mandos y la ranura recién dada no se envía ninguno hasta
+    /// elegir; se elige con «Enviar» (el marcado), pulsando un botón del que se quiera usar (no
+    /// cuenta una pulsación de antes) o se deja para luego con «Ahora no»; con uno enviándose,
+    /// «Cambiar» lo vuelve a abrir. La elección se recuerda.
+    #[test]
+    fn the_pad_picker_chooses_by_click_or_by_pressing_a_button() {
+        use coroom_session::input::gamepad::{PadKind, PadLooks};
+        let mut app = watching();
+        let one = shots::sample_pad(0x1234, 0x5678, "Mando de ejemplo", PadKind::Hid, false);
+        let two = shots::sample_pad(0x1234, 0x9abc, "Mando de ejemplo 2", PadKind::XInput, false);
+        let both = vec![one.clone(), two.clone()];
+        let pressed = |count: u64, key: Option<&PadKey>| PadLink {
+            pressed: (count, key.cloned()),
+            ..PadLink::default()
+        };
+        let visible = |app: &App| picker_visible(app, app.guest.as_ref().expect("invitado"));
+        // Una pulsación anterior a la lista no cuenta.
+        app.update(Message::Guest(Msg::Pads(
+            both.clone(),
+            pressed(3, Some(&two.key)),
+        )));
+        assert!(!visible(&app), "sin ranura, nada que elegir");
+        let mut stats = shots::sample_stats();
+        stats.allowed.gamepad_slot = Some(2);
+        app.update(Message::Event(Event::GuestStats(Box::new(stats))));
+        assert!(visible(&app));
+        assert_eq!(app.settings.input.pad, PadChoice::Auto);
+        let state = app.guest.as_ref().expect("invitado");
+        assert_eq!(
+            pad_status(&app, state, app.now).and_then(|status| status.problem),
+            Some(PadProblem::Choose)
+        );
+        assert_eq!(
+            picker_choice(&app, state),
+            Some(one.key.clone()),
+            "el primero"
+        );
+        // Marcar y enviar.
+        app.update(Message::Guest(Msg::PickPad(two.key.clone())));
+        let effects = app.update(Message::Guest(Msg::SendPickedPad));
+        assert_eq!(app.settings.input.pad, PadChoice::Pad(two.key.clone()));
+        assert!(effects.contains(&Effect::SetPadChoice(PadChoice::Pad(two.key.clone()))));
+        // Va el segundo: el selector se cierra y «Cambiar» lo abre otra vez.
+        let mut sending = both.clone();
+        sending[1].active = true;
+        app.update(Message::Guest(Msg::Pads(
+            sending.clone(),
+            pressed(3, Some(&two.key)),
+        )));
+        assert!(!visible(&app));
+        app.update(Message::Guest(Msg::OpenPadPicker));
+        assert!(visible(&app));
+        // Pulsar un botón del primero lo elige.
+        app.update(Message::Guest(Msg::Pads(
+            sending.clone(),
+            pressed(4, Some(&one.key)),
+        )));
+        assert_eq!(app.settings.input.pad, PadChoice::Pad(one.key.clone()));
+        assert!(!visible(&app));
+        // «Ahora no» lo cierra aunque no vaya ninguno; no vuelve hasta otra ranura.
+        app.update(Message::Guest(Msg::Pads(
+            both.clone(),
+            pressed(4, Some(&one.key)),
+        )));
+        app.settings.input.pad = PadChoice::Auto;
+        app.update(Message::Guest(Msg::OpenPadPicker));
+        app.update(Message::Guest(Msg::ClosePadPicker));
+        assert!(!visible(&app));
+        app.update(Message::Guest(Msg::Pads(
+            both.clone(),
+            pressed(5, Some(&one.key)),
+        )));
+        assert_eq!(
+            app.settings.input.pad,
+            PadChoice::Auto,
+            "cerrado, pulsar no elige"
+        );
+        // Un teclado que no parece un mando se marca como tal, pero se puede elegir.
+        let keyboard = ConnectedPad {
+            looks: PadLooks::NotAPad,
+            ..shots::sample_pad(0x1234, 0x0001, "Teclado de ejemplo", PadKind::Hid, false)
+        };
+        app.update(Message::Guest(Msg::OpenPadPicker));
+        app.update(Message::Guest(Msg::Pads(
+            vec![keyboard.clone()],
+            pressed(5, None),
+        )));
+        assert!(visible(&app));
+        app.update(Message::Guest(Msg::PickPad(keyboard.key.clone())));
+        app.update(Message::Guest(Msg::SendPickedPad));
+        assert_eq!(app.settings.input.pad, PadChoice::Pad(keyboard.key));
     }
 
     /// El aviso del teclado y el ratón: solo con ese permiso, dice cómo soltarlos mientras se

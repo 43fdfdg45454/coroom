@@ -131,6 +131,22 @@ sealed interface CoroomEvent {
         val weak: Int = 0,
     ) : CoroomEvent
 
+    /**
+     * Cómo va el mando que se envía a la ranura `slot`: cuál (`pad`, `null` si ninguno), cuántos
+     * hay conectados, si el anfitrión lo tiene tal cual (`raw`, `null` si aún no contestó) y cómo
+     * está en su equipo (`host`: `ready`, `paused` o `failed` con `reason`).
+     */
+    @Serializable
+    data class PadState(
+        val slot: Int = 0,
+        val pad: String? = null,
+        val connected: Int = 0,
+        val raw: Boolean? = null,
+        val host: String? = null,
+        val reason: String? = null,
+        val note: String? = null,
+    ) : CoroomEvent
+
     /** Qué deja hacer el anfitrión: teclado y ratón, y la ranura del mando (`null`: ninguna). */
     @Serializable
     data class Permissions(
@@ -169,7 +185,7 @@ val CoroomEvent.isRoomEvent: Boolean
         is CoroomEvent.Members, is CoroomEvent.Chat, is CoroomEvent.ChatHistory,
         CoroomEvent.ChatCleared, is CoroomEvent.ChatRejected, is CoroomEvent.MoveToRoom,
         is CoroomEvent.Warning, is CoroomEvent.Ended, is CoroomEvent.JoinProgress,
-        is CoroomEvent.Permissions,
+        is CoroomEvent.Permissions, is CoroomEvent.PadState,
         -> true
         else -> false
     }
@@ -205,6 +221,7 @@ fun parseEvent(text: String): CoroomEvent? = try {
         "rumble" -> json.decode(CoroomEvent.Rumble.serializer())
         "join_progress" -> json.decode(CoroomEvent.JoinProgress.serializer())
         "permissions" -> json.decode(CoroomEvent.Permissions.serializer())
+        "pad_state" -> json.decode(CoroomEvent.PadState.serializer())
         "update" -> CoroomEvent.Update(json.decode(UpdateState.serializer()))
         "update_install" -> json.decode(CoroomEvent.UpdateInstall.serializer())
         "protocol_mismatch" -> json.decode(CoroomEvent.ProtocolMismatch.serializer())

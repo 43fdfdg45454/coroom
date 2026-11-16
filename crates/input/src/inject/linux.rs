@@ -807,7 +807,18 @@ pub fn status() -> Vec<String> {
             format!("mandos: /dev/uinput no accesible ({err}); instala la regla udev del README")
         }
     };
-    vec![keyboard, pads]
+    // Los mandos tal cual van por UHID, con su propia regla udev: sin ella todos los mandos de los
+    // invitados llegan convertidos, y el diagnóstico no lo decía.
+    let raw = match std::fs::OpenOptions::new().write(true).open("/dev/uhid") {
+        Ok(_) => {
+            "mandos tal cual: /dev/uhid accesible (UHID, idénticos al del invitado)".to_owned()
+        }
+        Err(err) => format!(
+            "mandos tal cual: /dev/uhid no accesible ({err}); irán convertidos a Xbox 360 hasta \
+             instalar la regla udev del README"
+        ),
+    };
+    vec![keyboard, pads, raw]
 }
 
 // --- uinput -----------------------------------------------------------------------------------
@@ -870,9 +881,26 @@ pub fn create_gamepad(slot: u8) -> Result<VirtualDevice, InputError> {
     create_gamepad_as(&PadIdentity::converted(slot))
 }
 
+/// Bytes que caben en el nombre de un dispositivo uinput (`UINPUT_MAX_NAME_SIZE` es 80, con el
+/// nulo final; `evdev` exige uno menos y entra en pánico si no).
+pub const UINPUT_NAME_MAX: usize = 78;
+
+/// `name` como nombre de un dispositivo uinput: en una línea, sin caracteres de control y
+/// recortado a [`UINPUT_NAME_MAX`] bytes sin partir un carácter. El nombre lo manda el invitado
+/// (hasta 128 caracteres): tal cual, uno largo tumbaba el hilo `inject`.
+pub fn uinput_name(name: &str) -> String {
+    let name = coroom_proto::control::display_text(name, UINPUT_NAME_MAX);
+    if name.trim().is_empty() {
+        "coroom Gamepad".to_owned()
+    } else {
+        name
+    }
+}
+
 /// Crea un dispositivo uinput con la disposición de `xpad` y la identidad `identity` (la del
 /// mando XInput de un invitado, tal cual).
 pub fn create_gamepad_as(identity: &PadIdentity) -> Result<VirtualDevice, InputError> {
+    let name = uinput_name(&identity.name);
     let mut keys = AttributeSet::<KeyCode>::new();
     for key in [
         KeyCode::BTN_SOUTH,
@@ -894,7 +922,7 @@ pub fn create_gamepad_as(identity: &PadIdentity) -> Result<VirtualDevice, InputE
     let hat = AbsInfo::new(0, -1, 1, 0, 0, 0);
     let mut builder = VirtualDevice::builder()
         .map_err(uinput_error)?
-        .name(&identity.name)
+        .name(&name)
         .input_id(InputId::new(
             BusType::BUS_USB,
             identity.vendor,
@@ -1978,6 +2006,37 @@ mod tests {
         }
         game.join().expect("hilo del juego");
         assert!(pad.rumble.effects.is_empty(), "borrado");
+    }
+
+    /// El nombre del mando lo manda el invitado: cabe siempre en el de uinput, en una línea y sin
+    /// partir un carácter, y uno vacío tiene uno por defecto.
+    #[test]
+    fn a_guest_pad_name_always_fits_uinput() {
+        assert_eq!(uinput_name("Mando de ejemplo"), "Mando de ejemplo");
+        let long = "ñ".repeat(128);
+        let name = uinput_name(&long);
+        assert!(name.len() <= UINPUT_NAME_MAX && name.len() >= UINPUT_NAME_MAX - 1);
+        assert!(long.starts_with(&name));
+        assert_eq!(uinput_name("Mando\n\u{0}de ejemplo"), "Mando de ejemplo");
+        assert_eq!(uinput_name(" \u{202e}\n"), "coroom Gamepad");
+    }
+
+    /// Un mando de Xbox por cable con el nombre más largo que admite el protocolo se crea igual
+    /// (antes, `evdev` entraba en pánico y se llevaba el hilo `inject`).
+    #[test]
+    #[ignore = "necesita acceso a /dev/uinput (regla udev de coroom)"]
+    fn a_real_uinput_gamepad_survives_the_longest_guest_name() {
+        let identity = PadIdentity {
+            name: "M".repeat(coroom_proto::input::MAX_PAD_NAME),
+            vendor: 0x1234,
+            product: 0x5678,
+            version: 1,
+        };
+        let mut device = create_gamepad_as(&identity).expect("mando uinput");
+        // El nombre, de sysfs: no hace falta permiso sobre el nodo recién creado.
+        let name = std::fs::read_to_string(device.get_syspath().expect("sysfs").join("name"))
+            .expect("nombre");
+        assert_eq!(name.trim_end(), "M".repeat(UINPUT_NAME_MAX));
     }
 
     /// Crea un mando uinput real y comprueba con `evdev` que se presenta como un mando de Xbox 360.

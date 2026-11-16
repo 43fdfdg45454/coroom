@@ -2687,10 +2687,14 @@ fn connected_pads(app: &App) -> Element<'_, Message> {
         Some(pads) => {
             let mut options = vec![self::choice(PadChoice::Auto, t!("room-automatico"))];
             for pad in pads {
-                options.push(self::choice(
-                    PadChoice::Pad(pad.key.clone()),
-                    pad.key.name.clone(),
-                ));
+                // Lo que el sistema lista como mando sin parecerlo (un teclado, un ratón) se
+                // puede elegir a propósito, pero se dice: en automático no se envía.
+                let name = if pad.looks == coroom_session::input::gamepad::PadLooks::NotAPad {
+                    format!("{} · {}", pad.key.name, t!("settings-no-parece-un-mando"))
+                } else {
+                    pad.key.name.clone()
+                };
+                options.push(self::choice(PadChoice::Pad(pad.key.clone()), name));
             }
             // El elegido, aunque ahora no esté conectado.
             if let PadChoice::Pad(key) = choice

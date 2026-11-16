@@ -126,7 +126,14 @@ El anfitrión da y quita, a cada invitado y en cualquier momento:
   llega **tal cual** (el juego y Steam lo ven como ese mando, con sus botones) o **convertido a
   Xbox 360**, como decida el anfitrión. La vibración del juego llega a tu mando de las dos formas
   (convertido, si tu mando vibra). Si tienes varios mandos, eliges cuál envías en Ajustes →
-  Mandos, en **Mandos conectados**.
+  Mandos, en **Mandos conectados**. Al darte la ranura, si solo tienes un mando se envía ese; si
+  tienes varios, o solo algo que no parece un mando (un teclado o un ratón que el sistema liste
+  como mando), sale un **selector** sobre el vídeo: eliges con un clic o pulsando un botón del
+  mando que quieras usar, y la elección se recuerda. En **Personas**, tu fila dice qué mando
+  envías y cómo llega, con **Cambiar** para elegir otro; si no llega al juego, dice por qué
+  (también abajo, sobre el vídeo) y si lo tienes que arreglar tú o el anfitrión. El anfitrión lo
+  ve en tu fila, con el motivo entero. En Android, el panel de conexión dice lo mismo en **Tu
+  mando**.
 - **Voz**: el invitado habla a la sala. Lo trae al entrar, salvo que la sala se abriera con **Los
   invitados entran callados**; entonces se lo da el anfitrión. Oír al anfitrión y a los demás no
   necesita permiso: todo invitado oye la voz de la sala desde que entra.

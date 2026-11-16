@@ -170,6 +170,7 @@ fun ConnectionPanel(state: RoomUiState, onClose: () -> Unit, onShareLog: () -> U
                 StatRow(stringResource(R.string.connection_network), networkText(state.network))
                 PanelSection(stringResource(R.string.connection_input))
                 StatRow(stringResource(R.string.connection_permissions), permissionsText(state.permissions))
+                state.pad?.let { PadRow(it) }
                 state.safetyNumber?.let {
                     PanelSection(stringResource(R.string.connection_security))
                     Text(stringResource(R.string.connection_safety_number), style = CoroomText.supporting, color = colors.onSurfaceVariant)
@@ -207,6 +208,29 @@ private fun permissionsText(permissions: InputPermissions?): String = when {
     permissions.gamepadSlot != null -> stringResource(R.string.permissions_pad_long, permissions.gamepadSlot)
     permissions.keyboardMouse -> stringResource(R.string.permissions_keyboard_long)
     else -> stringResource(R.string.permissions_watch_long)
+}
+
+/**
+ * El mando que se envía: cuál y cómo llega o, si no llega al juego, por qué (en el color de error
+ * y en varias líneas: es lo que hay que arreglar).
+ */
+@Composable
+private fun PadRow(pad: PadInfo) {
+    val colors = MaterialTheme.colorScheme
+    val text = when {
+        pad.host == "failed" -> stringResource(R.string.pad_failed, pad.reason ?: "")
+        pad.host == "paused" -> stringResource(R.string.pad_paused)
+        pad.pad == null && pad.connected == 0 -> stringResource(R.string.pad_none, pad.slot)
+        pad.pad == null -> stringResource(R.string.pad_not_sent)
+        pad.raw == null -> stringResource(R.string.pad_waiting, pad.pad)
+        pad.raw -> stringResource(R.string.pad_raw, pad.pad)
+        pad.note != null -> stringResource(R.string.pad_converted_because, pad.pad, pad.note)
+        else -> stringResource(R.string.pad_converted, pad.pad)
+    }
+    Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(stringResource(R.string.connection_pad), style = CoroomText.supporting, color = colors.onSurfaceVariant)
+        Text(text, style = CoroomText.supporting, color = if (pad.broken) colors.error else colors.onSurface)
+    }
 }
 
 /** Una cifra destacada del enlace, con su nombre encima. */

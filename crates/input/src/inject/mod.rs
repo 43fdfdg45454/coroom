@@ -591,6 +591,10 @@ struct RecordingState {
     slots: BTreeSet<u8>,
     raw: BTreeSet<u8>,
     raw_unsupported: bool,
+    /// Por qué no se pueden crear mandos ([`RecordingSink::break_pads`]).
+    pads_broken: Option<String>,
+    /// Si los informes en crudo fallan ([`RecordingSink::break_raw_reports`]).
+    raw_reports_broken: bool,
     outputs: Vec<(u8, Vec<u8>)>,
     rumble: Vec<(u8, Rumble)>,
     /// Tamaño de cada grupo recibido por [`InputSink::inject_batch`].
@@ -663,6 +667,23 @@ impl RecordingSink {
         self
     }
 
+    /// Como un anfitrión que no puede crear mandos virtuales (sin permiso sobre `/dev/uinput`,
+    /// sin el driver en Windows): `assign_gamepad` falla con `reason` hasta
+    /// [`RecordingSink::fix_pads`].
+    pub fn break_pads(&self, reason: &str) {
+        self.lock().pads_broken = Some(reason.to_owned());
+    }
+
+    /// El anfitrión arregló lo que impedía crear mandos.
+    pub fn fix_pads(&self) {
+        self.lock().pads_broken = None;
+    }
+
+    /// Como un mando tal cual que el sistema deja de leer: sus informes fallan.
+    pub fn break_raw_reports(&self) {
+        self.lock().raw_reports_broken = true;
+    }
+
     /// Simula un informe de salida del driver del anfitrión para el mando tal cual de `slot`.
     pub fn push_output(&self, slot: u8, data: Vec<u8>) {
         self.lock().outputs.push((slot, data));
@@ -728,6 +749,9 @@ impl InputSink for RecordingSink {
 
     fn assign_gamepad(&mut self, slot: u8) -> Result<(), InputError> {
         let mut state = self.lock();
+        if let Some(reason) = &state.pads_broken {
+            return Err(InputError::Uinput(reason.clone()));
+        }
         state.slots.insert(slot);
         state.log.push(Recorded::GamepadAssigned { slot });
         Ok(())
@@ -771,6 +795,9 @@ impl InputSink for RecordingSink {
         let mut state = self.lock();
         if !state.raw.contains(&slot) {
             return Err(InputError::NoSuchSlot(slot));
+        }
+        if state.raw_reports_broken {
+            return Err(InputError::Backend("UHID: Broken pipe".to_owned()));
         }
         state.log.push(Recorded::RawReport {
             slot,

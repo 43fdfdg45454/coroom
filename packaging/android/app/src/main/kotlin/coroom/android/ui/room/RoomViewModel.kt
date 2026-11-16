@@ -70,6 +70,20 @@ enum class Panel { None, Connection, Chat }
 /** Lo que el anfitrión deja hacer (`permissions`). */
 data class InputPermissions(val keyboardMouse: Boolean, val gamepadSlot: Int?)
 
+/** Cómo va el mando que se envía (`pad_state`). */
+data class PadInfo(
+    val slot: Int,
+    val pad: String?,
+    val connected: Int,
+    val raw: Boolean?,
+    val host: String?,
+    val reason: String?,
+    val note: String?,
+) {
+    /** Si lo que se toca en el mando no llega al juego. */
+    val broken: Boolean get() = host == "failed" || host == "paused" || pad == null
+}
+
 data class RoomUiState(
     val code: String,
     val hostName: String? = null,
@@ -111,6 +125,8 @@ data class RoomUiState(
     val stats: RoomStats? = null,
     val network: NetworkKind = NetworkKind.Unknown,
     val permissions: InputPermissions? = null,
+    /** El mando que se envía, con ranura (`null`: sin ranura o aún no se sabe). */
+    val pad: PadInfo? = null,
     val confirmLeave: Boolean = false,
     /**
      * Si la barra de la sala (la lateral, los chips y la píldora entera) está a la vista: se
@@ -291,6 +307,7 @@ class RoomViewModel(
             CoroomEvent.ChatCleared -> _state.update { it.copy(chat = emptyList(), unreadChat = false) }
             is CoroomEvent.ChatRejected -> _state.update { it.copy(chatError = event.reason) }
             is CoroomEvent.Permissions -> onPermissions(event)
+            is CoroomEvent.PadState -> onPadState(event)
             is CoroomEvent.Warning -> showNotice(UiText.Raw(event.message))
             is CoroomEvent.MoveToRoom -> {
                 _state.update {
@@ -334,13 +351,33 @@ class RoomViewModel(
     private fun onPermissions(event: CoroomEvent.Permissions) {
         val before = _state.value.permissions
         val now = InputPermissions(event.keyboardMouse, event.gamepadSlot)
-        _state.update { it.copy(permissions = now) }
+        // Sin ranura no hay mando del que hablar.
+        _state.update { it.copy(permissions = now, pad = if (now.gamepadSlot == null) null else it.pad) }
         val notice = when {
             now.gamepadSlot != null && now.gamepadSlot != before?.gamepadSlot ->
                 UiText.res(R.string.room_notice_pad_given, now.gamepadSlot)
             now.gamepadSlot == null && before?.gamepadSlot != null -> UiText.res(R.string.room_notice_pad_taken)
             now.keyboardMouse && before?.keyboardMouse != true -> UiText.res(R.string.room_notice_keyboard_given)
             !now.keyboardMouse && before?.keyboardMouse == true -> UiText.res(R.string.room_notice_keyboard_taken)
+            else -> null
+        }
+        notice?.let(::showNotice)
+    }
+
+    /**
+     * El mando: se guarda para el panel y, si deja de llegar al juego, se dice por qué en un
+     * aviso (antes el teléfono no decía nada aunque el anfitrión no pudiera crearlo).
+     */
+    private fun onPadState(event: CoroomEvent.PadState) {
+        val before = _state.value.pad
+        val now = PadInfo(event.slot, event.pad, event.connected, event.raw, event.host, event.reason, event.note)
+        _state.update { it.copy(pad = now) }
+        val changed = before?.host != now.host || before?.pad != now.pad
+        if (!changed) return
+        val notice = when {
+            now.host == "failed" -> UiText.res(R.string.pad_notice_failed, now.reason ?: "")
+            now.host == "paused" -> UiText.res(R.string.pad_notice_paused)
+            now.pad == null && now.connected == 0 -> UiText.res(R.string.pad_notice_none, now.slot)
             else -> null
         }
         notice?.let(::showNotice)

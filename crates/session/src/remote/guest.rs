@@ -924,6 +924,7 @@ async fn run_guest(
                         | Command::Invite(_)
                         | Command::DeclineJoin(_)
                         | Command::GamepadMode { .. }
+                        | Command::GamepadStatus { .. }
                         | Command::GamepadOutput { .. }
                         | Command::GamepadRumble { .. }
                         | Command::Video(_)
@@ -1413,6 +1414,9 @@ async fn control_loop(
             }
             Some(ControlMessage::GamepadMode { slot, raw }) => {
                 core.guest_input.set_pad_mode(slot, raw);
+            }
+            Some(ControlMessage::GamepadStatus { slot, state, note }) => {
+                core.guest_input.set_pad_report(slot, state, note);
             }
             Some(ControlMessage::GamepadOutput { slot, data }) => {
                 core.guest_input.push_pad_output(slot, data);

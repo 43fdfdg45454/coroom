@@ -112,8 +112,10 @@ struct WindowInput {
     controls: GuestControls,
     capture: InputCapture,
     gamepads: Option<GamepadCapture>,
+    /// Por qué no hay hilo de mandos, si no se pudo arrancar.
+    pads_error: Option<String>,
     /// Último estado de los mandos que vio la interfaz.
-    pads: Option<(Vec<ConnectedPad>, bool)>,
+    pads: Option<(Vec<ConnectedPad>, guest::PadLink)>,
     confined: bool,
     mode: CaptureMode,
     /// Si reenviaba el teclado y el ratón la última vez que lo vio la interfaz.
@@ -785,11 +787,18 @@ impl Ready {
             capture.set_push_to_talk(keycode_from_name(name));
         }
         let link: Arc<dyn PadLink> = Arc::new(controls.input.clone());
-        let gamepads = GamepadCapture::spawn(link, self.app.settings.input.pad.clone()).ok();
+        // Sin el hilo de mandos no hay lista ni se envía ninguno: se dice, en vez de dejar la
+        // sala como si no hubiera mandos conectados.
+        let (gamepads, pads_error) =
+            match GamepadCapture::spawn(link, self.app.settings.input.pad.clone()) {
+                Ok(gamepads) => (Some(gamepads), None),
+                Err(err) => (None, Some(err.to_string())),
+            };
         self.input = Some(WindowInput {
             controls,
             capture,
             gamepads,
+            pads_error,
             pads: None,
             confined: false,
             mode: CaptureMode::Desktop,
@@ -908,13 +917,27 @@ impl Ready {
         }
         let allowed = input.controls.input.allowed();
         let mut pads = None;
-        if let Some(gamepads) = &input.gamepads {
-            let now = (
-                gamepads.pads(),
-                allowed
-                    .gamepad_slot
-                    .is_some_and(|slot| input.controls.input.raw(slot)),
-            );
+        {
+            let slot = allowed.gamepad_slot;
+            let link = guest::PadLink {
+                raw: slot.and_then(|slot| input.controls.input.pad_mode(slot)),
+                report: slot.and_then(|slot| input.controls.input.pad_report(slot)),
+                error: input
+                    .gamepads
+                    .as_ref()
+                    .map_or_else(|| input.pads_error.clone(), GamepadCapture::error),
+                pressed: input
+                    .gamepads
+                    .as_ref()
+                    .map(GamepadCapture::pressed)
+                    .unwrap_or_default(),
+            };
+            let list = input
+                .gamepads
+                .as_ref()
+                .map(GamepadCapture::pads)
+                .unwrap_or_default();
+            let now = (list, link);
             if input.pads.as_ref() != Some(&now) {
                 input.pads = Some(now.clone());
                 pads = Some(now);
@@ -927,8 +950,8 @@ impl Ready {
             let actions = input.capture.set_allowed(allowed);
             self.apply(actions);
         }
-        if let Some((pads, raw)) = pads {
-            self.dispatch(Message::Guest(guest::Msg::Pads(pads, raw)));
+        if let Some((pads, link)) = pads {
+            self.dispatch(Message::Guest(guest::Msg::Pads(pads, link)));
         }
     }
 

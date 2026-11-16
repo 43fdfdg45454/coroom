@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 
 use super::{
     AxisFilter, ConnectedPad, DECLARE_RETRY, IDLE_POLL, Motors, PERIOD, PadChoice, PadKey, PadKind,
-    PadLink, PadOutputs, PadRumble, pick_index, stick_value, trigger_value,
+    PadLink, PadLooks, PadOutputs, PadRumble, pick_or_ask, stick_value, trigger_value,
 };
 #[cfg(target_os = "linux")]
 use super::{EvdevMotors, evdev_motors};
@@ -74,6 +74,10 @@ pub struct GamepadCapture {
     /// Sube con cada [`GamepadCapture::set_choice`]: el hilo solo mira `choice` cuando cambia.
     generation: Arc<AtomicU64>,
     pads: Arc<Mutex<Vec<ConnectedPad>>>,
+    /// Por qué no se leen los mandos, si el hilo no pudo abrirlos.
+    error: Arc<Mutex<Option<String>>>,
+    /// El último mando en el que se pulsó un botón ([`GamepadCapture::pressed`]).
+    pressed: Arc<Mutex<(u64, Option<PadKey>)>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -87,8 +91,12 @@ impl GamepadCapture {
         let choice = Arc::new(Mutex::new(choice));
         let generation = Arc::new(AtomicU64::new(0));
         let pads = Arc::new(Mutex::new(Vec::new()));
+        let error = Arc::new(Mutex::new(None));
+        let pressed = Arc::new(Mutex::new((0, None)));
         let thread = {
             let shared = Shared {
+                error: Arc::clone(&error),
+                pressed: Arc::clone(&pressed),
                 stop: Arc::clone(&stop),
                 slot: Arc::clone(&slot),
                 paused: Arc::clone(&paused),
@@ -109,8 +117,28 @@ impl GamepadCapture {
             choice,
             generation,
             pads,
+            error,
+            pressed,
             thread: Some(thread),
         })
+    }
+
+    /// El último mando en el que se pulsó un botón, con un contador que sube con cada pulsación
+    /// (para elegir el mando pulsando un botón del que se quiere usar).
+    pub fn pressed(&self) -> (u64, Option<PadKey>) {
+        self.pressed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Por qué no se leen los mandos de este equipo, si el hilo no pudo abrirlos (la lista de
+    /// [`GamepadCapture::pads`] se queda vacía y no es porque no haya ninguno conectado).
+    pub fn error(&self) -> Option<String> {
+        self.error
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Ranura asignada por el anfitrión (`None`: sin mando).
@@ -157,6 +185,8 @@ struct Shared {
     choice: Arc<Mutex<PadChoice>>,
     generation: Arc<AtomicU64>,
     pads: Arc<Mutex<Vec<ConnectedPad>>>,
+    error: Arc<Mutex<Option<String>>>,
+    pressed: Arc<Mutex<(u64, Option<PadKey>)>>,
     link: Arc<dyn PadLink>,
 }
 
@@ -253,9 +283,63 @@ fn held(gilrs: &Gilrs, id: GamepadId) -> Held {
     (buttons, axes)
 }
 
-/// El mando que va a la ranura según `choice`.
-fn pick(choice: &PadChoice, connected: &[(GamepadId, PadKey)]) -> Option<GamepadId> {
-    pick_index(choice, connected.iter().map(|(_, key)| key)).map(|index| connected[index].0)
+/// Un mando conectado: su identificador de `gilrs`, por qué se le reconoce y qué parece.
+type Connected = (GamepadId, PadKey, PadLooks);
+
+/// El mando que va a la ranura según `choice` (`current`: el que va ahora).
+fn pick(
+    choice: &PadChoice,
+    connected: &[Connected],
+    current: Option<GamepadId>,
+) -> Option<GamepadId> {
+    let current = current.and_then(|current| connected.iter().position(|(id, ..)| *id == current));
+    pick_or_ask(
+        choice,
+        connected.iter().map(|(_, key, looks)| (key, *looks)),
+        current,
+    )
+    .map(|index| connected[index].0)
+}
+
+/// Qué parece el dispositivo `id`. En Linux, por los botones y teclas que declara su nodo
+/// `evdev` (el sistema lista como joystick cualquier cosa con un botón y dos ejes) y por si tiene
+/// una correspondencia de SDL; si el nodo no se puede leer, se le da por mando. En el resto, lo
+/// que lista el sistema ya son mandos.
+fn looks_of(gilrs: &Gilrs, id: GamepadId) -> PadLooks {
+    #[cfg(target_os = "linux")]
+    {
+        use gilrs::LinuxGamepadExt;
+        let pad = gilrs.gamepad(id);
+        let mapped = pad.mapping_source() == gilrs::MappingSource::SdlMappings;
+        let node = pad.devpath().to_owned();
+        match evdev::Device::open(&node) {
+            Ok(device) => PadLooks::from_codes(
+                device
+                    .supported_keys()
+                    .into_iter()
+                    .flat_map(|keys| keys.iter())
+                    .map(|key| key.code()),
+                mapped,
+            ),
+            Err(err) => {
+                debug!(error = %err, node = %node.display(), "no se pudo leer qué botones declara");
+                PadLooks::Gamepad
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // En Windows `gilrs` lista todo `RawGameController` (volantes y palancas incluidos) y da
+        // un identificador nulo a los que el sistema reconoce como mando
+        // (`Windows.Gaming.Input.Gamepad`).
+        let pad = gilrs.gamepad(id);
+        let mapped = pad.mapping_source() == gilrs::MappingSource::SdlMappings;
+        if mapped || pad.uuid() == [0; 16] {
+            PadLooks::Gamepad
+        } else {
+            PadLooks::Joystick
+        }
+    }
 }
 
 /// El mando en crudo de cada sistema, con la misma forma.
@@ -478,6 +562,42 @@ struct RawPad {
     /// Su declaración (la del hilo en crudo, si es HID, cuando la haga), para repetirla mientras
     /// el anfitrión no la conteste.
     declared: Arc<Mutex<Option<PadData>>>,
+    /// El hilo en crudo dejó de leer el mando (un error de lectura): hay que volver a declararlo
+    /// convertido, o se queda mudo con el anfitrión esperando informes que ya no salen.
+    dead: Arc<AtomicBool>,
+}
+
+/// Por qué va convertido un mando cuya lectura en crudo se cortó.
+const RAW_DIED: &str = "se cortó la lectura en crudo del mando en el equipo del invitado";
+
+/// Veces que se vuelve a abrir en crudo un mando cuya lectura se cortó antes de dejarlo
+/// convertido (hasta que se desconecte, o cambie la ranura o la elección).
+const RAW_RETRIES: u32 = 2;
+
+/// Declara el mando `key` de la ranura `slot` como solo convertido, por `reason`.
+fn declare_converted(link: &Arc<dyn PadLink>, slot: u8, key: &PadKey, reason: &str) -> RawPad {
+    let declared = PadData::Device {
+        slot,
+        device: GamepadDevice {
+            name: key.name.clone(),
+            vendor: key.vendor,
+            product: key.product,
+            version: 0,
+            bus: 3,
+            transport: GamepadTransport::Converted {
+                reason: reason.to_owned(),
+            },
+        },
+    };
+    link.pad(declared.clone());
+    RawPad {
+        stop: Arc::new(AtomicBool::new(false)),
+        thread: None,
+        outputs: None,
+        hid: false,
+        declared: Arc::new(Mutex::new(Some(declared))),
+        dead: Arc::new(AtomicBool::new(false)),
+    }
 }
 
 impl Drop for RawPad {
@@ -508,6 +628,7 @@ fn declare(link: &Arc<dyn PadLink>, slot: u8, key: &PadKey, paused: &Arc<AtomicB
         outputs: None,
         hid,
         declared: Arc::new(Mutex::new(declared)),
+        dead: Arc::new(AtomicBool::new(false)),
     };
     #[cfg(any(
         all(target_os = "linux", feature = "linux-portal"),
@@ -558,21 +679,42 @@ fn declare(link: &Arc<dyn PadLink>, slot: u8, key: &PadKey, paused: &Arc<AtomicB
         );
         let stop = Arc::new(AtomicBool::new(false));
         let declared = Arc::new(Mutex::new(None));
+        let dead = Arc::new(AtomicBool::new(false));
         let thread = {
-            let (stop, link, paused, declared) = (
+            let (stop, link, paused, declared, dead) = (
                 Arc::clone(&stop),
                 Arc::clone(link),
                 Arc::clone(paused),
                 Arc::clone(&declared),
+                Arc::clone(&dead),
             );
             thread::Builder::new()
                 .name("mando-crudo".into())
-                .spawn(move || raw_loop(reader, info, slot, &link, &stop, &paused, &declared))
-                .ok()
+                .spawn(move || {
+                    raw_loop(reader, info, slot, &link, &stop, &paused, &declared);
+                    // Si no se le pidió parar, es que dejó de poder leer el mando.
+                    if !stop.load(Ordering::Acquire) {
+                        dead.store(true, Ordering::Release);
+                    }
+                })
+        };
+        let thread = match thread {
+            Ok(thread) => Some(thread),
+            Err(err) => {
+                // Sin hilo no hay quien lea el mando en crudo: va convertido, y se dice.
+                warn!(error = %err, "no se pudo arrancar la lectura en crudo del mando");
+                return declare_converted(
+                    link,
+                    slot,
+                    key,
+                    "el equipo del invitado no pudo arrancar la lectura en crudo del mando",
+                );
+            }
         };
         RawPad {
             stop,
             declared,
+            dead,
             thread,
             outputs: Some(outputs),
             hid: true,
@@ -708,16 +850,19 @@ fn run(shared: &Shared) {
         Ok(gilrs) => gilrs,
         Err(gilrs::Error::NotImplemented(dummy)) => {
             warn!("los mandos no están disponibles en esta plataforma");
+            *shared.error.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some("este sistema no deja leer mandos".to_owned());
             dummy
         }
         Err(err) => {
             warn!(error = %err, "no se pudieron leer los mandos");
+            *shared.error.lock().unwrap_or_else(PoisonError::into_inner) = Some(err.to_string());
             return;
         }
     };
-    let mut connected: Vec<(GamepadId, PadKey)> = gilrs
+    let mut connected: Vec<Connected> = gilrs
         .gamepads()
-        .map(|(id, _)| (id, key_of(&gilrs, id)))
+        .map(|(id, _)| (id, key_of(&gilrs, id), looks_of(&gilrs, id)))
         .collect();
     let mut kinds: BTreeMap<PadKey, PadKind> = BTreeMap::new();
     let mut publish = true;
@@ -737,6 +882,9 @@ fn run(shared: &Shared) {
     let mut motors = SlotMotors::new();
     let mut last_rumble = Instant::now();
     let mut last_declared = Instant::now();
+    // Lecturas en crudo cortadas del mando de la ranura y si el anuncio que viene es por una.
+    let mut raw_deaths = 0u32;
+    let mut revive = false;
     // Si lo que se toca se está callando ([`GamepadCapture::set_paused`]).
     let mut paused = false;
     while !shared.stop.load(Ordering::Acquire) {
@@ -760,14 +908,25 @@ fn run(shared: &Shared) {
                         product = format_args!("{:04x}", key.product),
                         "mando conectado"
                     );
-                    connected.retain(|(id, _)| *id != event.id);
-                    connected.push((event.id, key));
+                    let looks = looks_of(&gilrs, event.id);
+                    connected.retain(|(id, ..)| *id != event.id);
+                    connected.push((event.id, key, looks));
                     publish = true;
                     repick = true;
                 }
+                EventType::ButtonPressed(..) => {
+                    // Para elegir mando pulsando un botón del que se quiere usar.
+                    if let Some((_, key, _)) = connected.iter().find(|(id, ..)| *id == event.id) {
+                        let mut pressed = shared
+                            .pressed
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
+                        *pressed = (pressed.0.wrapping_add(1), Some(key.clone()));
+                    }
+                }
                 EventType::Disconnected => {
                     info!("mando desconectado");
-                    connected.retain(|(id, _)| *id != event.id);
+                    connected.retain(|(id, ..)| *id != event.id);
                     publish = true;
                     repick = true;
                 }
@@ -824,17 +983,34 @@ fn run(shared: &Shared) {
             }
         }
 
+        // La lectura en crudo se cortó (un error al leer el mando): sin esto el mando se quedaba
+        // mudo, con el anfitrión esperando informes que ya no salían y lo convertido callado. Se
+        // vuelve a anunciar aquí abajo: otra vez en crudo y, si se sigue cortando, convertido.
+        if announced.is_some()
+            && raw
+                .as_ref()
+                .is_some_and(|raw| raw.dead.load(Ordering::Acquire))
+        {
+            raw_deaths += 1;
+            revive = true;
+            announced = None;
+        }
+
         // Qué mando va a qué ranura ahora.
         let generation = shared.generation.load(Ordering::Acquire);
         if repick || generation != seen_generation {
             repick = false;
             seen_generation = generation;
             let choice = shared.choice.lock().unwrap_or_else(PoisonError::into_inner);
-            active = pick(&choice, &connected);
+            active = pick(&choice, &connected, active);
         }
         let slot = shared.slot.load(Ordering::Acquire);
         let wanted = active.filter(|_| slot != 0).map(|id| (slot, id));
         if wanted != announced {
+            // Un cambio de verdad (otro mando, otra ranura) empieza la cuenta de cero.
+            if !std::mem::take(&mut revive) {
+                raw_deaths = 0;
+            }
             if let Some((old, old_id)) = announced {
                 link.event(InputEvent::GamepadDisconnected { slot: old });
                 // El mando deja la ranura: sin motores en marcha.
@@ -851,7 +1027,12 @@ fn run(shared: &Shared) {
                     kind: GamepadKind::Xbox,
                 });
                 let key = key_of(&gilrs, id);
-                raw = Some(declare(link, slot, &key, &shared.paused));
+                raw = Some(if raw_deaths > RAW_RETRIES {
+                    warn!(name = %key.name, "{RAW_DIED}: va convertido hasta que se vuelva a conectar");
+                    declare_converted(link, slot, &key, RAW_DIED)
+                } else {
+                    declare(link, slot, &key, &shared.paused)
+                });
                 last_declared = Instant::now();
                 rumble = Some(PadRumble::new(&key.name, rumble_help()));
             }
@@ -879,8 +1060,9 @@ fn run(shared: &Shared) {
             let active = announced.map(|(_, id)| id);
             let list: Vec<ConnectedPad> = connected
                 .iter()
-                .map(|(id, key)| ConnectedPad {
+                .map(|(id, key, looks)| ConnectedPad {
                     key: key.clone(),
+                    looks: *looks,
                     kind: kinds
                         .entry(key.clone())
                         .or_insert_with(|| kind_of(key))
@@ -1072,6 +1254,7 @@ mod tests {
             outputs: None,
             hid,
             declared: Arc::new(Mutex::new(None)),
+            dead: Arc::new(AtomicBool::new(false)),
         }
     }
 

@@ -1328,6 +1328,9 @@ impl HostCtx {
             status.target_kbps = None;
             // Cada conexión empieza con el vídeo encendido (al reconectar, el invitado lo repite).
             status.video_paused = false;
+            // Y sin mando declarado: el de la conexión que se cayó ya no está.
+            status.gamepad = None;
+            status.gamepad_problem = None;
         }
         lock(&self.guest_caps).remove(&guest);
         self.voice_state(guest, false);
@@ -2649,6 +2652,7 @@ impl Room {
                 input_key: false,
                 input: Default::default(),
                 gamepad: None,
+                gamepad_problem: None,
                 can_host: false,
                 device,
                 video_paused: false,
@@ -3047,6 +3051,14 @@ async fn run_host(
                 Some(Command::PermissionsChanged(guest)) => ctx.send_permissions(guest),
                 Some(Command::GamepadMode { guest, slot, raw }) => {
                     ctx.send_to_guest(guest, &ControlMessage::GamepadMode { slot, raw });
+                }
+                Some(Command::GamepadStatus {
+                    guest,
+                    slot,
+                    state,
+                    note,
+                }) => {
+                    ctx.send_to_guest(guest, &ControlMessage::GamepadStatus { slot, state, note });
                 }
                 Some(Command::GamepadOutput { guest, slot, data }) => {
                     ctx.send_to_guest(guest, &ControlMessage::GamepadOutput { slot, data });

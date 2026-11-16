@@ -101,7 +101,9 @@ pub struct PadKey {
 /// Qué mando mandar.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PadChoice {
-    /// El último conectado (y si se desconecta, el anterior que siga conectado).
+    /// En el escritorio, el único mando conectado; con varios, o con uno que no lo parezca, ninguno
+    /// hasta que el invitado elija ([`pick_or_ask`]), y el que va sigue aunque se conecte otro. En
+    /// Android, el último conectado (y si se desconecta, el anterior que siga conectado).
     #[default]
     Auto,
     /// Ese mando; si no está conectado, ninguno.
@@ -119,11 +121,62 @@ pub enum PadKind {
     Converted(String),
 }
 
+/// Qué parece un dispositivo que el sistema lista como mando. En Linux se lista como joystick
+/// cualquier cosa con un botón y dos ejes, y hay teclados y ratones que lo cumplen (una interfaz
+/// con teclas multimedia y un eje de volumen, un ratón con ejes absolutos): en automático nunca se
+/// manda uno de esos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PadLooks {
+    /// Un mando: declara los botones de un mando o tiene una correspondencia de SDL.
+    Gamepad,
+    /// Otro dispositivo de juego (un volante, una palanca de vuelo): botones de joystick, pero no
+    /// los de un mando.
+    Joystick,
+    /// Un teclado, un ratón u otra cosa que el sistema lista como joystick sin serlo.
+    NotAPad,
+}
+
+/// Primer código de los botones que no son teclas (`BTN_MISC`): por debajo, teclas de teclado.
+const BTN_MISC: u16 = 0x100;
+/// Botones de ratón (`BTN_MOUSE`…`BTN_TASK`).
+const MOUSE_BUTTONS: std::ops::RangeInclusive<u16> = 0x110..=0x117;
+/// Botones de joystick (`BTN_JOYSTICK`…`BTN_DEAD`) y de volante (`BTN_GEAR_DOWN`, `BTN_GEAR_UP`).
+const JOYSTICK_BUTTONS: std::ops::RangeInclusive<u16> = 0x120..=0x12f;
+const WHEEL_BUTTONS: std::ops::RangeInclusive<u16> = 0x150..=0x151;
+/// Botones de mando (`BTN_GAMEPAD`…`BTN_THUMBR`): según el núcleo, un mando declara `BTN_GAMEPAD`.
+const GAMEPAD_BUTTONS: std::ops::RangeInclusive<u16> = 0x130..=0x13e;
+/// Teclas de teclado a partir de las cuales el dispositivo se toma por un teclado.
+const KEYBOARD_KEYS: usize = 20;
+
+impl PadLooks {
+    /// Por los botones y teclas que declara el dispositivo (códigos de evdev) y si tiene una
+    /// correspondencia de SDL (`mapped`): alguien lo describió como mando.
+    pub fn from_codes(codes: impl IntoIterator<Item = u16>, mapped: bool) -> Self {
+        let (mut keys, mut mouse, mut joystick, mut gamepad) = (0usize, false, false, false);
+        for code in codes {
+            keys += usize::from(code < BTN_MISC);
+            mouse |= MOUSE_BUTTONS.contains(&code);
+            joystick |= JOYSTICK_BUTTONS.contains(&code) || WHEEL_BUTTONS.contains(&code);
+            gamepad |= GAMEPAD_BUTTONS.contains(&code);
+        }
+        let keyboard = keys >= KEYBOARD_KEYS;
+        if mapped || (gamepad && !keyboard && !mouse) {
+            Self::Gamepad
+        } else if keyboard || mouse || !(joystick || gamepad) {
+            Self::NotAPad
+        } else {
+            Self::Joystick
+        }
+    }
+}
+
 /// Un mando conectado al equipo del invitado.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectedPad {
     /// Cuál es.
     pub key: PadKey,
+    /// Qué parece.
+    pub looks: PadLooks,
     /// Cómo podría ir.
     pub kind: PadKind,
     /// Si es el que va a la ranura.
@@ -227,14 +280,61 @@ impl AxisFilter {
     }
 }
 
-/// Índice en `connected` (en orden de conexión) del mando que va a la ranura según `choice`.
+/// Índice en `connected` (en orden de conexión) del mando que va a la ranura según `choice`. En
+/// automático, el último conectado que parezca un mando; si no hay ninguno, el último de los
+/// otros dispositivos de juego; y nunca uno que no lo parezca ([`PadLooks::NotAPad`]: ese solo va
+/// si se elige a propósito).
 pub(crate) fn pick_index<'a>(
     choice: &PadChoice,
-    mut connected: impl ExactSizeIterator<Item = &'a PadKey>,
+    mut connected: impl Iterator<Item = (&'a PadKey, PadLooks)>,
 ) -> Option<usize> {
     match choice {
-        PadChoice::Auto => connected.len().checked_sub(1),
-        PadChoice::Pad(key) => connected.position(|k| k == key),
+        PadChoice::Auto => {
+            let mut best: Option<(PadLooks, usize)> = None;
+            for (index, (_, looks)) in connected.enumerate() {
+                // `Gamepad` < `Joystick`: gana el que más parezca un mando y, entre iguales, el
+                // último.
+                if looks != PadLooks::NotAPad && best.is_none_or(|(found, _)| looks <= found) {
+                    best = Some((looks, index));
+                }
+            }
+            best.map(|(_, index)| index)
+        }
+        PadChoice::Pad(key) => connected.position(|(k, _)| k == key),
+    }
+}
+
+/// Como [`pick_index`], pero en automático solo elige solo cuando no hay duda: el mando que ya va
+/// (`current`, su índice en `connected`) mientras siga conectado, o el único conectado que
+/// parezca un mando. Con dos o más, o con solo dispositivos dudosos, ninguno: el invitado elige
+/// (en la sala, con un clic o pulsando un botón del que quiera usar). Antes iba el último
+/// conectado, y a veces era un teclado o el mando de otro.
+pub fn pick_or_ask<'a>(
+    choice: &PadChoice,
+    connected: impl Iterator<Item = (&'a PadKey, PadLooks)>,
+    current: Option<usize>,
+) -> Option<usize> {
+    let connected: Vec<(&PadKey, PadLooks)> = connected.collect();
+    match choice {
+        PadChoice::Pad(key) => connected.iter().position(|(k, _)| *k == key),
+        PadChoice::Auto => {
+            if let Some(current) = current
+                && connected
+                    .get(current)
+                    .is_some_and(|(_, looks)| *looks == PadLooks::Gamepad)
+            {
+                return Some(current);
+            }
+            let mut pads = connected
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, looks))| *looks == PadLooks::Gamepad)
+                .map(|(index, _)| index);
+            match (pads.next(), pads.next()) {
+                (Some(only), None) => Some(only),
+                _ => None,
+            }
+        }
     }
 }
 
@@ -666,20 +766,162 @@ mod tests {
                 })
                 .collect()
         };
+        let pick = |choice: &PadChoice, pads: &[PadKey]| {
+            pick_index(choice, pads.iter().map(|key| (key, PadLooks::Gamepad)))
+        };
         // En orden de conexión: en automático va el último conectado.
         let pads = keys(&["8BitDo", "DualSense"]);
-        assert_eq!(pick_index(&PadChoice::Auto, pads.iter()), Some(1));
-        assert_eq!(pick_index(&PadChoice::Auto, [].iter()), None);
+        assert_eq!(pick(&PadChoice::Auto, &pads), Some(1));
+        assert_eq!(pick(&PadChoice::Auto, &[]), None);
         let eightbitdo = PadChoice::Pad(pads[0].clone());
-        assert_eq!(pick_index(&eightbitdo, pads.iter()), Some(0));
+        assert_eq!(pick(&eightbitdo, &pads), Some(0));
         // El último se desconecta: en automático, el anterior; el elegido sigue.
         let only = keys(&["8BitDo"]);
-        assert_eq!(pick_index(&PadChoice::Auto, only.iter()), Some(0));
-        assert_eq!(pick_index(&eightbitdo, only.iter()), Some(0));
+        assert_eq!(pick(&PadChoice::Auto, &only), Some(0));
+        assert_eq!(pick(&eightbitdo, &only), Some(0));
         // El elegido se desconecta: ninguno, y vuelve al reconectarlo.
         let other = keys(&["DualSense"]);
-        assert_eq!(pick_index(&eightbitdo, other.iter()), None);
-        assert_eq!(pick_index(&eightbitdo, pads.iter()), Some(0));
+        assert_eq!(pick(&eightbitdo, &other), None);
+        assert_eq!(pick(&eightbitdo, &pads), Some(0));
+    }
+
+    /// En automático nunca va un teclado o un ratón que el sistema lista como joystick, por
+    /// reciente que sea; un volante o una palanca, solo si no hay ningún mando. Elegido a
+    /// propósito, va lo que sea.
+    #[test]
+    fn auto_never_sends_what_does_not_look_like_a_pad() {
+        let key = |name: &str| PadKey {
+            vendor: 0x1234,
+            product: 0x5678,
+            name: name.to_owned(),
+        };
+        let (pad, wheel, keyboard) = (
+            key("Mando de ejemplo"),
+            key("Volante de ejemplo"),
+            key("Teclado de ejemplo"),
+        );
+        let auto =
+            |list: &[(&PadKey, PadLooks)]| pick_index(&PadChoice::Auto, list.iter().copied());
+        // El teclado es el último conectado: va el mando.
+        assert_eq!(
+            auto(&[
+                (&pad, PadLooks::Gamepad),
+                (&wheel, PadLooks::Joystick),
+                (&keyboard, PadLooks::NotAPad),
+            ]),
+            Some(0)
+        );
+        // Sin mando, el volante; solo con el teclado, nada.
+        assert_eq!(
+            auto(&[(&wheel, PadLooks::Joystick), (&keyboard, PadLooks::NotAPad)]),
+            Some(0)
+        );
+        assert_eq!(auto(&[(&keyboard, PadLooks::NotAPad)]), None);
+        // Entre dos mandos, el último; un volante posterior no se lo quita.
+        assert_eq!(
+            auto(&[
+                (&pad, PadLooks::Gamepad),
+                (&pad, PadLooks::Gamepad),
+                (&wheel, PadLooks::Joystick),
+            ]),
+            Some(1)
+        );
+        // Elegido a propósito, también el teclado.
+        let chosen = PadChoice::Pad(keyboard.clone());
+        assert_eq!(
+            pick_index(
+                &chosen,
+                [(&pad, PadLooks::Gamepad), (&keyboard, PadLooks::NotAPad)].into_iter()
+            ),
+            Some(1)
+        );
+    }
+
+    /// En el escritorio, el automático no elige cuando hay duda: con un solo mando lo envía; con
+    /// dos, o con solo un volante o un teclado, ninguno hasta que el invitado elija; y el que ya va
+    /// sigue aunque se conecte otro.
+    #[test]
+    fn auto_asks_when_there_is_doubt_and_keeps_the_pad_that_goes() {
+        let key = |name: &str| PadKey {
+            vendor: 0x1234,
+            product: 0x5678,
+            name: name.to_owned(),
+        };
+        let (one, two, wheel, keyboard) = (
+            key("Mando de ejemplo"),
+            key("Mando de ejemplo 2"),
+            key("Volante de ejemplo"),
+            key("Teclado de ejemplo"),
+        );
+        let auto = |list: &[(&PadKey, PadLooks)], current| {
+            pick_or_ask(&PadChoice::Auto, list.iter().copied(), current)
+        };
+        assert_eq!(auto(&[], None), None);
+        // Un mando (con un teclado al lado): ese.
+        assert_eq!(
+            auto(
+                &[(&keyboard, PadLooks::NotAPad), (&one, PadLooks::Gamepad)],
+                None
+            ),
+            Some(1)
+        );
+        // Dos mandos, o solo dudosos: se pregunta.
+        let both = [(&one, PadLooks::Gamepad), (&two, PadLooks::Gamepad)];
+        assert_eq!(auto(&both, None), None);
+        assert_eq!(auto(&[(&wheel, PadLooks::Joystick)], None), None);
+        assert_eq!(auto(&[(&keyboard, PadLooks::NotAPad)], None), None);
+        // El que ya va sigue aunque se conecte otro.
+        assert_eq!(auto(&both, Some(0)), Some(0));
+        // Elegido, ese aunque haya otros (también un teclado).
+        let chosen = PadChoice::Pad(keyboard.clone());
+        assert_eq!(
+            pick_or_ask(
+                &chosen,
+                [(&one, PadLooks::Gamepad), (&keyboard, PadLooks::NotAPad)].into_iter(),
+                Some(0)
+            ),
+            Some(1)
+        );
+    }
+
+    /// Lo que parece cada dispositivo por los botones que declara (códigos de evdev).
+    #[test]
+    fn devices_are_classified_by_the_buttons_they_declare() {
+        // Un mando: BTN_SOUTH…BTN_THUMBR.
+        assert_eq!(
+            PadLooks::from_codes(0x130..=0x13e, false),
+            PadLooks::Gamepad
+        );
+        // Un mando genérico que declara botones de joystick, con correspondencia de SDL.
+        assert_eq!(PadLooks::from_codes(0x120..=0x12b, true), PadLooks::Gamepad);
+        // Sin ella, un joystick o un volante.
+        assert_eq!(
+            PadLooks::from_codes(0x120..=0x12b, false),
+            PadLooks::Joystick
+        );
+        assert_eq!(
+            PadLooks::from_codes([0x150, 0x151], false),
+            PadLooks::Joystick
+        );
+        // Un teclado que además declara botones de joystick (o incluso de mando).
+        let keyboard = (1..=83).chain([0x120, 0x121]);
+        assert_eq!(PadLooks::from_codes(keyboard, false), PadLooks::NotAPad);
+        assert_eq!(
+            PadLooks::from_codes((1..=83).chain([0x130]), false),
+            PadLooks::NotAPad
+        );
+        // Un ratón con ejes absolutos y un botón de joystick.
+        assert_eq!(
+            PadLooks::from_codes([0x110, 0x111, 0x120], false),
+            PadLooks::NotAPad
+        );
+        // Una interfaz de teclas multimedia (KEY_MUTE, KEY_VOLUMEUP…) con un eje de volumen: ni
+        // un botón de juego.
+        assert_eq!(
+            PadLooks::from_codes([113, 114, 115, 164], false),
+            PadLooks::NotAPad
+        );
+        assert_eq!(PadLooks::from_codes([], false), PadLooks::NotAPad);
     }
 
     /// Un mando de mentira que apunta lo que se le escribe (o falla siempre).
