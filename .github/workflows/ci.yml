@@ -57,7 +57,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # Linux, en ubuntu-24.04 y no en `ubuntu-latest`: con la imagen 26.04 (libclang 21), bindgen
+        # deja opacas las estructuras de FFmpeg y `rsmpeg` no compila (lo mismo que pasa con el
+        # libclang del SDK del Flatpak, que por eso usa bindings pregenerados). Volver a
+        # `ubuntu-latest` cuando `rusty_ffmpeg` genere bien los bindings ahí.
+        os: [ubuntu-24.04, windows-latest]
     steps:
       - uses: actions/checkout@v7
 
