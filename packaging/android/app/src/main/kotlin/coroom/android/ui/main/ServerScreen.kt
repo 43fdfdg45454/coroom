@@ -8,22 +8,21 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -49,13 +48,15 @@ import coroom.android.bridge.displayHost
 import coroom.android.bridge.formatFingerprint
 import coroom.android.ui.components.CoroomIcon
 import coroom.android.ui.components.LabeledField
-import coroom.android.ui.components.NoticeCard
-import coroom.android.ui.components.PillButton
+import coroom.android.ui.components.Notice
+import coroom.android.ui.components.PrimaryButton
+import coroom.android.ui.components.TonalCard
 import coroom.android.ui.text
 import coroom.android.ui.theme.CoroomText
 import coroom.android.ui.theme.CoroomTheme
+import coroom.android.ui.theme.Tone
 
-/** Primera vez: el servidor del grupo, su certificado y la cuenta (boceto «Servidor»). */
+/** Primera vez: el servidor del grupo, su certificado y la cuenta. */
 @Composable
 fun ServerScreen(
     state: LoginUiState,
@@ -75,124 +76,132 @@ fun ServerScreen(
 ) {
     val colors = MaterialTheme.colorScheme
     Surface(color = colors.background, modifier = Modifier.fillMaxSize()) {
-        Column(
+        // El formulario no se estira en una tableta: una columna centrada. El margen seguro ya
+        // cuenta con el teclado, así que el campo que se escribe queda siempre a la vista.
+        Box(
             modifier = Modifier
                 .fillMaxSize()
                 .safeDrawingPadding()
-                .imePadding()
-                .verticalScroll(rememberScrollState())
-                .padding(start = 20.dp, end = 20.dp, top = 40.dp, bottom = 24.dp)
-                .widthIn(max = 560.dp)
-                .animateContentSize(),
-            verticalArrangement = Arrangement.spacedBy(18.dp),
+                .verticalScroll(rememberScrollState()),
+            contentAlignment = Alignment.TopCenter,
         ) {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                CoroomIcon(R.drawable.ic_radio, contentDescription = null, tint = colors.primary, size = 40.dp)
-                Text(stringResource(R.string.login_title), style = CoroomText.greeting, color = colors.onSurface)
-                Text(stringResource(R.string.login_intro), style = CoroomText.body, color = colors.onSurfaceVariant)
-            }
-
-            if (sessionLost) {
-                NoticeCard(
-                    title = stringResource(R.string.login_session_lost_title),
-                    body = stringResource(R.string.login_session_lost_body),
-                    icon = R.drawable.ic_shield_alert,
-                )
-            }
-
-            LabeledFieldServer(state, onUrl, onProbeNow)
-
-            // La app o el servidor quedaron atrás: quién y qué hacer (boceto «versiones distintas»).
-            state.probe?.protocolGap?.let { ProtocolBanner(displayHost(state.url), it, update, updates) }
-
-            AnimatedVisibility(
-                visible = state.probe != null && state.trust != TrustState.NotNeeded,
-                enter = fadeIn() + expandVertically(),
-                exit = fadeOut() + shrinkVertically(),
+            Column(
+                modifier = Modifier
+                    .widthIn(max = 560.dp)
+                    .fillMaxWidth()
+                    .padding(start = 20.dp, end = 20.dp, top = 40.dp, bottom = 24.dp)
+                    .animateContentSize(),
+                verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
-                state.probe?.let { TrustCard(it, state.trust, onTrust) }
-            }
+                Column(
+                    modifier = Modifier.padding(bottom = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    CoroomIcon(R.drawable.ic_radio, contentDescription = null, tint = colors.primary, size = 40.dp)
+                    Text(stringResource(R.string.login_title), style = CoroomText.greeting, color = colors.onSurface)
+                    Text(stringResource(R.string.login_intro), style = CoroomText.body, color = colors.onSurfaceVariant)
+                }
 
-            LabeledField(
-                label = stringResource(R.string.login_username),
-                value = state.username,
-                onValueChange = onUsername,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii, imeAction = ImeAction.Next),
-            )
-            LabeledField(
-                label = stringResource(if (state.invitationMode) R.string.login_password_new else R.string.login_password),
-                value = state.password,
-                onValueChange = onPassword,
-                supporting = if (state.invitationMode) stringResource(R.string.login_password_hint) else null,
-                visualTransformation = PasswordVisualTransformation(),
-                keyboardOptions = KeyboardOptions(
-                    keyboardType = KeyboardType.Password,
-                    imeAction = if (state.invitationMode) ImeAction.Next else ImeAction.Done,
-                ),
-                keyboardActions = KeyboardActions(onDone = { onSubmit() }),
-            )
-            AnimatedVisibility(visible = state.invitationMode) {
-                Column(verticalArrangement = Arrangement.spacedBy(18.dp)) {
-                    LabeledField(
-                        label = stringResource(R.string.login_password_repeat),
-                        value = state.passwordRepeat,
-                        onValueChange = onPasswordRepeat,
-                        visualTransformation = PasswordVisualTransformation(),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Next),
-                    )
-                    LabeledField(
-                        label = stringResource(R.string.login_invitation),
-                        value = state.invitation,
-                        onValueChange = onInvitation,
-                        supporting = stringResource(R.string.login_invitation_hint),
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii, imeAction = ImeAction.Next),
-                    )
-                    LabeledField(
-                        label = stringResource(R.string.login_display_name),
-                        value = state.displayName,
-                        onValueChange = onDisplayName,
-                        supporting = stringResource(R.string.login_display_name_hint),
-                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-                        keyboardActions = KeyboardActions(onDone = { onSubmit() }),
+                if (sessionLost) {
+                    Notice(
+                        title = stringResource(R.string.login_session_lost_title),
+                        body = stringResource(R.string.login_session_lost_body),
+                        icon = R.drawable.ic_shield_alert,
                     )
                 }
-            }
 
-            state.error?.let { error ->
-                NoticeCard(
-                    title = stringResource(R.string.login_error_title),
-                    body = error.text(),
-                    icon = R.drawable.ic_triangle_alert,
-                    containerColor = colors.errorContainer,
-                    contentColor = colors.onErrorContainer,
-                    modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                LabeledFieldServer(state, onUrl, onProbeNow)
+
+                // La app o el servidor quedaron atrás: quién y qué hacer.
+                state.probe?.protocolGap?.let { ProtocolBanner(displayHost(state.url), it, update, updates) }
+
+                AnimatedVisibility(
+                    visible = state.probe != null && state.trust != TrustState.NotNeeded,
+                    enter = fadeIn() + expandVertically(),
+                    exit = fadeOut() + shrinkVertically(),
+                ) {
+                    state.probe?.let { TrustCard(it, state.trust, onTrust) }
+                }
+
+                LabeledField(
+                    label = stringResource(R.string.login_username),
+                    value = state.username,
+                    onValueChange = onUsername,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii, imeAction = ImeAction.Next),
                 )
-            }
-
-            Spacer(Modifier.height(4.dp))
-
-            PillButton(
-                text = stringResource(
-                    when {
-                        state.busy && state.invitationMode -> R.string.login_creating
-                        state.busy -> R.string.login_signing_in
-                        state.invitationMode -> R.string.login_create_account
-                        else -> R.string.login_sign_in
-                    },
-                ),
-                onClick = onSubmit,
-                enabled = state.canSubmit,
-                height = 52.dp,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            TextButton(
-                onClick = onToggleInvitation,
-                modifier = Modifier.fillMaxWidth().height(44.dp),
-            ) {
-                Text(
-                    stringResource(if (state.invitationMode) R.string.login_have_account else R.string.login_have_invitation),
-                    style = CoroomText.button.copy(fontSize = MaterialTheme.typography.titleSmall.fontSize),
+                LabeledField(
+                    label = stringResource(if (state.invitationMode) R.string.login_password_new else R.string.login_password),
+                    value = state.password,
+                    onValueChange = onPassword,
+                    supporting = if (state.invitationMode) stringResource(R.string.login_password_hint) else null,
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Password,
+                        imeAction = if (state.invitationMode) ImeAction.Next else ImeAction.Done,
+                    ),
+                    keyboardActions = KeyboardActions(onDone = { onSubmit() }),
                 )
+                AnimatedVisibility(visible = state.invitationMode) {
+                    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                        LabeledField(
+                            label = stringResource(R.string.login_password_repeat),
+                            value = state.passwordRepeat,
+                            onValueChange = onPasswordRepeat,
+                            visualTransformation = PasswordVisualTransformation(),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Next),
+                        )
+                        LabeledField(
+                            label = stringResource(R.string.login_invitation),
+                            value = state.invitation,
+                            onValueChange = onInvitation,
+                            supporting = stringResource(R.string.login_invitation_hint),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Ascii, imeAction = ImeAction.Next),
+                        )
+                        LabeledField(
+                            label = stringResource(R.string.login_display_name),
+                            value = state.displayName,
+                            onValueChange = onDisplayName,
+                            supporting = stringResource(R.string.login_display_name_hint),
+                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                            keyboardActions = KeyboardActions(onDone = { onSubmit() }),
+                        )
+                    }
+                }
+
+                state.error?.let { error ->
+                    Notice(
+                        title = stringResource(R.string.login_error_title),
+                        body = error.text(),
+                        icon = R.drawable.ic_triangle_alert,
+                        tone = Tone.Error,
+                        modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+                    )
+                }
+
+                // La acción principal de la pantalla y, debajo, el cambio entre entrar y crear la cuenta.
+                Column(modifier = Modifier.padding(top = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    PrimaryButton(
+                        text = stringResource(
+                            when {
+                                state.busy && state.invitationMode -> R.string.login_creating
+                                state.busy -> R.string.login_signing_in
+                                state.invitationMode -> R.string.login_create_account
+                                else -> R.string.login_sign_in
+                            },
+                        ),
+                        onClick = onSubmit,
+                        enabled = state.canSubmit,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
+                    )
+                    TextButton(
+                        onClick = onToggleInvitation,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                    ) {
+                        Text(
+                            stringResource(if (state.invitationMode) R.string.login_have_account else R.string.login_have_invitation),
+                        )
+                    }
+                }
             }
         }
     }
@@ -235,79 +244,76 @@ private fun LabeledFieldServer(state: LoginUiState, onUrl: (String) -> Unit, onP
     )
 }
 
-/** «¿Confías en este certificado?» con la huella para compararla (boceto «Servidor»). */
+/** «¿Confías en este certificado?» con la huella para compararla, en el ámbar de los avisos. */
 @Composable
 private fun TrustCard(probe: ServerProbe, trust: TrustState, onTrust: (Boolean) -> Unit) {
     val extra = CoroomTheme.colors
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(extra.warningContainer)
-            .padding(14.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+    TonalCard(
+        containerColor = extra.warningContainer,
+        contentColor = extra.onWarningContainer,
+        outlined = false,
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            CoroomIcon(R.drawable.ic_shield_alert, contentDescription = null, tint = extra.warningAccent)
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                CoroomIcon(R.drawable.ic_shield_alert, contentDescription = null, tint = extra.warningAccent)
+                Text(
+                    text = stringResource(
+                        when (trust) {
+                            TrustState.Trusted -> R.string.trust_title_trusted
+                            TrustState.Rejected -> R.string.trust_title_rejected
+                            else -> R.string.trust_title
+                        },
+                    ),
+                    style = CoroomText.itemTitle,
+                )
+            }
             Text(
                 text = stringResource(
                     when (trust) {
-                        TrustState.Trusted -> R.string.trust_title_trusted
-                        TrustState.Rejected -> R.string.trust_title_rejected
-                        else -> R.string.trust_title
+                        TrustState.Trusted -> R.string.trust_body_trusted
+                        TrustState.Rejected -> R.string.trust_body_rejected
+                        else -> R.string.trust_body
                     },
                 ),
-                style = CoroomText.itemTitle.copy(fontWeight = CoroomText.section.fontWeight),
-                color = extra.onWarningContainer,
-            )
-        }
-        Text(
-            text = stringResource(
-                when (trust) {
-                    TrustState.Trusted -> R.string.trust_body_trusted
-                    TrustState.Rejected -> R.string.trust_body_rejected
-                    else -> R.string.trust_body
-                },
-            ),
-            style = CoroomText.body.copy(fontSize = MaterialTheme.typography.bodyMedium.fontSize),
-            color = extra.onWarningContainer,
-        )
-        probe.untrusted?.takeIf { it.isNotBlank() && trust == TrustState.Ask }?.let { reason ->
-            Text(
-                text = stringResource(R.string.trust_reason, reason),
                 style = CoroomText.supporting,
-                color = extra.onWarningContainer,
             )
-        }
-        Text(
-            text = formatFingerprint(probe.fingerprint),
-            style = CoroomText.mono,
-            color = extra.onWarningContainer,
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(10.dp))
-                .background(extra.warningCode)
-                .padding(horizontal = 10.dp, vertical = 8.dp),
-        )
-        if (trust == TrustState.Ask) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
-            ) {
-                TextButton(onClick = { onTrust(false) }) {
-                    Text(stringResource(R.string.trust_reject), style = CoroomText.button, color = extra.warningAccent)
-                }
-                PillButton(
-                    text = stringResource(R.string.trust_accept),
-                    onClick = { onTrust(true) },
-                    containerColor = extra.warningAccent,
-                    contentColor = extra.onWarningAccent,
-                )
+            probe.untrusted?.takeIf { it.isNotBlank() && trust == TrustState.Ask }?.let { reason ->
+                Text(text = stringResource(R.string.trust_reason, reason), style = CoroomText.supporting)
             }
-        } else if (trust == TrustState.Rejected) {
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                TextButton(onClick = { onTrust(true) }) {
-                    Text(stringResource(R.string.trust_accept_anyway), style = CoroomText.button, color = extra.warningAccent)
+            Text(
+                text = formatFingerprint(probe.fingerprint),
+                style = CoroomText.mono,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(MaterialTheme.shapes.small)
+                    .background(extra.warningCode)
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+            )
+            if (trust == TrustState.Ask) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TextButton(
+                        onClick = { onTrust(false) },
+                        colors = ButtonDefaults.textButtonColors(contentColor = extra.warningAccent),
+                    ) { Text(stringResource(R.string.trust_reject)) }
+                    PrimaryButton(
+                        text = stringResource(R.string.trust_accept),
+                        onClick = { onTrust(true) },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = extra.warningAccent,
+                            contentColor = extra.onWarningAccent,
+                        ),
+                    )
+                }
+            } else if (trust == TrustState.Rejected) {
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    TextButton(
+                        onClick = { onTrust(true) },
+                        colors = ButtonDefaults.textButtonColors(contentColor = extra.warningAccent),
+                    ) { Text(stringResource(R.string.trust_accept_anyway)) }
                 }
             }
         }

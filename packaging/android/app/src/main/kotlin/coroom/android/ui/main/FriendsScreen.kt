@@ -12,8 +12,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
@@ -23,6 +23,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -35,7 +36,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
@@ -49,17 +49,17 @@ import coroom.android.ui.components.Avatar
 import coroom.android.ui.components.CoroomIcon
 import coroom.android.ui.components.LabeledField
 import coroom.android.ui.components.ListCard
-import coroom.android.ui.components.NoticeCard
+import coroom.android.ui.components.Notice
 import coroom.android.ui.components.PersonRow
-import coroom.android.ui.components.PillButton
-import coroom.android.ui.components.PillOutlinedButton
 import coroom.android.ui.components.RowDivider
+import coroom.android.ui.components.SecondaryButton
 import coroom.android.ui.components.SectionHeader
+import coroom.android.ui.components.TonalButton
 import coroom.android.ui.preview.FakeData
 import coroom.android.ui.theme.CoroomText
 import coroom.android.ui.theme.CoroomTheme
 
-/** Pestaña Amigos (boceto «Amigos»): solicitudes, conectados, desconectados y «Agregar amigo». */
+/** Pestaña Amigos: solicitudes, conectados, desconectados y «Agregar amigo». */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun FriendsScreen(
@@ -95,91 +95,96 @@ fun FriendsScreen(
             onRefresh = onRefresh,
             modifier = Modifier.fillMaxSize(),
         ) {
-            Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-                Row(
-                    modifier = Modifier.padding(start = 20.dp, end = 16.dp, top = 20.dp, bottom = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        text = stringResource(R.string.friends_title),
-                        style = CoroomText.screenTitle,
-                        color = colors.onSurface,
-                        modifier = Modifier.weight(1f),
-                    )
-                    IconButton(onClick = {
-                        searching = !searching
-                        if (!searching) query = ""
-                    }) {
-                        CoroomIcon(
-                            if (searching) R.drawable.ic_x else R.drawable.ic_search,
-                            contentDescription = stringResource(if (searching) R.string.friends_search_close else R.string.friends_search),
+            Column(
+                modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Column(modifier = Modifier.widthIn(max = CONTENT_MAX_WIDTH).fillMaxWidth()) {
+                    Row(
+                        modifier = Modifier.padding(start = 20.dp, end = 8.dp, top = 12.dp, bottom = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = stringResource(R.string.friends_title),
+                            style = CoroomText.screenTitle,
+                            color = colors.onSurface,
+                            modifier = Modifier.weight(1f),
                         )
-                    }
-                }
-
-                Column(
-                    modifier = Modifier
-                        .padding(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 96.dp)
-                        .animateContentSize(),
-                    verticalArrangement = Arrangement.spacedBy(16.dp),
-                ) {
-                    AnimatedVisibility(visible = searching) {
-                        LabeledField(
-                            label = stringResource(R.string.friends_search_label),
-                            value = query,
-                            onValueChange = { query = it },
-                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                        )
+                        IconButton(onClick = {
+                            searching = !searching
+                            if (!searching) query = ""
+                        }) {
+                            CoroomIcon(
+                                if (searching) R.drawable.ic_x else R.drawable.ic_search,
+                                contentDescription = stringResource(if (searching) R.string.friends_search_close else R.string.friends_search),
+                            )
+                        }
                     }
 
-                    when {
-                        list == null && state.friends.error != null -> NoticeCard(
-                            title = stringResource(R.string.friends_error_title),
-                            body = state.friends.error,
-                            icon = R.drawable.ic_triangle_alert,
-                            action = { PillOutlinedButton(stringResource(R.string.action_retry), onRefresh) },
-                        )
-                        list == null -> Text(
-                            text = stringResource(R.string.friends_loading),
-                            style = CoroomText.supporting,
-                            color = colors.onSurfaceVariant,
-                            modifier = Modifier.padding(horizontal = 4.dp),
-                        )
-                        list.friends.isEmpty() && incoming.isEmpty() && outgoing.isEmpty() -> NoticeCard(
-                            title = stringResource(R.string.friends_empty_title),
-                            body = stringResource(R.string.friends_empty_body),
-                            icon = R.drawable.ic_users,
-                        )
-                        else -> {
-                            if (incoming.isNotEmpty()) Requests(incoming, state.busy, onAccept, onDecline)
-                            if (online.isNotEmpty()) {
-                                FriendGroup(stringResource(R.string.friends_online_count, online.size)) {
-                                    online.forEachIndexed { index, friend ->
-                                        if (index > 0) RowDivider()
-                                        FriendRow(friend, asked = friend.id in state.askedToJoin, onAskToJoin = onAskToJoin) {
-                                            FriendMenu(friend) { removing = it }
+                    Column(
+                        modifier = Modifier
+                            .padding(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 96.dp)
+                            .animateContentSize(),
+                        verticalArrangement = Arrangement.spacedBy(20.dp),
+                    ) {
+                        AnimatedVisibility(visible = searching) {
+                            LabeledField(
+                                label = stringResource(R.string.friends_search_label),
+                                value = query,
+                                onValueChange = { query = it },
+                                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                            )
+                        }
+
+                        when {
+                            list == null && state.friends.error != null -> Notice(
+                                title = stringResource(R.string.friends_error_title),
+                                body = state.friends.error,
+                                icon = R.drawable.ic_triangle_alert,
+                                actions = { TonalButton(stringResource(R.string.action_retry), onRefresh) },
+                            )
+                            list == null -> Text(
+                                text = stringResource(R.string.friends_loading),
+                                style = CoroomText.supporting,
+                                color = colors.onSurfaceVariant,
+                                modifier = Modifier.padding(horizontal = 4.dp),
+                            )
+                            list.friends.isEmpty() && incoming.isEmpty() && outgoing.isEmpty() -> Notice(
+                                title = stringResource(R.string.friends_empty_title),
+                                body = stringResource(R.string.friends_empty_body),
+                                icon = R.drawable.ic_users,
+                            )
+                            else -> {
+                                if (incoming.isNotEmpty()) Requests(incoming, state.busy, onAccept, onDecline)
+                                if (online.isNotEmpty()) {
+                                    FriendGroup(stringResource(R.string.friends_online_count, online.size)) {
+                                        online.forEachIndexed { index, friend ->
+                                            if (index > 0) RowDivider()
+                                            FriendRow(friend, asked = friend.id in state.askedToJoin, onAskToJoin = onAskToJoin) {
+                                                FriendMenu(friend) { removing = it }
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            if (offline.isNotEmpty()) {
-                                FriendGroup(stringResource(R.string.friends_offline_count, offline.size)) {
-                                    offline.forEachIndexed { index, friend ->
-                                        if (index > 0) RowDivider()
-                                        FriendRow(friend, asked = false, onAskToJoin = onAskToJoin) {
-                                            FriendMenu(friend) { removing = it }
+                                if (offline.isNotEmpty()) {
+                                    FriendGroup(stringResource(R.string.friends_offline_count, offline.size)) {
+                                        offline.forEachIndexed { index, friend ->
+                                            if (index > 0) RowDivider()
+                                            FriendRow(friend, asked = false, onAskToJoin = onAskToJoin) {
+                                                FriendMenu(friend) { removing = it }
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            if (outgoing.isNotEmpty()) Outgoing(outgoing, state.busy, onDecline)
-                            if (friends.isEmpty() && query.isNotBlank()) {
-                                Text(
-                                    text = stringResource(R.string.friends_search_empty, query.trim()),
-                                    style = CoroomText.supporting,
-                                    color = colors.onSurfaceVariant,
-                                    modifier = Modifier.padding(horizontal = 4.dp),
-                                )
+                                if (outgoing.isNotEmpty()) Outgoing(outgoing, state.busy, onDecline)
+                                if (friends.isEmpty() && query.isNotBlank()) {
+                                    Text(
+                                        text = stringResource(R.string.friends_search_empty, query.trim()),
+                                        style = CoroomText.supporting,
+                                        color = colors.onSurfaceVariant,
+                                        modifier = Modifier.padding(horizontal = 4.dp),
+                                    )
+                                }
                             }
                         }
                     }
@@ -187,14 +192,12 @@ fun FriendsScreen(
             }
         }
 
+        // La acción principal de la pantalla: un solo botón flotante, con la forma y el color de Material.
         ExtendedFloatingActionButton(
             onClick = { adding = true },
             modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
-            shape = RoundedCornerShape(16.dp),
-            containerColor = colors.primaryContainer,
-            contentColor = colors.onPrimaryContainer,
-            icon = { CoroomIcon(R.drawable.ic_user_plus, contentDescription = null, tint = colors.onPrimaryContainer) },
-            text = { Text(stringResource(R.string.friends_add), style = CoroomText.button) },
+            icon = { CoroomIcon(R.drawable.ic_user_plus, contentDescription = null, tint = LocalContentColor.current) },
+            text = { Text(stringResource(R.string.friends_add)) },
         )
     }
 
@@ -225,9 +228,13 @@ fun FriendsScreen(
     }
 }
 
+/** El ancho máximo del contenido: en una tableta la lista no se estira de borde a borde. */
+private val CONTENT_MAX_WIDTH = 720.dp
+
+/** Un grupo de la lista: su cabecera y sus filas en una sola tarjeta. */
 @Composable
 private fun FriendGroup(title: String, content: @Composable () -> Unit) {
-    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionHeader(title)
         ListCard { content() }
     }
@@ -256,6 +263,7 @@ private fun FriendMenu(friend: Friend, onRemove: (Friend) -> Unit) {
     }
 }
 
+/** Las solicitudes recibidas: una fila por persona, con «Rechazar» y «Aceptar» debajo. */
 @Composable
 private fun Requests(
     requests: List<FriendRequest>,
@@ -264,16 +272,12 @@ private fun Requests(
     onDecline: (Long) -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        SectionHeader(stringResource(R.string.friends_requests))
-        requests.forEach { request ->
+    FriendGroup(stringResource(R.string.friends_requests)) {
+        requests.forEachIndexed { index, request ->
+            if (index > 0) RowDivider()
             Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(colors.surfaceContainer)
-                    .padding(14.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
+                modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 12.dp, top = 12.dp, bottom = 8.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Avatar(
@@ -292,8 +296,8 @@ private fun Requests(
                     }
                 }
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)) {
-                    PillOutlinedButton(stringResource(R.string.friends_decline), { onDecline(request.id) }, enabled = !busy)
-                    PillButton(stringResource(R.string.friends_accept), { onAccept(request.id) }, enabled = !busy)
+                    SecondaryButton(stringResource(R.string.friends_decline), { onDecline(request.id) }, enabled = !busy)
+                    TonalButton(stringResource(R.string.friends_accept), { onAccept(request.id) }, enabled = !busy)
                 }
             }
         }
@@ -312,7 +316,7 @@ private fun Outgoing(requests: List<FriendRequest>, busy: Boolean, onCancel: (Lo
                 user = request.user?.id,
                 avatar = request.user?.avatar,
             ) {
-                PillOutlinedButton(stringResource(R.string.action_cancel), { onCancel(request.id) }, enabled = !busy)
+                SecondaryButton(stringResource(R.string.action_cancel), { onCancel(request.id) }, enabled = !busy)
             }
         }
     }

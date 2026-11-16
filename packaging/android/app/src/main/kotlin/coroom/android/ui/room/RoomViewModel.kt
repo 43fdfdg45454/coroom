@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import coroom.android.AppContainer
 import coroom.android.R
+import coroom.android.bridge.Account
 import coroom.android.bridge.BridgeException
 import coroom.android.bridge.ChatMessage
 import coroom.android.bridge.CoroomEvent
@@ -72,6 +73,8 @@ data class InputPermissions(val keyboardMouse: Boolean, val gamepadSlot: Int?)
 data class RoomUiState(
     val code: String,
     val hostName: String? = null,
+    /** La cuenta propia, para dibujar su butaca mientras se entra (`null` en las vistas previas sin cuenta). */
+    val self: Account? = null,
     val phase: RoomPhase = RoomPhase.Joining,
     val steps: Map<JoinStep, StepState> = JoinStep.entries.associateWith { StepState.Pending },
     val relayed: Boolean? = null,
@@ -146,7 +149,9 @@ class RoomViewModel(
     hostName: String?,
 ) : ViewModel() {
     private val repository = container.repository
-    private val _state = MutableStateFlow(RoomUiState(code = code, hostName = hostName))
+    private val _state = MutableStateFlow(
+        RoomUiState(code = code, hostName = hostName, self = container.repository.account.value),
+    )
     val state: StateFlow<RoomUiState> = _state.asStateFlow()
 
     private val _commands = Channel<RoomCommand>(Channel.BUFFERED)

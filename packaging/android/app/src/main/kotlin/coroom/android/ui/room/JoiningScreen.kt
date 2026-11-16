@@ -1,11 +1,6 @@
 package coroom.android.ui.room
 
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -19,7 +14,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -27,28 +24,29 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.SpanStyle
-import androidx.compose.ui.text.buildAnnotatedString
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import coroom.android.R
-import coroom.android.ui.components.Avatar
+import coroom.android.bridge.Account
 import coroom.android.ui.components.CoroomIcon
-import coroom.android.ui.components.PillButton
-import coroom.android.ui.components.PillOutlinedButton
+import coroom.android.ui.components.PrimaryButton
+import coroom.android.ui.components.SeatOccupant
+import coroom.android.ui.components.SeatRow
+import coroom.android.ui.components.SecondaryButton
+import coroom.android.ui.components.SignageCode
 import coroom.android.ui.theme.CoroomText
 import coroom.android.ui.theme.CoroomTheme
 
-/** «Entrando en la sala de Bea» con la lista de pasos (boceto «Entrando»). */
+/**
+ * «Entrando en la sala de Bea»: a la izquierda, el código en señalética y la fila de butacas (la
+ * del anfitrión y, en cuanto hay conexión con él, la propia, que se enciende con la lámpara de la
+ * ruta); a la derecha, los pasos. La sala va siempre en horizontal.
+ */
 @Composable
 fun JoiningScreen(state: RoomUiState, onCancel: () -> Unit) {
     val colors = MaterialTheme.colorScheme
@@ -60,58 +58,61 @@ fun JoiningScreen(state: RoomUiState, onCancel: () -> Unit) {
         label = "join-progress",
     )
     Box(
-        modifier = Modifier.fillMaxSize().background(colors.background).safeDrawingPadding().padding(24.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .background(colors.background)
+            .safeDrawingPadding()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 24.dp, vertical = 20.dp),
         contentAlignment = Alignment.Center,
     ) {
         Column(
-            modifier = Modifier.widthIn(max = 440.dp).fillMaxWidth().semantics { liveRegion = LiveRegionMode.Polite },
-            verticalArrangement = Arrangement.spacedBy(14.dp),
+            modifier = Modifier.widthIn(max = 760.dp).fillMaxWidth().semantics { liveRegion = LiveRegionMode.Polite },
+            verticalArrangement = Arrangement.spacedBy(20.dp),
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                val host = state.hostName
-                // El anfitrión es el miembro 0, si ya llegó la lista (al cambiar de sala, por ejemplo).
-                val hostMember = state.members.firstOrNull { it.guest == 0 }
-                Avatar(
-                    name = host ?: state.code,
-                    seed = hostMember?.user ?: (host ?: state.code).hashCode().toLong(),
-                    size = 44.dp,
-                    user = hostMember?.user,
-                    avatar = hostMember?.avatar,
-                )
-                Column {
-                    Text(
-                        text = if (host != null) stringResource(R.string.joining_title_host, host) else stringResource(R.string.joining_title),
-                        style = CoroomText.screenTitle.copy(fontWeight = CoroomText.cardTitle.fontWeight),
-                        color = colors.onSurface,
+            Row(horizontalArrangement = Arrangement.spacedBy(32.dp)) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                    val host = state.hostName
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(
+                            text = if (host != null) stringResource(R.string.joining_title_host, host) else stringResource(R.string.joining_title),
+                            style = CoroomText.screenTitle,
+                            color = colors.onSurface,
+                        )
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Text(
+                                text = stringResource(R.string.joining_room_label),
+                                style = CoroomText.supporting,
+                                color = colors.onSurfaceVariant,
+                            )
+                            SignageCode(code = state.code, style = CoroomText.signage, color = colors.onSurface)
+                        }
+                    }
+                    // Aún no se sabe quién más hay en la sala: solo la butaca del anfitrión y la que se va a ocupar.
+                    SeatRow(
+                        occupants = joiningSeats(state),
+                        seatSize = 48.dp,
+                        minSeats = JOINING_SEATS,
+                        lampRing = colors.background,
                     )
-                    val label = stringResource(R.string.joining_room_label)
-                    Text(
-                        text = buildAnnotatedString {
-                            append(label)
-                            append(" ")
-                            withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) { append(state.code) }
-                        },
-                        style = CoroomText.supporting.copy(fontSize = 14.sp),
-                        color = colors.onSurfaceVariant,
+                }
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        JoinStep.entries.forEach { step ->
+                            StepRow(step, state.steps[step] ?: StepState.Pending, state.relayed)
+                        }
+                    }
+                    LinearProgressIndicator(
+                        progress = { progress },
+                        modifier = Modifier.fillMaxWidth().height(4.dp),
+                        color = colors.primary,
+                        trackColor = colors.surfaceContainerHighest,
+                        strokeCap = StrokeCap.Round,
+                        gapSize = 0.dp,
+                        drawStopIndicator = {},
                     )
                 }
             }
-
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                JoinStep.entries.forEach { step ->
-                    StepRow(step, state.steps[step] ?: StepState.Pending, state.relayed)
-                }
-            }
-
-            LinearProgressIndicator(
-                progress = { progress },
-                modifier = Modifier.fillMaxWidth().height(4.dp),
-                color = colors.primary,
-                trackColor = colors.surfaceContainerHighest,
-                strokeCap = StrokeCap.Round,
-                gapSize = 0.dp,
-                drawStopIndicator = {},
-            )
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -124,10 +125,47 @@ fun JoiningScreen(state: RoomUiState, onCancel: () -> Unit) {
                     color = colors.onSurfaceVariant,
                     modifier = Modifier.weight(1f),
                 )
-                PillOutlinedButton(text = stringResource(R.string.action_cancel), onClick = onCancel, height = 44.dp)
+                SecondaryButton(text = stringResource(R.string.action_cancel), onClick = onCancel)
             }
         }
     }
+}
+
+/**
+ * Las butacas mientras se entra: la del anfitrión (el miembro 0 si ya llegó la lista; si no, su
+ * nombre) y la propia, que solo se ocupa cuando ya hay camino con el anfitrión, con la lámpara
+ * verde de la ruta directa o la ámbar del relay.
+ */
+@Composable
+private fun joiningSeats(state: RoomUiState): List<SeatOccupant> {
+    val extra = CoroomTheme.colors
+    val hostMember = state.members.firstOrNull { it.guest == 0 }
+    val hostName = hostMember?.name?.takeIf { it.isNotBlank() } ?: state.hostName
+    val host = hostName?.let { name ->
+        SeatOccupant(
+            name = name,
+            seed = hostMember?.user ?: name.hashCode().toLong(),
+            user = hostMember?.user,
+            avatar = hostMember?.avatar,
+            role = stringResource(R.string.seat_host),
+        )
+    }
+    val connected = state.steps[JoinStep.Path] == StepState.Done
+    val self = state.self?.takeIf { connected }?.let { account ->
+        SeatOccupant(
+            name = account.shownName,
+            seed = account.userId,
+            user = account.userId,
+            avatar = account.avatar,
+            lamp = when (state.relayed) {
+                true -> extra.cautionDot
+                false -> extra.successDot
+                null -> null
+            },
+            role = stringResource(R.string.seat_you),
+        )
+    }
+    return listOfNotNull(host, self)
 }
 
 @Composable
@@ -145,71 +183,60 @@ private fun StepRow(step: JoinStep, stepState: StepState, relayed: Boolean?) {
             JoinStep.Keys -> if (stepState == StepState.Done) R.string.step_keys_done else R.string.step_keys
         },
     )
-    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         when (stepState) {
             StepState.Done -> CoroomIcon(R.drawable.ic_check, contentDescription = null, tint = CoroomTheme.colors.success, size = 20.dp)
-            StepState.Active -> Spinner()
+            StepState.Active -> CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
             StepState.Pending -> CoroomIcon(R.drawable.ic_circle, contentDescription = null, tint = colors.outline, size = 20.dp)
         }
         Text(
             text = text,
             style = CoroomText.body,
-            color = if (stepState == StepState.Pending) colors.outline else colors.onSurface,
+            color = if (stepState == StepState.Pending) colors.onSurfaceVariant else colors.onSurface,
         )
     }
 }
 
-@Composable
-private fun Spinner() {
-    val transition = rememberInfiniteTransition(label = "spinner")
-    val angle by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(tween(900, easing = LinearEasing), RepeatMode.Restart),
-        label = "spinner-angle",
-    )
-    CoroomIcon(
-        R.drawable.ic_loader_circle,
-        contentDescription = null,
-        tint = MaterialTheme.colorScheme.primary,
-        size = 20.dp,
-        modifier = Modifier.rotate(angle),
-    )
-}
+/** Las butacas de «Entrando»: la del anfitrión y la propia. */
+private const val JOINING_SEATS = 2
 
-/** «No se pudo entrar en la sala» con el motivo (boceto «No se pudo entrar»). */
+/** «No se pudo entrar en la sala» con el motivo, y qué hacer. */
 @Composable
 fun RoomErrorScreen(error: String, wasInRoom: Boolean, onHome: () -> Unit, onRetry: () -> Unit) {
     val colors = MaterialTheme.colorScheme
     Box(
-        modifier = Modifier.fillMaxSize().background(colors.background).safeDrawingPadding().padding(24.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .background(colors.background)
+            .safeDrawingPadding()
+            .verticalScroll(rememberScrollState())
+            .padding(24.dp),
         contentAlignment = Alignment.Center,
     ) {
         Column(
-            modifier = Modifier.widthIn(max = 460.dp).fillMaxWidth().semantics { liveRegion = LiveRegionMode.Assertive },
-            verticalArrangement = Arrangement.spacedBy(14.dp),
+            modifier = Modifier.widthIn(max = 480.dp).fillMaxWidth().semantics { liveRegion = LiveRegionMode.Assertive },
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Box(
-                modifier = Modifier.size(48.dp).background(colors.errorContainer, CircleShape),
+                modifier = Modifier.size(48.dp).background(colors.errorContainer, MaterialTheme.shapes.medium),
                 contentAlignment = Alignment.Center,
             ) {
                 CoroomIcon(R.drawable.ic_triangle_alert, contentDescription = null, tint = colors.onErrorContainer, size = 24.dp)
             }
             Text(
                 text = stringResource(if (wasInRoom) R.string.room_error_title_ended else R.string.room_error_title),
-                style = CoroomText.screenTitle.copy(fontWeight = CoroomText.cardTitle.fontWeight),
+                style = CoroomText.screenTitle,
                 color = colors.onSurface,
             )
             Text(text = error, style = CoroomText.body, color = colors.onSurfaceVariant)
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
             ) {
-                PillOutlinedButton(text = stringResource(R.string.room_error_home), onClick = onHome, height = 44.dp)
-                PillButton(
+                SecondaryButton(text = stringResource(R.string.room_error_home), onClick = onHome)
+                PrimaryButton(
                     text = stringResource(if (wasInRoom) R.string.room_error_rejoin else R.string.action_retry),
                     onClick = onRetry,
-                    height = 44.dp,
                     icon = R.drawable.ic_refresh_cw,
                 )
             }
@@ -225,6 +252,8 @@ private fun JoiningPreview() {
             state = RoomUiState(
                 code = "K7Q2MZ",
                 hostName = "Bea",
+                self = Account(username = "ana", displayName = "Ana", userId = 1),
+                relayed = false,
                 steps = mapOf(
                     JoinStep.Server to StepState.Done,
                     JoinStep.Path to StepState.Done,

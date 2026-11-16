@@ -13,7 +13,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
@@ -39,6 +39,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalInspectionMode
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.core.net.toUri
@@ -48,15 +50,16 @@ import coroom.android.bridge.TouchMode
 import coroom.android.ui.components.Avatar
 import coroom.android.ui.components.CoroomIcon
 import coroom.android.ui.components.ListCard
-import coroom.android.ui.components.PillOutlinedButton
 import coroom.android.ui.components.RowDivider
+import coroom.android.ui.components.SecondaryButton
 import coroom.android.ui.components.SectionHeader
+import coroom.android.ui.components.serverDotColor
 import coroom.android.ui.preview.FakeData
 import coroom.android.ui.theme.CoroomText
 import coroom.android.ui.theme.CoroomTheme
 import kotlin.math.roundToInt
 
-/** Pestaña Ajustes (boceto «Ajustes»). */
+/** Pestaña Ajustes: cada grupo, una lista agrupada bajo su cabecera. */
 @Composable
 fun SettingsScreen(
     state: MainUiState,
@@ -84,17 +87,22 @@ fun SettingsScreen(
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
             .padding(contentPadding),
+        horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Text(
-            text = stringResource(R.string.settings_title),
-            style = CoroomText.screenTitle,
-            color = colors.onSurface,
-            modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 8.dp),
-        )
+        // En una tableta los ajustes no se estiran de borde a borde.
         Column(
-            modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 4.dp, bottom = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
+            modifier = Modifier
+                .widthIn(max = CONTENT_MAX_WIDTH)
+                .fillMaxWidth()
+                .padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
+            Text(
+                text = stringResource(R.string.settings_title),
+                style = CoroomText.screenTitle,
+                color = colors.onSurface,
+                modifier = Modifier.padding(horizontal = 4.dp).semantics { heading() },
+            )
             SettingsHeader(stringResource(R.string.settings_touch))
             ListCard(modifier = Modifier.selectableGroup()) {
                 TouchOption(
@@ -165,20 +173,27 @@ fun SettingsScreen(
             state.account?.let { account ->
                 ListCard {
                     Row(
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
+                        modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 12.dp, top = 12.dp, bottom = 12.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
-                        Avatar(name = account.shownName, seed = account.userId, user = account.userId, avatar = account.avatar)
+                        Avatar(
+                            name = account.shownName,
+                            seed = account.userId,
+                            size = 48.dp,
+                            user = account.userId,
+                            avatar = account.avatar,
+                            lamp = serverDotColor(state.serverOnline),
+                        )
                         Column(modifier = Modifier.weight(1f)) {
-                            Text(account.shownName, style = CoroomText.itemBody, color = colors.onSurface)
+                            Text(account.shownName, style = CoroomText.itemTitle, color = colors.onSurface)
                             Text(
                                 stringResource(R.string.settings_account_detail, account.username, account.serverHost),
                                 style = CoroomText.supporting,
                                 color = colors.onSurfaceVariant,
                             )
                         }
-                        PillOutlinedButton(
+                        SecondaryButton(
                             text = stringResource(R.string.settings_logout),
                             onClick = { confirmLogout = true },
                             contentColor = colors.error,
@@ -199,9 +214,9 @@ fun SettingsScreen(
                         .fillMaxWidth()
                         .clickable(role = Role.Button, onClick = onShareLog)
                         .heightIn(min = 56.dp)
-                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
                     CoroomIcon(R.drawable.ic_file_text, contentDescription = null)
                     Column(modifier = Modifier.weight(1f)) {
@@ -216,7 +231,7 @@ fun SettingsScreen(
             }
 
             Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
+                modifier = Modifier.fillMaxWidth().padding(start = 4.dp, top = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
@@ -252,21 +267,25 @@ fun SettingsScreen(
     if (showLicenses) LicensesDialog(onDismiss = { showLicenses = false })
 }
 
+/** El ancho máximo del contenido de Ajustes. */
+private val CONTENT_MAX_WIDTH = 720.dp
+
+/** La cabecera de un grupo: más aire encima que debajo, para que cada grupo se lea junto. */
 @Composable
 private fun SettingsHeader(text: String) {
     SectionHeader(
         text = text,
         color = MaterialTheme.colorScheme.primary,
-        modifier = Modifier.padding(start = 4.dp, top = 6.dp),
+        modifier = Modifier.padding(top = 16.dp),
     )
 }
 
 @Composable
 private fun SettingsRow(title: String, body: String?, icon: Int? = null) {
     Row(
-        modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp).padding(horizontal = 14.dp, vertical = 12.dp),
+        modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp).padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         if (icon != null) CoroomIcon(icon, contentDescription = null)
         Column(modifier = Modifier.weight(1f)) {
@@ -282,11 +301,12 @@ private fun TouchOption(title: String, body: String, selected: Boolean, onSelect
         modifier = Modifier
             .fillMaxWidth()
             .selectable(selected = selected, onClick = onSelect, role = Role.RadioButton)
-            .padding(horizontal = 14.dp, vertical = 12.dp),
+            .heightIn(min = 56.dp)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        RadioButton(selected = selected, onClick = null, modifier = Modifier.size(20.dp))
+        RadioButton(selected = selected, onClick = null)
         Column(modifier = Modifier.weight(1f)) {
             Text(title, style = CoroomText.itemBody, color = MaterialTheme.colorScheme.onSurface)
             Text(body, style = CoroomText.supporting, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -300,9 +320,10 @@ private fun SwitchRow(title: String, body: String?, checked: Boolean, onChange: 
         modifier = Modifier
             .fillMaxWidth()
             .toggleable(value = checked, onValueChange = onChange, role = Role.Switch)
-            .padding(horizontal = 14.dp, vertical = 12.dp),
+            .heightIn(min = 56.dp)
+            .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(14.dp),
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         Column(modifier = Modifier.weight(1f)) {
             Text(title, style = CoroomText.itemBody, color = MaterialTheme.colorScheme.onSurface)
@@ -319,8 +340,8 @@ private fun VolumeRow(volume: Int, onVolume: (Int) -> Unit) {
     var value by remember { mutableFloatStateOf(volume.toFloat()) }
     if (!dragging && value.roundToInt() != volume) value = volume.toFloat()
     Column(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         Text(
             stringResource(R.string.settings_volume, value.roundToInt()),
@@ -358,8 +379,8 @@ private fun LicensesDialog(onDismiss: () -> Unit) {
                 Text(stringResource(R.string.licenses_lucide), style = CoroomText.section)
                 Box(
                     Modifier
-                        .background(MaterialTheme.colorScheme.surfaceContainerHigh)
-                        .padding(8.dp),
+                        .background(MaterialTheme.colorScheme.surfaceContainerHighest, MaterialTheme.shapes.small)
+                        .padding(10.dp),
                 ) {
                     Text(lucide, style = CoroomText.mono)
                 }

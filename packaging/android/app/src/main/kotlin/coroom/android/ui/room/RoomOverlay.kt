@@ -8,9 +8,11 @@ import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.indication
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -19,10 +21,11 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -30,9 +33,13 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonColors
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -41,7 +48,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
@@ -54,17 +60,18 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
-import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.coerceAtLeast
+import androidx.compose.ui.unit.dp
 import coroom.android.R
 import coroom.android.bridge.ChatMessage
 import coroom.android.bridge.Member
 import coroom.android.bridge.RoomStats
 import coroom.android.bridge.TouchMode
 import coroom.android.ui.components.CoroomIcon
-import coroom.android.ui.components.PillButton
-import coroom.android.ui.components.StatusDot
+import coroom.android.ui.components.Lamp
+import coroom.android.ui.components.PrimaryButton
+import coroom.android.ui.components.SeatRow
 import coroom.android.ui.text
 import coroom.android.ui.theme.CoroomText
 import coroom.android.ui.theme.CoroomTheme
@@ -90,14 +97,13 @@ class RoomActions(
 )
 
 /**
- * Lo que va encima del vídeo con la sala abierta (bocetos «Sala», «Sala: conexión y calidad» y
- * «Sala: chat»): la píldora de conexión siempre visible, la barra lateral, el modo táctil, los
- * avisos y los paneles.
+ * Lo que va encima del vídeo con la sala abierta: la píldora de conexión siempre visible, la barra
+ * lateral, el modo táctil, los avisos y los paneles.
  *
  * La barra lateral y los chips se esconden solos a los [OVERLAY_HIDE_MS] sin tocarlos (con un
  * panel, el diálogo de salir, el teclado o una reconexión no se esconden): queda solo la píldora
- * reducida al punto de la calidad y la latencia, que siguen siempre a la vista, y tocarla vuelve
- * a enseñarlo todo. Los toques en el vídeo siguen yendo al juego.
+ * reducida a la lámpara de la calidad y la latencia, que siguen siempre a la vista, y tocarla
+ * vuelve a enseñarlo todo. Los toques en el vídeo siguen yendo al juego.
  */
 @Composable
 fun RoomOverlay(state: RoomUiState, actions: RoomActions) {
@@ -106,14 +112,14 @@ fun RoomOverlay(state: RoomUiState, actions: RoomActions) {
     Box(modifier = Modifier.fillMaxSize()) {
         // Con el vídeo apagado, su vista tapa la imagen (y los toques no llegan al juego).
         AnimatedVisibility(visible = state.videoOff, enter = fadeIn(), exit = fadeOut()) {
-            VideoOffView(state.hostName, onTurnOn = actions.onToggleVideo)
+            VideoOffView(state, onTurnOn = actions.onToggleVideo)
         }
         // Con un panel abierto el vídeo se oscurece y tocarlo cierra el panel (no llega al juego).
         AnimatedVisibility(visible = panelOpen, enter = fadeIn(), exit = fadeOut()) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.35f))
+                    .background(CoroomTheme.colors.scrim)
                     .clickable(
                         interactionSource = remember { MutableInteractionSource() },
                         indication = null,
@@ -123,8 +129,9 @@ fun RoomOverlay(state: RoomUiState, actions: RoomActions) {
         }
 
         Box(modifier = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.displayCutout)) {
+            // La píldora ocupa su zona de toque de 48 dp: con 6 de margen, se ve a 12 del borde.
             Row(
-                modifier = Modifier.align(Alignment.TopStart).padding(start = 14.dp, top = 12.dp),
+                modifier = Modifier.align(Alignment.TopStart).padding(start = 14.dp, top = 6.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -194,12 +201,13 @@ fun RoomOverlay(state: RoomUiState, actions: RoomActions) {
     }
 }
 
+/** La lámpara de la calidad: verde si va bien, ámbar si va justa o reconecta, rojo si va mal. */
 @Composable
 private fun qualityColor(state: RoomUiState): Color = when {
-    state.reconnecting != null -> CoroomTheme.colors.caution
+    state.reconnecting != null -> CoroomTheme.colors.cautionDot
     else -> when (state.quality) {
         LinkQuality.Excellent, LinkQuality.Good -> CoroomTheme.colors.successDot
-        LinkQuality.Acceptable -> CoroomTheme.colors.caution
+        LinkQuality.Acceptable -> CoroomTheme.colors.cautionDot
         LinkQuality.Poor -> MaterialTheme.colorScheme.error
         null -> MaterialTheme.colorScheme.outline
     }
@@ -215,9 +223,10 @@ private fun routeText(relayed: Boolean?): String = stringResource(
 )
 
 /**
- * «● 14 ms · directa · AV1»: la latencia siempre a la vista; abre el panel de conexión. Con la
- * barra escondida (`expanded` en falso) se queda en «● 14 ms» (y el aviso de chat sin leer), y
- * tocarla enseña la barra.
+ * «14 ms · directa · AV1» con la lámpara de la calidad: la latencia siempre a la vista; abre el
+ * panel de conexión. Con la barra escondida (`expanded` en falso) se queda en la lámpara y
+ * «14 ms» (y el aviso de chat sin leer), y tocarla enseña la barra. La píldora se ve baja, pero
+ * su zona de toque mide 48 dp.
  */
 @Composable
 fun ConnectionPill(state: RoomUiState, onClick: () -> Unit, modifier: Modifier = Modifier, expanded: Boolean = true) {
@@ -243,30 +252,39 @@ fun ConnectionPill(state: RoomUiState, onClick: () -> Unit, modifier: Modifier =
         state.unreadChat -> stringResource(R.string.pill_description_collapsed_unread, quality, rtt)
         else -> stringResource(R.string.pill_description_collapsed, quality, rtt)
     }
-    Row(
+    val interaction = remember { MutableInteractionSource() }
+    Box(
         modifier = modifier
-            .height(34.dp)
-            .clip(RoundedCornerShape(17.dp))
-            .background(CoroomTheme.colors.overlay)
-            .clickable(role = Role.Button, onClick = onClick)
-            .semantics(mergeDescendants = true) { contentDescription = description }
-            // El mismo margen a los dos lados: el contenido, centrado en la píldora.
-            .padding(horizontal = 12.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
+            .defaultMinSize(minHeight = TOUCH_TARGET)
+            .clickable(interactionSource = interaction, indication = null, role = Role.Button, onClick = onClick)
+            .semantics(mergeDescendants = true) { contentDescription = description },
+        contentAlignment = Alignment.Center,
     ) {
-        StatusDot(qualityColor(state))
-        Text(
-            text = if (state.reconnecting != null) stringResource(R.string.quality_reconnecting) else rtt,
-            style = CoroomText.pill.copy(fontWeight = FontWeight.SemiBold),
-            color = colors.onSurface,
-        )
-        AnimatedVisibility(visible = expanded) {
-            Text(text = detail, style = CoroomText.pill, color = colors.onSurfaceVariant)
-        }
-        // Con la barra escondida no se ve el aviso del chat de la barra lateral: va aquí.
-        AnimatedVisibility(visible = !expanded && state.unreadChat, enter = fadeIn(), exit = fadeOut()) {
-            Box(Modifier.size(8.dp).background(colors.error, CircleShape))
+        Row(
+            modifier = Modifier
+                .heightIn(min = PILL_HEIGHT)
+                .clip(CircleShape)
+                .background(CoroomTheme.colors.overlay)
+                // La respuesta al toque se dibuja en la píldora, no en toda la zona de toque.
+                .indication(interaction, LocalIndication.current)
+                // El mismo margen a los dos lados: el contenido, centrado en la píldora.
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Lamp(qualityColor(state))
+            Text(
+                text = if (state.reconnecting != null) stringResource(R.string.quality_reconnecting) else rtt,
+                style = CoroomText.pill.copy(fontWeight = FontWeight.SemiBold),
+                color = colors.onSurface,
+            )
+            AnimatedVisibility(visible = expanded) {
+                Text(text = detail, style = CoroomText.pill, color = colors.onSurfaceVariant)
+            }
+            // Con la barra escondida no se ve el aviso del chat de la barra lateral: va aquí.
+            AnimatedVisibility(visible = !expanded && state.unreadChat, enter = fadeIn(), exit = fadeOut()) {
+                Lamp(colors.error)
+            }
         }
     }
 }
@@ -297,14 +315,15 @@ private fun TouchModeChip(mode: TouchMode, modifier: Modifier = Modifier) {
     )
 }
 
+/** Un chip informativo sobre el vídeo (no se pulsa): icono y texto en una píldora. */
 @Composable
 private fun OverlayChip(@DrawableRes icon: Int, text: String, modifier: Modifier = Modifier) {
     Row(
         modifier = modifier
-            .height(32.dp)
-            .clip(RoundedCornerShape(16.dp))
+            .heightIn(min = PILL_HEIGHT)
+            .clip(CircleShape)
             .background(CoroomTheme.colors.overlay)
-            .padding(horizontal = 12.dp),
+            .padding(horizontal = 12.dp, vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
@@ -320,13 +339,13 @@ private fun RoomRail(state: RoomUiState, actions: RoomActions, modifier: Modifie
     BoxWithConstraints(
         modifier = modifier
             .fillMaxHeight()
-            .width(60.dp)
-            .clip(RoundedCornerShape(30.dp))
+            .width(RAIL_WIDTH)
+            .clip(MaterialTheme.shapes.extraLarge)
             .background(CoroomTheme.colors.overlayStrong),
     ) {
         // Los botones repartidos a lo alto; en un teléfono bajo, en horizontal, no caben con su
         // tamaño de toque y la barra se desliza en lugar de encogerlos.
-        val gap = ((maxHeight - RAIL_PADDING * 2 - RAIL_BUTTON * RAIL_BUTTONS) / (RAIL_BUTTONS - 1)).coerceAtLeast(0.dp)
+        val gap = ((maxHeight - RAIL_PADDING * 2 - TOUCH_TARGET * RAIL_BUTTONS) / (RAIL_BUTTONS - 1)).coerceAtLeast(0.dp)
         Column(
             modifier = Modifier
                 .fillMaxHeight()
@@ -369,12 +388,10 @@ private fun RoomRail(state: RoomUiState, actions: RoomActions, modifier: Modifie
                     onClick = { actions.onTogglePanel(Panel.Chat) },
                 )
                 if (state.unreadChat) {
-                    Box(
-                        Modifier
-                            .align(Alignment.TopEnd)
-                            .padding(top = 6.dp, end = 6.dp)
-                            .size(10.dp)
-                            .background(colors.error, CircleShape),
+                    Lamp(
+                        color = colors.error,
+                        modifier = Modifier.align(Alignment.TopEnd).padding(top = 8.dp, end = 8.dp),
+                        size = 10.dp,
                     )
                 }
             }
@@ -387,84 +404,95 @@ private fun RoomRail(state: RoomUiState, actions: RoomActions, modifier: Modifie
                 icon = R.drawable.ic_log_out,
                 description = stringResource(R.string.rail_leave),
                 onClick = { actions.onAskLeave(true) },
-                container = colors.errorContainer,
-                tint = colors.onErrorContainer,
+                colors = IconButtonDefaults.filledIconButtonColors(
+                    containerColor = colors.errorContainer,
+                    contentColor = colors.onErrorContainer,
+                ),
             )
         }
     }
 }
 
+/**
+ * Un botón de la barra lateral: el botón de icono de Material, con su zona de toque de 48 dp.
+ * Encendido (`active`) va relleno con el contenedor del primario; apagado, solo el icono.
+ */
 @Composable
 private fun RailButton(
     @DrawableRes icon: Int,
     description: String,
     onClick: () -> Unit,
     active: Boolean = false,
-    container: Color? = null,
-    tint: Color? = null,
     enabled: Boolean = true,
+    colors: IconButtonColors? = null,
 ) {
-    val colors = MaterialTheme.colorScheme
-    val background = container ?: if (active) colors.primaryContainer else Color.Transparent
-    val iconTint = tint ?: if (active) colors.onPrimaryContainer else colors.onSurface
-    Box(
-        modifier = Modifier
-            .size(RAIL_BUTTON)
-            .alpha(if (enabled) 1f else PAUSED_ALPHA)
-            .clip(CircleShape)
-            .background(background)
-            .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
-            .semantics { contentDescription = description },
-        contentAlignment = Alignment.Center,
-    ) {
-        CoroomIcon(icon, contentDescription = null, tint = iconTint)
+    val scheme = MaterialTheme.colorScheme
+    val buttonColors = colors ?: if (active) {
+        IconButtonDefaults.filledIconButtonColors(
+            containerColor = scheme.primaryContainer,
+            contentColor = scheme.onPrimaryContainer,
+        )
+    } else {
+        IconButtonDefaults.iconButtonColors(contentColor = scheme.onSurface)
+    }
+    IconButton(onClick = onClick, enabled = enabled, colors = buttonColors) {
+        CoroomIcon(icon, contentDescription = description, tint = LocalContentColor.current)
     }
 }
 
 /** Botones de la barra lateral: micrófono, vídeo, teclado, modo táctil, chat, conexión y salir. */
 private const val RAIL_BUTTONS = 7
 
-/** Lado de un botón de la barra lateral (su zona de toque). */
-private val RAIL_BUTTON = 44.dp
+/** La zona de toque mínima de Material: la de cada botón de la barra y la de la píldora. */
+private val TOUCH_TARGET = 48.dp
+
+/** El alto con que se ven las píldoras sobre el vídeo. */
+private val PILL_HEIGHT = 36.dp
+
+private val RAIL_WIDTH = 64.dp
 
 /** Margen de arriba y abajo de la barra lateral. */
 private val RAIL_PADDING = 8.dp
 
-/** Lo apagado de la barra mientras el vídeo está apagado (el teclado, el modo táctil). */
-private const val PAUSED_ALPHA = 0.35f
-
 /**
- * Lo que se ve en lugar del vídeo cuando el invitado lo apagó: qué sigue y qué no, y el botón
- * para encenderlo. Tapa la imagen y se queda con los toques (no llegan al juego).
+ * Lo que se ve en lugar del vídeo cuando el invitado lo apagó: qué sigue y qué no, quién está en
+ * la sala (sus butacas) y el botón para encenderlo. Tapa la imagen y se queda con los toques (no
+ * llegan al juego).
  */
 @Composable
-private fun VideoOffView(hostName: String?, onTurnOn: () -> Unit) {
+private fun VideoOffView(state: RoomUiState, onTurnOn: () -> Unit) {
     val colors = MaterialTheme.colorScheme
+    val backdrop = CoroomTheme.colors.videoBackdrop
+    val hostName = state.hostName
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black)
+            .background(backdrop)
             .pointerInput(Unit) { detectTapGestures { } }
             .semantics { liveRegion = LiveRegionMode.Polite },
         contentAlignment = Alignment.Center,
     ) {
         Column(
-            modifier = Modifier.widthIn(max = 420.dp).padding(horizontal = 24.dp),
+            modifier = Modifier
+                .widthIn(max = 440.dp)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 24.dp, vertical = 16.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Box(
-                modifier = Modifier
-                    .size(56.dp)
-                    .clip(RoundedCornerShape(16.dp))
-                    .background(Color.White.copy(alpha = 0.08f)),
-                contentAlignment = Alignment.Center,
-            ) {
-                CoroomIcon(R.drawable.ic_monitor_off, contentDescription = null, tint = colors.onSurfaceVariant, size = 28.dp)
+            if (state.members.isNotEmpty()) {
+                SeatRow(occupants = roomSeats(state), modifier = Modifier.padding(bottom = 8.dp), lampRing = backdrop)
+            } else {
+                Box(
+                    modifier = Modifier.size(56.dp).background(colors.surfaceContainerHigh, MaterialTheme.shapes.large),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    CoroomIcon(R.drawable.ic_monitor_off, contentDescription = null, tint = colors.onSurfaceVariant, size = 28.dp)
+                }
             }
             Text(
                 text = stringResource(R.string.room_video_off_title),
-                style = CoroomText.cardTitle.copy(fontWeight = FontWeight.SemiBold),
+                style = CoroomText.cardTitle,
                 color = colors.onSurface,
             )
             Text(
@@ -474,11 +502,10 @@ private fun VideoOffView(hostName: String?, onTurnOn: () -> Unit) {
                 color = colors.onSurfaceVariant,
                 textAlign = TextAlign.Center,
             )
-            PillButton(
+            PrimaryButton(
                 text = stringResource(R.string.room_video_on),
                 onClick = onTurnOn,
-                modifier = Modifier.padding(top = 6.dp),
-                height = 44.dp,
+                modifier = Modifier.padding(top = 8.dp),
                 icon = R.drawable.ic_monitor,
             )
         }
@@ -515,9 +542,9 @@ private fun NoticeToast(state: RoomUiState, onClear: (Int) -> Unit, modifier: Mo
     ) {
         Column(
             modifier = Modifier
-                .clip(RoundedCornerShape(17.dp))
+                .clip(MaterialTheme.shapes.large)
                 .background(CoroomTheme.colors.overlay)
-                .padding(horizontal = 14.dp, vertical = 8.dp)
+                .padding(horizontal = 16.dp, vertical = 8.dp)
                 .semantics { liveRegion = LiveRegionMode.Polite },
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
@@ -541,7 +568,7 @@ private fun NoticeToast(state: RoomUiState, onClear: (Int) -> Unit, modifier: Mo
     }
 }
 
-/** El panel lateral de los bocetos: fondo de superficie, esquinas izquierdas redondeadas. */
+/** El panel lateral de la sala: una superficie de contenedor con las esquinas del lado del vídeo redondeadas. */
 @Composable
 fun SidePanel(
     title: String,
@@ -555,33 +582,26 @@ fun SidePanel(
         modifier = Modifier
             .fillMaxHeight()
             .width(width)
-            .clip(RoundedCornerShape(topStart = 24.dp, bottomStart = 24.dp))
+            .clip(RoundedCornerShape(topStart = 28.dp, bottomStart = 28.dp))
             .background(colors.surfaceContainer)
             // Los toques dentro del panel no lo atraviesan hasta el fondo (que lo cerraría).
             .pointerInput(Unit) { detectTapGestures { } }
             .windowInsetsPadding(WindowInsets.displayCutout)
-            .padding(start = 20.dp, end = 18.dp, top = 14.dp, bottom = 14.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+            .padding(start = 20.dp, end = 12.dp, top = 8.dp, bottom = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
                 text = title,
-                style = CoroomText.cardTitle.copy(fontWeight = FontWeight.SemiBold),
+                style = CoroomText.cardTitle,
                 color = colors.onSurface,
                 modifier = Modifier.weight(1f),
             )
-            Box(
-                modifier = Modifier
-                    .size(44.dp)
-                    .clip(CircleShape)
-                    .clickable(role = Role.Button, onClick = onClose)
-                    .semantics { contentDescription = closeDescription },
-                contentAlignment = Alignment.Center,
-            ) {
-                CoroomIcon(R.drawable.ic_x, contentDescription = null)
+            IconButton(onClick = onClose) {
+                CoroomIcon(R.drawable.ic_x, contentDescription = closeDescription)
             }
         }
-        Box(modifier = Modifier.weight(1f), content = content)
+        Box(modifier = Modifier.weight(1f).padding(end = 8.dp), content = content)
     }
 }
 
@@ -591,7 +611,7 @@ private const val NOTICE_MS = 4_000L
 @Composable
 private fun RoomOverlayPreview() {
     CoroomTheme(darkTheme = true, dynamicColor = false) {
-        Box(Modifier.fillMaxSize().background(Color(0xFF3D8B4A))) {
+        Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.tertiaryContainer)) {
             RoomOverlay(PreviewRoom.state, PreviewRoom.actions)
         }
     }
@@ -601,7 +621,7 @@ private fun RoomOverlayPreview() {
 @Composable
 private fun RoomOverlayHiddenPreview() {
     CoroomTheme(darkTheme = true, dynamicColor = false) {
-        Box(Modifier.fillMaxSize().background(Color(0xFF3D8B4A))) {
+        Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.tertiaryContainer)) {
             RoomOverlay(PreviewRoom.state.copy(overlayShown = false), PreviewRoom.actions)
         }
     }
@@ -611,7 +631,7 @@ private fun RoomOverlayHiddenPreview() {
 @Composable
 private fun RoomVideoOffPreview() {
     CoroomTheme(darkTheme = true, dynamicColor = false) {
-        Box(Modifier.fillMaxSize().background(Color(0xFF3D8B4A))) {
+        Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.tertiaryContainer)) {
             RoomOverlay(PreviewRoom.state.copy(videoOff = true), PreviewRoom.actions)
         }
     }
@@ -621,7 +641,7 @@ private fun RoomVideoOffPreview() {
 @Composable
 private fun RoomConnectionPreview() {
     CoroomTheme(darkTheme = true, dynamicColor = false) {
-        Box(Modifier.fillMaxSize().background(Color(0xFF3D8B4A))) {
+        Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.tertiaryContainer)) {
             RoomOverlay(PreviewRoom.state.copy(panel = Panel.Connection), PreviewRoom.actions)
         }
     }
@@ -631,7 +651,7 @@ private fun RoomConnectionPreview() {
 @Composable
 private fun RoomChatPreview() {
     CoroomTheme(darkTheme = true, dynamicColor = false) {
-        Box(Modifier.fillMaxSize().background(Color(0xFF3D8B4A))) {
+        Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.tertiaryContainer)) {
             RoomOverlay(PreviewRoom.state.copy(panel = Panel.Chat, unreadChat = false), PreviewRoom.actions)
         }
     }
