@@ -6,13 +6,15 @@ home-update-available = Hay una versión nueva de coroom: { $version } (tienes l
 home-update-see = Ver la versión nueva
 home-relay-disabled = Este servidor no tiene relay: solo funcionará la conexión directa entre equipos.
 home-relay-usage = Has usado el { $percent } % del relay este mes ({ $used } de { $quota }). Al llegar al 100 % solo funcionará la conexión directa.
-home-offline-reason = Sin conexión con el servidor: coroom vuelve a intentarlo solo.
+home-offline-reason = Sin conexión con el servidor: no puedes compartir ni entrar en salas hasta que vuelva. coroom lo reintenta solo.
 home-hosting-reason = Tienes tu sala abierta: ciérrala para entrar en otra.
+home-back-to-room = Volver a la sala
 
 ## Compartir y unirse
 
 home-share-title = Compartir mi pantalla
 home-share-text = Abre una sala e invita a quien quieras.
+home-share-open-text = Tu sala sigue abierta mientras miras otras páginas.
 home-share = Compartir
 home-see-room = Ver mi sala
 home-join-title = Unirse con código
@@ -20,6 +22,15 @@ home-join-text = Con el código que te pasó el anfitrión.
 home-code-length = El código tiene { $length } caracteres
 home-code-invalid = Ese código no es de una sala (sin «0», «1», «I» ni «O»)
 home-enter = Entrar
+
+## Tu sala (el pie del bloque de compartir)
+
+home-room-closed = Tu sala está cerrada
+home-room-opening = Abriendo tu sala…
+home-room-open-empty = Tu sala está abierta, todavía sin invitados
+home-room-open-one = Tu sala está abierta con 1 invitado
+home-room-open-many = Tu sala está abierta con { $count } invitados
+home-room-live = en vivo
 
 ## Bandeja y «En línea ahora»
 
@@ -39,13 +50,13 @@ home-load-failed-detail = No se pudo cargar la lista de amigos: { $err }
 ## Invitaciones
 
 home-invite-title = { $name } te invita a su sala
-home-invite-detail = Sala { $code } · caduca en
+home-invite-expires = Caduca en
 home-ignore = Ignorar
 
 ## Salas propias en otros dispositivos
 
 home-own-room-title = Tu sala en { $device }
-home-own-room-detail = Sala { $code } · abierta con tu cuenta en otro dispositivo
+home-own-room-detail = Abierta con tu cuenta en otro dispositivo
 
 ## Amigos
 
@@ -89,7 +100,6 @@ home-withdraw = Retirar
 
 ## Página de Amigos
 
-friends-group = { $group } · { $count }
 friends-group-hosting = En sala
 friends-group-playing = Jugando
 friends-group-online = Conectados

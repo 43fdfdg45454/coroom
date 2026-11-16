@@ -5,9 +5,11 @@
 //! este dispositivo) o cuenta nueva con un código de invitación. Los errores del servidor se leen
 //! en línea, con su causa.
 //!
-//! Arriba, la misma barra que el resto de la aplicación (sin riel): «←» para volver un paso
-//! (también con Alt+← o el botón «atrás» del ratón, [`back`]) y el diagnóstico. La acción
-//! principal de cada paso va abajo a la derecha.
+//! Es lo primero que se ve de coroom: la marca, centrada, y debajo un solo formulario sobrio por
+//! paso, en una sola tarjeta (el informe del servidor son filas de esa misma tarjeta, no otra
+//! dentro). Arriba, una franja sin fondo (aquí no hay riel): «←» para volver un paso (también
+//! con Alt+← o el botón «atrás» del ratón, [`back`]) y el diagnóstico. La acción principal de cada
+//! paso va abajo a la derecha.
 
 use std::time::Instant;
 
@@ -15,7 +17,7 @@ use coroom_transport::api::ServerProbe;
 use coroom_transport::proto::PROTOCOL_VERSION;
 use coroom_ui::Element;
 use coroom_ui::icon::{Icon, icon_with};
-use coroom_ui::style::{ButtonClass, SvgClass};
+use coroom_ui::style::{ButtonClass, ContainerClass, SvgClass, TextClass};
 use coroom_ui::theme::Tone;
 use coroom_ui::tokens::{size, space};
 use coroom_ui::widget::{self as ui, Kind};
@@ -25,6 +27,12 @@ use iced_widget::{Column, button, column, container, row, scrollable};
 
 use crate::ui::app::{App, Effect, Event, Message, Page, Screen, host_of};
 use crate::ui::settings::{ServerEntry, Settings};
+
+/// Lado de la marca sobre el formulario.
+const BRAND_MARK: f32 = 44.0;
+
+/// Margen interior de las tarjetas de los formularios.
+const FORM_PADDING: f32 = space::L;
 
 /// Paso.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -488,11 +496,15 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
 pub fn view(app: &App) -> Element<'_, Message> {
     let state = &app.login;
     let brand = column![
-        icon_with(Icon::RadioTower, 40.0, SvgClass::Accent),
-        ui::title("coroom"),
-        ui::secondary(t!("pantalla-login-juego-remoto-con-amigos-cifrado-de"))
+        icon_with(Icon::RadioTower, BRAND_MARK, SvgClass::Accent),
+        column![
+            ui::title("coroom"),
+            ui::secondary(t!("pantalla-login-juego-remoto-con-amigos-cifrado-de"))
+        ]
+        .spacing(space::XXS)
+        .align_x(Alignment::Center)
     ]
-    .spacing(space::XS)
+    .spacing(space::S)
     .align_x(Alignment::Center);
     let body: Element<'_, Message> = match state.step {
         Step::Servers => servers(app),
@@ -517,17 +529,16 @@ pub fn view(app: &App) -> Element<'_, Message> {
     content = content.push(container(body).max_width(column_width).width(Length::Fill));
     let body = scrollable(
         container(content)
-            .padding(Padding::from([space::XL * 1.5, space::L]))
+            .padding(Padding {
+                top: space::M,
+                right: space::L,
+                bottom: space::XL * 1.5,
+                left: space::L,
+            })
             .center_x(Length::Fill),
     )
     .height(Length::Fill);
-    column![
-        iced_widget::rule::horizontal(1),
-        header(app),
-        iced_widget::rule::horizontal(1),
-        body
-    ]
-    .into()
+    column![iced_widget::rule::horizontal(1), header(app), body].into()
 }
 
 /// Si hay un paso al que volver: a la cuenta abierta (desde «Cambiar de servidor») o a la lista
@@ -551,7 +562,8 @@ pub fn back(app: &mut App) -> Vec<Effect> {
     }
 }
 
-/// La barra de arriba: «←» (si hay adónde volver), la marca y el diagnóstico.
+/// La franja de arriba, sin fondo propio: «←» (si hay adónde volver) y el diagnóstico. La marca
+/// está en la página, una sola vez.
 fn header(app: &App) -> Element<'_, Message> {
     let back = can_go_back(app).then(|| {
         ui::icon_button(
@@ -563,8 +575,6 @@ fn header(app: &App) -> Element<'_, Message> {
     container(
         row![
             ui::slot(back),
-            icon_with(Icon::RadioTower, 20.0, SvgClass::Accent),
-            ui::heading("coroom"),
             ui::fill(),
             ui::with_tooltip(
                 ui::button_with(
@@ -584,7 +594,6 @@ fn header(app: &App) -> Element<'_, Message> {
     )
     .padding(Padding::from([0.0, space::M]))
     .center_y(Length::Fixed(crate::ui::app::HEADERBAR_HEIGHT))
-    .class(coroom_ui::style::ContainerClass::Headerbar)
     .into()
 }
 
@@ -602,6 +611,15 @@ fn on(msg: Msg) -> Message {
     Message::Login(msg)
 }
 
+/// La tarjeta de un formulario: un solo plano, con el margen de [`FORM_PADDING`].
+fn form_card<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    container(content)
+        .padding(FORM_PADDING)
+        .width(Length::Fill)
+        .class(ContainerClass::Card)
+        .into()
+}
+
 fn servers(app: &App) -> Element<'_, Message> {
     let state = &app.login;
     if state.restoring {
@@ -614,7 +632,7 @@ fn servers(app: &App) -> Element<'_, Message> {
         if let Some(silent) = silent_for(app) {
             waiting = waiting.push(silent);
         }
-        return ui::card(waiting);
+        return form_card(waiting);
     }
     let rows = app
         .settings
@@ -670,7 +688,11 @@ fn servers(app: &App) -> Element<'_, Message> {
         )
     ];
     column![
-        ui::section(t!("pantalla-login-elige-un-servidor"), None, rows),
+        column![
+            ui::heading(t!("pantalla-login-elige-un-servidor")),
+            ui::boxed_list(rows)
+        ]
+        .spacing(space::S),
         actions
     ]
     .spacing(space::M)
@@ -710,9 +732,12 @@ fn add_server(app: &App) -> Element<'_, Message> {
     let state = &app.login;
     let checking = state.probe.is_checking();
     let mut form = column![
-        ui::heading(t!("pantalla-login-anadir-servidor")),
-        ui::secondary(t!("pantalla-login-el-servidor-de-coroom-de-tu"))
-            .wrapping(Wrapping::WordOrGlyph),
+        column![
+            ui::heading(t!("pantalla-login-anadir-servidor")),
+            ui::secondary(t!("pantalla-login-el-servidor-de-coroom-de-tu"))
+                .wrapping(Wrapping::WordOrGlyph),
+        ]
+        .spacing(space::XXS),
         Element::from(
             ui::field(t!("pantalla-login-direccion-del-servidor"), &state.url)
                 .placeholder("https://coroom.example.com")
@@ -722,7 +747,11 @@ fn add_server(app: &App) -> Element<'_, Message> {
                 .id("server-url")
         ),
     ]
-    .spacing(space::S);
+    .spacing(space::M);
+    // Versiones distintas: quién tiene que actualizarse, encima de la tarjeta.
+    let mut gap = None;
+    // El informe del servidor: filas de la misma tarjeta, tras una línea.
+    let mut report: Vec<Element<'_, Message>> = Vec::new();
     match &state.probe {
         Probe::Idle => {}
         Probe::Checking { url, .. } => {
@@ -732,70 +761,133 @@ fn add_server(app: &App) -> Element<'_, Message> {
                 phase(app),
             ));
         }
+        // El fallo, junto al campo y en el tono del error, con «Reintentar» al lado.
         Probe::Failed(err) => {
-            form = form.push(ui::banner(
-                Tone::Error,
-                t!(
-                    "pantalla-login-no-se-pudo-conectar-err-comprueba",
-                    err = err
-                ),
-                Some((t!("pantalla-login-reintentar"), on(Msg::Check))),
-            ));
+            form = form.push(
+                row![
+                    icon_with(Icon::CircleAlert, 16.0, SvgClass::Tone(Tone::Error)),
+                    ui::secondary(t!(
+                        "pantalla-login-no-se-pudo-conectar-err-comprueba",
+                        err = err
+                    ))
+                    .class(TextClass::Tone(Tone::Error))
+                    .wrapping(Wrapping::WordOrGlyph)
+                    .width(Length::Fill),
+                    ui::button_with(
+                        Kind::Normal,
+                        t!("pantalla-login-reintentar"),
+                        Some(Icon::Refresh),
+                        Some(on(Msg::Check)),
+                    )
+                ]
+                .spacing(space::XS)
+                .align_y(Alignment::Center),
+            );
         }
         Probe::Done { url, probe } => {
-            // Versiones distintas: quién tiene que actualizarse, encima del informe.
-            if let Some(gap) = crate::update::protocol_gap(probe.protocol) {
-                form = form.push(crate::ui::screens::updates::protocol_banner(
-                    app,
-                    &host_of(url),
-                    gap,
-                ));
-            }
-            form = form.push(probe_report(app, probe));
+            gap = crate::update::protocol_gap(probe.protocol)
+                .map(|gap| crate::ui::screens::updates::protocol_banner(app, &host_of(url), gap));
+            report = probe_report(app, probe);
         }
     }
     let ready = matches!(&state.probe, Probe::Done { probe, .. }
         if probe.untrusted.is_none() || state.trusted);
-    let mut actions = row![ui::fill()]
-        .spacing(space::XS)
-        .align_y(Alignment::Center);
-    actions = if ready {
-        actions.push(ui::primary(
-            t!("pantalla-login-continuar"),
-            Some(on(Msg::Continue)),
-        ))
+    let action = if ready {
+        ui::primary(t!("pantalla-login-continuar"), Some(on(Msg::Continue)))
     } else {
-        actions.push(ui::button_with(
+        ui::button_with(
             Kind::Primary,
             t!("pantalla-login-comprobar"),
             Some(Icon::Refresh),
             (!checking).then(|| on(Msg::Check)),
-        ))
+        )
     };
-    ui::card(form.push(ui::gap(space::XXS)).push(actions))
+    let mut card = Column::new().push(container(form).padding(FORM_PADDING).width(Length::Fill));
+    for line in report {
+        card = card.push(iced_widget::rule::horizontal(1)).push(line);
+    }
+    card = card.push(iced_widget::rule::horizontal(1)).push(
+        container(row![ui::fill(), action].align_y(Alignment::Center))
+            .padding(Padding::from([space::M, FORM_PADDING]))
+            .width(Length::Fill),
+    );
+    column![
+        ui::slot(gap),
+        container(card)
+            .width(Length::Fill)
+            .class(ContainerClass::Card)
+    ]
+    .spacing(space::S)
+    .into()
 }
 
-fn probe_report<'a>(app: &'a App, probe: &'a ServerProbe) -> Element<'a, Message> {
+/// Una fila del informe del servidor: icono, título, explicación y lo que diga su estado al
+/// final, con el margen del formulario.
+fn report_row<'a>(
+    glyph: Element<'a, Message>,
+    title: impl iced_core::text::IntoFragment<'a>,
+    detail: &'a str,
+    trailing: Option<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    row![
+        glyph,
+        column![
+            ui::strong(title).wrapping(Wrapping::WordOrGlyph),
+            ui::secondary(detail).wrapping(Wrapping::WordOrGlyph)
+        ]
+        .spacing(2)
+        .width(Length::Fill),
+        ui::slot(trailing),
+    ]
+    .spacing(space::S)
+    .align_y(Alignment::Center)
+    .padding(Padding::from([space::S, FORM_PADDING]))
+    .into()
+}
+
+/// La huella en líneas de ocho grupos de cuatro, para compararla de un vistazo con la que
+/// imprime el servidor.
+pub fn fingerprint_lines(fingerprint: &str) -> Vec<String> {
+    grouped_fingerprint(fingerprint)
+        .split(' ')
+        .collect::<Vec<_>>()
+        .chunks(8)
+        .map(|groups| groups.join(" "))
+        .collect()
+}
+
+/// Lo que respondió el servidor, en filas: versión, red y certificado. Cada una con su tono: lo
+/// que va bien, en verde; lo que conviene saber, en ámbar; lo incompatible, en rojo.
+fn probe_report<'a>(app: &'a App, probe: &'a ServerProbe) -> Vec<Element<'a, Message>> {
     let state = &app.login;
     let compatible = probe.protocol == PROTOCOL_VERSION;
-    let version = ui::list_row(
-        Some(icon_with(Icon::Server, 20.0, SvgClass::Secondary)),
-        format!(
-            "{} {}",
-            if probe.name.is_empty() {
-                "Servidor"
-            } else {
-                probe.name.as_str()
-            },
-            probe.version
-        ),
-        Some(t!("pantalla-login-protocolo", protocol = probe.protocol)),
-        vec![if compatible {
+    let version = row![
+        icon_with(Icon::Server, 20.0, SvgClass::Secondary),
+        column![
+            ui::strong(format!(
+                "{} {}",
+                if probe.name.is_empty() {
+                    "Servidor"
+                } else {
+                    probe.name.as_str()
+                },
+                probe.version
+            ))
+            .wrapping(Wrapping::WordOrGlyph),
+            ui::secondary(t!("pantalla-login-protocolo", protocol = probe.protocol))
+        ]
+        .spacing(2)
+        .width(Length::Fill),
+        if compatible {
             ui::status_badge(Tone::Success, t!("pantalla-login-compatible"))
         } else {
             ui::status_badge(Tone::Error, t!("pantalla-login-otra-version"))
-        }],
-    );
+        },
+    ]
+    .spacing(space::S)
+    .align_y(Alignment::Center)
+    .padding(Padding::from([space::S, FORM_PADDING]))
+    .into();
     let (udp_tone, udp_title, udp_text) = match (probe.http3, probe.udp_reachable) {
         (true, Some(false)) => (
             Tone::Warning,
@@ -813,32 +905,34 @@ fn probe_report<'a>(app: &'a App, probe: &'a ServerProbe) -> Element<'a, Message
             t!("pantalla-login-el-udp-no-llega-desde-esta"),
         ),
     };
-    let network = ui::list_row(
-        Some(icon_with(
+    let network = report_row(
+        icon_with(
             if probe.http3 {
                 Icon::Wifi
             } else {
                 Icon::WifiOff
             },
             20.0,
-            SvgClass::Secondary,
-        )),
+            SvgClass::Tone(udp_tone),
+        ),
         udp_title,
-        Some(udp_text.to_owned()),
-        vec![ui::dot(udp_tone)],
+        udp_text,
+        None,
     );
     let certificate: Element<'a, Message> = match &probe.untrusted {
-        None => ui::list_row(
-            Some(icon_with(
-                Icon::ShieldCheck,
-                20.0,
-                SvgClass::Tone(Tone::Success),
-            )),
+        None => report_row(
+            icon_with(Icon::ShieldCheck, 20.0, SvgClass::Tone(Tone::Success)),
             t!("pantalla-login-certificado-valido"),
-            Some(t!("pantalla-login-lo-firma-una-autoridad-en-la").to_owned()),
-            vec![],
+            t!("pantalla-login-lo-firma-una-autoridad-en-la"),
+            None,
         ),
         Some(_) => {
+            // Sin confiar todavía, en ámbar y con el botón; ya confiado, en verde y dicho.
+            let (glyph, tone) = if state.trusted {
+                (Icon::ShieldCheck, Tone::Success)
+            } else {
+                (Icon::ShieldAlert, Tone::Warning)
+            };
             let trust: Element<'a, Message> = if state.trusted {
                 ui::status_badge(Tone::Success, t!("pantalla-login-confiado"))
             } else {
@@ -850,10 +944,13 @@ fn probe_report<'a>(app: &'a App, probe: &'a ServerProbe) -> Element<'a, Message
                 )
                 .into()
             };
-            container(
+            let lines = fingerprint_lines(&probe.fingerprint)
+                .into_iter()
+                .map(|line| ui::mono(line, 13.0).wrapping(Wrapping::WordOrGlyph).into());
+            row![
+                icon_with(glyph, 20.0, SvgClass::Tone(tone)),
                 column![
                     row![
-                        icon_with(Icon::ShieldAlert, 20.0, SvgClass::Tone(Tone::Warning)),
                         column![
                             ui::strong(t!("pantalla-login-certificado-autofirmado")),
                             ui::secondary(t!("pantalla-login-compara-esta-huella-con-la-que"))
@@ -865,16 +962,21 @@ fn probe_report<'a>(app: &'a App, probe: &'a ServerProbe) -> Element<'a, Message
                     ]
                     .spacing(space::S)
                     .align_y(Alignment::Center),
-                    ui::mono(grouped_fingerprint(&probe.fingerprint), 13.0)
-                        .wrapping(Wrapping::WordOrGlyph)
+                    container(Column::with_children(lines).spacing(space::XXS))
+                        .padding(Padding::from([space::XS, space::S]))
+                        .width(Length::Fill)
+                        .class(ContainerClass::Code),
                 ]
-                .spacing(space::XS),
-            )
-            .padding(Padding::from([10.0, 16.0]))
+                .spacing(space::XS)
+                .width(Length::Fill),
+            ]
+            .spacing(space::S)
+            .align_y(Alignment::Start)
+            .padding(Padding::from([space::S, FORM_PADDING]))
             .into()
         }
     };
-    ui::boxed_list(vec![version, network, certificate])
+    vec![version, network, certificate]
 }
 
 fn sign_in(app: &App) -> Element<'_, Message> {
@@ -885,17 +987,20 @@ fn sign_in(app: &App) -> Element<'_, Message> {
         .map(|server| host_of(&server.url))
         .unwrap_or_default();
     let submit = (!state.busy).then(|| on(Msg::Submit));
-    let mut form = Column::new().spacing(space::S);
-    form = form.push(ui::heading(if state.invitation {
+    let mut heading = column![ui::heading(if state.invitation {
         t!("pantalla-login-crear-cuenta-en-host", host = host)
     } else {
         t!("pantalla-login-iniciar-sesion-en-host", host = host)
-    }));
+    })]
+    .spacing(space::XXS);
     if state.invitation {
-        form = form.push(
+        heading = heading.push(
             ui::secondary(t!("pantalla-login-con-el-codigo-de-invitacion-de"))
                 .wrapping(Wrapping::WordOrGlyph),
         );
+    }
+    let mut form = Column::new().spacing(space::M).push(heading);
+    if state.invitation {
         form = form.push(Element::from(
             ui::field(t!("pantalla-login-codigo-de-invitacion"), &state.code)
                 .placeholder(t!("pantalla-login-abcd-efgh-jklm"))
@@ -985,8 +1090,25 @@ fn sign_in(app: &App) -> Element<'_, Message> {
         )
         .into()
     };
+    // El otro camino (crear la cuenta con un código o entrar con la que ya se tiene), a la
+    // izquierda de la acción principal: un enlace, no un segundo botón.
+    let switch = ui::button_with(
+        Kind::Link,
+        if state.invitation {
+            t!("pantalla-login-ya-tengo-cuenta")
+        } else {
+            t!("pantalla-login-tengo-un-codigo-de-invitacion")
+        },
+        Some(if state.invitation {
+            Icon::LogIn
+        } else {
+            Icon::Key
+        }),
+        Some(on(Msg::ToggleInvitation)),
+    )
+    .padding(Padding::from([8.0, 0.0]));
     let mut actions = column![
-        row![ui::fill(), main]
+        row![switch, ui::fill(), main]
             .spacing(space::XS)
             .align_y(Alignment::Center)
     ]
@@ -994,30 +1116,7 @@ fn sign_in(app: &App) -> Element<'_, Message> {
     if let Some(silent) = silent_for(app) {
         actions = actions.push(row![ui::fill(), silent]);
     }
-    let switch = row![
-        ui::fill(),
-        ui::button_with(
-            Kind::Link,
-            if state.invitation {
-                t!("pantalla-login-ya-tengo-cuenta")
-            } else {
-                t!("pantalla-login-tengo-un-codigo-de-invitacion")
-            },
-            Some(if state.invitation {
-                Icon::LogIn
-            } else {
-                Icon::Key
-            }),
-            Some(on(Msg::ToggleInvitation)),
-        ),
-        ui::fill()
-    ];
-    column![
-        ui::card(form.push(ui::gap(space::XXS)).push(actions)),
-        switch
-    ]
-    .spacing(space::S)
-    .into()
+    form_card(form.push(actions))
 }
 
 #[cfg(test)]
@@ -1095,6 +1194,10 @@ mod tests {
             "huella en grupos de cuatro"
         );
         assert_eq!(grouped_fingerprint("ab:cd:ef"), "ABCD EF");
+        // Una huella SHA-256 (64 cifras) se lee en dos líneas de ocho grupos.
+        let lines = fingerprint_lines(&"9c4e".repeat(16));
+        assert_eq!(lines.len(), 2);
+        assert!(lines.iter().all(|line| line == &["9C4E"; 8].join(" ")));
     }
 
     #[test]

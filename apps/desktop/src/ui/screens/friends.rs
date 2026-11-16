@@ -1,10 +1,12 @@
 //! Amigos: la página del riel con la lista completa **por estado** (en sala, jugando,
 //! conectados y, plegados, los desconectados), las solicitudes pendientes y «Agregar amigo».
 //!
-//! Un amigo que cambia de estado cambia de grupo. Cada fila lleva su insignia y su botón en
-//! ranuras del ancho de la variante más ancha: el nombre no se reacomoda al cambiar el estado.
-//! Invitar y pedir entrar en la sala de un amigo son de Inicio ([`super::home::Msg`]), que
-//! también muestra las solicitudes recibidas en su bandeja.
+//! Un amigo que cambia de estado cambia de grupo. Cada grupo es una lista agrupada con su título
+//! (el estado, en palabras) y cuántos son; cada persona, su butaca con la lámpara (verde,
+//! conectado; gris, desconectado), su nombre y su botón, en una ranura del ancho de la variante
+//! más ancha: el nombre no se reacomoda al cambiar el estado. Invitar y pedir entrar en la sala
+//! de un amigo son de Inicio ([`super::home::Msg`]), que también muestra las solicitudes recibidas
+//! en su bandeja.
 
 use std::time::Instant;
 
@@ -14,7 +16,7 @@ use coroom_ui::Element;
 use coroom_ui::animate::Collapse;
 use coroom_ui::icon::{Icon, icon_with};
 use coroom_ui::motion::{EXIT_EASING, Token};
-use coroom_ui::style::SvgClass;
+use coroom_ui::style::{Surface, SvgClass};
 use coroom_ui::theme::Tone;
 use coroom_ui::tokens::{size, space};
 use coroom_ui::widget::{self as ui, Kind};
@@ -25,6 +27,9 @@ use iced_widget::{Column, column, container, row};
 use crate::ui::app::{App, Dialog, Effect, Load, Message};
 use crate::ui::avatars;
 use crate::ui::screens::home::{self, Msg as HomeMsg};
+
+/// Aire encima de cada grupo de la página (más que debajo de su título).
+const GROUP_GAP: f32 = space::L;
 
 /// Estado.
 #[derive(Debug, Clone, Default)]
@@ -257,14 +262,34 @@ pub(crate) fn updated(app: &App) -> Option<String> {
 /// Dibuja la página.
 pub fn view<'a>(app: &'a App) -> Element<'a, Message> {
     let state = &app.friends_page;
-    let count: Element<'a, Message> =
-        ui::caption(app.friends.loaded().map(summary).unwrap_or_default()).into();
-    let count = match updated(app) {
-        Some(updated) => ui::with_tooltip(count, updated),
-        None => count,
-    };
+    // Cuántos hay conectados, con su lámpara; al pasar el ratón, cuándo se actualizó. Sin
+    // conexión con el servidor la lámpara se apaga y la fecha se lee al lado: es lo último que
+    // se supo.
+    let stale = home::server_down(app);
+    let count: Option<Element<'a, Message>> = app.friends.loaded().map(|friends| {
+        let online = friends.friends.iter().any(|friend| friend.online);
+        let text = match updated(app).filter(|_| stale) {
+            Some(updated) => format!("{} · {updated}", summary(friends)),
+            None => summary(friends),
+        };
+        let line: Element<'a, Message> = row![
+            ui::dot(if online && !stale {
+                Tone::Success
+            } else {
+                Tone::Neutral
+            }),
+            ui::secondary(text)
+        ]
+        .spacing(space::XS)
+        .align_y(Alignment::Center)
+        .into();
+        match updated(app).filter(|_| !stale) {
+            Some(updated) => ui::with_tooltip(line, updated),
+            None => line,
+        }
+    });
     let header = row![
-        container(count).width(Length::Fill),
+        container(ui::slot(count)).width(Length::Fill),
         ui::button_with(
             if state.adding {
                 Kind::Normal
@@ -302,22 +327,9 @@ pub fn view<'a>(app: &'a App) -> Element<'a, Message> {
             Some((t!("home-retry"), on(Msg::Reload))),
         )),
         Load::Loaded(friends) => {
-            pending = requests(app, friends).map(|requests| below(requests, space::L));
+            pending = requests(app, friends).map(|requests| below(requests, GROUP_GAP));
             if friends.friends.is_empty() {
-                ui::card(ui::empty_state(
-                    Icon::Users,
-                    t!("home-empty-title"),
-                    t!("home-empty-text"),
-                    (!state.adding).then(|| {
-                        ui::button_with(
-                            Kind::Normal,
-                            t!("home-add-friend"),
-                            Some(Icon::UserPlus),
-                            Some(on(Msg::ToggleAdd)),
-                        )
-                        .into()
-                    }),
-                ))
+                nobody_yet(app)
             } else {
                 groups(app, friends)
             }
@@ -327,9 +339,37 @@ pub fn view<'a>(app: &'a App) -> Element<'a, Message> {
         header,
         ui::slot(add),
         ui::slot(pending),
-        below(body, space::L)
+        below(body, GROUP_GAP)
     ];
     ui::page("friends", page)
+}
+
+/// Sin amigos todavía: una fila de butacas libres, qué hacer y el botón que lo hace.
+fn nobody_yet(app: &App) -> Element<'_, Message> {
+    use coroom_ui::avatar::{SeatNames, SeatRow, seat_row};
+    let mut content = column![
+        seat_row(&app.theme, &[], SeatRow::default().names(SeatNames::Hidden)),
+        column![
+            ui::strong(t!("home-empty-title")),
+            ui::secondary(t!("home-empty-text"))
+                .align_x(iced_core::alignment::Horizontal::Center)
+                .wrapping(Wrapping::WordOrGlyph)
+        ]
+        .spacing(space::XXS)
+        .align_x(Alignment::Center)
+        .max_width(420),
+    ]
+    .spacing(space::M)
+    .align_x(Alignment::Center);
+    if !app.friends_page.adding {
+        content = content.push(ui::button_with(
+            Kind::Normal,
+            t!("home-add-friend"),
+            Some(Icon::UserPlus),
+            Some(on(Msg::ToggleAdd)),
+        ));
+    }
+    ui::card(container(content).padding(space::L).center_x(Length::Fill))
 }
 
 /// Los grupos por estado; cada uno está siempre entre los hijos (vacío, un hueco), así que un
@@ -343,7 +383,7 @@ fn groups<'a>(app: &'a App, friends: &'a Friends) -> Element<'a, Message> {
             out = out.push(ui::slot((!members.is_empty()).then(|| {
                 container(offline_group(app, members))
                     .padding(Padding {
-                        top: if first { 0.0 } else { space::L },
+                        top: if first { 0.0 } else { GROUP_GAP },
                         ..Padding::ZERO
                     })
                     .into()
@@ -351,11 +391,11 @@ fn groups<'a>(app: &'a App, friends: &'a Friends) -> Element<'a, Message> {
             continue;
         }
         let shown = (!members.is_empty()).then(|| {
-            let top = if first { 0.0 } else { space::L };
+            let top = if first { 0.0 } else { GROUP_GAP };
             first = false;
             container(
                 column![
-                    group_title(kind, members.len()),
+                    group_title(kind.title(), members.len()),
                     ui::boxed_list(
                         members
                             .into_iter()
@@ -376,15 +416,20 @@ fn groups<'a>(app: &'a App, friends: &'a Friends) -> Element<'a, Message> {
     out.into()
 }
 
-fn group_title<'a>(kind: Group, count: usize) -> Element<'a, Message> {
-    ui::caption(t!("friends-group", group = kind.title(), count = count)).into()
+/// Título de un grupo: el estado en palabras y, en secundario, cuántos son.
+fn group_title<'a>(title: &'a str, count: usize) -> Element<'a, Message> {
+    row![ui::strong(title), ui::secondary(count.to_string())]
+        .spacing(space::XS)
+        .align_y(Alignment::Center)
+        .into()
 }
 
-/// Los desconectados: un botón que los despliega y, debajo, la lista plegable.
+/// Los desconectados: su título, que es un botón que los despliega, y debajo la lista plegable.
 fn offline_group<'a>(app: &'a App, members: Vec<&'a Friend>) -> Element<'a, Message> {
     let open = app.friends_page.show_offline;
     let toggle = coroom_ui::animate::button(
         row![
+            group_title(Group::Offline.title(), members.len()),
             icon_with(
                 if open {
                     Icon::ChevronDown
@@ -394,16 +439,17 @@ fn offline_group<'a>(app: &'a App, members: Vec<&'a Friend>) -> Element<'a, Mess
                 16.0,
                 SvgClass::Secondary
             ),
-            ui::caption(t!(
-                "friends-group",
-                group = Group::Offline.title(),
-                count = members.len()
-            )),
         ]
         .spacing(space::XXS)
         .align_y(Alignment::Center),
     )
-    .padding(Padding::from([2.0, 4.0]))
+    // Sin margen a la izquierda: el título queda alineado con los de los demás grupos.
+    .padding(Padding {
+        top: 2.0,
+        right: space::XXS,
+        bottom: 2.0,
+        left: 0.0,
+    })
     .class(coroom_ui::style::ButtonClass::Flat)
     .on_press(on(Msg::ToggleOffline));
     let list = container(ui::boxed_list(
@@ -413,7 +459,7 @@ fn offline_group<'a>(app: &'a App, members: Vec<&'a Friend>) -> Element<'a, Mess
             .collect(),
     ))
     .padding(Padding {
-        top: space::XS,
+        top: space::XS - 2.0,
         ..Padding::ZERO
     });
     column![
@@ -465,6 +511,23 @@ fn add_friend(app: &App) -> Element<'_, Message> {
     )
 }
 
+/// La butaca de alguien en una fila de lista, con la lámpara de su estado si se sabe.
+fn seat<'a>(
+    app: &App,
+    name: &str,
+    avatar: Option<u64>,
+    lamp: Option<Tone>,
+) -> Element<'a, Message> {
+    coroom_ui::avatar::seat_lamp(
+        &app.theme,
+        name,
+        avatars::of(app, avatar),
+        size::AVATAR,
+        lamp,
+        Surface::Card,
+    )
+}
+
 /// Solicitudes pendientes: las recibidas (aceptar o rechazar) y las enviadas (retirar).
 fn requests<'a>(app: &'a App, friends: &'a Friends) -> Option<Element<'a, Message>> {
     if friends.incoming.is_empty() && friends.outgoing.is_empty() {
@@ -473,11 +536,11 @@ fn requests<'a>(app: &'a App, friends: &'a Friends) -> Option<Element<'a, Messag
     let busy = app.friends_page.busy;
     let incoming = friends.incoming.iter().map(|request| {
         ui::list_row(
-            Some(avatars::view(
+            Some(seat(
                 app,
                 &request.user.display_name,
                 request.user.avatar,
-                size::AVATAR,
+                None,
             )),
             request.user.display_name.as_str(),
             Some(t!(
@@ -500,11 +563,11 @@ fn requests<'a>(app: &'a App, friends: &'a Friends) -> Option<Element<'a, Messag
     });
     let outgoing = friends.outgoing.iter().map(|request| {
         ui::list_row(
-            Some(avatars::view(
+            Some(seat(
                 app,
                 &request.user.display_name,
                 request.user.avatar,
-                size::AVATAR,
+                None,
             )),
             request.user.display_name.as_str(),
             Some(t!("home-pending", username = request.user.username)),
@@ -519,25 +582,15 @@ fn requests<'a>(app: &'a App, friends: &'a Friends) -> Option<Element<'a, Messag
     });
     Some(
         column![
-            ui::caption(t!("home-requests")),
+            group_title(
+                t!("home-requests"),
+                friends.incoming.len() + friends.outgoing.len()
+            ),
             ui::boxed_list(incoming.chain(outgoing).collect())
         ]
         .spacing(space::XS)
         .into(),
     )
-}
-
-/// Las cuatro insignias de estado, para medir la ranura (todas del mismo ancho en la lista).
-fn badge_samples<'a>() -> Vec<Element<'a, Message>> {
-    [
-        (Tone::Neutral, t!("home-offline")),
-        (Tone::Success, t!("home-available")),
-        (Tone::Info, t!("home-hosting")),
-        (Tone::Info, t!("home-playing")),
-    ]
-    .into_iter()
-    .map(|(tone, label)| ui::status_badge(tone, label))
-    .collect()
 }
 
 /// Los botones que puede llevar una fila, para medir la ranura.
@@ -555,8 +608,9 @@ fn action_samples<'a>() -> Vec<Element<'a, Message>> {
     ]
 }
 
-/// Fila de un amigo: avatar, nombre, usuario, estado, «Invitar» (o «Pedir entrar» si tiene una
-/// sala abierta y aquí no hay ninguna; nada si está desconectado) y quitar.
+/// Fila de un amigo: su butaca con la lámpara (verde, conectado; gris, desconectado), nombre,
+/// usuario, «Invitar» (o «Pedir entrar» si tiene una sala abierta y aquí no hay ninguna; nada si
+/// está desconectado) y quitar. Su estado, en palabras, es el título del grupo.
 fn friend_row<'a>(app: &'a App, friend: &'a Friend) -> Element<'a, Message> {
     let invite_button = |on_press: Option<Message>| {
         ui::button_with(Kind::Normal, t!("home-invite"), None, on_press)
@@ -592,19 +646,17 @@ fn friend_row<'a>(app: &'a App, friend: &'a Friend) -> Element<'a, Message> {
     } else {
         Some(invite_button(Some(on_home(HomeMsg::Invite(friend.id)))).into())
     };
+    // Sin conexión con el servidor no se sabe quién sigue conectado: todas en gris.
+    let lamp = if friend.online && !home::server_down(app) {
+        Tone::Success
+    } else {
+        Tone::Neutral
+    };
     ui::list_row(
-        Some(avatars::view(
-            app,
-            &friend.display_name,
-            friend.avatar,
-            size::AVATAR,
-        )),
+        Some(seat(app, &friend.display_name, friend.avatar, Some(lamp))),
         friend.display_name.as_str(),
         Some(format!("@{}", friend.username)),
         vec![
-            ui::reserve(badge_samples(), Some(home::activity_badge(friend)))
-                .align_x(iced_core::alignment::Horizontal::Right)
-                .into(),
             ui::reserve(action_samples(), invite)
                 .align_x(iced_core::alignment::Horizontal::Right)
                 .into(),
@@ -646,9 +698,19 @@ pub(crate) mod shots {
         app.page_change = None;
     }
 
+    /// La página sin amigos todavía.
+    fn nobody(app: &mut App) {
+        crate::ui::screens::home::shots::home_empty(app);
+        app.update(Message::Navigate(Page::Friends));
+        app.page_change = None;
+    }
+
     /// Escenas de esta pantalla.
-    pub(crate) const BUILDERS: &[(&str, Builder)] =
-        &[("07-agregar-amigo", add_friend), ("07-amigos", friends)];
+    pub(crate) const BUILDERS: &[(&str, Builder)] = &[
+        ("07-agregar-amigo", add_friend),
+        ("07-amigos", friends),
+        ("07-amigos-vacio", nobody),
+    ];
 }
 
 #[cfg(test)]

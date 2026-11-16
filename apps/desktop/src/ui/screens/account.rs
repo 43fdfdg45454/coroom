@@ -1,12 +1,13 @@
 //! Cuenta: lo que antes estaba en el menú del avatar y en Ajustes → Cuenta, en una página del
 //! riel.
 //!
-//! Quién eres (avatar, nombre, usuario y este equipo), el servidor en una línea con «Cambiar de
-//! servidor» y «Cerrar sesión» (su estado, el certificado y el diagnóstico están en Ajustes →
-//! Servidor y red), los dispositivos de la cuenta, los números de seguridad de quienes conoces y,
-//! plegada en «Detalles de seguridad», la huella larga de la identidad de este equipo. Las acciones
-//! son las de siempre: desvincular un dispositivo o ver un número de seguridad van por los
-//! mensajes de Ajustes ([`settings::Msg`]), que tienen la misma lógica.
+//! Quién eres (tu butaca con la lámpara de la conexión con el servidor, nombre, usuario y este
+//! equipo), el servidor en una línea con «Cambiar de servidor» y «Cerrar sesión» (su estado, el
+//! certificado y el diagnóstico están en Ajustes → Servidor y red), los dispositivos de la cuenta,
+//! los números de seguridad de quienes conoces y, plegada en «Detalles de seguridad», la huella
+//! larga de la identidad de este equipo. Las acciones son las de siempre: desvincular un
+//! dispositivo o ver un número de seguridad van por los mensajes de Ajustes ([`settings::Msg`]),
+//! que tienen la misma lógica.
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,9 +15,9 @@ use coroom_ui::Element;
 use coroom_ui::animate::Collapse;
 use coroom_ui::icon::{Icon, icon_with};
 use coroom_ui::motion::{EXIT_EASING, Token};
-use coroom_ui::style::{ButtonClass, ContainerClass, SvgClass};
+use coroom_ui::style::{ButtonClass, ContainerClass, Surface, SvgClass};
 use coroom_ui::theme::Tone;
-use coroom_ui::tokens::{space, text as type_size};
+use coroom_ui::tokens::{size, space, text as type_size};
 use coroom_ui::widget::{self as ui, Kind};
 use iced_core::text::Wrapping;
 use iced_core::{Alignment, Length, Padding};
@@ -130,23 +131,40 @@ pub fn view(app: &App) -> Element<'_, Message> {
     ui::page("account", page)
 }
 
-/// Quién eres: avatar, nombre, usuario y equipo, y la fila del avatar.
+/// Quién eres: tu butaca con la lámpara de la conexión con el servidor (y el estado, en
+/// palabras, al final de la fila), nombre, usuario y equipo; debajo, la fila del avatar.
 fn profile<'a>(app: &'a App, account: &'a AccountInfo) -> Element<'a, Message> {
-    let mut rows = vec![ui::list_row(
-        Some(avatars::view(
-            app,
+    let state = match app.server_status.online {
+        Some(true) => Some(ui::status_badge(Tone::Success, t!("account-conectado"))),
+        Some(false) => Some(ui::status_badge(Tone::Neutral, t!("account-sin-conexion"))),
+        None => None,
+    };
+    let identity = row![
+        coroom_ui::avatar::seat_lamp(
+            &app.theme,
             &account.display_name,
-            account.avatar,
+            avatars::of(app, account.avatar),
             avatars::SETTINGS_SIDE,
-        )),
-        account.display_name.as_str(),
-        Some(t!(
-            "account-usuario-en-este-equipo",
-            username = account.username,
-            device = account.device
-        )),
-        vec![],
-    )];
+            app.own_lamp(),
+            Surface::Card,
+        ),
+        column![
+            ui::heading(account.display_name.as_str()).wrapping(Wrapping::WordOrGlyph),
+            ui::secondary(t!(
+                "account-usuario-en-este-equipo",
+                username = account.username,
+                device = account.device
+            ))
+            .wrapping(Wrapping::WordOrGlyph)
+        ]
+        .spacing(2)
+        .width(Length::Fill),
+        ui::slot(state),
+    ]
+    .spacing(space::S)
+    .align_y(Alignment::Center)
+    .padding(Padding::from([space::S, space::M]));
+    let mut rows: Vec<Element<'a, Message>> = vec![identity.into()];
     rows.extend(avatars::settings_row(app));
     ui::section(t!("account-perfil"), None, rows)
 }
@@ -255,7 +273,7 @@ fn devices(app: &App) -> Element<'_, Message> {
 fn peers(app: &App) -> Element<'_, Message> {
     let rows: Vec<Element<'_, Message>> = if app.settings.peers.is_empty() {
         vec![
-            container(ui::caption(t!("account-numeros-de-seguridad-vacio")))
+            container(ui::secondary(t!("account-numeros-de-seguridad-vacio")))
                 .padding(Padding::from([12.0, 16.0]))
                 .into(),
         ]
@@ -268,7 +286,7 @@ fn peers(app: &App) -> Element<'_, Message> {
             .map(|(index, peer)| {
                 let preview: String = peer.safety_number.chars().take(17).collect();
                 ui::list_row(
-                    Some(ui::avatar(&app.theme, &peer.name, 28.0)),
+                    Some(ui::avatar(&app.theme, &peer.name, size::AVATAR)),
                     peer.name.as_str(),
                     Some(t!("account-numero-recortado", preview = preview)),
                     vec![

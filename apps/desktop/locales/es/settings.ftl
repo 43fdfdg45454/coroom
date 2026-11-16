@@ -2,7 +2,7 @@
 
 settings-se-guardan-al-cambiarlos = Se guardan al cambiarlos
 
-## Cuándo surte efecto un ajuste (la columna de etiquetas de cada fila)
+## Cuándo surte efecto un ajuste (la etiqueta tras el título de cada fila)
 settings-al-momento = Al momento
 settings-en-la-proxima-sala = En la próxima sala
 settings-al-entrar = Al entrar
@@ -41,6 +41,7 @@ settings-sin-servidor-texto = Inicia sesión en un servidor para verlo aquí, co
 settings-servidor-conectado = Conectado
 settings-servidor-no-responde-corto = No responde
 settings-servidor-comprobando = Comprobando la conexión…
+settings-sesion-de = Sesión de { $name } (@{ $username })
 settings-cambiar-de-servidor = Cambiar de servidor
 settings-certificado-del-servidor = Certificado del servidor
 settings-certificado-del-servidor-ayuda = La huella SHA-256 en la que confiaste al añadirlo. Si el servidor cambia de certificado, coroom te lo pregunta otra vez.
@@ -226,12 +227,11 @@ settings-usar-el-ultimo-que-conectes = Usar el último que conectes
 settings-ranura-preferida = Ranura preferida al dar mando
 settings-ranura-preferida-ayuda = La que se ofrece primero al dar el mando a un invitado.
 settings-la-primera-libre = La primera libre
-settings-ranura = Ranura { $slot }
 
 ## Atajos de teclado
-settings-atajos-ayuda = Los de la sala van siempre con Ctrl+Alt, para no chocar con los del juego. Con «Cambiar», pulsa la letra nueva.
+settings-atajos-ayuda = Van siempre con Ctrl+Alt, para no chocar con los del juego. Con «Cambiar», pulsa la letra nueva.
 settings-atajo-en-la-sala = En la sala, como invitado
-settings-atajo-pulsar-para-hablar = En la sala, con pulsar para hablar encendido (Audio y voz)
+settings-atajo-pulsar-para-hablar = Con pulsar para hablar encendido en Audio y voz.
 settings-atajo-en-toda-la-app = En toda la aplicación
 settings-atajo-inmersivo = Modo inmersivo o escritorio
 settings-atajo-soltar = Soltar el teclado y el ratón
@@ -251,6 +251,8 @@ settings-atajo-cerrar-dialogos = Cerrar diálogos y paneles
 settings-atajo-salir-de-coroom = Salir de coroom
 
 ## Apariencia
+settings-colores = Colores
+settings-texto-y-movimiento = Texto y movimiento
 settings-tema = Tema
 settings-del-sistema = Del sistema
 settings-claro = Claro
@@ -267,6 +269,7 @@ settings-fuente = Fuente
 settings-fuente-del-escritorio = { $family }, la de tu escritorio. coroom usa siempre la del sistema: cámbiala en los ajustes del escritorio.
 settings-fuente-incluida = { $family }, incluida con coroom: no se encontró la de tu escritorio.
 settings-fuente-instalada = { $family }, instalada en el sistema: el escritorio no dice cuál usa.
+settings-fuente-del-sistema = La fuente no se elige en coroom
 settings-animaciones = Animaciones
 settings-reducidas = Reducidas
 settings-completas = Completas

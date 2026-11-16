@@ -1,9 +1,13 @@
 //! Inicio: lo primero del riel.
 //!
-//! Arriba, dos tarjetas grandes («Compartir mi pantalla» y «Unirse con código»); debajo, la
-//! **bandeja**, con lo que llega y vence (las invitaciones, con su cuenta atrás de
-//! [`INVITATION_TTL`] y una barra fina del tiempo que queda; las solicitudes de amistad; los
-//! avisos de versión y del relay), y **En línea ahora**, los amigos conectados. Cada entrada de la
+//! Arriba, dos bloques desiguales: «Compartir mi pantalla», el principal, con su botón y la fila
+//! de butacas de **tu sala** (la tuya encendida y las libres numeradas con la sala cerrada; quien
+//! está de verdad, con su lámpara, si la sala está abierta en este equipo) y su estado en
+//! palabras; y «Unirse con código». Debajo, la **bandeja**, con lo que llega de alguien y vence
+//! (las invitaciones a una sala, como entradas con su código y su cuenta atrás de
+//! [`INVITATION_TTL`]; las solicitudes de amistad, como filas), y **En línea ahora**, los amigos
+//! conectados en una fila de butacas. Los avisos no son de la bandeja: el que impide usar el
+//! servidor va arriba del todo y los de la versión nueva y el relay, al final. Cada entrada de la
 //! bandeja cae desde arriba al llegar y se pliega con su altura al vencer o descartarla: lo que
 //! hay debajo se desliza en lugar de saltar. La lista completa de amigos está en su página
 //! ([`super::friends`]); aquí queda la lógica de invitar y de **pedir entrar** en la sala de un
@@ -17,18 +21,16 @@ use coroom_transport::proto::api::{Friend, Friends};
 use coroom_transport::proto::signal::{Activity, OwnRoom, ROOM_CODE_LEN, is_valid_room_code};
 use coroom_ui::Element;
 use coroom_ui::animate::{Collapse, Shift};
-use coroom_ui::font::MONO;
+use coroom_ui::font::SEMIBOLD;
 use coroom_ui::icon::{Icon, icon_with};
 use coroom_ui::motion::{EXIT_EASING, Token};
-use coroom_ui::style::{
-    ButtonClass, ContainerClass, InputClass, ProgressClass, SvgClass, TextClass,
-};
+use coroom_ui::style::{ButtonClass, ContainerClass, InputClass, Surface, SvgClass, TextClass};
 use coroom_ui::theme::Tone;
-use coroom_ui::tokens::{size, space, text as type_size};
-use coroom_ui::widget::{self as ui, Kind};
+use coroom_ui::tokens::{seat, size, space, text as type_size};
+use coroom_ui::widget::{self as ui, CodeSize, Kind};
 use iced_core::text::{LineHeight, Wrapping};
 use iced_core::{Alignment, Length, Padding};
-use iced_widget::{Column, Row, column, container, progress_bar, row, text, text_input};
+use iced_widget::{Column, Row, Space, column, container, row, text, text_input};
 
 use crate::ui::app::{
     App, Effect, Event, Invitation, JOIN_REQUEST_TTL, Load, Message, Page, Screen,
@@ -47,8 +49,21 @@ const INVITATIONS_SHOWN: usize = 3;
 /// Amigos conectados que se ven en «En línea ahora» (el resto, en Amigos).
 const ONLINE_SHOWN: usize = 12;
 
-/// Grosor de la barra del tiempo que le queda a una invitación.
-const TIME_BAR: f32 = 3.0;
+/// Butacas de personas que caben en la fila de «tu sala» (si hay más, la última dice cuántas).
+const ROOM_SEATS: usize = 5;
+
+/// Margen interior de los dos bloques de arriba.
+const BLOCK_PADDING: f32 = space::M + space::XXS;
+
+/// Aire encima de cada sección de la página (más que debajo de su título).
+const SECTION_GAP: f32 = space::XL;
+
+/// Tamaño de la letra del campo del código.
+const CODE_INPUT_TEXT: f32 = 22.0;
+
+/// Desde qué ancho de lo de dentro del bloque de compartir el estado de la sala va al lado de las
+/// butacas y no debajo.
+const ROOM_INLINE_FROM: f32 = 440.0;
 
 /// Una invitación que se va de la bandeja (venció o se descartó) y se pliega con su altura.
 #[derive(Debug, Clone)]
@@ -97,6 +112,8 @@ pub enum Msg {
     Invite(u64),
     /// Pedir entrar en la sala abierta de un amigo.
     AskToJoin(u64),
+    /// Ir a Amigos con el campo de «Agregar amigo» desplegado.
+    AddFriend,
 }
 
 /// Normaliza lo que se escribe en el código: mayúsculas, sin espacios ni guiones, como mucho seis.
@@ -215,6 +232,13 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
             app.home.asked_at.insert(user, app.now);
             app.toast(Tone::Info, t!("home-ask-sent", name = name));
             vec![Effect::AskToJoin(user)]
+        }
+        Msg::AddFriend => {
+            let mut effects = app.update(Message::Navigate(Page::Friends));
+            if !app.friends_page.adding {
+                effects.extend(app.update(Message::Friends(FriendsMsg::ToggleAdd)));
+            }
+            effects
         }
     }
 }
@@ -454,33 +478,76 @@ fn on(msg: Msg) -> Message {
     Message::Home(msg)
 }
 
-/// Dibuja la página: compartir y unirse arriba, la bandeja y quién está en línea.
+/// Dibuja la página: arriba, compartir (el bloque grande, con la fila de butacas de tu sala) y
+/// unirse con un código; debajo, la bandeja y quién está en línea. Lo que impide usar el servidor
+/// se dice arriba del todo; los avisos que no corren prisa (la versión nueva, el relay), al final.
 pub fn view<'a>(app: &'a App) -> Element<'a, Message> {
+    let (blocking, notices) = notices(app);
+    let below = |content: Element<'a, Message>, top: f32| -> Element<'a, Message> {
+        container(content)
+            .padding(Padding {
+                top,
+                ..Padding::ZERO
+            })
+            .into()
+    };
+    let blocking = blocking.map(|notice| {
+        container(notice)
+            .padding(Padding {
+                bottom: space::M,
+                ..Padding::ZERO
+            })
+            .into()
+    });
+    let notices = (!notices.is_empty()).then(|| {
+        below(
+            Column::with_children(notices).spacing(space::XS).into(),
+            SECTION_GAP,
+        )
+    });
     let page = column![
+        ui::slot(blocking),
         ui::equal_height_row(
-            |real| vec![share_card(app, real), join_card(app, real)],
+            |real| vec![share_block(app, real), join_block(app, real)],
             space::M,
         ),
-        container(tray(app)).padding(Padding {
-            top: space::L,
-            ..Padding::ZERO
-        }),
-        container(online_now(app)).padding(Padding {
-            top: space::L,
-            ..Padding::ZERO
-        }),
+        below(tray(app), SECTION_GAP),
+        below(online_now(app), SECTION_GAP),
+        ui::slot(notices),
     ];
     ui::page("home", page)
 }
 
-/// Avisos de la bandeja: versión nueva y el uso del relay.
-fn notices(app: &App) -> Vec<Element<'_, Message>> {
+/// Los avisos de Inicio, fuera de la bandeja (no son de nadie ni vencen): el que explica por qué
+/// no se puede compartir ni entrar (versiones distintas con el servidor; si no, el servidor sin
+/// conexión, con el diagnóstico a un clic; si no, estar dentro de la sala de otro, con la vuelta a
+/// ella a un clic), que va arriba del todo y una sola vez; y los demás (la versión nueva, el uso
+/// del relay), que van al final de la página.
+fn notices(app: &App) -> (Option<Element<'_, Message>>, Vec<Element<'_, Message>>) {
     let mut out = Vec::new();
     // Versiones distintas con el servidor; después, la versión nueva ([`super::updates`]).
     let mut client_older = false;
+    let mut blocking = None;
     if let Some((host, gap)) = &app.update.protocol {
-        out.push(super::updates::protocol_banner(app, host, *gap));
+        blocking = Some(super::updates::protocol_banner(app, host, *gap));
         client_older = matches!(gap, crate::update::ProtocolGap::ClientOlder { .. });
+    } else if server_down(app) {
+        blocking = Some(ui::banner(
+            Tone::Error,
+            t!("home-offline-reason"),
+            Some((
+                t!("app-abrir-el-diagnostico"),
+                Message::Diagnostics(crate::ui::screens::diagnostics::Msg::Open),
+            )),
+        ));
+    } else if app.guest.is_some() && !app.host.is_open() {
+        // Dentro de la sala de otro (se llega aquí desde el riel): ni compartir ni entrar en
+        // otra; volver a ella está a un clic.
+        blocking = Some(ui::banner(
+            Tone::Info,
+            t!("room-ya-estas-en-una-sala"),
+            Some((t!("home-back-to-room"), Message::Navigate(Page::Host))),
+        ));
     }
     // Si la app es la vieja, su aviso ya lleva la acción de la versión nueva (un fallo sí se
     // explica aparte).
@@ -515,23 +582,20 @@ fn notices(app: &App) -> Vec<Element<'_, Message>> {
             }
         }
     }
-    out
+    (blocking, out)
 }
 
-/// Cabecera de una tarjeta grande: icono del acento, título y explicación.
-fn big_card_header<'a>(icon: Icon, title: &'a str, explanation: &'a str) -> Element<'a, Message> {
-    row![
-        icon_with(icon, size::ICON_LARGE, SvgClass::Accent),
-        column![
-            ui::heading(title),
-            ui::secondary(explanation).wrapping(Wrapping::WordOrGlyph)
-        ]
-        .spacing(2)
-        .width(Length::Fill)
+/// Título y explicación de uno de los dos bloques de arriba.
+fn block_header<'a>(
+    title: &'a str,
+    explanation: &'a str,
+) -> Column<'a, Message, coroom_ui::Theme, coroom_ui::Renderer> {
+    column![
+        ui::heading(title),
+        ui::secondary(explanation).wrapping(Wrapping::WordOrGlyph)
     ]
-    .spacing(space::S)
-    .align_y(Alignment::Center)
-    .into()
+    .spacing(2)
+    .width(Length::Fill)
 }
 
 /// El motivo de «Entrar» desactivado con la sala propia abierta: entrar en otra la dejaría
@@ -546,57 +610,40 @@ fn hosting_reason<'a>() -> Element<'a, Message> {
     .into()
 }
 
-/// El motivo de los botones desactivados dentro de la sala de otro (se ve desde el riel).
-fn visiting_reason<'a>() -> Element<'a, Message> {
-    row![
-        icon_with(Icon::Info, 14.0, SvgClass::Tone(Tone::Info)),
-        ui::caption(t!("room-ya-estas-en-una-sala")).wrapping(Wrapping::WordOrGlyph)
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center)
-    .into()
-}
-
-/// El motivo de un botón desactivado por el servidor caído.
-fn offline_reason<'a>() -> Element<'a, Message> {
-    row![
-        icon_with(Icon::CloudOff, 14.0, SvgClass::Tone(Tone::Error)),
-        ui::caption(t!("home-offline-reason")).wrapping(Wrapping::WordOrGlyph)
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center)
-    .into()
-}
-
-/// Altura de una tarjeta de [`ui::equal_height_row`]: la de verdad llena la fila; la copia de
+/// Altura de un bloque de [`ui::equal_height_row`]: el de verdad llena la fila; la copia de
 /// debajo, que solo mide, se encoge.
-fn card_height(real: bool) -> Length {
+fn block_height(real: bool) -> Length {
     if real { Length::Fill } else { Length::Shrink }
 }
 
-fn big_card<'a>(
-    content: Column<'a, Message, coroom_ui::Theme, coroom_ui::Renderer>,
-    real: bool,
-) -> Element<'a, Message> {
-    container(content.spacing(space::S))
-        .padding(space::M)
-        .width(Length::Fill)
-        .height(card_height(real))
-        .class(ContainerClass::Card)
-        .into()
+/// Lo que separa lo de arriba de un bloque de lo de su pie: en el de verdad, un hueco que crece
+/// (los pies de los dos bloques quedan a la misma altura); en la copia que mide, nada.
+fn block_filler<'a>(real: bool) -> Element<'a, Message> {
+    ui::slot(real.then(|| Space::new().height(Length::Fill).into()))
 }
 
-/// Tarjeta de compartir (`real`: ver [`ui::equal_height_row`]).
-fn share_card(app: &App, real: bool) -> Element<'_, Message> {
+/// El bloque principal: compartir la pantalla, con su botón y, al pie, la fila de butacas de la
+/// sala propia y su estado en palabras (`real`: ver [`ui::equal_height_row`]).
+fn share_block(app: &App, real: bool) -> Element<'_, Message> {
     let open = app.host.is_open();
     let visiting = app.guest.is_some() && !open;
     let blocked = (server_down(app) && !open) || visiting;
-    let mut content = column![
-        big_card_header(
-            Icon::ShareScreen,
+    let mut header = Row::new()
+        .spacing(space::S)
+        .align_y(Alignment::Start)
+        .push(block_header(
             t!("home-share-title"),
-            t!("home-share-text")
-        ),
+            if open {
+                t!("home-share-open-text")
+            } else {
+                t!("home-share-text")
+            },
+        ));
+    if app.sharing_screen() {
+        header = header.push(ui::status_badge(Tone::Live, t!("home-room-live")));
+    }
+    let top = column![
+        header,
         ui::button_with(
             Kind::Primary,
             if open {
@@ -607,22 +654,105 @@ fn share_card(app: &App, real: bool) -> Element<'_, Message> {
             Some(Icon::ShareScreen),
             (real && !blocked).then(|| on(Msg::Share))
         )
-    ];
-    if visiting {
-        content = content.push(visiting_reason());
-    } else if blocked {
-        content = content.push(offline_reason());
-    }
-    big_card(content, real)
+    ]
+    .spacing(space::M);
+    container(column![
+        container(top).padding(BLOCK_PADDING).width(Length::Fill),
+        block_filler(real),
+        iced_widget::rule::horizontal(1),
+        container(own_room(app))
+            .padding(Padding::from([space::S, BLOCK_PADDING]))
+            .width(Length::Fill),
+    ])
+    .width(Length::FillPortion(3))
+    .height(block_height(real))
+    .class(ContainerClass::Card)
+    .into()
 }
 
-/// Campo del código: monoespaciado y grande, para que se lea letra a letra.
+/// El estado de la sala propia: la lámpara y la frase que lo dice.
+pub(crate) fn room_state(app: &App) -> (Tone, String) {
+    match &app.host.room {
+        Some(room) if room.code.is_some() => (
+            Tone::Success,
+            match room.guests.len() {
+                0 => t!("home-room-open-empty").to_owned(),
+                1 => t!("home-room-open-one").to_owned(),
+                count => t!("home-room-open-many", count = count),
+            },
+        ),
+        _ if app.host.is_open() => (Tone::Warning, t!("home-room-opening").to_owned()),
+        _ => (Tone::Neutral, t!("home-room-closed").to_owned()),
+    }
+}
+
+/// Ancho (lógico) de lo de dentro del bloque de compartir con la ventana de ahora: decide si el
+/// estado de la sala cabe al lado de las butacas o va debajo.
+fn share_block_inner(app: &App) -> f32 {
+    let rail = if ui::rail_is_wide(app.window.width) {
+        ui::RAIL_WIDE
+    } else {
+        ui::RAIL_NARROW
+    };
+    let content = (app.window.width - rail - 1.0 - 2.0 * space::XL).min(size::CONTENT);
+    (content - space::M) * 3.0 / 5.0 - 2.0 * BLOCK_PADDING
+}
+
+/// La fila de butacas de «tu sala» y su estado en palabras. Cerrada: la tuya encendida y las
+/// demás libres, numeradas. Abierta en este equipo: quien está de verdad, con la lámpara de su
+/// enlace (verde, directo; ámbar, por el relay o conectando; la tuya, verde: estás dentro) y el
+/// anillo de quien habla.
+fn own_room(app: &App) -> Element<'_, Message> {
+    use coroom_transport::Path;
+    use coroom_ui::avatar::{SeatRow, Seated, seat_row};
+    let room = app.host.room.as_ref();
+    let talking = |guest: u32| room.is_some_and(|room| room.voice.talkers.contains(&guest));
+    let mut people: Vec<Seated<'_>> = Vec::new();
+    if let Some(account) = &app.account {
+        people.push(
+            Seated::new(&account.display_name)
+                .picture(avatars::of(app, account.avatar))
+                .lamp(room.map(|_| Tone::Success))
+                .talking(talking(0)),
+        );
+    }
+    for guest in room.into_iter().flat_map(|room| &room.guests) {
+        people.push(
+            Seated::new(&guest.name)
+                .picture(avatars::of(app, guest.avatar))
+                .lamp(Some(match guest.path {
+                    Some(Path::Direct) => Tone::Success,
+                    Some(Path::Relayed) | None => Tone::Warning,
+                }))
+                .talking(talking(guest.guest.0)),
+        );
+    }
+    let seats = seat_row(&app.theme, &people, SeatRow::default().max(ROOM_SEATS));
+    let (tone, text) = room_state(app);
+    let state = row![
+        ui::dot(tone),
+        ui::secondary(text).wrapping(Wrapping::WordOrGlyph)
+    ]
+    .spacing(space::XS)
+    .align_y(Alignment::Center);
+    if share_block_inner(app) >= ROOM_INLINE_FROM {
+        row![seats, container(state).width(Length::Fill)]
+            .spacing(space::M)
+            .align_y(Alignment::Center)
+            .into()
+    } else {
+        column![seats, state].spacing(space::XS).into()
+    }
+}
+
+/// Campo del código: el campo de texto de siempre, con la letra grande y en seminegrita, como el
+/// código en la sala, para que se lea letra a letra.
 fn code_input(app: &App, real: bool, enabled: bool) -> Element<'_, Message> {
     let mut input = text_input("K7Q2MZ", &app.home.code)
-        .padding(Padding::from([6.0, 14.0]))
-        .size(20)
-        .line_height(LineHeight::Absolute(ui::px(24.0)))
-        .font(MONO)
+        .padding(Padding::from([8.0, 14.0]))
+        .size(CODE_INPUT_TEXT)
+        .line_height(LineHeight::Absolute(ui::px(28.0)))
+        .font(SEMIBOLD)
         .class(if app.home.code_error.is_some() {
             InputClass::Invalid
         } else {
@@ -639,28 +769,19 @@ fn code_input(app: &App, real: bool, enabled: bool) -> Element<'_, Message> {
     input.into()
 }
 
-/// Tarjeta de unirse (`real`: ver [`ui::equal_height_row`]; la copia no lleva el `id` del campo
-/// ni mensajes).
-fn join_card(app: &App, real: bool) -> Element<'_, Message> {
+/// El bloque de unirse: el código y «Entrar» (`real`: ver [`ui::equal_height_row`]; la copia no
+/// lleva el `id` del campo ni mensajes).
+fn join_block(app: &App, real: bool) -> Element<'_, Message> {
     let hosting = app.host.is_open();
     let visiting = app.guest.is_some();
     let blocked = server_down(app) || hosting || visiting;
-    let mut content = column![
-        big_card_header(Icon::LogIn, t!("home-join-title"), t!("home-join-text")),
-        row![
-            container(code_input(app, real, !blocked)).width(Length::Fill),
-            ui::button_with(
-                Kind::Primary,
-                t!("home-enter"),
-                Some(Icon::LogIn),
-                (real && !blocked).then(|| on(Msg::Join))
-            )
-        ]
-        .spacing(space::XS)
-        .align_y(Alignment::Center)
-    ];
+    let mut top = column![
+        block_header(t!("home-join-title"), t!("home-join-text")),
+        code_input(app, real, !blocked),
+    ]
+    .spacing(space::S);
     if let Some(error) = &app.home.code_error {
-        content = content.push(
+        top = top.push(
             row![
                 icon_with(Icon::CircleAlert, 14.0, SvgClass::Tone(Tone::Error)),
                 text(error.as_str())
@@ -672,20 +793,40 @@ fn join_card(app: &App, real: bool) -> Element<'_, Message> {
             .align_y(Alignment::Center),
         );
     }
-    if hosting {
-        content = content.push(hosting_reason());
-    } else if visiting {
-        content = content.push(visiting_reason());
-    } else if blocked {
-        content = content.push(offline_reason());
-    }
-    big_card(content, real)
+    // Dentro de la sala de otro o sin servidor, el motivo está arriba de la página.
+    let why = hosting.then(hosting_reason);
+    let foot = row![
+        container(ui::slot(why)).width(Length::Fill),
+        ui::button_with(
+            Kind::Primary,
+            t!("home-enter"),
+            Some(Icon::LogIn),
+            (real && !blocked).then(|| on(Msg::Join))
+        )
+    ]
+    .spacing(space::S)
+    .align_y(Alignment::Center);
+    container(column![
+        top,
+        block_filler(real),
+        container(foot).padding(Padding {
+            top: space::S,
+            ..Padding::ZERO
+        }),
+    ])
+    .padding(BLOCK_PADDING)
+    .width(Length::FillPortion(2))
+    .height(block_height(real))
+    .class(ContainerClass::Card)
+    .into()
 }
 
 // --- Bandeja --------------------------------------------------------------------------------------
 
-/// La bandeja: lo que llega y vence. Siempre está, con su título; cada entrada cae desde arriba
-/// al llegar y se pliega con su altura al irse, así que lo de debajo se desliza en vez de saltar.
+/// La bandeja: lo que llega de alguien y vence (las invitaciones a una sala, como entradas; las
+/// solicitudes de amistad, como filas). Siempre está, con su título; cada entrada cae desde
+/// arriba al llegar y se pliega con su altura al irse, así que lo de debajo se desliza en vez de
+/// saltar.
 fn tray<'a>(app: &'a App) -> Element<'a, Message> {
     let mut invitations: Vec<&Invitation> = app.invitations.iter().collect();
     invitations.sort_by_key(|invitation| std::cmp::Reverse(received_at(app, invitation)));
@@ -695,9 +836,8 @@ fn tray<'a>(app: &'a App) -> Element<'a, Message> {
         .loaded()
         .map(|friends| friends.incoming.as_slice())
         .unwrap_or_default();
-    let notices = notices(app);
     let own = own_rooms(app);
-    let count = own.len() + invitations.len() + requests.len() + notices.len();
+    let count = own.len() + invitations.len() + requests.len();
     let summary = match count {
         0 => t!("home-tray-empty").to_owned(),
         _ => t!("home-tray-detail").to_owned(),
@@ -705,19 +845,19 @@ fn tray<'a>(app: &'a App) -> Element<'a, Message> {
     let header = row![
         ui::heading(t!("home-tray")),
         ui::slot((count > 0).then(|| ui::rail_count(count.to_string()))),
-        ui::caption(summary).wrapping(Wrapping::None),
+        ui::secondary(summary).wrapping(Wrapping::None),
     ]
     .spacing(space::XS)
     .align_y(Alignment::Center);
     let mut entries: Vec<Element<'a, Message>> = Vec::new();
     for room in own {
-        entries.push(tray_entry(app, own_room_card(app, room), 1.0, 0.0));
+        entries.push(tray_entry(app, own_room_ticket(app, room), 1.0, 0.0));
     }
     for invitation in invitations {
         let since = received_at(app, invitation);
         entries.push(tray_entry(
             app,
-            invitation_card(app, invitation, since, false),
+            invitation_ticket(app, invitation, since, false),
             entered(app, since),
             0.0,
         ));
@@ -725,7 +865,7 @@ fn tray<'a>(app: &'a App) -> Element<'a, Message> {
     for leaving in &app.home.leaving {
         entries.push(tray_entry(
             app,
-            invitation_card(app, &leaving.invitation, leaving.received, true),
+            invitation_ticket(app, &leaving.invitation, leaving.received, true),
             1.0,
             left(app, leaving.since),
         ));
@@ -743,9 +883,6 @@ fn tray<'a>(app: &'a App) -> Element<'a, Message> {
             entered(app, since),
             0.0,
         ));
-    }
-    for notice in notices {
-        entries.push(tray_entry(app, notice, 1.0, 0.0));
     }
     column![
         header,
@@ -780,14 +917,14 @@ fn tray_entry<'a>(
     .into()
 }
 
-/// «Entrar» de una invitación; con la sala propia abierta, desactivado y con el motivo al pasar
-/// el ratón.
-fn enter_invitation(invitation: &Invitation, blocked: bool, hosting: bool) -> Element<'_, Message> {
+/// «Entrar» de una entrada: el talón. Con la sala propia abierta (o dentro de otra), desactivado
+/// y con el motivo al pasar el ratón.
+fn enter_stub<'a>(code: &str, blocked: bool, hosting: bool) -> Element<'a, Message> {
     let button = ui::button_with(
         Kind::Primary,
         t!("home-enter"),
         Some(Icon::LogIn),
-        (!blocked).then(|| on(Msg::Accept(invitation.code.clone()))),
+        (!blocked).then(|| on(Msg::Accept(code.to_owned()))),
     );
     if hosting {
         ui::with_tooltip(button, t!("home-hosting-reason"))
@@ -796,9 +933,28 @@ fn enter_invitation(invitation: &Invitation, blocked: bool, hosting: bool) -> El
     }
 }
 
-/// Tarjeta de una invitación que llega, con el borde del acento, su cuenta atrás y una barra fina
-/// del tiempo que queda. `leaving`: se va (sin botones que hagan nada).
-fn invitation_card<'a>(
+/// El cuerpo de una entrada: la butaca de quien invita, el texto (título y lo de debajo) y el
+/// código de la sala en señalética pequeña.
+fn ticket_body<'a>(
+    seat: Element<'a, Message>,
+    title: String,
+    detail: Element<'a, Message>,
+    code: &str,
+) -> Row<'a, Message, coroom_ui::Theme, coroom_ui::Renderer> {
+    row![
+        seat,
+        column![ui::strong(title).wrapping(Wrapping::WordOrGlyph), detail]
+            .spacing(2)
+            .width(Length::Fill),
+        ui::code_cells(code, CodeSize::Small),
+    ]
+    .spacing(space::S)
+    .align_y(Alignment::Center)
+}
+
+/// Una invitación que llega, como una entrada: quien invita, el código de su sala, la cuenta
+/// atrás y, en el talón, «Entrar». `leaving`: se va (sin botones que hagan nada).
+fn invitation_ticket<'a>(
     app: &'a App,
     invitation: &'a Invitation,
     received: Instant,
@@ -812,48 +968,29 @@ fn invitation_card<'a>(
     let left = remaining.as_secs().max(u64::from(!leaving));
     let hosting = app.host.is_open() || app.guest.is_some();
     let blocked = server_down(app) || hosting || leaving;
-    let fraction = remaining.as_secs_f32() / INVITATION_TTL.as_secs_f32();
-    container(
-        column![
-            row![
-                avatars::view(
-                    app,
-                    &invitation.from_name,
-                    avatars::of_user(app, invitation.from_user),
-                    size::AVATAR,
-                ),
-                column![
-                    ui::strong(t!("home-invite-title", name = invitation.from_name))
-                        .wrapping(Wrapping::WordOrGlyph),
-                    // La cuenta atrás en m:ss en una ranura de ancho fijo: cambia cada segundo
-                    // sin mover el texto ni repartir las líneas.
-                    row![
-                        ui::secondary(t!("home-invite-detail", code = invitation.code))
-                            .wrapping(Wrapping::None),
-                        ui::figure(ui::secondary, stats::clock(left), &[stats::CLOCK_WIDEST]),
-                    ]
-                    .spacing(space::XXS)
-                ]
-                .spacing(2)
-                .width(Length::Fill),
-                ui::flat(
-                    t!("home-ignore"),
-                    (!leaving).then(|| on(Msg::Ignore(invitation.from_user)))
-                ),
-                enter_invitation(invitation, blocked, hosting)
-            ]
-            .spacing(space::S)
-            .align_y(Alignment::Center),
-            progress_bar(0.0..=1.0, fraction)
-                .girth(Length::Fixed(TIME_BAR))
-                .class(ProgressClass::Accent),
-        ]
-        .spacing(space::S),
+    // La cuenta atrás en m:ss en una ranura de ancho fijo: cambia cada segundo sin mover el texto
+    // ni repartir las líneas.
+    let countdown = row![
+        ui::secondary(t!("home-invite-expires")).wrapping(Wrapping::None),
+        ui::figure(ui::secondary, stats::clock(left), &[stats::CLOCK_WIDEST]),
+    ]
+    .spacing(space::XXS);
+    let body = ticket_body(
+        avatars::view(
+            app,
+            &invitation.from_name,
+            avatars::of_user(app, invitation.from_user),
+            size::AVATAR,
+        ),
+        t!("home-invite-title", name = invitation.from_name),
+        countdown.into(),
+        &invitation.code,
     )
-    .padding(Padding::from([12.0, 16.0]))
-    .width(Length::Fill)
-    .class(ContainerClass::CardAccent)
-    .into()
+    .push(ui::flat(
+        t!("home-ignore"),
+        (!leaving).then(|| on(Msg::Ignore(invitation.from_user))),
+    ));
+    ui::ticket(body, enter_stub(&invitation.code, blocked, hosting))
 }
 
 /// Las salas de la cuenta abiertas en sus otros dispositivos (sin la que comparte este).
@@ -865,34 +1002,28 @@ pub(crate) fn own_rooms(app: &App) -> Vec<&OwnRoom> {
         .collect()
 }
 
-/// La sala que la cuenta tiene abierta en otro dispositivo: se entra con un toque, sin código ni
-/// invitación. Se queda mientras siga abierta.
-fn own_room_card<'a>(app: &'a App, room: &'a OwnRoom) -> Element<'a, Message> {
+/// La sala que la cuenta tiene abierta en otro dispositivo, como una entrada con la butaca
+/// propia: se entra con un toque, sin escribir el código ni esperar invitación. Se queda mientras
+/// siga abierta.
+fn own_room_ticket<'a>(app: &'a App, room: &'a OwnRoom) -> Element<'a, Message> {
     let hosting = app.host.is_open() || app.guest.is_some();
     let blocked = server_down(app) || hosting;
-    let enter = ui::button_with(
-        Kind::Primary,
-        t!("home-enter"),
-        Some(Icon::LogIn),
-        (!blocked).then(|| on(Msg::Accept(room.code.clone()))),
-    );
-    let enter = if hosting {
-        ui::with_tooltip(enter, t!("home-hosting-reason"))
-    } else {
-        enter.into()
+    let seat: Element<'a, Message> = match &app.account {
+        Some(account) => avatars::view(app, &account.display_name, account.avatar, size::AVATAR),
+        None => icon_with(Icon::Monitor, size::AVATAR, SvgClass::Accent),
     };
-    container(ui::list_row(
-        Some(icon_with(Icon::Monitor, size::AVATAR, SvgClass::Accent)),
+    let body = ticket_body(
+        seat,
         t!("home-own-room-title", device = room.device.as_str()),
-        Some(t!("home-own-room-detail", code = room.code.as_str())),
-        vec![enter],
-    ))
-    .width(Length::Fill)
-    .class(ContainerClass::Card)
-    .into()
+        ui::secondary(t!("home-own-room-detail"))
+            .wrapping(Wrapping::WordOrGlyph)
+            .into(),
+        &room.code,
+    );
+    ui::ticket(body, enter_stub(&room.code, blocked, hosting))
 }
 
-/// Una solicitud de amistad recibida: aceptar o rechazar sin ir a Amigos.
+/// Una solicitud de amistad recibida, como una fila: aceptar o rechazar sin ir a Amigos.
 fn request_card<'a>(
     app: &'a App,
     request: &'a coroom_transport::proto::api::FriendRequest,
@@ -930,8 +1061,58 @@ fn request_card<'a>(
 
 // --- En línea ahora -------------------------------------------------------------------------------
 
-/// Quién está conectado ahora: sus avatares (con su nombre y qué hace al pasar el ratón), que
-/// llevan a Amigos.
+/// Un amigo conectado en «En línea ahora»: su butaca con la lámpara verde, su nombre debajo y,
+/// en palabras, qué hace (o «Pedido…» si se le pidió entrar y aún no contesta). Pulsarlo lleva a
+/// Amigos. Sin conexión con el servidor la lámpara se apaga: lo que se ve es lo último que se
+/// supo.
+fn online_seat<'a>(app: &App, friend: &Friend) -> Element<'a, Message> {
+    let status = if app.home.asked_at.contains_key(&friend.id) {
+        t!("home-asked")
+    } else {
+        activity_text(friend)
+    };
+    let line = |content: String, class: TextClass| {
+        ui::one_line(content, move |content| {
+            text(content)
+                .size(type_size::CAPTION)
+                .font(coroom_ui::font::UI)
+                .class(class)
+        })
+    };
+    let seat = column![
+        coroom_ui::avatar::seat_lamp(
+            &app.theme,
+            &friend.display_name,
+            avatars::of(app, friend.avatar),
+            seat::ROW,
+            (!server_down(app)).then_some(Tone::Success),
+            Surface::Window,
+        ),
+        column![
+            line(friend.display_name.clone(), TextClass::Primary),
+            line(status.to_owned(), TextClass::Secondary),
+        ]
+        .align_x(Alignment::Center),
+    ]
+    .spacing(space::XXS)
+    .width(Length::Fixed(seat::LABEL))
+    .align_x(Alignment::Center);
+    ui::with_tooltip(
+        coroom_ui::animate::button(seat)
+            .padding(space::XXS)
+            .class(ButtonClass::Flat)
+            .press_scale(true)
+            .on_press(Message::Navigate(Page::Friends)),
+        t!(
+            "home-online-face",
+            name = friend.display_name,
+            status = status
+        ),
+    )
+}
+
+/// Quién está conectado ahora: una fila de butacas con su lámpara, el nombre y qué hace cada
+/// uno debajo, que llevan a Amigos. Sin amigos todavía, dice cómo agregarlos.
 fn online_now(app: &App) -> Element<'_, Message> {
     let online: Vec<&Friend> = app
         .friends
@@ -948,9 +1129,14 @@ fn online_now(app: &App) -> Element<'_, Message> {
         1 => t!("home-online-now-one").to_owned(),
         n => t!("home-online-now-many", count = n),
     };
+    // Sin conexión con el servidor, se dice de cuándo es lo que se ve.
+    let summary = match friends::updated(app).filter(|_| server_down(app)) {
+        Some(updated) => format!("{summary} · {updated}"),
+        None => summary,
+    };
     let header = row![
         ui::heading(t!("home-online-now")),
-        ui::caption(summary).wrapping(Wrapping::None),
+        ui::secondary(summary).wrapping(Wrapping::None),
         ui::fill(),
         ui::button_with(
             Kind::Link,
@@ -962,9 +1148,9 @@ fn online_now(app: &App) -> Element<'_, Message> {
     .spacing(space::XS)
     .align_y(Alignment::Center);
     let body: Element<'_, Message> = match &app.friends {
-        Load::Idle | Load::Loading => ui::caption(t!("home-loading")).into(),
+        Load::Idle | Load::Loading => ui::secondary(t!("home-loading")).into(),
         Load::Failed(err) => row![
-            ui::caption(t!("home-load-failed-detail", err = err)).wrapping(Wrapping::WordOrGlyph),
+            ui::secondary(t!("home-load-failed-detail", err = err)).wrapping(Wrapping::WordOrGlyph),
             ui::button_with(
                 Kind::Link,
                 t!("home-retry"),
@@ -975,37 +1161,39 @@ fn online_now(app: &App) -> Element<'_, Message> {
         .spacing(space::XS)
         .align_y(Alignment::Center)
         .into(),
-        Load::Loaded(_) if online.is_empty() => ui::caption(t!("home-online-now-empty"))
+        // Sin amigos todavía: qué hacer, con el botón al lado.
+        Load::Loaded(friends) if friends.friends.is_empty() => row![
+            column![
+                ui::strong(t!("home-empty-title")),
+                ui::secondary(t!("home-empty-text")).wrapping(Wrapping::WordOrGlyph)
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+            ui::button_with(
+                Kind::Normal,
+                t!("home-add-friend"),
+                Some(Icon::UserPlus),
+                Some(on(Msg::AddFriend))
+            )
+        ]
+        .spacing(space::M)
+        .align_y(Alignment::Center)
+        .into(),
+        Load::Loaded(_) if online.is_empty() => ui::secondary(t!("home-online-now-empty"))
             .wrapping(Wrapping::WordOrGlyph)
             .into(),
         Load::Loaded(_) => {
-            let mut faces = Row::new().spacing(space::XS).align_y(Alignment::Center);
+            let mut seats = Row::new().spacing(space::XXS).align_y(Alignment::Center);
             for friend in online.iter().take(ONLINE_SHOWN) {
-                faces = faces.push(ui::with_tooltip(
-                    coroom_ui::animate::button(avatars::view(
-                        app,
-                        &friend.display_name,
-                        friend.avatar,
-                        size::AVATAR,
-                    ))
-                    .padding(2)
-                    .class(ButtonClass::Flat)
-                    .press_scale(true)
-                    .on_press(Message::Navigate(Page::Friends)),
-                    t!(
-                        "home-online-face",
-                        name = friend.display_name,
-                        status = activity_text(friend)
-                    ),
-                ));
+                seats = seats.push(online_seat(app, friend));
             }
             if online.len() > ONLINE_SHOWN {
-                faces = faces.push(ui::caption(t!(
+                seats = seats.push(ui::caption(t!(
                     "home-online-more",
                     count = online.len() - ONLINE_SHOWN
                 )));
             }
-            faces.wrap().into()
+            seats.wrap().vertical_spacing(space::XS).into()
         }
     };
     column![header, body].spacing(space::S).into()
@@ -1103,9 +1291,27 @@ pub(crate) mod shots {
         app.home.friends_updated = Some(ago(app, 75));
     }
 
+    /// Inicio en una ventana estrecha, con la invitación de Bea y la sala propia abierta en otro
+    /// equipo: las dos entradas de la bandeja y el estado de la sala bajo las butacas.
+    fn home_narrow(app: &mut App) {
+        home(app);
+        app.window = iced_core::Size::new(
+            crate::ui::shots::NARROW.0 as f32,
+            crate::ui::shots::NARROW.1 as f32,
+        );
+        app.update(Message::Event(Event::OwnRooms(vec![
+            coroom_transport::proto::signal::OwnRoom {
+                code: "H4W9TC".to_owned(),
+                device: "Sobremesa".to_owned(),
+            },
+        ])));
+        app.home.code.clear();
+    }
+
     /// Escenas de esta pantalla.
     pub(crate) const BUILDERS: &[(&str, Builder)] = &[
         ("05-inicio", home),
+        ("05-inicio-estrecho", home_narrow),
         ("05-inicio-pedido", home_asked),
         ("06-inicio-vacio", home_empty),
         ("06-inicio-sin-servidor", home_offline),
@@ -1606,6 +1812,33 @@ mod tests {
             app.update(Message::Home(Msg::Join))
                 .contains(&Effect::Join("K7Q2MZ".into()))
         );
+    }
+
+    /// «Agregar amigo» desde Inicio (sin amigos todavía) lleva a Amigos con el campo desplegado, y
+    /// repetirlo no lo recoge.
+    #[test]
+    fn add_friend_from_home_opens_the_field_in_friends() {
+        let mut app = main_app();
+        app.update(Message::Home(Msg::AddFriend));
+        assert_eq!(app.page, Page::Friends);
+        assert!(app.friends_page.adding);
+        app.page = Page::Home;
+        app.update(Message::Home(Msg::AddFriend));
+        assert!(app.friends_page.adding, "sigue desplegado");
+    }
+
+    /// El estado de la sala propia se dice en palabras, con su lámpara: cerrada, abriéndose y
+    /// abierta.
+    #[test]
+    fn the_own_room_state_is_said_in_words() {
+        let mut app = main_app();
+        let (tone, text) = room_state(&app);
+        assert_eq!(tone, Tone::Neutral);
+        assert!(text.contains("cerrada"), "{text}");
+        app.host.starting = true;
+        let (tone, text) = room_state(&app);
+        assert_eq!(tone, Tone::Warning);
+        assert!(text.contains("Abriendo"), "{text}");
     }
 
     #[test]

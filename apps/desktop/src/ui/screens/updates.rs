@@ -3,7 +3,10 @@
 //! servidor). Lo que se hace en cada momento lo decide [`crate::update::Updater`]; aquí solo se
 //! enseña y se traduce cada botón a su orden.
 //!
-//! Mientras descarga, Inicio no muestra nada: el progreso está en Acerca de.
+//! Mientras descarga, Inicio no muestra nada: el progreso está en Acerca de. En Inicio estos avisos
+//! no van en la bandeja (que es de lo que llega de alguien y vence): el de versiones distintas,
+//! que impide usar el servidor, va arriba del todo, y los de la versión nueva, al final de la
+//! página, cada uno con su tono (información, aviso o error).
 
 use coroom_ui::Element;
 use coroom_ui::icon::{Icon, icon_with};
