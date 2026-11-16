@@ -27,7 +27,7 @@ use coroom_ui::icon::{Icon, icon_with};
 use coroom_ui::selectable::selectable;
 use coroom_ui::style::{ButtonClass, ContainerClass, SvgClass, TextClass};
 use coroom_ui::theme::{Mode, Palette, Tone};
-use coroom_ui::tokens::{size, space, text as type_size};
+use coroom_ui::tokens::{radius, size, space, text as type_size};
 use coroom_ui::widget::{self as ui, Kind};
 use coroom_ui::{Element, Renderer};
 use iced_core::text::Wrapping;
@@ -902,6 +902,20 @@ impl Look {
             Surface::Window => TextClass::Secondary,
         }
     }
+
+    /// El relleno de la burbuja de un mensaje: tonal, de esquina suave y sin sombra. En la
+    /// ventana, la propia lleva el relleno suave de acento y la de los demás, el tono del fondo
+    /// (hundida en la tarjeta del chat); sobre el vídeo, las dos el velo claro de los grupos de
+    /// la barra, y la propia se distingue por ir a la derecha.
+    fn bubble(self, own: bool) -> ContainerClass {
+        match (self.surface, own) {
+            (Surface::Overlay, _) => ContainerClass::OverlaySegmented,
+            (Surface::Window, true) => ContainerClass::CodeCell {
+                radius: radius::CONTROL,
+            },
+            (Surface::Window, false) => ContainerClass::Code,
+        }
+    }
 }
 
 /// Teclas del campo: `Intro` envía, `Mayús+Intro` salta de línea; el resto, como siempre.
@@ -976,15 +990,16 @@ fn header(app: &App) -> Element<'_, Message> {
 
 fn messages<'a>(app: &'a App, look: Look) -> Element<'a, Message> {
     if app.chat.entries.is_empty() {
-        let detail = if app.chat.ready {
-            t!("chat-aun-sin-mensajes-detalle")
+        // Vacío: qué es este chat y quién puede leerlo (o por qué aún no se puede escribir).
+        let (glyph, detail) = if app.chat.ready {
+            (Icon::Lock, t!("chat-aun-sin-mensajes-detalle"))
         } else {
-            t!("chat-esperando-las-claves")
+            (Icon::Key, t!("chat-esperando-las-claves"))
         };
         return center(
             column![
                 icon_with(
-                    Icon::ChatText,
+                    glyph,
                     size::ICON_LARGE,
                     match look.surface {
                         Surface::Overlay => SvgClass::Overlay,
@@ -1071,6 +1086,12 @@ fn keyed_item<'a>(row: impl Into<Element<'a, Message>>) -> Element<'a, Message> 
     Column::with_children([row.into()]).into()
 }
 
+/// Lado de la butaca de quien escribe.
+const AUTHOR_SEAT: f32 = 28.0;
+
+/// Un mensaje: la butaca de quien lo escribe y, a su lado, la burbuja con su nombre, su papel
+/// («Anfitrión»), la hora y el texto. El propio va a la derecha, sin butaca (uno ya sabe quién
+/// es) y con «Tú» en el acento. La burbuja mide lo que su texto, hasta el ancho de la lista.
 fn message_row<'a>(
     app: &'a App,
     look: Look,
@@ -1096,35 +1117,59 @@ fn message_row<'a>(
             .font(coroom_ui::font::SEMIBOLD)
             .class(look.primary())
     };
-    let mut who = row![name].spacing(space::XS).align_y(Alignment::Center);
-    if line.author.guest == 0 {
-        who = who.push(coroom_ui::tag::live(t!("chat-anfitrion")));
-    }
-    who = who.push(
-        text(clock)
+    let note = |content: &'a str| {
+        text(content)
             .size(type_size::CAPTION)
-            .font(coroom_ui::font::MONO)
-            .class(look.secondary()),
-    );
-    let body = row![
-        avatars::view(
-            app,
-            &seed,
-            avatars::of_member(app, line.author.guest, line.own),
-            28.0,
-        ),
-        column![who, message_text(app, look, &line.text, pieces)]
-            .spacing(2)
+            .class(look.secondary())
+            .wrapping(Wrapping::None)
+    };
+    let mut who = row![name.wrapping(Wrapping::None)]
+        .spacing(space::XS)
+        .align_y(Alignment::Center);
+    if line.author.guest == 0 {
+        who = who.push(note(t!("chat-anfitrion")));
+    }
+    who = who.push(note(clock));
+    let bubble = container(column![who, message_text(app, look, &line.text, pieces)].spacing(2))
+        .padding(Padding::from([6.0, 10.0]))
+        .class(look.bubble(line.own));
+    let (body, copy_side): (Element<'a, Message>, iced_core::alignment::Horizontal) = if line.own {
+        (
+            container(bubble)
+                .align_right(Length::Fill)
+                .padding(Padding {
+                    left: AUTHOR_SEAT + space::XS,
+                    ..Padding::ZERO
+                })
+                .into(),
+            iced_core::alignment::Horizontal::Left,
+        )
+    } else {
+        (
+            row![
+                avatars::view(
+                    app,
+                    &seed,
+                    avatars::of_member(app, line.author.guest, line.own),
+                    AUTHOR_SEAT,
+                ),
+                bubble
+            ]
+            .spacing(space::XS)
             .width(Length::Fill)
-    ]
-    .spacing(space::XS);
-    // Copiar: con el botón que aparece al pasar por encima o con el botón derecho.
+            .into(),
+            iced_core::alignment::Horizontal::Right,
+        )
+    };
+    // Copiar: con el botón que aparece al pasar por encima (al lado libre de la fila) o con el
+    // botón derecho.
     let copy = container(ui::icon_button(
         Icon::Copy,
         t!("chat-copiar-el-mensaje"),
         Some(Message::Copy(line.text.clone())),
     ))
-    .align_right(Length::Fill);
+    .width(Length::Fill)
+    .align_x(copy_side);
     mouse_area(hover(body, copy))
         .on_right_press(Message::Copy(line.text.clone()))
         .into()
@@ -1149,6 +1194,7 @@ fn message_text<'a>(
     });
     selectable(content)
         .links(links)
+        .width(Length::Shrink)
         .size(type_size::BODY)
         .class(look.primary())
         .link_color(look.accent)
@@ -1379,7 +1425,11 @@ pub fn bubbles(app: &App) -> Option<Element<'_, Message>> {
         .spacing(space::XS)
         .align_y(Alignment::Center);
         if bubble.line.author.guest == 0 {
-            who = who.push(coroom_ui::tag::live(t!("chat-anfitrion")));
+            who = who.push(
+                text(t!("chat-anfitrion"))
+                    .size(type_size::CAPTION)
+                    .class(TextClass::OverlaySecondary),
+            );
         }
         let first_line = bubble.line.text.lines().next().unwrap_or_default();
         // Una línea que quepa en la burbuja; si una letra ancha la pasa, salta en vez de salirse.
@@ -1395,7 +1445,7 @@ pub fn bubbles(app: &App) -> Option<Element<'_, Message>> {
                             app,
                             &name,
                             avatars::of_member(app, bubble.line.author.guest, bubble.line.own),
-                            28.0,
+                            AUTHOR_SEAT,
                         ),
                         column![who, body].spacing(2)
                     ]

@@ -104,6 +104,7 @@ host-hdr-pantalla-quiza = Si la pantalla no expone HDR, el vídeo HDR se ve con 
 
 ## Audio y voz
 
+host-audio-y-voz = Audio y voz
 host-audio-que-se-envia = Audio que se envía
 host-este-equipo-no-separa-el-audio = Todo lo que suena: este equipo no separa el audio por aplicación ({ $why }).
 host-ninguna-aplicacion-suena-ahora = Ninguna aplicación suena ahora.
@@ -131,10 +132,12 @@ host-no-se-pudo-abrir-la-sala = No se pudo abrir la sala: { $error }
 
 host-sala-de = Sala de { $name }
 host-tu-sala = Tu sala
-host-codigo = Código
-host-en-vivo = EN VIVO
+host-codigo-de-la-sala = Código de la sala
+host-copiar = Copiar
+host-copiado = Copiado
+host-en-vivo = En vivo
 host-creando-la-sala = Creando la sala en el servidor…
-host-sin-invitados = sin invitados
+host-sin-invitados = Sin invitados
 host-un-invitado = 1 invitado
 host-n-invitados = { $n } invitados
 host-ruta-directa = directa

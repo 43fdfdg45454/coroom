@@ -28,8 +28,9 @@ use coroom_transport::connect::{PUNCH_TIMEOUT, candidate_class};
 use coroom_transport::nat::{MappingOutcome, MappingReport};
 use coroom_transport::quic::Path;
 use coroom_ui::Element;
+use coroom_ui::avatar::seat_lamp;
 use coroom_ui::icon::{Icon, icon_with};
-use coroom_ui::style::{ContainerClass, SvgClass, TextClass};
+use coroom_ui::style::{ContainerClass, Surface, SvgClass, TextClass};
 use coroom_ui::theme::Tone;
 use coroom_ui::tokens::{space as gap, text as type_size};
 use coroom_ui::widget::{self as ui, Kind};
@@ -42,6 +43,9 @@ use crate::ui::stats;
 
 /// Ancho máximo del panel.
 const PANEL_WIDTH: f32 = 860.0;
+
+/// Lado de la butaca de cada invitado en el diagnóstico del anfitrión.
+const GUEST_SEAT: f32 = 32.0;
 
 /// Percentil que enseñan las etapas.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -373,6 +377,9 @@ struct Metric {
     /// y la etiqueta de al lado no reparte sus líneas de otra forma con cada medida. Vacío en los
     /// que no cambian solos.
     widest: Vec<String>,
+    /// Si el valor es un dato técnico que se copia tal cual (el nombre del servidor): va en
+    /// monoespaciada. Las cifras y los estados, con la letra de la interfaz.
+    technical: bool,
 }
 
 /// Las muestras de una ranura de ancho fijo, para [`Metric::widest`].
@@ -624,6 +631,7 @@ fn probe_metric(probe: Option<Probe>, kbps: Option<u32>, detail: &'static str) -
         detail: Some(detail),
         value: kbps.map_or_else(|| "—".to_owned(), |kbps| stats::kbps(f64::from(kbps))),
         widest: widest(&stats::KBPS_WIDEST),
+        technical: false,
     }
 }
 
@@ -633,6 +641,7 @@ fn mtu_metric() -> Metric {
         detail: Some(t!("diagnostics-mtu-detalle").to_owned()),
         value: "—".to_owned(),
         widest: Vec::new(),
+        technical: false,
     }
 }
 
@@ -653,12 +662,14 @@ fn guest_metrics(app: &App) -> Vec<Metric> {
             detail: None,
             value: guest_rtt(app).map_or_else(|| "—".to_owned(), stats::ms),
             widest: widest(&stats::MS_WIDEST),
+            technical: false,
         },
         Metric {
             label: t!("diagnostics-perdida"),
             detail: Some(t!("diagnostics-perdida-detalle").to_owned()),
             value: link.map_or_else(|| "—".to_owned(), |link| stats::percent(link.loss_percent)),
             widest: widest(&stats::PERCENT_WIDEST),
+            technical: false,
         },
         mtu_metric(),
         probe_metric(side.route.probe, None, t!("diagnostics-sonda-hacia-ti")),
@@ -678,6 +689,7 @@ fn guest_metrics(app: &App) -> Vec<Metric> {
                 target = "888,8",
                 real = "888,8"
             )],
+            technical: false,
         },
     ]
 }
@@ -711,6 +723,7 @@ fn host_guest_metrics(status: &GuestStatus, route: Option<&Route>) -> Vec<Metric
                 .then(|| t!("diagnostics-rtt-tramo-relay").to_owned()),
             value: status.rtt_ms.map_or_else(|| "—".to_owned(), stats::ms),
             widest: widest(&stats::MS_WIDEST),
+            technical: false,
         },
         mtu_metric(),
         probe_metric(
@@ -725,12 +738,14 @@ fn host_guest_metrics(status: &GuestStatus, route: Option<&Route>) -> Vec<Metric
                 .target_kbps
                 .map_or_else(|| "—".to_owned(), |kbps| stats::kbps(f64::from(kbps))),
             widest: widest(&stats::KBPS_WIDEST),
+            technical: false,
         },
         Metric {
             label: t!("diagnostics-entrada"),
             detail: Some(t!("diagnostics-entrada-detalle").to_owned()),
             value: input_value(Some(&status.input)),
             widest: widest(&["88,8 ms / 88,8 ms", "888 ms / 888 ms"]),
+            technical: false,
         },
     ]
 }
@@ -1186,8 +1201,9 @@ pub fn scrub_addresses(text: &str) -> String {
 
 // --- Vista ----------------------------------------------------------------------------------------
 
+/// Título de una sección con su nota al lado.
 fn section_title<'a>(title: &'a str, detail: Option<String>) -> Element<'a, Message> {
-    let mut line = row![ui::strong(title).size(15.0)]
+    let mut line = row![ui::strong(title).size(SECTION_TITLE)]
         .spacing(gap::XS)
         .align_y(Alignment::Center);
     if let Some(detail) = detail {
@@ -1196,6 +1212,23 @@ fn section_title<'a>(title: &'a str, detail: Option<String>) -> Element<'a, Mess
     line.into()
 }
 
+/// Una sección: su título y, pegado debajo, lo suyo (las secciones van separadas entre sí por
+/// más aire que el que hay bajo cada título).
+fn section<'a>(
+    title: Element<'a, Message>,
+    content: impl Into<Element<'a, Message>>,
+) -> Column<'a, Message, coroom_ui::Theme> {
+    column![title, content.into()].spacing(gap::XS)
+}
+
+/// Tamaño del título de una sección.
+const SECTION_TITLE: f32 = 15.0;
+
+/// Tamaño de las direcciones (monoespaciada, discreta bajo su explicación).
+const ADDRESS_SIZE: f32 = 11.0;
+
+/// Una fila de la lista de candidatos: el icono del resultado, qué dirección es y qué pasó, la
+/// dirección en monoespaciada y, al final, el resultado en palabras con su tono.
 fn line_view<'a>(line: Line) -> Element<'a, Message> {
     let (svg, class) = match line.tone {
         Some(tone) => (SvgClass::Tone(tone), TextClass::Tone(tone)),
@@ -1209,9 +1242,8 @@ fn line_view<'a>(line: Line) -> Element<'a, Message> {
     .width(Length::Fill);
     if let Some(address) = line.address {
         texts = texts.push(
-            ui::caption(address)
-                .size(11.0)
-                .class(TextClass::Disabled)
+            ui::mono(address, ADDRESS_SIZE)
+                .class(TextClass::Secondary)
                 .wrapping(Wrapping::Glyph),
         );
     }
@@ -1224,14 +1256,17 @@ fn line_view<'a>(line: Line) -> Element<'a, Message> {
                 .class(class)
                 .wrapping(Wrapping::None),
         ]
-        .spacing(10)
+        .spacing(gap::S)
         .align_y(Alignment::Center),
     )
-    .padding(Padding::from([8.0, 14.0]))
+    .padding(Padding::from([10.0, 16.0]))
     .width(Length::Fill)
     .into()
 }
 
+/// Una fila de cifras: qué se mide (y cómo) a la izquierda y el valor al final, alineado a la
+/// derecha en una ranura del ancho del más ancho. Las cifras, en seminegrita con la letra de la
+/// interfaz; solo un dato técnico (el nombre del servidor) va en monoespaciada.
 fn metric_view<'a>(metric: Metric) -> Element<'a, Message> {
     let mut texts = column![ui::body(metric.label).wrapping(Wrapping::WordOrGlyph)]
         .spacing(2)
@@ -1239,19 +1274,22 @@ fn metric_view<'a>(metric: Metric) -> Element<'a, Message> {
     if let Some(detail) = metric.detail {
         texts = texts.push(ui::caption(detail).wrapping(Wrapping::WordOrGlyph));
     }
+    let widest: Vec<&str> = metric.widest.iter().map(String::as_str).collect();
+    let value: Element<'a, Message> = if metric.technical {
+        ui::figure(
+            |value: String| ui::mono(value, type_size::SECONDARY),
+            metric.value,
+            &widest,
+        )
+    } else {
+        ui::figure(ui::strong, metric.value, &widest)
+    };
     container(
-        row![texts, {
-            let widest: Vec<&str> = metric.widest.iter().map(String::as_str).collect();
-            ui::figure(
-                |value: String| ui::mono(value, type_size::BODY),
-                metric.value,
-                &widest,
-            )
-        }]
-        .spacing(gap::S)
-        .align_y(Alignment::Center),
+        row![texts, value]
+            .spacing(gap::M)
+            .align_y(Alignment::Center),
     )
-    .padding(Padding::from([8.0, 14.0]))
+    .padding(Padding::from([10.0, 16.0]))
     .width(Length::Fill)
     .into()
 }
@@ -1283,28 +1321,26 @@ fn route_columns<'a>(
     if !tried {
         rows.push(
             container(ui::secondary(t!("diagnostics-candidatos-vacio")))
-                .padding(Padding::from([10.0, 14.0]))
+                .padding(Padding::from([10.0, 16.0]))
                 .into(),
         );
     }
     rows.extend(lines.into_iter().map(line_view));
-    let left = column![
+    let left = section(
         section_title(t!("diagnostics-candidatos-titulo"), Some(detail)),
         ui::boxed_list(rows),
-    ]
-    .spacing(gap::XS)
+    )
     .width(Length::FillPortion(5));
-    let right = column![
+    let right = section(
         section_title(
             t!("diagnostics-enlace-titulo"),
-            Some(t!("diagnostics-enlace-detalle").to_owned())
+            Some(t!("diagnostics-enlace-detalle").to_owned()),
         ),
         ui::boxed_list(metrics.into_iter().map(metric_view).collect()),
-    ]
-    .spacing(gap::XS)
+    )
     .width(Length::FillPortion(4));
     row![left, right]
-        .spacing(gap::S)
+        .spacing(gap::M)
         .align_y(Alignment::Start)
         .into()
 }
@@ -1336,7 +1372,7 @@ fn route_banner<'a>(tone: Tone, title: String, text: String, retry: bool) -> Ele
         ));
     }
     container(line)
-        .padding(Padding::from([12.0, 14.0]))
+        .padding(Padding::from([gap::S, gap::M]))
         .width(Length::Fill)
         .class(ContainerClass::Banner(tone))
         .into()
@@ -1409,6 +1445,15 @@ fn guest_banner<'a>(app: &App) -> Element<'a, Message> {
     }
 }
 
+/// Alto de la barra de una etapa.
+const STAGE_BAR: f32 = 8.0;
+
+/// Ancho de la columna con el nombre de cada etapa (la más larga, «captura y codificación»).
+const STAGE_NAME: f32 = 168.0;
+
+/// La latencia por etapa: una fila por etapa, en el orden del pipeline, con su nombre, una barra
+/// proporcional (todas desde la misma línea, la mayor a todo el ancho) y la cifra alineada a la
+/// derecha; debajo, los totales.
 fn stages_card<'a>(app: &App, summary: Option<&LatencySummary>) -> Element<'a, Message> {
     let percentile = app.diagnostics.percentile;
     let toggle = ui::segmented(
@@ -1438,41 +1483,49 @@ fn stages_card<'a>(app: &App, summary: Option<&LatencySummary>) -> Element<'a, M
     .spacing(gap::S)
     .align_y(Alignment::Center);
     let Some((summary, values)) = values else {
-        return column![
-            header,
+        return section(
+            header.into(),
             ui::card(
                 column![ui::secondary(t!("diagnostics-etapas-vacio")), ui_draws(app)]
-                    .spacing(gap::XS)
-            )
-        ]
-        .spacing(gap::XS)
+                    .spacing(gap::XS),
+            ),
+        )
         .into();
     };
     let largest = values.iter().copied().max().unwrap_or(0).max(1);
-    let bar = Row::with_children(values.iter().enumerate().map(|(index, us)| {
-        // Proporcional, con un mínimo para que un tramo de 0 ms se siga viendo.
-        let portion = ((*us * 1000 / largest) as u16).max(12);
-        container(Space::new())
-            .width(Length::FillPortion(portion))
-            .height(Length::Fixed(22.0))
-            .class(ContainerClass::BarSegment {
-                alternate: index % 2 == 1,
-            })
+    let mut rows: Vec<Element<'a, Message>> = values
+        .iter()
+        .enumerate()
+        .map(|(index, us)| {
+            // Proporcional a la mayor; una etapa de 0 no dibuja barra.
+            let filled = (*us * 1000 / largest) as u16;
+            let mut bar = Row::new().width(Length::Fill);
+            if filled > 0 {
+                bar = bar.push(
+                    container(Space::new())
+                        .width(Length::FillPortion(filled))
+                        .height(Length::Fixed(STAGE_BAR))
+                        .class(ContainerClass::BarSegment { alternate: false }),
+                );
+            }
+            if filled < 1000 {
+                bar = bar.push(Space::new().width(Length::FillPortion(1000 - filled)));
+            }
+            container(
+                row![
+                    container(ui::body(group_label(index)).wrapping(Wrapping::WordOrGlyph))
+                        .width(Length::Fixed(STAGE_NAME)),
+                    bar,
+                    ui::figure(ui::strong, ms_us(*us), &stats::MS_WIDEST),
+                ]
+                .spacing(gap::M)
+                .align_y(Alignment::Center),
+            )
+            .padding(Padding::from([8.0, 16.0]))
+            .width(Length::Fill)
             .into()
-    }))
-    .spacing(2)
-    .width(Length::Fill);
-    let labels = Row::with_children(values.iter().enumerate().map(|(index, us)| {
-        column![
-            ui::strong(ms_us(*us)).size(13.0),
-            ui::caption(group_label(index)).wrapping(Wrapping::WordOrGlyph)
-        ]
-        .spacing(2)
-        .width(Length::FillPortion(1))
-        .into()
-    }))
-    .spacing(gap::XS)
-    .width(Length::Fill);
+        })
+        .collect();
     let (video, input, added) = totals(summary, percentile);
     let hint = ui::secondary(t!(
         "diagnostics-etapas-resumen",
@@ -1481,15 +1534,13 @@ fn stages_card<'a>(app: &App, summary: Option<&LatencySummary>) -> Element<'a, M
         added = added
     ))
     .wrapping(Wrapping::WordOrGlyph);
-    column![
-        header,
-        container(column![bar, labels, hint, ui_draws(app)].spacing(gap::XS))
-            .padding(Padding::from([12.0, 14.0]))
+    rows.push(
+        container(column![hint, ui_draws(app)].spacing(gap::XXS))
+            .padding(Padding::from([10.0, 16.0]))
             .width(Length::Fill)
-            .class(ContainerClass::Card),
-    ]
-    .spacing(gap::XS)
-    .into()
+            .into(),
+    );
+    section(header.into(), ui::boxed_list(rows)).into()
 }
 
 /// Vuelve a filtrar la salida de `coroom doctor` con los nombres que hay que ocultar ahora
@@ -1509,7 +1560,7 @@ fn equipment<'a>(app: &App) -> Element<'a, Message> {
         Some(text) => {
             let text = text.clone();
             container(ui::mono(text, type_size::CAPTION).wrapping(Wrapping::WordOrGlyph))
-                .padding(Padding::from([10.0, 14.0]))
+                .padding(Padding::from([gap::S, gap::M]))
                 .width(Length::Fill)
                 .class(ContainerClass::Code)
                 .into()
@@ -1519,14 +1570,13 @@ fn equipment<'a>(app: &App) -> Element<'a, Message> {
         }
         None => ui::secondary(t!("diagnostics-equipo-sin-datos")).into(),
     };
-    column![
+    section(
         section_title(
             t!("diagnostics-equipo"),
-            Some(t!("diagnostics-equipo-detalle").to_owned())
+            Some(t!("diagnostics-equipo-detalle").to_owned()),
         ),
-        content
-    ]
-    .spacing(gap::XS)
+        content,
+    )
     .into()
 }
 
@@ -1609,11 +1659,10 @@ fn host_body<'a>(app: &'a App) -> Vec<Element<'a, Message>> {
     let mut body = vec![banner];
     if let Some(mapping) = &host.mapping {
         body.push(
-            column![
+            section(
                 section_title(t!("diagnostics-tu-router"), None),
                 ui::boxed_list(vec![line_view(router_line(mapping))]),
-            ]
-            .spacing(gap::XS)
+            )
             .into(),
         );
     }
@@ -1621,15 +1670,27 @@ fn host_body<'a>(app: &'a App) -> Vec<Element<'a, Message>> {
         let route = host.routes.get(&status.guest);
         let empty = Route::default();
         let detail = tried_detail(app, route.unwrap_or(&empty));
+        // Su butaca con la lámpara de su ruta (verde directa; ámbar relay o conectando) y, al
+        // final, la misma ruta en palabras con su RTT.
+        let lamp = match status.path {
+            Some(Path::Direct) => Tone::Success,
+            Some(Path::Relayed) | None => Tone::Warning,
+        };
         let heading = row![
-            crate::ui::avatars::view(app, &status.name, status.avatar, 28.0),
-            ui::heading(status.name.as_str()),
-            ui::fill(),
+            seat_lamp(
+                &app.theme,
+                &status.name,
+                crate::ui::avatars::of(app, status.avatar),
+                GUEST_SEAT,
+                Some(lamp),
+                Surface::Dialog,
+            ),
+            ui::one_line(status.name.clone(), ui::heading).width(Length::Fill),
             path_badge(status.path, status.rtt_ms),
         ]
-        .spacing(gap::XS)
+        .spacing(gap::S)
         .align_y(Alignment::Center);
-        let mut block = column![heading].spacing(gap::XS);
+        let mut block = column![rule::horizontal(1), heading].spacing(gap::S);
         if status.path == Some(Path::Relayed)
             && let Some(reason) = route.and_then(|route| route.relay_reason.as_ref())
         {
@@ -1671,18 +1732,21 @@ fn lobby_body<'a>(app: &App) -> Vec<Element<'a, Message>> {
             detail: None,
             value: server_host(app),
             widest: Vec::new(),
+            technical: true,
         }),
         metric_view(Metric {
             label: t!("diagnostics-servidor-estado"),
             detail: None,
             value: server_state(app),
             widest: Vec::new(),
+            technical: false,
         }),
         metric_view(Metric {
             label: t!("diagnostics-servidor-relay"),
             detail: None,
             value: relay.to_owned(),
             widest: Vec::new(),
+            technical: false,
         }),
     ]);
     vec![
@@ -1692,9 +1756,7 @@ fn lobby_body<'a>(app: &App) -> Vec<Element<'a, Message>> {
             t!("diagnostics-lobby-texto").to_owned(),
             false,
         ),
-        column![section_title(t!("diagnostics-servidor"), None), server]
-            .spacing(gap::XS)
-            .into(),
+        section(section_title(t!("diagnostics-servidor"), None), server).into(),
         equipment(app),
     ]
 }
@@ -1782,7 +1844,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
         }),
         rule::horizontal(1),
         scrollable(
-            container(Column::with_children(body).spacing(gap::M)).padding(Padding {
+            container(Column::with_children(body).spacing(gap::L)).padding(Padding {
                 top: gap::M,
                 right: gap::L,
                 bottom: gap::L,

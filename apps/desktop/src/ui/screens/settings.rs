@@ -11,11 +11,13 @@
 //! La cuenta tiene su página en el riel (`screens::account`); sus acciones (desvincular un
 //! dispositivo, ver un número de seguridad) siguen siendo mensajes de aquí ([`Msg`]).
 //!
-//! Todas las filas son iguales ([`ui::setting_row`]): título y descripción a la izquierda, la
-//! etiqueta de cuándo surte efecto («Al momento», «En la próxima sala», «Al entrar») en una
-//! columna de ancho fijo y el control a la derecha. Ninguna cambia de alto al cambiar su valor
-//! (lo que cambia con él va en una ranura del tamaño de su variante mayor) ni al llegar una
-//! lista de dispositivos nueva (su hora va en un icono, con el detalle al pasar el ratón).
+//! Todas las filas son iguales ([`setting`]): el título con la etiqueta de cuándo surte efecto
+//! («Al momento», «En la próxima sala», «Al entrar») a continuación, la descripción debajo y el
+//! control al final, de modo que los controles de un grupo forman una sola columna pegada al borde
+//! derecho. Ninguna cambia de alto al cambiar su valor (lo que cambia con él va en una ranura del
+//! tamaño de su variante mayor) ni al llegar una lista de dispositivos nueva (su hora va en un
+//! icono, con el detalle al pasar el ratón). Los grupos van separados entre sí más de lo que cada
+//! encabezado se separa de su lista.
 //!
 //! Cada cambio se guarda solo, poco después ([`App::settings_changed`]).
 
@@ -32,7 +34,8 @@ use coroom_transport::proto::api::Devices;
 use coroom_ui::Element;
 use coroom_ui::icon::{Icon, icon_with};
 use coroom_ui::style::{
-    ButtonClass, ContainerClass, InputClass, ProgressClass, SliderClass, SvgClass, TextClass,
+    ButtonClass, ContainerClass, InputClass, ProgressClass, SliderClass, Surface, SvgClass,
+    TextClass,
 };
 use coroom_ui::tag;
 use coroom_ui::theme::{Accent, Tone};
@@ -49,7 +52,8 @@ use crate::ui::app::{
     App, AudioDevice, Dialog, Effect, Event, Load, Message, MicTest, MicTestError, Page, Screen,
     VideoSupport,
 };
-use crate::ui::screens::{diagnostics, guest, host};
+use crate::ui::avatars;
+use crate::ui::screens::{diagnostics, guest, host, login};
 use crate::ui::settings::{
     CodecChoice, DEFAULT_INTERFACE_VOLUME, DEFAULT_NOTIFICATION_VOLUME, DEFAULT_VOICE_VOLUME,
     DecoderChoice, FPS_CHOICES, MAX_VOICE_VOLUME, MotionChoice, QualityPreset, Resolution,
@@ -57,6 +61,7 @@ use crate::ui::settings::{
     voice_gain,
 };
 use crate::ui::tones::Builtin;
+use crate::update::{Progress, Stage};
 
 /// Cada cuánto se vuelve a pedir la lista de micrófonos y salidas con «Audio y voz» abierta.
 pub const AUDIO_REFRESH: Duration = Duration::from_secs(3);
@@ -814,9 +819,11 @@ pub const ROW_ID: &str = "ajuste:";
 /// [`SettingsPage::ALL`].
 pub const NAV_ID: &str = "ajustes-nav:";
 
-/// Dibuja la página: la navegación a la izquierda y la sección elegida a la derecha. El fondo
-/// del elegido se desliza con un resorte hasta el nuevo ([`coroom_ui::animate::Segments`]); el
-/// contenido cambia en su sitio, sin desplazarse.
+/// Dibuja la página: la navegación a la izquierda y la sección elegida a la derecha. La
+/// navegación va sobre el fondo de la ventana (el plano teñido es solo el riel) y su entrada
+/// elegida lleva el relleno suave de acento y el icono en acento, como el destino elegido del
+/// riel. Ese relleno se desliza con un resorte hasta la nueva
+/// ([`coroom_ui::animate::Segments`]); el contenido cambia en su sitio, sin desplazarse.
 pub fn view(app: &App) -> Element<'_, Message> {
     let state = &app.settings_page;
     let offline = app.server_status.online == Some(false);
@@ -829,7 +836,15 @@ pub fn view(app: &App) -> Element<'_, Message> {
             // El punto del servidor que no responde tiene su sitio siempre.
             let alert = (*page == SettingsPage::Network && offline).then(|| ui::dot(Tone::Error));
             let line = row![
-                icon_with(page.icon(), 18.0, SvgClass::Text),
+                icon_with(
+                    page.icon(),
+                    18.0,
+                    if selected {
+                        SvgClass::Accent
+                    } else {
+                        SvgClass::Text
+                    }
+                ),
                 text(page.label())
                     .size(type_size::BODY)
                     .font(if selected {
@@ -863,10 +878,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
         chosen,
         ButtonClass::Nav { selected: true },
     ))
-    .padding(Padding::from([12.0, 8.0]))
+    .padding(Padding::from([space::M, space::S]))
     .width(Length::Fixed(NAV_WIDTH))
-    .height(Length::Fill)
-    .class(ContainerClass::Sidebar);
+    .height(Length::Fill);
     let content: Element<'_, Message> = match state.page {
         SettingsPage::Network => network(app),
         SettingsPage::Audio => audio(app),
@@ -892,7 +906,7 @@ const NAV_WIDTH: f32 = 220.0;
 
 // --- Filas ---------------------------------------------------------------------------------------
 
-/// Cuándo surte efecto un ajuste: la etiqueta de su fila, en la columna de «cuándo aplica».
+/// Cuándo surte efecto un ajuste: la etiqueta de su fila, tras el título.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Applies {
     /// Ya, también en la sala abierta («Al momento»).
@@ -932,8 +946,9 @@ impl Applies {
     }
 }
 
-/// La columna de «cuándo aplica» de una fila con su etiqueta: del ancho de la más ancha, así las
-/// etiquetas de las filas con el mismo control quedan una debajo de otra.
+/// La etiqueta de cuándo aplica en una columna de ancho fijo, el de la más ancha: para las filas
+/// que la llevan aparte del título (las de Compartir), donde así quedan una debajo de otra. Las
+/// de Ajustes la llevan tras el título ([`setting`]).
 pub fn when_column<'a>(applies: Applies) -> Element<'a, Message> {
     let labels = Applies::ALL.map(|applies| (applies.when(), applies.label()));
     tag::column(&labels, Some((applies.when(), applies.label())))
@@ -944,41 +959,362 @@ pub fn row_id(title: &str) -> Id {
     Id::from(format!("{ROW_ID}{title}"))
 }
 
-/// Fila de ajuste, la misma en todas las secciones: título y `below` a la izquierda, la columna
-/// de «cuándo aplica» y el control a la derecha ([`ui::setting_row`]). Las filas de lo que no
-/// tiene que ver con una sala (`applies` vacío: el tema, un tono) no llevan la columna y dejan
-/// ese ancho a su descripción; ninguna fila la pone o la quita según su valor.
+/// Cómo de holgada va una fila.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Density {
+    /// Una fila de ajuste: título, descripción y control.
+    Setting,
+    /// Una fila de tabla (los atajos, las licencias): más prieta, una línea cada una.
+    Table,
+}
+
+impl Density {
+    /// Margen de la fila.
+    fn padding(self) -> Padding {
+        let vertical = match self {
+            Density::Setting => 10.0,
+            Density::Table => 6.0,
+        };
+        Padding::from([vertical, space::M])
+    }
+
+    /// El ancho que el texto de la fila conserva junto a su control: con menos (la ventana
+    /// estrecha y un control ancho), el control baja debajo del texto ([`beside::Beside`]). Las
+    /// tablas aguantan más: sus nombres son cortos y sus columnas tienen que seguir alineadas.
+    fn text_min(self) -> f32 {
+        match self {
+            Density::Setting => 220.0,
+            Density::Table => 120.0,
+        }
+    }
+}
+
+/// Ancho máximo de la descripción de una fila: unas ochenta letras por línea. Con el control en el
+/// borde derecho, una descripción sin tope correría de punta a punta de la tarjeta.
+const HELP_WIDTH: f32 = 540.0;
+
+/// Separación entre los grupos de una sección: bastante más que la de un encabezado con su
+/// lista, para que cada encabezado se lea con lo que tiene debajo.
+const GROUP_GAP: f32 = space::XL;
+
+/// Los grupos de una sección, uno bajo otro.
+fn groups<'a>(groups: Vec<Element<'a, Message>>) -> Element<'a, Message> {
+    Column::with_children(groups).spacing(GROUP_GAP).into()
+}
+
+/// Fila de ajuste, la misma en todas las secciones: el título con la etiqueta de cuándo surte
+/// efecto a continuación, `below` debajo y el control al final, pegado al borde derecho. Las filas
+/// de lo que no tiene que ver con una sala (`applies` vacío: el tema, un tono) no llevan
+/// etiqueta; ninguna fila la pone o la quita según su valor.
 fn setting<'a>(
     title: impl Into<std::borrow::Cow<'a, str>>,
     below: Option<Element<'a, Message>>,
     applies: Option<Applies>,
     control: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    let title = title.into();
-    let id = row_id(&title);
-    container(ui::setting_row(
+    line(
         title,
+        None,
+        applies.map(applies_tag),
         below,
-        applies.map(when_column),
-        control,
-    ))
-    .id(id)
-    .width(Length::Fill)
-    .into()
+        control.into(),
+        Density::Setting,
+    )
 }
 
-/// Descripción de una fila.
+/// La etiqueta de cuándo surte efecto un ajuste, tras el título de su fila.
+fn applies_tag<'a>(applies: Applies) -> Element<'a, Message> {
+    tag::tag(applies.when(), applies.label())
+}
+
+/// La fila de [`setting`] con todas sus piezas: `leading` delante del texto (una butaca), `mark`
+/// tras el título (la etiqueta de cuándo aplica o una insignia de estado), `below` debajo y
+/// `control` al final, o debajo del texto si a su lado lo dejaría sin sitio
+/// ([`beside::Beside`]). Su identificador es el del título ([`row_id`]).
+fn line<'a>(
+    title: impl Into<std::borrow::Cow<'a, str>>,
+    leading: Option<Element<'a, Message>>,
+    mark: Option<Element<'a, Message>>,
+    below: Option<Element<'a, Message>>,
+    control: Element<'a, Message>,
+    density: Density,
+) -> Element<'a, Message> {
+    let title = title.into();
+    let id = row_id(&title);
+    let mut heading = Row::new()
+        .spacing(space::XS)
+        .align_y(Alignment::Center)
+        .push(ui::body(title));
+    if let Some(mark) = mark {
+        heading = heading.push(mark);
+    }
+    let mut texts = column![heading].spacing(2);
+    if let Some(below) = below {
+        texts = texts.push(below);
+    }
+    let mut line = Row::new().spacing(space::M).align_y(Alignment::Center);
+    if let Some(leading) = leading {
+        line = line.push(leading);
+    }
+    let body = beside::Beside::new(texts.width(Length::Fill), control, density.text_min());
+    container(line.push(body).padding(density.padding()))
+        .id(id)
+        .width(Length::Fill)
+        .into()
+}
+
+/// El texto de una fila y su control, uno junto al otro o uno bajo el otro según el sitio.
+mod beside {
+    use coroom_ui::tokens::space;
+    use coroom_ui::{Element, Renderer, Theme};
+    use iced_core::widget::{Operation, Tree};
+    use iced_core::{
+        Clipboard, Event, Layout, Length, Point, Rectangle, Shell, Size, Vector, Widget, layout,
+        mouse, overlay, renderer,
+    };
+
+    use crate::ui::app::Message;
+
+    /// Hueco entre el texto y el control a su lado.
+    const BESIDE_GAP: f32 = space::M;
+
+    /// Hueco entre el texto y el control debajo.
+    const BELOW_GAP: f32 = space::XS;
+
+    /// Si el control de `control` px de ancho cabe junto al texto en una fila de `width` px
+    /// dejándole al menos `text_min`. Un control vacío (la fila lleva lo suyo bajo la
+    /// descripción) no cuenta: el texto ocupa toda la fila.
+    pub(super) fn fits(width: f32, control: f32, text_min: f32) -> bool {
+        control < 1.0 || width - control - BESIDE_GAP >= text_min
+    }
+
+    /// El texto de una fila (título y descripción) y su control. Mientras al texto le quede un
+    /// ancho legible, el control va a su lado, pegado al borde derecho y centrado en alto; si no
+    /// (la ventana estrecha y un selector o un deslizador anchos), el control baja debajo del
+    /// texto, a la izquierda, y el texto recupera toda la fila. Lo decide la maqueta con el ancho
+    /// de verdad del control, no un umbral de ventana.
+    pub(super) struct Beside<'a> {
+        /// El texto y el control.
+        children: [Element<'a, Message>; 2],
+        text_min: f32,
+    }
+
+    impl<'a> Beside<'a> {
+        pub(super) fn new(
+            texts: impl Into<Element<'a, Message>>,
+            control: Element<'a, Message>,
+            text_min: f32,
+        ) -> Self {
+            Self {
+                children: [texts.into(), control],
+                text_min,
+            }
+        }
+    }
+
+    impl Widget<Message, Theme, Renderer> for Beside<'_> {
+        fn children(&self) -> Vec<Tree> {
+            self.children.iter().map(Tree::new).collect()
+        }
+
+        fn diff(&self, tree: &mut Tree) {
+            tree.diff_children(&self.children);
+        }
+
+        fn size(&self) -> Size<Length> {
+            Size::new(Length::Fill, Length::Shrink)
+        }
+
+        fn layout(
+            &mut self,
+            tree: &mut Tree,
+            renderer: &Renderer,
+            limits: &layout::Limits,
+        ) -> layout::Node {
+            let max = limits.max();
+            let [texts, control] = &mut self.children;
+            let [text_tree, control_tree] = &mut tree.children[..] else {
+                return layout::Node::new(Size::ZERO);
+            };
+            let loose = layout::Limits::new(Size::ZERO, max);
+            let mut control_node = control
+                .as_widget_mut()
+                .layout(control_tree, renderer, &loose);
+            let control_size = control_node.size();
+            if fits(max.width, control_size.width, self.text_min) {
+                let gap = if control_size.width < 1.0 {
+                    0.0
+                } else {
+                    BESIDE_GAP
+                };
+                let room = Size::new((max.width - control_size.width - gap).max(0.0), max.height);
+                let mut text_node = texts.as_widget_mut().layout(
+                    text_tree,
+                    renderer,
+                    &layout::Limits::new(Size::ZERO, room),
+                );
+                let text_size = text_node.size();
+                let height = text_size.height.max(control_size.height);
+                let centered = |inner: f32| ((height - inner) / 2.0).round();
+                text_node.move_to_mut(Point::new(0.0, centered(text_size.height)));
+                control_node.move_to_mut(Point::new(
+                    text_size.width + gap,
+                    centered(control_size.height),
+                ));
+                let width = text_size.width + gap + control_size.width;
+                layout::Node::with_children(Size::new(width, height), vec![text_node, control_node])
+            } else {
+                let mut text_node = texts.as_widget_mut().layout(text_tree, renderer, &loose);
+                let text_size = text_node.size();
+                text_node.move_to_mut(Point::ORIGIN);
+                control_node.move_to_mut(Point::new(0.0, text_size.height + BELOW_GAP));
+                layout::Node::with_children(
+                    Size::new(
+                        text_size.width.max(control_size.width),
+                        text_size.height + BELOW_GAP + control_size.height,
+                    ),
+                    vec![text_node, control_node],
+                )
+            }
+        }
+
+        fn draw(
+            &self,
+            tree: &Tree,
+            renderer: &mut Renderer,
+            theme: &Theme,
+            style: &renderer::Style,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            viewport: &Rectangle,
+        ) {
+            for ((child, tree), layout) in self
+                .children
+                .iter()
+                .zip(&tree.children)
+                .zip(layout.children())
+                .filter(|(_, layout)| layout.bounds().intersects(viewport))
+            {
+                child
+                    .as_widget()
+                    .draw(tree, renderer, theme, style, layout, cursor, viewport);
+            }
+        }
+
+        fn operate(
+            &mut self,
+            tree: &mut Tree,
+            layout: Layout<'_>,
+            renderer: &Renderer,
+            operation: &mut dyn Operation,
+        ) {
+            operation.container(None, layout.bounds());
+            operation.traverse(&mut |operation| {
+                self.children
+                    .iter_mut()
+                    .zip(&mut tree.children)
+                    .zip(layout.children())
+                    .for_each(|((child, tree), layout)| {
+                        child
+                            .as_widget_mut()
+                            .operate(tree, layout, renderer, operation);
+                    });
+            });
+        }
+
+        fn update(
+            &mut self,
+            tree: &mut Tree,
+            event: &Event,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            renderer: &Renderer,
+            clipboard: &mut dyn Clipboard,
+            shell: &mut Shell<'_, Message>,
+            viewport: &Rectangle,
+        ) {
+            for ((child, tree), layout) in self
+                .children
+                .iter_mut()
+                .zip(&mut tree.children)
+                .zip(layout.children())
+            {
+                child.as_widget_mut().update(
+                    tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+                );
+            }
+        }
+
+        fn mouse_interaction(
+            &self,
+            tree: &Tree,
+            layout: Layout<'_>,
+            cursor: mouse::Cursor,
+            viewport: &Rectangle,
+            renderer: &Renderer,
+        ) -> mouse::Interaction {
+            self.children
+                .iter()
+                .zip(&tree.children)
+                .zip(layout.children())
+                .map(|((child, tree), layout)| {
+                    child
+                        .as_widget()
+                        .mouse_interaction(tree, layout, cursor, viewport, renderer)
+                })
+                .max()
+                .unwrap_or_default()
+        }
+
+        fn overlay<'b>(
+            &'b mut self,
+            tree: &'b mut Tree,
+            layout: Layout<'b>,
+            renderer: &Renderer,
+            viewport: &Rectangle,
+            translation: Vector,
+        ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
+            overlay::from_children(
+                &mut self.children,
+                tree,
+                layout,
+                renderer,
+                viewport,
+                translation,
+            )
+        }
+    }
+
+    impl<'a> From<Beside<'a>> for Element<'a, Message> {
+        fn from(beside: Beside<'a>) -> Self {
+            Element::new(beside)
+        }
+    }
+}
+
+/// Descripción de una fila: secundaria y con tope de ancho ([`HELP_WIDTH`]), para que no compita
+/// con el título ni corra bajo el control.
 fn help<'a>(content: impl text::IntoFragment<'a>) -> Element<'a, Message> {
-    ui::secondary(content)
-        .wrapping(Wrapping::WordOrGlyph)
+    container(ui::secondary(content).wrapping(Wrapping::WordOrGlyph))
+        .max_width(HELP_WIDTH)
         .into()
 }
 
 /// Descripción en rojo (un error en el sitio de la descripción).
 fn help_error<'a>(content: impl text::IntoFragment<'a>) -> Element<'a, Message> {
-    ui::secondary(content)
-        .class(TextClass::Tone(Tone::Error))
-        .wrapping(Wrapping::WordOrGlyph)
+    container(
+        ui::secondary(content)
+            .class(TextClass::Tone(Tone::Error))
+            .wrapping(Wrapping::WordOrGlyph),
+    )
+    .max_width(HELP_WIDTH)
+    .into()
+}
+
+/// Nota al pie de una descripción (más pequeña), con su mismo tope de ancho.
+fn note<'a>(content: impl text::IntoFragment<'a>) -> Element<'a, Message> {
+    container(ui::caption(content).wrapping(Wrapping::WordOrGlyph))
+        .max_width(HELP_WIDTH)
         .into()
 }
 
@@ -1001,19 +1337,18 @@ fn steady<'a>(
         .into()
 }
 
-/// Valor monoespaciado con «Copiar» (huellas).
+/// Una huella con «Copiar»: en monoespaciada y en grupos de cuatro, como se enseñó al confiar
+/// en ella, para compararla a ojo; se copia tal cual es.
 fn copy_row<'a>(title: &'a str, subtitle: &'a str, value: &'a str) -> Element<'a, Message> {
     setting(
         title,
         Some(
             column![
                 help(subtitle),
-                container(ui::mono(value, type_size::SECONDARY).wrapping(Wrapping::WordOrGlyph))
-                    .padding(Padding::from([6.0, 10.0]))
-                    .width(Length::Fill)
-                    .class(ContainerClass::Code),
+                ui::mono(login::grouped_fingerprint(value), type_size::SECONDARY)
+                    .wrapping(Wrapping::WordOrGlyph),
             ]
-            .spacing(space::XS)
+            .spacing(space::XXS)
             .into(),
         ),
         None,
@@ -1045,11 +1380,15 @@ pub fn ago_secs(seconds: u64) -> String {
 // --- Servidor y red ------------------------------------------------------------------------------
 
 fn network(app: &App) -> Element<'_, Message> {
-    column![server(app), net(app)].spacing(space::L).into()
+    groups(vec![server(app), net(app)])
 }
 
-/// El servidor: su estado con «Cambiar de servidor», su certificado, el uso del relay del mes y
-/// el diagnóstico.
+/// Lado de la butaca de la cuenta en la fila del servidor.
+const ACCOUNT_SEAT: f32 = 40.0;
+
+/// El servidor: tu sesión en él (tu butaca, con la lámpara del estado del servidor, que también
+/// va en palabras tras su nombre) con «Cambiar de servidor», su certificado, el uso del relay del
+/// mes y el diagnóstico.
 fn server(app: &App) -> Element<'_, Message> {
     let Some(account) = &app.account else {
         return ui::section(
@@ -1068,21 +1407,29 @@ fn server(app: &App) -> Element<'_, Message> {
         (_, Some(_)) => (Tone::Success, t!("settings-servidor-conectado")),
         _ => (Tone::Neutral, t!("settings-servidor-comprobando")),
     };
-    let mut rows = vec![setting(
+    let seat = coroom_ui::avatar::seat_lamp(
+        &app.theme,
+        &account.display_name,
+        avatars::of(app, account.avatar),
+        ACCOUNT_SEAT,
+        Some(tone),
+        Surface::Card,
+    );
+    let mut rows = vec![line(
         account.host(),
-        Some(
-            row![ui::status_badge(tone, status)]
-                .padding(Padding {
-                    top: 2.0,
-                    ..Padding::ZERO
-                })
-                .into(),
-        ),
-        None,
+        Some(seat),
+        Some(ui::status_badge(tone, status)),
+        Some(help(t!(
+            "settings-sesion-de",
+            name = account.display_name.as_str(),
+            username = account.username.as_str()
+        ))),
         ui::normal(
             t!("settings-cambiar-de-servidor"),
             Some(Message::SwitchServer),
-        ),
+        )
+        .into(),
+        Density::Setting,
     )];
     if let Some(certificate) = &account.server.fingerprint {
         rows.push(copy_row(
@@ -1150,7 +1497,7 @@ fn relay_usage(app: &App) -> Element<'_, Message> {
     let bar = fraction.map(|fraction| {
         progress_bar(0.0..=1.0, fraction)
             .length(Length::Fixed(RELAY_BAR))
-            .girth(Length::Fixed(8.0))
+            .girth(Length::Fixed(METER_GIRTH))
             .class(if fraction >= 1.0 {
                 ProgressClass::Tone(Tone::Error)
             } else if fraction >= 0.8 {
@@ -1163,15 +1510,12 @@ fn relay_usage(app: &App) -> Element<'_, Message> {
     setting(
         t!("settings-uso-del-relay"),
         Some(
-            column![
-                help(summary),
-                ui::caption(t!("settings-uso-del-relay-ayuda")).wrapping(Wrapping::WordOrGlyph)
-            ]
-            .spacing(2)
-            .into(),
+            column![help(summary), note(t!("settings-uso-del-relay-ayuda"))]
+                .spacing(2)
+                .into(),
         ),
         None,
-        ui::reserved(RELAY_BAR, 8.0, bar),
+        ui::reserved(RELAY_BAR, METER_GIRTH, bar),
     )
 }
 
@@ -1581,21 +1925,20 @@ fn audio(app: &App) -> Element<'_, Message> {
         ))
         .width(Length::Fixed(DEVICE_SELECT_WIDTH)),
     );
-    column![
+    groups(vec![
         ui::section_with(
             t!("settings-dispositivos"),
             None,
             Some(devices_freshness(app)),
-            device_rows
+            device_rows,
         ),
         ui::section(t!("settings-tu-voz"), None, voice_rows),
         ui::section(t!("settings-audio-del-juego"), None, vec![game_row]),
-    ]
-    .spacing(space::L)
-    .into()
+    ])
 }
 
-/// «Probar el micrófono»: el botón, el medidor de nivel mientras dura y «Oírte».
+/// «Probar el micrófono»: en una columna del ancho de los selectores y los deslizadores de
+/// arriba, el botón a un lado y «Oírte» al otro, y debajo el medidor de nivel de punta a punta.
 fn mic_test_row(app: &App) -> Element<'_, Message> {
     let state = &app.settings_page;
     let running = state.mic_test.is_some();
@@ -1616,14 +1959,14 @@ fn mic_test_row(app: &App) -> Element<'_, Message> {
         )
     };
     // «Probar» y «Parar» en una ranura del ancho del mayor.
-    let button = steady(
-        vec![start().into(), stop().into()],
-        if running { stop() } else { start() },
+    let button = ui::reserve(
+        [start().into(), stop().into()],
+        Some(if running { stop() } else { start() }.into()),
     );
     let level = state.mic_test.unwrap_or(0.0);
     let meter = progress_bar(0.0..=1.0, level)
-        .length(Length::Fixed(DEVICE_SELECT_WIDTH - 140.0))
-        .girth(Length::Fixed(8.0))
+        .length(Length::Fill)
+        .girth(Length::Fixed(METER_GIRTH))
         .class(ProgressClass::Tone(if level > 0.9 {
             Tone::Warning
         } else {
@@ -1633,19 +1976,17 @@ fn mic_test_row(app: &App) -> Element<'_, Message> {
     // por el micrófono de la sala (eco para los demás). El nivel sigue funcionando.
     let in_room = room_open(app);
     let hear = row![
+        ui::secondary(t!("settings-oirte")),
         ui::switch(
             state.mic_test_hear && !in_room,
             (!in_room).then_some(|on_off| on(Msg::MicTestHear(on_off)))
         ),
-        ui::caption(t!("settings-oirte")),
     ]
     .spacing(space::XS)
     .align_y(Alignment::Center);
     let mut below = column![help(t!("settings-probar-el-microfono-ayuda"))].spacing(2);
     if in_room {
-        below = below.push(
-            ui::caption(t!("settings-oirte-con-sala-abierta")).wrapping(Wrapping::WordOrGlyph),
-        );
+        below = below.push(note(t!("settings-oirte-con-sala-abierta")));
     }
     if let Some(err) = &state.mic_test_error {
         below = below.push(help_error(err.as_str()));
@@ -1655,18 +1996,19 @@ fn mic_test_row(app: &App) -> Element<'_, Message> {
         Some(below.into()),
         None,
         column![
-            row![button, hear]
-                .spacing(space::S)
-                .align_y(Alignment::Center),
+            row![button, ui::fill(), hear].align_y(Alignment::Center),
             meter
         ]
         .spacing(space::XS)
-        .align_x(Alignment::End),
+        .width(Length::Fixed(DEVICE_SELECT_WIDTH)),
     )
 }
 
 /// Ancho de los selectores de audio (los nombres de los dispositivos son largos).
 const DEVICE_SELECT_WIDTH: f32 = 280.0;
+
+/// Grosor de las barras de nivel y de progreso de Ajustes.
+const METER_GIRTH: f32 = 8.0;
 
 // --- Vídeo ---------------------------------------------------------------------------------------
 
@@ -1845,25 +2187,23 @@ fn video(app: &App) -> Element<'_, Message> {
             ),
         ),
     ];
-    column![
+    groups(vec![
         ui::section(
             t!("host-calidad"),
             Some(t!("settings-calidad-ayuda").to_owned()),
-            vec![quality]
+            vec![quality],
         ),
         ui::section(
             t!("host-avanzado"),
             Some(t!("host-avanzado-desplegado").to_owned()),
-            advanced
+            advanced,
         ),
         ui::section(
             t!("settings-en-tu-pantalla"),
             Some(t!("settings-en-tu-pantalla-ayuda").to_owned()),
-            screen
+            screen,
         ),
-    ]
-    .spacing(space::L)
-    .into()
+    ])
 }
 
 // --- Sala ----------------------------------------------------------------------------------------
@@ -1882,7 +2222,7 @@ fn room(app: &App) -> Element<'_, Message> {
     if REMEMBERS_SHARE_PERMISSION {
         as_host.push(share_permission_row(app));
     }
-    column![
+    groups(vec![
         ui::section(t!("settings-como-anfitrion"), None, as_host),
         ui::section(
             t!("settings-como-invitado"),
@@ -1897,9 +2237,7 @@ fn room(app: &App) -> Element<'_, Message> {
                 ),
             )],
         ),
-    ]
-    .spacing(space::L)
-    .into()
+    ])
 }
 
 /// Fila del permiso de pantalla del portal (Linux): para qué fuentes se recuerda y «Olvidar el
@@ -1924,7 +2262,7 @@ fn share_permission_row(app: &App) -> Element<'_, Message> {
     .to_vec();
     let below = column![
         varying(variants, help(current)),
-        ui::caption(t!("settings-permiso-de-pantalla-ayuda")).wrapping(Wrapping::WordOrGlyph),
+        note(t!("settings-permiso-de-pantalla-ayuda")),
     ]
     .spacing(2);
     setting(
@@ -2186,7 +2524,7 @@ fn notifications<'a>(app: &'a App) -> Element<'a, Message> {
         ))
         .width(Length::Fixed(TONE_SELECT_WIDTH + 110.0)),
     );
-    column![
+    groups(vec![
         ui::section(
             t!("settings-sonido"),
             None,
@@ -2195,7 +2533,7 @@ fn notifications<'a>(app: &'a App) -> Element<'a, Message> {
                 interface_sounds,
                 interface_volume_row,
                 cue_previews(),
-            ]
+            ],
         ),
         ui::section(
             t!("settings-avisos-en-la-sala"),
@@ -2217,15 +2555,18 @@ fn notifications<'a>(app: &'a App) -> Element<'a, Message> {
                 SoundEvent::FriendRequest,
             ]),
         ),
-        ui::section(
-            t!("settings-chat-de-la-sala"),
-            Some(t!("settings-chat-de-la-sala-ayuda").to_owned()),
-            chat
-        ),
-        ui::caption(files).wrapping(Wrapping::WordOrGlyph),
-    ]
-    .spacing(space::L)
-    .into()
+        column![
+            ui::section(
+                t!("settings-chat-de-la-sala"),
+                Some(t!("settings-chat-de-la-sala-ayuda").to_owned()),
+                chat,
+            ),
+            // La nota de los ficheros de tono, pegada al último grupo y alineada con sus filas.
+            container(note(files)).padding(Padding::from([0.0, space::M])),
+        ]
+        .spacing(space::XS)
+        .into(),
+    ])
 }
 
 // --- Mandos --------------------------------------------------------------------------------------
@@ -2257,19 +2598,27 @@ fn gamepads<'a>(app: &'a App) -> Element<'a, Message> {
         Some(Applies::Now),
         steady(vec![auto_control(), back_to_auto()], pad_control),
     );
-    let max = coroom_session::input::max_gamepads();
-    let mut slots = vec![choice(0u8, t!("settings-la-primera-libre"))];
     let connected_row = connected_pads(app);
-    slots.extend((1..=max).map(|slot| choice(slot, t!("settings-ranura", slot = slot))));
-    let slot = slots
-        .iter()
-        .find(|c| c.value == input.preferred_slot)
-        .cloned();
-    column![
+    // Las ranuras de la sala, todas a la vista con su número: «La primera libre» y de la 1 a la
+    // última, en un selector segmentado (son cuatro, ocho como mucho).
+    let max = coroom_session::input::max_gamepads();
+    let slots = ui::segmented(
+        std::iter::once((t!("settings-la-primera-libre").to_owned(), 0u8))
+            .chain((1..=max).map(|slot| (slot.to_string(), slot)))
+            .map(|(label, slot)| {
+                (
+                    label.clone(),
+                    on(Msg::PreferredSlot(choice(slot, label))),
+                    input.preferred_slot == slot,
+                )
+            })
+            .collect(),
+    );
+    groups(vec![
         ui::section(
             t!("settings-como-invitado"),
             None,
-            vec![pad_row, connected_row]
+            vec![pad_row, connected_row],
         ),
         ui::section(
             t!("settings-como-anfitrion"),
@@ -2278,12 +2627,10 @@ fn gamepads<'a>(app: &'a App) -> Element<'a, Message> {
                 t!("settings-ranura-preferida"),
                 Some(help(t!("settings-ranura-preferida-ayuda"))),
                 None,
-                ui::select(slots, slot, |c| on(Msg::PreferredSlot(c))),
+                slots,
             )],
         ),
-    ]
-    .spacing(space::L)
-    .into()
+    ])
 }
 
 /// «Mandos conectados»: dentro de una sala, los mandos de este equipo (los ve la sesión) para
@@ -2350,34 +2697,38 @@ fn shortcut_names() -> [&'static str; 9] {
     ]
 }
 
-/// Una fila de la tabla de atajos: qué hace y dónde vale a la izquierda; sus teclas (o «Pulsa
-/// una letra…» mientras se cambia) y «Cambiar» o «Cancelar» a la derecha, cada cosa en su
-/// columna de ancho fijo. `capture`: cómo se cambia (sin él, el atajo es fijo).
+/// Una fila de la tabla de atajos: qué hace a la izquierda y, en dos columnas de ancho fijo, sus
+/// teclas (o «Pulsa una letra…» mientras se cambia) y «Cambiar» o «Cancelar». Las teclas van
+/// alineadas por su comienzo, así «Ctrl» y «Alt» caen uno bajo otro en todas las filas, también
+/// en las de los atajos fijos. `context`: dónde vale, si no lo dice ya el grupo; `capture`: cómo
+/// se cambia (sin él, el atajo es fijo).
 fn shortcut_row<'a>(
     app: &App,
     name: &'a str,
-    context: &'a str,
+    context: Option<&'a str>,
     keys: Element<'a, Message>,
     capture: Option<Capture>,
 ) -> Element<'a, Message> {
     let capturing = capture.is_some() && app.settings_page.capturing == capture;
-    let prompt = match capture {
+    // Lo que se espera mientras se cambia, en acento: es lo que está pasando en la fila.
+    let prompt = |label: &'a str| -> Element<'a, Message> {
+        ui::secondary(label)
+            .class(TextClass::Accent)
+            .wrapping(Wrapping::None)
+            .into()
+    };
+    let waiting = match capture {
         Some(Capture::PushToTalk) => t!("settings-pulsa-una-tecla"),
         _ => t!("settings-pulsa-una-letra"),
     };
     let keys_slot = ui::reserve(
         [
             shortcut_caps('W'),
-            ui::caption(t!("settings-pulsa-una-letra")).into(),
-            ui::caption(t!("settings-pulsa-una-tecla")).into(),
+            prompt(t!("settings-pulsa-una-letra")),
+            prompt(t!("settings-pulsa-una-tecla")),
         ],
-        Some(if capturing {
-            ui::caption(prompt).into()
-        } else {
-            keys
-        }),
-    )
-    .align_x(Horizontal::Right);
+        Some(if capturing { prompt(waiting) } else { keys }),
+    );
     let action = capture.map(|capture| -> Element<'a, Message> {
         if capturing {
             ui::flat(t!("settings-cancelar"), Some(on(Msg::CancelCapture))).into()
@@ -2393,21 +2744,25 @@ fn shortcut_row<'a>(
         action,
     )
     .align_x(Horizontal::Right);
-    setting(
+    line(
         name,
-        Some(help(context)),
         None,
+        None,
+        context.map(help),
         row![keys_slot, action_slot]
-            .spacing(space::S)
-            .align_y(Alignment::Center),
+            .spacing(space::L)
+            .align_y(Alignment::Center)
+            .into(),
+        Density::Table,
     )
 }
 
-/// Todos los atajos en una tabla: los del invitado, pulsar para hablar y los de la aplicación.
+/// Todos los atajos en dos tablas, por dónde valen: los de la sala (los del invitado y pulsar
+/// para hablar, que se cambian) y los de toda la aplicación (fijos).
 fn shortcuts(app: &App) -> Element<'_, Message> {
     let input = &app.settings.input;
     let letters = input.shortcuts.letters();
-    let mut rows: Vec<Element<'_, Message>> = shortcut_names()
+    let mut in_room: Vec<Element<'_, Message>> = shortcut_names()
         .into_iter()
         .zip(letters)
         .enumerate()
@@ -2415,46 +2770,44 @@ fn shortcuts(app: &App) -> Element<'_, Message> {
             shortcut_row(
                 app,
                 name,
-                t!("settings-atajo-en-la-sala"),
+                None,
                 shortcut_caps(letter),
                 Some(Capture::Shortcut(index)),
             )
         })
         .collect();
-    rows.push(shortcut_row(
+    in_room.push(shortcut_row(
         app,
         t!("settings-pulsar-para-hablar"),
-        t!("settings-atajo-pulsar-para-hablar"),
+        Some(t!("settings-atajo-pulsar-para-hablar")),
         ui::shortcut(&[app.settings.audio.push_to_talk_key.as_str()]),
         Some(Capture::PushToTalk),
     ));
-    for (name, keys) in [
+    let everywhere = [
         (t!("settings-atajo-ajustes"), &["Ctrl", ","][..]),
         (t!("settings-atajo-pantalla-completa"), &["F11"][..]),
         (t!("settings-atajo-cerrar-dialogos"), &["Esc"][..]),
         (t!("settings-atajo-salir-de-coroom"), &["Ctrl", "Q"][..]),
-    ] {
-        rows.push(shortcut_row(
-            app,
-            name,
-            t!("settings-atajo-en-toda-la-app"),
-            ui::shortcut(keys),
-            None,
-        ));
-    }
+    ]
+    .into_iter()
+    .map(|(name, keys)| shortcut_row(app, name, None, ui::shortcut(keys), None))
+    .collect();
     let defaults = input.shortcuts == Shortcuts::default();
-    ui::section_with(
-        t!("settings-atajos-de-teclado"),
-        Some(t!("settings-atajos-ayuda").to_owned()),
-        Some(
-            ui::flat(
-                t!("settings-restablecer"),
-                (!defaults).then_some(on(Msg::ResetShortcuts)),
-            )
-            .into(),
+    groups(vec![
+        ui::section_with(
+            t!("settings-atajo-en-la-sala"),
+            Some(t!("settings-atajos-ayuda").to_owned()),
+            Some(
+                ui::flat(
+                    t!("settings-restablecer"),
+                    (!defaults).then_some(on(Msg::ResetShortcuts)),
+                )
+                .into(),
+            ),
+            in_room,
         ),
-        rows,
-    )
+        ui::section(t!("settings-atajo-en-toda-la-app"), None, everywhere),
+    ])
 }
 
 fn shortcut_caps<'a>(letter: char) -> Element<'a, Message> {
@@ -2510,21 +2863,16 @@ fn appearance(app: &App) -> Element<'_, Message> {
         t!("settings-siempre-oscuro").to_owned(),
     ];
     let follows_system = current.accent == "system";
-    let mut swatches = Row::new().spacing(space::XS).align_y(Alignment::Center);
-    swatches = swatches.push(ui::button_with(
-        if follows_system {
-            Kind::Primary
-        } else {
-            Kind::Normal
-        },
-        t!("settings-del-sistema"),
-        follows_system.then_some(Icon::Check),
-        Some(on(Msg::Accent("system".to_owned()))),
-    ));
+    // «Del sistema» y las muestras, con lo elegido marcado igual en los dos: el borde o el anillo
+    // de acento y una marca de visto.
+    let mut swatches = Row::new()
+        .spacing(space::XXS)
+        .align_y(Alignment::Center)
+        .push(system_accent_chip(follows_system))
+        .push(ui::gap(space::XXS));
+    let chosen = chosen_accent(app);
     for accent in Accent::NAMED {
-        let key = accent.key();
-        let selected = current.accent == key;
-        swatches = swatches.push(swatch(accent, key, selected));
+        swatches = swatches.push(swatch(accent, accent.key(), chosen == Some(accent)));
     }
     let system_accent = t!(
         "settings-acento-del-sistema",
@@ -2586,62 +2934,120 @@ fn appearance(app: &App) -> Element<'_, Message> {
         t!("settings-solo-fundidos-cortos").to_owned(),
         t!("settings-siempre-completas").to_owned(),
     ];
-    ui::section(
-        t!("settings-apariencia"),
-        None,
-        vec![
-            setting(
-                t!("settings-tema"),
-                Some(varying(theme_variants, help(theme_hint))),
-                None,
-                theme,
-            ),
-            setting(
-                t!("settings-color-de-acento"),
-                Some(
-                    column![varying(accent_variants, help(accent_hint)), swatches.wrap()]
-                        .spacing(space::XS)
-                        .into(),
+    groups(vec![
+        ui::section(
+            t!("settings-colores"),
+            None,
+            vec![
+                setting(
+                    t!("settings-tema"),
+                    Some(varying(theme_variants, help(theme_hint))),
+                    None,
+                    theme,
                 ),
-                None,
-                ui::gap(0.0),
-            ),
-            setting(
-                t!("settings-fuente"),
-                Some(help(font_hint)),
-                None,
-                icon_with(Icon::Lock, 16.0, SvgClass::Secondary),
-            ),
-            setting(
-                t!("settings-animaciones"),
-                Some(varying(motion_variants, help(motion_hint))),
-                None,
-                motion,
-            ),
-        ],
-    )
+                setting(
+                    t!("settings-color-de-acento"),
+                    Some(
+                        column![varying(accent_variants, help(accent_hint)), swatches.wrap()]
+                            .spacing(space::XS)
+                            .into(),
+                    ),
+                    None,
+                    ui::gap(0.0),
+                ),
+            ],
+        ),
+        ui::section(
+            t!("settings-texto-y-movimiento"),
+            None,
+            vec![
+                setting(
+                    t!("settings-fuente"),
+                    Some(help(font_hint)),
+                    None,
+                    ui::with_tooltip(
+                        icon_with(Icon::Lock, 16.0, SvgClass::Secondary),
+                        t!("settings-fuente-del-sistema"),
+                    ),
+                ),
+                setting(
+                    t!("settings-animaciones"),
+                    Some(varying(motion_variants, help(motion_hint))),
+                    None,
+                    motion,
+                ),
+            ],
+        ),
+    ])
 }
 
-/// Muestra de un acento de GNOME, con su nombre al pasar el ratón.
+/// El acento elegido a mano entre las muestras (`None` si se sigue al sistema): el que está en
+/// uso, también si se guardó con su nombre de GNOME en inglés («purple») y no con la clave que
+/// escribe coroom.
+fn chosen_accent(app: &App) -> Option<Accent> {
+    (app.settings.appearance.accent != "system").then(|| app.accent())
+}
+
+/// Lado de una muestra de acento.
+const SWATCH: f32 = 26.0;
+
+/// Lo que ocupa alrededor de cada muestra el anillo de la elegida: sus 2 px y 3 de hueco. Todas
+/// lo reservan, así elegir otra no mueve ninguna.
+const SWATCH_RING: f32 = 5.0;
+
+/// «Del sistema» entre las opciones del acento: una ficha que, elegida, lleva el relleno suave y
+/// el borde de acento con la marca de visto. Mide lo mismo elegida o no (la marca tiene su
+/// sitio), así las muestras de al lado no se mueven.
+fn system_accent_chip<'a>(selected: bool) -> Element<'a, Message> {
+    let label = || {
+        text(t!("settings-del-sistema"))
+            .size(type_size::BODY)
+            .font(coroom_ui::font::SEMIBOLD)
+            .wrapping(Wrapping::None)
+    };
+    let checked = || -> Element<'a, Message> {
+        row![icon_with(Icon::Check, 16.0, SvgClass::Accent), label()]
+            .spacing(space::XS)
+            .align_y(Alignment::Center)
+            .into()
+    };
+    button(ui::steady(
+        [checked()],
+        if selected { checked() } else { label().into() },
+    ))
+    .padding(Padding::from([8.0, 14.0]))
+    .class(ButtonClass::Choice { selected })
+    .on_press(on(Msg::Accent("system".to_owned())))
+    .into()
+}
+
+/// Muestra de un acento de GNOME, con su nombre al pasar el ratón. La elegida lleva la marca de
+/// visto y, alrededor y separado de ella, un anillo del acento: se distingue también cuando la
+/// muestra y el acento son del mismo color.
 fn swatch<'a>(accent: Accent, key: String, selected: bool) -> Element<'a, Message> {
+    let sample = button(if selected {
+        Element::from(iced_widget::center(icon_with(
+            Icon::Check,
+            14.0,
+            SvgClass::OnAccent,
+        )))
+    } else {
+        ui::gap(0.0)
+    })
+    .width(Length::Fixed(SWATCH))
+    .height(Length::Fixed(SWATCH))
+    .padding(0)
+    .class(ButtonClass::Swatch {
+        color: accent.rgb(),
+        selected: false,
+    })
+    .on_press(on(Msg::Accent(key)));
     ui::with_tooltip(
-        button(if selected {
-            Element::from(iced_widget::center(icon_with(
-                Icon::Check,
-                16.0,
-                SvgClass::OnAccent,
-            )))
+        container(sample).padding(SWATCH_RING).class(if selected {
+            ContainerClass::AvatarRing(Tone::Info)
         } else {
-            ui::gap(0.0)
-        })
-        .width(Length::Fixed(28.0))
-        .height(Length::Fixed(28.0))
-        .padding(0)
-        .class(ButtonClass::Swatch {
-            color: accent.rgb(),
-            selected,
-        })
-        .on_press(on(Msg::Accent(key))),
+            ContainerClass::Transparent
+        }),
         accent.label(),
     )
 }
@@ -2656,8 +3062,16 @@ pub fn release_page(version: &str) -> String {
 fn updates<'a>(app: &'a App) -> Vec<Element<'a, Message>> {
     let updates = &app.settings.updates;
     let disabled = crate::update::disabled_by_env();
-    // El texto y la acción de cada punto de la versión nueva ([`super::updates`]).
+    // El texto y la acción de cada punto de la versión nueva ([`super::updates`]). Mientras
+    // descarga (o con la descarga en pausa), en el sitio de la acción va el progreso con su
+    // porcentaje en cifras.
     let (status, action) = super::updates::status(app);
+    let action = match app.update.updater.stage() {
+        _ if disabled || app.update.checking => action,
+        Stage::Downloading(progress) => download_progress(*progress, false),
+        Stage::Paused(progress) => download_progress(*progress, true),
+        _ => action,
+    };
     // Del alto de la más larga de las que pueden salir sin más datos (y de la de ahora).
     let status_variants = vec![
         t!("settings-comprobando-en-las-publicaciones").to_owned(),
@@ -2729,37 +3143,83 @@ fn updates<'a>(app: &'a App) -> Vec<Element<'a, Message>> {
     ]
 }
 
-fn license_row<'a>(name: &'a str, license: &'a str) -> Element<'a, Message> {
-    setting(name, Some(help(license)), None, ui::gap(0.0))
+/// Ancho de la barra de la descarga de la versión nueva.
+const DOWNLOAD_BAR: f32 = 200.0;
+
+/// El progreso de la descarga de la versión nueva: el porcentaje en cifras sobre su barra, que
+/// se apaga con la descarga en pausa (la frase de la fila dice por qué).
+fn download_progress<'a>(progress: Progress, paused: bool) -> Element<'a, Message> {
+    column![
+        ui::strong(t!("settings-porcentaje", percent = progress.percent())),
+        progress_bar(0.0..=1.0, progress.fraction)
+            .length(Length::Fixed(DOWNLOAD_BAR))
+            .girth(Length::Fixed(METER_GIRTH))
+            .class(if paused {
+                ProgressClass::Tone(Tone::Neutral)
+            } else {
+                ProgressClass::Accent
+            }),
+    ]
+    .spacing(space::XXS)
+    .align_x(Alignment::End)
+    .into()
 }
 
+/// Ancho máximo de la licencia de una fila de «Licencias y atribuciones».
+const LICENSE_WIDTH: f32 = 520.0;
+
+/// Fila de la tabla de licencias: de qué es a la izquierda y su licencia a la derecha, alineada
+/// con las demás.
+fn license_row<'a>(name: &'a str, license: &'a str) -> Element<'a, Message> {
+    line(
+        name,
+        None,
+        None,
+        None,
+        container(
+            ui::secondary(license)
+                .wrapping(Wrapping::WordOrGlyph)
+                .align_x(Horizontal::Right),
+        )
+        .max_width(LICENSE_WIDTH)
+        .padding(Padding::from([4.0, 0.0]))
+        .into(),
+        Density::Table,
+    )
+}
+
+/// Lado del icono de coroom en la cabecera de «Acerca de».
+const BRAND_ICON: f32 = 40.0;
+
 fn about(app: &App) -> Element<'_, Message> {
-    let header = ui::card(
-        row![
-            icon_with(Icon::RadioTower, 44.0, SvgClass::Accent),
-            column![
-                ui::title("coroom"),
-                ui::secondary(t!(
-                    "settings-version-y-protocolo",
-                    version = app.version,
-                    protocol = PROTOCOL_VERSION
-                )),
-                ui::caption(t!("settings-juego-remoto-con-amigos"))
-            ]
-            .spacing(4)
-            .width(Length::Fill),
-            ui::button_with(
-                Kind::Flat,
-                t!("settings-notas-de-esta-version"),
-                Some(Icon::ExternalLink),
-                Some(Message::OpenUrl(release_page(app.version))),
-            )
-        ]
-        .spacing(space::M)
-        .align_y(Alignment::Center),
+    // Qué es y qué versión, sobre el fondo de la página (no en una tarjeta más): es la cabecera
+    // de la sección, y lo que se puede hacer va en los grupos de debajo. De más a menos: el
+    // nombre, la versión y qué es.
+    let texts = column![
+        ui::heading("coroom"),
+        ui::body(t!(
+            "settings-version-y-protocolo",
+            version = app.version,
+            protocol = PROTOCOL_VERSION
+        )),
+        help(t!("settings-juego-remoto-con-amigos")),
+    ]
+    .spacing(2)
+    .width(Length::Fill);
+    let notes = ui::button_with(
+        Kind::Flat,
+        t!("settings-notas-de-esta-version"),
+        Some(Icon::ExternalLink),
+        Some(Message::OpenUrl(release_page(app.version))),
     );
-    column![
-        header,
+    let header = row![
+        icon_with(Icon::RadioTower, BRAND_ICON, SvgClass::Accent),
+        beside::Beside::new(texts, notes.into(), Density::Setting.text_min()),
+    ]
+    .spacing(space::M)
+    .align_y(Alignment::Center);
+    groups(vec![
+        header.into(),
         ui::section(t!("settings-versiones"), None, updates(app)),
         ui::section(
             t!("settings-licencias"),
@@ -2773,13 +3233,11 @@ fn about(app: &App) -> Element<'_, Message> {
                 license_row("FFmpeg", t!("settings-licencia-ffmpeg")),
                 license_row(
                     t!("settings-dependencias-de-rust"),
-                    t!("settings-licencia-dependencias")
+                    t!("settings-licencia-dependencias"),
                 ),
-            ]
+            ],
         ),
-    ]
-    .spacing(space::L)
-    .into()
+    ])
 }
 
 /// Escenas de Ajustes para las capturas.
@@ -2929,6 +3387,12 @@ pub(crate) mod shots {
         ("20-ajustes-apariencia", |app| {
             settings_page(app, SettingsPage::Appearance)
         }),
+        // Un acento elegido a mano: su muestra lleva el anillo y la marca, y toda la ventana se
+        // tiñe con él.
+        ("20-ajustes-apariencia-acento", |app| {
+            settings_page(app, SettingsPage::Appearance);
+            app.update(Message::Settings(super::Msg::Accent("green".to_owned())));
+        }),
         ("21-ajustes-acerca", |app| {
             settings_page(app, SettingsPage::About)
         }),
@@ -2995,20 +3459,29 @@ fn cue_previews<'a>() -> Element<'a, Message> {
             .spacing(space::XS)
             .align_y(Alignment::Center),
         )
-        .class(ButtonClass::Flat)
+        .class(ButtonClass::Normal)
         .padding(Padding::from([4.0, 10.0]))
         // Sin el «toc» del botón: se oye solo el sonido elegido.
         .cue(None)
         .on_press(Message::Settings(Msg::PreviewCue(cue)))
         .into()
     });
+    // Los diez botones bajo la descripción, a lo ancho de la fila: al lado no caben sin
+    // estrecharla hasta partirla en tres líneas.
     setting(
         t!("settings-escuchar-los-sonidos"),
-        Some(help(t!("settings-escuchar-los-sonidos-ayuda"))),
-        None,
-        iced_widget::Row::with_children(buttons)
+        Some(
+            column![
+                help(t!("settings-escuchar-los-sonidos-ayuda")),
+                iced_widget::Row::with_children(buttons)
+                    .spacing(space::XS)
+                    .wrap(),
+            ]
             .spacing(space::XS)
-            .wrap(),
+            .into(),
+        ),
+        None,
+        ui::gap(0.0),
     )
 }
 
@@ -3674,6 +4147,45 @@ mod tests {
             assert_eq!(app.settings_page.page, page);
             let _ = view(&app);
         }
+    }
+
+    /// El control de una fila va junto al texto mientras le deje un ancho legible; si no, baja
+    /// debajo. Con la ventana de arranque ninguno baja; con la mínima, los anchos sí y los
+    /// interruptores no.
+    #[test]
+    fn a_wide_control_goes_below_its_text_only_when_there_is_no_room() {
+        let text_min = Density::Setting.text_min();
+        // La fila de una ventana de 1180 px: unos 800 px.
+        for control in [44.0, DEVICE_SELECT_WIDTH, TONE_SELECT_WIDTH + 110.0] {
+            assert!(beside::fits(800.0, control, text_min), "{control}");
+        }
+        // La de la ventana mínima (760 px): unos 390 px.
+        assert!(
+            beside::fits(390.0, 44.0, text_min),
+            "un interruptor cabe siempre"
+        );
+        assert!(!beside::fits(390.0, DEVICE_SELECT_WIDTH, text_min));
+        // Sin control (lo suyo va bajo la descripción), el texto ocupa toda la fila.
+        assert!(beside::fits(100.0, 0.0, text_min));
+        // Las tablas aguantan más antes de partirse.
+        assert!(Density::Table.text_min() < text_min);
+        assert!(Density::Table.padding().top < Density::Setting.padding().top);
+    }
+
+    /// La muestra marcada en Apariencia es la del acento en uso: ninguna si se sigue al sistema,
+    /// y la suya tanto si se guardó con la clave de coroom como con el nombre de GNOME.
+    #[test]
+    fn the_marked_swatch_is_the_accent_in_use() {
+        let mut app = open(SettingsPage::Appearance);
+        assert_eq!(app.settings.appearance.accent, "system");
+        assert_eq!(chosen_accent(&app), None);
+        app.update(Message::Settings(Msg::Accent(Accent::Green.key())));
+        assert_eq!(chosen_accent(&app), Some(Accent::Green));
+        app.update(Message::Settings(Msg::Accent("purple".to_owned())));
+        assert_eq!(chosen_accent(&app), Some(Accent::Purple));
+        let _ = view(&app);
+        app.update(Message::Settings(Msg::Accent("system".to_owned())));
+        assert_eq!(chosen_accent(&app), None);
     }
 
     /// Un solo nombre para cada cosa (la tabla de la especificación) y las etiquetas de cuándo

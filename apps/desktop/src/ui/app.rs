@@ -2240,7 +2240,8 @@ impl App {
         self.motion().exit_duration(coroom_ui::motion::Token::Panel)
     }
 
-    /// Cabecera arriba y, debajo, el riel y la página (que entra deslizándose al cambiar).
+    /// El riel a la izquierda, de arriba abajo, y a su derecha la cabecera de la página y la
+    /// página (que entra deslizándose al cambiar).
     fn shell(&self) -> Element<'_, Message> {
         use coroom_ui::animate::Shift;
         let page: Element<'_, Message> = match self.page {
@@ -2262,15 +2263,20 @@ impl App {
         .width(Length::Fill)
         .height(Length::Fill)
         .clip(true);
-        // Una línea fina por encima y por debajo de la cabecera, que además lleva el tono de las
-        // tarjetas y más aire vertical: con la barra de título del sistema (KDE) encima, del mismo
-        // gris que la barra lateral, las dos se leían como una sola barra gruesa con el título
-        // pegado arriba.
+        // Una línea fina arriba del todo: con la barra de título del sistema (KDE) encima, la
+        // cabecera y ella se leían como una sola barra gruesa. El riel llega hasta esa línea, con
+        // la marca a la altura del título; la línea de debajo de la cabecera cae donde empiezan
+        // los destinos ([`HEADERBAR_HEIGHT`]).
         column![
             iced_widget::rule::horizontal(1),
-            self.headerbar(),
-            iced_widget::rule::horizontal(1),
-            row![self.rail(), iced_widget::rule::vertical(1), page].height(Length::Fill)
+            row![
+                self.rail(),
+                iced_widget::rule::vertical(1),
+                column![self.headerbar(), iced_widget::rule::horizontal(1), page]
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            ]
+            .height(Length::Fill)
         ]
         .height(Length::Fill)
         .into()
@@ -2351,18 +2357,26 @@ impl App {
         }
     }
 
-    /// Cabecera: el título de la página a la izquierda y la insignia del servidor a la derecha
-    /// (un clic abre el diagnóstico). Los destinos, la sala en vivo y la cuenta están en el riel.
+    /// Cabecera de la página: su título (26, seminegrita) a la izquierda y la píldora del servidor
+    /// a la derecha, con su lámpara y la latencia siempre a la vista (un clic abre el
+    /// diagnóstico). La marca, los destinos, la sala en vivo y la cuenta están en el riel.
     fn headerbar(&self) -> Element<'_, Message> {
         use coroom_ui::style::ContainerClass;
         use iced_widget::button;
-        let mut left = row![ui::heading(self.page_title())]
-            .spacing(8)
+        // La sala abierta lleva su propio título en la página (el nombre de la sala), como la
+        // sala de otro: ahí la cabecera dice el destino en pequeño y no compite con él.
+        let title = if self.page == Page::Host && self.host.room.is_some() {
+            ui::heading(self.page_title())
+        } else {
+            ui::title(self.page_title())
+        };
+        let mut left = row![title]
+            .spacing(coroom_ui::tokens::space::S)
             .align_y(Alignment::Center);
         // El subtítulo va al lado del título y no debajo: en dos líneas no cabría con aire en el
         // alto de la cabecera.
         if let Some(subtitle) = self.page_subtitle() {
-            left = left.push(ui::caption(subtitle));
+            left = left.push(ui::secondary(subtitle));
         }
         let server = ui::with_tooltip(
             button(self.server_badge())
@@ -2376,20 +2390,28 @@ impl App {
                 .align_y(Alignment::Center)
                 .width(Length::Fill),
         )
-        // Centrado en vertical: sin `center_y`, la fila (del alto de un botón) quedaba arriba,
-        // pegada a la barra de título del sistema.
-        .padding(Padding::from([0.0, coroom_ui::tokens::space::M]))
+        .padding(Padding::from([0.0, coroom_ui::tokens::space::L]))
         .center_y(Length::Fixed(HEADERBAR_HEIGHT))
         .class(ContainerClass::Headerbar)
         .into()
     }
 
-    /// El riel junto al vídeo del invitado, bajo una franja del alto de la cabecera de las demás
-    /// páginas y sus dos líneas ([`SHELL_TOP`]): sin ella el riel empezaba arriba del todo y, al
-    /// ir del vídeo a Inicio o volver, sus iconos y nombres saltaban el alto de la cabecera.
+    /// La lámpara de la butaca propia: verde con conexión con el servidor, gris sin ella y nada
+    /// mientras no se sabe. La píldora de la cabecera lo dice en palabras.
+    pub fn own_lamp(&self) -> Option<Tone> {
+        match self.server_status.online {
+            Some(true) => Some(Tone::Success),
+            Some(false) => Some(Tone::Neutral),
+            None => None,
+        }
+    }
+
+    /// El riel junto al vídeo del invitado, bajo el mismo píxel que ocupa la línea de arriba de
+    /// las demás páginas ([`App::shell`]): al ir del vídeo a Inicio o volver, la marca, los
+    /// iconos y los nombres no se mueven.
     fn guest_rail(&self) -> Element<'_, Message> {
         container(column![
-            iced_widget::Space::new().height(Length::Fixed(SHELL_TOP)),
+            iced_widget::Space::new().height(Length::Fixed(1.0)),
             self.rail(),
         ])
         .height(Length::Fill)
@@ -2451,10 +2473,16 @@ impl App {
             item(Page::Friends, Icon::Users, t!("app-amigos"), "Ctrl+2"),
             sala,
         ];
+        // La cuenta es la butaca propia, con la lámpara de la conexión con el servidor.
         let account_glyph: Element<'_, Message> = match &self.account {
-            Some(account) => {
-                avatars::view(self, &account.display_name, account.avatar, RAIL_AVATAR)
-            }
+            Some(account) => coroom_ui::avatar::seat_lamp(
+                &self.theme,
+                &account.display_name,
+                avatars::of(self, account.avatar),
+                RAIL_AVATAR,
+                self.own_lamp(),
+                coroom_ui::style::Surface::Sidebar,
+            ),
             None => glyph(Page::Account, Icon::UserRound),
         };
         let bottom = vec![
@@ -2495,7 +2523,7 @@ impl App {
             .into()
     }
 
-    /// El punto rojo de «Sala» mientras se comparte: late una vez al empezar (un anillo que se
+    /// El piloto rojo de «Sala» mientras se comparte: late una vez al empezar (un anillo que se
     /// abre) y después queda quieto. En una caja fija: el latido no mueve nada.
     fn live_mark(&self) -> Element<'_, Message> {
         use coroom_ui::style::ContainerClass;
@@ -2506,7 +2534,7 @@ impl App {
                 container(iced_widget::Space::new())
                     .width(Length::Fixed(side))
                     .height(Length::Fixed(side))
-                    .class(ContainerClass::AvatarRing(Tone::Error))
+                    .class(ContainerClass::AvatarRing(Tone::Live))
                     .into()
             }
             None => iced_widget::Space::new().into(),
@@ -2517,7 +2545,7 @@ impl App {
                 container(iced_widget::Space::new())
                     .width(Length::Fixed(dot))
                     .height(Length::Fixed(dot))
-                    .class(ContainerClass::Dot(Tone::Error))
+                    .class(ContainerClass::Dot(Tone::Live))
             ),
         ]
         .width(Length::Fixed(LIVE_MARK))
@@ -2771,7 +2799,7 @@ impl App {
     }
 }
 
-/// Tamaño de la marca (el icono de la antena) en la cabecera.
+/// Tamaño de la marca (el icono de la antena) en el riel.
 const BRAND_ICON: f32 = 22.0;
 
 /// Lado de los iconos de los destinos del riel.
@@ -2796,14 +2824,11 @@ pub const RAIL_MIC_ID: &str = "rail-mic";
 /// movió nada del riel).
 pub const RAIL_ACCOUNT_ID: &str = "rail-account";
 
-/// Alto de la cabecera en píxeles lógicos: la marca, centrada, queda a la misma distancia del
-/// borde de arriba (la barra de título del sistema) y de abajo que del borde izquierdo de la
-/// ventana (`space::S`), como en la barra de cabecera de GNOME.
-pub const HEADERBAR_HEIGHT: f32 = BRAND_ICON + 2.0 * coroom_ui::tokens::space::S;
-
-/// Dónde empiezan el riel y la página bajo la cabecera ([`App::shell`]): la cabecera y una línea
-/// de 1 px por encima y otra por debajo. El riel del invitado empieza a la misma altura.
-const SHELL_TOP: f32 = HEADERBAR_HEIGHT + 2.0;
+/// Alto de la cabecera de la página en píxeles lógicos: lo que ocupa en el riel la marca con su
+/// aire (el margen de arriba, su ranura y el hueco hasta los destinos). Así el título queda a la
+/// altura de la marca y la línea de debajo de la cabecera, donde empiezan los destinos. Cabe el
+/// título de página (26 px) con aire.
+pub const HEADERBAR_HEIGHT: f32 = ui::RAIL_ITEM + 2.0 * coroom_ui::tokens::space::XS;
 
 /// Cuánto se espera tras el último cambio de ajustes para guardarlos.
 pub const SETTINGS_SAVE_DELAY: Duration = Duration::from_millis(600);

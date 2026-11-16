@@ -1,28 +1,36 @@
-//! Pantalla «Compartir» (anfitrión), según el boceto aprobado.
+//! Pantalla «Compartir» (anfitrión).
 //!
-//! Antes de abrir la sala: arriba, **Qué compartir** (Pantalla o Ventana, las dos con el audio de
-//! todas las aplicaciones salvo las quitadas) con el monitor o la ventana, y **A quién invitar**
-//! con la lista de amigos en vivo (los marcados se invitan en cuanto el servidor crea la sala);
-//! debajo, la **calidad** en tres perfiles ([`QualityPreset`]) y **Avanzado** plegado (resolución,
+//! Antes de abrir la sala, un solo flujo de arriba abajo, cada grupo con su título: **Qué
+//! compartir** (Pantalla, Ventana o Solo voz, con el monitor o la ventana; las dos primeras con
+//! el audio de todas las aplicaciones salvo las quitadas) y, a su lado, **A quién invitar** con
+//! la lista de amigos en vivo (los marcados se invitan en cuanto el servidor crea la sala);
+//! **Calidad** en tres perfiles ([`QualityPreset`]) con **Avanzado** plegado debajo (resolución,
 //! fps, códec y codificador, tope del bitrate Auto, 4:4:4 y HDR), cada fila con «En vivo» o «Al
-//! abrir la sala» según [`Video::when`]; el audio que se envía y la voz; y «Abrir la sala e
-//! invitar». La vista previa no existe hasta abrir la sala (la captura arranca con ella): hasta
-//! entonces, un marcador. Donde el sistema elige el monitor o la ventana con su propio selector
-//! (el portal en Wayland), «Elegir…» lo abre ya y la elección se repite al abrir con su token;
-//! donde no, se elige aquí de la lista. La lista de audio son las aplicaciones que suenan,
-//! refrescadas cada [`REFRESH`].
+//! abrir la sala» según [`Video::when`]; y **Audio y voz**, lo que se envía y quién habla. Abajo,
+//! fija, la barra con el resumen de lo que se abrirá y «Abrir la sala» (siempre a la vista, se
+//! desplace lo que se desplace la página). La vista previa no existe hasta abrir la sala (la
+//! captura arranca con ella): hasta entonces, un marcador. Donde el sistema elige el monitor o la
+//! ventana con su propio selector (el portal en Wayland), «Elegir…» lo abre ya y la elección se
+//! repite al abrir con su token; donde no, se elige aquí de la lista. La lista de audio son las
+//! aplicaciones que suenan, refrescadas cada [`REFRESH`].
 //!
-//! Con la sala abierta (la misma página): la cabecera con el código (que cae letra a letra al
-//! crearse la sala), los invitados y la ruta; arriba, **la transmisión**: lo que se comparte con
-//! borde rojo y la etiqueta «EN VIVO» con el tiempo transmitiendo (brillan una vez al empezar y
-//! quedan quietos), «Cambiar fuente» (el mismo selector, que se abre con su altura) y «Dejar de
-//! compartir»; o «Solo voz» si no se comparte nada. Debajo, **Personas**: una fila de altura fija
-//! por persona (avatar con anillo de voz, nombre y estado, «Hablando» en su ranura y la latencia
-//! siempre visible) con su desplegable (volumen, permisos, mando, número de seguridad, pasar la
-//! sala y expulsar), que solo se abre o se cierra con un clic; y la **bandeja** de los amigos que
-//! piden entrar ([`JoinRequest`], que caen al llegar, muestran el tiempo que les queda y se
-//! pliegan a los [`JOIN_REQUEST_TTL`]). Después, el audio, el micrófono y la salida, la calidad
-//! y, a la derecha, el chat de la sala.
+//! Con la sala abierta (la misma página): la cabecera dice qué sala es y cómo está; debajo, la
+//! **fila de butacas** (la tuya primero, cada invitado con la lámpara de su enlace y el anillo
+//! verde mientras habla, y libres numeradas hasta el mínimo) con lo mismo en palabras («2
+//! invitados · directa y relay») y, a su lado, la **entrada** con el código en señalética (que
+//! cae letra a letra al crearse la sala) y «Copiar» en el talón. Después, **la transmisión**: lo
+//! que se comparte en su marco, rojo mientras sale de este equipo, con el piloto «En vivo» y el
+//! tiempo transmitiendo (brillan una vez al empezar y quedan quietos), «Cambiar fuente» (el mismo
+//! selector, que se abre con su altura) y «Dejar de compartir»; o «No compartes nada» si la sala
+//! es solo de voz. Debajo, **Personas**: una fila de altura fija por persona (su butaca con la
+//! lámpara y el anillo de voz, el nombre con «Viendo» o «Solo voz», cómo llega y qué puede hacer,
+//! «Hablando» en su ranura y la latencia siempre visible) con su desplegable (permisos, mando,
+//! volumen, número de seguridad, pasar la sala y expulsar), que solo se abre o se cierra con un
+//! clic; y la **bandeja** de los amigos que piden entrar ([`JoinRequest`]), cada petición como
+//! una entrada con «Dejar entrar» en el talón (caen al llegar, muestran el tiempo que les queda
+//! y se pliegan a los [`JOIN_REQUEST_TTL`]). Después, **Audio y voz** (lo que se envía, el
+//! micrófono y la salida), la **calidad**, a quién más invitar y, a la derecha, el chat de la
+//! sala.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -37,15 +45,16 @@ use coroom_session::remote::{
 use coroom_session::{GuestId, Permissions};
 use coroom_ui::Element;
 use coroom_ui::animate::{Collapse, Shift};
+use coroom_ui::avatar::{SeatRow, Seated, seat_lamp, seat_row};
 use coroom_ui::icon::{Icon, icon_with};
 use coroom_ui::motion::{EXIT_EASING, Motion, Reveal, Token};
 use coroom_ui::sound::{Cue, cue};
 use coroom_ui::style::{
-    ButtonClass, ContainerClass, ProgressClass, SliderClass, SvgClass, TextClass,
+    ButtonClass, ContainerClass, ProgressClass, SliderClass, Surface, SvgClass, TextClass,
 };
 use coroom_ui::theme::Tone;
-use coroom_ui::tokens::{size, space, text as type_size};
-use coroom_ui::widget::{self as ui, Kind};
+use coroom_ui::tokens::{seat, size, space, text as type_size};
+use coroom_ui::widget::{self as ui, CodeSize, Kind};
 use iced_core::alignment::Horizontal;
 use iced_core::text::Wrapping;
 use iced_core::{Alignment, Length, Padding, Radians, Rotation, Vector};
@@ -462,7 +471,7 @@ pub struct LeavingRequest {
 
 /// Las marcas de tiempo de lo que se anima en la sala. Todo se dibuja en función de `App::now`
 /// (los cuadros los pide la ventana mientras [`animating`] lo diga); con la transmisión en marcha
-/// nada se anima de continuo: el tiempo «EN VIVO» cambia una vez por segundo con un `Tick`.
+/// nada se anima de continuo: el tiempo «En vivo» cambia una vez por segundo con un `Tick`.
 #[derive(Debug, Clone, Default)]
 pub struct RoomMotion {
     /// Cuándo se abrió la sala: la vista previa crece hasta su sitio ([`Token::Moment`]).
@@ -471,7 +480,7 @@ pub struct RoomMotion {
     pub code_at: Option<Instant>,
     /// Cuándo se copió el código: el icono es un tilde durante [`COPIED`].
     pub copied_at: Option<Instant>,
-    /// Desde cuándo se transmite algo (el tiempo de «EN VIVO»).
+    /// Desde cuándo se transmite algo (el tiempo de «En vivo»).
     pub live_since: Option<Instant>,
     /// Cuándo empezó a transmitirse: el borde y la etiqueta brillan una vez.
     pub glow_at: Option<Instant>,
@@ -1380,7 +1389,7 @@ fn room_visible(app: &App) -> bool {
 }
 
 /// Cuándo hace falta el próximo `Tick`: al caducar la petición de entrar más antigua y, con la
-/// sala a la vista, cada segundo para su cuenta atrás y para el tiempo «EN VIVO»; al acabar de
+/// sala a la vista, cada segundo para su cuenta atrás y para el tiempo «En vivo»; al acabar de
 /// plegarse lo que se va y al volver el icono de copiar.
 pub fn next_tick(app: &App) -> Option<Instant> {
     let now = app.now;
@@ -1489,7 +1498,7 @@ pub fn animating(app: &App) -> bool {
 
 /// Deja la sala sin nada a medio animar (las capturas y las pruebas de que nada se mueve): lo que
 /// entraba ya entró, lo que se iba ya se fue y cada desplegable queda abierto o cerrado del todo.
-/// El tiempo «EN VIVO» no se toca.
+/// El tiempo «En vivo» no se toca.
 pub fn settle(app: &mut App) {
     let now = app.now;
     let motion = &mut app.host.motion;
@@ -1509,7 +1518,7 @@ pub fn settle(app: &mut App) {
     }
 }
 
-/// Lo que se transmite pasó a ser `sharing` (o nada): arranca el tiempo «EN VIVO» con su brillo,
+/// Lo que se transmite pasó a ser `sharing` (o nada): arranca el tiempo «En vivo» con su brillo,
 /// o el rojo se apaga.
 fn on_shared(app: &mut App, sharing: Option<&Sharing>) {
     let now = app.now;
@@ -1530,7 +1539,7 @@ fn on_shared(app: &mut App, sharing: Option<&Sharing>) {
     }
 }
 
-/// Lo que lleva la transmisión en vivo: «EN VIVO 12:04» (`None` si no se comparte nada).
+/// Lo que lleva la transmisión en vivo: «En vivo 12:04» (`None` si no se comparte nada).
 pub fn live_label(app: &App) -> Option<String> {
     let since = app.host.motion.live_since?;
     app.host.room.as_ref()?;
@@ -1676,7 +1685,7 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
             });
             app.page = Page::Host;
             // El momento de abrir la sala: la vista previa crece hasta su sitio y, si se comparte
-            // algo, arranca «EN VIVO».
+            // algo, arranca «En vivo».
             app.host.motion = RoomMotion {
                 opened_at: Some(app.now),
                 ..RoomMotion::default()
@@ -2617,16 +2626,46 @@ fn mode_picker(state: &State) -> Element<'_, Message> {
     )
 }
 
-/// «Qué compartir» antes de abrir la sala (`real`: la de verdad o la copia que da la altura).
+/// Encabezado de un grupo de la página: el título, una nota a su lado y algo al final (un
+/// selector, un estado). Todos miden lo mismo de alto, lleven o no un control: dos grupos en la
+/// misma fila empiezan a la misma altura.
+fn group_head<'a>(
+    title: &'a str,
+    note: Option<&'a str>,
+    trailing: Option<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let mut head = Row::new()
+        .spacing(space::XS)
+        .align_y(Alignment::Center)
+        .push(ui::strong(title).size(GROUP_TITLE).wrapping(Wrapping::None));
+    if let Some(note) = note {
+        head = head.push(ui::one_line(note, ui::caption));
+    }
+    head = head.push(ui::fill());
+    if let Some(trailing) = trailing {
+        head = head.push(trailing);
+    }
+    container(head)
+        .center_y(Length::Fixed(size::CONTROL))
+        .width(Length::Fill)
+        .into()
+}
+
+/// Un grupo de la página: su encabezado y, pegado debajo, lo suyo.
+fn group<'a>(
+    head: Element<'a, Message>,
+    content: impl Into<Element<'a, Message>>,
+) -> Column<'a, Message, coroom_ui::Theme> {
+    column![head, content.into()].spacing(space::XXS)
+}
+
+/// Tamaño del título de un grupo de la página.
+const GROUP_TITLE: f32 = 15.0;
+
+/// «Qué compartir» antes de abrir la sala (`real`: la de verdad o la copia que da la altura): el
+/// monitor o la ventana con su marcador de vista previa y lo que hay que saber de esa fuente.
 fn source_card(app: &App, real: bool) -> Element<'_, Message> {
     let state = &app.host;
-    let head = row![
-        ui::strong(t!("host-que-compartir")),
-        ui::fill(),
-        mode_picker(state)
-    ]
-    .spacing(space::S)
-    .align_y(Alignment::Center);
     // La vista previa en vivo no existe antes de abrir la sala: la captura arranca con ella.
     let preview = thumb(
         placeholder(
@@ -2651,21 +2690,26 @@ fn source_card(app: &App, real: bool) -> Element<'_, Message> {
         side = side.push(help.spacing(2));
     }
     let body = row![preview, side.width(Length::Fill)]
-        .spacing(space::S)
+        .spacing(space::M)
         .align_y(Alignment::Center);
-    let card = column![head, body].spacing(space::S);
     // Algo elegido (aún no en vivo: la sala no está abierta) lleva el borde de acento.
     let class = if state.mode == ShareMode::Nothing {
         ContainerClass::Card
     } else {
         ContainerClass::CardAccent
     };
-    container(card)
-        .padding(Padding::from([space::S, space::M]))
+    let card = container(body)
+        .padding(space::M)
         .width(Length::Fill)
         .height(if real { Length::Fill } else { Length::Shrink })
-        .class(class)
-        .into()
+        .align_y(iced_core::alignment::Vertical::Center)
+        .class(class);
+    group(
+        group_head(t!("host-que-compartir"), None, Some(mode_picker(state))),
+        card,
+    )
+    .height(if real { Length::Fill } else { Length::Shrink })
+    .into()
 }
 
 /// «● en vivo», con cuándo llegó la última lista de amigos o el último cambio de presencia al
@@ -2689,34 +2733,17 @@ fn friends_live<'a>(app: &App) -> Option<Element<'a, Message>> {
     ))
 }
 
-/// `list` con una línea y `element` debajo.
-fn with_separator<'a>(
-    list: Column<'a, Message, coroom_ui::Theme>,
-    element: Element<'a, Message>,
-) -> Column<'a, Message, coroom_ui::Theme> {
-    list.push(rule::horizontal(1)).push(element)
-}
-
-/// «A quién invitar»: los amigos con su casilla (los conectados arriba; los desconectados, sin
-/// casilla).
+/// «A quién invitar»: los amigos con su casilla, su butaca y la lámpara de su estado (los
+/// conectados arriba; los desconectados, sin casilla).
 fn invite_card(app: &App, real: bool) -> Element<'_, Message> {
     let state = &app.host;
-    let mut header = row![ui::strong(t!("host-a-quien-invitar")), ui::fill()]
-        .spacing(space::S)
-        .align_y(Alignment::Center);
-    if let Some(label) = friends_live(app)
-        && app.friends.loaded().is_some()
-    {
-        header = header.push(label);
-    }
-    let mut list = Column::new().push(container(header).padding(Padding::from([12.0, 16.0])));
-    let push = with_separator;
+    let live = friends_live(app).filter(|_| app.friends.loaded().is_some());
+    let mut rows: Vec<Element<'_, Message>> = Vec::new();
     match &app.friends {
         Load::Loaded(friends) if friends.friends.is_empty() => {
-            list = push(
-                list,
+            rows.push(
                 container(ui::secondary(t!("host-sin-amigos")).wrapping(Wrapping::WordOrGlyph))
-                    .padding(Padding::from([10.0, 16.0]))
+                    .padding(Padding::from([space::S, space::M]))
                     .into(),
             );
         }
@@ -2732,32 +2759,42 @@ fn invite_card(app: &App, real: bool) -> Element<'_, Message> {
                     ui::gap(18.0)
                 };
                 let name: Element<'_, Message> = if friend.online {
-                    ui::strong(friend.display_name.as_str()).into()
+                    ui::one_line(friend.display_name.clone(), ui::strong).into()
                 } else {
-                    ui::secondary(friend.display_name.as_str()).into()
+                    ui::one_line(friend.display_name.clone(), ui::secondary).into()
                 };
-                // La misma insignia que en Inicio: disponible, en su sala o jugando.
-                let badge = super::home::activity_badge(friend);
-                list = push(
-                    list,
+                // La lámpara de la butaca dice si está; la insignia, lo mismo en palabras (la de
+                // Inicio: disponible, en su sala o jugando).
+                let lamp = if friend.online {
+                    Tone::Success
+                } else {
+                    Tone::Neutral
+                };
+                rows.push(
                     container(
                         row![
                             mark,
-                            avatars::view(app, &friend.display_name, friend.avatar, 28.0),
+                            seat_lamp(
+                                &app.theme,
+                                &friend.display_name,
+                                avatars::of(app, friend.avatar),
+                                FRIEND_SEAT,
+                                Some(lamp),
+                                Surface::Card,
+                            ),
                             container(name).width(Length::Fill),
-                            badge
+                            super::home::activity_badge(friend)
                         ]
                         .spacing(space::S)
                         .align_y(Alignment::Center),
                     )
-                    .padding(Padding::from([6.0, 16.0]))
+                    .padding(Padding::from([space::XS, space::M]))
                     .into(),
                 );
             }
         }
         Load::Failed(err) => {
-            list = push(
-                list,
+            rows.push(
                 container(ui::banner(
                     Tone::Error,
                     err.as_str(),
@@ -2768,20 +2805,31 @@ fn invite_card(app: &App, real: bool) -> Element<'_, Message> {
             );
         }
         Load::Idle | Load::Loading => {
-            list = push(
-                list,
+            rows.push(
                 container(ui::skeleton(t!("host-cargando-tus-amigos"), 2))
-                    .padding(Padding::from([10.0, 16.0]))
+                    .padding(Padding::from([space::S, space::M]))
                     .into(),
             );
         }
     }
-    container(list)
+    let mut list = Column::new();
+    for (index, row) in rows.into_iter().enumerate() {
+        if index > 0 {
+            list = list.push(rule::horizontal(1));
+        }
+        list = list.push(row);
+    }
+    let card = container(list)
         .width(Length::Fill)
         .height(if real { Length::Fill } else { Length::Shrink })
-        .class(ContainerClass::Card)
+        .class(ContainerClass::Card);
+    group(group_head(t!("host-a-quien-invitar"), None, live), card)
+        .height(if real { Length::Fill } else { Length::Shrink })
         .into()
 }
+
+/// Lado de la butaca de un amigo en las listas de invitar.
+const FRIEND_SEAT: f32 = 28.0;
 
 /// Cuánto está «encendida» la tarjeta de `preset` (0 a 1): la elegida sube y se le enciende el
 /// borde en un panel; la que deja de serlo se apaga a la vez.
@@ -3079,8 +3127,8 @@ fn audio_summary(app: &App) -> String {
     }
 }
 
-/// Audio que se envía (desplegable) y, antes de abrir, la voz.
-fn audio_box(app: &App, with_voice: bool) -> Element<'_, Message> {
+/// Audio que se envía (desplegable) y, antes de abrir, la voz: las filas de su lista.
+fn audio_rows(app: &App, with_voice: bool) -> Vec<Element<'_, Message>> {
     let state = &app.host;
     let open = state.audio_open;
     let header = button(
@@ -3156,12 +3204,13 @@ fn audio_box(app: &App, with_voice: bool) -> Element<'_, Message> {
             ),
         ));
     }
-    ui::boxed_list(rows)
+    rows
 }
 
 /// Micrófono y salida de este equipo con la sala abierta: los mismos de Ajustes → Audio y voz,
-/// con el mismo nombre y la misma columna («Al momento»).
-fn devices_box(app: &App) -> Element<'_, Message> {
+/// con el mismo nombre y la misma columna («Al momento»). Las filas, para la lista de «Audio y
+/// voz».
+fn device_rows(app: &App) -> Vec<Element<'_, Message>> {
     let audio = &app.settings.audio;
     let devices: Vec<AudioDevice> = app
         .settings_page
@@ -3210,7 +3259,7 @@ fn devices_box(app: &App) -> Element<'_, Message> {
     } else {
         DEVICE_SELECT
     };
-    ui::boxed_list(vec![
+    vec![
         device_row(
             t!("settings-microfono"),
             t!("settings-microfono-ayuda"),
@@ -3231,7 +3280,7 @@ fn devices_box(app: &App) -> Element<'_, Message> {
                 width,
             ),
         ),
-    ])
+    ]
 }
 
 /// Ancho de los selectores de dispositivo de la sala.
@@ -3251,7 +3300,21 @@ fn marked_count(app: &App) -> usize {
     })
 }
 
-/// Antes de abrir la sala.
+/// Lo que se abrirá, en una línea: qué se comparte y con qué perfil («Monitor principal ·
+/// Equilibrado»), o que la sala será solo de voz.
+fn setup_summary(app: &App) -> String {
+    let state = &app.host;
+    let what = sharing_label(&state.sharing());
+    if state.mode == ShareMode::Nothing {
+        what
+    } else {
+        format!("{what} · {}", preset_name(app.settings.video.preset))
+    }
+}
+
+/// Antes de abrir la sala, en un solo flujo de arriba abajo: qué se comparte (con a quién se
+/// invita al lado), con qué calidad y qué se oye; y abajo, fija, la barra con el resumen de lo
+/// que se abrirá y «Abrir la sala», que queda a la vista aunque la página se desplace.
 fn setup(app: &App) -> Element<'_, Message> {
     let state = &app.host;
     let top = ui::equal_height_row(
@@ -3269,21 +3332,17 @@ fn setup(app: &App) -> Element<'_, Message> {
         },
         space::M,
     );
-    let quality_head = row![
-        ui::strong(t!("host-calidad")).size(15.0),
-        ui::caption(t!("host-calidad-ayuda"))
-    ]
-    .spacing(space::XS)
-    .align_y(Alignment::Center);
-    let page = column![
-        top,
-        column![quality_head, preset_cards(app)].spacing(space::XS),
-        advanced(app),
-        audio_box(app, true),
-    ]
-    .spacing(space::M);
+    let quality = group(
+        group_head(t!("host-calidad"), Some(t!("host-calidad-ayuda")), None),
+        column![preset_cards(app), advanced(app)].spacing(space::XS),
+    );
+    let audio = group(
+        group_head(t!("host-audio-y-voz"), None, None),
+        ui::boxed_list(audio_rows(app, true)),
+    );
+    let page = column![top, quality, audio].spacing(space::M);
     // El error va con los botones, en una ranura que está siempre (con el espacio de debajo
-    // dentro): los bloques de la página no cambian de posición cuando aparece.
+    // dentro): la barra no cambia de sitio cuando aparece.
     let error = state.error.as_ref().map(|error| {
         container(ui::banner(
             Tone::Error,
@@ -3291,12 +3350,24 @@ fn setup(app: &App) -> Element<'_, Message> {
             Some((t!("host-reintentar"), on(Msg::Start))),
         ))
         .padding(Padding {
-            bottom: space::M,
+            bottom: space::S,
             ..Padding::ZERO
         })
         .into()
     });
-    let actions: Element<'_, Message> = if state.starting {
+    let marked = marked_count(app);
+    let note = match marked {
+        0 => t!("host-el-codigo-aparece").to_owned(),
+        1 => t!("host-invitaras-a-uno").to_owned(),
+        n => t!("host-invitaras-a-n", n = n),
+    };
+    let summary = column![
+        ui::one_line(setup_summary(app), ui::strong).width(Length::Fill),
+        ui::one_line(note, ui::secondary).width(Length::Fill),
+    ]
+    .spacing(2)
+    .width(Length::Fill);
+    let action: Element<'_, Message> = if state.starting {
         let since = state.starting_since.unwrap_or(app.now);
         // Sin el sondeo de códecs (primer arranque o drivers nuevos) la sala lo espera: se dice.
         let label = if coroom_session::codec::Capabilities::is_probed() {
@@ -3312,34 +3383,36 @@ fn setup(app: &App) -> Element<'_, Message> {
         .width(Length::Fixed(420.0))
         .into()
     } else {
-        let marked = marked_count(app);
-        let note = match marked {
-            0 => t!("host-el-codigo-aparece").to_owned(),
-            1 => t!("host-invitaras-a-uno").to_owned(),
-            n => t!("host-invitaras-a-n", n = n),
-        };
-        row![
-            ui::caption(note),
-            ui::button_with(
-                Kind::Primary,
-                if marked > 0 {
-                    t!("host-abrir-la-sala-e-invitar")
-                } else {
-                    t!("host-abrir-la-sala")
-                },
-                Some(Icon::ShareScreen),
-                (!state.picking).then(|| on(Msg::Start)),
-            ),
-        ]
-        .spacing(space::S)
-        .align_y(Alignment::Center)
+        ui::button_with(
+            Kind::Primary,
+            if marked > 0 {
+                t!("host-abrir-la-sala-e-invitar")
+            } else {
+                t!("host-abrir-la-sala")
+            },
+            Some(Icon::ShareScreen),
+            (!state.picking).then(|| on(Msg::Start)),
+        )
         .into()
     };
-    let page = page.push(column![
-        ui::slot(error),
-        row![ui::fill(), actions].align_y(Alignment::Center)
-    ]);
-    ui::page("share", page)
+    let bar = container(
+        container(column![
+            ui::slot(error),
+            row![summary, action]
+                .spacing(space::M)
+                .align_y(Alignment::Center)
+        ])
+        .max_width(size::CONTENT),
+    )
+    .padding(Padding::from([space::S, space::XL]))
+    .center_x(Length::Fill)
+    .class(ContainerClass::Headerbar);
+    column![
+        container(ui::page("share", page)).height(Length::Fill),
+        rule::horizontal(1),
+        bar
+    ]
+    .into()
 }
 
 /// `K7Q2MZ` → `K7Q 2MZ` (más fácil de dictar).
@@ -3374,13 +3447,9 @@ fn voice_only(state: &State) -> bool {
             .is_some_and(|shared| shared.mode == ShareMode::Nothing)
 }
 
-/// Cabecera de la sala: «Sala de Ana», el código (que cae letra a letra al crearse la sala), los
-/// invitados y la ruta; a la derecha, el estado, copiar el código, Diagnóstico y «Cerrar la sala».
-fn room_header<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
-    let title = app.account.as_ref().map_or_else(
-        || t!("host-tu-sala").to_owned(),
-        |account| t!("host-sala-de", name = account.display_name.as_str()),
-    );
+/// «2 invitados · directa y relay»: cuántos hay y cómo llegan, lo mismo que dicen las lámparas
+/// de la fila de butacas, en palabras.
+fn room_facts(room: &Room) -> String {
     let mut facts = vec![match room.guests.len() {
         0 => t!("host-sin-invitados").to_owned(),
         1 => t!("host-un-invitado").to_owned(),
@@ -3389,30 +3458,78 @@ fn room_header<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
     if let Some(route) = route_summary(room) {
         facts.push(route.to_owned());
     }
-    let facts = facts.join(" · ");
-    let code: Element<'a, Message> = match &room.code {
-        Some(code) => row![
-            ui::secondary(t!("host-codigo")).wrapping(Wrapping::None),
-            code_letters(app, code)
-        ]
-        .spacing(space::XS)
-        .align_y(Alignment::Center)
-        .into(),
-        None => ui::secondary(t!("host-creando-la-sala"))
-            .wrapping(Wrapping::None)
-            .into(),
-    };
-    // El código con su botón de copiar al lado; los invitados y la ruta debajo, en su línea (en
-    // la de la ventana estrecha no cabían junto al código).
-    let texts = column![
-        ui::title(title),
-        row![code, copy_button(app, room)]
-            .spacing(space::XS)
-            .align_y(Alignment::Center),
-        ui::one_line(facts, ui::secondary).width(Length::Fill),
+    facts.join(" · ")
+}
+
+/// La lámpara de la butaca de un invitado: verde si llega directo; ámbar si va por el relay o
+/// todavía se está conectando.
+fn link_lamp(status: &GuestStatus) -> Tone {
+    match status.path {
+        Some(coroom_transport::Path::Direct) => Tone::Success,
+        Some(coroom_transport::Path::Relayed) | None => Tone::Warning,
+    }
+}
+
+/// El nombre con el que se ve el anfitrión (este equipo) en la sala.
+fn own_name(app: &App) -> String {
+    app.account
+        .as_ref()
+        .map_or_else(|| t!("host-tu").to_owned(), |a| a.display_name.clone())
+}
+
+/// Cuántas butacas de lado `side` caben en `width` sin partir la fila (nunca menos que el
+/// mínimo de una fila de sala): las personas que pasen de ahí se cuentan en la última («+3»),
+/// así la fila no cambia de alto cuando entra alguien.
+fn seats_that_fit(width: f32, side: f32) -> usize {
+    let slot = side + 2.0 * coroom_ui::avatar::RING_PADDING + space::XS;
+    (((width + space::XS) / slot).floor() as usize).max(seat::ROW_MIN)
+}
+
+/// La fila de butacas de la sala: primero la tuya; después, cada invitado con la lámpara de su
+/// enlace y el anillo verde mientras habla; detrás, libres numeradas hasta el mínimo.
+fn room_seats<'a>(app: &App, room: &Room, side: f32, width: f32) -> Element<'a, Message> {
+    let name = own_name(app);
+    let own = app.account.as_ref().and_then(|account| account.avatar);
+    let mut people = vec![
+        Seated::new(&name)
+            .picture(avatars::of(app, own))
+            .talking(room.voice.talkers.contains(&0)),
+    ];
+    people.extend(room.guests.iter().map(|status| {
+        Seated::new(&status.name)
+            .picture(avatars::of(app, status.avatar))
+            .lamp(Some(link_lamp(status)))
+            .talking(room.voice.talkers.contains(&status.guest.0))
+    }));
+    let row = seat_row(
+        &app.theme,
+        &people,
+        SeatRow::default()
+            .side(side)
+            .max(seats_that_fit(width, side))
+            .on(Surface::Window),
+    );
+    // Cada butaca lleva alrededor el hueco de su anillo: la primera, al ras del título.
+    Shift::new(row, Vector::new(-coroom_ui::avatar::RING_PADDING, 0.0)).into()
+}
+
+/// Cabecera de la sala: «Sala de Ana» con su estado al lado («Transmitiendo») y, al final,
+/// Diagnóstico y «Cerrar la sala»; debajo, la fila de butacas con lo mismo en palabras («2
+/// invitados · directa y relay») y, a su lado, la entrada con el código. En la sala estrecha, los
+/// botones van junto a las butacas y la entrada debajo, a todo el ancho.
+fn room_header<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
+    let title = app.account.as_ref().map_or_else(
+        || t!("host-tu-sala").to_owned(),
+        |account| t!("host-sala-de", name = account.display_name.as_str()),
+    );
+    // El estado, pegado al nombre de la sala: si el nombre es largo, se acorta él.
+    let title = row![
+        ui::one_line(title, ui::title),
+        room_badge(app, room, Horizontal::Left),
     ]
-    .spacing(2)
-    .width(Length::Fill);
+    .spacing(space::S)
+    .align_y(Alignment::Center);
+    let facts = ui::one_line(room_facts(room), ui::secondary).width(Length::Fill);
     let diagnostics = Message::Diagnostics(crate::ui::screens::diagnostics::Msg::Open);
     let close = ui::button_with(
         Kind::Destructive,
@@ -3421,20 +3538,23 @@ fn room_header<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
         (!app.host.stopping).then(|| on(Msg::Stop)),
     );
     if compact(app) {
-        // En la sala estrecha, en dos pisos: el estado y los botones debajo, Diagnóstico solo con
-        // su icono.
-        let actions = row![
-            room_badge(app, room, Horizontal::Left),
-            ui::fill(),
+        // En la sala estrecha: Diagnóstico solo con su icono, junto a las butacas (pequeñas), y
+        // la entrada debajo, a todo el ancho y con el talón de solo icono.
+        let seats = column![room_seats(app, room, seat::ROW_SMALL, 0.0), facts]
+            .spacing(space::XXS)
+            .width(Length::Fill);
+        let people = row![
+            seats,
             ui::icon_button(Icon::Stethoscope, t!("app-diagnostico"), Some(diagnostics)),
             close,
         ]
         .spacing(space::XS)
         .align_y(Alignment::Center);
-        return column![texts, actions].spacing(space::S).into();
+        return column![title, people, code_ticket(app, room, true)]
+            .spacing(space::S)
+            .into();
     }
     let actions = row![
-        room_badge(app, room, Horizontal::Right),
         ui::button_with(
             Kind::Normal,
             t!("app-diagnostico"),
@@ -3445,33 +3565,112 @@ fn room_header<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
     ]
     .spacing(space::XS)
     .align_y(Alignment::Center);
-    row![texts, actions]
-        .spacing(space::M)
-        .align_y(Alignment::Center)
-        .into()
+    let seats = room_seats(
+        app,
+        room,
+        seat::ROW,
+        content_width(app) - TICKET_WIDTH - space::M,
+    );
+    let people = column![seats, facts]
+        .spacing(space::XXS)
+        .width(Length::Fill);
+    let ticket = container(code_ticket(app, room, false)).width(Length::Fixed(TICKET_WIDTH));
+    column![
+        row![container(title).width(Length::Fill), actions]
+            .spacing(space::M)
+            .align_y(Alignment::Center),
+        row![people, ticket]
+            .spacing(space::M)
+            .align_y(Alignment::Center),
+    ]
+    .spacing(space::S)
+    .into()
 }
 
-/// El código, letra a letra: al crearse la sala cada una cae a su sitio y aparece, escalonadas
-/// ([`Token::Moment`] en total); con movimiento reducido solo aparecen.
-fn code_letters<'a>(app: &App, code: &str) -> Element<'a, Message> {
+/// Ancho de la entrada con el código, al lado de las butacas (en la sala estrecha ocupa el ancho
+/// de la página): el código en celdas grandes, el punteado y el talón «Copiar».
+const TICKET_WIDTH: f32 = 460.0;
+
+/// La entrada de la sala: el código en señalética y «Copiar» en el talón. Mientras el servidor
+/// crea la sala, las celdas están vacías (la entrada ya mide lo que medirá) y lo dice el rótulo.
+fn code_ticket<'a>(app: &App, room: &Room, narrow: bool) -> Element<'a, Message> {
+    let label = match &room.code {
+        Some(_) => t!("host-codigo-de-la-sala"),
+        None => t!("host-creando-la-sala"),
+    };
+    let body = column![
+        ui::one_line(label, ui::caption).width(Length::Fill),
+        code_sign(app, room.code.as_deref()),
+    ]
+    .spacing(space::XS);
+    ui::ticket(body, copy_button(app, room, narrow))
+}
+
+/// Caracteres de un código de sala (las celdas que se ven antes de que llegue).
+const CODE_LENGTH: usize = 6;
+
+/// El código en sus celdas. En reposo, la señalética de siempre; al crearse la sala, cada
+/// carácter cae a su celda y aparece, escalonados ([`Token::Moment`] en total; con movimiento
+/// reducido solo aparecen); sin código todavía, las celdas vacías.
+fn code_sign<'a>(app: &App, code: Option<&str>) -> Element<'a, Message> {
     let motion = app.motion();
+    let at = app.host.motion.code_at;
+    let landed = |index: usize| {
+        at.map_or(1.0, |at| {
+            progress(app, at, Token::Panel, motion.stagger(index))
+        })
+    };
+    let characters: Vec<char> = ui::code_groups(code.unwrap_or_default())
+        .concat()
+        .chars()
+        .collect();
+    if let Some(code) = code
+        && (0..characters.len()).all(|index| landed(index) >= 1.0)
+    {
+        return ui::code_cells(code, CodeSize::Large);
+    }
+    let cell = CodeSize::Large.cell();
     let fall = motion.slide(space::S);
     let color = app.theme.palette.text;
-    let at = app.host.motion.code_at;
-    let letters = spaced(code)
-        .chars()
-        .enumerate()
-        .map(|(index, letter)| {
-            let shown = at.map_or(1.0, |at| {
-                progress(app, at, Token::Panel, motion.stagger(index))
-            });
-            let glyph = ui::strong(letter.to_string())
-                .wrapping(Wrapping::None)
-                .class(TextClass::Custom(color.alpha(shown)));
-            Shift::new(glyph, Vector::new(0.0, -fall * (1.0 - shown))).into()
-        })
-        .collect::<Vec<Element<'a, Message>>>();
-    Row::with_children(letters).into()
+    let count = characters.len().max(CODE_LENGTH);
+    let cells = (0..count).map(|index| -> Element<'a, Message> {
+        let glyph: Element<'a, Message> = match characters.get(index) {
+            Some(character) => {
+                let shown = landed(index);
+                let glyph = iced_widget::text(character.to_string())
+                    .size(cell.text)
+                    .font(coroom_ui::font::SEMIBOLD)
+                    .wrapping(Wrapping::None)
+                    .class(TextClass::Custom(color.alpha(shown)));
+                Shift::new(
+                    ui::cap_centered(glyph, cell.text),
+                    Vector::new(0.0, -fall * (1.0 - shown)),
+                )
+                .into()
+            }
+            None => iced_widget::Space::new().into(),
+        };
+        container(glyph)
+            .center_x(Length::Fixed(cell.width))
+            .center_y(Length::Fixed(cell.height))
+            .class(ContainerClass::CodeCell {
+                radius: cell.radius,
+            })
+            .into()
+    });
+    // De tres en tres, con los mismos huecos que la señalética en reposo.
+    let cells: Vec<Element<'a, Message>> = cells.collect();
+    let mut groups = Row::new()
+        .spacing(cell.group_gap)
+        .align_y(Alignment::Center);
+    let mut cells = cells.into_iter().peekable();
+    while cells.peek().is_some() {
+        groups = groups.push(
+            Row::with_children(cells.by_ref().take(coroom_ui::tokens::sign::GROUP))
+                .spacing(cell.gap),
+        );
+    }
+    groups.into()
 }
 
 /// La insignia de estado de la cabecera, en una ranura del ancho de la más ancha.
@@ -3498,25 +3697,27 @@ fn room_badge<'a>(app: &App, room: &Room, align: Horizontal) -> Element<'a, Mess
         .into()
 }
 
-/// Lado del botón de copiar, junto al código (más pequeño que un botón suelto: va en una línea
-/// de texto).
-const COPY_SIZE: f32 = 28.0;
-
-/// «Copiar el código»: al copiar, el icono se vuelve un tilde con un pulso y vuelve a los
-/// [`COPIED`].
-fn copy_button<'a>(app: &App, room: &Room) -> Element<'a, Message> {
+/// «Copiar», el talón de la entrada: al copiar, el icono se vuelve un tilde con un pulso, el
+/// texto dice «Copiado» y vuelve a los [`COPIED`]. `narrow`: solo el icono (la sala estrecha).
+fn copy_button<'a>(app: &App, room: &Room, narrow: bool) -> Element<'a, Message> {
     let copied_at = app
         .host
         .motion
         .copied_at
         .filter(|at| app.now.saturating_duration_since(*at) < COPIED);
-    let (glyph, tint, tip) = match copied_at {
+    let (glyph, tint, label, tip) = match copied_at {
         Some(_) => (
             Icon::Check,
             SvgClass::Tone(Tone::Success),
+            t!("host-copiado"),
             t!("app-copiado-al-portapapeles"),
         ),
-        None => (Icon::Copy, SvgClass::Text, t!("host-copiar-codigo")),
+        None => (
+            Icon::Copy,
+            SvgClass::Text,
+            t!("host-copiar"),
+            t!("host-copiar-codigo"),
+        ),
     };
     // El pulso: crece un cuarto y vuelve (sin escalas con movimiento reducido).
     let pulse = match copied_at {
@@ -3526,22 +3727,46 @@ fn copy_button<'a>(app: &App, room: &Room) -> Element<'a, Message> {
         }
         _ => 0.0,
     };
-    let control = coroom_ui::animate::button(iced_widget::center(icon_with(
+    // El icono, en una caja de su tamaño en reposo: el pulso no mueve el texto de al lado.
+    let glyph = container(icon_with(glyph, size::ICON * (1.0 + pulse), tint))
+        .center_x(Length::Fixed(size::ICON))
+        .center_y(Length::Fixed(size::ICON));
+    let on_press = room.code.as_ref().map(|_| on(Msg::CopyCode));
+    if narrow {
+        let control = coroom_ui::animate::button(iced_widget::center(glyph))
+            .width(Length::Fixed(size::CONTROL))
+            .height(Length::Fixed(size::CONTROL))
+            .padding(0)
+            .class(ButtonClass::Normal)
+            .press_scale(true)
+            .on_press_maybe(on_press);
+        return ui::with_tooltip(control, tip);
+    }
+    // «Copiar» y «Copiado», en una ranura del ancho del más ancho: el talón no cambia.
+    let word = |word: &'static str| -> Element<'a, Message> {
+        ui::strong(word).wrapping(Wrapping::None).into()
+    };
+    let content = row![
         glyph,
-        size::ICON * (1.0 + pulse),
-        tint,
-    )))
-    .width(Length::Fixed(COPY_SIZE))
-    .height(Length::Fixed(COPY_SIZE))
-    .padding(0)
-    .class(ButtonClass::Flat)
+        ui::reserve(
+            [word(t!("host-copiar")), word(t!("host-copiado"))],
+            Some(word(label))
+        ),
+    ]
+    .spacing(space::XS)
+    .align_y(Alignment::Center);
+    let control = coroom_ui::animate::button(
+        container(content).center_y(Length::Fixed(size::CONTROL - 16.0)),
+    )
+    .padding(Padding::from([8.0, 16.0]))
+    .class(ButtonClass::Normal)
     .press_scale(true)
-    .on_press_maybe(room.code.as_ref().map(|_| on(Msg::CopyCode)));
+    .on_press_maybe(on_press);
     ui::with_tooltip(control, tip)
 }
 
-/// Cuánto rojo lleva el borde de la transmisión: 1 mientras se comparte; al dejar de compartir se
-/// apaga con un fundido de 260 ms (lo que dura [`Token::Screen`]).
+/// Cuánto rojo lleva el marco de lo que se transmite: 1 mientras se comparte; al dejar de
+/// compartir se apaga con un fundido de 260 ms (lo que dura [`Token::Screen`]).
 fn live_amount(app: &App) -> f32 {
     let motion = &app.host.motion;
     if motion.live_since.is_some() {
@@ -3566,9 +3791,9 @@ fn live_glow(app: &App) -> f32 {
     })
 }
 
-/// La etiqueta «EN VIVO» con lo que lleva transmitiendo, de ancho fijo (el de la cifra más
-/// ancha) y con el texto centrado.
-fn live_tag<'a>(glow: f32, seconds: u64) -> Element<'a, Message> {
+/// El piloto «en vivo» con lo que lleva transmitiendo: el punto rojo y el texto, en una
+/// insignia de ancho fijo (el de la cifra más ancha).
+fn live_tag<'a>(seconds: u64) -> Element<'a, Message> {
     let line = |elapsed: String| -> Element<'a, Message> {
         row![
             ui::badge_text(t!("host-en-vivo").to_owned()).wrapping(Wrapping::None),
@@ -3578,22 +3803,22 @@ fn live_tag<'a>(glow: f32, seconds: u64) -> Element<'a, Message> {
         .align_y(Alignment::Center)
         .into()
     };
-    container(ui::cap_centered(
-        ui::steady(
-            [line(stats::elapsed_widest(seconds).to_owned())],
-            line(stats::elapsed(seconds)),
-        ),
-        type_size::CAPTION,
-    ))
-    .padding(Padding::from([3.0, 10.0]))
-    .align_x(iced_core::alignment::Horizontal::Center)
-    .align_y(iced_core::alignment::Vertical::Center)
-    .class(ContainerClass::LiveTag { glow })
-    .into()
+    ui::status_badge_steady(
+        Tone::Live,
+        line(stats::elapsed(seconds)),
+        [line(stats::elapsed_widest(seconds).to_owned())],
+        false,
+    )
 }
 
-/// La vista previa en su sitio de la sala; al abrirla, crece desde el tamaño que tenía en
-/// Compartir ([`Token::Moment`]) sin mover lo de al lado (su caja ya tiene el tamaño final).
+/// Aire entre la vista previa y su marco: lo justo para que las esquinas de la imagen no pisen
+/// las redondeadas del marco.
+const PREVIEW_FRAME: f32 = 5.0;
+
+/// La vista previa en su sitio de la sala, dentro de su marco: del rojo del piloto mientras sale
+/// de este equipo (con el brillo del arranque, una vez) y del color de un filete cuando no. Al
+/// abrir la sala, la imagen crece desde el tamaño que tenía en Compartir ([`Token::Moment`]) sin
+/// mover lo de al lado (su caja ya tiene el tamaño final).
 fn grown_preview<'a>(app: &App, content: Element<'a, Message>) -> Element<'a, Message> {
     let height = (PREVIEW_WIDTH * 9.0 / 16.0).round();
     let grown = app
@@ -3604,38 +3829,67 @@ fn grown_preview<'a>(app: &App, content: Element<'a, Message>) -> Element<'a, Me
     let from = app.motion().start_scale(THUMB_WIDTH / PREVIEW_WIDTH);
     let scale = from + (1.0 - from) * grown;
     let rise = app.motion().slide(space::M) * (1.0 - grown);
-    container(Shift::new(
-        thumb(content, (PREVIEW_WIDTH * scale).round()),
-        Vector::new(0.0, rise),
-    ))
-    .center_x(Length::Fixed(PREVIEW_WIDTH))
-    .center_y(Length::Fixed(height))
+    container(
+        container(Shift::new(
+            thumb(content, (PREVIEW_WIDTH * scale).round()),
+            Vector::new(0.0, rise),
+        ))
+        .center_x(Length::Fixed(PREVIEW_WIDTH))
+        .center_y(Length::Fixed(height)),
+    )
+    .padding(PREVIEW_FRAME)
+    .class(ContainerClass::CardLive {
+        live: live_amount(app),
+        glow: live_glow(app),
+    })
     .into()
 }
 
-/// La transmisión, arriba de todo: la vista previa, qué es y con qué se codifica, con el borde
-/// rojo y «EN VIVO» mientras sale de este equipo; «Cambiar fuente» (que se abre con su altura) y
-/// «Dejar de compartir». Sin nada compartido, «No compartes nada» y el botón para compartir.
+/// La transmisión, arriba de todo: la vista previa en su marco (rojo mientras sale de este
+/// equipo), el piloto «en vivo» con el tiempo, qué es y con qué se codifica, y debajo «Cambiar
+/// fuente» (que se abre con su altura) y «Dejar de compartir». Sin nada compartido, «No compartes
+/// nada» y el botón para compartir. En la sala estrecha, los botones bajan a su línea.
 fn room_source_card<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
     let state = &app.host;
+    let narrow = compact(app);
     let picker: Element<'a, Message> = Collapse::new(
         container(column![rule::horizontal(1), source_picker(app)].spacing(space::S)).padding(
             Padding {
-                top: space::S,
+                top: space::M,
                 ..Padding::ZERO
             },
         ),
         state.motion.source.shown(app.now),
     )
     .into();
-    let card = |content: Element<'a, Message>| -> Element<'a, Message> {
-        container(content)
+    // La imagen a la izquierda; a su lado, lo que es y, si caben, sus botones debajo.
+    let card = |preview: Element<'a, Message>,
+                info: Column<'a, Message, coroom_ui::Theme>,
+                actions: Row<'a, Message, coroom_ui::Theme>|
+     -> Element<'a, Message> {
+        let actions = actions.spacing(space::XS).align_y(Alignment::Center);
+        let content: Element<'a, Message> = if narrow {
+            column![
+                row![preview, info.width(Length::Fill)]
+                    .spacing(space::M)
+                    .align_y(Alignment::Center),
+                row![ui::fill(), actions],
+            ]
+            .spacing(space::S)
+            .into()
+        } else {
+            row![
+                preview,
+                column![info, actions].spacing(space::S).width(Length::Fill),
+            ]
+            .spacing(space::M)
+            .align_y(Alignment::Center)
+            .into()
+        };
+        container(column![content, picker])
             .padding(space::M)
             .width(Length::Fill)
-            .class(ContainerClass::CardLive {
-                live: live_amount(app),
-                glow: live_glow(app),
-            })
+            .class(ContainerClass::Card)
             .into()
     };
     if voice_only(state) {
@@ -3643,24 +3897,17 @@ fn room_source_card<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
             ui::strong(t!("host-no-compartes-nada")),
             ui::secondary(t!("host-no-compartes-nada-detalle")).wrapping(Wrapping::WordOrGlyph),
         ]
-        .spacing(2)
-        .width(Length::Fill);
+        .spacing(2);
         let share = ui::button_with(
             Kind::Primary,
             t!("host-compartir-pantalla-o-ventana"),
             Some(Icon::ShareScreen),
             (!state.changing_source).then(|| on(Msg::StartSharing)),
         );
-        let top = row![
+        return card(
             grown_preview(app, placeholder(Icon::Mic, t!("host-solo-voz-y-chat"))),
             info,
-        ]
-        .spacing(space::M)
-        .align_y(Alignment::Center);
-        return card(
-            column![top, row![ui::fill(), share], picker]
-                .spacing(space::S)
-                .into(),
+            row![share],
         );
     }
     let preview: Element<'a, Message> = if room.preview_unavailable {
@@ -3697,26 +3944,23 @@ fn room_source_card<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
             )
             .into()
         });
-    // «EN VIVO» con su tiempo, en una ranura que está siempre (vacía mientras no sale nada).
+    // El piloto con su tiempo, en una ranura que está siempre (vacía mientras no sale nada).
     let seconds = state
         .motion
         .live_since
         .map(|since| app.now.saturating_duration_since(since).as_secs());
-    let glow = live_glow(app);
-    let tag = ui::reserve(
-        [live_tag(0.0, seconds.unwrap_or(0))],
-        seconds.map(|seconds| live_tag(glow, seconds)),
-    );
+    let pilot = ui::reserve([live_tag(seconds.unwrap_or(0))], seconds.map(live_tag));
     let info = column![
-        tag,
-        ui::one_line(title, ui::strong).width(Length::Fill),
-        row![ui::one_line(facts, ui::secondary), ui::slot(rate)].align_y(Alignment::Center),
+        pilot,
+        column![
+            ui::one_line(title, ui::strong).width(Length::Fill),
+            row![ui::one_line(facts, ui::secondary), ui::slot(rate)].align_y(Alignment::Center),
+        ]
+        .spacing(2),
     ]
-    .spacing(space::XS)
-    .width(Length::Fill);
+    .spacing(space::XS);
     let idle = !state.changing_source && state.switching.is_none();
     let actions = row![
-        ui::fill(),
         ui::button_with(
             Kind::Normal,
             t!("host-cambiar-fuente"),
@@ -3729,13 +3973,8 @@ fn room_source_card<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
             Some(Icon::Pause),
             idle.then(|| on(Msg::StopSharing)),
         ),
-    ]
-    .spacing(space::S)
-    .align_y(Alignment::Center);
-    let top = row![grown_preview(app, preview), info]
-        .spacing(space::M)
-        .align_y(Alignment::Center);
-    card(column![top, actions, picker].spacing(space::S).into())
+    ];
+    card(grown_preview(app, preview), info, actions)
 }
 
 /// El selector de fuente con la sala abierta: lo mismo que antes de abrirla, más «Compartir
@@ -3889,7 +4128,7 @@ fn people_section<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
         )
     };
     let head = row![
-        ui::strong(t!("host-personas", valor = room.guests.len() + 1)).size(15.0),
+        ui::strong(t!("host-personas", valor = room.guests.len() + 1)).size(GROUP_TITLE),
         ui::with_tooltip(
             icon_with(Icon::Info, size::ICON, SvgClass::Secondary),
             voice_rule
@@ -3903,9 +4142,11 @@ fn people_section<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
     ]
     .spacing(space::S)
     .align_y(Alignment::Center);
-    column![head, people_list(app, room), request_tray(app, room)]
-        .spacing(space::XS)
-        .into()
+    column![
+        column![head, people_list(app, room)].spacing(space::XXS),
+        request_tray(app, room)
+    ]
+    .into()
 }
 
 /// Las filas de «Personas»: primero tú, después los invitados por orden de llegada (quien llega
@@ -4227,6 +4468,11 @@ fn room_width(app: &App) -> f32 {
     app.window.width - rail - (CHAT_WIDTH + space::M + space::S)
 }
 
+/// El ancho del contenido de la página de la sala (sin sus márgenes).
+fn content_width(app: &App) -> f32 {
+    (room_width(app) - 2.0 * space::XL).min(size::CONTENT)
+}
+
 /// Por debajo de este ancho de página, la sala va en su forma estrecha.
 const COMPACT_BELOW: f32 = 640.0;
 
@@ -4240,10 +4486,7 @@ fn compact(app: &App) -> bool {
 /// Tu fila: «Ana (tú)» con «Anfitrión», cómo está tu micrófono, «Hablando» y el botón para
 /// silenciarte; en el desplegable, lo alto que te oyen.
 fn own_row<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
-    let name = app
-        .account
-        .as_ref()
-        .map_or_else(|| t!("host-tu").to_owned(), |a| a.display_name.clone());
+    let name = own_name(app);
     let voice = &room.voice;
     let talking = voice.talkers.contains(&0);
     let status = if !voice.enabled {
@@ -4345,15 +4588,29 @@ fn guest_row<'a>(app: &'a App, room: &'a Room, status: &'a GuestStatus) -> Eleme
         .shared
         .as_ref()
         .is_some_and(|shared| shared.mode != ShareMode::Nothing);
+    // Su butaca con la lámpara del enlace (lo dice en palabras la línea de debajo del nombre) y
+    // el anillo verde mientras habla; junto al nombre, si mira lo que se comparte.
     let header = row![
-        avatars::ringed_view(app, &status.name, status.avatar, size::AVATAR, talking),
+        coroom_ui::avatar::ringed_lamp(
+            &app.theme,
+            &status.name,
+            avatars::of(app, status.avatar),
+            size::AVATAR,
+            talking,
+            Some(link_lamp(status)),
+            Surface::Card,
+        ),
         column![
-            ui::one_line(status.name.clone(), ui::strong).width(Length::Fill),
+            row![
+                ui::one_line(status.name.clone(), ui::strong),
+                video_slot(status.video_paused, sharing && status.path.is_some()),
+            ]
+            .spacing(space::XS)
+            .align_y(Alignment::Center),
             ui::one_line(facts.join(" · "), ui::secondary).width(Length::Fill)
         ]
         .spacing(2)
         .width(Length::Fill),
-        video_slot(status.video_paused, sharing && status.path.is_some()),
         speaking_slot(talking, compact(app)),
         trailing(latency_badge(status.rtt_ms, true), compact(app)),
         chevron(app, Person::Guest(id), &status.name),
@@ -4368,24 +4625,24 @@ fn guest_row<'a>(app: &'a App, room: &'a Room, status: &'a GuestStatus) -> Eleme
     )
 }
 
-/// A la derecha del nombre de un invitado, si mira lo que se comparte: «Viendo» (`watching`: hay
-/// algo compartido y está conectado, con un camino) o, con el vídeo apagado, «Solo voz» (así se
-/// sabe por qué no mueve nada en el juego). Si no, nada. Con el hueco de la más ancha reservado,
-/// para que las etiquetas de todas las filas queden en columna.
+/// Junto al nombre de un invitado, si mira lo que se comparte: «Viendo» (`watching`: hay algo
+/// compartido y está conectado, con un camino) o, con el vídeo apagado, «Solo voz» (así se sabe
+/// por qué no mueve nada en el juego). Si no, nada. Con el hueco de la más ancha reservado: la
+/// etiqueta cambia sin mover el nombre ni la fila.
 fn video_slot<'a>(paused: bool, watching: bool) -> Element<'a, Message> {
     let voice_only = || -> Element<'a, Message> {
-        let tag = ui::icon_badge(Tone::Info, Icon::MonitorOff, t!("host-solo-voz"));
-        ui::with_tooltip(tag, t!("host-solo-voz-tip"))
+        ui::with_tooltip(
+            coroom_ui::tag::later(t!("host-solo-voz")),
+            t!("host-solo-voz-tip"),
+        )
     };
-    let watching_tag = || ui::status_badge(Tone::Success, t!("host-viendo"));
+    let watching_tag = || coroom_ui::tag::live(t!("host-viendo"));
     let current = if paused {
         Some(voice_only())
     } else {
         watching.then(watching_tag)
     };
-    ui::reserve([voice_only(), watching_tag()], current)
-        .align_x(Horizontal::Right)
-        .into()
+    ui::reserve([voice_only(), watching_tag()], current).into()
 }
 
 /// «Pasarle la sala»: desactivado mientras otra oferta espera respuesta y, con el motivo al pasar
@@ -4485,9 +4742,18 @@ fn guest_details<'a>(
     .align_y(Alignment::Center)
     .wrap()
     .vertical_spacing(space::XS);
-    column![volume, keyboard, voice, pad_line(app, status), actions]
-        .spacing(space::S)
-        .into()
+    // Primero lo que puede hacer en la sala; después cómo se le oye aquí; al final, tras una
+    // línea, lo que no es un ajuste.
+    column![
+        keyboard,
+        pad_line(app, status),
+        voice,
+        volume,
+        rule::horizontal(1),
+        actions
+    ]
+    .spacing(space::S)
+    .into()
 }
 
 /// El mando de un invitado: la ranura («Sin mando» se lo quita), si va tal cual o convertido, y
@@ -4614,9 +4880,9 @@ fn tray_entry<'a>(
     .into()
 }
 
-/// Tarjeta de un amigo que pide entrar, con el borde del acento, su cuenta atrás y una barra fina
-/// del tiempo que queda: «Dejar entrar» lo invita (en cuanto la sala tiene código) y «Ahora no»
-/// se lo dice. `leaving`: se va (sin botones que hagan nada).
+/// La petición de un amigo que pide entrar, como una entrada: quién es, su cuenta atrás y una
+/// barra fina del tiempo que queda; en el talón, «Dejar entrar» (lo invita en cuanto la sala
+/// tiene código) y «Ahora no» (se lo dice). `leaving`: se va (sin botones que hagan nada).
 fn join_request_card<'a>(
     app: &'a App,
     room: &'a Room,
@@ -4643,75 +4909,61 @@ fn join_request_card<'a>(
             .filter(|_| !leaving)
             .map(|_| on(Msg::AllowJoin(request.user))),
     );
-    // En la sala estrecha, los botones en su línea: el nombre no cabía a su lado.
-    let (inline, below): (Vec<Element<'a, Message>>, Option<Element<'a, Message>>) = if compact(app)
-    {
-        (
-            Vec::new(),
-            Some(
-                row![ui::fill(), decline, allow]
-                    .spacing(space::S)
-                    .align_y(Alignment::Center)
-                    .into(),
-            ),
-        )
+    // En la sala estrecha, los botones uno sobre otro: el nombre no cabía a su lado.
+    let stub: Element<'a, Message> = if compact(app) {
+        column![allow, decline]
+            .spacing(space::XXS)
+            .align_x(Alignment::Center)
+            .into()
     } else {
-        (vec![decline.into(), allow.into()], None)
+        row![decline, allow]
+            .spacing(space::XS)
+            .align_y(Alignment::Center)
+            .into()
     };
-    container(
-        column![
-            row![
-                avatars::view(
-                    app,
-                    &request.name,
-                    avatars::of_user(app, request.user),
-                    size::AVATAR,
-                ),
-                column![
-                    ui::one_line(t!("host-name-pide-entrar", name = request.name), ui::strong)
-                        .width(Length::Fill),
-                    // La cuenta atrás en m:ss en una ranura de ancho fijo: cambia cada segundo
-                    // sin mover el texto ni cortar la línea.
-                    row![
-                        ui::secondary(t!("host-caduca-en")).wrapping(Wrapping::None),
-                        ui::figure(ui::secondary, stats::clock(left), &[stats::CLOCK_WIDEST]),
-                    ]
-                    .spacing(space::XXS)
+    let body = column![
+        row![
+            avatars::view(
+                app,
+                &request.name,
+                avatars::of_user(app, request.user),
+                size::AVATAR,
+            ),
+            column![
+                ui::one_line(t!("host-name-pide-entrar", name = request.name), ui::strong)
+                    .width(Length::Fill),
+                // La cuenta atrás en m:ss en una ranura de ancho fijo: cambia cada segundo
+                // sin mover el texto ni cortar la línea.
+                row![
+                    ui::secondary(t!("host-caduca-en")).wrapping(Wrapping::None),
+                    ui::figure(ui::secondary, stats::clock(left), &[stats::CLOCK_WIDEST]),
                 ]
-                .spacing(2)
-                .width(Length::Fill),
+                .spacing(space::XXS)
             ]
-            .extend(inline)
-            .spacing(space::S)
-            .align_y(Alignment::Center),
-            ui::slot(below),
-            progress_bar(0.0..=1.0, fraction)
-                .girth(Length::Fixed(TIME_BAR))
-                .class(ProgressClass::Accent),
+            .spacing(2)
+            .width(Length::Fill),
         ]
-        .spacing(space::S),
-    )
-    .padding(Padding::from([12.0, 16.0]))
-    .width(Length::Fill)
-    .class(ContainerClass::CardAccent)
-    .into()
+        .spacing(space::S)
+        .align_y(Alignment::Center),
+        progress_bar(0.0..=1.0, fraction)
+            .girth(Length::Fixed(TIME_BAR))
+            .class(ProgressClass::Accent),
+    ]
+    .spacing(space::XS);
+    ui::ticket(body, stub)
 }
 
-/// La calidad con la sala abierta: el segmentado de perfiles y «Avanzado».
+/// La calidad con la sala abierta: el segmentado de perfiles, cuándo se aplica cada cosa y
+/// «Avanzado».
 fn room_quality(app: &App) -> Element<'_, Message> {
-    let head = row![
-        ui::strong(t!("host-calidad")).size(15.0),
-        ui::fill(),
-        preset_segmented(app)
-    ]
-    .spacing(space::S)
-    .align_y(Alignment::Center);
-    column![
-        head,
-        ui::caption(when_summary()).wrapping(Wrapping::WordOrGlyph),
-        advanced(app)
-    ]
-    .spacing(space::XS)
+    group(
+        group_head(t!("host-calidad"), None, Some(preset_segmented(app))),
+        column![
+            ui::caption(when_summary()).wrapping(Wrapping::WordOrGlyph),
+            advanced(app)
+        ]
+        .spacing(space::XS),
+    )
     .into()
 }
 
@@ -4725,11 +4977,13 @@ fn invite_more<'a>(app: &'a App, room: &'a Room) -> Option<Element<'a, Message>>
         .filter(|friend| friend.online && !inside.contains(&friend.id))
         .map(|friend| {
             ui::list_row(
-                Some(avatars::view(
-                    app,
+                Some(seat_lamp(
+                    &app.theme,
                     &friend.display_name,
-                    friend.avatar,
-                    28.0,
+                    avatars::of(app, friend.avatar),
+                    FRIEND_SEAT,
+                    Some(Tone::Success),
+                    Surface::Card,
                 )),
                 friend.display_name.as_str(),
                 None,
@@ -4750,11 +5004,10 @@ fn invite_more<'a>(app: &'a App, room: &'a Room) -> Option<Element<'a, Message>>
         return None;
     }
     Some(
-        column![
-            ui::strong(t!("host-invitar-a-mas-amigos")).size(15.0),
-            ui::boxed_list(rows)
-        ]
-        .spacing(space::XS)
+        group(
+            group_head(t!("host-invitar-a-mas-amigos"), None, None),
+            ui::boxed_list(rows),
+        )
         .into(),
     )
 }
@@ -4813,13 +5066,22 @@ fn room_view<'a>(app: &'a App, room: &'a Room) -> Element<'a, Message> {
             })
             .into()
     });
+    // Lo de la sala (la cabecera, lo que se transmite, quién está) va seguido; los ajustes de
+    // después, cada grupo con su título y más aire encima.
     let page = Column::new()
         .spacing(space::M)
         .push(column![room_header(app, room), ui::slot(notices)])
         .push(room_source_card(app, room))
         .push(people_section(app, room))
-        .push(audio_box(app, false))
-        .push(devices_box(app))
+        .push(group(
+            group_head(t!("host-audio-y-voz"), None, None),
+            ui::boxed_list(
+                audio_rows(app, false)
+                    .into_iter()
+                    .chain(device_rows(app))
+                    .collect(),
+            ),
+        ))
         .push(room_quality(app))
         .push(ui::slot(invite_more(app, room)));
     Row::new()
@@ -5142,6 +5404,16 @@ pub(crate) mod shots {
             app.update(Message::Host(Msg::Mode(super::ShareMode::Nothing)));
         }),
         ("09-sala-abierta", host_room),
+        // Recién abierta: el servidor aún no ha dado el código y no ha entrado nadie.
+        ("09-sala-creando", |app| {
+            host_setup(app);
+            let preview = VideoFeed::detached();
+            preview.push(game_frame(1, 640, 360), None, None);
+            app.update(Message::Host(Msg::Start));
+            app.update(Message::Event(Event::HostStarted(Ok(preview))));
+            super::settle(app);
+            app.toasts.clear();
+        }),
         ("09-sala-sin-compartir", |app| {
             host_room(app);
             app.update(Message::Host(Msg::StopSharing));
@@ -6680,17 +6952,17 @@ mod tests {
         assert!((fold.shown(app.now) - 1.0).abs() < f32::EPSILON);
     }
 
-    /// «EN VIVO» lleva el tiempo transmitiendo (m:ss y, pasada una hora, h:mm:ss), se pide un
+    /// «En vivo» lleva el tiempo transmitiendo (m:ss y, pasada una hora, h:mm:ss), se pide un
     /// cuadro por segundo para él solo con la sala delante y desaparece al dejar de compartir.
     #[test]
     fn en_vivo_shows_its_time() {
         let mut app = app();
         app.screen = Screen::Main;
         open_room(&mut app);
-        assert_eq!(live_label(&app).as_deref(), Some("EN VIVO 0:00"));
+        assert_eq!(live_label(&app).as_deref(), Some("En vivo 0:00"));
         let since = app.host.motion.live_since.expect("en vivo");
         app.now = since + Duration::from_millis(12 * 60_000 + 4_300);
-        assert_eq!(live_label(&app).as_deref(), Some("EN VIVO 12:04"));
+        assert_eq!(live_label(&app).as_deref(), Some("En vivo 12:04"));
         settle(&mut app);
         assert_eq!(
             next_tick(&app),
@@ -6699,7 +6971,7 @@ mod tests {
         );
         assert!(!animating(&app), "nada de continuo: un cuadro por segundo");
         app.now = since + Duration::from_secs(3_600 + 2 * 60 + 3);
-        assert_eq!(live_label(&app).as_deref(), Some("EN VIVO 1:02:03"));
+        assert_eq!(live_label(&app).as_deref(), Some("En vivo 1:02:03"));
         app.page = Page::Home;
         assert_eq!(next_tick(&app), None, "sin la sala delante, nada");
         app.page = Page::Host;
