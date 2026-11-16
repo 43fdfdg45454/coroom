@@ -11,7 +11,7 @@ import coroom.android.ui.main.MainPhase
 import coroom.android.ui.main.MainUiState
 
 /**
- * Datos de muestra para las vistas previas, con los nombres ficticios de los bocetos. Solo los
+ * Datos de muestra para las vistas previas, con nombres ficticios. Solo los
  * usan las `@Preview`; en la app todo llega del puente con Rust.
  */
 internal object FakeData {

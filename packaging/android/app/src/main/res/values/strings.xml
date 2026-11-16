@@ -89,12 +89,12 @@
     <string name="home_join_title">Unirme a una sala</string>
     <string name="home_join_code">Código de la sala</string>
     <string name="home_join_placeholder">K7Q2MZ</string>
+    <string name="home_join_hint">Seis letras y números. Te lo pasa quien abrió la sala.</string>
     <string name="home_invitations">Invitaciones</string>
     <string name="home_invitations_empty">Sin invitaciones por ahora. Cuando un amigo te invite a su sala, aparecerá aquí.</string>
     <string name="home_invitation_title">%1$s te invita</string>
-    <string name="home_invitation_detail">Sala %1$s · %2$s</string>
     <string name="home_own_room_title">Tu sala en %1$s</string>
-    <string name="home_own_room_detail">Sala %1$s · abierta con tu cuenta en otro dispositivo</string>
+    <string name="room_live">En vivo</string>
     <string name="home_friends_online">Amigos conectados</string>
     <string name="home_friends_online_empty">Ninguno de tus amigos está conectado ahora.</string>
     <string name="home_friends_none_body">Agrega a tus amigos por su nombre de usuario de coroom para ver aquí quién está conectado y entrar en sus salas.</string>
@@ -190,6 +190,12 @@
     <string name="notification_channel_invitations_description">Cuando un amigo te invita a su sala</string>
     <string name="notification_invited_title">%1$s te invita a su sala</string>
     <string name="notification_invited_text">Sala %1$s · toca para entrar</string>
+
+    <!-- Las butacas de una sala -->
+    <string name="room_seats">En la sala</string>
+    <string name="seat_host">Anfitrión</string>
+    <string name="seat_you">Tú</string>
+    <string name="seat_free">Butaca %1$d, libre</string>
 
     <!-- Entrando en la sala -->
     <string name="joining_title">Entrando en la sala</string>

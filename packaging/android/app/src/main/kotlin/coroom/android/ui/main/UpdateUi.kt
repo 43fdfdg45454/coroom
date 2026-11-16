@@ -1,17 +1,17 @@
 package coroom.android.ui.main
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.selection.toggleable
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.ButtonColors
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.LinearProgressIndicator
@@ -29,7 +29,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
@@ -45,11 +44,13 @@ import coroom.android.bridge.UpdateState
 import coroom.android.platform.UpdateInstaller
 import coroom.android.settings.UPDATE_INTERVALS
 import coroom.android.ui.components.CoroomIcon
-import coroom.android.ui.components.PillButton
-import coroom.android.ui.components.PillOutlinedButton
+import coroom.android.ui.components.Notice
+import coroom.android.ui.components.PrimaryButton
 import coroom.android.ui.components.RowDivider
+import coroom.android.ui.components.SecondaryButton
 import coroom.android.ui.theme.CoroomText
 import coroom.android.ui.theme.CoroomTheme
+import coroom.android.ui.theme.Tone
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlin.math.roundToLong
@@ -75,68 +76,47 @@ data class UpdateActions(
 private fun sentence(error: String?): String =
     error.orEmpty().trim().trimEnd('.').replaceFirstChar { it.uppercaseChar() }
 
-/** Un aviso del boceto: icono, título, texto y los botones debajo, con el color de su tono. */
-@Composable
-private fun UpdateNotice(
-    icon: Int,
-    title: String,
-    body: String,
-    container: Color,
-    content: Color,
-    actions: @Composable () -> Unit = {},
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(container)
-            .padding(start = 14.dp, end = 12.dp, top = 12.dp, bottom = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            CoroomIcon(icon, contentDescription = null, tint = content, size = 22.dp)
-            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                Text(title, style = CoroomText.itemTitle, color = content)
-                if (body.isNotEmpty()) Text(body, style = CoroomText.supporting, color = content.copy(alpha = 0.85f))
-            }
-        }
-        FlowRow(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) { actions() }
-    }
-}
-
 /**
  * «Instalar ahora»: desactivado con una sala abierta, y TalkBack dice por qué (el texto del aviso
  * ya lo explica).
  */
 @Composable
-private fun RestartButton(text: String, update: UpdateState, onInstall: () -> Unit) {
+private fun RestartButton(
+    text: String,
+    update: UpdateState,
+    onInstall: () -> Unit,
+    colors: ButtonColors = ButtonDefaults.buttonColors(),
+) {
     val reason = stringResource(R.string.update_close_room)
-    PillButton(
+    PrimaryButton(
         text = text,
         onClick = onInstall,
         enabled = update.canInstall,
         icon = R.drawable.ic_rotate_ccw,
+        colors = colors,
         modifier = if (update.canInstall) Modifier else Modifier.semantics { stateDescription = reason },
     )
 }
 
+/** «Novedades», la alternativa junto a «Instalar ahora»: con el color del aviso que la contiene. */
 @Composable
-private fun NewsButton(update: UpdateState) {
+private fun NewsButton(update: UpdateState, contentColor: Color) {
     val uri = LocalUriHandler.current
-    PillOutlinedButton(text = stringResource(R.string.update_news), onClick = { runCatching { uri.openUri(update.url) } })
+    SecondaryButton(
+        text = stringResource(R.string.update_news),
+        onClick = { runCatching { uri.openUri(update.url) } },
+        contentColor = contentColor,
+    )
 }
 
 @Composable
-private fun SeeButton(update: UpdateState) {
+private fun SeeButton(update: UpdateState, colors: ButtonColors = ButtonDefaults.buttonColors()) {
     val uri = LocalUriHandler.current
-    PillButton(
+    PrimaryButton(
         text = stringResource(R.string.update_see),
         onClick = { runCatching { uri.openUri(update.url) } },
         icon = R.drawable.ic_external_link,
+        colors = colors,
     )
 }
 
@@ -150,7 +130,7 @@ fun UpdateBanner(update: UpdateState?, actions: UpdateActions) {
     val version = update.version ?: return
     val colors = MaterialTheme.colorScheme
     when (update.stage) {
-        "ready" -> UpdateNotice(
+        "ready" -> Notice(
             icon = R.drawable.ic_download,
             title = stringResource(R.string.update_ready_title, version),
             body = if (update.roomOpen) {
@@ -158,28 +138,32 @@ fun UpdateBanner(update: UpdateState?, actions: UpdateActions) {
             } else {
                 stringResource(R.string.update_ready_body, update.current)
             },
-            container = colors.primaryContainer,
-            content = colors.onPrimaryContainer,
-        ) {
-            NewsButton(update)
-            RestartButton(stringResource(R.string.update_restart), update, actions.install)
-        }
-        "failed" -> UpdateNotice(
+            tone = Tone.Info,
+            actions = {
+                NewsButton(update, contentColor = colors.onPrimaryContainer)
+                RestartButton(stringResource(R.string.update_restart), update, actions.install)
+            },
+        )
+        "failed" -> Notice(
             icon = R.drawable.ic_circle_alert,
             title = stringResource(R.string.update_failed_title, version),
             body = stringResource(R.string.update_failed_body, sentence(update.error)),
-            container = colors.errorContainer,
-            content = colors.onErrorContainer,
-        ) {
-            PillOutlinedButton(text = stringResource(R.string.action_retry), onClick = actions.retry)
-        }
-        "notice" -> UpdateNotice(
+            tone = Tone.Error,
+            actions = {
+                SecondaryButton(
+                    text = stringResource(R.string.action_retry),
+                    onClick = actions.retry,
+                    contentColor = colors.onErrorContainer,
+                )
+            },
+        )
+        "notice" -> Notice(
             icon = R.drawable.ic_info,
             title = stringResource(R.string.update_available, version, update.current),
             body = "",
-            container = colors.primaryContainer,
-            content = colors.onPrimaryContainer,
-        ) { SeeButton(update) }
+            tone = Tone.Info,
+            actions = { SeeButton(update) },
+        )
         else -> Unit
     }
 }
@@ -187,52 +171,66 @@ fun UpdateBanner(update: UpdateState?, actions: UpdateActions) {
 /** El aviso de versiones distintas con el servidor `host`. */
 @Composable
 fun ProtocolBanner(host: String, gap: ProtocolGap, update: UpdateState?, actions: UpdateActions) {
-    val colors = MaterialTheme.colorScheme
     if (!gap.clientOlder) {
-        UpdateNotice(
+        Notice(
             icon = R.drawable.ic_server,
             title = stringResource(R.string.protocol_server_older_title),
             body = stringResource(R.string.protocol_server_older_body, host, gap.server, gap.client),
-            container = colors.errorContainer,
-            content = colors.onErrorContainer,
+            tone = Tone.Error,
         )
         return
     }
-    val extra = CoroomTheme.colors
-    UpdateNotice(
+    val known = update?.takeIf { it.version != null }
+    Notice(
         icon = R.drawable.ic_triangle_alert,
         title = stringResource(R.string.protocol_client_older_title),
         body = stringResource(R.string.protocol_client_older_body, host, gap.server, gap.client),
-        container = extra.warningContainer,
-        content = extra.onWarningContainer,
-    ) {
-        val known = update?.takeIf { it.version != null }
-        when {
-            known == null -> Unit
-            !known.auto -> SeeButton(known)
-            known.stage == "ready" -> RestartButton(stringResource(R.string.protocol_update_restart), known, actions.install)
-            known.stage == "downloading" || known.stage == "paused" -> Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                LinearProgressIndicator(
-                    progress = { known.percent / 100f },
-                    modifier = Modifier.width(140.dp),
-                    color = if (known.stage == "paused") colors.outline else colors.primary,
-                )
-                Text(
-                    stringResource(R.string.protocol_percent, known.percent),
-                    style = CoroomText.supporting,
-                    color = extra.onWarningContainer,
-                )
-            }
-            else -> PillButton(
-                text = stringResource(R.string.protocol_download_update),
-                onClick = actions.updateNow,
-                enabled = !known.roomOpen,
-                icon = R.drawable.ic_download,
+        tone = Tone.Warning,
+        actions = known?.let { { ProtocolUpdateAction(it, actions) } },
+    )
+}
+
+/** Lo que se puede hacer con la versión nueva desde el aviso de versiones distintas. */
+@Composable
+private fun ProtocolUpdateAction(known: UpdateState, actions: UpdateActions) {
+    val colors = MaterialTheme.colorScheme
+    val extra = CoroomTheme.colors
+    // Sobre el ámbar del aviso, los botones rellenos van con su acento, no con el primario.
+    val warningButton = ButtonDefaults.buttonColors(
+        containerColor = extra.warningAccent,
+        contentColor = extra.onWarningAccent,
+    )
+    when {
+        !known.auto -> SeeButton(known, colors = warningButton)
+        known.stage == "ready" -> RestartButton(
+            stringResource(R.string.protocol_update_restart),
+            known,
+            actions.install,
+            colors = warningButton,
+        )
+        known.stage == "downloading" || known.stage == "paused" -> Row(
+            modifier = Modifier.heightIn(min = 40.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            LinearProgressIndicator(
+                progress = { known.percent / 100f },
+                modifier = Modifier.width(140.dp),
+                color = if (known.stage == "paused") colors.outline else extra.warningAccent,
+            )
+            Text(
+                stringResource(R.string.protocol_percent, known.percent),
+                style = CoroomText.figure,
+                color = extra.onWarningContainer,
             )
         }
+        else -> PrimaryButton(
+            text = stringResource(R.string.protocol_download_update),
+            onClick = actions.updateNow,
+            enabled = !known.roomOpen,
+            icon = R.drawable.ic_download,
+            colors = warningButton,
+        )
     }
 }
 
@@ -255,8 +253,8 @@ fun UpdateSettings(update: UpdateState?, intervalHours: Int, actions: UpdateActi
     val state = update ?: UpdateState()
     val version = state.version.orEmpty()
     Column(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 12.dp, top = 12.dp, bottom = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
         Text(stringResource(R.string.update_status_title), style = CoroomText.itemBody, color = colors.onSurface)
         val text = when {
@@ -280,26 +278,26 @@ fun UpdateSettings(update: UpdateState?, intervalHours: Int, actions: UpdateActi
         Text(text, style = CoroomText.supporting, color = colors.onSurfaceVariant)
         Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterEnd) {
             when {
-                state.checking -> PillOutlinedButton(
+                state.checking -> SecondaryButton(
                     text = stringResource(R.string.update_checking_button),
                     onClick = {},
                     enabled = false,
                 )
                 state.stage == "downloading" || state.stage == "paused" -> LinearProgressIndicator(
                     progress = { state.percent / 100f },
-                    modifier = Modifier.width(160.dp),
+                    modifier = Modifier.padding(vertical = 18.dp).width(160.dp),
                     color = if (state.stage == "paused") colors.outline else colors.primary,
                 )
                 state.stage == "ready" -> Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    NewsButton(state)
+                    NewsButton(state, contentColor = colors.primary)
                     RestartButton(stringResource(R.string.update_restart), state, actions.install)
                 }
-                state.stage == "failed" -> PillOutlinedButton(
+                state.stage == "failed" -> SecondaryButton(
                     text = stringResource(R.string.action_retry),
                     onClick = actions.retry,
                 )
                 state.stage == "notice" && state.version != null -> SeeButton(state)
-                else -> PillOutlinedButton(
+                else -> SecondaryButton(
                     text = stringResource(R.string.update_check_now),
                     onClick = actions.checkNow,
                     enabled = state.enabled,
@@ -340,10 +338,10 @@ private fun ToggleRow(
         modifier = Modifier
             .fillMaxWidth()
             .toggleable(value = checked, enabled = enabled, onValueChange = onChange, role = Role.Switch)
-            .padding(horizontal = 14.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(title, style = CoroomText.itemBody, color = MaterialTheme.colorScheme.onSurface)
                 Text(body, style = CoroomText.supporting, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -354,7 +352,7 @@ private fun ToggleRow(
     }
 }
 
-/** «Una vez al día ▾». */
+/** «Una vez al día», con la flecha del desplegable. */
 @Composable
 private fun IntervalChoice(hours: Int, onChoose: (Int) -> Unit) {
     var open by remember { mutableStateOf(false) }
@@ -362,7 +360,7 @@ private fun IntervalChoice(hours: Int, onChoose: (Int) -> Unit) {
         stringResource(if (value == 24) R.string.update_daily else R.string.update_weekly)
     }
     Box {
-        PillOutlinedButton(text = "${label(hours)} ▾", onClick = { open = true })
+        SecondaryButton(text = label(hours), onClick = { open = true }, trailingIcon = R.drawable.ic_chevron_down)
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             UPDATE_INTERVALS.forEach { value ->
                 DropdownMenuItem(
