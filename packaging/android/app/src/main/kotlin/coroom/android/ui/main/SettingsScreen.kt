@@ -192,6 +192,18 @@ fun SettingsScreen(
                                 style = CoroomText.supporting,
                                 color = colors.onSurfaceVariant,
                             )
+                            // Lo que dice la lámpara de la butaca, también en palabras.
+                            Text(
+                                stringResource(
+                                    when (state.serverOnline) {
+                                        true -> R.string.settings_server_online
+                                        false -> R.string.settings_server_offline
+                                        null -> R.string.settings_server_connecting
+                                    },
+                                ),
+                                style = CoroomText.supporting,
+                                color = colors.onSurfaceVariant,
+                            )
                         }
                         SecondaryButton(
                             text = stringResource(R.string.settings_logout),

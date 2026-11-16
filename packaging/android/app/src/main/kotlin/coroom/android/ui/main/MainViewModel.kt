@@ -81,8 +81,16 @@ data class MainUiState(
     val pendingInstall: String? = null,
 )
 
-/** Entrar en una sala: lo abre la actividad de la sala. */
-data class RoomRequest(val code: String, val hostName: String?)
+/**
+ * Entrar en una sala: lo abre la actividad de la sala. `hostUser` y `hostAvatar` (la versión de su
+ * imagen) son de quien aloja, si se sabe: así su butaca es la misma en Inicio y al entrar.
+ */
+data class RoomRequest(
+    val code: String,
+    val hostName: String?,
+    val hostUser: Long? = null,
+    val hostAvatar: Long? = null,
+)
 
 class MainViewModel(private val container: AppContainer) : ViewModel() {
     private val repository = container.repository
@@ -294,7 +302,18 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
             _messages.trySend(UiText.res(R.string.message_invalid_code))
             return
         }
-        val request = RoomRequest(clean, hostName)
+        // Quién aloja, si se sabe: quien invitó con ese código, o la propia cuenta si la sala es
+        // una de las suyas en otro dispositivo. Con un código escrito a mano no se sabe.
+        val state = _state.value
+        val account = state.account
+        val hostUser: Long? = state.invitations.firstOrNull { RoomCode.clean(it.code) == clean }?.fromUser
+            ?: account?.userId?.takeIf { state.ownRooms.any { room -> RoomCode.clean(room.code) == clean } }
+        val hostAvatar: Long? = when {
+            hostUser == null -> null
+            hostUser == account?.userId -> account.avatar
+            else -> state.friends.list?.friends?.firstOrNull { it.id == hostUser }?.avatar
+        }
+        val request = RoomRequest(clean, hostName, hostUser, hostAvatar)
         if (_state.value.phase == MainPhase.SignedIn) _rooms.trySend(request) else pendingJoin = request
     }
 

@@ -88,7 +88,7 @@
     <string name="home_server_offline">Sin conexión con %1$s: coroom vuelve a intentarlo solo</string>
     <string name="home_join_title">Unirme a una sala</string>
     <string name="home_join_code">Código de la sala</string>
-    <string name="home_join_placeholder">K7Q2MZ</string>
+    <string name="home_join_placeholder">K7Q 2MZ</string>
     <string name="home_join_hint">Seis letras y números. Te lo pasa quien abrió la sala.</string>
     <string name="home_invitations">Invitaciones</string>
     <string name="home_invitations_empty">Sin invitaciones por ahora. Cuando un amigo te invite a su sala, aparecerá aquí.</string>
@@ -168,6 +168,9 @@
     <string name="settings_notify_body">Notificación del sistema mientras coroom siga abierto en segundo plano</string>
     <string name="settings_account">Cuenta</string>
     <string name="settings_account_detail">\@%1$s · %2$s</string>
+    <string name="settings_server_online">Conectado al servidor</string>
+    <string name="settings_server_connecting">Conectando con el servidor…</string>
+    <string name="settings_server_offline">Sin conexión con el servidor</string>
     <string name="settings_logout">Cerrar sesión</string>
     <string name="settings_version">coroom %1$s</string>
     <string name="settings_licenses">Licencias</string>
@@ -195,7 +198,7 @@
     <string name="room_seats">En la sala</string>
     <string name="seat_host">Anfitrión</string>
     <string name="seat_you">Tú</string>
-    <string name="seat_free">Butaca %1$d, libre</string>
+    <string name="seat_own">Tu butaca</string>
 
     <!-- Entrando en la sala -->
     <string name="joining_title">Entrando en la sala</string>
@@ -225,6 +228,7 @@
     <string name="quality_poor">mala</string>
     <string name="quality_unknown">sin medir</string>
     <string name="quality_reconnecting">Reconectando</string>
+    <string name="pill_rtt_quality">%1$s · %2$s</string>
     <string name="pill_description">Conexión %1$s: %2$s, %3$s. Abrir conexión y calidad</string>
     <string name="pill_description_collapsed">Conexión %1$s: %2$s. Mostrar los controles de la sala</string>
     <string name="pill_description_collapsed_unread">Conexión %1$s: %2$s. Hay mensajes nuevos en el chat. Mostrar los controles de la sala</string>

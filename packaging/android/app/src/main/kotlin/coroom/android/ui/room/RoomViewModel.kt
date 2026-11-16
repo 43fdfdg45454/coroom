@@ -73,6 +73,13 @@ data class InputPermissions(val keyboardMouse: Boolean, val gamepadSlot: Int?)
 data class RoomUiState(
     val code: String,
     val hostName: String? = null,
+    /**
+     * La cuenta de quien aloja y la versión de su imagen, si se sabían al entrar (por una
+     * invitación o una sala propia): su butaca es la misma que en Inicio hasta que llega la lista
+     * de integrantes.
+     */
+    val hostUser: Long? = null,
+    val hostAvatar: Long? = null,
     /** La cuenta propia, para dibujar su butaca mientras se entra (`null` en las vistas previas sin cuenta). */
     val self: Account? = null,
     val phase: RoomPhase = RoomPhase.Joining,
@@ -147,10 +154,18 @@ class RoomViewModel(
     private val container: AppContainer,
     code: String,
     hostName: String?,
+    hostUser: Long? = null,
+    hostAvatar: Long? = null,
 ) : ViewModel() {
     private val repository = container.repository
     private val _state = MutableStateFlow(
-        RoomUiState(code = code, hostName = hostName, self = container.repository.account.value),
+        RoomUiState(
+            code = code,
+            hostName = hostName,
+            hostUser = hostUser,
+            hostAvatar = hostAvatar,
+            self = container.repository.account.value,
+        ),
     )
     val state: StateFlow<RoomUiState> = _state.asStateFlow()
 
@@ -282,6 +297,9 @@ class RoomViewModel(
                     it.copy(
                         code = event.code,
                         hostName = event.hostName.ifBlank { it.hostName },
+                        // La sala nueva puede ser de otra persona: de su cuenta solo llega el nombre.
+                        hostUser = null,
+                        hostAvatar = null,
                         phase = RoomPhase.Joining,
                         steps = JoinStep.entries.associateWith { StepState.Pending },
                         reconnecting = null,
