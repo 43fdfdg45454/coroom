@@ -310,7 +310,7 @@ class MainViewModel(private val container: AppContainer) : ViewModel() {
             ?: account?.userId?.takeIf { state.ownRooms.any { room -> RoomCode.clean(room.code) == clean } }
         val hostAvatar: Long? = when {
             hostUser == null -> null
-            hostUser == account?.userId -> account?.avatar
+            hostUser == account?.userId -> account.avatar
             else -> state.friends.list?.friends?.firstOrNull { it.id == hostUser }?.avatar
         }
         val request = RoomRequest(clean, hostName, hostUser, hostAvatar)
