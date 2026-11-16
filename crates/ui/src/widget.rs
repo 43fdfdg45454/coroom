@@ -1,8 +1,10 @@
 //! Componentes del sistema de diseño, hechos con los *widgets* de `iced` y las clases de
 //! [`crate::style`]: tipografía, botones, campos con validación, interruptores, filas de lista con
-//! avatar, insignias de estado, avisos en línea, toasts, diálogos modales, progreso con texto,
+//! butaca, insignias de estado, avisos en línea, toasts, diálogos modales, progreso con texto,
 //! selectores, deslizadores, teclas de atajo, barra lateral, cabecera de página, tarjetas,
-//! grupos de ajustes y los estados vacío, cargando y error.
+//! grupos de ajustes y los estados vacío, cargando y error. Y lo propio de coroom: la butaca
+//! ([`avatar`], [`empty_seat`]; con foto, lámpara y en fila, en [`crate::avatar`]), el código de
+//! sala en señalética ([`code_cells`]) y la entrada ([`ticket`]).
 
 use iced_core::alignment::{Horizontal, Vertical};
 use iced_core::text::Wrapping;
@@ -17,10 +19,11 @@ use crate::font::{MONO, SEMIBOLD, UI};
 use crate::icon::{Icon, icon, icon_with};
 use crate::release::release_to_pick;
 use crate::style::{
-    ButtonClass, ContainerClass, InputClass, ProgressClass, SliderClass, SvgClass, TextClass,
+    ButtonClass, ContainerClass, InputClass, ProgressClass, SliderClass, Surface, SvgClass,
+    TextClass,
 };
 use crate::theme::Tone;
-use crate::tokens::{size, space as gap, text as type_size};
+use crate::tokens::{seat, sign, size, space as gap, text as type_size, ticket as perforation};
 use crate::{Element, Renderer, Theme};
 
 /// Texto con el tema de coroom.
@@ -31,7 +34,7 @@ pub type Button<'a, M> = crate::animate::AnimatedButton<'a, M>;
 
 // --- Tipografía ---------------------------------------------------------------------------------
 
-/// Título de página (24/600).
+/// Título de página (26/600).
 pub fn title<'a>(content: impl text::IntoFragment<'a>) -> Text<'a> {
     text(content).size(type_size::TITLE).font(SEMIBOLD)
 }
@@ -541,20 +544,222 @@ pub fn initials(name: &str) -> String {
     out
 }
 
-/// Avatar redondo con las iniciales de `name` y un color estable para ese nombre.
+/// Butaca de `name`: sus iniciales en seminegrita sobre un color estable para ese nombre, con la
+/// silueta de la butaca (respaldo redondeado, base casi recta). Es el avatar de coroom; con foto,
+/// [`crate::avatar::avatar_with`].
 pub fn avatar<'a, M: 'a>(theme: &Theme, name: &str, side: f32) -> Element<'a, M> {
     let (background, text_color) = theme.palette.avatar(name);
     container(
         text(initials(name))
-            .size((side * 0.4).round())
-            .font(SEMIBOLD),
+            .size((side * seat::INITIALS).round())
+            .font(SEMIBOLD)
+            .wrapping(Wrapping::None),
     )
     .center_x(Length::Fixed(side))
     .center_y(Length::Fixed(side))
-    .class(ContainerClass::Avatar {
+    .class(ContainerClass::Seat {
         background,
         text: text_color,
+        side,
     })
+    .into()
+}
+
+/// Butaca libre: el contorno de la butaca sin relleno, con su número (`number`, desde 1) en el
+/// color secundario. Sobre una tarjeta o la ventana; sobre el vídeo, [`empty_seat_on`].
+pub fn empty_seat<'a, M: 'a>(number: usize, side: f32) -> Element<'a, M> {
+    empty_seat_on(number, side, Surface::Card)
+}
+
+/// [`empty_seat`] sobre el plano `on`: sobre el vídeo ([`Surface::Overlay`]) el contorno y el
+/// número van claros.
+pub fn empty_seat_on<'a, M: 'a>(number: usize, side: f32, on: Surface) -> Element<'a, M> {
+    seat_outline(number.to_string(), side, on)
+}
+
+/// El contorno de una butaca con `label` dentro (el número de una libre, «+3» de las que no
+/// caben en la fila).
+pub(crate) fn seat_outline<'a, M: 'a>(label: String, side: f32, on: Surface) -> Element<'a, M> {
+    container(
+        text(label)
+            .size((side * seat::NUMBER).round())
+            .font(SEMIBOLD)
+            .wrapping(Wrapping::None),
+    )
+    .center_x(Length::Fixed(side))
+    .center_y(Length::Fixed(side))
+    .class(ContainerClass::SeatEmpty { side, on })
+    .into()
+}
+
+// --- Señalética y entradas ------------------------------------------------------------------------
+
+/// Tamaño de las celdas de [`code_cells`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum CodeSize {
+    /// El código de la sala abierta ([`sign::LARGE`]).
+    #[default]
+    Large,
+    /// El código dentro de una invitación ([`sign::SMALL`]).
+    Small,
+}
+
+impl CodeSize {
+    /// Las medidas de la celda.
+    pub fn cell(self) -> sign::Cell {
+        match self {
+            CodeSize::Large => sign::LARGE,
+            CodeSize::Small => sign::SMALL,
+        }
+    }
+}
+
+/// Los caracteres de un código de sala en grupos de tres («k7q2mz», «K7Q 2MZ» y «K7Q-2MZ» dan
+/// «K7Q» y «2MZ»): en mayúsculas y sin espacios ni guiones. Si no es múltiplo de tres, el último
+/// grupo queda corto.
+pub fn code_groups(code: &str) -> Vec<String> {
+    let characters: Vec<char> = code
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_uppercase)
+        .collect();
+    characters
+        .chunks(sign::GROUP)
+        .map(|group| group.iter().collect())
+        .collect()
+}
+
+/// Ancho de [`code_cells`] para un código de `characters` caracteres.
+pub fn code_width(characters: usize, size: CodeSize) -> f32 {
+    let cell = size.cell();
+    let groups = characters.div_ceil(sign::GROUP);
+    let inner_gaps = characters.saturating_sub(groups);
+    characters as f32 * cell.width
+        + inner_gaps as f32 * cell.gap
+        + groups.saturating_sub(1) as f32 * cell.group_gap
+}
+
+/// El código de una sala en señalética: cada carácter en su celda de ancho fijo, en seminegrita,
+/// agrupados de tres en tres con un hueco mayor entre grupos ([`code_groups`]). `size` elige la
+/// celda: grande para la sala abierta, pequeña para una invitación. No cambia de ancho con las
+/// letras que lleve.
+pub fn code_cells<'a, M: 'a>(code: &str, size: CodeSize) -> Element<'a, M> {
+    let cell = size.cell();
+    let groups = code_groups(code).into_iter().map(|group| {
+        let cells = group.chars().map(|character| {
+            container(cap_centered(
+                text(character.to_string())
+                    .size(cell.text)
+                    .font(SEMIBOLD)
+                    .wrapping(Wrapping::None),
+                cell.text,
+            ))
+            .center_x(Length::Fixed(cell.width))
+            .center_y(Length::Fixed(cell.height))
+            .class(ContainerClass::CodeCell {
+                radius: cell.radius,
+            })
+            .into()
+        });
+        Row::with_children(cells).spacing(cell.gap).into()
+    });
+    Row::with_children(groups)
+        .spacing(cell.group_gap)
+        .align_y(Alignment::Center)
+        .into()
+}
+
+/// Dónde empieza cada punto del filete punteado de una entrada de `height` de alto: puntos
+/// enteros, a la misma distancia unos de otros y centrados en el alto.
+pub fn perforation_dots(height: f32) -> Vec<f32> {
+    if height < perforation::DOT {
+        return Vec::new();
+    }
+    let count = ((height - perforation::DOT) / perforation::PITCH).floor() as usize + 1;
+    let used = (count - 1) as f32 * perforation::PITCH + perforation::DOT;
+    let start = ((height - used) / 2.0).floor();
+    (0..count)
+        .map(|index| start + index as f32 * perforation::PITCH)
+        .collect()
+}
+
+/// El filete punteado vertical de una entrada: una columna de puntos pequeños tan alta como le
+/// dejen. No recibe eventos ni foco.
+struct Perforation;
+
+impl<M> iced_core::Widget<M, Theme, Renderer> for Perforation {
+    fn size(&self) -> iced_core::Size<Length> {
+        iced_core::Size::new(Length::Fixed(perforation::DOT), Length::Fill)
+    }
+
+    fn layout(
+        &mut self,
+        _tree: &mut iced_core::widget::Tree,
+        _renderer: &Renderer,
+        limits: &iced_core::layout::Limits,
+    ) -> iced_core::layout::Node {
+        iced_core::layout::Node::new(limits.resolve(
+            Length::Fixed(perforation::DOT),
+            Length::Fill,
+            iced_core::Size::ZERO,
+        ))
+    }
+
+    fn draw(
+        &self,
+        _tree: &iced_core::widget::Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        _style: &iced_core::renderer::Style,
+        layout: iced_core::Layout<'_>,
+        _cursor: iced_core::mouse::Cursor,
+        _viewport: &iced_core::Rectangle,
+    ) {
+        use iced_core::Renderer as _;
+
+        let bounds = layout.bounds();
+        let color = theme.palette.border_strong.color();
+        for offset in perforation_dots(bounds.height) {
+            renderer.fill_quad(
+                iced_core::renderer::Quad {
+                    bounds: iced_core::Rectangle {
+                        x: bounds.x,
+                        y: bounds.y + offset,
+                        width: perforation::DOT,
+                        height: perforation::DOT,
+                    },
+                    border: iced_core::border::rounded(perforation::DOT / 2.0),
+                    ..iced_core::renderer::Quad::default()
+                },
+                color,
+            );
+        }
+    }
+}
+
+/// Entrada: una tarjeta con el cuerpo a la izquierda (quién invita, a qué sala; o el código de la
+/// sala propia), un filete vertical punteado y el talón a la derecha con la acción («Entrar»,
+/// «Copiar»). Es una tarjeta tonal como las demás; el punteado es lo único que la distingue.
+/// Ocupa el ancho que le den y el talón, lo que mida.
+pub fn ticket<'a, M: 'a>(
+    body: impl Into<Element<'a, M>>,
+    stub: impl Into<Element<'a, M>>,
+) -> Element<'a, M> {
+    container(
+        row![
+            container(body)
+                .padding(Padding::from([gap::S, gap::M]))
+                .width(Length::Fill),
+            container(Element::new(Perforation)).padding(Padding::from([gap::XS, 0.0])),
+            container(stub).padding(Padding::from([gap::S, gap::M])),
+        ]
+        // El punteado es tan alto como le dejen: sin esto la fila (y la entrada) se estiraría
+        // con él en vez de medir lo que su contenido.
+        .height(Length::Shrink)
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .class(ContainerClass::Ticket)
     .into()
 }
 
@@ -728,6 +933,7 @@ fn tone_icon(tone: Tone) -> Icon {
         Tone::Success => Icon::CircleCheck,
         Tone::Warning => Icon::Warning,
         Tone::Error => Icon::CircleAlert,
+        Tone::Live => Icon::Radio,
     }
 }
 
@@ -1017,15 +1223,21 @@ pub struct NavItem<M> {
     pub badge: Option<String>,
 }
 
-/// Barra lateral: cabecera, entradas y pie (usuario y servidor).
+/// Barra lateral: cabecera, entradas y pie (usuario y servidor). La entrada elegida lleva un
+/// relleno suave de acento y el icono en el color de acento.
 pub fn sidebar<'a, M: Clone + 'a>(
     header: Element<'a, M>,
     items: Vec<NavItem<M>>,
     footer: Element<'a, M>,
 ) -> Element<'a, M> {
     let entries = items.into_iter().map(|item| {
+        let glyph = if item.selected {
+            SvgClass::Accent
+        } else {
+            SvgClass::Text
+        };
         let mut line = row![
-            icon(item.icon, 18.0),
+            icon_with(item.icon, 18.0, glyph),
             text(item.label)
                 .size(type_size::BODY)
                 .font(if item.selected { SEMIBOLD } else { UI })
@@ -1285,7 +1497,8 @@ pub fn rail<'a, M: Clone + 'a>(
     .into()
 }
 
-/// Cabecera de página: título, subtítulo y acciones a la derecha.
+/// Cabecera de página: título (26, seminegrita), subtítulo en secundario y acciones a la derecha.
+/// Sin antetítulo: el título se basta.
 pub fn page_header<'a, M: 'a>(
     title_text: impl text::IntoFragment<'a>,
     subtitle: Option<String>,
@@ -1329,7 +1542,7 @@ pub fn page<'a, M: 'a>(
     .into()
 }
 
-/// Tarjeta.
+/// Tarjeta: relleno y filete fino, sin sombra.
 pub fn card<'a, M: 'a>(content: impl Into<Element<'a, M>>) -> Element<'a, M> {
     container(content)
         .padding(gap::M)
@@ -1690,6 +1903,63 @@ mod tests {
         assert_eq!(initials("bea"), "B");
         assert_eq!(initials("  "), "?");
         assert_eq!(initials("Carla de la Vega"), "CD");
+    }
+
+    #[test]
+    fn codes_are_grouped_by_three() {
+        assert_eq!(code_groups("K7Q2MZ"), ["K7Q", "2MZ"]);
+        assert_eq!(code_groups("k7q 2mz"), ["K7Q", "2MZ"]);
+        assert_eq!(code_groups(" K7Q-2MZ "), ["K7Q", "2MZ"]);
+        assert_eq!(code_groups("ABCDEFG"), ["ABC", "DEF", "G"]);
+        assert_eq!(code_groups("AB"), ["AB"]);
+        assert!(code_groups("").is_empty());
+        assert!(code_groups(" - ").is_empty());
+    }
+
+    #[test]
+    fn a_code_is_as_wide_as_its_cells_and_gaps() {
+        let large = sign::LARGE;
+        assert_eq!(
+            code_width(6, CodeSize::Large),
+            6.0 * large.width + 4.0 * large.gap + large.group_gap
+        );
+        let small = sign::SMALL;
+        assert_eq!(
+            code_width(6, CodeSize::Small),
+            6.0 * small.width + 4.0 * small.gap + small.group_gap
+        );
+        assert_eq!(code_width(0, CodeSize::Large), 0.0);
+        assert_eq!(code_width(1, CodeSize::Large), large.width);
+        // Siete: tres grupos (3 + 3 + 1), cuatro huecos de celda y dos de grupo.
+        assert_eq!(
+            code_width(7, CodeSize::Large),
+            7.0 * large.width + 4.0 * large.gap + 2.0 * large.group_gap
+        );
+        assert_eq!(CodeSize::default().cell(), sign::LARGE);
+        assert_eq!(CodeSize::Small.cell(), sign::SMALL);
+    }
+
+    #[test]
+    fn the_perforation_is_whole_dots_evenly_spaced_and_centred() {
+        assert!(perforation_dots(0.0).is_empty());
+        assert!(perforation_dots(1.0).is_empty());
+        assert_eq!(perforation_dots(perforation::DOT), [0.0]);
+        for height in [7.0_f32, 24.0, 40.0, 52.5, 81.0, 200.0] {
+            let dots = perforation_dots(height);
+            assert!(!dots.is_empty());
+            let first = dots[0];
+            let last = dots[dots.len() - 1] + perforation::DOT;
+            assert!(first >= 0.0 && last <= height, "{height}: {dots:?}");
+            assert!(
+                dots.windows(2)
+                    .all(|pair| pair[1] - pair[0] == perforation::PITCH),
+                "{height}"
+            );
+            // Centrados: lo que sobra arriba y abajo difiere en menos de un píxel.
+            assert!((first - (height - last)).abs() <= 1.0, "{height}: {dots:?}");
+            // Y no cabe uno más.
+            assert!(last + perforation::PITCH > height, "{height}");
+        }
     }
 
     #[test]

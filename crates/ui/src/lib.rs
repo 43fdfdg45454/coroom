@@ -1,16 +1,21 @@
 //! Sistema de diseño de coroom: tokens, tema, iconos y componentes sobre `iced` 0.14.
 //!
-//! La interfaz debe sentirse **de Linux** (`CLAUDE.md`, "Interfaz de usuario"): la paleta es la de
-//! GNOME (libadwaita) en claro y oscuro con el color de acento del sistema, la tipografía la del
-//! escritorio y los espaciados y radios los suyos; en Windows, lo mismo con el tema y el acento del
-//! sistema. Módulos:
+//! La interfaz debe sentirse **de Linux** (`CLAUDE.md`, "Interfaz de usuario"): tema claro y oscuro
+//! con el color de acento del sistema, la tipografía del escritorio y los espaciados y radios de
+//! GNOME; en Windows, lo mismo con el tema y el acento del sistema. Sobre eso, coroom es una sala:
+//! los neutros van teñidos del acento (las luces de la sala), las personas son butacas, los
+//! códigos van en señalética y las invitaciones son entradas. Los controles son los de siempre.
+//! Módulos:
 //!
 //! - [`animate`]: componentes con movimiento (botones que cambian de estado con una transición,
 //!   contenido que se desliza).
-//! - [`avatar`]: avatares con imagen (o iniciales) y el indicador de quién habla.
-//! - [`tokens`]: espaciado (4-32), radios (8, 12, 16), escala tipográfica, tamaños y movimiento.
-//! - [`theme`]: [`theme::Palette`] (los únicos colores fijos del código) con contraste AA
-//!   garantizado para cualquier acento, y utilidades de contraste WCAG.
+//! - [`avatar`]: butacas con foto (o iniciales), lámpara de estado y anillo de quien habla; la
+//!   fila de butacas de una sala y el indicador de quién habla.
+//! - [`tokens`]: espaciado (4-32), radios (8, 12, 16), escala tipográfica, tamaños, la butaca, las
+//!   celdas de señalética y movimiento.
+//! - [`theme`]: [`theme::Palette`] (los únicos colores fijos del código): neutros teñidos del
+//!   acento, lámparas de estado y colores de butaca, con contraste AA garantizado para cualquier
+//!   acento, y utilidades de contraste WCAG.
 //! - [`style`]: [`Theme`] y los catálogos de estilo de los *widgets* de `iced` con clases propias.
 //! - [`font`]: fuente del escritorio o Inter embebida; monoespaciada para códigos y huellas.
 //! - [`icon`]: iconos de Lucide (ISC) monocromos.
@@ -23,7 +28,8 @@
 //!   fijo) y texto en una línea con «…».
 //! - [`selectable`]: texto que se selecciona con el ratón y se copia (los mensajes del chat).
 //! - [`widget`]: componentes (botones, campos, listas, insignias, avisos, toasts, diálogos,
-//!   progreso, selectores, atajos, barra lateral, cabecera, tarjetas, estados).
+//!   progreso, selectores, atajos, barra lateral, cabecera, tarjetas, estados, butacas, código en
+//!   señalética, entradas).
 //!
 //! No depende de ninguna crate del workspace (`docs/ARQUITECTURA.md` §5): la aplicación le da los datos.
 

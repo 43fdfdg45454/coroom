@@ -1314,7 +1314,7 @@ fn route_banner<'a>(tone: Tone, title: String, text: String, retry: bool) -> Ele
         Tone::Success => Icon::CircleCheck,
         Tone::Warning => Icon::Warning,
         Tone::Error => Icon::CircleAlert,
-        Tone::Info | Tone::Neutral => Icon::Info,
+        Tone::Info | Tone::Neutral | Tone::Live => Icon::Info,
     };
     let mut line = row![
         icon_with(glyph, 20.0, SvgClass::Tone(tone)),
