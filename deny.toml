@@ -38,6 +38,27 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant de zbus 5 (ashpd 0.13, keyring 4); sin versiones con zbus 6 todavía" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names de zbus 5 (ashpd 0.13, keyring 4); sin versiones con zbus 6 todavía" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive de zbus 5 (ashpd 0.13, keyring 4); sin versiones con zbus 6 todavía" },
+    # `crypto-bigint` 0.5.5: operaciones que debían ser de tiempo constante (resta, división,
+    # multiplicación de Montgomery) pueden ramificar según el secreto; solo está corregido en la
+    # serie 0.7 (>= 0.7.6). Llega con `elliptic-curve` 0.13 por `p256`, `p384` y `k256` de
+    # `openmls_rust_crypto` 0.6.0 y de su `hpke-rs-rust-crypto` 0.7.0. Ese proveedor es el último
+    # publicado para `openmls` 0.9 y no admite `hpke-rs-rust-crypto` 0.8, el que pasa a
+    # `elliptic-curve` 0.14. coroom no hace operaciones con secretos en esas curvas: la suite MLS
+    # es la de X25519 y Ed25519 (`coroom_crypto::mls::CIPHERSUITE`; un `KeyPackage` o un `Welcome`
+    # de otra suite se rechazan) y su HPKE (X25519 y X-Wing) va con la crate `hpke`. Lo más que
+    # alcanza un par remoto es la verificación de la firma de un `KeyPackage` de otra suite, que
+    # solo maneja datos públicos. Retirar cuando `openmls_rust_crypto` salga con `elliptic-curve`
+    # 0.14.
+    { id = "RUSTSEC-2026-0387", reason = "curvas NIST de openmls_rust_crypto 0.6, que coroom no usa (X25519, Ed25519); sin proveedor con elliptic-curve 0.14 todavía" },
+    # SQLite anterior a 3.54.0 puede devolver memoria sin inicializar del proceso al abrir una base
+    # junto a un fichero `-wal` manipulado, con otro tamaño de página (CVE-2026-119375, vector
+    # local). `libsqlite3-sys` 0.37.0 incluye SQLite 3.51.3 y llega con `sqlx-sqlite` 0.9.0, de la
+    # última `sqlx` publicada, que exige `libsqlite3-sys` < 0.38; el arreglo está en la 0.39. El
+    # servidor solo abre su propia base (`coroom.db`, que crea él mismo en el directorio de datos
+    # del operador) con consultas propias y parámetros; nunca abre una base que le llegue por la
+    # red. Para aprovecharlo hay que poder escribir en ese directorio, y al restaurar una copia se
+    # borra el `-wal` (`deploy/README.md`). Retirar cuando `sqlx` admita `libsqlite3-sys` 0.39.
+    { id = "RUSTSEC-2026-0459", reason = "SQLite de sqlx-sqlite 0.9.0; el servidor solo abre su propia base; sin sqlx con libsqlite3-sys 0.39 todavía" },
 ]
 
 [licenses]
