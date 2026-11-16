@@ -83,7 +83,7 @@ impl text_editor::Catalog for Theme {
                 border: if focused {
                     outline(p.focus.color(), 2.0)
                 } else if hovered {
-                    outline(p.text_secondary.alpha(0.6), 1.0)
+                    outline(p.border_strong.color(), 1.0)
                 } else {
                     outline(p.border.color(), 1.0)
                 },
