@@ -44,8 +44,8 @@ import coroom.android.ui.theme.CoroomTheme
 
 /**
  * «Entrando en la sala de Bea»: a la izquierda, el código en señalética y la fila de butacas (la
- * del anfitrión y, en cuanto hay conexión con él, la propia, que se enciende con la lámpara de la
- * ruta); a la derecha, los pasos. La sala va siempre en horizontal.
+ * del anfitrión y la propia, en contorno hasta que hay conexión con él y entonces encendida con
+ * la lámpara de la ruta); a la derecha, los pasos. La sala va siempre en horizontal.
  */
 @Composable
 fun JoiningScreen(state: RoomUiState, onCancel: () -> Unit) {
@@ -88,11 +88,13 @@ fun JoiningScreen(state: RoomUiState, onCancel: () -> Unit) {
                             SignageCode(code = state.code, style = CoroomText.signage, color = colors.onSurface)
                         }
                     }
-                    // Aún no se sabe quién más hay en la sala: solo la butaca del anfitrión y la que se va a ocupar.
+                    // Aún no se sabe quién más hay en la sala: solo la butaca del anfitrión y la
+                    // propia, en contorno hasta que hay conexión con él.
                     SeatRow(
                         occupants = joiningSeats(state),
                         seatSize = 48.dp,
-                        minSeats = JOINING_SEATS,
+                        ownSeat = !selfSeated(state),
+                        ownSeatColor = colors.onSurfaceVariant,
                         lampRing = colors.background,
                     )
                 }
@@ -132,9 +134,10 @@ fun JoiningScreen(state: RoomUiState, onCancel: () -> Unit) {
 }
 
 /**
- * Las butacas mientras se entra: la del anfitrión (el miembro 0 si ya llegó la lista; si no, su
- * nombre) y la propia, que solo se ocupa cuando ya hay camino con el anfitrión, con la lámpara
- * verde de la ruta directa o la ámbar del relay.
+ * Las butacas mientras se entra: la del anfitrión (el miembro 0 si ya llegó la lista; si no, la
+ * cuenta con la que se abrió la sala desde Inicio, para que no cambie de color ni pierda la foto,
+ * o solo su nombre) y la propia, que solo se ocupa cuando ya hay camino con el anfitrión, con la
+ * lámpara verde de la ruta directa o la ámbar del relay.
  */
 @Composable
 private fun joiningSeats(state: RoomUiState): List<SeatOccupant> {
@@ -142,16 +145,16 @@ private fun joiningSeats(state: RoomUiState): List<SeatOccupant> {
     val hostMember = state.members.firstOrNull { it.guest == 0 }
     val hostName = hostMember?.name?.takeIf { it.isNotBlank() } ?: state.hostName
     val host = hostName?.let { name ->
+        val user = hostMember?.user ?: state.hostUser
         SeatOccupant(
             name = name,
-            seed = hostMember?.user ?: name.hashCode().toLong(),
-            user = hostMember?.user,
-            avatar = hostMember?.avatar,
+            seed = user ?: name.hashCode().toLong(),
+            user = user,
+            avatar = if (hostMember != null) hostMember.avatar else state.hostAvatar,
             role = stringResource(R.string.seat_host),
         )
     }
-    val connected = state.steps[JoinStep.Path] == StepState.Done
-    val self = state.self?.takeIf { connected }?.let { account ->
+    val self = state.self?.takeIf { selfSeated(state) }?.let { account ->
         SeatOccupant(
             name = account.shownName,
             seed = account.userId,
@@ -167,6 +170,10 @@ private fun joiningSeats(state: RoomUiState): List<SeatOccupant> {
     }
     return listOfNotNull(host, self)
 }
+
+/** Si la butaca propia ya está ocupada: hay cuenta y ya hay camino con el anfitrión. */
+private fun selfSeated(state: RoomUiState): Boolean =
+    state.self != null && state.steps[JoinStep.Path] == StepState.Done
 
 @Composable
 private fun StepRow(step: JoinStep, stepState: StepState, relayed: Boolean?) {
@@ -196,9 +203,6 @@ private fun StepRow(step: JoinStep, stepState: StepState, relayed: Boolean?) {
         )
     }
 }
-
-/** Las butacas de «Entrando»: la del anfitrión y la propia. */
-private const val JOINING_SEATS = 2
 
 /** «No se pudo entrar en la sala» con el motivo, y qué hacer. */
 @Composable

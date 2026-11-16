@@ -52,7 +52,15 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
                 main.rooms.collect { request ->
-                    startActivity(RoomActivity.intent(this@MainActivity, request.code, request.hostName))
+                    startActivity(
+                        RoomActivity.intent(
+                            this@MainActivity,
+                            request.code,
+                            request.hostName,
+                            request.hostUser,
+                            request.hostAvatar,
+                        ),
+                    )
                 }
             }
         }

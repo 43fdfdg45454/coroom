@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -58,6 +59,8 @@ import kotlin.math.min
  * `lamp` enciende la lámpara de estado de la esquina inferior derecha (verde de conectado o de
  * ruta directa, ámbar de relay); `lampRing` es el color de lo que hay detrás, para separarla de
  * la butaca.
+ *
+ * Para los lectores de pantalla es decorativa: no dice nada por sí sola.
  */
 @Composable
 fun Avatar(
@@ -97,7 +100,9 @@ fun Avatar(
     } else {
         null
     }
-    Box(modifier = modifier.size(size)) {
+    // La butaca es un dibujo: los lectores de pantalla no leen su inicial. El nombre lo dice el
+    // texto de al lado o quien la coloca (la fila de butacas, el botón de la cuenta).
+    Box(modifier = modifier.size(size).clearAndSetSemantics { }) {
         Box(
             modifier = Modifier.matchParentSize().clip(SeatShape).background(background),
             contentAlignment = Alignment.Center,
@@ -146,36 +151,23 @@ private fun SeatLamp(color: Color, ring: Color, seat: Dp, modifier: Modifier = M
 }
 
 /**
- * Una butaca libre: el mismo contorno que la de una persona, sin relleno, con su número. Los
- * lectores de pantalla dicen «Butaca 3, libre».
+ * La butaca que espera a quien va a entrar: el mismo contorno que la de una persona, sin relleno
+ * ni número (no se sabe cuántas tiene la sala ni cuál tocará). Los lectores de pantalla dicen
+ * «Tu butaca». `color` es el del contorno: por defecto, el del contenido de donde se dibuja.
  */
 @Composable
-fun EmptySeat(number: Int, modifier: Modifier = Modifier, size: Dp = 40.dp) {
-    val colors = MaterialTheme.colorScheme
-    val description = stringResource(R.string.seat_free, number)
-    val numberSize = with(LocalDensity.current) { (size * NUMBER_SCALE).toSp() }
+fun OwnSeat(modifier: Modifier = Modifier, size: Dp = 40.dp, color: Color = LocalContentColor.current) {
+    val description = stringResource(R.string.seat_own)
     Box(
         modifier = modifier
             .size(size)
-            .border(EMPTY_SEAT_BORDER, colors.outline, SeatShape)
+            .border(OWN_SEAT_BORDER, color, SeatShape)
             .clearAndSetSemantics { contentDescription = description },
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(
-            text = number.toString(),
-            color = colors.onSurfaceVariant,
-            fontWeight = FontWeight.Medium,
-            fontSize = numberSize,
-            maxLines = 1,
-        )
-    }
+    )
 }
 
 /** La inicial, en proporción al lado de la butaca. */
 private const val INITIAL_SCALE = 0.4f
-
-/** El número de una butaca libre, en proporción a su lado. */
-private const val NUMBER_SCALE = 0.34f
 
 /** La lámpara, en proporción al lado de la butaca, y su mínimo para que se vea en las pequeñas. */
 private const val LAMP_SCALE = 0.3f
@@ -185,7 +177,7 @@ private val LAMP_RING = 2.dp
 /** Lo que la lámpara sobresale de la esquina de la butaca. */
 private val LAMP_OVERHANG = 2.dp
 
-private val EMPTY_SEAT_BORDER = 1.5.dp
+private val OWN_SEAT_BORDER = 1.5.dp
 
 private const val OFFLINE_ALPHA = 0.6f
 

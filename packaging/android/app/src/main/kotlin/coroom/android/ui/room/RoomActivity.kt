@@ -49,10 +49,15 @@ class RoomActivity : ComponentActivity() {
                     container,
                     intent.getStringExtra(EXTRA_CODE).orEmpty(),
                     intent.getStringExtra(EXTRA_HOST_NAME),
+                    hostUser = longExtra(EXTRA_HOST_USER),
+                    hostAvatar = longExtra(EXTRA_HOST_AVATAR),
                 )
             }
         }
     }
+
+    /** Un extra `Long` opcional del intent: `null` si no vino. */
+    private fun longExtra(name: String): Long? = if (intent.hasExtra(name)) intent.getLongExtra(name, 0L) else null
 
     private lateinit var video: VideoView
 
@@ -259,6 +264,8 @@ class RoomActivity : ComponentActivity() {
     companion object {
         private const val EXTRA_CODE = "coroom.android.extra.ROOM_CODE"
         private const val EXTRA_HOST_NAME = "coroom.android.extra.ROOM_HOST"
+        private const val EXTRA_HOST_USER = "coroom.android.extra.ROOM_HOST_USER"
+        private const val EXTRA_HOST_AVATAR = "coroom.android.extra.ROOM_HOST_AVATAR"
         private const val AXIS_COUNT = 48
 
         /** Teclas que siguen siendo del teléfono dentro de la sala. */
@@ -274,9 +281,20 @@ class RoomActivity : ComponentActivity() {
             KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
         )
 
-        fun intent(context: Context, code: String, hostName: String?): Intent =
-            Intent(context, RoomActivity::class.java)
+        /** `hostUser` y `hostAvatar` (la versión de su imagen): de quien aloja, si se sabe. */
+        fun intent(
+            context: Context,
+            code: String,
+            hostName: String?,
+            hostUser: Long? = null,
+            hostAvatar: Long? = null,
+        ): Intent {
+            val intent = Intent(context, RoomActivity::class.java)
                 .putExtra(EXTRA_CODE, code)
                 .putExtra(EXTRA_HOST_NAME, hostName)
+            if (hostUser != null) intent.putExtra(EXTRA_HOST_USER, hostUser)
+            if (hostAvatar != null) intent.putExtra(EXTRA_HOST_AVATAR, hostAvatar)
+            return intent
+        }
     }
 }

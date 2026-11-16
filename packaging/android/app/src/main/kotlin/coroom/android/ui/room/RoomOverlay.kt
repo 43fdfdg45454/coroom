@@ -156,7 +156,9 @@ fun RoomOverlay(state: RoomUiState, actions: RoomActions) {
             }
             AnimatedVisibility(
                 visible = overlayVisible && !panelOpen,
-                modifier = Modifier.align(Alignment.CenterEnd).padding(end = 12.dp, top = 12.dp, bottom = 12.dp),
+                // Poco margen arriba y abajo: en un teléfono de 360 dp de alto caben los siete
+                // botones con su zona de toque de 48 dp sin tener que deslizar la barra.
+                modifier = Modifier.align(Alignment.CenterEnd).padding(end = 12.dp, top = RAIL_MARGIN, bottom = RAIL_MARGIN),
                 enter = slideInHorizontally { it } + fadeIn(),
                 exit = slideOutHorizontally { it } + fadeOut(),
             ) {
@@ -223,10 +225,10 @@ private fun routeText(relayed: Boolean?): String = stringResource(
 )
 
 /**
- * «14 ms · directa · AV1» con la lámpara de la calidad: la latencia siempre a la vista; abre el
- * panel de conexión. Con la barra escondida (`expanded` en falso) se queda en la lámpara y
- * «14 ms» (y el aviso de chat sin leer), y tocarla enseña la barra. La píldora se ve baja, pero
- * su zona de toque mide 48 dp.
+ * «14 ms · buena · directa · AV1» con la lámpara de la calidad: la latencia y la calidad, dicha
+ * también en palabras (el color solo no basta), siempre a la vista; abre el panel de conexión. Con
+ * la barra escondida (`expanded` en falso) se queda en la lámpara y «14 ms · buena» (y el aviso de
+ * chat sin leer), y tocarla enseña la barra. La píldora se ve baja, pero su zona de toque mide 48 dp.
  */
 @Composable
 fun ConnectionPill(state: RoomUiState, onClick: () -> Unit, modifier: Modifier = Modifier, expanded: Boolean = true) {
@@ -247,6 +249,12 @@ fun ConnectionPill(state: RoomUiState, onClick: () -> Unit, modifier: Modifier =
             }
         },
     )
+    // Lo que se lee siempre: «Reconectando», o la latencia con la calidad si ya se midió.
+    val headline = when {
+        state.reconnecting != null -> quality
+        state.quality != null -> stringResource(R.string.pill_rtt_quality, rtt, quality)
+        else -> rtt
+    }
     val description = when {
         expanded -> stringResource(R.string.pill_description, quality, rtt, route)
         state.unreadChat -> stringResource(R.string.pill_description_collapsed_unread, quality, rtt)
@@ -274,7 +282,7 @@ fun ConnectionPill(state: RoomUiState, onClick: () -> Unit, modifier: Modifier =
         ) {
             Lamp(qualityColor(state))
             Text(
-                text = if (state.reconnecting != null) stringResource(R.string.quality_reconnecting) else rtt,
+                text = headline,
                 style = CoroomText.pill.copy(fontWeight = FontWeight.SemiBold),
                 color = colors.onSurface,
             )
@@ -451,8 +459,11 @@ private val PILL_HEIGHT = 36.dp
 
 private val RAIL_WIDTH = 64.dp
 
-/** Margen de arriba y abajo de la barra lateral. */
-private val RAIL_PADDING = 8.dp
+/** Margen de arriba y abajo dentro de la barra lateral. */
+private val RAIL_PADDING = 4.dp
+
+/** Margen de la barra lateral con el borde de arriba y de abajo de la pantalla. */
+private val RAIL_MARGIN = 4.dp
 
 /**
  * Lo que se ve en lugar del vídeo cuando el invitado lo apagó: qué sigue y qué no, quién está en

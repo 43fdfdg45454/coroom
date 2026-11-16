@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
@@ -76,8 +77,8 @@ import coroom.android.ui.theme.CoroomTheme
 
 /**
  * Pestaña Inicio: unirse con un código, las salas propias y las invitaciones como entradas (con su
- * fila de butacas), y los amigos conectados. En ancho compacto va todo en una columna; desde [TWO_PANE_MIN_WIDTH], las
- * salas a la izquierda (3/5) y los amigos a la derecha (2/5).
+ * fila de butacas), y los amigos conectados. En ancho compacto va todo en una columna; desde
+ * [TWO_PANE_MIN_WIDTH], las salas a la izquierda y los amigos a la derecha, a partes iguales.
  */
 @Composable
 fun HomeScreen(
@@ -95,18 +96,22 @@ fun HomeScreen(
 
     BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
         val twoPane = maxWidth >= TWO_PANE_MIN_WIDTH
+        // El ancho que le queda al bloque de las salas: si es poco, «Entrar» va debajo del campo
+        // para que el código se vea entero también con la letra grande.
+        val roomsWidth = if (twoPane) (maxWidth - PAGE_MARGIN * 2 - PANE_GAP) / 2 else maxWidth - PAGE_MARGIN * 2
+        val stackJoin = roomsWidth < JOIN_ROW_MIN_WIDTH
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .verticalScroll(rememberScrollState())
                 .padding(contentPadding)
-                .padding(start = 16.dp, end = 16.dp, bottom = 24.dp),
+                .padding(start = PAGE_MARGIN, end = PAGE_MARGIN, bottom = 24.dp),
         ) {
             HomeTopBar(account, onOpenAccount)
             Greeting(account, state.serverOnline)
             Spacer(Modifier.height(24.dp))
             if (twoPane) {
-                Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(PANE_GAP)) {
                     HomeRooms(
                         state = state,
                         account = account,
@@ -114,9 +119,10 @@ fun HomeScreen(
                         onCode = { code = RoomCode.clean(it) },
                         onJoin = onJoin,
                         updates = updates,
-                        modifier = Modifier.weight(3f),
+                        stackJoin = stackJoin,
+                        modifier = Modifier.weight(1f),
                     )
-                    HomeFriends(state, onAskToJoin, onOpenFriends, modifier = Modifier.weight(2f))
+                    HomeFriends(state, onAskToJoin, onOpenFriends, modifier = Modifier.weight(1f))
                 }
             } else {
                 HomeRooms(
@@ -126,6 +132,7 @@ fun HomeScreen(
                     onCode = { code = RoomCode.clean(it) },
                     onJoin = onJoin,
                     updates = updates,
+                    stackJoin = stackJoin,
                     modifier = Modifier.fillMaxWidth(),
                 )
                 Spacer(Modifier.height(28.dp))
@@ -202,6 +209,7 @@ private fun HomeRooms(
     onCode: (String) -> Unit,
     onJoin: (code: String, hostName: String?) -> Unit,
     updates: UpdateActions,
+    stackJoin: Boolean,
     modifier: Modifier = Modifier,
 ) {
     Column(modifier = modifier.animateContentSize(), verticalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -216,49 +224,77 @@ private fun HomeRooms(
             code = code,
             onCode = onCode,
             onJoin = { onJoin(code, null) },
+            stacked = stackJoin,
         )
         if (state.ownRooms.isNotEmpty()) OwnRooms(state.ownRooms, account, onJoin)
         Invitations(state.invitations, state.friends.list?.friends.orEmpty(), state.nowMs, onJoin)
     }
 }
 
-/** «Unirme a una sala»: el código en señalética, en un campo de texto normal, y «Entrar». */
+/**
+ * «Unirme a una sala»: el código en señalética, en un campo de texto normal, y «Entrar». Con
+ * `stacked` (poco ancho) el botón va debajo del campo, a todo lo ancho; si no, a su derecha.
+ */
 @Composable
-private fun JoinCard(code: String, onCode: (String) -> Unit, onJoin: () -> Unit) {
+private fun JoinCard(code: String, onCode: (String) -> Unit, onJoin: () -> Unit, stacked: Boolean) {
     val colors = MaterialTheme.colorScheme
     val valid = RoomCode.isValid(code)
     TonalCard(contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 18.dp, bottom = 16.dp)) {
         Text(stringResource(R.string.home_join_title), style = CoroomText.cardTitle, color = colors.onSurface)
         Spacer(Modifier.height(12.dp))
-        // El botón toma el alto del campo (sin el hueco que la etiqueta flotante deja arriba).
-        Row(modifier = Modifier.height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            LabeledField(
-                label = stringResource(R.string.home_join_code),
-                value = code,
-                onValueChange = onCode,
-                textStyle = CoroomText.roomCode,
-                placeholder = stringResource(R.string.home_join_placeholder),
-                modifier = Modifier.weight(1f),
-                keyboardOptions = KeyboardOptions(
-                    capitalization = KeyboardCapitalization.Characters,
-                    keyboardType = KeyboardType.Ascii,
-                    autoCorrectEnabled = false,
-                    imeAction = ImeAction.Go,
-                ),
-                keyboardActions = KeyboardActions(onGo = { if (valid) onJoin() }),
-                visualTransformation = RoomCodeGrouping,
-            )
+        if (stacked) {
+            JoinCodeField(code, onCode, valid, onJoin, modifier = Modifier.fillMaxWidth())
+            Spacer(Modifier.height(8.dp))
             PrimaryButton(
                 text = stringResource(R.string.action_join),
                 onClick = onJoin,
                 enabled = valid,
                 icon = R.drawable.ic_log_in,
-                modifier = Modifier.fillMaxHeight().padding(top = FIELD_LABEL_INSET),
+                modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
             )
+        } else {
+            // El botón toma el alto del campo (sin el hueco que la etiqueta flotante deja arriba).
+            Row(modifier = Modifier.height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                JoinCodeField(code, onCode, valid, onJoin, modifier = Modifier.weight(1f))
+                PrimaryButton(
+                    text = stringResource(R.string.action_join),
+                    onClick = onJoin,
+                    enabled = valid,
+                    icon = R.drawable.ic_log_in,
+                    modifier = Modifier.fillMaxHeight().padding(top = FIELD_LABEL_INSET),
+                )
+            }
         }
         Spacer(Modifier.height(8.dp))
         Text(stringResource(R.string.home_join_hint), style = CoroomText.supporting, color = colors.onSurfaceVariant)
     }
+}
+
+/** El campo del código de sala: mayúsculas, sin corrector, agrupado de tres en tres al verlo. */
+@Composable
+private fun JoinCodeField(
+    code: String,
+    onCode: (String) -> Unit,
+    valid: Boolean,
+    onJoin: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    LabeledField(
+        label = stringResource(R.string.home_join_code),
+        value = code,
+        onValueChange = onCode,
+        textStyle = CoroomText.roomCode,
+        placeholder = stringResource(R.string.home_join_placeholder),
+        modifier = modifier,
+        keyboardOptions = KeyboardOptions(
+            capitalization = KeyboardCapitalization.Characters,
+            keyboardType = KeyboardType.Ascii,
+            autoCorrectEnabled = false,
+            imeAction = ImeAction.Go,
+        ),
+        keyboardActions = KeyboardActions(onGo = { if (valid) onJoin() }),
+        visualTransformation = RoomCodeGrouping,
+    )
 }
 
 /**
@@ -354,9 +390,9 @@ private fun Invitations(
 }
 
 /**
- * Lo que dice una entrada de sala: arriba, la fila de butacas (la del anfitrión y la libre que
- * espera a quien entra; de los demás integrantes no se sabe hasta estar dentro) con el título al
- * lado; debajo, el código en señalética y, tras él, `detail` (hace cuánto llegó, «En vivo»).
+ * Lo que dice una entrada de sala: arriba, la fila de butacas (la del anfitrión y, en contorno,
+ * la que espera a quien entra; de los demás integrantes no se sabe hasta estar dentro) con el
+ * título al lado; debajo, el código en señalética y, tras él, `detail` (hace cuánto llegó, «En vivo»).
  */
 @Composable
 private fun TicketBody(
@@ -372,11 +408,17 @@ private fun TicketBody(
             SeatRow(
                 occupants = listOf(host),
                 seatSize = 40.dp,
-                minSeats = TICKET_SEATS,
+                ownSeat = true,
                 showLabels = false,
                 lampRing = lampRing,
             )
-            Text(text = title, style = CoroomText.itemTitle, modifier = Modifier.weight(1f))
+            Text(
+                text = title,
+                style = CoroomText.itemTitle,
+                modifier = Modifier.weight(1f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             SignageCode(code, modifier = Modifier.padding(end = 2.dp))
@@ -384,9 +426,6 @@ private fun TicketBody(
         }
     }
 }
-
-/** Las butacas de una entrada: la del anfitrión y la que se va a ocupar. */
-private const val TICKET_SEATS = 2
 
 /** Los amigos conectados, en una lista agrupada con sus butacas, y el mando conectado al pie. */
 @Composable
@@ -511,8 +550,15 @@ private fun PadHint(pad: Gamepad) {
 /** El hueco que la etiqueta flotante de un campo con borde deja encima de su caja. */
 private val FIELD_LABEL_INSET = 8.dp
 
-/** El ancho desde el que Inicio pasa a dos columnas. */
-private val TWO_PANE_MIN_WIDTH = 720.dp
+/** El ancho desde el que Inicio pasa a dos columnas: con menos, los nombres de los amigos se cortan. */
+private val TWO_PANE_MIN_WIDTH = 900.dp
+
+/** El margen de la página a cada lado y el hueco entre las dos columnas. */
+private val PAGE_MARGIN = 16.dp
+private val PANE_GAP = 24.dp
+
+/** El ancho del bloque de las salas desde el que «Entrar» cabe a la derecha del campo del código. */
+private val JOIN_ROW_MIN_WIDTH = 520.dp
 
 @Preview(name = "Inicio", widthDp = 390, heightDp = 844)
 @Composable
@@ -534,7 +580,7 @@ private fun HomeDarkPreview() {
     }
 }
 
-@Preview(name = "Inicio, ancho expandido", widthDp = 900, heightDp = 600)
+@Preview(name = "Inicio, ancho expandido", widthDp = 1100, heightDp = 700)
 @Composable
 private fun HomeWidePreview() {
     CoroomTheme(dynamicColor = false) {
