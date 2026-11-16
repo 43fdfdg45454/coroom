@@ -3,7 +3,8 @@
 //! butaca, insignias de estado, avisos en línea, toasts, diálogos modales, progreso con texto,
 //! selectores, deslizadores, teclas de atajo, barra lateral, cabecera de página, tarjetas,
 //! grupos de ajustes y los estados vacío, cargando y error. Y lo propio de coroom: la butaca
-//! ([`avatar`], [`empty_seat`]; con foto, lámpara y en fila, en [`crate::avatar`]), el código de
+//! ([`avatar`], [`empty_seat`], [`vacant_seat`]; con foto, lámpara y en fila, en
+//! [`crate::avatar`]), el código de
 //! sala en señalética ([`code_cells`]) y la entrada ([`ticket`]).
 
 use iced_core::alignment::{Horizontal, Vertical};
@@ -501,17 +502,26 @@ pub fn ellipsize(text: &str, max: usize) -> std::borrow::Cow<'_, str> {
     format!("{}…", kept.trim_end()).into()
 }
 
-/// Selector segmentado: `(texto, mensaje, elegido)` por opción. El fondo del elegido se desliza
-/// hasta el nuevo ([`crate::animate::Segments`]).
+/// Selector segmentado: `(texto, mensaje, elegido)` por opción. El elegido lleva el relleno suave
+/// de acento con un filete de acento, que se desliza hasta el nuevo
+/// ([`crate::animate::Segments`]), y el texto en seminegrita; los demás, en normal. Cada segmento
+/// mide siempre lo que su texto en seminegrita, así que elegir otro no mueve nada.
 pub fn segmented<'a, M: Clone + 'a>(options: Vec<(String, M, bool)>) -> Element<'a, M> {
     let chosen = options.iter().position(|(_, _, selected)| *selected);
     let buttons = options.into_iter().map(|(label, message, selected)| {
-        button(
+        let write = |label: String, weight| -> Element<'a, M> {
             text(label)
                 .size(type_size::BODY)
-                .font(SEMIBOLD)
+                .font(weight)
                 .wrapping(Wrapping::None)
-                .align_x(Horizontal::Center),
+                .into()
+        };
+        button(
+            reserve(
+                [write(label.clone(), SEMIBOLD)],
+                Some(write(label, if selected { SEMIBOLD } else { UI })),
+            )
+            .align_x(Horizontal::Center),
         )
         .padding(Padding::from([6.0, 14.0]))
         .class(ButtonClass::Segment { selected })
@@ -577,8 +587,16 @@ pub fn empty_seat_on<'a, M: 'a>(number: usize, side: f32, on: Surface) -> Elemen
     seat_outline(number.to_string(), side, on)
 }
 
+/// Butaca vacante: solo el contorno, sin número. Es «tu sitio» antes de ocuparlo (mientras
+/// entras en una sala ajena, donde no se sabe cuántas butacas hay ni cuál es la tuya); al
+/// conectar, la sustituye la butaca de verdad, del mismo tamaño. `on` es el plano de detrás: sobre
+/// el vídeo ([`Surface::Overlay`]) el contorno va claro.
+pub fn vacant_seat<'a, M: 'a>(side: f32, on: Surface) -> Element<'a, M> {
+    seat_outline(String::new(), side, on)
+}
+
 /// El contorno de una butaca con `label` dentro (el número de una libre, «+3» de las que no
-/// caben en la fila).
+/// caben en la fila; nada en una vacante).
 pub(crate) fn seat_outline<'a, M: 'a>(label: String, side: f32, on: Surface) -> Element<'a, M> {
     container(
         text(label)
@@ -718,7 +736,8 @@ impl<M> iced_core::Widget<M, Theme, Renderer> for Perforation {
         use iced_core::Renderer as _;
 
         let bounds = layout.bounds();
-        let color = theme.palette.border_strong.color();
+        // Los puntos son todo lo que dibuja el filete: tienen que verse por sí solos.
+        let color = theme.palette.outline.color();
         for offset in perforation_dots(bounds.height) {
             renderer.fill_quad(
                 iced_core::renderer::Quad {
@@ -745,6 +764,19 @@ pub fn ticket<'a, M: 'a>(
     body: impl Into<Element<'a, M>>,
     stub: impl Into<Element<'a, M>>,
 ) -> Element<'a, M> {
+    // El punteado es tan alto como le dejen: con `Shrink` la fila (y la entrada) mide lo que su
+    // contenido en vez de estirarse con él.
+    ticket_with_height(body, stub, Length::Shrink)
+}
+
+/// [`ticket`] del alto `height`: con [`Length::Fill`] llena el alto que le den (una entrada igual
+/// de alta que el bloque de al lado, en una [`equal_height_row`]) y el punteado la recorre
+/// entera; el talón sigue centrado.
+pub fn ticket_with_height<'a, M: 'a>(
+    body: impl Into<Element<'a, M>>,
+    stub: impl Into<Element<'a, M>>,
+    height: Length,
+) -> Element<'a, M> {
     container(
         row![
             container(body)
@@ -753,13 +785,35 @@ pub fn ticket<'a, M: 'a>(
             container(Element::new(Perforation)).padding(Padding::from([gap::XS, 0.0])),
             container(stub).padding(Padding::from([gap::S, gap::M])),
         ]
-        // El punteado es tan alto como le dejen: sin esto la fila (y la entrada) se estiraría
-        // con él en vez de medir lo que su contenido.
+        .height(height)
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .height(height)
+    .class(ContainerClass::Ticket)
+    .into()
+}
+
+/// [`ticket`] destacada: la misma entrada con el relleno suave y el borde del acento
+/// ([`ContainerClass::CardAccent`]), para la que pide una respuesta ya (alguien que pide entrar
+/// en la sala). Como mucho una a la vez en pantalla llama así la atención; las demás, [`ticket`].
+pub fn ticket_accent<'a, M: 'a>(
+    body: impl Into<Element<'a, M>>,
+    stub: impl Into<Element<'a, M>>,
+) -> Element<'a, M> {
+    container(
+        row![
+            container(body)
+                .padding(Padding::from([gap::S, gap::M]))
+                .width(Length::Fill),
+            container(Element::new(Perforation)).padding(Padding::from([gap::XS, 0.0])),
+            container(stub).padding(Padding::from([gap::S, gap::M])),
+        ]
         .height(Length::Shrink)
         .align_y(Alignment::Center),
     )
     .width(Length::Fill)
-    .class(ContainerClass::Ticket)
+    .class(ContainerClass::CardAccent)
     .into()
 }
 

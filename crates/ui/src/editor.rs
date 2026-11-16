@@ -80,14 +80,20 @@ impl text_editor::Catalog for Theme {
                 } else {
                     p.card.color()
                 }),
+                // Como los campos de una línea: el borde se ve por sí solo en reposo.
                 border: if focused {
                     outline(p.focus.color(), 2.0)
                 } else if hovered {
-                    outline(p.border_strong.color(), 1.0)
+                    outline(p.text_secondary.color(), 1.0)
                 } else {
-                    outline(p.border.color(), 1.0)
+                    outline(p.outline.color(), 1.0)
                 },
-                placeholder: p.text_secondary.color(),
+                // Desactivado, el ejemplo no se pinta (se leería como algo escrito).
+                placeholder: if disabled {
+                    Color::TRANSPARENT
+                } else {
+                    p.placeholder.color()
+                },
                 value: if disabled {
                     p.text_disabled.color()
                 } else {
@@ -104,11 +110,15 @@ impl text_editor::Catalog for Theme {
                 border: if focused {
                     outline(p.focus.color(), 2.0)
                 } else if hovered {
-                    outline(p.overlay_text.alpha(0.28), 1.0)
+                    outline(p.overlay_text.alpha(0.7), 1.0)
                 } else {
-                    outline(p.overlay_text.alpha(0.14), 1.0)
+                    outline(p.overlay_text.alpha(crate::style::OVERLAY_TRACK), 1.0)
                 },
-                placeholder: p.overlay_text_secondary.color(),
+                placeholder: if disabled {
+                    Color::TRANSPARENT
+                } else {
+                    p.overlay_text_secondary.color()
+                },
                 value: if disabled {
                     p.overlay_text_secondary.color()
                 } else {

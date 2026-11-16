@@ -4,7 +4,7 @@
 use coroom_ui::avatar::{self, AvatarImage, SeatNames, SeatRow, Seated};
 use coroom_ui::font::Fonts;
 use coroom_ui::icon::Icon;
-use coroom_ui::style::{ContainerClass, Surface, seat_radius};
+use coroom_ui::style::{ContainerClass, Surface, image_radius, seat_radius};
 use coroom_ui::theme::{Accent, Mode, Tone};
 use coroom_ui::tokens::{seat, sign};
 use coroom_ui::widget::{self as ui, CodeSize, Kind, NavItem};
@@ -66,6 +66,8 @@ fn gallery(theme: &Theme) -> Vec<Element<'static, Msg>> {
         ui::status_badge(Tone::Live, "en vivo"),
         ui::empty_seat(2, seat::ROW),
         ui::empty_seat_on(3, seat::ROW_SMALL, Surface::Overlay),
+        ui::vacant_seat(seat::ROW, Surface::Card),
+        ui::vacant_seat(seat::ROW_SMALL, Surface::Overlay),
         ui::code_cells("K7Q2MZ", CodeSize::Large),
         ui::code_cells("k7q 2mz", CodeSize::Small),
         ui::ticket(
@@ -76,6 +78,10 @@ fn gallery(theme: &Theme) -> Vec<Element<'static, Msg>> {
                 vec![ui::code_cells("K7Q2MZ", CodeSize::Small)],
             ),
             ui::primary("Entrar", Some(Msg::Press)),
+        ),
+        ui::ticket_accent(
+            ui::strong("Dani pide entrar"),
+            ui::primary("Dejar entrar", Some(Msg::Press)),
         ),
         ui::banner(Tone::Info, "Aviso", Some(("Ver", Msg::Press))),
         ui::toast(Tone::Error, "No se pudo"),
@@ -359,6 +365,307 @@ fn the_chosen_destination_is_a_soft_accent_fill() {
             for status in [Status::Active, Status::Hovered, Status::Pressed] {
                 let style = style_of(&theme, class, status);
                 assert_eq!(style.shadow.color.a, 0.0, "{mode:?} {class:?} {status:?}");
+            }
+        }
+    }
+}
+
+// --- Píxeles --------------------------------------------------------------------------------------
+
+/// Espera a `future` sin ejecutor: abrir el adaptador gráfico no se queda pendiente de nada.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    loop {
+        if let std::task::Poll::Ready(output) = future.as_mut().poll(&mut context) {
+            return output;
+        }
+        std::thread::yield_now();
+    }
+}
+
+/// Un renderizador sin ventana (en contenedores, `lavapipe`); `None` si no lo hay y la prueba de
+/// píxeles se salta, como las capturas de la aplicación. Dos motivos: que no haya adaptador
+/// gráfico, o que esta compilación no lleve ningún backend de `wgpu` (los activa `coroom-render`:
+/// con `cargo test -p coroom-ui` a solas no están y `wgpu` aborta al crear la instancia; con
+/// `--workspace`, como en la CI, o añadiendo `-p coroom-render`, sí).
+fn headless() -> Option<coroom_ui::Renderer> {
+    use iced_core::renderer::Headless;
+    let opened = std::panic::catch_unwind(|| {
+        block_on(<coroom_ui::Renderer as Headless>::new(
+            iced_core::Font::DEFAULT,
+            iced_core::Pixels(14.0),
+            None,
+        ))
+    });
+    match opened {
+        Ok(Some(renderer)) => Some(renderer),
+        Ok(None) => {
+            eprintln!("sin prueba de píxeles: no hay adaptador gráfico");
+            None
+        }
+        Err(_) => {
+            eprintln!(
+                "sin prueba de píxeles: esta compilación no lleva backend de wgpu \
+                 (ejecútala con --workspace o con -p coroom-render)"
+            );
+            None
+        }
+    }
+}
+
+/// Dibuja `element` en un lienzo de `side` × `side` con el fondo de la ventana: los píxeles RGBA.
+fn paint(
+    renderer: &mut coroom_ui::Renderer,
+    theme: &Theme,
+    mut element: Element<'_, Msg>,
+    side: u32,
+) -> Vec<u8> {
+    use iced_core::renderer::Headless;
+    use iced_core::{Renderer as _, Size, layout, mouse, renderer, widget};
+
+    let size = Size::new(side as f32, side as f32);
+    let bounds = iced_core::Rectangle::with_size(size);
+    let mut tree = widget::Tree::new(&element);
+    let node =
+        element
+            .as_widget_mut()
+            .layout(&mut tree, renderer, &layout::Limits::new(Size::ZERO, size));
+    renderer.reset(bounds);
+    element.as_widget().draw(
+        &tree,
+        renderer,
+        theme,
+        &renderer::Style {
+            text_color: theme.text_color(),
+        },
+        iced_core::Layout::new(&node),
+        mouse::Cursor::Unavailable,
+        &bounds,
+    );
+    let pixels = Headless::screenshot(renderer, Size::new(side, side), 1.0, theme.background());
+    assert_eq!(pixels.len(), (side * side * 4) as usize);
+    pixels
+}
+
+/// Lo que se aparta un píxel del fondo del lienzo (el de la esquina de arriba a la izquierda,
+/// que queda fuera de cualquier butaca), en el canal que más cambia.
+fn off_background(pixels: &[u8]) -> Vec<u8> {
+    let background = [pixels[0], pixels[1], pixels[2]];
+    pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|pixel| {
+            (0..3)
+                .map(|channel| pixel[channel].abs_diff(background[channel]))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+/// Qué píxeles no son el fondo: cualquier trazo cuenta (para contornos finos).
+fn mask(pixels: &[u8]) -> Vec<bool> {
+    off_background(pixels)
+        .into_iter()
+        .map(|distance| distance > 24)
+        .collect()
+}
+
+/// Qué píxeles son de una butaca llena: los cubiertos al menos a medias por su relleno (el del
+/// píxel `inside`, dentro de la butaca y fuera de las iniciales). Así el suavizado del borde,
+/// distinto en un rectángulo y en una imagen, no cuenta.
+fn filled_mask(pixels: &[u8], side: usize, inside: (usize, usize)) -> Vec<bool> {
+    let distances = off_background(pixels);
+    let full = distances[inside.1 * side + inside.0];
+    assert!(full > 48, "el relleno se distingue del fondo ({full})");
+    distances
+        .into_iter()
+        .map(|distance| distance > full / 2)
+        .collect()
+}
+
+/// Píxeles de fondo en cada esquina (cuadros de `corner` de lado): arriba a la izquierda, arriba
+/// a la derecha, abajo a la derecha y abajo a la izquierda. Cuanto más redonda la esquina, más.
+fn cut_corners(mask: &[bool], side: usize, corner: usize) -> [usize; 4] {
+    let outside = |xs: std::ops::Range<usize>, ys: std::ops::Range<usize>| {
+        ys.flat_map(|y| xs.clone().map(move |x| (x, y)))
+            .filter(|(x, y)| !mask[y * side + x])
+            .count()
+    };
+    [
+        outside(0..corner, 0..corner),
+        outside(side - corner..side, 0..corner),
+        outside(side - corner..side, side - corner..side),
+        outside(0..corner, side - corner..side),
+    ]
+}
+
+/// La butaca con foto tiene la misma silueta que la de iniciales: respaldo redondeado arriba y
+/// base casi recta. (El sombreador de imágenes de `iced_wgpu` lee los radios girados media vuelta
+/// y la foto salía boca abajo: `image_radius` lo compensa.)
+#[test]
+fn a_seat_with_a_photo_has_the_same_outline_as_one_with_initials() {
+    // Lo que se le pide a la imagen son los radios de la butaca girados media vuelta.
+    let wanted = seat_radius(64.0);
+    let given = image_radius(wanted);
+    assert_eq!(
+        (given.top_left, given.top_right),
+        (wanted.bottom_right, wanted.bottom_left)
+    );
+    assert_eq!(
+        (given.bottom_right, given.bottom_left),
+        (wanted.top_left, wanted.top_right)
+    );
+    assert_eq!(image_radius(given), wanted);
+
+    let Some(mut renderer) = headless() else {
+        return;
+    };
+    const SIDE: u32 = 64;
+    let side = SIDE as usize;
+    let corner = (seat::BACK * SIDE as f32).ceil() as usize;
+    // Una foto lisa y opaca, de un color que no es el del fondo en ningún modo.
+    let level = |side: u32| {
+        let pixels = [200u8, 60, 60, 255].repeat((side * side) as usize);
+        (side, pixels)
+    };
+    let picture = AvatarImage::from_rgba_levels(vec![level(128), level(64)]).expect("foto");
+    // Un píxel del relleno: a media altura, cerca del borde izquierdo (lejos de las iniciales).
+    let fill_at = (side / 10, side / 2);
+    for mode in [Mode::Light, Mode::Dark] {
+        let theme = Theme::new(mode, Accent::Blue, Fonts::default());
+        let initials = filled_mask(
+            &paint(
+                &mut renderer,
+                &theme,
+                ui::avatar(&theme, "Ana", SIDE as f32),
+                SIDE,
+            ),
+            side,
+            fill_at,
+        );
+        let photo = filled_mask(
+            &paint(
+                &mut renderer,
+                &theme,
+                avatar::avatar_with(&theme, "Ana", Some(&picture), SIDE as f32),
+                SIDE,
+            ),
+            side,
+            fill_at,
+        );
+        for (what, seat_mask) in [("iniciales", &initials), ("foto", &photo)] {
+            let [top_left, top_right, bottom_right, bottom_left] =
+                cut_corners(seat_mask, side, corner);
+            assert!(
+                seat_mask[side * side / 2 + side / 2],
+                "{mode:?} {what}: la butaca se dibuja"
+            );
+            // Arriba, redondeada; abajo, casi recta.
+            assert!(
+                top_left > 3 * bottom_left && top_right > 3 * bottom_right,
+                "{mode:?} {what}: arriba {top_left} y {top_right}, abajo {bottom_left} y \
+                 {bottom_right} píxeles recortados"
+            );
+            assert!(bottom_left > 0 && bottom_right > 0, "{mode:?} {what}");
+            assert!(
+                top_left.abs_diff(top_right) <= 4 && bottom_left.abs_diff(bottom_right) <= 4,
+                "{mode:?} {what}: simétrica"
+            );
+        }
+        // Y las dos coinciden, esquina a esquina y píxel a píxel (salvo el suavizado del borde).
+        let (a, b) = (
+            cut_corners(&initials, side, corner),
+            cut_corners(&photo, side, corner),
+        );
+        // El margen cubre lo que difieren el sombreador de rectángulos y el de imágenes al
+        // suavizar el borde (medio píxel a lo largo de la curva); una butaca boca abajo se
+        // aparta más de cien píxeles por esquina.
+        for (index, (a, b)) in a.iter().zip(b).enumerate() {
+            assert!(
+                a.abs_diff(b) <= 24 + a / 8,
+                "{mode:?}: esquina {index}: iniciales {a}, foto {b}"
+            );
+        }
+        // Píxel a píxel, fuera del centro (donde van las iniciales, que no son silueta).
+        let middle = side / 4..side - side / 4;
+        let different = (0..side * side)
+            .filter(|index| !(middle.contains(&(index % side)) && middle.contains(&(index / side))))
+            .filter(|index| initials[*index] != photo[*index])
+            .count();
+        assert!(
+            different <= side * side / 24,
+            "{mode:?}: {different} píxeles de silueta distintos"
+        );
+    }
+}
+
+/// La butaca vacante es solo el contorno de una butaca: mismo tamaño y silueta que la libre, sin
+/// número ni nada dentro.
+#[test]
+fn a_vacant_seat_is_an_outline_with_nothing_inside() {
+    let theme = Theme::new(Mode::Dark, Accent::Blue, Fonts::default());
+    let class = ContainerClass::SeatEmpty {
+        side: 64.0,
+        on: Surface::Card,
+    };
+    let style = theme.style(&class);
+    assert_eq!(style.background, None);
+    assert_eq!(style.border.radius, seat_radius(64.0));
+
+    let Some(mut renderer) = headless() else {
+        return;
+    };
+    const SIDE: u32 = 64;
+    let side = SIDE as usize;
+    for mode in [Mode::Light, Mode::Dark] {
+        let theme = Theme::new(mode, Accent::Blue, Fonts::default());
+        let vacant = mask(&paint(
+            &mut renderer,
+            &theme,
+            ui::vacant_seat(SIDE as f32, Surface::Window),
+            SIDE,
+        ));
+        // El contorno está (a media altura, en los dos bordes)...
+        let row = side / 2;
+        assert!(
+            (0..3).any(|x| vacant[row * side + x])
+                && (0..3).any(|x| vacant[row * side + side - 1 - x]),
+            "{mode:?}: se ve el contorno"
+        );
+        // ...y dentro no hay nada: ni relleno ni número.
+        let inset = 4;
+        let inside = (inset..side - inset)
+            .flat_map(|y| (inset..side - inset).map(move |x| (x, y)))
+            .filter(|(x, y)| {
+                // Fuera de los cuadros de las esquinas, por donde pasa el contorno curvo.
+                let corner = (seat::BACK * SIDE as f32).ceil() as usize;
+                let in_corner =
+                    (*x < corner || *x >= side - corner) && (*y < corner || *y >= side - corner);
+                !in_corner && vacant[y * side + x]
+            })
+            .count();
+        assert_eq!(inside, 0, "{mode:?}: la vacante va vacía");
+        // Con la misma silueta que una butaca ocupada: en cada fila, el borde izquierdo cae
+        // en el mismo píxel (uno de margen por el suavizado).
+        let taken = mask(&paint(
+            &mut renderer,
+            &theme,
+            ui::avatar(&theme, "Ana", SIDE as f32),
+            SIDE,
+        ));
+        let left_edge = |mask: &[bool], y: usize| (0..side).find(|x| mask[y * side + x]);
+        for y in 0..side {
+            match (left_edge(&vacant, y), left_edge(&taken, y)) {
+                (Some(a), Some(b)) => {
+                    assert!(a.abs_diff(b) <= 1, "{mode:?}: fila {y}: {a} y {b}");
+                }
+                (a, b) => assert!(
+                    y < 2 || y >= side - 2,
+                    "{mode:?}: fila {y}: vacante {a:?}, ocupada {b:?}"
+                ),
             }
         }
     }

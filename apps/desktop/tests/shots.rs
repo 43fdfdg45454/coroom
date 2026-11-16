@@ -45,7 +45,7 @@ fn every_screen_renders_in_light_and_dark() {
     let scenes = scenes();
     assert_eq!(scenes.len() % 2, 0, "cada escena en claro y en oscuro");
     for scene in &scenes {
-        let (width, height, rgba) = renderer.render(&scene.app, 1.0);
+        let (width, height, rgba) = renderer.render_scrolled(&scene.app, 1.0, scene.scroll);
         let window = (
             scene.app.window.width as u32,
             scene.app.window.height as u32,

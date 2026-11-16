@@ -153,6 +153,9 @@ icons! {
     Volume1 => "volume-1",
     Waypoints => "waypoints",
     Zap => "zap",
+    // La marca: los dos anillos enlazados del icono de coroom (`packaging/icons/coroom.svg`), en
+    // un solo color para teñirlos como los demás. Dibujo propio, no de Lucide.
+    Coroom => "coroom",
 }
 
 impl Icon {

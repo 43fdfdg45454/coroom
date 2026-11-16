@@ -1,7 +1,9 @@
 //! La sala del anfitrión no empuja nada: las filas de «Personas» tienen siempre la misma altura y
-//! el mismo sitio, hable quien hable, llegue lo que llegue de la sesión (latencia, mando,
-//! permisos) y haya o no peticiones de entrada (van debajo de la lista). Los desplegables solo se
-//! abren cuando el usuario lo pide.
+//! el mismo sitio, hable quien hable y llegue lo que llegue de la sesión (latencia, mando,
+//! permisos). Las peticiones de entrada van arriba, bajo la cabecera, donde se ven aunque haya
+//! una fila abierta: bajan todas las filas lo mismo, sin cambiarles el tamaño ni el orden, y al
+//! contestarlas todo vuelve a su sitio (y el desplazamiento de la página se ancla a lo que se
+//! mira: `coroom_ui::scroll`). Los desplegables solo se abren cuando el usuario lo pide.
 //!
 //! Sin adaptador gráfico (ni `lavapipe`) se salta, como el de las capturas.
 
@@ -150,7 +152,8 @@ fn data_does_not_move_the_rows(shots: &mut ShotRenderer, app: &mut App, case: &s
         "{case}: lo que llega no abre ni cierra nada"
     );
 
-    // Llega una petición de entrada (y otra): van en la bandeja, debajo de la lista.
+    // Llega una petición de entrada (y otra): van en la bandeja, bajo la cabecera. Las filas
+    // bajan todas lo mismo (lo que mide la bandeja) y conservan su tamaño y su columna.
     for (user, name) in [(4, "Dani"), (5, "Eli")] {
         app.update(Message::Event(Event::JoinRequested {
             from_user: user,
@@ -162,11 +165,21 @@ fn data_does_not_move_the_rows(shots: &mut ShotRenderer, app: &mut App, case: &s
         2,
         "{case}: las peticiones llegaron"
     );
-    assert_eq!(
-        before,
-        measure(shots.renderer(), app),
-        "{case}: con peticiones"
-    );
+    let requested = measure(shots.renderer(), app);
+    let pushed = requested[0].1.y - before[0].1.y;
+    assert!(pushed > 0.0, "{case}: la bandeja va antes de «Personas»");
+    for ((person, was), (_, now)) in before.iter().zip(&requested) {
+        assert_eq!(
+            (was.x, was.width, was.height),
+            (now.x, now.width, now.height),
+            "{case}: {person:?} conserva su tamaño con peticiones"
+        );
+        assert!(
+            (now.y - was.y - pushed).abs() < 0.01,
+            "{case}: {person:?} baja lo mismo que las demás ({} y {pushed})",
+            now.y - was.y
+        );
+    }
     app.update(Message::Host(host::Msg::DeclineJoin(4)));
     app.update(Message::Host(host::Msg::DeclineJoin(5)));
     assert!(app.host.join_requests.is_empty(), "{case}: contestadas");

@@ -40,6 +40,37 @@ pub struct Scene {
     pub name: String,
     /// La aplicación.
     pub app: App,
+    /// Cuánto se ha desplazado la página (0: arriba del todo), para las escenas que enseñan lo
+    /// que queda bajo el pliegue ([`ShotRenderer::render_scrolled`]).
+    pub scroll: f32,
+}
+
+/// Desplaza `0.0` hacia abajo la primera zona con desplazamiento a la que le sobra contenido (la
+/// página; el riel y un chat vacío no se mueven).
+struct ScrollPage(f32, bool);
+
+impl Operation for ScrollPage {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+
+    fn scrollable(
+        &mut self,
+        _id: Option<&iced_core::widget::Id>,
+        bounds: iced_core::Rectangle,
+        content_bounds: iced_core::Rectangle,
+        _translation: iced_core::Vector,
+        state: &mut dyn operation::Scrollable,
+    ) {
+        if !self.1 && content_bounds.height > bounds.height {
+            self.1 = true;
+            state.scroll_by(
+                operation::scrollable::AbsoluteOffset { x: 0.0, y: self.0 },
+                bounds,
+                content_bounds,
+            );
+        }
+    }
 }
 
 /// Dibuja la aplicación en una textura.
@@ -79,6 +110,11 @@ impl ShotRenderer {
     /// El tamaño es el de la ventana de `app` ([`App::window`]; [`SIZE`] salvo en las escenas
     /// del riel estrecho).
     pub fn render(&mut self, app: &App, scale: f32) -> (u32, u32, Vec<u8>) {
+        self.render_scrolled(app, scale, 0.0)
+    }
+
+    /// [`ShotRenderer::render`] con la página desplazada `scroll` hacia abajo ([`Scene::scroll`]).
+    pub fn render_scrolled(&mut self, app: &App, scale: f32, scroll: f32) -> (u32, u32, Vec<u8>) {
         let width = (app.window.width * scale).round() as u32;
         let height = (app.window.height * scale).round() as u32;
         let viewport = Viewport::with_physical_size(Size::new(width, height), scale);
@@ -86,7 +122,7 @@ impl ShotRenderer {
         let mut cache = user_interface::Cache::new();
         // Dos pasadas: la primera asienta lo que depende del tamaño medido (desplazamientos,
         // menús), como en la ventana tras el primer evento.
-        for _ in 0..2 {
+        for pass in 0..2 {
             let mut interface = UserInterface::build(
                 app.view(),
                 viewport.logical_size(),
@@ -110,6 +146,9 @@ impl ShotRenderer {
                 },
                 mouse::Cursor::Unavailable,
             );
+            if pass == 0 && scroll > 0.0 {
+                interface.operate(&self.renderer, &mut ScrollPage(scroll, false));
+            }
             cache = interface.into_cache();
         }
         let pixels = self.renderer.screenshot(&viewport, theme.background());
@@ -286,12 +325,16 @@ fn scenes_where(wanted: impl Fn(&str) -> bool) -> Vec<Scene> {
             }
             let mut app = base(mode, fonts);
             build(&mut app);
+            // Dentro de una sala ajena, quien aloja lleva su avatar de ejemplo como en las demás
+            // pantallas.
+            guest::shots::known_host(&mut app);
             // Las capturas muestran la página ya entrada (sin el desliz del cambio de destino).
             app.page_change = None;
             app.refresh_theme();
             scenes.push(Scene {
                 name: format!("{name}-{suffix}"),
                 app,
+                scroll: host::shots::scroll_of(name),
             });
         }
     }

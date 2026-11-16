@@ -349,9 +349,17 @@ pub struct Palette {
     pub text_disabled: Rgb,
     /// Bordes y separadores: el filete fino de las tarjetas, de poco contraste.
     pub border: Rgb,
-    /// Contorno que tiene que verse por sí solo: una butaca libre, un campo bajo el ratón, los
-    /// puntos de una entrada.
+    /// Contorno más marcado que el filete de las tarjetas: una butaca libre, un campo o una
+    /// tarjeta bajo el ratón. Acompaña a algo que ya se ve; para lo que se dibuja solo con una
+    /// línea, [`Palette::outline`].
     pub border_strong: Rgb,
+    /// Lo que un control dibuja sin más apoyo y tiene que verse por sí solo (3:1 con la ventana,
+    /// la tarjeta, el riel y el diálogo): el carril vacío de un deslizador, un interruptor
+    /// apagado, el contorno de uno desactivado, el punteado de una entrada.
+    pub outline: Rgb,
+    /// Texto de ejemplo de un campo vacío: AA sobre el fondo del campo ([`Palette::card`]), pero
+    /// mucho más tenue que el valor, para que no parezca algo ya escrito.
+    pub placeholder: Rgb,
     /// Borde de los campos con el foco y anillo de foco.
     pub focus: Rgb,
     /// Fondo de los botones normales.
@@ -526,6 +534,8 @@ impl Palette {
                     ),
                     border: tint(Rgb::new(0xe0, 0xe0, 0xe5), 0.06),
                     border_strong: tint(Rgb::new(0xb0, 0xb2, 0xba), 0.10),
+                    outline: graphic_on_all(tint(Rgb::new(0x8c, 0x90, 0x9a), 0.10), &surfaces),
+                    placeholder: ensure_contrast(text.mix(card, 0.52), card, AA),
                     focus: readable_on_all(base, &surfaces),
                     button,
                     button_hover: tint(Rgb::new(0xda, 0xda, 0xdf), 0.06),
@@ -615,6 +625,8 @@ impl Palette {
                     ),
                     border: lit(0.12),
                     border_strong: lit(0.28),
+                    outline: graphic_on_all(lit(0.42), &surfaces),
+                    placeholder: ensure_contrast(text.mix(card, 0.50), card, AA),
                     focus: readable_on_all(base.mix(WHITE, 0.25), &surfaces),
                     button,
                     button_hover: lit(0.17),
@@ -721,6 +733,14 @@ pub fn button_background(base: Rgb) -> Filled {
 pub fn readable_on_all(color: Rgb, backgrounds: &[Rgb]) -> Rgb {
     backgrounds.iter().fold(color, |color, background| {
         ensure_contrast(color, *background, AA)
+    })
+}
+
+/// `color` ajustado para verse como elemento gráfico (3:1) sobre todos los `backgrounds` (todos
+/// claros o todos oscuros, como en [`readable_on_all`]).
+pub fn graphic_on_all(color: Rgb, backgrounds: &[Rgb]) -> Rgb {
+    backgrounds.iter().fold(color, |color, background| {
+        ensure_contrast(color, *background, AA_LARGE)
     })
 }
 

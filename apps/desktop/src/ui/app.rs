@@ -2161,9 +2161,13 @@ impl App {
                 // hijos: a pantalla completa quedan vacíos).
                 Some(state) => {
                     let shown = guest::rail_shown(self);
+                    // Con el vídeo en pantalla la sala está a oscuras: el riel y su línea se
+                    // dibujan con la paleta oscura también con el tema claro, como la barra y
+                    // los paneles sobre el vídeo.
+                    let night = self.video_in_front().then_some(self.dark);
                     row![
-                        ui::slot(shown.then(|| self.guest_rail())),
-                        ui::slot(shown.then(|| iced_widget::rule::vertical(1).into())),
+                        ui::slot(shown.then(|| Night::over(self.guest_rail(), night))),
+                        ui::slot(shown.then(|| Night::over(iced_widget::rule::vertical(1), night))),
                         guest::view(self, state),
                     ]
                     .height(Length::Fill)
@@ -2503,14 +2507,14 @@ impl App {
         ];
         let header: Element<'_, Message> = if wide {
             row![
-                icon_with(Icon::RadioTower, BRAND_ICON, SvgClass::Accent),
+                icon_with(Icon::Coroom, BRAND_ICON, SvgClass::Accent),
                 ui::heading("coroom")
             ]
             .spacing(8)
             .align_y(Alignment::Center)
             .into()
         } else {
-            icon_with(Icon::RadioTower, BRAND_ICON, SvgClass::Accent)
+            icon_with(Icon::Coroom, BRAND_ICON, SvgClass::Accent)
         };
         let footer = match visiting {
             Some(state) => Some(guest::rail_footer(self, state, wide)),
@@ -2799,7 +2803,144 @@ impl App {
     }
 }
 
-/// Tamaño de la marca (el icono de la antena) en el riel.
+/// Dibuja lo de dentro con otra paleta (la oscura, para el riel junto al vídeo) y el resto del
+/// tema de fuera tal cual: las fuentes, el movimiento de ese dibujo y las transiciones en curso.
+/// No tiene estado ni hijos propios: el árbol es el de su contenido, así que ponerlo o quitarlo
+/// (al llegar el vídeo, al salir de él) no pierde el estado de nada. Lo que flota (los textos
+/// emergentes) ya es oscuro en los dos temas y se dibuja con el de fuera.
+struct Night<'a> {
+    content: Element<'a, Message>,
+    palette: Palette,
+}
+
+impl<'a> Night<'a> {
+    /// `content` con la paleta `palette` o, sin ella, tal cual.
+    fn over(
+        content: impl Into<Element<'a, Message>>,
+        palette: Option<Palette>,
+    ) -> Element<'a, Message> {
+        let content = content.into();
+        match palette {
+            Some(palette) => Night { content, palette }.into(),
+            None => content,
+        }
+    }
+}
+
+impl iced_core::Widget<Message, Theme, coroom_ui::Renderer> for Night<'_> {
+    fn tag(&self) -> iced_core::widget::tree::Tag {
+        self.content.as_widget().tag()
+    }
+
+    fn state(&self) -> iced_core::widget::tree::State {
+        self.content.as_widget().state()
+    }
+
+    fn children(&self) -> Vec<iced_core::widget::Tree> {
+        self.content.as_widget().children()
+    }
+
+    fn diff(&self, tree: &mut iced_core::widget::Tree) {
+        self.content.as_widget().diff(tree);
+    }
+
+    fn size(&self) -> iced_core::Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut iced_core::widget::Tree,
+        renderer: &coroom_ui::Renderer,
+        limits: &iced_core::layout::Limits,
+    ) -> iced_core::layout::Node {
+        self.content.as_widget_mut().layout(tree, renderer, limits)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut iced_core::widget::Tree,
+        layout: iced_core::Layout<'_>,
+        renderer: &coroom_ui::Renderer,
+        operation: &mut dyn iced_core::widget::Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(tree, layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut iced_core::widget::Tree,
+        event: &iced_core::Event,
+        layout: iced_core::Layout<'_>,
+        cursor: iced_core::mouse::Cursor,
+        renderer: &coroom_ui::Renderer,
+        clipboard: &mut dyn iced_core::Clipboard,
+        shell: &mut iced_core::Shell<'_, Message>,
+        viewport: &iced_core::Rectangle,
+    ) {
+        self.content.as_widget_mut().update(
+            tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &iced_core::widget::Tree,
+        layout: iced_core::Layout<'_>,
+        cursor: iced_core::mouse::Cursor,
+        viewport: &iced_core::Rectangle,
+        renderer: &coroom_ui::Renderer,
+    ) -> iced_core::mouse::Interaction {
+        self.content
+            .as_widget()
+            .mouse_interaction(tree, layout, cursor, viewport, renderer)
+    }
+
+    fn draw(
+        &self,
+        tree: &iced_core::widget::Tree,
+        renderer: &mut coroom_ui::Renderer,
+        theme: &Theme,
+        _style: &iced_core::renderer::Style,
+        layout: iced_core::Layout<'_>,
+        cursor: iced_core::mouse::Cursor,
+        viewport: &iced_core::Rectangle,
+    ) {
+        let night = Theme {
+            palette: self.palette,
+            ..*theme
+        };
+        let style = iced_core::renderer::Style {
+            text_color: night.text_color(),
+        };
+        self.content
+            .as_widget()
+            .draw(tree, renderer, &night, &style, layout, cursor, viewport);
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut iced_core::widget::Tree,
+        layout: iced_core::Layout<'b>,
+        renderer: &coroom_ui::Renderer,
+        viewport: &iced_core::Rectangle,
+        translation: iced_core::Vector,
+    ) -> Option<iced_core::overlay::Element<'b, Message, Theme, coroom_ui::Renderer>> {
+        self.content
+            .as_widget_mut()
+            .overlay(tree, layout, renderer, viewport, translation)
+    }
+}
+
+impl<'a> From<Night<'a>> for Element<'a, Message> {
+    fn from(night: Night<'a>) -> Self {
+        Element::new(night)
+    }
+}
+
+/// Tamaño de la marca (los dos anillos enlazados de coroom) en el riel.
 const BRAND_ICON: f32 = 22.0;
 
 /// Lado de los iconos de los destinos del riel.

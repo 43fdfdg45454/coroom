@@ -22,6 +22,11 @@ diagnostics-insignia-invitados = { $count } invitados
 
 diagnostics-relay-titulo = Vas por el relay de { $host }.
 diagnostics-relay-motivo = La conexión directa falló: { $reason }.
+diagnostics-motivo-ninguna = ninguna de las { $total } direcciones sirvió ({ $detail })
+diagnostics-motivo-la-unica = la única dirección no sirvió ({ $detail })
+diagnostics-motivo-sin-respuesta = { $n } sin respuesta
+diagnostics-motivo-con-error = { $n } con error
+diagnostics-motivo-sin-probar = { $n } sin probar
 diagnostics-relay-sin-probar = No se probó la conexión directa: el relay está forzado en los ajustes o el anfitrión no anunció direcciones.
 diagnostics-relay-router = Tu router tampoco abrió un puerto (UPnP, NAT-PMP y PCP).
 diagnostics-relay-reintento = La sesión no la reintenta sola: «Reintentar ahora» vuelve a entrar en la sala (el vídeo se corta un momento).

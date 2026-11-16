@@ -16,7 +16,7 @@ use iced_core::{Alignment, Length, Padding};
 use iced_widget::{Column, Row, Space, container, image, row, stack, text};
 
 use crate::font::{SEMIBOLD, UI};
-use crate::style::{ContainerClass, Surface, TextClass, seat_radius};
+use crate::style::{ContainerClass, Surface, TextClass, image_radius, seat_radius};
 use crate::theme::Tone;
 use crate::tokens::{seat, space, text as type_size};
 use crate::widget::{avatar, ellipsize, one_line, seat_outline, slot, with_tooltip};
@@ -79,7 +79,7 @@ pub fn avatar_with<'a, M: 'a>(
         Some(picture) => image(picture.for_side(side).clone())
             .width(Length::Fixed(side))
             .height(Length::Fixed(side))
-            .border_radius(seat_radius(side))
+            .border_radius(image_radius(seat_radius(side)))
             .into(),
         None => avatar(theme, name, side),
     }
@@ -579,8 +579,18 @@ mod tests {
             assert_eq!(plan.seats(), people);
             assert!(plan.free_numbers().is_empty());
         }
-        // Sin mínimo, solo las ocupadas.
-        assert_eq!(seat_plan(2, 0, usize::MAX).seats(), 2);
+        // Sin mínimo, solo las ocupadas: en una sala ajena no se sabe cuántas butacas hay, así
+        // que no se dibuja ninguna libre, haya quien haya.
+        for people in [0, 1, 2, 7] {
+            let plan = seat_plan(people, 0, usize::MAX);
+            assert_eq!((plan.shown, plan.more, plan.free), (people, 0, 0));
+            assert_eq!(plan.seats(), people);
+            assert!(plan.free_numbers().is_empty());
+        }
+        // Tampoco con un máximo: la butaca de «+N» no es una libre.
+        let capped = seat_plan(9, 0, 4);
+        assert_eq!((capped.shown, capped.more, capped.free), (3, 6, 0));
+        assert_eq!(SeatRow::default().min(0).min, 0);
     }
 
     #[test]

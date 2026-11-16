@@ -138,6 +138,9 @@ pub struct State {
     pub error: Option<String>,
     /// Errores de validación.
     pub errors: FieldErrors,
+    /// Respuestas del servidor que ya no se esperan ([`Msg::CancelWait`]): cuando lleguen, se
+    /// descartan.
+    pub abandoned: u32,
 }
 
 impl State {
@@ -166,6 +169,7 @@ impl State {
             waiting_since: Instant::now(),
             error: None,
             errors: FieldErrors::default(),
+            abandoned: 0,
         }
     }
 }
@@ -207,6 +211,9 @@ pub enum Msg {
     ToggleInvitation,
     /// Enviar.
     Submit,
+    /// Dejar de esperar al servidor (al entrar o al recuperar la sesión guardada): se vuelve al
+    /// paso de antes y la respuesta, si llega, se descarta.
+    CancelWait,
 }
 
 /// Normaliza la dirección de un servidor: `coroom.example.com` → `https://coroom.example.com`.
@@ -394,6 +401,18 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Effect> {
                 }),
             }];
         }
+        Msg::CancelWait => {
+            if state.busy || state.restoring {
+                // La petición sigue su curso fuera de aquí; su respuesta ya no cuenta.
+                state.abandoned += 1;
+                state.busy = false;
+                state.restoring = false;
+                state.error = None;
+                if state.step == Step::Servers && app.settings.servers.is_empty() {
+                    state.step = Step::AddServer;
+                }
+            }
+        }
     }
     Vec::new()
 }
@@ -408,6 +427,11 @@ fn stay_here(app: &mut App) -> Vec<Effect> {
 
 /// Resultados de la red para esta pantalla.
 pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
+    // La respuesta de una espera cancelada ([`Msg::CancelWait`]) no cambia nada.
+    if matches!(event, Event::SignedIn(_) | Event::NoSavedSession) && app.login.abandoned > 0 {
+        app.login.abandoned -= 1;
+        return Vec::new();
+    }
     match event {
         Event::Probed { url, result } => {
             if matches!(&app.login.probe, Probe::Checking { url: checking, .. } if *checking == url)
@@ -496,7 +520,7 @@ pub fn on_event(app: &mut App, event: Event) -> Vec<Effect> {
 pub fn view(app: &App) -> Element<'_, Message> {
     let state = &app.login;
     let brand = column![
-        icon_with(Icon::RadioTower, BRAND_MARK, SvgClass::Accent),
+        icon_with(Icon::Coroom, BRAND_MARK, SvgClass::Accent),
         column![
             ui::title("coroom"),
             ui::secondary(t!("pantalla-login-juego-remoto-con-amigos-cifrado-de"))
@@ -632,6 +656,11 @@ fn servers(app: &App) -> Element<'_, Message> {
         if let Some(silent) = silent_for(app) {
             waiting = waiting.push(silent);
         }
+        // Sin esperar más: a la lista de servidores, a elegir otro o a volver a intentarlo.
+        waiting = waiting.push(row![
+            ui::fill(),
+            ui::normal(t!("app-cancelar"), Some(on(Msg::CancelWait)))
+        ]);
         return form_card(waiting);
     }
     let rows = app
@@ -787,27 +816,50 @@ fn add_server(app: &App) -> Element<'_, Message> {
         Probe::Done { url, probe } => {
             gap = crate::update::protocol_gap(probe.protocol)
                 .map(|gap| crate::ui::screens::updates::protocol_banner(app, &host_of(url), gap));
+            // Con otra versión no se puede seguir: del informe basta la fila de la versión (la
+            // red y el certificado no cambian nada hasta actualizar) y «Comprobar» queda a la
+            // vista para repetirlo después.
             report = probe_report(app, probe);
+            if gap.is_some() {
+                report.truncate(1);
+            }
         }
     }
-    let ready = matches!(&state.probe, Probe::Done { probe, .. }
-        if probe.untrusted.is_none() || state.trusted);
-    let action = if ready {
-        ui::primary(t!("pantalla-login-continuar"), Some(on(Msg::Continue)))
-    } else {
+    let check = |kind: Kind| {
         ui::button_with(
-            Kind::Primary,
+            kind,
             t!("pantalla-login-comprobar"),
             Some(Icon::Refresh),
             (!checking).then(|| on(Msg::Check)),
         )
+    };
+    // La acción principal es siempre el paso que toca: comprobar; con un certificado propio
+    // todavía sin confiar, confiar (comprobar otra vez queda al lado, en normal); y continuar.
+    let mut actions = row![ui::fill()]
+        .spacing(space::XS)
+        .align_y(Alignment::Center);
+    actions = match &state.probe {
+        Probe::Done { .. } if gap.is_some() => actions.push(check(Kind::Primary)),
+        Probe::Done { probe, .. } if probe.untrusted.is_some() && !state.trusted => {
+            actions.push(check(Kind::Normal)).push(ui::button_with(
+                Kind::Primary,
+                t!("pantalla-login-confiar"),
+                Some(Icon::ShieldCheck),
+                Some(on(Msg::Trust)),
+            ))
+        }
+        Probe::Done { .. } => actions.push(ui::primary(
+            t!("pantalla-login-continuar"),
+            Some(on(Msg::Continue)),
+        )),
+        _ => actions.push(check(Kind::Primary)),
     };
     let mut card = Column::new().push(container(form).padding(FORM_PADDING).width(Length::Fill));
     for line in report {
         card = card.push(iced_widget::rule::horizontal(1)).push(line);
     }
     card = card.push(iced_widget::rule::horizontal(1)).push(
-        container(row![ui::fill(), action].align_y(Alignment::Center))
+        container(actions)
             .padding(Padding::from([space::M, FORM_PADDING]))
             .width(Length::Fill),
     );
@@ -927,23 +979,16 @@ fn probe_report<'a>(app: &'a App, probe: &'a ServerProbe) -> Vec<Element<'a, Mes
             None,
         ),
         Some(_) => {
-            // Sin confiar todavía, en ámbar y con el botón; ya confiado, en verde y dicho.
+            // Sin confiar todavía, en ámbar; ya confiado, en verde y dicho.
             let (glyph, tone) = if state.trusted {
                 (Icon::ShieldCheck, Tone::Success)
             } else {
                 (Icon::ShieldAlert, Tone::Warning)
             };
-            let trust: Element<'a, Message> = if state.trusted {
-                ui::status_badge(Tone::Success, t!("pantalla-login-confiado"))
-            } else {
-                ui::button_with(
-                    Kind::Normal,
-                    t!("pantalla-login-confiar"),
-                    Some(Icon::ShieldCheck),
-                    Some(on(Msg::Trust)),
-                )
-                .into()
-            };
+            // «Confiar» es la acción principal del paso, al pie de la tarjeta.
+            let trust = state
+                .trusted
+                .then(|| ui::status_badge(Tone::Success, t!("pantalla-login-confiado")));
             let lines = fingerprint_lines(&probe.fingerprint)
                 .into_iter()
                 .map(|line| ui::mono(line, 13.0).wrapping(Wrapping::WordOrGlyph).into());
@@ -958,7 +1003,7 @@ fn probe_report<'a>(app: &'a App, probe: &'a ServerProbe) -> Vec<Element<'a, Mes
                         ]
                         .spacing(2)
                         .width(Length::Fill),
-                        trust
+                        ui::slot(trust)
                     ]
                     .spacing(space::S)
                     .align_y(Alignment::Center),
@@ -1068,16 +1113,21 @@ fn sign_in(app: &App) -> Element<'_, Message> {
         .id("device"),
     ));
     let main: Element<'_, Message> = if state.busy {
-        container(ui::progress(
-            if state.invitation {
-                t!("pantalla-login-creando-la-cuenta")
-            } else {
-                t!("pantalla-login-iniciando-sesion")
-            },
-            None,
-            phase(app),
-        ))
-        .width(Length::Fixed(180.0))
+        row![
+            ui::flat(t!("app-cancelar"), Some(on(Msg::CancelWait))),
+            container(ui::progress(
+                if state.invitation {
+                    t!("pantalla-login-creando-la-cuenta")
+                } else {
+                    t!("pantalla-login-iniciando-sesion")
+                },
+                None,
+                phase(app),
+            ))
+            .width(Length::Fixed(180.0))
+        ]
+        .spacing(space::S)
+        .align_y(Alignment::Center)
         .into()
     } else {
         ui::primary(
@@ -1361,6 +1411,51 @@ mod tests {
         let effects = update(&mut app, Msg::Choose("https://coroom.example.com".into()));
         assert_eq!(app.screen, Screen::Main);
         assert_eq!(effects, [Effect::StartLobby]);
+    }
+
+    /// Mientras el servidor no contesta se puede dejar de esperar: se vuelve al formulario (o a
+    /// la lista) y la respuesta tardía no inicia sesión ni enseña su error; la siguiente sí cuenta.
+    #[test]
+    fn a_wait_can_be_cancelled_and_its_late_answer_is_dropped() {
+        let mut app = app();
+        app.login.server = Some(ServerEntry {
+            url: "https://coroom.example.com".into(),
+            fingerprint: None,
+            tcp_port: None,
+            username: None,
+        });
+        app.login.step = Step::SignIn;
+        app.update(Message::Login(Msg::Username("ana".into())));
+        app.update(Message::Login(Msg::Password("change-me-please".into())));
+        assert_eq!(app.update(Message::Login(Msg::Submit)).len(), 1);
+        assert!(app.login.busy);
+        assert!(app.update(Message::Login(Msg::CancelWait)).is_empty());
+        assert!(!app.login.busy);
+        assert_eq!(app.login.step, Step::SignIn);
+        // Cancelar sin esperar nada no hace nada.
+        app.update(Message::Login(Msg::CancelWait));
+        assert_eq!(app.login.abandoned, 1);
+        // La respuesta que llega tarde se descarta.
+        let effects = app.update(Message::Event(Event::SignedIn(Err("tarde".into()))));
+        assert!(effects.is_empty());
+        assert_eq!(app.login.error, None);
+        assert_eq!(app.screen, Screen::Login);
+        assert_eq!(app.login.abandoned, 0);
+        // Recuperando la sesión guardada: cancelar deja la lista de servidores.
+        app.login.step = Step::Servers;
+        app.login.restoring = true;
+        app.update(Message::Login(Msg::CancelWait));
+        assert!(!app.login.restoring);
+        app.update(Message::Event(Event::NoSavedSession));
+        assert_eq!(
+            app.login.step,
+            Step::AddServer,
+            "sin servidores, a añadir uno"
+        );
+        // La siguiente respuesta ya cuenta.
+        app.login.busy = true;
+        app.update(Message::Event(Event::SignedIn(Err("no".into()))));
+        assert_eq!(app.login.error.as_deref(), Some("no"));
     }
 
     #[test]

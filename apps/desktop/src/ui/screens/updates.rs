@@ -281,49 +281,68 @@ pub fn protocol_banner<'a>(app: &'a App, host: &str, gap: ProtocolGap) -> Elemen
         ),
         ProtocolGap::ClientOlder { server, client } => {
             let updater = &app.update.updater;
-            let action: Option<Element<'a, Message>> = match updater.stage() {
-                _ if updater.release().is_none() => None,
-                _ if !updater.installs() => Some(see_button(app)),
-                Stage::Ready => Some(restart_button(app, t!("update-actualizar-y-reiniciar"))),
-                Stage::Downloading(progress) | Stage::Paused(progress) => Some(inline_progress(
-                    *progress,
-                    matches!(updater.stage(), Stage::Paused(_)),
-                )),
-                _ => Some(
-                    ui::button_with(
-                        Kind::Primary,
-                        t!("update-descargar-y-actualizar"),
-                        Some(Icon::Download),
-                        (!updater.room_open()).then(|| on(Msg::UpdateNow)),
-                    )
-                    .into(),
-                ),
+            let action: Element<'a, Message> = match updater.stage() {
+                // Sin saber todavía cuál es la versión nueva, o si esta copia no se instala
+                // sola: la página de la versión nueva (o la de las publicaciones).
+                _ if updater.release().is_none() || !updater.installs() => see_button(app),
+                Stage::Ready => restart_button(app, t!("update-actualizar-y-reiniciar")),
+                Stage::Downloading(progress) => bar(*progress, false),
+                Stage::Paused(progress) => bar(*progress, true),
+                _ => ui::button_with(
+                    Kind::Primary,
+                    t!("update-descargar-y-actualizar"),
+                    Some(Icon::Download),
+                    (!updater.room_open()).then(|| on(Msg::UpdateNow)),
+                )
+                .into(),
             };
-            notice(
-                Tone::Warning,
-                Icon::Warning,
-                t!("update-app-vieja").to_owned(),
+            // Mientras baja la versión nueva, el texto dice eso (con su porcentaje) y no que
+            // hay que actualizar: ya se está haciendo.
+            let body = match updater.stage() {
+                _ if updater.release().is_none() || !updater.installs() => None,
+                Stage::Downloading(progress) => Some(downloading_text(app, *progress)),
+                Stage::Paused(progress) => Some(t!(
+                    "update-en-pausa",
+                    version = version(app),
+                    percent = progress.percent()
+                )),
+                _ => None,
+            }
+            .unwrap_or_else(|| {
                 t!(
                     "update-app-vieja-texto",
                     host = host,
                     server = server,
                     client = client
-                ),
-                action.into_iter().collect(),
+                )
+            });
+            notice(
+                Tone::Warning,
+                Icon::Warning,
+                t!("update-app-vieja").to_owned(),
+                body,
+                vec![action],
             )
         }
     }
 }
 
-/// La barra del progreso con su porcentaje (donde iría el botón).
-fn inline_progress<'a>(progress: Progress, paused: bool) -> Element<'a, Message> {
-    row![
-        bar(progress, paused),
-        ui::secondary(t!("update-porcentaje", percent = progress.percent()))
-    ]
-    .spacing(space::XS)
-    .align_y(Alignment::Center)
-    .into()
+/// «Descargando coroom 2.1.0 · 34 % de 61 MB» (sin el tamaño, si no se sabe).
+fn downloading_text(app: &App, progress: Progress) -> String {
+    let version = version(app);
+    match progress.total_bytes {
+        Some(total) => t!(
+            "update-descargando",
+            version = version,
+            percent = progress.percent(),
+            size = megabytes(total)
+        ),
+        None => t!(
+            "update-descargando-sin-tamano",
+            version = version,
+            percent = progress.percent()
+        ),
+    }
 }
 
 fn bar<'a>(progress: Progress, paused: bool) -> Element<'a, Message> {
@@ -340,7 +359,7 @@ fn bar<'a>(progress: Progress, paused: bool) -> Element<'a, Message> {
     .into()
 }
 
-/// El texto y la acción de la fila «Versión nueva» de Acerca de.
+/// El texto y la acción de la fila «Estado» de las actualizaciones de Acerca de.
 pub fn status(app: &App) -> (String, Element<'_, Message>) {
     let state = &app.update;
     let updater = &state.updater;
@@ -370,22 +389,7 @@ pub fn status(app: &App) -> (String, Element<'_, Message>) {
         );
     }
     match updater.stage() {
-        Stage::Downloading(progress) => (
-            match progress.total_bytes {
-                Some(total) => t!(
-                    "update-descargando",
-                    version = version,
-                    percent = progress.percent(),
-                    size = megabytes(total)
-                ),
-                None => t!(
-                    "update-descargando-sin-tamano",
-                    version = version,
-                    percent = progress.percent()
-                ),
-            },
-            bar(*progress, false),
-        ),
+        Stage::Downloading(progress) => (downloading_text(app, *progress), bar(*progress, false)),
         Stage::Paused(progress) => (
             t!(
                 "update-en-pausa",

@@ -13,7 +13,7 @@ use iced_widget::{
 
 use crate::font::Fonts;
 use crate::motion::Motion;
-use crate::theme::{Accent, Mode, Palette, Rgb, Tone};
+use crate::theme::{AA_LARGE, Accent, Mode, Palette, Rgb, Tone, contrast, ensure_contrast};
 use crate::tokens::{radius, seat};
 
 /// Tema de la interfaz: paleta, fuentes y movimiento.
@@ -144,6 +144,22 @@ pub fn seat_radius(side: f32) -> Radius {
         top_right: back,
         bottom_right: base,
         bottom_left: base,
+    }
+}
+
+/// `radius` tal como hay que dárselo a una imagen (`iced_widget::image`) para que salga con esas
+/// esquinas. El sombreador de imágenes de `iced_wgpu` 0.14 lee los cuatro radios girados media
+/// vuelta respecto de [`Radius`] y del de los rectángulos (a la esquina de arriba a la izquierda
+/// le aplica el de abajo a la derecha, y así las cuatro), de modo que una butaca con foto salía
+/// boca abajo: recta arriba y redonda abajo. Aquí se le da ya girado. Con radios iguales no
+/// cambia nada. Lo vigila la prueba de píxeles `a_seat_with_a_photo_has_the_same_outline…` de
+/// `tests/components.rs`: si un `iced` posterior lo corrige, fallará y esto sobra.
+pub fn image_radius(radius: Radius) -> Radius {
+    Radius {
+        top_left: radius.bottom_right,
+        top_right: radius.bottom_left,
+        bottom_right: radius.top_left,
+        bottom_left: radius.top_right,
     }
 }
 
@@ -560,17 +576,11 @@ impl Theme {
                 snap: true,
             },
             ButtonClass::SegmentThumb => button::Style {
-                // El elegido es el plano más claro del grupo: la tarjeta en claro y, en oscuro, un
-                // paso por encima del fondo del grupo. Sin sombra: lo separa su filete.
-                background: Some(Background::Color(
-                    match p.mode {
-                        Mode::Light => p.card,
-                        Mode::Dark => p.button_pressed,
-                    }
-                    .color(),
-                )),
+                // El elegido no depende de ser algo más claro que el grupo: lleva el relleno
+                // suave de acento y un filete de acento que se ve por sí solo.
+                background: Some(Background::Color(p.highlight.color())),
                 text_color: p.text.color(),
-                border: outline(p.border.color(), 1.0, radius::CONTROL - 2.0),
+                border: outline(p.focus.color(), 1.0, radius::CONTROL - 2.0),
                 shadow: Shadow::default(),
                 snap: true,
             },
@@ -953,8 +963,7 @@ impl container::Catalog for Theme {
             ContainerClass::LiveTag { glow } => {
                 let glow = glow.clamp(0.0, 1.0);
                 // El piloto, oscurecido lo justo para llevar la letra clara con AA.
-                let pilot =
-                    crate::theme::ensure_contrast(p.live.solid, p.on_destructive, crate::theme::AA);
+                let pilot = ensure_contrast(p.live.solid, p.on_destructive, crate::theme::AA);
                 container::Style {
                     background: fill(pilot.color()),
                     text_color: Some(p.on_destructive.color()),
@@ -1047,15 +1056,18 @@ impl text_input::Catalog for Theme {
 
     fn style(&self, class: &Self::Class<'_>, status: text_input::Status) -> text_input::Style {
         let p = &self.palette;
+        // El campo no tiene relleno propio (es del color de la tarjeta): lo que dice dónde está
+        // es su borde, que se ve por sí solo también en reposo. Con el foco, el anillo de acento,
+        // más grueso; con un error, el del error.
         let border = match (class, status) {
             (InputClass::Invalid, _) => outline(p.error.solid.color(), 2.0, radius::CONTROL),
             (_, text_input::Status::Focused { .. }) => {
                 outline(p.focus.color(), 2.0, radius::CONTROL)
             }
             (_, text_input::Status::Hovered) => {
-                outline(p.border_strong.color(), 1.0, radius::CONTROL)
+                outline(p.text_secondary.color(), 1.0, radius::CONTROL)
             }
-            _ => outline(p.border.color(), 1.0, radius::CONTROL),
+            _ => outline(p.outline.color(), 1.0, radius::CONTROL),
         };
         text_input::Style {
             background: Background::Color(if status == text_input::Status::Disabled {
@@ -1065,7 +1077,14 @@ impl text_input::Catalog for Theme {
             }),
             border,
             icon: p.text_secondary.color(),
-            placeholder: p.text_secondary.color(),
+            // Más tenue que el valor. En un campo desactivado no se pinta: el valor ya va en el
+            // color más tenue que cumple AA, así que el ejemplo se leería como algo escrito (y
+            // un ejemplo de qué escribir no dice nada donde no se puede escribir).
+            placeholder: if status == text_input::Status::Disabled {
+                Color::TRANSPARENT
+            } else {
+                p.placeholder.color()
+            },
             value: if status == text_input::Status::Disabled {
                 p.text_disabled.color()
             } else {
@@ -1090,27 +1109,43 @@ impl toggler::Catalog for Theme {
             toggler::Status::Hovered { is_toggled } => (is_toggled, true, false),
             toggler::Status::Disabled { is_toggled } => (is_toggled, false, true),
         };
-        let track = match (on, hovered, disabled) {
-            (_, _, true) => p.button,
-            (true, true, _) => p.accent_bg_hover,
-            (true, false, _) => p.accent_bg,
-            (false, true, _) => p.border_strong,
-            (false, false, _) => p.button_pressed,
-        };
-        // El tirador es lo más claro del interruptor en los dos modos.
-        let knob = match p.mode {
+        // El tirador es lo más claro del interruptor en los dos modos; encendido, si el acento
+        // es tan claro que no se vería, el color del texto sobre el acento.
+        let light = match p.mode {
             Mode::Light => p.card,
             Mode::Dark => p.text,
         };
+        let knob = if disabled && on {
+            // Sobre el relleno suave de acento, que con acentos muy claros se acerca al gris del
+            // tirador.
+            ensure_contrast(p.text_disabled, p.highlight, AA_LARGE)
+        } else if disabled {
+            p.text_disabled
+        } else if on && contrast(light, p.accent_bg) < AA_LARGE {
+            p.on_accent
+        } else {
+            light
+        };
+        // Apagado, un carril gris lleno; encendido, el acento. Desactivado no es «apagado»: el
+        // carril se vacía y queda su contorno (con el relleno suave de acento si estaba
+        // encendido), así que se ve que está ahí, en qué posición y que no responde.
+        let track = match (on, hovered, disabled) {
+            (true, _, true) => p.highlight.color(),
+            (false, _, true) => Color::TRANSPARENT,
+            (true, true, _) => p.accent_bg_hover.color(),
+            (true, false, _) => p.accent_bg.color(),
+            (false, true, _) => p.outline.mix(p.text, 0.18).color(),
+            (false, false, _) => p.outline.color(),
+        };
         toggler::Style {
-            background: Background::Color(track.color()),
-            background_border_width: 0.0,
-            background_border_color: Color::TRANSPARENT,
-            foreground: Background::Color(if disabled {
-                knob.alpha(0.6)
+            background: Background::Color(track),
+            background_border_width: if disabled { 1.5 } else { 0.0 },
+            background_border_color: if disabled {
+                p.outline.color()
             } else {
-                knob.color()
-            }),
+                Color::TRANSPARENT
+            },
+            foreground: Background::Color(knob.color()),
             foreground_border_width: 0.0,
             foreground_border_color: Color::TRANSPARENT,
             text_color: Some(if disabled { p.text_disabled } else { p.text }.color()),
@@ -1248,19 +1283,15 @@ impl pick_list::Catalog for Theme {
             placeholder_color: p.text_secondary.color(),
             handle_color: p.text_secondary.color(),
             background: Background::Color(background.color()),
-            border: outline(
-                if matches!(status, pick_list::Status::Opened { .. }) {
-                    p.focus.color()
-                } else {
-                    Color::TRANSPARENT
-                },
-                if matches!(status, pick_list::Status::Opened { .. }) {
-                    2.0
-                } else {
-                    0.0
-                },
-                radius::CONTROL,
-            ),
+            // Como los campos: un borde que se ve por sí solo en reposo (el relleno apenas se
+            // aparta de la tarjeta), más marcado bajo el ratón y el anillo de acento al abrirlo.
+            border: match status {
+                pick_list::Status::Opened { .. } => outline(p.focus.color(), 2.0, radius::CONTROL),
+                pick_list::Status::Hovered => {
+                    outline(p.text_secondary.color(), 1.0, radius::CONTROL)
+                }
+                pick_list::Status::Active => outline(p.outline.color(), 1.0, radius::CONTROL),
+            },
         }
     }
 }
@@ -1362,47 +1393,59 @@ impl slider::Catalog for Theme {
     fn style(&self, class: &Self::Class<'_>, status: slider::Status) -> slider::Style {
         let p = &self.palette;
         let touched = status != slider::Status::Active;
-        let filled = if touched {
+        let accent = if touched {
             p.accent_bg_hover
         } else {
             p.accent_bg
         };
-        let filled_color = match *class {
-            SliderClass::AccentMuted => p.border.color(),
-            SliderClass::OverlayMuted => p.overlay_text.alpha(0.4),
-            SliderClass::Accent | SliderClass::Overlay => filled.color(),
-        };
-        let (empty, handle, handle_border) = match *class {
-            SliderClass::Accent | SliderClass::AccentMuted => (
-                Background::Color(p.button_hover.color()),
-                Background::Color(if touched {
-                    p.card_hover.color()
-                } else {
-                    p.card.color()
-                }),
-                if touched { filled } else { p.border },
+        // Lo recorrido, lo que falta y el tirador. El carril vacío y el tirador se ven por sí
+        // solos (3:1 con su plano): el tirador es lo que se arrastra y no puede confundirse con
+        // el fondo. Silenciado, lo recorrido se apaga pero sigue distinguiéndose de lo que falta.
+        let (filled, empty, handle, ring) = match *class {
+            SliderClass::Accent => (accent.color(), p.outline.color(), p.focus, p.text),
+            SliderClass::AccentMuted => (
+                p.text_secondary.color(),
+                p.outline.color(),
+                p.text_secondary,
+                p.text,
             ),
-            SliderClass::Overlay | SliderClass::OverlayMuted => (
-                Background::Color(p.overlay_text.alpha(0.25)),
-                Background::Color(p.overlay_text.color()),
-                if touched { filled } else { p.overlay_text },
+            SliderClass::Overlay => (
+                accent.color(),
+                p.overlay_text.alpha(OVERLAY_TRACK),
+                p.overlay_text,
+                p.focus,
+            ),
+            SliderClass::OverlayMuted => (
+                p.overlay_text_secondary.color(),
+                p.overlay_text.alpha(OVERLAY_TRACK),
+                p.overlay_text,
+                p.focus,
             ),
         };
         slider::Style {
             rail: slider::Rail {
-                backgrounds: (Background::Color(filled_color), empty),
+                backgrounds: (Background::Color(filled), Background::Color(empty)),
                 width: 4.0,
                 border: outline(Color::TRANSPARENT, 0.0, radius::PILL),
             },
             handle: slider::Handle {
                 shape: slider::HandleShape::Circle { radius: 9.0 },
-                background: handle,
-                border_width: if touched { 2.0 } else { 1.0 },
-                border_color: handle_border.color(),
+                background: Background::Color(handle.color()),
+                // Bajo el ratón o arrastrando, un aro que lo destaca.
+                border_width: if touched { 2.0 } else { 0.0 },
+                border_color: if touched {
+                    ring.color()
+                } else {
+                    Color::TRANSPARENT
+                },
             },
         }
     }
 }
+
+/// Opacidad del carril vacío de un deslizador sobre el vídeo (del texto claro sobre el panel
+/// oscuro): 3:1 con el panel, haya debajo un fotograma claro u oscuro.
+pub const OVERLAY_TRACK: f32 = 0.45;
 
 /// Clases de barra de progreso.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]

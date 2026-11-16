@@ -61,7 +61,7 @@ use crate::ui::settings::{
     voice_gain,
 };
 use crate::ui::tones::Builtin;
-use crate::update::{Progress, Stage};
+use crate::update::{Channel, NoticeOnly, Progress, Stage};
 
 /// Cada cuánto se vuelve a pedir la lista de micrófonos y salidas con «Audio y voz» abierta.
 pub const AUDIO_REFRESH: Duration = Duration::from_secs(3);
@@ -1467,12 +1467,17 @@ fn server(app: &App) -> Element<'_, Message> {
 /// Ancho de la barra del uso del relay.
 const RELAY_BAR: f32 = 160.0;
 
-/// El uso del relay del mes, siempre a la vista (no solo al acercarse a la cuota).
-fn relay_usage(app: &App) -> Element<'_, Message> {
+/// Lo que se lee del uso del relay del mes: la frase con el servidor respondiendo, la de sin
+/// conexión si es otra, y la fracción de la cuota gastada si hay cuota. Sin conexión, lo que se
+/// sabe es lo último que dijo el servidor: se dice así (o, sin dato, que no se puede
+/// consultar), para que no pase por un dato de ahora.
+fn relay_reading(app: &App) -> (String, Option<String>, Option<f32>) {
     let bytes = crate::ui::stats::bytes;
-    let (summary, fraction) = match &app.usage {
-        None => (t!("settings-relay-consultando").to_owned(), None),
-        Some(usage) if !usage.relay_enabled => (t!("settings-relay-sin-relay").to_owned(), None),
+    let (summary, fraction, figures) = match &app.usage {
+        None => (t!("settings-relay-consultando").to_owned(), None, false),
+        Some(usage) if !usage.relay_enabled => {
+            (t!("settings-relay-sin-relay").to_owned(), None, false)
+        }
         Some(usage) => match usage.quota_bytes.filter(|quota| *quota > 0) {
             Some(quota) => {
                 let used = usage.bytes as f64 / quota as f64;
@@ -1486,19 +1491,37 @@ fn relay_usage(app: &App) -> Element<'_, Message> {
                         percent = format!("{:.0}", used * 100.0)
                     )
                 };
-                (summary, Some(used.min(1.0) as f32))
+                (summary, Some(used.min(1.0) as f32), true)
             }
             None => (
                 t!("settings-relay-sin-limite", used = bytes(usage.bytes)),
                 None,
+                true,
             ),
         },
     };
+    let stale = if figures {
+        Some(t!("settings-relay-ultimo-dato", summary = summary.as_str()))
+    } else if app.usage.is_none() {
+        Some(t!("settings-relay-sin-conexion").to_owned())
+    } else {
+        None
+    };
+    (summary, stale, fraction)
+}
+
+/// El uso del relay del mes, siempre a la vista (no solo al acercarse a la cuota). Sin conexión
+/// se lee como el último dato conocido y su barra se apaga.
+fn relay_usage(app: &App) -> Element<'_, Message> {
+    let offline = app.server_status.online == Some(false);
+    let (summary, stale, fraction) = relay_reading(app);
     let bar = fraction.map(|fraction| {
         progress_bar(0.0..=1.0, fraction)
             .length(Length::Fixed(RELAY_BAR))
             .girth(Length::Fixed(METER_GIRTH))
-            .class(if fraction >= 1.0 {
+            .class(if offline {
+                ProgressClass::Tone(Tone::Neutral)
+            } else if fraction >= 1.0 {
                 ProgressClass::Tone(Tone::Error)
             } else if fraction >= 0.8 {
                 ProgressClass::Tone(Tone::Warning)
@@ -1507,12 +1530,21 @@ fn relay_usage(app: &App) -> Element<'_, Message> {
             })
             .into()
     });
+    // Del alto de la más larga de las dos: la fila no cambia cuando el servidor vuelve.
+    let shown = match &stale {
+        Some(stale) if offline => stale.clone(),
+        _ => summary.clone(),
+    };
+    let variants = std::iter::once(summary).chain(stale).collect();
     setting(
         t!("settings-uso-del-relay"),
         Some(
-            column![help(summary), note(t!("settings-uso-del-relay-ayuda"))]
-                .spacing(2)
-                .into(),
+            column![
+                varying(variants, help(shown)),
+                note(t!("settings-uso-del-relay-ayuda"))
+            ]
+            .spacing(2)
+            .into(),
         ),
         None,
         ui::reserved(RELAY_BAR, METER_GIRTH, bar),
@@ -1857,7 +1889,11 @@ fn audio(app: &App) -> Element<'_, Message> {
     let voice_rows = vec![
         setting(
             t!("settings-volumen-de-tu-voz"),
-            Some(help(t!("settings-volumen-de-tu-voz-ayuda"))),
+            Some(help(t!(
+                "settings-volumen-de-tu-voz-ayuda",
+                normal = DEFAULT_VOICE_VOLUME,
+                max = MAX_VOICE_VOLUME
+            ))),
             Some(Applies::Now),
             container(ui::slider(
                 0..=MAX_VOICE_VOLUME,
@@ -1902,7 +1938,11 @@ fn audio(app: &App) -> Element<'_, Message> {
     let game = audio.game_volume;
     let game_row = setting(
         t!("settings-volumen-del-juego"),
-        Some(help(t!("settings-volumen-del-juego-ayuda"))),
+        Some(help(t!(
+            "settings-volumen-del-juego-ayuda",
+            normal = DEFAULT_VOICE_VOLUME,
+            max = MAX_VOICE_VOLUME
+        ))),
         Some(Applies::Now),
         container(ui::slider(
             0..=MAX_VOICE_VOLUME,
@@ -2988,12 +3028,12 @@ fn chosen_accent(app: &App) -> Option<Accent> {
     (app.settings.appearance.accent != "system").then(|| app.accent())
 }
 
-/// Lado de una muestra de acento.
-const SWATCH: f32 = 26.0;
+/// Lado de una muestra de acento: toda ella se pulsa, así que no baja de 32 px.
+const SWATCH: f32 = 32.0;
 
-/// Lo que ocupa alrededor de cada muestra el anillo de la elegida: sus 2 px y 3 de hueco. Todas
+/// Lo que ocupa alrededor de cada muestra el anillo de la elegida: sus 2 px y 2 de hueco. Todas
 /// lo reservan, así elegir otra no mueve ninguna.
-const SWATCH_RING: f32 = 5.0;
+const SWATCH_RING: f32 = 4.0;
 
 /// «Del sistema» entre las opciones del acento: una ficha que, elegida, lleva el relleno suave y
 /// el borde de acento con la marca de visto. Mide lo mismo elegida o no (la marca tiene su
@@ -3028,7 +3068,7 @@ fn swatch<'a>(accent: Accent, key: String, selected: bool) -> Element<'a, Messag
     let sample = button(if selected {
         Element::from(iced_widget::center(icon_with(
             Icon::Check,
-            14.0,
+            16.0,
             SvgClass::OnAccent,
         )))
     } else {
@@ -3109,14 +3149,26 @@ fn updates<'a>(app: &'a App) -> Vec<Element<'a, Message>> {
     .into();
     vec![
         setting(
-            t!("settings-version-nueva"),
+            t!("settings-estado-de-las-actualizaciones"),
             Some(varying(status_variants, help(status))),
             None,
             steady(vec![check_sample], action),
         ),
+        // Con el interruptor sin poder tocarse, en el sitio de la descripción va por qué (del
+        // alto de la más larga: la fila no cambia al apagar «Buscar versiones nuevas»).
         setting(
             t!("update-automatico"),
-            Some(help(t!("update-automatico-ayuda"))),
+            Some(varying(
+                AutoBlocked::ALL
+                    .map(AutoBlocked::reason)
+                    .into_iter()
+                    .chain([t!("update-automatico-ayuda").to_owned()])
+                    .collect(),
+                help(AutoBlocked::of(app).map_or_else(
+                    || t!("update-automatico-ayuda").to_owned(),
+                    AutoBlocked::reason,
+                )),
+            )),
             None,
             super::updates::auto_switch(app),
         ),
@@ -3141,6 +3193,58 @@ fn updates<'a>(app: &'a App) -> Vec<Element<'a, Message>> {
             ),
         ),
     ]
+}
+
+/// Por qué «Actualizar automáticamente» no se puede tocar ([`super::updates::auto_switch`] lo
+/// deja apagado y desactivado en estos casos, en este orden).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoBlocked {
+    /// La variable de entorno del paquete que se actualiza por su canal.
+    Environment,
+    /// «Buscar versiones nuevas» está apagado: no hay de qué enterarse.
+    NoChecks,
+    /// El MSIX de Windows no se instala encima de sí mismo.
+    Msix,
+    /// Una copia compilada a mano o de un paquete sin camino de actualización.
+    Unpackaged,
+}
+
+impl AutoBlocked {
+    /// Todos: la fila reserva el alto del más largo.
+    const ALL: [AutoBlocked; 4] = [
+        AutoBlocked::Environment,
+        AutoBlocked::NoChecks,
+        AutoBlocked::Msix,
+        AutoBlocked::Unpackaged,
+    ];
+
+    /// El motivo que aplica ahora (`None`: el interruptor se puede tocar).
+    fn of(app: &App) -> Option<AutoBlocked> {
+        if crate::update::disabled_by_env() {
+            Some(AutoBlocked::Environment)
+        } else if !app.settings.updates.check {
+            Some(AutoBlocked::NoChecks)
+        } else {
+            match app.update.updater.channel() {
+                Channel::Notice(NoticeOnly::Msix) => Some(AutoBlocked::Msix),
+                Channel::Notice(NoticeOnly::Unpackaged) => Some(AutoBlocked::Unpackaged),
+                Channel::Package(_) | Channel::Flatpak => None,
+            }
+        }
+    }
+
+    /// El motivo en palabras, con lo que se puede hacer si hay algo.
+    fn reason(self) -> String {
+        match self {
+            AutoBlocked::Environment => t!(
+                "settings-desactivado-con-este-paquete",
+                valor = crate::update::DISABLE_ENV
+            ),
+            AutoBlocked::NoChecks => t!("settings-auto-sin-buscar").to_owned(),
+            AutoBlocked::Msix => t!("settings-auto-msix").to_owned(),
+            AutoBlocked::Unpackaged => t!("settings-auto-sin-paquete").to_owned(),
+        }
+    }
 }
 
 /// Ancho de la barra de la descarga de la versión nueva.
@@ -3213,7 +3317,7 @@ fn about(app: &App) -> Element<'_, Message> {
         Some(Message::OpenUrl(release_page(app.version))),
     );
     let header = row![
-        icon_with(Icon::RadioTower, BRAND_ICON, SvgClass::Accent),
+        icon_with(Icon::Coroom, BRAND_ICON, SvgClass::Accent),
         beside::Beside::new(texts, notes.into(), Density::Setting.text_min()),
     ]
     .spacing(space::M)
@@ -3306,7 +3410,9 @@ pub(crate) mod shots {
         app.settings_page.audio_answered_at = app.settings_page.audio_updated_at;
         app.settings.audio.speaker = Some("usb-headset".to_owned());
         app.settings.audio.microphone = Some("usb-headset-mic".to_owned());
-        app.settings.updates.last_check = Some(1_790_000_000);
+        // La última búsqueda, reciente: con la búsqueda diaria encendida no puede ser de hace
+        // semanas.
+        app.settings.updates.last_check = Some(crate::update::unix_now() - 3 * 3600);
         app.usage = Some(Usage {
             month: "2026-10".to_owned(),
             bytes: 12_400_000_000,
@@ -4170,6 +4276,79 @@ mod tests {
         // Las tablas aguantan más antes de partirse.
         assert!(Density::Table.text_min() < text_min);
         assert!(Density::Table.padding().top < Density::Setting.padding().top);
+    }
+
+    /// «Actualizar automáticamente» desactivado dice siempre por qué: sin buscar versiones, o
+    /// con una copia que no puede instalarse sola. Coincide con cuándo lo desactiva
+    /// [`crate::ui::screens::updates::auto_switch`].
+    #[test]
+    fn the_auto_update_switch_says_why_it_cannot_be_changed() {
+        use crate::update::{Package, Updater};
+
+        if crate::update::disabled_by_env() {
+            return;
+        }
+        let mut app = open(SettingsPage::About);
+        app.settings.updates.check = true;
+        app.update.updater = Updater::new(Channel::Package(Package::WindowsZip), true);
+        assert_eq!(AutoBlocked::of(&app), None, "se puede tocar: sin motivo");
+        for (channel, why) in [
+            (Channel::Notice(NoticeOnly::Msix), AutoBlocked::Msix),
+            (
+                Channel::Notice(NoticeOnly::Unpackaged),
+                AutoBlocked::Unpackaged,
+            ),
+        ] {
+            app.update.updater = Updater::new(channel, true);
+            assert_eq!(AutoBlocked::of(&app), Some(why));
+        }
+        // Sin buscar versiones, ese es el motivo, también en una copia que no se instala sola.
+        app.settings.updates.check = false;
+        assert_eq!(AutoBlocked::of(&app), Some(AutoBlocked::NoChecks));
+        app.update.updater = Updater::new(Channel::Flatpak, true);
+        assert_eq!(AutoBlocked::of(&app), Some(AutoBlocked::NoChecks));
+        // Cada motivo tiene su frase, distinta de las demás.
+        let reasons = AutoBlocked::ALL.map(AutoBlocked::reason);
+        for (index, reason) in reasons.iter().enumerate() {
+            assert!(!reason.is_empty());
+            assert!(!reasons[..index].contains(reason), "{reason}");
+        }
+        let _ = view(&app);
+    }
+
+    /// Sin conexión, el uso del relay se lee como el último dato conocido (no como el de
+    /// ahora); sin dato, que no se puede consultar.
+    #[test]
+    fn offline_the_relay_usage_reads_as_the_last_known() {
+        use coroom_transport::proto::api::Usage;
+
+        let mut app = open(SettingsPage::Network);
+        app.account = Some(crate::ui::app::tests::account());
+        // Sin dato: «Consultando…» con el servidor y, sin él, que no se puede consultar.
+        let (summary, stale, fraction) = relay_reading(&app);
+        assert_eq!(summary, t!("settings-relay-consultando"));
+        assert_eq!(stale.as_deref(), Some(t!("settings-relay-sin-conexion")));
+        assert_eq!(fraction, None);
+        // Con dato: el mismo, dicho como el último conocido.
+        app.usage = Some(Usage {
+            month: "2026-10".to_owned(),
+            bytes: 1_000_000_000,
+            quota_bytes: Some(4_000_000_000),
+            relay_enabled: true,
+            days: Vec::new(),
+        });
+        let (summary, stale, fraction) = relay_reading(&app);
+        let stale = stale.expect("con cifras hay frase de sin conexión");
+        assert!(stale.ends_with(&summary), "{stale}");
+        assert_ne!(stale, summary);
+        assert_eq!(fraction, Some(0.25));
+        // Un servidor sin relay lo es con conexión o sin ella.
+        if let Some(usage) = &mut app.usage {
+            usage.relay_enabled = false;
+        }
+        assert_eq!(relay_reading(&app).1, None);
+        app.server_status.online = Some(false);
+        let _ = view(&app);
     }
 
     /// La muestra marcada en Apariencia es la del acento en uso: ninguna si se sigue al sistema,

@@ -18,7 +18,7 @@ home-share-open-text = Tu sala sigue abierta mientras miras otras páginas.
 home-share = Compartir
 home-see-room = Ver mi sala
 home-join-title = Unirse con código
-home-join-text = Con el código que te pasó el anfitrión.
+home-join-text = Te lo pasa el anfitrión.
 home-code-length = El código tiene { $length } caracteres
 home-code-invalid = Ese código no es de una sala (sin «0», «1», «I» ni «O»)
 home-enter = Entrar
@@ -31,6 +31,12 @@ home-room-open-empty = Tu sala está abierta, todavía sin invitados
 home-room-open-one = Tu sala está abierta con 1 invitado
 home-room-open-many = Tu sala está abierta con { $count } invitados
 home-room-live = en vivo
+home-you = Tú
+home-visiting = Estás en la sala de { $name }
+home-visiting-unknown = Estás en una sala
+home-visiting-text = Sal de ella para abrir la tuya o entrar en otra.
+home-in-your-room = En tu sala
+home-asked-status = Esperando respuesta
 
 ## Bandeja y «En línea ahora»
 
@@ -64,6 +70,7 @@ home-online-none = Nadie conectado
 home-online-one = 1 conectado
 home-online-many = { $count } conectados
 home-updated = actualizado { $ago }
+home-updated-moments = actualizado hace menos de 1 min
 home-add-friend = Agregar amigo
 home-add-friend-close = Cancelar
 home-username = Nombre de usuario
